@@ -1,0 +1,39 @@
+name: GitForgeOps PR Review
+
+on:
+  pull_request:
+    paths:
+      - 'resources/**'
+      - 'overlays/**'
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ferrum-edge binary
+        run: |
+          curl -sL https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64 -o /usr/local/bin/ferrum-edge
+          chmod +x /usr/local/bin/ferrum-edge
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gitforgeops
+        run: cargo install --path .
+
+      - name: Validate
+        run: gitforgeops validate --format github-annotations
+        env:
+          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}

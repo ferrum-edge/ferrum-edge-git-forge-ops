@@ -1,0 +1,71 @@
+name: GitForgeOps Apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'resources/**'
+      - 'overlays/**'
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ferrum-edge binary
+        run: |
+          curl -sL https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64 -o /usr/local/bin/ferrum-edge
+          chmod +x /usr/local/bin/ferrum-edge
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gitforgeops
+        run: cargo install --path .
+
+      - name: Validate
+        run: gitforgeops validate
+        env:
+          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+
+      # --- API mode: push to gateway ---
+      - name: Apply to gateway (API mode)
+        if: vars.FERRUM_GATEWAY_MODE != 'file'
+        run: gitforgeops apply --auto-approve
+        env:
+          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
+          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+          FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
+          FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+          FERRUM_APPLY_STRATEGY: ${{ vars.FERRUM_APPLY_STRATEGY }}
+          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+
+      # --- File mode: assemble flat file and commit to main ---
+      - name: Assemble config (file mode)
+        if: vars.FERRUM_GATEWAY_MODE == 'file'
+        run: gitforgeops export --output assembled/resources.yaml
+        env:
+          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+
+      - name: Commit assembled config (file mode)
+        if: vars.FERRUM_GATEWAY_MODE == 'file'
+        run: |
+          git config user.name "gitforgeops[bot]"
+          git config user.email "gitforgeops[bot]@users.noreply.github.com"
+          git add assembled/resources.yaml
+          git diff --cached --quiet || git commit -m "chore: regenerate assembled config [skip ci]"
+          git push

@@ -1,0 +1,9 @@
+kind: Consumer
+spec:
+  id: "consumer-alice"
+  username: "alice"
+  credentials:
+    keyauth:
+      key: "alice-secret-key-12345"
+  acl_groups:
+    - "engineering"

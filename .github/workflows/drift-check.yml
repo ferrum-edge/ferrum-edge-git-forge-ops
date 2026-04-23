@@ -1,0 +1,43 @@
+name: GitForgeOps Drift Check
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ferrum-edge binary
+        run: |
+          curl -sL https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64 -o /usr/local/bin/ferrum-edge
+          chmod +x /usr/local/bin/ferrum-edge
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gitforgeops
+        run: cargo install --path .
+
+      - name: Check drift
+        run: gitforgeops diff --exit-on-drift
+        env:
+          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
+          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+          FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
+          FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}

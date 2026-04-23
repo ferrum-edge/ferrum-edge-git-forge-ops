@@ -1,0 +1,11 @@
+# Example plugin config resource — rename this file (remove leading _) to use it.
+#
+# kind: PluginConfig
+# spec:
+#   id: "plugin-my-keyauth"
+#   plugin_name: "key_auth"
+#   scope: proxy
+#   proxy_id: "proxy-my-api"
+#   enabled: true
+#   config:
+#     key_location: "header:X-API-Key"

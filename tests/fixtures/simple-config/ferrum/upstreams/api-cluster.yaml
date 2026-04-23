@@ -1,0 +1,12 @@
+kind: Upstream
+spec:
+  id: "upstream-api"
+  name: "API Cluster"
+  algorithm: round_robin
+  targets:
+    - host: "api1.example.com"
+      port: 8080
+      weight: 1
+    - host: "api2.example.com"
+      port: 8080
+      weight: 2

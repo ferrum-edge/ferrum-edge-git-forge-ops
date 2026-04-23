@@ -1,0 +1,6 @@
+kind: Proxy
+spec:
+  id: "proxy-httpbin"
+  backend_host: "httpbin-prod.internal"
+  backend_connect_timeout_ms: 3000
+  backend_read_timeout_ms: 15000

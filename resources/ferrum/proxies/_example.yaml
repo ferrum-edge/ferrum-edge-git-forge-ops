@@ -1,0 +1,17 @@
+# Example proxy resource — rename this file (remove leading _) to use it.
+#
+# kind: Proxy
+# spec:
+#   id: "proxy-my-api"
+#   name: "My API"
+#   listen_path: "/api/v1"
+#   backend_protocol: https
+#   backend_host: "api.internal"
+#   backend_port: 8443
+#   strip_listen_path: true
+#   backend_connect_timeout_ms: 5000
+#   backend_read_timeout_ms: 30000
+#   upstream_id: "my-upstream"
+#   auth_mode: single
+#   plugins:
+#     - plugin_config_id: "plugin-my-keyauth"
