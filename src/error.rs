@@ -41,6 +41,21 @@ pub enum Error {
     #[error("{0}")]
     Config(String),
 
+    #[error("API request failed ({status}): {message}")]
+    ApiError { status: u16, message: String },
+
+    #[error("JWT error: {0}")]
+    JwtError(String),
+
+    #[error("gateway URL not configured (set FERRUM_GATEWAY_URL)")]
+    NoGatewayUrl,
+
+    #[error("JWT secret not configured (set FERRUM_ADMIN_JWT_SECRET)")]
+    NoJwtSecret,
+
+    #[error("HTTP client error: {0}")]
+    HttpClient(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

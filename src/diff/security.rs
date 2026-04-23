@@ -1,0 +1,87 @@
+use crate::config::GatewayConfig;
+
+#[derive(Debug, Clone)]
+pub struct SecurityFinding {
+    pub severity: String,
+    pub kind: String,
+    pub id: String,
+    pub message: String,
+}
+
+pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
+    let mut findings = Vec::new();
+
+    for consumer in &config.consumers {
+        for (cred_type, cred_value) in &consumer.credentials {
+            check_literal_credentials(&consumer.id, cred_type, cred_value, &mut findings);
+        }
+    }
+
+    for proxy in &config.proxies {
+        let has_auth = proxy.plugins.iter().any(|assoc| {
+            config
+                .plugin_configs
+                .iter()
+                .any(|pc| pc.id == assoc.plugin_config_id && pc.plugin_name.contains("auth"))
+        });
+        if !has_auth {
+            findings.push(SecurityFinding {
+                severity: "warning".to_string(),
+                kind: "Proxy".to_string(),
+                id: proxy.id.clone(),
+                message: "No auth plugin attached".to_string(),
+            });
+        }
+
+        if !proxy.backend_tls_verify_server_cert {
+            findings.push(SecurityFinding {
+                severity: "warning".to_string(),
+                kind: "Proxy".to_string(),
+                id: proxy.id.clone(),
+                message: "backend_tls_verify_server_cert is false".to_string(),
+            });
+        }
+    }
+
+    findings
+}
+
+fn check_literal_credentials(
+    consumer_id: &str,
+    cred_type: &str,
+    value: &serde_json::Value,
+    findings: &mut Vec<SecurityFinding>,
+) {
+    match value {
+        serde_json::Value::String(s) if !s.starts_with("${") => {
+            findings.push(SecurityFinding {
+                severity: "error".to_string(),
+                kind: "Consumer".to_string(),
+                id: consumer_id.to_string(),
+                message: format!("Literal credential in '{cred_type}' (use ${{...}} for secrets)"),
+            });
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if let serde_json::Value::String(s) = v {
+                    if !s.starts_with("${") {
+                        findings.push(SecurityFinding {
+                            severity: "error".to_string(),
+                            kind: "Consumer".to_string(),
+                            id: consumer_id.to_string(),
+                            message: format!(
+                                "Literal credential in '{cred_type}.{k}' (use ${{...}} for secrets)"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                check_literal_credentials(consumer_id, cred_type, item, findings);
+            }
+        }
+        _ => {}
+    }
+}
