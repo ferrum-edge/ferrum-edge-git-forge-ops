@@ -1,0 +1,9 @@
+kind: Proxy
+spec:
+  id: "proxy-httpbin"
+  name: "HTTPBin Proxy"
+  listen_path: "/httpbin"
+  backend_protocol: https
+  backend_host: "httpbin.org"
+  backend_port: 443
+  strip_listen_path: true

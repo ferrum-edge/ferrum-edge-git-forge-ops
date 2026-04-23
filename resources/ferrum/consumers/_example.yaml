@@ -1,0 +1,11 @@
+# Example consumer resource — rename this file (remove leading _) to use it.
+#
+# kind: Consumer
+# spec:
+#   id: "consumer-alice"
+#   username: "alice"
+#   credentials:
+#     keyauth:
+#       key: "${ALICE_API_KEY}"    # secret ref — resolved at apply time
+#   acl_groups:
+#     - "engineering"

@@ -1,0 +1,18 @@
+# Example upstream resource — rename this file (remove leading _) to use it.
+#
+# kind: Upstream
+# spec:
+#   id: "upstream-api-cluster"
+#   name: "API Backend Pool"
+#   algorithm: round_robin
+#   targets:
+#     - host: "api-1.internal"
+#       port: 8443
+#       weight: 1
+#     - host: "api-2.internal"
+#       port: 8443
+#       weight: 1
+#   health_checks:
+#     active:
+#       http_path: "/health"
+#       interval_seconds: 10

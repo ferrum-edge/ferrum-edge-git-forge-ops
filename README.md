@@ -154,6 +154,7 @@ Set in: Settings > Secrets and variables > Actions > Variables
 | `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all. |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` (CRUD) or `full-replace` (POST /restore) |
 | `FERRUM_OVERLAY` | — | Overlay directory (e.g. `staging`, `production`) |
+| `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification (dev only) |
 
 ## Apply Modes
@@ -265,6 +266,33 @@ gitforgeops diff --exit-on-drift
 ```
 
 Reports drifted (changed outside git), orphaned (in live but not git), and missing (in git but not live) resources.
+
+## Docker
+
+A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into a single image. The `ferrum-edge` binary is pulled from the official `ferrumedge/ferrum-edge` Docker Hub image.
+
+### Building
+
+```bash
+# Uses latest ferrum-edge
+docker build -t gitforgeops .
+
+# Pin to a specific ferrum-edge version (match your runtime)
+docker build --build-arg FERRUM_EDGE_VERSION=v0.9.0 -t gitforgeops .
+```
+
+### Running locally
+
+```bash
+docker run --rm -v $(pwd):/repo gitforgeops validate
+docker run --rm -v $(pwd):/repo gitforgeops export --output assembled/resources.yaml
+```
+
+### Version Pinning
+
+Set the `FERRUM_EDGE_VERSION` GitHub Actions variable to pin the `ferrum-edge` binary version used in CI workflows. This should match the version of Ferrum Edge running in your environment to ensure validation rules are consistent.
+
+For example, if your gateways run `v0.9.0`, set `FERRUM_EDGE_VERSION=v0.9.0` in your repo's Actions variables. The CI workflows will download that specific release for validation. If unset, `latest` is used.
 
 ## License
 

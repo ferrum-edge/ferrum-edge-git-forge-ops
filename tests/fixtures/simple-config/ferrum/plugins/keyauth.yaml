@@ -1,0 +1,9 @@
+kind: PluginConfig
+spec:
+  id: "plugin-keyauth"
+  plugin_name: "key_auth"
+  scope: proxy
+  proxy_id: "proxy-httpbin"
+  enabled: true
+  config:
+    key_location: "header:X-API-Key"
