@@ -21,8 +21,14 @@ Fork this repo, configure a few environment variables, and get a full-featured G
 
 You define gateway resources (proxies, consumers, upstreams, plugins) as individual YAML files organized by namespace. The built-in CI workflows handle the rest:
 
-- **On PR open/update**: Validates config via `ferrum-edge validate`, posts a structured review comment with change summary, breaking change detection, security audit, and best practice recommendations.
-- **On merge to main**: Applies the validated config to your gateway — either via the Admin API (database/CP mode) or by assembling a flat file (file mode).
+- **On PR open/update** (`.github/workflows/validate-pr.yml`): Validates config via `ferrum-edge validate`, posts a structured review comment with change summary, breaking change detection, security audit, and best practice recommendations. Triggered only when the PR touches `resources/**` or `overlays/**`.
+- **On merge to main** (`.github/workflows/apply-on-merge.yml`): Applies the validated config to your gateway — either via the Admin API (database/CP mode) or by assembling a flat file (file mode). Same path filter.
+- **Daily** (`.github/workflows/drift-check.yml`): Scheduled cron at 06:00 UTC runs `gitforgeops diff --exit-on-drift` to surface config drift between git and the live gateway.
+- **On push to main / `v*` tag** (`.github/workflows/release.yml`): Builds multi-arch Docker images (`linux/amd64` + `linux/arm64`) and pushes to Docker Hub (`ferrumedge/ferrum-edge-git-forge-ops`) and GHCR. `main` pushes tag `:latest` + `:main-<sha>`; version tags push `:<version>`, `:<major>.<minor>`, `:v<version>`.
+
+### What a single PR can change
+
+One PR can include any number of new, modified, or deleted resources across any number of namespaces, in any mix of kinds (proxies, consumers, upstreams, plugin configs). The loader walks every `resources/<namespace>/{proxies,consumers,upstreams,plugins}/` directory, the assembler flattens into a single `GatewayConfig`, and apply groups by namespace on the way out — each namespace gets its own `X-Ferrum-Namespace` header and its own incremental diff against the live gateway. Namespaces are isolated: a failure applying to `team-alpha` doesn't block `team-beta`.
 
 ## Repository Layout
 
@@ -136,13 +142,26 @@ All configuration is via GitHub repository **secrets** and **variables**. No con
 
 Set in: Settings > Secrets and variables > Actions > Secrets
 
+#### Gateway (required for `apply` / `diff` / `drift-check`)
+
 | Secret | Description |
 |--------|-------------|
 | `FERRUM_GATEWAY_URL` | Admin API base URL (e.g. `https://gw.example.com:9000`) |
 | `FERRUM_ADMIN_JWT_SECRET` | HS256 secret for minting Admin API JWTs (min 32 chars) |
 | `FERRUM_GATEWAY_CA_CERT` | Custom CA cert (PEM, base64-encoded) for Admin API TLS. Omit for public CA. |
-| `FERRUM_GATEWAY_CLIENT_CERT` | Client cert (PEM, base64-encoded) for mTLS to Admin API. Optional. |
+| `FERRUM_GATEWAY_CLIENT_CERT` | Client cert (PEM, base64-encoded) for mTLS to Admin API. Optional. If set, `CLIENT_KEY` is mandatory. |
 | `FERRUM_GATEWAY_CLIENT_KEY` | Client key (PEM, base64-encoded) for mTLS. Required if `CLIENT_CERT` set. |
+
+#### Docker Hub (required only if you want the `release` workflow to publish images)
+
+| Secret | Description |
+|--------|-------------|
+| `DOCKERHUB_USERNAME` | Docker Hub account that owns the `ferrumedge` namespace |
+| `DOCKERHUB_TOKEN` | Docker Hub access token with Read+Write+Delete on `ferrum-edge-git-forge-ops` |
+
+The `release` workflow also pushes to GHCR using the built-in `GITHUB_TOKEN` — no extra secret needed. Ensure Settings → Actions → General → Workflow permissions is set to **Read and write** so `GITHUB_TOKEN` can push to `ghcr.io/<owner>/…`.
+
+If you don't need published Docker images, you can skip Docker Hub setup entirely — the `apply-on-merge` and `drift-check` workflows build `gitforgeops` natively on each run.
 
 ### Variables
 
@@ -152,10 +171,20 @@ Set in: Settings > Secrets and variables > Actions > Variables
 |----------|---------|-------------|
 | `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML |
 | `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all. |
-| `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` (CRUD) or `full-replace` (POST /restore) |
+| `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` (CRUD) or `full_replace` (POST /restore) |
 | `FERRUM_OVERLAY` | — | Overlay directory (e.g. `staging`, `production`) |
 | `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification (dev only) |
+| `GITFORGEOPS_IMAGE_TAG` | — | When set (e.g. `latest`, `v0.1.0`), PR validation runs in the pre-built `ferrumedge/ferrum-edge-git-forge-ops` container instead of compiling natively. Much faster CI, but requires the image to have been published by the `release` workflow first. Unset = native fallback (slower, always works). |
+
+### Local CLI env vars
+
+These don't need to be set on GitHub — they only apply when running `gitforgeops` locally. All are documented in `.env.example`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Path to the `ferrum-edge` binary for validation. |
+| `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | Where `file` mode writes the flat assembled YAML. |
 
 ## Apply Modes
 
@@ -269,9 +298,31 @@ Reports drifted (changed outside git), orphaned (in live but not git), and missi
 
 ## Docker
 
-A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into a single image. The `ferrum-edge` binary is pulled from the official `ferrumedge/ferrum-edge` Docker Hub image.
+A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into a single image. The `ferrum-edge` binary is copied from the official `ferrumedge/ferrum-edge` Docker Hub image; `gitforgeops` is compiled from source in a builder stage.
 
-### Building
+### Published images
+
+The `release` workflow publishes to two registries on every push to `main` and every `v*` tag:
+
+- `docker.io/ferrumedge/ferrum-edge-git-forge-ops`
+- `ghcr.io/ferrum-edge/ferrum-edge-git-forge-ops`
+
+Tags:
+
+| Trigger | Tags published |
+|---------|----------------|
+| push to `main` | `:latest`, `:main-<sha>` |
+| push of `v0.1.0` | `:0.1.0`, `:0.1`, `:v0.1.0` |
+
+Platforms: `linux/amd64` + `linux/arm64`.
+
+### Prerequisites for the release workflow
+
+1. Docker Hub repo `ferrumedge/ferrum-edge-git-forge-ops` exists (public)
+2. Repo secrets `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` are set
+3. Settings → Actions → General → Workflow permissions = **Read and write** (for GHCR push)
+
+### Building locally
 
 ```bash
 # Uses latest ferrum-edge
@@ -287,6 +338,10 @@ docker build --build-arg FERRUM_EDGE_VERSION=v0.9.0 -t gitforgeops .
 docker run --rm -v $(pwd):/repo gitforgeops validate
 docker run --rm -v $(pwd):/repo gitforgeops export --output assembled/resources.yaml
 ```
+
+### Using the published image for fast CI
+
+Once the release workflow has published an image, set the `GITFORGEOPS_IMAGE_TAG` GitHub Actions variable (e.g. to `latest` or a pinned version) and PR validation will run inside the pre-built container instead of compiling natively — typically 10–20s vs. 1–3 minutes.
 
 ### Version Pinning
 
