@@ -9,12 +9,32 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
+    container:
+      image: ferrumedge/ferrum-edge-git-forge-ops:${{ vars.GITFORGEOPS_IMAGE_TAG || 'latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate
+        run: gitforgeops validate --format github-annotations
+        env:
+          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+
+  review-native:
+    if: vars.GITFORGEOPS_IMAGE_TAG == ''
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Download ferrum-edge binary
         run: |
-          curl -sL https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64 -o /usr/local/bin/ferrum-edge
+          VERSION="${{ vars.FERRUM_EDGE_VERSION || 'latest' }}"
+          if [ "$VERSION" = "latest" ]; then
+            URL="https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64"
+          else
+            URL="https://github.com/ferrum-edge/ferrum-edge/releases/download/${VERSION}/ferrum-edge-linux-x86_64"
+          fi
+          curl -sL "$URL" -o /usr/local/bin/ferrum-edge
           chmod +x /usr/local/bin/ferrum-edge
 
       - name: Install Rust toolchain

@@ -13,7 +13,13 @@ jobs:
 
       - name: Download ferrum-edge binary
         run: |
-          curl -sL https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64 -o /usr/local/bin/ferrum-edge
+          VERSION="${{ vars.FERRUM_EDGE_VERSION || 'latest' }}"
+          if [ "$VERSION" = "latest" ]; then
+            URL="https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64"
+          else
+            URL="https://github.com/ferrum-edge/ferrum-edge/releases/download/${VERSION}/ferrum-edge-linux-x86_64"
+          fi
+          curl -sL "$URL" -o /usr/local/bin/ferrum-edge
           chmod +x /usr/local/bin/ferrum-edge
 
       - name: Install Rust toolchain
