@@ -73,7 +73,14 @@ impl StateFile {
 }
 
 fn hash_resource<T: serde::Serialize>(resource: &T) -> String {
-    let canonical = serde_json::to_string(resource).unwrap_or_default();
+    // Serialize through `serde_json::Value` first: direct `to_string` on a
+    // struct iterates `HashMap` fields (e.g. `Consumer.credentials`,
+    // `UpstreamTarget.tags`) in random order, producing different hashes
+    // across runs for the same resource. `serde_json::Map` is backed by
+    // `BTreeMap` (no `preserve_order` feature), so going through `Value`
+    // yields sorted, deterministic output.
+    let value = serde_json::to_value(resource).unwrap_or(serde_json::Value::Null);
+    let canonical = serde_json::to_string(&value).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     format!("sha256:{:x}", hasher.finalize())

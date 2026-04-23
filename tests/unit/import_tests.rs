@@ -107,6 +107,45 @@ fn split_config_empty_config() {
 }
 
 #[test]
+fn split_config_rejects_path_traversal_in_namespace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.proxies[0].namespace = "../evil".to_string();
+
+    let err = split_config(&config, tmp.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("unsafe"),
+        "expected path-traversal rejection, got: {err}"
+    );
+
+    let escaped = tmp.path().parent().unwrap().join("evil");
+    assert!(
+        !escaped.exists(),
+        "namespace traversal must not create files outside output_dir"
+    );
+}
+
+#[test]
+fn split_config_rejects_path_traversal_in_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.proxies[0].id = "../escape".to_string();
+
+    let err = split_config(&config, tmp.path()).unwrap_err();
+    assert!(err.to_string().contains("unsafe"));
+}
+
+#[test]
+fn split_config_rejects_absolute_path_in_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.proxies[0].id = "/etc/passwd".to_string();
+
+    let err = split_config(&config, tmp.path()).unwrap_err();
+    assert!(err.to_string().contains("unsafe"));
+}
+
+#[test]
 fn import_from_file_roundtrip() {
     let tmp_export = tempfile::tempdir().unwrap();
     let config = make_test_config();

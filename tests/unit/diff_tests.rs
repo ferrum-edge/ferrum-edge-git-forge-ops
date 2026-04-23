@@ -229,6 +229,38 @@ fn breaking_detects_listen_path_change() {
 }
 
 #[test]
+fn breaking_auth_plugin_deletion_scoped_by_namespace() {
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        plugin_configs: vec![
+            make_plugin_config("plugin-shared", "team-alpha", "keyauth", PluginScope::Proxy),
+            make_plugin_config(
+                "plugin-shared",
+                "team-beta",
+                "rate_limiting",
+                PluginScope::Proxy,
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    let breaking = detect_breaking_changes(&diffs, &desired, &actual);
+
+    // Only the team-alpha deletion should be flagged as breaking — the
+    // team-beta plugin with the same id is rate_limiting, not auth.
+    let auth_breaking: Vec<_> = breaking
+        .iter()
+        .filter(|bc| bc.kind == "PluginConfig" && bc.reason.contains("Auth"))
+        .collect();
+    assert_eq!(
+        auth_breaking.len(),
+        1,
+        "expected exactly one auth-plugin breaking change, got {breaking:?}"
+    );
+}
+
+#[test]
 fn security_detects_literal_credential() {
     let mut creds = std::collections::HashMap::new();
     creds.insert(

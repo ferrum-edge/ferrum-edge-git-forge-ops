@@ -37,7 +37,7 @@ pub fn detect_breaking_changes(
                     let is_auth = actual
                         .plugin_configs
                         .iter()
-                        .find(|p| p.id == diff.id)
+                        .find(|p| p.id == diff.id && p.namespace == diff.namespace)
                         .map(|p| p.plugin_name.contains("auth"))
                         .unwrap_or(false);
                     if is_auth {

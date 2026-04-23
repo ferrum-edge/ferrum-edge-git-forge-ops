@@ -23,66 +23,80 @@ pub fn split_config(
     let mut result = ImportResult::default();
 
     for proxy in &config.proxies {
-        let dir = output_dir.join(&proxy.namespace).join("proxies");
+        let namespace = safe_path_component(&proxy.namespace, "namespace")?;
+        let dir = output_dir.join(namespace).join("proxies");
         std::fs::create_dir_all(&dir)?;
         let resource = Resource::Proxy {
             spec: proxy.clone(),
         };
         let yaml = serde_yaml::to_string(&resource)?;
-        let filename = if proxy.id.is_empty() {
-            "unnamed.yaml".to_string()
-        } else {
-            format!("{}.yaml", proxy.id)
-        };
+        let filename = resource_filename(&proxy.id, "id")?;
         std::fs::write(dir.join(filename), yaml)?;
         result.proxies += 1;
     }
 
     for consumer in &config.consumers {
-        let dir = output_dir.join(&consumer.namespace).join("consumers");
+        let namespace = safe_path_component(&consumer.namespace, "namespace")?;
+        let dir = output_dir.join(namespace).join("consumers");
         std::fs::create_dir_all(&dir)?;
         let resource = Resource::Consumer {
             spec: consumer.clone(),
         };
         let yaml = serde_yaml::to_string(&resource)?;
-        let filename = if consumer.id.is_empty() {
-            "unnamed.yaml".to_string()
-        } else {
-            format!("{}.yaml", consumer.id)
-        };
+        let filename = resource_filename(&consumer.id, "id")?;
         std::fs::write(dir.join(filename), yaml)?;
         result.consumers += 1;
     }
 
     for upstream in &config.upstreams {
-        let dir = output_dir.join(&upstream.namespace).join("upstreams");
+        let namespace = safe_path_component(&upstream.namespace, "namespace")?;
+        let dir = output_dir.join(namespace).join("upstreams");
         std::fs::create_dir_all(&dir)?;
         let resource = Resource::Upstream {
             spec: upstream.clone(),
         };
         let yaml = serde_yaml::to_string(&resource)?;
-        let filename = if upstream.id.is_empty() {
-            "unnamed.yaml".to_string()
-        } else {
-            format!("{}.yaml", upstream.id)
-        };
+        let filename = resource_filename(&upstream.id, "id")?;
         std::fs::write(dir.join(filename), yaml)?;
         result.upstreams += 1;
     }
 
     for pc in &config.plugin_configs {
-        let dir = output_dir.join(&pc.namespace).join("plugins");
+        let namespace = safe_path_component(&pc.namespace, "namespace")?;
+        let dir = output_dir.join(namespace).join("plugins");
         std::fs::create_dir_all(&dir)?;
         let resource = Resource::PluginConfig { spec: pc.clone() };
         let yaml = serde_yaml::to_string(&resource)?;
-        let filename = if pc.id.is_empty() {
-            "unnamed.yaml".to_string()
-        } else {
-            format!("{}.yaml", pc.id)
-        };
+        let filename = resource_filename(&pc.id, "id")?;
         std::fs::write(dir.join(filename), yaml)?;
         result.plugin_configs += 1;
     }
 
     Ok(result)
+}
+
+/// Reject values that would break out of `output_dir` (path traversal, absolute
+/// paths, null bytes). Resource identifiers originate from an admin API or
+/// user YAML and must not be trusted as filesystem path components.
+fn safe_path_component<'a>(value: &'a str, field: &str) -> crate::error::Result<&'a str> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('\0')
+    {
+        return Err(crate::error::Error::Config(format!(
+            "unsafe {field} {value:?} — cannot use as filesystem path component"
+        )));
+    }
+    Ok(value)
+}
+
+fn resource_filename(id: &str, field: &str) -> crate::error::Result<String> {
+    if id.is_empty() {
+        return Ok("unnamed.yaml".to_string());
+    }
+    let safe = safe_path_component(id, field)?;
+    Ok(format!("{safe}.yaml"))
 }

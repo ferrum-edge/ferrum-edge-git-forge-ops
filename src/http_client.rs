@@ -39,20 +39,37 @@ impl AdminClient {
                 .tls_built_in_root_certs(false);
         }
 
-        if let (Some(ref cert_b64), Some(ref key_b64)) =
-            (env.client_cert.clone(), env.client_key.clone())
-        {
-            let cert_pem = base64::engine::general_purpose::STANDARD
-                .decode(cert_b64)
-                .map_err(|e| crate::error::Error::HttpClient(format!("client cert decode: {e}")))?;
-            let key_pem = base64::engine::general_purpose::STANDARD
-                .decode(key_b64)
-                .map_err(|e| crate::error::Error::HttpClient(format!("client key decode: {e}")))?;
-            let mut combined = cert_pem;
-            combined.extend_from_slice(&key_pem);
-            let identity = reqwest::Identity::from_pem(&combined)
-                .map_err(|e| crate::error::Error::HttpClient(format!("identity parse: {e}")))?;
-            builder = builder.identity(identity);
+        match (env.client_cert.as_ref(), env.client_key.as_ref()) {
+            (Some(cert_b64), Some(key_b64)) => {
+                let cert_pem = base64::engine::general_purpose::STANDARD
+                    .decode(cert_b64)
+                    .map_err(|e| {
+                        crate::error::Error::HttpClient(format!("client cert decode: {e}"))
+                    })?;
+                let key_pem = base64::engine::general_purpose::STANDARD
+                    .decode(key_b64)
+                    .map_err(|e| {
+                        crate::error::Error::HttpClient(format!("client key decode: {e}"))
+                    })?;
+                let mut combined = cert_pem;
+                combined.extend_from_slice(&key_pem);
+                let identity = reqwest::Identity::from_pem(&combined)
+                    .map_err(|e| crate::error::Error::HttpClient(format!("identity parse: {e}")))?;
+                builder = builder.identity(identity);
+            }
+            (Some(_), None) => {
+                return Err(crate::error::Error::Config(
+                    "FERRUM_GATEWAY_CLIENT_CERT is set but FERRUM_GATEWAY_CLIENT_KEY is missing"
+                        .to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(crate::error::Error::Config(
+                    "FERRUM_GATEWAY_CLIENT_KEY is set but FERRUM_GATEWAY_CLIENT_CERT is missing"
+                        .to_string(),
+                ));
+            }
+            (None, None) => {}
         }
 
         let client = builder
