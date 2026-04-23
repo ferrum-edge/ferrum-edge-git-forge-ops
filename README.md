@@ -152,16 +152,22 @@ Set in: Settings > Secrets and variables > Actions > Secrets
 | `FERRUM_GATEWAY_CLIENT_CERT` | Client cert (PEM, base64-encoded) for mTLS to Admin API. Optional. If set, `CLIENT_KEY` is mandatory. |
 | `FERRUM_GATEWAY_CLIENT_KEY` | Client key (PEM, base64-encoded) for mTLS. Required if `CLIENT_CERT` set. |
 
-#### Docker Hub (required only if you want the `release` workflow to publish images)
+#### Docker Hub (upstream maintainers only)
+
+**Forks don't need these.** The `release` workflow is gated to run only on the upstream repo; forks consume the already-published `ferrumedge/ferrum-edge-git-forge-ops` image and skip the build step entirely.
+
+These secrets are only required if:
+- You are the upstream maintainer, or
+- You're a fork that has opted in to building and publishing your own image (see [Publishing your own image](#publishing-your-own-image) below)
 
 | Secret | Description |
 |--------|-------------|
-| `DOCKERHUB_USERNAME` | Docker Hub account that owns the `ferrumedge` namespace |
-| `DOCKERHUB_TOKEN` | Docker Hub access token with Read+Write+Delete on `ferrum-edge-git-forge-ops` |
+| `DOCKERHUB_USERNAME` | Docker Hub account that owns the target namespace |
+| `DOCKERHUB_TOKEN` | Docker Hub access token with push access to the target repository |
 
 The `release` workflow also pushes to GHCR using the built-in `GITHUB_TOKEN` — no extra secret needed. Ensure Settings → Actions → General → Workflow permissions is set to **Read and write** so `GITHUB_TOKEN` can push to `ghcr.io/<owner>/…`.
 
-If you don't need published Docker images, you can skip Docker Hub setup entirely — the `apply-on-merge` and `drift-check` workflows build `gitforgeops` natively on each run.
+The `apply-on-merge` and `drift-check` workflows build `gitforgeops` natively from source on each run — they never pull the Docker image, so Docker Hub access is irrelevant to the normal fork workflow.
 
 ### Variables
 
@@ -175,7 +181,10 @@ Set in: Settings > Secrets and variables > Actions > Variables
 | `FERRUM_OVERLAY` | — | Overlay directory (e.g. `staging`, `production`) |
 | `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification (dev only) |
-| `GITFORGEOPS_IMAGE_TAG` | — | When set (e.g. `latest`, `v0.1.0`), PR validation runs in the pre-built `ferrumedge/ferrum-edge-git-forge-ops` container instead of compiling natively. Much faster CI, but requires the image to have been published by the `release` workflow first. Unset = native fallback (slower, always works). |
+| `GITFORGEOPS_IMAGE_TAG` | — | When set (e.g. `latest`, `v0.1.0`), PR validation runs in the pre-built `gitforgeops` container instead of compiling natively. Unset = native fallback (slower, always works). |
+| `GITFORGEOPS_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Image name the container job pulls from. Default points at the upstream-published image; override only if you're publishing your own. |
+| `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
+| `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Where the `release` workflow pushes on Docker Hub. Only matters if `GITFORGEOPS_RELEASE_ENABLED=true`. GHCR path is always `ghcr.io/<owner>/<repo>` and auto-derived. |
 
 ### Local CLI env vars
 
@@ -341,7 +350,25 @@ docker run --rm -v $(pwd):/repo gitforgeops export --output assembled/resources.
 
 ### Using the published image for fast CI
 
-Once the release workflow has published an image, set the `GITFORGEOPS_IMAGE_TAG` GitHub Actions variable (e.g. to `latest` or a pinned version) and PR validation will run inside the pre-built container instead of compiling natively — typically 10–20s vs. 1–3 minutes.
+The upstream release workflow publishes `ferrumedge/ferrum-edge-git-forge-ops:latest` (and versioned tags) on every push to `main`. To use it on your fork:
+
+1. Set repo variable `GITFORGEOPS_IMAGE_TAG=latest` (or pin to a version like `v0.1.0`).
+2. PR validation will now run inside the pre-built container instead of compiling natively — typically 10–20s vs. 1–3 minutes.
+
+No Docker Hub secrets or permissions are needed — you're only pulling a public image.
+
+### Publishing your own image
+
+If you'd rather not depend on the upstream image (air-gapped env, vendored build, divergent customizations), your fork can publish its own:
+
+1. Create a Docker Hub repo you can push to (e.g. `acme/ferrum-edge-git-forge-ops`).
+2. Set repo secrets `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN`.
+3. Set repo variables:
+   - `GITFORGEOPS_RELEASE_ENABLED=true` — opts the fork into running `release.yml`.
+   - `DOCKERHUB_IMAGE=acme/ferrum-edge-git-forge-ops` — where to push on Docker Hub. GHCR path auto-derives from the repo.
+   - `GITFORGEOPS_IMAGE=acme/ferrum-edge-git-forge-ops` — tells `validate-pr.yml` to pull your image instead of upstream's.
+   - `GITFORGEOPS_IMAGE_TAG=latest` — activates fast container-mode CI.
+4. Push to `main` — release.yml builds + pushes, validate-pr.yml consumes.
 
 ### Version Pinning
 
