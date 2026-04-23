@@ -14,12 +14,12 @@ jobs:
       - name: Download ferrum-edge binary
         run: |
           VERSION="${{ vars.FERRUM_EDGE_VERSION || 'latest' }}"
-          if [ "$VERSION" = "latest" ]; then
-            URL="https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64"
-          else
-            URL="https://github.com/ferrum-edge/ferrum-edge/releases/download/${VERSION}/ferrum-edge-linux-x86_64"
-          fi
-          curl -sL "$URL" -o /usr/local/bin/ferrum-edge
+          # Use the direct-tag URL (`/releases/download/<tag>/`) rather
+          # than `/releases/latest/download/`, which only resolves to the
+          # most recent non-prerelease. ferrum-edge's `latest` tag is
+          # marked prerelease, so the indirect path returns 404.
+          URL="https://github.com/ferrum-edge/ferrum-edge/releases/download/${VERSION}/ferrum-edge-linux-x86_64"
+          curl -fsSL "$URL" -o /usr/local/bin/ferrum-edge
           chmod +x /usr/local/bin/ferrum-edge
 
       - name: Install Rust toolchain
