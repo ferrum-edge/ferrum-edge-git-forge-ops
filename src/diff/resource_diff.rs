@@ -70,13 +70,13 @@ fn diff_collection<T: serde::Serialize>(
     ns_fn: impl Fn(&T) -> String,
     diffs: &mut Vec<ResourceDiff>,
 ) {
-    let desired_map: std::collections::HashMap<String, &T> =
-        desired.iter().map(|r| (id_fn(r), r)).collect();
-    let actual_map: std::collections::HashMap<String, &T> =
-        actual.iter().map(|r| (id_fn(r), r)).collect();
+    let desired_map: std::collections::HashMap<(String, String), &T> =
+        desired.iter().map(|r| ((ns_fn(r), id_fn(r)), r)).collect();
+    let actual_map: std::collections::HashMap<(String, String), &T> =
+        actual.iter().map(|r| ((ns_fn(r), id_fn(r)), r)).collect();
 
-    for (id, desired_res) in &desired_map {
-        match actual_map.get(id) {
+    for ((namespace, id), desired_res) in &desired_map {
+        match actual_map.get(&(namespace.clone(), id.clone())) {
             Some(actual_res) => {
                 let details = compare_fields(desired_res, actual_res);
                 if !details.is_empty() {
@@ -84,7 +84,7 @@ fn diff_collection<T: serde::Serialize>(
                         action: DiffAction::Modify,
                         kind: kind.to_string(),
                         id: id.clone(),
-                        namespace: ns_fn(desired_res),
+                        namespace: namespace.clone(),
                         details,
                     });
                 }
@@ -94,20 +94,20 @@ fn diff_collection<T: serde::Serialize>(
                     action: DiffAction::Add,
                     kind: kind.to_string(),
                     id: id.clone(),
-                    namespace: ns_fn(desired_res),
+                    namespace: namespace.clone(),
                     details: Vec::new(),
                 });
             }
         }
     }
 
-    for (id, actual_res) in &actual_map {
-        if !desired_map.contains_key(id) {
+    for (namespace, id) in actual_map.keys() {
+        if !desired_map.contains_key(&(namespace.clone(), id.clone())) {
             diffs.push(ResourceDiff {
                 action: DiffAction::Delete,
                 kind: kind.to_string(),
                 id: id.clone(),
-                namespace: ns_fn(actual_res),
+                namespace: namespace.clone(),
                 details: Vec::new(),
             });
         }

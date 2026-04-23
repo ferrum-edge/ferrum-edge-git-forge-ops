@@ -6,13 +6,13 @@ use gitforgeops::review::pr_comment::build_review_comment;
 
 #[test]
 fn review_comment_shows_validation_pass() {
-    let comment = build_review_comment(true, "", &[], &[], &[], &[]);
+    let comment = build_review_comment(true, "", &[], &[], &[], &[], None);
     assert!(comment.contains("PASS"));
 }
 
 #[test]
 fn review_comment_shows_validation_fail() {
-    let comment = build_review_comment(false, "some error", &[], &[], &[], &[]);
+    let comment = build_review_comment(false, "some error", &[], &[], &[], &[], None);
     assert!(comment.contains("FAIL"));
 }
 
@@ -25,7 +25,7 @@ fn review_comment_includes_changes_table() {
         namespace: "ferrum".to_string(),
         details: vec![],
     }];
-    let comment = build_review_comment(true, "", &diffs, &[], &[], &[]);
+    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
     assert!(comment.contains("proxy-new"));
     assert!(comment.contains("Add"));
 }
@@ -37,7 +37,7 @@ fn review_comment_includes_breaking_changes() {
         id: "proxy-1".to_string(),
         reason: "listen_path changed".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &breaking, &[], &[]);
+    let comment = build_review_comment(true, "", &[], &breaking, &[], &[], None);
     assert!(comment.contains("listen_path changed"));
     assert!(comment.contains("Breaking"));
 }
@@ -50,7 +50,7 @@ fn review_comment_includes_security_findings() {
         id: "consumer-1".to_string(),
         message: "Literal credential detected".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &[], &findings, &[]);
+    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
     assert!(comment.contains("Literal credential"));
 }
 
@@ -61,6 +61,22 @@ fn review_comment_includes_best_practices() {
         id: "proxy-1".to_string(),
         message: "No rate limiting plugin".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &[], &[], &practices);
+    let comment = build_review_comment(true, "", &[], &[], &[], &practices, None);
     assert!(comment.contains("rate limiting"));
+}
+
+#[test]
+fn review_comment_marks_live_comparison_as_skipped() {
+    let comment = build_review_comment(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        Some("Live gateway comparison skipped: gateway unavailable"),
+    );
+    assert!(comment.contains("Changes: Skipped"));
+    assert!(comment.contains("Breaking Changes: Skipped"));
+    assert!(comment.contains("gateway unavailable"));
 }

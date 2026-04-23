@@ -1,3 +1,4 @@
+use crate::config::schema::{PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
 
 #[derive(Debug, Clone)]
@@ -18,12 +19,8 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
     }
 
     for proxy in &config.proxies {
-        let has_auth = proxy.plugins.iter().any(|assoc| {
-            config
-                .plugin_configs
-                .iter()
-                .any(|pc| pc.id == assoc.plugin_config_id && pc.plugin_name.contains("auth"))
-        });
+        let has_auth =
+            proxy_has_plugin(config, proxy, |plugin| plugin.plugin_name.contains("auth"));
         if !has_auth {
             findings.push(SecurityFinding {
                 severity: "warning".to_string(),
@@ -44,6 +41,37 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
     }
 
     findings
+}
+
+fn proxy_has_plugin(
+    config: &GatewayConfig,
+    proxy: &Proxy,
+    predicate: impl Fn(&PluginConfig) -> bool,
+) -> bool {
+    config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.namespace == proxy.namespace)
+        .any(|plugin| {
+            if !predicate(plugin) {
+                return false;
+            }
+
+            match plugin.scope {
+                PluginScope::Global => true,
+                PluginScope::Proxy => {
+                    plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                        && proxy
+                            .plugins
+                            .iter()
+                            .any(|assoc| assoc.plugin_config_id == plugin.id)
+                }
+                PluginScope::ProxyGroup => proxy
+                    .plugins
+                    .iter()
+                    .any(|assoc| assoc.plugin_config_id == plugin.id),
+            }
+        })
 }
 
 fn check_literal_credentials(

@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use gitforgeops::config::{apply_overlay, assemble, load_resources, schema::Resource};
+use gitforgeops::config::{
+    apply_overlay, assemble, filter_config_by_namespace, load_resources, schema::Resource,
+    select_config_namespace, split_config_by_namespace,
+};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-config")
@@ -100,6 +103,42 @@ fn multi_namespace_assembly() {
     assert_eq!(config.proxies.len(), 2);
     assert_eq!(config.proxies[0].namespace, "ferrum");
     assert_eq!(config.proxies[1].namespace, "team-alpha");
+}
+
+#[test]
+fn namespace_filter_only_keeps_target_namespace() {
+    let resources = vec![
+        ("ferrum".to_string(), make_proxy("proxy-default")),
+        ("team-alpha".to_string(), make_proxy("proxy-alpha")),
+    ];
+    let config = assemble(resources);
+    let filtered = filter_config_by_namespace(&config, "team-alpha");
+
+    assert_eq!(filtered.proxies.len(), 1);
+    assert_eq!(filtered.proxies[0].id, "proxy-alpha");
+    assert_eq!(filtered.proxies[0].namespace, "team-alpha");
+}
+
+#[test]
+fn split_config_by_namespace_preserves_empty_filtered_namespace() {
+    let config = assemble(vec![("ferrum".to_string(), make_proxy("proxy-default"))]);
+    let split = split_config_by_namespace(&config, Some("team-alpha"));
+
+    assert_eq!(split.len(), 1);
+    assert_eq!(split[0].0, "team-alpha");
+    assert!(split[0].1.proxies.is_empty());
+}
+
+#[test]
+fn select_config_namespace_leaves_all_namespaces_when_unfiltered() {
+    let resources = vec![
+        ("ferrum".to_string(), make_proxy("proxy-default")),
+        ("team-alpha".to_string(), make_proxy("proxy-alpha")),
+    ];
+    let config = assemble(resources);
+    let selected = select_config_namespace(&config, None);
+
+    assert_eq!(selected.proxies.len(), 2);
 }
 
 fn make_proxy(id: &str) -> Resource {

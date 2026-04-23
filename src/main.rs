@@ -53,7 +53,47 @@ fn load_and_assemble() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
     }
 
     let gateway_config = config::assemble(resources);
+    let gateway_config =
+        config::select_config_namespace(&gateway_config, env_config.namespace_filter.as_deref());
     Ok(gateway_config)
+}
+
+async fn load_namespace_pairs(
+    client: &AdminClient,
+    desired: &GatewayConfig,
+    namespace_filter: Option<&str>,
+) -> gitforgeops::error::Result<Vec<(String, GatewayConfig, GatewayConfig)>> {
+    let mut pairs = Vec::new();
+
+    for (namespace, desired_namespace) in
+        config::split_config_by_namespace(desired, namespace_filter)
+    {
+        let actual_namespace = client.get_backup(&namespace).await?;
+        pairs.push((namespace, desired_namespace, actual_namespace));
+    }
+
+    Ok(pairs)
+}
+
+fn compute_namespace_diffs(
+    namespace_pairs: &[(String, GatewayConfig, GatewayConfig)],
+) -> (
+    Vec<gitforgeops::diff::resource_diff::ResourceDiff>,
+    Vec<gitforgeops::diff::breaking::BreakingChange>,
+) {
+    let mut diffs = Vec::new();
+    let mut breaking = Vec::new();
+
+    for (_, desired_namespace, actual_namespace) in namespace_pairs {
+        let namespace_diffs = diff::compute_diff(desired_namespace, actual_namespace);
+        let namespace_breaking =
+            diff::detect_breaking_changes(&namespace_diffs, desired_namespace, actual_namespace);
+
+        diffs.extend(namespace_diffs);
+        breaking.extend(namespace_breaking);
+    }
+
+    (diffs, breaking)
 }
 
 fn cmd_validate(format: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -98,10 +138,9 @@ async fn cmd_diff(exit_on_drift: bool) -> Result<(), Box<dyn std::error::Error>>
     let env_config = config::load_env_config();
     let desired = load_and_assemble()?;
     let client = AdminClient::new(&env_config)?;
-    let namespace = env_config.namespace_filter.as_deref().unwrap_or("ferrum");
-    let actual = client.get_backup(namespace).await?;
-
-    let diffs = diff::compute_diff(&desired, &actual);
+    let namespace_pairs =
+        load_namespace_pairs(&client, &desired, env_config.namespace_filter.as_deref()).await?;
+    let (diffs, _) = compute_namespace_diffs(&namespace_pairs);
 
     if diffs.is_empty() {
         println!("No differences found. Configuration is in sync.");
@@ -155,20 +194,19 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client = AdminClient::new(&env_config);
-    let namespace = env_config.namespace_filter.as_deref().unwrap_or("ferrum");
-
     let (diffs, breaking, actual_available) = match &client {
-        Ok(c) => match c.get_backup(namespace).await {
-            Ok(actual) => {
-                let d = diff::compute_diff(&desired, &actual);
-                let b = diff::detect_breaking_changes(&d, &desired, &actual);
-                (d, b, true)
+        Ok(c) => {
+            match load_namespace_pairs(c, &desired, env_config.namespace_filter.as_deref()).await {
+                Ok(namespace_pairs) => {
+                    let (d, b) = compute_namespace_diffs(&namespace_pairs);
+                    (d, b, true)
+                }
+                Err(e) => {
+                    eprintln!("Could not fetch live config: {}", e);
+                    (Vec::new(), Vec::new(), false)
+                }
             }
-            Err(e) => {
-                eprintln!("Could not fetch live config: {}", e);
-                (Vec::new(), Vec::new(), false)
-            }
-        },
+        }
         Err(e) => {
             eprintln!("Could not create API client: {}", e);
             (Vec::new(), Vec::new(), false)
@@ -240,11 +278,12 @@ async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>>
     match env_config.gateway_mode {
         GatewayMode::Api => {
             let client = AdminClient::new(&env_config)?;
-            let namespace = env_config.namespace_filter.as_deref().unwrap_or("ferrum");
 
             if !auto_approve {
-                let actual = client.get_backup(namespace).await?;
-                let diffs = diff::compute_diff(&desired, &actual);
+                let namespace_pairs =
+                    load_namespace_pairs(&client, &desired, env_config.namespace_filter.as_deref())
+                        .await?;
+                let (diffs, _) = compute_namespace_diffs(&namespace_pairs);
                 if diffs.is_empty() {
                     println!("No changes to apply.");
                     return Ok(());
@@ -268,18 +307,13 @@ async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>>
                 env_config.apply_strategy.clone(),
                 env_config.namespace_filter.as_deref(),
             )
-            .await?;
+            .await?
+            .into_result()?;
 
             println!(
                 "Applied: {} created, {} updated, {} deleted",
                 result.created, result.updated, result.deleted
             );
-            if !result.errors.is_empty() {
-                eprintln!("Errors:");
-                for e in &result.errors {
-                    eprintln!("  {}", e);
-                }
-            }
         }
         GatewayMode::File => {
             apply::apply_file(&desired, &env_config.file_output_path)?;
@@ -304,8 +338,12 @@ async fn cmd_import(
     let result = if from_api.is_some() {
         let env_config = config::load_env_config();
         let client = AdminClient::new(&env_config)?;
-        let namespace = env_config.namespace_filter.as_deref().unwrap_or("ferrum");
-        import::import_from_api(&client, &output_path, namespace).await?
+        import::import_from_api(
+            &client,
+            &output_path,
+            env_config.namespace_filter.as_deref(),
+        )
+        .await?
     } else if let Some(file_path) = from_file {
         import::import_from_file(&PathBuf::from(file_path), &output_path)?
     } else {
@@ -332,18 +370,26 @@ async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client = AdminClient::new(&env_config);
-    let namespace = env_config.namespace_filter.as_deref().unwrap_or("ferrum");
 
-    let (diffs, breaking) = match &client {
-        Ok(c) => match c.get_backup(namespace).await {
-            Ok(actual) => {
-                let d = diff::compute_diff(&desired, &actual);
-                let b = diff::detect_breaking_changes(&d, &desired, &actual);
-                (d, b)
+    let (diffs, breaking, comparison_error) = match &client {
+        Ok(c) => {
+            match load_namespace_pairs(c, &desired, env_config.namespace_filter.as_deref()).await {
+                Ok(namespace_pairs) => {
+                    let (diffs, breaking) = compute_namespace_diffs(&namespace_pairs);
+                    (diffs, breaking, None)
+                }
+                Err(e) => (
+                    Vec::new(),
+                    Vec::new(),
+                    Some(format!("Live gateway comparison skipped: {}", e)),
+                ),
             }
-            Err(_) => (Vec::new(), Vec::new()),
-        },
-        Err(_) => (Vec::new(), Vec::new()),
+        }
+        Err(e) => (
+            Vec::new(),
+            Vec::new(),
+            Some(format!("Live gateway comparison skipped: {}", e)),
+        ),
     };
 
     let security_findings = diff::audit_security(&desired);
@@ -356,6 +402,7 @@ async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
         &breaking,
         &security_findings,
         &bp_findings,
+        comparison_error.as_deref(),
     );
 
     match pr {

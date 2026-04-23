@@ -1,3 +1,4 @@
+mod apply_tests;
 mod assembler_tests;
 mod diff_tests;
 mod env_tests;

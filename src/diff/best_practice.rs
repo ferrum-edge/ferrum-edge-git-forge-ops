@@ -1,3 +1,4 @@
+use crate::config::schema::{PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
 
 #[derive(Debug, Clone)]
@@ -11,11 +12,8 @@ pub fn check_best_practices(config: &GatewayConfig) -> Vec<BestPractice> {
     let mut findings = Vec::new();
 
     for proxy in &config.proxies {
-        let has_rate_limiting = proxy.plugins.iter().any(|assoc| {
-            config
-                .plugin_configs
-                .iter()
-                .any(|pc| pc.id == assoc.plugin_config_id && pc.plugin_name == "rate_limiting")
+        let has_rate_limiting = proxy_has_plugin(config, proxy, |plugin| {
+            plugin.plugin_name == "rate_limiting"
         });
         if !has_rate_limiting {
             findings.push(BestPractice {
@@ -25,11 +23,8 @@ pub fn check_best_practices(config: &GatewayConfig) -> Vec<BestPractice> {
             });
         }
 
-        let has_logging = proxy.plugins.iter().any(|assoc| {
-            config
-                .plugin_configs
-                .iter()
-                .any(|pc| pc.id == assoc.plugin_config_id && pc.plugin_name.contains("logging"))
+        let has_logging = proxy_has_plugin(config, proxy, |plugin| {
+            plugin.plugin_name.contains("logging")
         });
         if !has_logging {
             findings.push(BestPractice {
@@ -69,4 +64,35 @@ pub fn check_best_practices(config: &GatewayConfig) -> Vec<BestPractice> {
     }
 
     findings
+}
+
+fn proxy_has_plugin(
+    config: &GatewayConfig,
+    proxy: &Proxy,
+    predicate: impl Fn(&PluginConfig) -> bool,
+) -> bool {
+    config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.namespace == proxy.namespace)
+        .any(|plugin| {
+            if !predicate(plugin) {
+                return false;
+            }
+
+            match plugin.scope {
+                PluginScope::Global => true,
+                PluginScope::Proxy => {
+                    plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                        && proxy
+                            .plugins
+                            .iter()
+                            .any(|assoc| assoc.plugin_config_id == plugin.id)
+                }
+                PluginScope::ProxyGroup => proxy
+                    .plugins
+                    .iter()
+                    .any(|assoc| assoc.plugin_config_id == plugin.id),
+            }
+        })
 }

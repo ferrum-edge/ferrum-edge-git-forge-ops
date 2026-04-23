@@ -10,6 +10,7 @@ pub fn build_review_comment(
     breaking: &[BreakingChange],
     security: &[SecurityFinding],
     best_practices: &[BestPractice],
+    comparison_error: Option<&str>,
 ) -> String {
     let mut md = String::new();
 
@@ -27,7 +28,11 @@ pub fn build_review_comment(
         md.push_str("```\n\n");
     }
 
-    if !diffs.is_empty() {
+    if let Some(reason) = comparison_error {
+        md.push_str("### Changes: Skipped\n\n");
+        md.push_str(reason);
+        md.push_str("\n\n");
+    } else if !diffs.is_empty() {
         md.push_str("### Changes\n\n");
         md.push_str("| Action | Kind | ID | Details |\n");
         md.push_str("|--------|------|----|---------|\n");
@@ -56,7 +61,11 @@ pub fn build_review_comment(
         md.push_str("### Changes: None (in sync)\n\n");
     }
 
-    if !breaking.is_empty() {
+    if let Some(reason) = comparison_error {
+        md.push_str("### Breaking Changes: Skipped\n\n");
+        md.push_str(reason);
+        md.push_str("\n\n");
+    } else if !breaking.is_empty() {
         md.push_str("### Breaking Changes\n\n");
         for bc in breaking {
             md.push_str(&format!("- **{} `{}`**: {}\n", bc.kind, bc.id, bc.reason));

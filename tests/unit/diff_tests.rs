@@ -70,6 +70,26 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
     }
 }
 
+fn make_plugin_config(
+    id: &str,
+    namespace: &str,
+    plugin_name: &str,
+    scope: PluginScope,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: namespace.to_string(),
+        config: serde_json::json!({}),
+        scope,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
 fn make_upstream(id: &str, target_count: usize) -> Upstream {
     let targets: Vec<UpstreamTarget> = (0..target_count)
         .map(|i| UpstreamTarget {
@@ -150,6 +170,33 @@ fn diff_identical_configs_empty() {
     };
     let diffs = compute_diff(&config, &config);
     assert!(diffs.is_empty());
+}
+
+#[test]
+fn diff_treats_same_id_in_different_namespaces_as_distinct() {
+    let mut desired_proxy = make_proxy("shared-id", "/api", "localhost");
+    desired_proxy.namespace = "team-alpha".to_string();
+
+    let mut actual_proxy = make_proxy("shared-id", "/api", "localhost");
+    actual_proxy.namespace = "ferrum".to_string();
+
+    let desired = GatewayConfig {
+        proxies: vec![desired_proxy],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![actual_proxy],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 2);
+    assert!(diffs
+        .iter()
+        .any(|diff| matches!(diff.action, DiffAction::Add) && diff.namespace == "team-alpha"));
+    assert!(diffs
+        .iter()
+        .any(|diff| matches!(diff.action, DiffAction::Delete) && diff.namespace == "ferrum"));
 }
 
 #[test]
@@ -238,6 +285,28 @@ fn security_detects_tls_verify_disabled() {
 }
 
 #[test]
+fn security_respects_global_auth_plugin() {
+    let mut proxy = make_proxy("p1", "/api", "localhost");
+    proxy.namespace = "team-alpha".to_string();
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![make_plugin_config(
+            "global-auth",
+            "team-alpha",
+            "key_auth",
+            PluginScope::Global,
+        )],
+        ..GatewayConfig::default()
+    };
+
+    let findings = audit_security(&config);
+    assert!(!findings
+        .iter()
+        .any(|f| f.message.contains("No auth plugin")));
+}
+
+#[test]
 fn best_practice_flags_single_target_upstream() {
     let config = GatewayConfig {
         upstreams: vec![make_upstream("u1", 1)],
@@ -267,4 +336,35 @@ fn best_practice_flags_high_timeout() {
     };
     let checks = check_best_practices(&config);
     assert!(checks.iter().any(|c| c.message.contains("timeout")));
+}
+
+#[test]
+fn best_practice_respects_global_plugins() {
+    let mut proxy = make_proxy("p1", "/api", "localhost");
+    proxy.namespace = "team-alpha".to_string();
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![
+            make_plugin_config(
+                "global-rate-limit",
+                "team-alpha",
+                "rate_limiting",
+                PluginScope::Global,
+            ),
+            make_plugin_config(
+                "global-logging",
+                "team-alpha",
+                "request_logging",
+                PluginScope::Global,
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    let checks = check_best_practices(&config);
+    assert!(!checks
+        .iter()
+        .any(|check| check.message.contains("rate_limiting")));
+    assert!(!checks.iter().any(|check| check.message.contains("logging")));
 }

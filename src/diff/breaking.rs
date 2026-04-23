@@ -67,8 +67,14 @@ fn check_proxy_breaking_fields(
     actual: &GatewayConfig,
     breaking: &mut Vec<BreakingChange>,
 ) {
-    let desired_proxy = desired.proxies.iter().find(|p| p.id == diff.id);
-    let actual_proxy = actual.proxies.iter().find(|p| p.id == diff.id);
+    let desired_proxy = desired
+        .proxies
+        .iter()
+        .find(|p| p.id == diff.id && p.namespace == diff.namespace);
+    let actual_proxy = actual
+        .proxies
+        .iter()
+        .find(|p| p.id == diff.id && p.namespace == diff.namespace);
 
     if let (Some(d), Some(a)) = (desired_proxy, actual_proxy) {
         if d.listen_path != a.listen_path {

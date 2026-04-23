@@ -116,6 +116,32 @@ impl AdminClient {
             .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
     }
 
+    pub async fn list_namespaces(&self) -> crate::error::Result<Vec<String>> {
+        let resp = self
+            .client
+            .get(self.url("/namespaces"))
+            .bearer_auth(self.token()?)
+            .send()
+            .await
+            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("<no body>"));
+            return Err(crate::error::Error::ApiError {
+                status,
+                message: body,
+            });
+        }
+
+        resp.json::<Vec<String>>()
+            .await
+            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
+    }
+
     pub async fn post_restore(
         &self,
         config: &GatewayConfig,
