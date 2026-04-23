@@ -8,9 +8,14 @@ on:
 
 jobs:
   review:
+    # Only run the container-based job when an image tag is explicitly
+    # configured. Forks that haven't published an image fall through to
+    # `review-native` and pay the native-build cost instead of failing
+    # on `docker pull`.
+    if: vars.GITFORGEOPS_IMAGE_TAG != ''
     runs-on: ubuntu-latest
     container:
-      image: ferrumedge/ferrum-edge-git-forge-ops:${{ vars.GITFORGEOPS_IMAGE_TAG || 'latest' }}
+      image: ferrumedge/ferrum-edge-git-forge-ops:${{ vars.GITFORGEOPS_IMAGE_TAG }}
     steps:
       - uses: actions/checkout@v4
 
