@@ -95,15 +95,45 @@ impl StateFile {
             }
         }
 
-        // Legacy migration: if per-env file is absent but a legacy .state/state.json
-        // exists, adopt it as this environment's state. One-time ceremony.
+        // Legacy migration: atomically rename `.state/state.json` into this
+        // environment's state file so the legacy content is adopted by
+        // exactly ONE environment. Without the rename, every env whose
+        // specific file didn't yet exist would inherit the same legacy
+        // `resources` set — shared-mode diffs would then double-count
+        // every resource as "managed by me" and apply could delete
+        // resources in the wrong environment on first multi-env rollout.
+        //
+        // Rename is atomic on POSIX within a filesystem. Whichever env
+        // calls load() first wins; concurrent calls see the legacy file
+        // already gone and fall through to default state. Operators can
+        // inspect the audit log (loud notice below) and, if the wrong env
+        // adopted, restore from git history and re-name manually.
         let legacy = Path::new(LEGACY_STATE_FILE);
         if legacy.exists() {
-            if let Ok(contents) = std::fs::read_to_string(legacy) {
-                if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
-                    state.environment = environment.to_string();
-                    state.version = 2;
-                    return state;
+            let _ = std::fs::create_dir_all(STATE_DIR);
+            if std::fs::rename(legacy, &path).is_ok() {
+                eprintln!(
+                    "Notice: migrated legacy .state/state.json -> .state/{environment}.json \
+                     (this is a one-time operation). If '{environment}' is not the environment \
+                     the legacy state represented, restore from git history and rename manually \
+                     before the next apply."
+                );
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
+                        state.environment = environment.to_string();
+                        state.version = 2;
+                        return state;
+                    }
+                }
+            }
+            // Rename failed — either legacy is gone (another env won the
+            // race) or the target already exists. Either way, fall through
+            // and retry reading `path` if it now exists.
+            if path.exists() {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Ok(state) = serde_json::from_str::<Self>(&contents) {
+                        return state;
+                    }
                 }
             }
         }

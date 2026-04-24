@@ -74,8 +74,8 @@ fn state_file_migrates_v1_legacy_format() {
         }"#;
         std::fs::write(".state/state.json", v1).unwrap();
 
-        // Env-specific file doesn't exist; load() should fall through to the
-        // legacy file and adopt it.
+        // Env-specific file doesn't exist; load() should rename legacy into
+        // .state/production.json atomically.
         assert!(!std::path::Path::new(".state/production.json").exists());
         let state = StateFile::load("production");
 
@@ -86,6 +86,58 @@ fn state_file_migrates_v1_legacy_format() {
         assert_eq!(state.credential_shard_count, 1);
         assert!(state.credentials.is_empty());
         assert!(state.overrides.is_empty());
+
+        // Legacy file must be gone after adoption so subsequent envs don't
+        // inherit the same resources.
+        assert!(
+            !std::path::Path::new(".state/state.json").exists(),
+            "legacy .state/state.json should have been renamed, not just read"
+        );
+        assert!(
+            std::path::Path::new(".state/production.json").exists(),
+            "adopted file should now exist at .state/production.json"
+        );
+    });
+}
+
+#[test]
+fn legacy_state_is_consumed_exactly_once_across_environments() {
+    // Multi-env rollout scenario: legacy state exists and no env-specific
+    // files exist. The first env to load() adopts the legacy state; the
+    // second env must see an empty default, not the same resource set
+    // (otherwise shared-mode diffs would double-claim every resource and
+    // apply could delete resources in the wrong environment).
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let legacy = r#"{
+            "version": 1,
+            "resources": {
+                "ferrum:Proxy:httpbin": "sha256:abc"
+            }
+        }"#;
+        std::fs::write(".state/state.json", legacy).unwrap();
+
+        // First env adopts the legacy content.
+        let staging = StateFile::load("staging");
+        assert_eq!(staging.resources.len(), 1);
+        assert_eq!(staging.environment, "staging");
+
+        // Legacy is gone.
+        assert!(!std::path::Path::new(".state/state.json").exists());
+
+        // Second env sees no legacy and no env-specific → empty default.
+        let production = StateFile::load("production");
+        assert_eq!(
+            production.resources.len(),
+            0,
+            "second env must not inherit the legacy state — that would cross-contaminate shared-mode tracking and risk cross-env deletes"
+        );
+        assert_eq!(production.environment, "production");
+
+        // Staging's file persists and can be re-read unchanged.
+        let staging_again = StateFile::load("staging");
+        assert_eq!(staging_again.resources.len(), 1);
     });
 }
 

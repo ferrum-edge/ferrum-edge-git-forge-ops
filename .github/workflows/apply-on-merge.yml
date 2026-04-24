@@ -151,16 +151,27 @@ jobs:
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
 
-      # File mode: assemble a flat YAML preserving `${gh-env-secret:...}`
-      # placeholders. This is safe to commit — no credentials are resolved.
-      # To get a fully-populated file (for gateways that consume it), admins
-      # run the `materialize-file.yml` workflow, which produces an age-
-      # encrypted artifact delivered to the admin's SSH key.
-      - name: Assemble placeholder file (file mode)
+      # File mode: `gitforgeops apply` in file mode writes the placeholder-
+      # preserving YAML to disk AND runs the credential allocator (so
+      # alloc=generate/rotate slots get real values in the GitHub Env
+      # Secret, deliveries go out, and state is updated). Calling plain
+      # `export` here would skip allocation and state tracking, leaving
+      # slots permanently pending and breaking later materialization.
+      # To pull the fully-populated YAML (credentials inlined), admins run
+      # the separate `materialize-file.yml` workflow which produces an
+      # age-encrypted artifact.
+      - name: Apply (file mode)
         if: vars.FERRUM_GATEWAY_MODE == 'file'
         env:
           FERRUM_ENV: ${{ matrix.environment }}
-        run: gitforgeops export --output assembled/${{ matrix.environment }}.yaml
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author || github.actor }}
+          GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gitforgeops apply --auto-approve
 
       - name: Commit state + assembled (if changed)
         # Persisting state is load-bearing: shared-mode diffs, credential shard
