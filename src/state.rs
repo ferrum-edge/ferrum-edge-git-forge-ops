@@ -89,7 +89,17 @@ impl StateFile {
         let path = Self::path_for(environment);
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(state) = serde_json::from_str::<Self>(&contents) {
+                if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
+                    // Normalize environment to the requested name. An
+                    // env-specific file may have been written during a
+                    // legacy migration triggered from a read-only command
+                    // (plan/diff/review) that never calls save() — in that
+                    // case the on-disk `environment` field is the serde
+                    // default (""), not the real name. Subsequent save()
+                    // uses self.environment to build the path, so we must
+                    // patch here or the next apply would write to
+                    // `.state/.json`.
+                    state.environment = environment.to_string();
                     return state;
                 }
             }
@@ -131,7 +141,8 @@ impl StateFile {
             // and retry reading `path` if it now exists.
             if path.exists() {
                 if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(state) = serde_json::from_str::<Self>(&contents) {
+                    if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
+                        state.environment = environment.to_string();
                         return state;
                     }
                 }
@@ -160,22 +171,53 @@ impl StateFile {
         !path.exists() && !Path::new(LEGACY_STATE_FILE).exists()
     }
 
-    pub fn record(&mut self, config: &GatewayConfig) {
-        self.resources.clear();
+    /// Rewrite the `resources` map with the hashes of every resource in
+    /// `config`, but only for keys whose namespace falls within
+    /// `scope_namespaces`. Entries outside that scope are preserved.
+    ///
+    /// This matters when a scoped apply (e.g. `FERRUM_NAMESPACE=ferrum` on a
+    /// shared-mode env) narrows `config` to just one namespace. Clearing the
+    /// whole map would drop managed-resource hashes for every OTHER namespace
+    /// the repo tracks — the next shared-mode diff would then classify those
+    /// resources as unmanaged and stop issuing deletes/drift alerts for
+    /// removals, silently breaking ownership tracking after a routine
+    /// scoped apply.
+    pub fn record(&mut self, config: &GatewayConfig, scope_namespaces: &[String]) {
+        use std::collections::HashSet;
+        let scope: HashSet<&str> = scope_namespaces.iter().map(String::as_str).collect();
+
+        // Drop only the entries for namespaces we're reconciling right now;
+        // everything else stays as the last apply recorded it.
+        self.resources.retain(|key, _| {
+            let ns = key.split_once(':').map(|(n, _)| n).unwrap_or("");
+            !scope.contains(ns)
+        });
 
         for proxy in &config.proxies {
+            if !scope.contains(proxy.namespace.as_str()) {
+                continue;
+            }
             let key = format!("{}:Proxy:{}", proxy.namespace, proxy.id);
             self.resources.insert(key, hash_resource(proxy));
         }
         for consumer in &config.consumers {
+            if !scope.contains(consumer.namespace.as_str()) {
+                continue;
+            }
             let key = format!("{}:Consumer:{}", consumer.namespace, consumer.id);
             self.resources.insert(key, hash_resource(consumer));
         }
         for upstream in &config.upstreams {
+            if !scope.contains(upstream.namespace.as_str()) {
+                continue;
+            }
             let key = format!("{}:Upstream:{}", upstream.namespace, upstream.id);
             self.resources.insert(key, hash_resource(upstream));
         }
         for pc in &config.plugin_configs {
+            if !scope.contains(pc.namespace.as_str()) {
+                continue;
+            }
             let key = format!("{}:PluginConfig:{}", pc.namespace, pc.id);
             self.resources.insert(key, hash_resource(pc));
         }

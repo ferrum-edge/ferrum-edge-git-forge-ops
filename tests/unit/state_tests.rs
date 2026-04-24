@@ -39,6 +39,123 @@ fn state_file_writes_and_reads_per_env() {
 }
 
 #[test]
+fn scoped_record_preserves_entries_outside_scope() {
+    // Regression guard: in shared mode with multiple namespaces, a scoped
+    // apply (FERRUM_NAMESPACE=ferrum) used to clear the WHOLE resources
+    // map and repopulate only from the namespace-filtered desired. That
+    // dropped managed entries for every other namespace, so the next diff
+    // classified them as unmanaged and stopped reconciling.
+    use gitforgeops::config::schema::{BackendProtocol, GatewayConfig, Proxy};
+
+    fn proxy(id: &str, ns: &str) -> Proxy {
+        Proxy {
+            id: id.to_string(),
+            name: None,
+            namespace: ns.to_string(),
+            hosts: vec![],
+            listen_path: Some(format!("/{id}")),
+            backend_protocol: BackendProtocol::Https,
+            backend_host: "b".to_string(),
+            backend_port: 443,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5000,
+            backend_read_timeout_ms: 30000,
+            backend_write_timeout_ms: 30000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: Default::default(),
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: Default::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 30,
+            udp_max_response_amplification_factor: None,
+            tcp_idle_timeout_seconds: None,
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    let mut state = StateFile::default();
+    // Prior state has entries in two namespaces.
+    state
+        .resources
+        .insert("ferrum:Proxy:one".to_string(), "sha256:A".to_string());
+    state
+        .resources
+        .insert("platform:Proxy:two".to_string(), "sha256:B".to_string());
+
+    // Scoped apply: only ferrum is in scope, and desired has been filtered
+    // to ferrum.
+    let desired = GatewayConfig {
+        proxies: vec![proxy("one-updated", "ferrum")],
+        ..GatewayConfig::default()
+    };
+    state.record(&desired, &["ferrum".to_string()]);
+
+    // ferrum entries refreshed.
+    assert!(state.resources.contains_key("ferrum:Proxy:one-updated"));
+    assert!(!state.resources.contains_key("ferrum:Proxy:one"));
+    // platform entry preserved — this is the invariant the scoped apply
+    // must honor.
+    assert_eq!(
+        state.resources.get("platform:Proxy:two"),
+        Some(&"sha256:B".to_string())
+    );
+}
+
+#[test]
+fn state_load_normalizes_environment_to_requested_name() {
+    // Regression guard: if an env-specific state file was created via the
+    // legacy migration from a read-only command, the on-disk `environment`
+    // field is empty (serde default). Loading that file must patch the
+    // in-memory state to the requested env name; otherwise the next
+    // save() would path to `.state/.json`.
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        // Write a state file whose environment field is missing/default.
+        let state_json = r#"{
+            "version": 2,
+            "resources": {"ferrum:Proxy:p1": "sha256:abc"}
+        }"#;
+        std::fs::write(".state/production.json", state_json).unwrap();
+
+        let state = StateFile::load("production");
+        assert_eq!(state.environment, "production");
+
+        // Save must go to .state/production.json, not .state/.json.
+        state.save().unwrap();
+        assert!(std::path::Path::new(".state/production.json").exists());
+        assert!(!std::path::Path::new(".state/.json").exists());
+    });
+}
+
+#[test]
 fn state_file_persists_override_records_for_audit() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {

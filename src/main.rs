@@ -1066,7 +1066,12 @@ async fn cmd_apply(
         }
     }
 
-    state.record(&desired);
+    // Scoped record: only overwrite entries for namespaces we just
+    // reconciled. In shared mode with multiple namespaces and a scoped
+    // apply (e.g. FERRUM_NAMESPACE=ferrum), the previous clear-all
+    // behavior dropped managed-resource hashes for every other namespace
+    // — next diff would classify those as unmanaged and stop reconciling.
+    state.record(&desired, &namespaces);
     state.credential_shard_count = shard_count;
     if let Some(outcome) = &allocation {
         let run_id = std::env::var("GITHUB_RUN_ID").ok();
