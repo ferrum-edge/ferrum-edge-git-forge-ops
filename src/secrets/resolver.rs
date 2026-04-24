@@ -59,6 +59,27 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
     format!("{namespace}/{consumer_id}/{cred_key}")
 }
 
+/// Walk consumers and produce a [`ResolveReport`] **without mutating** `cfg`.
+///
+/// Use this in contexts where the caller must preserve placeholder strings in
+/// `cfg` (notably file-mode apply, which serializes `cfg` to a YAML that gets
+/// committed to the repo). `resolve_secrets` is the right function when the
+/// caller wants placeholders replaced with bundle values in-memory.
+pub fn report_secrets(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+) -> crate::error::Result<ResolveReport> {
+    let mut report = ResolveReport::default();
+    for consumer in &cfg.consumers {
+        let namespace = &consumer.namespace;
+        let consumer_id = &consumer.id;
+        for (cred_key, value) in &consumer.credentials {
+            walk_and_report(value, namespace, consumer_id, cred_key, bundle, &mut report)?;
+        }
+    }
+    Ok(report)
+}
+
 /// Walk the consumers in `cfg` and replace `${gh-env-secret:...}` placeholders
 /// with values from the merged credential bundle.
 ///

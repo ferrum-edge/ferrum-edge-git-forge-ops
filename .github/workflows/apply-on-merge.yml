@@ -115,15 +115,20 @@ jobs:
         run: gitforgeops validate
 
       # Map the merge commit back to the PR that produced it. The binary uses
-      # this to check policy-override labels on the PR; without it, an override
-      # approved at PR time wouldn't be honored on the post-merge apply.
-      - name: Derive PR number from merge commit
+      # this for (a) policy-override label/permission lookups and (b) routing
+      # age-encrypted credential delivery to the PR author. Using
+      # ${{ github.actor }} for delivery would target the merger (or a bot),
+      # not the contributor who actually requested the credential slot.
+      - name: Derive PR metadata from merge commit
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          pr=$(gh api "/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // ""')
+          info=$(gh api "/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0] // {}')
+          pr=$(echo "$info" | jq -r '.number // ""')
+          author=$(echo "$info" | jq -r '.user.login // ""')
           echo "number=$pr" >> "$GITHUB_OUTPUT"
+          echo "author=$author" >> "$GITHUB_OUTPUT"
 
       - name: Apply
         if: vars.FERRUM_GATEWAY_MODE != 'file'
@@ -139,7 +144,10 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITFORGEOPS_ACTOR: ${{ github.actor }}
+          # Delivery recipient: prefer the PR author (the contributor who
+          # added the placeholder); fall back to the pusher only when no PR
+          # is associated with this commit (e.g. a direct push to main).
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author || github.actor }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
 

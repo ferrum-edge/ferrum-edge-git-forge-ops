@@ -761,10 +761,23 @@ async fn cmd_apply(
     let mut state = StateFile::load(&resolved.name);
 
     // First resolve: classify placeholders with the current bundle.
+    //
+    // In file mode we MUST NOT mutate `desired`: the file-mode branch below
+    // serializes `desired` to a committed-to-repo YAML, and replacing
+    // placeholders with real bundle values here would leak credentials into
+    // the committed artifact. `report_secrets` walks and classifies without
+    // touching `cfg`.
+    //
+    // In api mode we want the mutation: apply_api pushes `desired` to the
+    // gateway, which needs real values for already-allocated slots. The
+    // allocator handles `alloc=generate` / `alloc=rotate` gaps afterward.
     let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
     let mut shard_count = state.credential_shard_count.max(1);
     let initial_bundle = secrets::merge_bundles(&per_shard);
-    let secret_report = secrets::resolve_secrets(&mut desired, &initial_bundle)?;
+    let secret_report = match env_config.gateway_mode {
+        GatewayMode::File => secrets::report_secrets(&desired, &initial_bundle)?,
+        GatewayMode::Api => secrets::resolve_secrets(&mut desired, &initial_bundle)?,
+    };
 
     // Missing required credentials → fail fast before we touch the gateway.
     let missing = secret_report.missing_required();

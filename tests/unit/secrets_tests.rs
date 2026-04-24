@@ -179,6 +179,51 @@ fn resolver_reports_missing_required() {
 }
 
 #[test]
+fn report_secrets_does_not_mutate_config() {
+    // File-mode apply MUST NOT replace `alloc=require` or `alloc=generate`
+    // placeholders in `desired` before serializing to disk — otherwise
+    // resolved values would land in the committed YAML. `report_secrets`
+    // is the non-mutating path that file mode uses.
+    use gitforgeops::secrets::report_secrets;
+
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let placeholder = "${gh-env-secret:alloc=require}";
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String(placeholder.to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let mut bundle = BTreeMap::new();
+    // Populate a matching bundle entry — resolve_secrets WOULD replace this,
+    // but report_secrets must leave it alone.
+    bundle.insert("ferrum/app/api_key".to_string(), "real-secret".to_string());
+
+    let report = report_secrets(&cfg, &bundle).unwrap();
+
+    // Report was populated correctly.
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+
+    // Critical: `cfg` was NOT mutated.
+    assert_eq!(
+        cfg.consumers[0].credentials.get("api_key").unwrap(),
+        &serde_json::Value::String(placeholder.to_string()),
+        "report_secrets must not replace placeholders; doing so would leak credentials into the committed file-mode YAML"
+    );
+}
+
+#[test]
 fn skipping_resolve_preserves_placeholder_strings_verbatim() {
     // Simulates the `export` (without `--materialize`) path: we never call
     // resolve_secrets, so the placeholder lives on through YAML serialization
