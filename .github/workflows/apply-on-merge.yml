@@ -10,10 +10,14 @@ on:
 
 # `apply` commits state updates (and, in file mode, the assembled placeholder
 # YAML) back to main, and queries the GitHub API to resolve the PR that
-# produced this merge (for policy-override lookups).
+# produced this merge (for policy-override lookups). `write` on
+# pull-requests is required so `surface_delivered_credentials` can POST
+# the age-encrypted credential blob back to the merged PR for the author
+# — with `read` the POST is rejected and delivery falls back to stdout
+# (log-only), which the intended recipient is very likely to miss.
 permissions:
   contents: write
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   list-envs:

@@ -91,7 +91,12 @@ jobs:
         # the process env, not just the `vars.*` gate context.
         env:
           FERRUM_ENV: ${{ inputs.environment }}
-          FERRUM_GATEWAY_MODE: api
+          # Pass the repo's actual gateway mode through. Hardcoding `api`
+          # here meant a file-mode repo's rotate would slip past the
+          # binary's mode preflight, write the GitHub Env Secret, and only
+          # fail later when the Admin API config was missing — leaving
+          # the store mutated with no corresponding gateway push path.
+          FERRUM_GATEWAY_MODE: ${{ vars.FERRUM_GATEWAY_MODE || 'api' }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}

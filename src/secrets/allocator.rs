@@ -104,17 +104,37 @@ pub async fn allocate_and_deliver(
             },
         };
 
+        // Encrypt for delivery BEFORE mutating the local shards map.
+        // If delivery fails (recipient has no compatible SSH key),
+        // returning Err here means we never touch `shards` for this
+        // candidate — the outer PUT loop won't see a shard to write,
+        // and no GitHub Env Secret is committed. A dead-letter
+        // credential (generated but undeliverable) is worse than no
+        // credential; the next run can retry once the recipient adds
+        // a key.
+        let delivered = if let Some(login) = pr_author {
+            match deliver_to_author(client, login, value.as_bytes()).await? {
+                Some(d) => Some(d),
+                None => {
+                    return Err(crate::error::Error::Config(format!(
+                        "Refusing to allocate credential slot '{}': recipient @{} has no compatible SSH public key on GitHub. \
+                         Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys, then retry. \
+                         To allocate without delivery, unset the recipient (no GITFORGEOPS_ACTOR).",
+                        candidate.slot, login
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Delivery succeeded (or wasn't required) — now safe to mutate
+        // local state and mark the shard as one we need to PUT.
         shards
             .entry(shard)
             .or_default()
             .insert(candidate.slot.clone(), value.clone());
         touched_shards.insert(shard);
-
-        let delivered = if let Some(login) = pr_author {
-            deliver_to_author(client, login, value.as_bytes()).await?
-        } else {
-            None
-        };
 
         outcome.allocated.push(AllocatedSlot {
             slot: candidate.slot.clone(),

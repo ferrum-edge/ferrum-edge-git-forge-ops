@@ -36,7 +36,15 @@ jobs:
 
   drift:
     needs: list-envs
-    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
+    # Skip drift-check entirely when the repo is configured for file mode.
+    # `gitforgeops diff` talks to the Admin API (to pull /backup and
+    # compute a diff against desired state). File-mode repos intentionally
+    # have no Admin API URL or JWT secret, so this step would fail on
+    # every scheduled run regardless of whether there's any real drift.
+    if: |
+      needs.list-envs.outputs.envs != '[]'
+      && needs.list-envs.outputs.envs != ''
+      && (vars.FERRUM_GATEWAY_MODE == '' || vars.FERRUM_GATEWAY_MODE == 'api')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

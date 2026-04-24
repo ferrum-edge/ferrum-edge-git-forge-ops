@@ -1172,6 +1172,20 @@ async fn cmd_apply(
                 }
             }
 
+            // Surface the encrypted delivery blob BEFORE apply_api. The
+            // allocator has already written the new value to the GitHub
+            // Env Secret, so if apply_api fails here, the bundle will be
+            // treated as resolved on the next run and no later delivery
+            // attempt will happen — the recipient would be permanently
+            // locked out. By surfacing first, we guarantee the ciphertext
+            // reaches the recipient (PR comment or stdout) regardless of
+            // whether the gateway push succeeds. A failed gateway push
+            // just means a subsequent apply will pick up the already-
+            // committed bundle value and push it again.
+            if let Some(outcome) = &allocation {
+                surface_delivered_credentials(&env_config, outcome).await?;
+            }
+
             let result = apply::apply_api(
                 &desired,
                 &client,
@@ -1186,16 +1200,6 @@ async fn cmd_apply(
                 "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped",
                 result.created, result.updated, result.deleted, result.unmanaged_skipped
             );
-
-            // Apply succeeded — now surface the encrypted delivery blobs.
-            // `allocate_if_needed` already produced the age-armored ciphertext
-            // for each new/rotated slot; without this step it was logged and
-            // discarded, so the recipient never had a way to retrieve the
-            // secret. Prefer PR comment (post-merge PR still accepts
-            // comments); fall back to stdout for local runs.
-            if let Some(outcome) = &allocation {
-                surface_delivered_credentials(&env_config, outcome).await?;
-            }
         }
         GatewayMode::File => {
             // File mode has no gateway diff or auto-approve gate in the
@@ -1595,11 +1599,33 @@ async fn cmd_rotate(
     )
     .await?;
 
-    // The rotation wrote a fresh value to the GitHub Environment Secret and
-    // (optionally) delivered it to the recipient. The live gateway still
-    // validates the OLD value until we push the new one. Push the updated
-    // consumer now so the rotation is immediately usable — skipping this
-    // step locks the recipient out until someone else triggers apply.
+    // Emit the encrypted delivery blob FIRST, before attempting the
+    // gateway push. rotate_and_deliver has already written the new value
+    // to the GitHub Env Secret; if we returned Err from the push without
+    // having printed the ciphertext, the recipient would have no way to
+    // recover the value — the bundle's new entry would be treated as
+    // resolved on subsequent runs and the allocator wouldn't re-deliver.
+    //
+    // A gateway push failure after successful delivery is recoverable:
+    // the next `gitforgeops apply` picks up the bundle value and pushes
+    // it through. Lost blob is not recoverable; order must be delivery
+    // first.
+    match &outcome.delivered {
+        Some(d) => {
+            println!(
+                "Delivered age-encrypted blob to @{} (ssh key {}):\n",
+                d.login, d.key_fingerprint
+            );
+            println!("{}", d.encrypted_b64);
+        }
+        None => {
+            if recipient.is_some() {
+                println!("Warning: recipient had no compatible SSH keys; secret written but not delivered.");
+            }
+        }
+    }
+
+    // Now push to the gateway.
     let push_status =
         push_rotated_consumer_to_gateway(&env_config, &resolved, &per_shard, ns, consumer).await;
 
@@ -1625,8 +1651,8 @@ async fn cmd_rotate(
         }
         Err(e) => {
             // Hard-fail: the credential store and gateway are out of sync.
-            // We already delivered the new value to the recipient; returning
-            // Ok would trick the caller into thinking rotation succeeded.
+            // The recipient has the blob (printed above), so they're not
+            // stranded; run apply to close the gap.
             return Err(format!(
                 "Rotated credential stored (GitHub Env Secret) + delivered, but gateway push FAILED: {e}\n\
                  State NOT persisted (the gateway still has the old value). The new value lives\n\
@@ -1635,21 +1661,6 @@ async fn cmd_rotate(
                  before apply runs, they will be rejected."
             )
             .into());
-        }
-    }
-
-    match outcome.delivered {
-        Some(d) => {
-            println!(
-                "Delivered age-encrypted blob to @{} (ssh key {}):\n",
-                d.login, d.key_fingerprint
-            );
-            println!("{}", d.encrypted_b64);
-        }
-        None => {
-            if recipient.is_some() {
-                println!("Warning: recipient had no compatible SSH keys; secret written but not delivered.");
-            }
         }
     }
 
