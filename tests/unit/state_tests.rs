@@ -39,6 +39,24 @@ fn state_file_writes_and_reads_per_env() {
 }
 
 #[test]
+fn state_file_persists_override_records_for_audit() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let mut state = StateFile::load("production");
+        state.record_override("backend_scheme", "abc123", "alice");
+        state.record_override("proxy_timeout_bands", "abc123", "alice");
+        state.save().unwrap();
+
+        let reloaded = StateFile::load("production");
+        assert_eq!(reloaded.overrides.len(), 2);
+        assert_eq!(reloaded.overrides[0].rule_id, "backend_scheme");
+        assert_eq!(reloaded.overrides[0].approver, "alice");
+        assert_eq!(reloaded.overrides[0].commit, "abc123");
+        assert!(!reloaded.overrides[0].recorded_at.is_empty());
+    });
+}
+
+#[test]
 fn state_file_migrates_v1_legacy_format() {
     // v1 .state/state.json has no `environment`, no credential fields, no
     // overrides, no shard_count. Serde defaults must fill the gaps so the

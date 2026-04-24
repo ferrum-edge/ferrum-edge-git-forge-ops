@@ -2,6 +2,7 @@ use crate::diff::best_practice::BestPractice;
 use crate::diff::breaking::BreakingChange;
 use crate::diff::resource_diff::{DiffAction, ResourceDiff, UnmanagedResource};
 use crate::diff::security::SecurityFinding;
+use crate::policy::config::OverrideConfig;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
 
@@ -113,6 +114,7 @@ pub fn build_review_comment_v2(
     policy: &[PolicyFinding],
     unmanaged: &[UnmanagedResource],
     override_reason: Option<&str>,
+    override_cfg: Option<&OverrideConfig>,
     comparison_error: Option<&str>,
     environment_note: Option<&str>,
     secrets: &ResolveReport,
@@ -173,9 +175,15 @@ pub fn build_review_comment_v2(
         }
         md.push('\n');
         if has_blocking {
-            md.push_str(
-                "> **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label (requires `write` permission on this repo).\n\n",
-            );
+            let default_label = "gitforgeops/policy-override".to_string();
+            let default_perm = "write".to_string();
+            let (label, perm) = match override_cfg {
+                Some(cfg) => (&cfg.require_label, &cfg.required_permission),
+                None => (&default_label, &default_perm),
+            };
+            md.push_str(&format!(
+                "> **Apply is blocked** until the listed violations are resolved. To override, add the `{label}` label (requires `{perm}` permission on this repo).\n\n",
+            ));
         }
         if let Some(reason) = override_reason {
             md.push_str(&format!("_Override status: {reason}_\n\n"));

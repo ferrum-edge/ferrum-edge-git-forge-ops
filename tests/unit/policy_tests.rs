@@ -147,6 +147,22 @@ fn forbid_tls_verify_disabled_triggers_on_false() {
 }
 
 #[test]
+fn parse_next_link_extracts_next_page_url() {
+    // Verifies the Link header parser used by override pagination.
+    use gitforgeops::policy::github_override::parse_next_link;
+
+    let header = r#"<https://api.github.com/repos/x/y/issues/1/events?page=2>; rel="next", <https://api.github.com/repos/x/y/issues/1/events?page=5>; rel="last""#;
+    assert_eq!(
+        parse_next_link(header).as_deref(),
+        Some("https://api.github.com/repos/x/y/issues/1/events?page=2")
+    );
+
+    // Last page: only `prev` + `first`, no `next`.
+    let last_page = r#"<...?page=4>; rel="prev", <...?page=1>; rel="first""#;
+    assert_eq!(parse_next_link(last_page), None);
+}
+
+#[test]
 fn override_config_permission_rank_is_monotonic() {
     use gitforgeops::policy::config::OverrideConfig;
 

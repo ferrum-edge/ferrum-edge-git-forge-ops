@@ -769,7 +769,10 @@ async fn cmd_apply(
         }
     }
 
-    // Policy enforcement (with optional override).
+    // Policy enforcement (with optional override). Overridden rule_ids are
+    // captured here and written into state after a successful apply so audits
+    // can see which blocking findings were bypassed by whom.
+    let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
     if let Some(policy_cfg) = policy::load_policies()? {
         let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
         let pr_number = resolve_pr_number(&env_config).await;
@@ -780,6 +783,18 @@ async fn cmd_apply(
         } else {
             None
         };
+
+        if let Some(d) = &override_decision {
+            if d.active {
+                if let Some(approver) = &d.approver {
+                    for f in &findings {
+                        if f.overridden_by.is_some() {
+                            overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
+                        }
+                    }
+                }
+            }
+        }
 
         let blockers: Vec<_> = findings.iter().filter(|f| f.is_blocking()).collect();
         if !blockers.is_empty() {
@@ -956,6 +971,16 @@ async fn cmd_apply(
             );
         }
     }
+    if !overridden_for_audit.is_empty() {
+        let commit = state
+            .last_applied_commit
+            .clone()
+            .or_else(|| std::env::var("GITHUB_SHA").ok())
+            .unwrap_or_default();
+        for (rule_id, approver) in &overridden_for_audit {
+            state.record_override(rule_id, &commit, approver);
+        }
+    }
     state.save()?;
 
     Ok(())
@@ -1031,7 +1056,7 @@ async fn cmd_review(
     let security_findings = diff::audit_security(&desired);
     let bp_findings = diff::check_best_practices(&desired);
 
-    let (policy_findings, override_reason) = match policy::load_policies()? {
+    let (policy_findings, override_reason, override_cfg) = match policy::load_policies()? {
         Some(policy_cfg) => {
             let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
             let decision = match pr {
@@ -1043,9 +1068,13 @@ async fn cmd_review(
                 }
                 None => None,
             };
-            (findings, decision.map(|d| d.reason))
+            (
+                findings,
+                decision.map(|d| d.reason),
+                Some(policy_cfg.overrides),
+            )
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), None, None),
     };
 
     let ownership_note = format!(
@@ -1063,6 +1092,7 @@ async fn cmd_review(
         &policy_findings,
         &unmanaged,
         override_reason.as_deref(),
+        override_cfg.as_ref(),
         comparison_error.as_deref(),
         Some(&ownership_note),
         &secret_report,
