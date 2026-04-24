@@ -195,6 +195,49 @@ fn require_auth_plugin_ignores_disabled_plugins() {
 }
 
 #[test]
+fn forbid_tls_verify_disabled_covers_upstreams() {
+    // Regression guard: the rule used to scan proxies only. Upstream
+    // carries the same field, and a proxy can delegate to an upstream —
+    // proxy-only scan lets an upstream set tls_verify=false and bypass.
+    use gitforgeops::config::schema::{LoadBalancerAlgorithm, Upstream};
+    let upstream_insecure = Upstream {
+        id: "api-pool".to_string(),
+        name: None,
+        namespace: "ferrum".to_string(),
+        targets: vec![],
+        algorithm: LoadBalancerAlgorithm::default(),
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: false, // <-- the violation
+        backend_tls_server_ca_cert_path: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let cfg = GatewayConfig {
+        upstreams: vec![upstream_insecure],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            forbid_tls_verify_disabled: ForbidTlsVerifyDisabledRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, "Upstream");
+    assert_eq!(findings[0].id, "api-pool");
+}
+
+#[test]
 fn forbid_tls_verify_disabled_triggers_on_false() {
     let cfg = GatewayConfig {
         proxies: vec![proxy("risky", BackendProtocol::Https, 30_000, false)],

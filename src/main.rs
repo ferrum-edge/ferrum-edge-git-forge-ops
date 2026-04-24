@@ -312,6 +312,31 @@ async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
 /// Returns the allocation outcome (or `None` if nothing needed allocation) and
 /// the final post-allocation shard map (for state-file updates).
 #[allow(clippy::too_many_arguments)]
+/// Append `comment` to `$GITHUB_STEP_SUMMARY` when running under GitHub
+/// Actions. The step summary is always writable, so this is a reliable
+/// fallback when PR comment posting is blocked (fork PRs, read-only
+/// tokens). No-op when the env var is unset (local runs).
+fn write_review_to_step_summary(comment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = match std::env::var("GITHUB_STEP_SUMMARY") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return Ok(()),
+    };
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(
+        file,
+        "> _PR comment posting was blocked (typical on fork PRs). The review is shown below as a step summary fallback._\n"
+    )?;
+    file.write_all(comment.as_bytes())?;
+    if !comment.ends_with('\n') {
+        writeln!(file)?;
+    }
+    Ok(())
+}
+
 /// Emit the age-armored ciphertext for each newly-allocated slot so the
 /// recipient can decrypt. Without this, the allocator produced encrypted
 /// blobs and the binary logged only the recipient's SSH fingerprint — the
@@ -1352,8 +1377,25 @@ async fn cmd_review(
 
     match pr {
         Some(pr_number) => {
-            review::post_pr_comment(&env_config, pr_number, &comment).await?;
-            println!("Posted review comment to PR #{}", pr_number);
+            // Fork PRs: GITHUB_TOKEN is downgraded to read-only by GitHub
+            // regardless of the workflow's `permissions:` block, so the
+            // POST to /issues/{n}/comments returns 403. We still want the
+            // review content visible, so fall back to $GITHUB_STEP_SUMMARY
+            // (which the runner always lets us write) and to stdout.
+            // Never fail the job on a delivery-channel error — the
+            // validation itself succeeded; only the report delivery didn't.
+            match review::post_pr_comment(&env_config, pr_number, &comment).await {
+                Ok(()) => {
+                    println!("Posted review comment to PR #{}", pr_number);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {e}"
+                    );
+                    write_review_to_step_summary(&comment)?;
+                    print!("{}", comment);
+                }
+            }
         }
         None => {
             print!("{}", comment);
