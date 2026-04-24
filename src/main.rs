@@ -1250,6 +1250,26 @@ async fn cmd_rotate(
     let ns = namespace.unwrap_or("ferrum");
     let slot = secrets::resolver::slot_path(ns, consumer, credential);
 
+    // Verify the target slot corresponds to an actual `${gh-env-secret:...}`
+    // placeholder in the repo's desired config. Without this, a typo in
+    // --credential or a credential field that holds a literal value would
+    // still "succeed": a fresh secret would be written to the GitHub Env
+    // Secret and delivered to the recipient, but the consumer on the gateway
+    // would never reference that value — a false-success rotation that
+    // orphans a secret and confuses the recipient.
+    let desired_for_check = load_and_assemble_for(&resolved)?;
+    let empty_bundle = BTreeMap::new();
+    let placeholder_report = secrets::report_secrets(&desired_for_check, &empty_bundle)?;
+    if !placeholder_report.results.iter().any(|r| r.slot == slot) {
+        return Err(format!(
+            "Refusing to rotate: no `${{gh-env-secret:...}}` placeholder at slot '{slot}'.\n\
+             Rotate only operates on consumer credential fields that reference a placeholder in\n\
+             the repo. Check that consumer '{consumer}' in namespace '{ns}' has a credential\n\
+             key '{credential}' whose value is a gh-env-secret placeholder."
+        )
+        .into());
+    }
+
     let mut shard_count = state.credential_shard_count.max(1);
 
     let client = Client::builder()
@@ -1277,27 +1297,36 @@ async fn cmd_rotate(
     let push_status =
         push_rotated_consumer_to_gateway(&env_config, &resolved, &per_shard, ns, consumer).await;
 
-    state.credential_shard_count = shard_count;
-    state.record_credential(
-        &slot,
-        outcome.shard,
-        &outcome.value,
-        outcome.delivered.as_ref().map(|d| d.login.as_str()),
-        std::env::var("GITHUB_RUN_ID").ok().as_deref(),
-    );
-    state.save()?;
-
-    println!("Rotated slot {slot} in shard {}", outcome.shard);
+    // Persist rotation state ONLY on full success. Saving before the gateway
+    // push check would claim the rotation completed even when the gateway
+    // never received the new value — audits would show "rotated at T" while
+    // the old credential kept authenticating. On failure, leave state alone;
+    // the next successful `gitforgeops apply` (which picks up the fresh
+    // bundle value naturally) or re-rotate will record accurate metadata.
     match push_status {
-        Ok(()) => println!("Gateway consumer '{}/{}' updated.", ns, consumer),
+        Ok(()) => {
+            state.credential_shard_count = shard_count;
+            state.record_credential(
+                &slot,
+                outcome.shard,
+                &outcome.value,
+                outcome.delivered.as_ref().map(|d| d.login.as_str()),
+                std::env::var("GITHUB_RUN_ID").ok().as_deref(),
+            );
+            state.save()?;
+            println!("Rotated slot {slot} in shard {}", outcome.shard);
+            println!("Gateway consumer '{}/{}' updated.", ns, consumer);
+        }
         Err(e) => {
             // Hard-fail: the credential store and gateway are out of sync.
             // We already delivered the new value to the recipient; returning
             // Ok would trick the caller into thinking rotation succeeded.
             return Err(format!(
-                "Rotated credential stored + delivered, but gateway push FAILED: {e}\n\
-                 The new value will not authenticate until `gitforgeops apply` is run.\n\
-                 Resolve the gateway error and re-run apply to close the gap."
+                "Rotated credential stored (GitHub Env Secret) + delivered, but gateway push FAILED: {e}\n\
+                 State NOT persisted (the gateway still has the old value). The new value lives\n\
+                 in the GitHub Env Secret; run `gitforgeops apply` to push it through and record\n\
+                 rotation metadata. If the recipient tries to authenticate with the new value\n\
+                 before apply runs, they will be rejected."
             )
             .into());
         }
