@@ -1,0 +1,64 @@
+name: Rust CI
+
+# Runs on PRs / pushes that touch the tool's source. Path-filtered so resource-
+# only PRs (which modify resources/**, overlays/**, .gitforgeops/**) do NOT
+# trigger a cargo build — those PRs are served by validate-pr.yml instead.
+#
+# Conversely, resource workflows are filtered to their own paths and do not fire
+# on code-only PRs. The two CI paths are mutually exclusive except for PRs that
+# touch both categories (rare, by design).
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'Dockerfile'
+      - '.github/workflows/rust-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'Dockerfile'
+      - '.github/workflows/rust-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-ci-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --test unit_tests

@@ -45,7 +45,10 @@ cargo fmt --all && cargo fmt --all -- --check
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test --test unit_tests`
 
-CI runs the same three on every PR.
+`.github/workflows/rust-ci.yml` runs those same three on every PR that touches
+`src/**`, `tests/**`, `Cargo.{toml,lock}`, or the Dockerfile. Resource-only
+PRs (touching `resources/**`, `overlays/**`, `.gitforgeops/**`) skip Rust CI
+and run `validate-pr.yml` instead; the two paths are mutually exclusive.
 
 ## Architecture
 
