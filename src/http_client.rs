@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use base64::Engine;
 use reqwest::Client;
 
@@ -22,7 +24,13 @@ impl AdminClient {
             .clone()
             .ok_or(crate::error::Error::NoJwtSecret)?;
 
-        let mut builder = Client::builder();
+        // Timeouts prevent CI from hanging indefinitely when the gateway is
+        // unreachable or slow. Defaults: connect 10s, total request 60s.
+        // `/backup` on large configs or `/restore` on slow commits may need
+        // the request timeout raised via env.
+        let mut builder = Client::builder()
+            .connect_timeout(Duration::from_secs(env.gateway_connect_timeout_secs))
+            .timeout(Duration::from_secs(env.gateway_request_timeout_secs));
 
         if env.tls_no_verify {
             builder = builder.danger_accept_invalid_certs(true);

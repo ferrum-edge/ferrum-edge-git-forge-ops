@@ -14,6 +14,8 @@ fn clear_env() {
         "FERRUM_GATEWAY_CA_CERT",
         "FERRUM_GATEWAY_CLIENT_CERT",
         "FERRUM_GATEWAY_CLIENT_KEY",
+        "FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS",
+        "FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS",
     ] {
         std::env::remove_var(var);
     }
@@ -55,6 +57,28 @@ fn env_config_defaults_and_overrides() {
     assert_eq!(config.gateway_url.as_deref(), Some("https://gw:9000"));
     assert_eq!(config.admin_jwt_secret.as_deref(), Some("secret123"));
     assert_eq!(config.namespace_filter.as_deref(), Some("team-alpha"));
+
+    clear_env();
+}
+
+#[test]
+fn env_config_timeout_defaults_and_overrides() {
+    clear_env();
+
+    let config = load_env_config();
+    assert_eq!(config.gateway_connect_timeout_secs, 10);
+    assert_eq!(config.gateway_request_timeout_secs, 60);
+
+    std::env::set_var("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", "5");
+    std::env::set_var("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "120");
+    let config = load_env_config();
+    assert_eq!(config.gateway_connect_timeout_secs, 5);
+    assert_eq!(config.gateway_request_timeout_secs, 120);
+
+    // Non-numeric value falls back to default.
+    std::env::set_var("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", "not-a-number");
+    let config = load_env_config();
+    assert_eq!(config.gateway_connect_timeout_secs, 10);
 
     clear_env();
 }

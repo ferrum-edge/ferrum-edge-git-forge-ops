@@ -181,6 +181,8 @@ Set in: Settings > Secrets and variables > Actions > Variables
 | `FERRUM_OVERLAY` | — | Overlay directory (e.g. `staging`, `production`) |
 | `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification (dev only) |
+| `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | Timeout for TCP/TLS connection establishment to the admin API. Raise if the gateway is behind a slow LB. |
+| `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | Total HTTP request timeout (connect + send + receive). Raise for very large `/backup` responses or slow `/restore` commits; 60s is enough for typical configs. |
 | `GITFORGEOPS_IMAGE_TAG` | — | When set (e.g. `latest`, `v0.1.0`), PR validation runs in the pre-built `gitforgeops` container instead of compiling natively. Unset = native fallback (slower, always works). |
 | `GITFORGEOPS_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Image name the container job pulls from. Default points at the upstream-published image; override only if you're publishing your own. |
 | `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
@@ -247,6 +249,21 @@ spec:
 ```
 
 Only overridden fields are needed. Set `FERRUM_OVERLAY=production` to activate.
+
+## Timeouts
+
+Every call to the admin API is bounded by two timeouts so CI never hangs indefinitely on a flaky or unreachable gateway:
+
+- **Connect timeout** (default `10s`) — how long to wait for TCP handshake + TLS negotiation. Applies per-connection; reqwest's pool may reuse connections within a run.
+- **Request timeout** (default `60s`) — end-to-end cap on a single request, including body send and response read. Applies to every call: `GET /backup`, `POST /batch`, `POST /restore`, individual `PUT`/`DELETE`/`POST` per resource.
+
+The defaults are sized to cover typical configurations without fighting slow but legitimate operations. Two cases commonly need tuning:
+
+- `GET /backup` on very large configs (thousands of resources) — raise request timeout.
+- `POST /restore` on gateways whose commit path is slow (large MongoDB transactions, high replication lag) — raise request timeout.
+- Gateway behind a slow load balancer or cold NLB — raise connect timeout.
+
+Override via `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` / `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS`. A timeout expiring surfaces as a clear HTTP-client error; nothing is silently retried.
 
 ## TLS Connectivity
 

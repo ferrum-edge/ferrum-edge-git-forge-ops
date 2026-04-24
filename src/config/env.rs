@@ -47,6 +47,13 @@ pub struct EnvConfig {
     pub client_cert: Option<String>,
     /// Path to client key for mTLS to gateway.
     pub client_key: Option<String>,
+    /// Timeout for TCP/TLS connection establishment to the gateway, in seconds.
+    pub gateway_connect_timeout_secs: u64,
+    /// Timeout for a complete HTTP request/response cycle to the gateway, in seconds.
+    /// Applies end-to-end including response body read. `/backup` on large
+    /// configs or `/restore` on gateways with slow commit paths may need this
+    /// raised above the 60s default.
+    pub gateway_request_timeout_secs: u64,
 }
 
 /// Load tool configuration from environment variables.
@@ -65,6 +72,8 @@ pub struct EnvConfig {
 /// | `FERRUM_GATEWAY_CA_CERT`     | `ca_cert`          | `None`                           |
 /// | `FERRUM_GATEWAY_CLIENT_CERT` | `client_cert`      | `None`                           |
 /// | `FERRUM_GATEWAY_CLIENT_KEY`  | `client_key`       | `None`                           |
+/// | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `gateway_connect_timeout_secs` | `10`        |
+/// | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `gateway_request_timeout_secs` | `60`        |
 pub fn load_env_config() -> EnvConfig {
     EnvConfig {
         gateway_url: env::var("FERRUM_GATEWAY_URL").ok(),
@@ -97,5 +106,14 @@ pub fn load_env_config() -> EnvConfig {
         ca_cert: env::var("FERRUM_GATEWAY_CA_CERT").ok(),
         client_cert: env::var("FERRUM_GATEWAY_CLIENT_CERT").ok(),
         client_key: env::var("FERRUM_GATEWAY_CLIENT_KEY").ok(),
+        gateway_connect_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", 10),
+        gateway_request_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", 60),
     }
+}
+
+fn parse_timeout_env(var: &str, default_secs: u64) -> u64 {
+    env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default_secs)
 }
