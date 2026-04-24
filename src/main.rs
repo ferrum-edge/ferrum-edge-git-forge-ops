@@ -447,39 +447,33 @@ async fn cmd_export(
     let mut gateway_config = load_and_assemble_for(&resolved)?;
 
     if materialize {
-        // Fail fast if credentials cannot be fully resolved — we don't want to
-        // hand an admin a file that still has `${gh-env-secret:...}` strings in
-        // it, and we won't allocate fresh secrets during export (that's the job
-        // of `apply`).
-        let report = resolve_credentials(&mut gateway_config, &env_config)?;
-        let missing = report.missing_required();
-        if !missing.is_empty() {
+        // Fail fast if credentials cannot be fully resolved — we don't want
+        // to hand an admin a file that still has `${gh-env-secret:...}`
+        // strings in it, and we won't allocate fresh secrets during export
+        // (that's the job of `apply`).
+        //
+        // Resolve with the rotate-aware variant so a rotate placeholder
+        // with a valid bundle entry is replaced (the prior `apply` wrote
+        // the value into the bundle). Rotate placeholders that still have
+        // no bundle entry stay in place and show up as "remaining" below.
+        //
+        // Don't trust the pre-resolve report's NeedsAllocation/NeedsRotation
+        // classification for the pending check: `alloc=rotate` is always
+        // classified as NeedsRotation regardless of whether the bundle
+        // carries a value, so keying the check off that status would block
+        // materialization forever on any config using rotate. Instead, run
+        // the post-resolve config back through report_secrets with an
+        // empty bundle — any placeholder still present in the config is a
+        // truly-unresolved slot.
+        let (bundle, _) = load_credential_bundles(&env_config)?;
+        let _ = secrets::resolve_secrets_including_rotate(&mut gateway_config, &bundle)?;
+        let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
+        if !remaining.results.is_empty() {
             return Err(format!(
-                "refusing to materialize: {} required credential slot(s) missing from bundle:\n  {}",
-                missing.len(),
-                missing
-                    .iter()
-                    .map(|r| r.slot.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n  ")
-            )
-            .into());
-        }
-        let pending: Vec<_> = report
-            .results
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.status,
-                    secrets::SlotStatus::NeedsAllocation | secrets::SlotStatus::NeedsRotation
-                )
-            })
-            .collect();
-        if !pending.is_empty() {
-            return Err(format!(
-                "refusing to materialize: {} slot(s) need allocation or rotation — run `gitforgeops apply` first:\n  {}",
-                pending.len(),
-                pending
+                "refusing to materialize: {} credential slot(s) have no value yet — run `gitforgeops apply` to allocate/rotate, then retry:\n  {}",
+                remaining.results.len(),
+                remaining
+                    .results
                     .iter()
                     .map(|r| r.slot.as_str())
                     .collect::<Vec<_>>()
@@ -488,8 +482,8 @@ async fn cmd_export(
             .into());
         }
     }
-    // When `!materialize`: skip resolve_credentials entirely so placeholder
-    // strings remain as `${gh-env-secret:...}`. Output is safe to commit.
+    // When `!materialize`: skip resolve entirely so placeholder strings
+    // remain as `${gh-env-secret:...}`. Output is safe to commit.
 
     let yaml = serde_yaml::to_string(&gateway_config)?;
 
@@ -1390,6 +1384,27 @@ async fn push_rotated_consumer_to_gateway(
                 "consumer '{namespace}/{consumer_id}' not present in repo desired state; cannot push rotated credential. Add the consumer to resources/ first, or if it was intentionally removed, rotation has no consumer to update."
             )
         })?;
+
+    // Guard: the consumer may carry OTHER credentials besides the one we
+    // just rotated. If any of those other credentials are placeholders
+    // without a bundle value (e.g. alloc=require that was never
+    // pre-populated, or alloc=generate never run through apply), pushing
+    // the consumer now would send a literal `${gh-env-secret:...}` string
+    // to the gateway as a credential value — breaking auth for that
+    // credential. Refuse and tell the operator to run apply first.
+    let single_consumer_cfg = gitforgeops::config::GatewayConfig {
+        consumers: vec![consumer.clone()],
+        ..Default::default()
+    };
+    let remaining = secrets::report_secrets(&single_consumer_cfg, &BTreeMap::new())?;
+    if !remaining.results.is_empty() {
+        return Err(format!(
+            "refusing to push rotated consumer '{namespace}/{consumer_id}': {} unresolved placeholder(s) remain on this consumer:\n  {}\n\
+             Run `gitforgeops apply` to allocate missing slots before rotating (or pre-populate FERRUM_CREDS_JSON).",
+            remaining.results.len(),
+            remaining.results.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
+        ).into());
+    }
 
     let client = AdminClient::new(env_config)?;
     client.update_consumer(consumer, namespace).await?;

@@ -85,21 +85,53 @@ fn default_required_permission() -> String {
     "write".to_string()
 }
 
+/// The set of repo-permission strings GitHub's API returns, ordered from
+/// weakest to strongest. Matches the /collaborators/{login}/permission
+/// endpoint's possible responses.
+pub const VALID_PERMISSIONS: &[&str] = &["read", "triage", "write", "maintain", "admin"];
+
 impl OverrideConfig {
-    pub fn permission_rank(permission: &str) -> u8 {
-        match permission {
-            "admin" => 4,
-            "maintain" => 3,
-            "write" => 2,
-            "triage" => 1,
-            "read" => 0,
-            _ => 0,
-        }
+    /// Returns the rank of a permission string, or `None` for an unknown
+    /// value. Caller decides how to handle unknowns — never treat them as
+    /// rank 0 (same as "read"), because that would silently satisfy any
+    /// required threshold that was misspelled in config.
+    pub fn permission_rank(permission: &str) -> Option<u8> {
+        VALID_PERMISSIONS
+            .iter()
+            .position(|p| *p == permission)
+            .map(|i| i as u8)
     }
 
+    /// Is the labeler's actual permission sufficient to satisfy the
+    /// configured requirement?
+    ///
+    /// Fail-closed on either side:
+    /// - Unknown `actual` (an API response we don't recognize) → false.
+    /// - Unknown `required_permission` (misspelled config) → false.
+    ///
+    /// The load-time validator in [`validate_overrides`] should catch the
+    /// misspelled-config case before this function ever runs, but
+    /// fail-closed here is the defense-in-depth.
     pub fn is_sufficient(&self, actual: &str) -> bool {
-        Self::permission_rank(actual) >= Self::permission_rank(&self.required_permission)
+        match (
+            Self::permission_rank(actual),
+            Self::permission_rank(&self.required_permission),
+        ) {
+            (Some(a), Some(r)) => a >= r,
+            _ => false,
+        }
     }
+}
+
+fn validate_overrides(cfg: &OverrideConfig) -> crate::error::Result<()> {
+    if OverrideConfig::permission_rank(&cfg.required_permission).is_none() {
+        return Err(crate::error::Error::Config(format!(
+            "overrides.required_permission='{}' is not a valid GitHub repo permission. Must be one of: {}",
+            cfg.required_permission,
+            VALID_PERMISSIONS.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 impl Default for OverrideConfig {
@@ -133,6 +165,12 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
     if !path.exists() {
         return Ok(None);
     }
+    let loaded = load_raw(path)?;
+    validate_overrides(&loaded.overrides)?;
+    Ok(Some(loaded))
+}
+
+fn load_raw(path: &Path) -> crate::error::Result<PolicyConfig> {
     let contents =
         std::fs::read_to_string(path).map_err(|source| crate::error::Error::FileRead {
             path: path.to_path_buf(),
@@ -143,5 +181,5 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
             path: path.to_path_buf(),
             source,
         })?;
-    Ok(Some(config))
+    Ok(config)
 }

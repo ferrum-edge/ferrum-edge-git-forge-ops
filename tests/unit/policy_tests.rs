@@ -176,5 +176,52 @@ fn override_config_permission_rank_is_monotonic() {
     assert!(cfg.is_sufficient("write"));
     assert!(!cfg.is_sufficient("triage"));
     assert!(!cfg.is_sufficient("read"));
+    // Unknown actual permission fails closed — don't treat "none" or a
+    // typoed response as if it were "read" (rank 0) and silently satisfy.
     assert!(!cfg.is_sufficient("none"));
+    assert!(!cfg.is_sufficient("owner"));
+}
+
+#[test]
+fn override_is_sufficient_fails_closed_on_unknown_required_permission() {
+    // Defense in depth: even if validate_overrides is bypassed, a
+    // misspelled required_permission must not silently admit every
+    // labeler — which would happen if unknown values resolved to rank 0.
+    use gitforgeops::policy::config::OverrideConfig;
+
+    let cfg = OverrideConfig {
+        require_label: "x".to_string(),
+        required_permission: "admn".to_string(), // typo
+    };
+
+    assert!(!cfg.is_sufficient("admin"));
+    assert!(!cfg.is_sufficient("maintain"));
+    assert!(!cfg.is_sufficient("write"));
+    assert!(!cfg.is_sufficient("read"));
+}
+
+#[test]
+fn policy_config_load_rejects_invalid_override_permission() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(
+        file,
+        r#"
+version: 1
+overrides:
+  require_label: gitforgeops/policy-override
+  required_permission: admn
+"#
+    )
+    .unwrap();
+
+    let err = load_policies_from_path(file.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("admn"),
+        "expected rejection of misspelled permission, got: {err}"
+    );
+    assert!(err.to_string().contains("admin"));
 }
