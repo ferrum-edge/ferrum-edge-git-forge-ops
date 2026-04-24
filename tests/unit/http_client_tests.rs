@@ -20,6 +20,11 @@ fn base_env() -> EnvConfig {
         ca_cert: None,
         client_cert: None,
         client_key: None,
+        gateway_connect_timeout_secs: 10,
+        gateway_request_timeout_secs: 60,
+        github_connect_timeout_secs: 10,
+        github_request_timeout_secs: 30,
+        gateway_max_retries: 3,
     }
 }
 
@@ -59,4 +64,12 @@ fn admin_client_rejects_client_key_without_cert() {
 fn admin_client_builds_without_mtls() {
     let env = base_env();
     AdminClient::new(&env).expect("client should build without mTLS");
+}
+
+#[test]
+fn admin_client_honors_custom_timeouts() {
+    let mut env = base_env();
+    env.gateway_connect_timeout_secs = 3;
+    env.gateway_request_timeout_secs = 15;
+    AdminClient::new(&env).expect("client should build with custom timeouts");
 }

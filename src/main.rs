@@ -794,7 +794,7 @@ async fn cmd_review(
 
     match pr {
         Some(pr_number) => {
-            review::post_pr_comment(pr_number, &comment).await?;
+            review::post_pr_comment(&env_config, pr_number, &comment).await?;
             println!("Posted review comment to PR #{}", pr_number);
         }
         None => {
