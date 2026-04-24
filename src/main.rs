@@ -1303,10 +1303,12 @@ async fn cmd_rotate(
     })?;
 
     // Load current bundle to know shard layout.
-    let (_merged, mut per_shard) = match &env_config.creds_bundle_json {
-        Some(raw) if !raw.trim().is_empty() => secrets::load_bundles_from_env(raw)?,
-        _ => (BTreeMap::new(), BTreeMap::new()),
-    };
+    // Use the shared helper so both FERRUM_CREDS_JSON (inline) and
+    // FERRUM_CREDS_JSON_FILE (path) are honored. The workflow uses the file
+    // form — reading only the inline var left per_shard empty, and
+    // rotate_and_deliver would then write a shard containing ONLY the
+    // rotated slot, overwriting every other slot in that shard on GitHub.
+    let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
 
     let mut state = StateFile::load(&resolved.name);
     let ns = namespace.unwrap_or("ferrum");
