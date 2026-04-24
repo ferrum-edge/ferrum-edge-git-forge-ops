@@ -179,6 +179,81 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
 }
 
 #[test]
+fn resolver_does_not_replace_rotate_placeholder_with_stale_value() {
+    // alloc=rotate with an existing (stale) bundle value must keep the
+    // placeholder in place during the initial resolve — otherwise the
+    // placeholder is masked before the allocator generates a fresh value,
+    // and the post-allocation resolve has no placeholder left to replace.
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let placeholder = "${gh-env-secret:alloc=rotate}";
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String(placeholder.to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/api_key".to_string(), "stale-value".to_string());
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::NeedsRotation);
+
+    // Placeholder must survive the initial resolve — NOT be replaced with
+    // the stale value.
+    assert_eq!(
+        cfg.consumers[0].credentials.get("api_key").unwrap(),
+        &serde_json::Value::String(placeholder.to_string()),
+        "rotate placeholder should not be replaced until post-allocation resolve"
+    );
+}
+
+#[test]
+fn resolver_including_rotate_replaces_rotate_placeholders() {
+    use gitforgeops::secrets::resolve_secrets_including_rotate;
+
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=rotate}".to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/api_key".to_string(),
+        "freshly-rotated".to_string(),
+    );
+
+    let _ = resolve_secrets_including_rotate(&mut cfg, &bundle).unwrap();
+    assert_eq!(
+        cfg.consumers[0].credentials.get("api_key").unwrap(),
+        &serde_json::Value::String("freshly-rotated".to_string()),
+        "post-allocation variant must replace rotate placeholders with fresh bundle values"
+    );
+}
+
+#[test]
 fn resolver_reports_needs_allocation_for_generate() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {

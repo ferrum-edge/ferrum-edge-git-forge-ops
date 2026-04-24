@@ -10,4 +10,7 @@ pub use bundle::{load_bundles_from_env, merge_bundles, serialize_bundle, Credent
 pub use delivery::{deliver_to_author, DeliveryResult};
 pub use github_api::{fetch_public_key, put_environment_secret, EnvSecretPublicKey};
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
-pub use resolver::{resolve_secrets, slot_path, ResolveReport, ResolveResult, SlotStatus};
+pub use resolver::{
+    resolve_secrets, resolve_secrets_including_rotate, slot_path, ResolveReport, ResolveResult,
+    SlotStatus,
+};

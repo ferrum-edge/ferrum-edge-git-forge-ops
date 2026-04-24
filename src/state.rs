@@ -29,12 +29,22 @@ pub struct OverrideRecord {
     pub recorded_at: String,
 }
 
+// All fields carry serde defaults so v1 `.state/state.json` files — which
+// predate `environment`, `credentials`, `credential_bundle_versions`,
+// `credential_shard_count`, and `overrides` — deserialize cleanly into the
+// v2 struct during the legacy migration path in `load()`. The caller patches
+// `environment` after load, so its default ("") is never observable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFile {
+    #[serde(default = "default_version")]
     pub version: u32,
+    #[serde(default)]
     pub environment: String,
+    #[serde(default)]
     pub last_applied_at: Option<String>,
+    #[serde(default)]
     pub last_applied_commit: Option<String>,
+    #[serde(default)]
     pub resources: HashMap<String, String>,
     #[serde(default)]
     pub credentials: HashMap<String, CredentialMetadata>,
@@ -44,6 +54,10 @@ pub struct StateFile {
     pub credential_shard_count: u32,
     #[serde(default)]
     pub overrides: Vec<OverrideRecord>,
+}
+
+fn default_version() -> u32 {
+    2
 }
 
 fn default_shard_count() -> u32 {

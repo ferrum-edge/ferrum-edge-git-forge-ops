@@ -62,12 +62,36 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
 /// Walk the consumers in `cfg` and replace `${gh-env-secret:...}` placeholders
 /// with values from the merged credential bundle.
 ///
-/// Mutates `cfg` in place: for each placeholder, replaces the string with the
-/// resolved value (or leaves it alone when the value is missing and alloc is
-/// `require`; the caller decides how to react based on the returned report).
+/// Mutates `cfg` in place:
+///   - `alloc=require` with a bundle match: replaced.
+///   - `alloc=generate` with a bundle match: replaced (existing value reused).
+///   - `alloc=rotate`: **left in place**, regardless of whether the bundle has
+///     a stale value. Rotation always wants a fresh value from the allocator;
+///     replacing with the stale value first would mask the placeholder before
+///     the allocator's new value is available. Call
+///     [`resolve_secrets_including_rotate`] after the allocator has written new
+///     values to finish the substitution.
+///   - Missing slot: placeholder stays; the report tells the caller why.
 pub fn resolve_secrets(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
+) -> crate::error::Result<ResolveReport> {
+    resolve_with_opts(cfg, bundle, false)
+}
+
+/// Same as [`resolve_secrets`] but also replaces `alloc=rotate` placeholders
+/// whose bundle entries are now fresh (post-allocation).
+pub fn resolve_secrets_including_rotate(
+    cfg: &mut GatewayConfig,
+    bundle: &CredentialBundle,
+) -> crate::error::Result<ResolveReport> {
+    resolve_with_opts(cfg, bundle, true)
+}
+
+fn resolve_with_opts(
+    cfg: &mut GatewayConfig,
+    bundle: &CredentialBundle,
+    replace_rotate: bool,
 ) -> crate::error::Result<ResolveReport> {
     let mut report = ResolveReport::default();
 
@@ -88,8 +112,14 @@ pub fn resolve_secrets(
         }
 
         for (cred_key, value) in consumer.credentials.iter() {
-            let replaced =
-                walk_and_replace(value.clone(), &namespace, &consumer_id, cred_key, bundle)?;
+            let replaced = walk_and_replace(
+                value.clone(),
+                &namespace,
+                &consumer_id,
+                cred_key,
+                bundle,
+                replace_rotate,
+            )?;
             replacements.insert(cred_key.clone(), replaced);
         }
 
@@ -155,22 +185,26 @@ fn walk_and_replace(
     consumer_id: &str,
     cred_key: &str,
     bundle: &CredentialBundle,
+    replace_rotate: bool,
 ) -> crate::error::Result<serde_json::Value> {
     match value {
         serde_json::Value::String(s) => {
             if let Some(res) = parse_placeholder(&s) {
                 let placeholder = res?;
+
+                // Rotate placeholders: in the initial pass (replace_rotate=false),
+                // leave them in place so the allocator can generate a fresh value.
+                // Replacing with the stale bundle value here would mask the
+                // placeholder before the new value is available, and the post-
+                // allocation resolve would have no placeholder to target.
+                if matches!(placeholder.alloc, PlaceholderAlloc::Rotate) && !replace_rotate {
+                    return Ok(serde_json::Value::String(s));
+                }
+
                 let slot = slot_path(namespace, consumer_id, cred_key);
                 match bundle.get(&slot) {
                     Some(v) => Ok(serde_json::Value::String(v.clone())),
-                    None => {
-                        // Allocation (generate/rotate) is the allocator's job;
-                        // we leave the placeholder in place so the apply path
-                        // can act on the report. Require + missing returns the
-                        // placeholder too, with a clear error in the report.
-                        let _ = placeholder;
-                        Ok(serde_json::Value::String(s))
-                    }
+                    None => Ok(serde_json::Value::String(s)),
                 }
             } else {
                 Ok(serde_json::Value::String(s))
@@ -182,7 +216,14 @@ fn walk_and_replace(
                 let child_path = format!("{cred_key}.{child_key}");
                 out.insert(
                     child_key,
-                    walk_and_replace(child_val, namespace, consumer_id, &child_path, bundle)?,
+                    walk_and_replace(
+                        child_val,
+                        namespace,
+                        consumer_id,
+                        &child_path,
+                        bundle,
+                        replace_rotate,
+                    )?,
                 );
             }
             Ok(serde_json::Value::Object(out))
@@ -197,6 +238,7 @@ fn walk_and_replace(
                     consumer_id,
                     &child_path,
                     bundle,
+                    replace_rotate,
                 )?);
             }
             Ok(serde_json::Value::Array(out))

@@ -287,9 +287,12 @@ async fn allocate_if_needed(
     )
     .await?;
 
-    // Re-resolve so desired picks up the generated values.
+    // Re-resolve so desired picks up the generated values. Use the rotate-
+    // aware variant: the initial resolve left rotate placeholders in place so
+    // the allocator could produce a fresh value; now that the bundle has
+    // fresh values, rotate placeholders are safe to replace.
     let merged = secrets::merge_bundles(per_shard);
-    let _ = secrets::resolve_secrets(desired, &merged)?;
+    let _ = secrets::resolve_secrets_including_rotate(desired, &merged)?;
 
     Ok(Some(outcome))
 }
@@ -726,38 +729,6 @@ async fn cmd_apply(
         process::exit(1);
     }
 
-    // Allocate/rotate any slots that need it. This writes to the GitHub
-    // Environment Secret, delivers the new value, and replaces placeholders in
-    // `desired` with the generated values.
-    let allocation = allocate_if_needed(
-        &mut desired,
-        &env_config,
-        &resolved,
-        &secret_report,
-        &mut per_shard,
-        &mut shard_count,
-    )
-    .await?;
-
-    if let Some(outcome) = &allocation {
-        eprintln!(
-            "Allocated/rotated {} credential slot(s):",
-            outcome.allocated.len()
-        );
-        for slot in &outcome.allocated {
-            match &slot.delivered {
-                Some(d) => eprintln!(
-                    "  {} -> @{} (ssh {})",
-                    slot.slot, d.login, d.key_fingerprint
-                ),
-                None => eprintln!(
-                    "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
-                    slot.slot
-                ),
-            }
-        }
-    }
-
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     if let Ok(ref r) = val_result {
         if !r.success {
@@ -807,6 +778,10 @@ async fn cmd_apply(
     }
 
     let namespaces = resolved_namespaces(&resolved, &desired);
+    // Populated by the API-mode arm after the approve gate; None for file mode
+    // or when nothing needed allocating. State-record reads this after the
+    // match.
+    let mut allocation: Option<secrets::AllocateOutcome> = None;
 
     match env_config.gateway_mode {
         GatewayMode::Api => {
@@ -819,7 +794,10 @@ async fn cmd_apply(
                 let (diffs, _, unmanaged) =
                     compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
-                if diffs.is_empty() && unmanaged.is_empty() {
+                if diffs.is_empty()
+                    && unmanaged.is_empty()
+                    && secret_report.needs_allocation().is_empty()
+                {
                     println!("No changes to apply.");
                     return Ok(());
                 }
@@ -838,8 +816,55 @@ async fn cmd_apply(
                         unmanaged.len()
                     );
                 }
+                let pending_creds = secret_report.needs_allocation();
+                if !pending_creds.is_empty() {
+                    println!(
+                        "\n{} credential slot(s) would be allocated/rotated on apply:",
+                        pending_creds.len()
+                    );
+                    for r in pending_creds {
+                        let kind = match r.status {
+                            secrets::SlotStatus::NeedsAllocation => "new",
+                            secrets::SlotStatus::NeedsRotation => "rotate",
+                            _ => "",
+                        };
+                        println!("  [{kind}] {}", r.slot);
+                    }
+                }
                 println!("\nUse --auto-approve to skip this check.");
                 process::exit(0);
+            }
+
+            // User has approved apply. Allocate/rotate credentials *now* — we
+            // deliberately do not write to GitHub env secrets during a plan
+            // preview.
+            allocation = allocate_if_needed(
+                &mut desired,
+                &env_config,
+                &resolved,
+                &secret_report,
+                &mut per_shard,
+                &mut shard_count,
+            )
+            .await?;
+
+            if let Some(outcome) = &allocation {
+                eprintln!(
+                    "Allocated/rotated {} credential slot(s):",
+                    outcome.allocated.len()
+                );
+                for slot in &outcome.allocated {
+                    match &slot.delivered {
+                        Some(d) => eprintln!(
+                            "  {} -> @{} (ssh {})",
+                            slot.slot, d.login, d.key_fingerprint
+                        ),
+                        None => eprintln!(
+                            "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
+                            slot.slot
+                        ),
+                    }
+                }
             }
 
             // Large-prune safety check.

@@ -39,6 +39,39 @@ fn state_file_writes_and_reads_per_env() {
 }
 
 #[test]
+fn state_file_migrates_v1_legacy_format() {
+    // v1 .state/state.json has no `environment`, no credential fields, no
+    // overrides, no shard_count. Serde defaults must fill the gaps so the
+    // migration path succeeds instead of silently dropping prior state.
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let v1 = r#"{
+            "version": 1,
+            "last_applied_at": "2026-04-20T12:00:00Z",
+            "last_applied_commit": "abc123",
+            "resources": {
+                "ferrum:Proxy:httpbin": "sha256:deadbeef"
+            }
+        }"#;
+        std::fs::write(".state/state.json", v1).unwrap();
+
+        // Env-specific file doesn't exist; load() should fall through to the
+        // legacy file and adopt it.
+        assert!(!std::path::Path::new(".state/production.json").exists());
+        let state = StateFile::load("production");
+
+        assert_eq!(state.environment, "production");
+        assert_eq!(state.resources.len(), 1);
+        assert!(state.resources.contains_key("ferrum:Proxy:httpbin"));
+        // v2-only fields get defaults without blowing up.
+        assert_eq!(state.credential_shard_count, 1);
+        assert!(state.credentials.is_empty());
+        assert!(state.overrides.is_empty());
+    });
+}
+
+#[test]
 fn state_file_records_credential_metadata() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
