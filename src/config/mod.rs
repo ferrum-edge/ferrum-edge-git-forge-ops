@@ -11,7 +11,7 @@ pub use loader::load_resources;
 pub use repo_config::{
     EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
 };
-pub use resolved::{resolve_env, ResolvedEnv};
+pub use resolved::{resolve_env, validate_env_name_is_safe_path_component, ResolvedEnv};
 pub use schema::{GatewayConfig, Resource};
 
 use std::collections::BTreeSet;

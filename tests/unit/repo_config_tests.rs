@@ -120,6 +120,46 @@ environments:
 }
 
 #[test]
+fn resolved_env_rejects_unsafe_environment_names() {
+    // Environment names flow into `.state/<name>.json`. A name with path
+    // separators or traversal segments would escape .state/ and could let
+    // `state.save()` overwrite arbitrary repo files. Reject at validation
+    // time so no command path uses an unsafe name.
+    use gitforgeops::config::repo_config::{OwnershipConfig, OwnershipMode};
+    use gitforgeops::config::resolved::{validate_env_name_is_safe_path_component, ResolvedEnv};
+    use gitforgeops::config::ApplyStrategy;
+
+    // Direct helper test: the unsafe cases.
+    for bad in ["..", ".", "", "foo/bar", "foo\\bar", "foo\0bar"] {
+        assert!(
+            validate_env_name_is_safe_path_component(bad).is_err(),
+            "expected {bad:?} to be rejected"
+        );
+    }
+    // Normal names pass.
+    for good in ["staging", "production", "env-with-dashes", "env_with_under"] {
+        assert!(
+            validate_env_name_is_safe_path_component(good).is_ok(),
+            "expected {good:?} to be accepted"
+        );
+    }
+
+    // End-to-end: ResolvedEnv::validate catches unsafe names.
+    let r = ResolvedEnv {
+        name: "../oops".to_string(),
+        overlay: None,
+        namespace_filter: None,
+        apply_strategy: ApplyStrategy::Incremental,
+        ownership: OwnershipConfig {
+            mode: OwnershipMode::Shared,
+            ..OwnershipConfig::default()
+        },
+    };
+    let err = r.validate().unwrap_err();
+    assert!(err.to_string().contains("../oops"));
+}
+
+#[test]
 fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
     // Regression guard: RepoConfig::validate blocks the combination in YAML,
     // but the synthetic-default path (no .gitforgeops/config.yaml, pure

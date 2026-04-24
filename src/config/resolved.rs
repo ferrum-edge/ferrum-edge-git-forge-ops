@@ -26,6 +26,13 @@ impl ResolvedEnv {
     /// configuration the YAML validator would reject. Run this at the end
     /// of resolve_env so both branches go through the same gate.
     pub fn validate(&self) -> crate::error::Result<()> {
+        // Environment name is interpolated into `.state/<name>.json`. Reject
+        // anything that could escape the .state/ directory — a `..` or `/`
+        // in a repo-config YAML key or FERRUM_ENV var would let an apply
+        // overwrite files outside .state/ (particularly dangerous in CI
+        // runs that auto-commit bot changes back to main).
+        validate_env_name_is_safe_path_component(&self.name)?;
+
         if matches!(self.ownership.mode, OwnershipMode::Shared)
             && matches!(self.apply_strategy, ApplyStrategy::FullReplace)
         {
@@ -49,6 +56,26 @@ impl ResolvedEnv {
         }
         Ok(())
     }
+}
+
+/// Reject environment names that would be unsafe as a filesystem path
+/// component (path separators, traversal segments, null bytes, empty
+/// string). Environment names flow from untrusted input (repo config keys,
+/// FERRUM_ENV env var, --env CLI flag) into a .state/<name>.json path.
+pub fn validate_env_name_is_safe_path_component(name: &str) -> crate::error::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(crate::error::Error::Config(format!(
+            "environment name {name:?} is not safe for use as a filesystem path component. \
+             Names must not be empty, '.', '..', or contain '/', '\\', or null bytes."
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve the active environment for this run.

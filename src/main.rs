@@ -157,14 +157,12 @@ fn resolved_namespaces(
             // `platform` — but `desired` has been filtered to `ferrum` only,
             // so `platform` shows up as an all-deletions diff and prunes
             // resources outside the operator's requested scope.
+            // The mismatched-filter case (namespace_filter not in owned set)
+            // is rejected upstream by `enforce_exclusive_scope`. If we reach
+            // here with a filter set, it's guaranteed to be in the allowed
+            // list.
             match resolved.namespace_filter.as_deref() {
-                Some(ns) if owned.iter().any(|o| o == ns) => vec![ns.to_string()],
-                Some(ns) => {
-                    eprintln!(
-                        "Warning: namespace_filter '{ns}' is not in ownership.namespaces {owned:?}; nothing to reconcile."
-                    );
-                    Vec::new()
-                }
+                Some(ns) => vec![ns.to_string()],
                 None => owned,
             }
         }
@@ -192,8 +190,11 @@ fn resolved_namespaces(
 }
 
 /// In `exclusive` mode, every resource in `desired` must live in a namespace
-/// declared in `ownership.namespaces`. Otherwise the repo would be silently
-/// pushing resources the ownership contract never signed for. Flag loudly.
+/// declared in `ownership.namespaces`, and any `namespace_filter` must be one
+/// of those allowed namespaces. Otherwise the repo would be silently pushing
+/// resources the ownership contract never signed for — or a filter typo
+/// would produce a "successful" no-op apply that still mutates the local
+/// state baseline to reflect a desired set that never reached the gateway.
 fn enforce_exclusive_scope(
     resolved: &ResolvedEnv,
     desired: &GatewayConfig,
@@ -201,14 +202,24 @@ fn enforce_exclusive_scope(
     if !matches!(resolved.ownership.mode, OwnershipMode::Exclusive) {
         return Ok(());
     }
-    let allowed: std::collections::HashSet<&str> = resolved
-        .ownership
-        .namespaces
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let owned: Vec<String> = resolved.ownership.namespaces.clone().unwrap_or_default();
+    let allowed: std::collections::HashSet<&str> = owned.iter().map(String::as_str).collect();
+
+    // Reject namespace_filter outside the ownership list BEFORE we touch
+    // anything else. Letting it through would produce an empty reconcile
+    // scope while state.record still ran against the already-filtered
+    // desired — a no-op apply that still drifts the local baseline.
+    if let Some(filter) = resolved.namespace_filter.as_deref() {
+        if !allowed.contains(filter) {
+            return Err(format!(
+                "namespace_filter '{filter}' is not in ownership.namespaces {owned:?} for env '{}'. \
+                 Apply would reconcile nothing but still record state, which desyncs ownership tracking. \
+                 Either add '{filter}' to ownership.namespaces, remove FERRUM_NAMESPACE, or target a different env.",
+                resolved.name
+            )
+            .into());
+        }
+    }
 
     let mut violations = Vec::new();
     let mut check = |ns: &str, kind: &str, id: &str| {
@@ -601,6 +612,11 @@ async fn cmd_diff(
 async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
+    // Plan must see the same scope/validation errors as apply would hit, so
+    // the preview matches reality. Without this, a plan could print "None
+    // (in sync)" for an exclusive env whose filter doesn't match ownership —
+    // apply would then fail when the operator tries to act on the preview.
+    enforce_exclusive_scope(&resolved, &desired)?;
     // Audit security BEFORE resolving credentials. audit_security flags
     // literal (non-placeholder) credential strings as a security issue
     // ("use ${...} for secrets"). If we resolve first, placeholders are
@@ -1112,6 +1128,10 @@ async fn cmd_review(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
+    // PR review preview must match apply's real validation surface, so a
+    // reviewer looking at the comment sees the same errors the post-merge
+    // apply would produce.
+    enforce_exclusive_scope(&resolved, &desired)?;
     // Audit pre-resolve so placeholder-resolved values aren't misreported as
     // literal credentials (see cmd_plan for full rationale).
     let security_findings = diff::audit_security(&desired);
