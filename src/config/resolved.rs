@@ -19,6 +19,36 @@ impl ResolvedEnv {
     pub fn default_env_name() -> String {
         "default".to_string()
     }
+
+    /// Enforce the invariants that `RepoConfig::validate` enforces on the
+    /// YAML side, so the synthetic-default path (legacy env-var-only
+    /// deployments, no .gitforgeops/config.yaml) can't construct a
+    /// configuration the YAML validator would reject. Run this at the end
+    /// of resolve_env so both branches go through the same gate.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if matches!(self.ownership.mode, OwnershipMode::Shared)
+            && matches!(self.apply_strategy, ApplyStrategy::FullReplace)
+        {
+            return Err(crate::error::Error::Config(format!(
+                "environment '{}': apply_strategy='full_replace' is incompatible with ownership.mode='shared' (full_replace would wipe unmanaged resources). Set FERRUM_APPLY_STRATEGY=incremental, or define the env in .gitforgeops/config.yaml with ownership.mode='exclusive' + explicit namespaces.",
+                self.name
+            )));
+        }
+        if matches!(self.ownership.mode, OwnershipMode::Exclusive)
+            && self
+                .ownership
+                .namespaces
+                .as_ref()
+                .map(|ns| ns.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(crate::error::Error::Config(format!(
+                "environment '{}': ownership.mode='exclusive' requires ownership.namespaces to be non-empty",
+                self.name
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the active environment for this run.
@@ -41,7 +71,7 @@ pub fn resolve_env(
         .map(|s| s.to_string())
         .or_else(|| env_config.env_name.clone());
 
-    match (repo, selected.as_deref()) {
+    let resolved = match (repo, selected.as_deref()) {
         (Some(repo), Some(name)) => {
             let env = repo.environment(name).ok_or_else(|| {
                 crate::error::Error::Config(format!(
@@ -49,7 +79,7 @@ pub fn resolve_env(
                     super::repo_config::REPO_CONFIG_PATH
                 ))
             })?;
-            Ok(merge(name.to_string(), env, env_config))
+            merge(name.to_string(), env, env_config)
         }
         (Some(repo), None) => {
             if let Some(default) = &repo.default_environment {
@@ -59,23 +89,29 @@ pub fn resolve_env(
                         super::repo_config::REPO_CONFIG_PATH
                     ))
                 })?;
-                return Ok(merge(default.clone(), env, env_config));
-            }
-            if repo.environments.len() == 1 {
+                merge(default.clone(), env, env_config)
+            } else if repo.environments.len() == 1 {
                 let (name, env) = repo.environments.iter().next().unwrap();
-                return Ok(merge(name.clone(), env, env_config));
+                merge(name.clone(), env, env_config)
+            } else if repo.environments.is_empty() {
+                synthetic_default(env_config)
+            } else {
+                let names = repo.environment_names().join(", ");
+                return Err(crate::error::Error::Config(format!(
+                    "multiple environments defined ({names}); specify --env or FERRUM_ENV, or set default_environment in {}",
+                    super::repo_config::REPO_CONFIG_PATH
+                )));
             }
-            if repo.environments.is_empty() {
-                return Ok(synthetic_default(env_config));
-            }
-            let names = repo.environment_names().join(", ");
-            Err(crate::error::Error::Config(format!(
-                "multiple environments defined ({names}); specify --env or FERRUM_ENV, or set default_environment in {}",
-                super::repo_config::REPO_CONFIG_PATH
-            )))
         }
-        (None, _) => Ok(synthetic_default(env_config)),
-    }
+        (None, _) => synthetic_default(env_config),
+    };
+
+    // Enforce shared + full_replace incompatibility (and other invariants)
+    // on every path — the YAML validator guards the repo-config side but
+    // the synthetic path picks up legacy FERRUM_APPLY_STRATEGY=full_replace
+    // env vars without going through that check.
+    resolved.validate()?;
+    Ok(resolved)
 }
 
 fn merge(name: String, env: &EnvironmentConfig, env_config: &EnvConfig) -> ResolvedEnv {

@@ -139,6 +139,13 @@ jobs:
         if: vars.FERRUM_GATEWAY_MODE != 'file'
         env:
           FERRUM_ENV: ${{ matrix.environment }}
+          # The workflow-level `if:` only gates whether this step runs; it
+          # does NOT propagate FERRUM_GATEWAY_MODE into the process env.
+          # Without this line, `gitforgeops apply` reads the unset var and
+          # falls back to its default (api). Default happens to be `api`
+          # so the non-file arm works by accident, but we make it explicit
+          # for symmetry with the file-mode step.
+          FERRUM_GATEWAY_MODE: api
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
@@ -169,6 +176,13 @@ jobs:
         if: vars.FERRUM_GATEWAY_MODE == 'file'
         env:
           FERRUM_ENV: ${{ matrix.environment }}
+          # `vars.FERRUM_GATEWAY_MODE` gates expression evaluation, not the
+          # process environment. Without this explicit export the binary
+          # reads an unset FERRUM_GATEWAY_MODE, defaults to api, and tries
+          # to push to a gateway — typically failing on missing URL/JWT
+          # secrets. Must set to `file` here so apply takes the file-mode
+          # branch.
+          FERRUM_GATEWAY_MODE: file
           # Must match the path staged by the commit step below. Without
           # this override, apply writes to the default
           # ./assembled/resources.yaml and the per-env staged path doesn't

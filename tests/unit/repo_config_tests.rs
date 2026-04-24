@@ -120,6 +120,50 @@ environments:
 }
 
 #[test]
+fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
+    // Regression guard: RepoConfig::validate blocks the combination in YAML,
+    // but the synthetic-default path (no .gitforgeops/config.yaml, pure
+    // env-var config) used to bypass the check. ResolvedEnv::validate now
+    // enforces the same rule on every resolve_env path.
+    use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
+    use gitforgeops::config::resolve_env;
+
+    let env_config = EnvConfig {
+        gateway_url: None,
+        admin_jwt_secret: None,
+        namespace_filter: None,
+        gateway_mode: GatewayMode::Api,
+        apply_strategy: ApplyStrategy::FullReplace, // <-- legacy setting
+        overlay: None,
+        env_name: None,
+        github_repository: None,
+        github_token: None,
+        github_provisioner_token: None,
+        creds_bundle_json: None,
+        file_output_path: "./assembled/resources.yaml".to_string(),
+        edge_binary_path: "ferrum-edge".to_string(),
+        tls_no_verify: false,
+        ca_cert: None,
+        client_cert: None,
+        client_key: None,
+        gateway_connect_timeout_secs: 10,
+        gateway_request_timeout_secs: 60,
+        github_connect_timeout_secs: 10,
+        github_request_timeout_secs: 30,
+        gateway_max_retries: 3,
+    };
+
+    // No repo config → synthetic_default picks ownership=shared, carries
+    // full_replace from env — incompatible combination.
+    let err = resolve_env(None, &env_config, None).unwrap_err();
+    assert!(
+        err.to_string().contains("full_replace"),
+        "expected full_replace+shared rejection, got: {err}"
+    );
+    assert!(err.to_string().contains("shared"));
+}
+
+#[test]
 fn repo_config_rejects_unknown_default_environment() {
     let yaml = r#"
 environments:
