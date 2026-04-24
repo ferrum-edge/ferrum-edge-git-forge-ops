@@ -118,6 +118,7 @@ pub fn build_review_comment_v2(
     comparison_error: Option<&str>,
     environment_note: Option<&str>,
     secrets: &ResolveReport,
+    bundle_loaded: bool,
 ) -> String {
     let mut md = build_review_comment(
         validation_success,
@@ -192,13 +193,36 @@ pub fn build_review_comment_v2(
 
     if !secrets.results.is_empty() {
         md.push_str("### Credential Slots\n\n");
-        md.push_str("| Slot | Status |\n|------|--------|\n");
+        if !bundle_loaded {
+            // PR review on a fork (or any context without environment-secret
+            // access) sees no bundle, so every placeholder looks unresolved.
+            // Without this disclaimer, a reviewer would think already-
+            // allocated slots are missing and spam apply-first guidance.
+            md.push_str(
+                "_This CI context has no access to the credential bundle \
+                 (typical for PRs from forks or runs without an environment \
+                 binding). The table below shows which placeholders are \
+                 declared; **actual allocation status is determined at apply \
+                 time**, not here._\n\n",
+            );
+        }
+        md.push_str("| Slot | Declared as |\n|------|-------------|\n");
         for r in &secrets.results {
-            let label = match r.status {
-                SlotStatus::Resolved => "resolved",
-                SlotStatus::NeedsAllocation => "needs allocation (generated on apply)",
-                SlotStatus::NeedsRotation => "needs rotation (regenerated on apply)",
-                SlotStatus::MissingRequired => "**MISSING (required)**",
+            let label = if bundle_loaded {
+                match r.status {
+                    SlotStatus::Resolved => "resolved".to_string(),
+                    SlotStatus::NeedsAllocation => {
+                        "needs allocation (generated on apply)".to_string()
+                    }
+                    SlotStatus::NeedsRotation => {
+                        "needs rotation (regenerated on apply)".to_string()
+                    }
+                    SlotStatus::MissingRequired => "**MISSING (required)**".to_string(),
+                }
+            } else {
+                // Without a bundle, the only signal is the placeholder's alloc
+                // mode. Show that rather than bundle-dependent status.
+                format!("{:?}", r.placeholder.alloc)
             };
             md.push_str(&format!("| `{}` | {} |\n", r.slot, label));
         }

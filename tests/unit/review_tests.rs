@@ -116,6 +116,7 @@ fn review_comment_v2_uses_configured_override_label_and_permission() {
         None,
         None,
         &ResolveReport::default(),
+        true, // bundle_loaded — test contexts have a bundle
     );
 
     assert!(
@@ -159,8 +160,75 @@ fn review_comment_v2_falls_back_to_defaults_when_no_override_config() {
         None,
         None,
         &ResolveReport::default(),
+        true, // bundle_loaded — test contexts have a bundle
     );
 
     assert!(comment.contains("gitforgeops/policy-override"));
     assert!(comment.contains("`write` permission"));
+}
+
+#[test]
+fn review_comment_credential_section_discloses_bundle_context_when_absent() {
+    use gitforgeops::secrets::placeholder::{PlaceholderAlloc, SecretPlaceholder};
+    use gitforgeops::secrets::{ResolveReport, ResolveResult, SlotStatus};
+
+    // Build a report that looks like what resolve_secrets would produce
+    // against an empty bundle: a single placeholder marked NeedsAllocation.
+    let mut report = ResolveReport::default();
+    report.results.push(ResolveResult {
+        consumer_id: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        cred_key: "api_key".to_string(),
+        slot: "ferrum/app/api_key".to_string(),
+        placeholder: SecretPlaceholder {
+            alloc: PlaceholderAlloc::Generate,
+            length_bytes: 32,
+        },
+        status: SlotStatus::NeedsAllocation,
+    });
+
+    // bundle_loaded=false → disclaimer present, status wording not shown
+    let no_bundle = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &report,
+        false,
+    );
+    assert!(
+        no_bundle.contains("actual allocation status is determined at apply time"),
+        "expected bundle-context disclaimer when bundle_loaded=false; got:\n{no_bundle}"
+    );
+    // Without bundle, we show the alloc mode, not a bundle-dependent status.
+    assert!(no_bundle.contains("Generate"));
+    assert!(!no_bundle.contains("needs allocation (generated on apply)"));
+
+    // bundle_loaded=true → no disclaimer, full status wording
+    let with_bundle = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &report,
+        true,
+    );
+    assert!(!with_bundle.contains("actual allocation status is determined at apply time"));
+    assert!(with_bundle.contains("needs allocation (generated on apply)"));
 }

@@ -1236,6 +1236,17 @@ async fn cmd_review(
         resolved.name, resolved.ownership.mode, resolved.apply_strategy
     );
 
+    let bundle_loaded = env_config
+        .creds_bundle_json_file
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || env_config
+            .creds_bundle_json
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+
     let comment = review::build_review_comment_v2(
         validation_ok,
         &validation_output,
@@ -1250,6 +1261,7 @@ async fn cmd_review(
         comparison_error.as_deref(),
         Some(&ownership_note),
         &secret_report,
+        bundle_loaded,
     );
 
     match pr {
