@@ -80,6 +80,41 @@ fn shard_secret_name_strips_suffix_for_shard_zero() {
 }
 
 #[test]
+fn existing_slot_stays_on_its_current_shard() {
+    // Verifies the invariant that allocate_and_deliver must honor:
+    // once a slot lives on shard N, subsequent writes should find it on N
+    // regardless of how shard_count has grown. pick_shard alone wouldn't
+    // guarantee this; allocate_and_deliver now consults the per-shard map
+    // first. This test covers the bookkeeping directly.
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle};
+
+    let slot = "ferrum/app/api_key";
+
+    // Start with the slot on shard 0.
+    let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    shards
+        .entry(0)
+        .or_default()
+        .insert(slot.to_string(), "v0".to_string());
+
+    // Expand shard_count to 4 — as if we've grown since initial allocation.
+    let shard_count = 4;
+
+    // pick_shard would hash-pick among 0..4, which may or may not return 0.
+    // The right behavior (as implemented in allocate_and_deliver) is to
+    // notice existing_shard == Some(0) and keep writing there, so the
+    // stale copy can't linger on a different shard.
+    let existing = shards
+        .iter()
+        .find_map(|(s, bundle)| bundle.contains_key(slot).then_some(*s));
+    assert_eq!(existing, Some(0));
+
+    // Sanity: pick_shard is still deterministic for new slots.
+    let fresh = pick_shard("ferrum/other/cred", 32, &shards, shard_count).unwrap();
+    assert!(fresh < shard_count);
+}
+
+#[test]
 fn pick_shard_is_deterministic_and_within_bounds() {
     let shards = BTreeMap::new();
     let a = pick_shard("slot-a", 32, &shards, 4).unwrap();

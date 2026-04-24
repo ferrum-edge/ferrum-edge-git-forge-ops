@@ -70,23 +70,38 @@ pub async fn allocate_and_deliver(
     for candidate in candidates {
         let value = random_value(candidate.placeholder.length_bytes);
 
-        let shard = loop {
-            if *shard_count == 0 {
-                *shard_count = 1;
-            }
-            match pick_shard(&candidate.slot, value.len(), shards, *shard_count) {
-                Some(s) => break s,
-                None => {
-                    // Target shard would overflow — expand and redistribute lazily.
-                    *shard_count += 1;
-                    if *shard_count > 100 {
-                        return Err(crate::error::Error::Config(
-                            "credential bundle shards exceeded 100 (GitHub env secret limit)"
-                                .to_string(),
-                        ));
+        // Prefer the shard the slot already lives on (for alloc=rotate, and
+        // for alloc=generate on a slot that somehow exists). If we ran
+        // pick_shard after `shard_count` has grown, the hash-based target
+        // could differ from the slot's current shard — we'd write the fresh
+        // value to shard N while a stale copy lingers on shard M. Because
+        // `merge_bundles` iterates shards in ascending order, whichever copy
+        // sits on the higher shard index wins; that can silently revert a
+        // rotation to the old value.
+        let existing_shard = shards
+            .iter()
+            .find_map(|(s, bundle)| bundle.contains_key(&candidate.slot).then_some(*s));
+
+        let shard = match existing_shard {
+            Some(s) => s,
+            None => loop {
+                if *shard_count == 0 {
+                    *shard_count = 1;
+                }
+                match pick_shard(&candidate.slot, value.len(), shards, *shard_count) {
+                    Some(s) => break s,
+                    None => {
+                        // Target shard would overflow — expand and redistribute lazily.
+                        *shard_count += 1;
+                        if *shard_count > 100 {
+                            return Err(crate::error::Error::Config(
+                                "credential bundle shards exceeded 100 (GitHub env secret limit)"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 }
-            }
+            },
         };
 
         shards

@@ -1177,17 +1177,40 @@ async fn cmd_rotate(
     )
     .await?;
 
+    // The rotation wrote a fresh value to the GitHub Environment Secret and
+    // (optionally) delivered it to the recipient. The live gateway still
+    // validates the OLD value until we push the new one. Push the updated
+    // consumer now so the rotation is immediately usable — skipping this
+    // step locks the recipient out until someone else triggers apply.
+    let push_status =
+        push_rotated_consumer_to_gateway(&env_config, &resolved, &per_shard, ns, consumer).await;
+
     state.credential_shard_count = shard_count;
     state.record_credential(
         &slot,
         outcome.shard,
         &outcome.value,
         outcome.delivered.as_ref().map(|d| d.login.as_str()),
-        None,
+        std::env::var("GITHUB_RUN_ID").ok().as_deref(),
     );
     state.save()?;
 
     println!("Rotated slot {slot} in shard {}", outcome.shard);
+    match push_status {
+        Ok(()) => println!("Gateway consumer '{}/{}' updated.", ns, consumer),
+        Err(e) => {
+            // Hard-fail: the credential store and gateway are out of sync.
+            // We already delivered the new value to the recipient; returning
+            // Ok would trick the caller into thinking rotation succeeded.
+            return Err(format!(
+                "Rotated credential stored + delivered, but gateway push FAILED: {e}\n\
+                 The new value will not authenticate until `gitforgeops apply` is run.\n\
+                 Resolve the gateway error and re-run apply to close the gap."
+            )
+            .into());
+        }
+    }
+
     match outcome.delivered {
         Some(d) => {
             println!(
@@ -1203,5 +1226,41 @@ async fn cmd_rotate(
         }
     }
 
+    Ok(())
+}
+
+/// Push just the rotated consumer to the live gateway so the new credential
+/// is immediately usable. Loads desired config, resolves placeholders against
+/// the post-rotation bundle (including rotate slots), finds the target
+/// consumer, and calls `update_consumer`.
+async fn push_rotated_consumer_to_gateway(
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
+    namespace: &str,
+    consumer_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(env_config.gateway_mode, GatewayMode::Api) {
+        return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
+    }
+
+    let mut desired = load_and_assemble_for(resolved)?;
+    let merged = secrets::merge_bundles(per_shard);
+    // Use the rotate-aware variant so rotate placeholders pick up the fresh
+    // value that rotate_and_deliver just wrote into the bundle.
+    let _ = secrets::resolve_secrets_including_rotate(&mut desired, &merged)?;
+
+    let consumer = desired
+        .consumers
+        .iter()
+        .find(|c| c.namespace == namespace && c.id == consumer_id)
+        .ok_or_else(|| {
+            format!(
+                "consumer '{namespace}/{consumer_id}' not present in repo desired state; cannot push rotated credential. Add the consumer to resources/ first, or if it was intentionally removed, rotation has no consumer to update."
+            )
+        })?;
+
+    let client = AdminClient::new(env_config)?;
+    client.update_consumer(consumer, namespace).await?;
     Ok(())
 }
