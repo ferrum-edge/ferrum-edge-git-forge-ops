@@ -98,6 +98,28 @@ environments:
 }
 
 #[test]
+fn repo_config_drift_alert_defaults_flag_managed_changes_only() {
+    // Default drift_alert_on should alert on managed modifications/deletions
+    // but NOT on unmanaged additions (admin-GUI-added resources are expected
+    // in shared mode and shouldn't spam the drift check).
+    let yaml = r#"
+environments:
+  staging:
+    overlay: staging
+"#;
+    let file = write_repo_config(yaml);
+    let config = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+    let alert = &config
+        .environment("staging")
+        .unwrap()
+        .ownership
+        .drift_alert_on;
+    assert!(alert.managed_modified);
+    assert!(alert.managed_deleted);
+    assert!(!alert.unmanaged_added);
+}
+
+#[test]
 fn repo_config_rejects_unknown_default_environment() {
     let yaml = r#"
 environments:

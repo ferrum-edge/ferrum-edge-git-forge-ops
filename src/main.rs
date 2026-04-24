@@ -143,12 +143,32 @@ fn resolve_credentials(
     Ok(secrets::resolve_secrets(cfg, &bundle)?)
 }
 
-fn resolved_namespaces(resolved: &ResolvedEnv, desired: &GatewayConfig) -> Vec<String> {
+fn resolved_namespaces(
+    resolved: &ResolvedEnv,
+    desired: &GatewayConfig,
+    state: &StateFile,
+) -> Vec<String> {
     match resolved.ownership.mode {
         OwnershipMode::Exclusive => resolved.ownership.namespaces.clone().unwrap_or_default(),
         OwnershipMode::Shared => match resolved.namespace_filter.as_deref() {
             Some(ns) => vec![ns.to_string()],
-            None => config::collect_namespaces(desired),
+            None => {
+                // Shared mode: iterate every namespace the repo *currently*
+                // declares AND every namespace it has previously managed.
+                // Missing the latter means a PR that removes the last resource
+                // from a namespace silently stops reconciling it — the gateway
+                // keeps the orphan forever.
+                use std::collections::BTreeSet;
+                let mut set: BTreeSet<String> =
+                    config::collect_namespaces(desired).into_iter().collect();
+                for key in state.resources.keys() {
+                    // state key format: "<namespace>:<Kind>:<id>"
+                    if let Some((ns, _)) = key.split_once(':') {
+                        set.insert(ns.to_string());
+                    }
+                }
+                set.into_iter().collect()
+            }
         },
     }
 }
@@ -507,7 +527,7 @@ async fn cmd_diff(
     let client = AdminClient::new(&env_config)?;
     let state = StateFile::load(&resolved.name);
     let managed = previously_managed(&resolved, &state);
-    let namespaces = resolved_namespaces(&resolved, &desired);
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
     let (diffs, _breaking, unmanaged) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
@@ -544,8 +564,20 @@ async fn cmd_diff(
         }
     }
 
-    let has_drift = !diffs.is_empty()
-        || (resolved.ownership.drift_alert_on.unmanaged_added && !unmanaged.is_empty());
+    // Honor drift_alert_on flags so operators can selectively suppress
+    // categories (e.g. a noisy staging env where only destructive changes
+    // should alert). Only categories with their flag set contribute to the
+    // drift decision.
+    let alert = &resolved.ownership.drift_alert_on;
+    let managed_modify_or_add = diffs
+        .iter()
+        .any(|d| matches!(d.action, diff::DiffAction::Modify | diff::DiffAction::Add));
+    let managed_delete = diffs
+        .iter()
+        .any(|d| matches!(d.action, diff::DiffAction::Delete));
+    let has_drift = (alert.managed_modified && managed_modify_or_add)
+        || (alert.managed_deleted && managed_delete)
+        || (alert.unmanaged_added && !unmanaged.is_empty());
 
     if exit_on_drift && has_drift {
         process::exit(2);
@@ -597,7 +629,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name);
     let managed = previously_managed(&resolved, &state);
-    let namespaces = resolved_namespaces(&resolved, &desired);
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let (diffs, breaking, unmanaged, actual_available) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
@@ -777,7 +809,7 @@ async fn cmd_apply(
         );
     }
 
-    let namespaces = resolved_namespaces(&resolved, &desired);
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
     // Populated by the API-mode arm after the approve gate; None for file mode
     // or when nothing needed allocating. State-record reads this after the
     // match.
@@ -835,9 +867,31 @@ async fn cmd_apply(
                 process::exit(0);
             }
 
-            // User has approved apply. Allocate/rotate credentials *now* — we
-            // deliberately do not write to GitHub env secrets during a plan
-            // preview.
+            // Large-prune safety check runs BEFORE allocation. The check
+            // inspects the diff against the placeholder-containing desired
+            // (allocation would only replace string values, not change which
+            // resources exist), so pruning behavior is unaffected. Placing
+            // allocation after this gate means a blocked apply leaves GitHub
+            // env secrets untouched — otherwise we'd burn a generated value
+            // that the gateway never receives.
+            let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+            let (diffs, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+            let delete_count = diffs
+                .iter()
+                .filter(|d| matches!(d.action, diff::DiffAction::Delete))
+                .count();
+            let managed_total = state.resources.len().max(1);
+            let delete_pct = (delete_count * 100) / managed_total;
+            let threshold = resolved.ownership.large_prune_threshold_percent as usize;
+            if delete_pct > threshold && !allow_large_prune {
+                eprintln!(
+                    "Refusing to apply: would delete {}% of managed resources (threshold {}%). Re-run with --allow-large-prune to proceed.",
+                    delete_pct, threshold
+                );
+                process::exit(1);
+            }
+
+            // All safety gates passed — now allocate/rotate credentials.
             allocation = allocate_if_needed(
                 &mut desired,
                 &env_config,
@@ -865,24 +919,6 @@ async fn cmd_apply(
                         ),
                     }
                 }
-            }
-
-            // Large-prune safety check.
-            let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
-            let (diffs, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
-            let delete_count = diffs
-                .iter()
-                .filter(|d| matches!(d.action, diff::DiffAction::Delete))
-                .count();
-            let managed_total = state.resources.len().max(1);
-            let delete_pct = (delete_count * 100) / managed_total;
-            let threshold = resolved.ownership.large_prune_threshold_percent as usize;
-            if delete_pct > threshold && !allow_large_prune {
-                eprintln!(
-                    "Refusing to apply: would delete {}% of managed resources (threshold {}%). Re-run with --allow-large-prune to proceed.",
-                    delete_pct, threshold
-                );
-                process::exit(1);
             }
 
             let result = apply::apply_api(
@@ -969,7 +1005,7 @@ async fn cmd_review(
     let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name);
     let managed = previously_managed(&resolved, &state);
-    let namespaces = resolved_namespaces(&resolved, &desired);
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
 
     let (diffs, breaking, unmanaged, comparison_error) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {

@@ -131,6 +131,36 @@ fn shared_mode_deletes_resource_previously_managed_now_removed_from_repo() {
 }
 
 #[test]
+fn shared_mode_iterates_previously_managed_namespaces_even_when_desired_is_empty_there() {
+    // The key invariant: if the repo used to manage a resource in namespace X
+    // and then removes its last resource, we still need to reconcile X to
+    // delete the orphan. Verified at the compute_diff layer by passing a
+    // previously_managed set that contains team-alpha — even when desired is
+    // empty for team-alpha, the previously-managed hit drives a delete.
+    let desired_for_team_alpha = gateway_with(vec![]);
+    let actual_for_team_alpha = gateway_with(vec![proxy("was-in-repo", "team-alpha")]);
+
+    let mut managed = HashSet::new();
+    managed.insert(state_key("team-alpha", "Proxy", "was-in-repo"));
+
+    let result = compute_diff_with_ownership(
+        &desired_for_team_alpha,
+        &actual_for_team_alpha,
+        Some(&managed),
+    );
+
+    assert!(result.unmanaged.is_empty());
+    let deletes: Vec<_> = result
+        .diffs
+        .iter()
+        .filter(|d| matches!(d.action, DiffAction::Delete))
+        .collect();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].id, "was-in-repo");
+    assert_eq!(deletes[0].namespace, "team-alpha");
+}
+
+#[test]
 fn exclusive_mode_with_explicit_namespaces_iterates_empty_namespaces() {
     // Scenario: repo used to manage `team-alpha` but now declares no resources
     // there. In exclusive mode with `namespaces: [team-alpha]`, apply must
