@@ -607,6 +607,13 @@ async fn cmd_diff(
 async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
+    // Audit security BEFORE resolving credentials. audit_security flags
+    // literal (non-placeholder) credential strings as a security issue
+    // ("use ${...} for secrets"). If we resolve first, placeholders are
+    // replaced with real values — which, post-substitution, look like
+    // literals to the auditor. Running pre-resolve keeps the audit on
+    // the repo's actual committed state.
+    let security_findings = diff::audit_security(&desired);
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
 
     println!("=== Environment ===");
@@ -702,7 +709,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
         println!();
     }
 
-    let security_findings = diff::audit_security(&desired);
+    // security_findings was computed pre-resolve above; reuse it here.
     if !security_findings.is_empty() {
         println!("=== Security Findings ===");
         for sf in &security_findings {
@@ -1111,6 +1118,9 @@ async fn cmd_review(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
+    // Audit pre-resolve so placeholder-resolved values aren't misreported as
+    // literal credentials (see cmd_plan for full rationale).
+    let security_findings = diff::audit_security(&desired);
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
@@ -1145,7 +1155,7 @@ async fn cmd_review(
         ),
     };
 
-    let security_findings = diff::audit_security(&desired);
+    // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
     let (policy_findings, override_reason, override_cfg) = match policy::load_policies()? {

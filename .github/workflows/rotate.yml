@@ -51,16 +51,24 @@ jobs:
         run: cargo install --path . --locked
 
       - name: Load credential bundles
-        env:
-          ALL_SECRETS: ${{ toJSON(secrets) }}
+        # Heredoc-to-file routing bypasses OS env-var size limits that
+        # would truncate multi-shard FERRUM_CREDS_BUNDLE* payloads at
+        # scale. See apply-on-merge.yml for the full rationale.
         run: |
-          python3 - <<'PY' >> "$GITHUB_ENV"
-          import json, os
-          raw = os.environ.get("ALL_SECRETS", "{}")
-          try:
-              data = json.loads(raw)
-          except json.JSONDecodeError:
-              data = {}
+          set -euo pipefail
+          secrets_file=$(mktemp)
+          trap 'rm -f "$secrets_file"' EXIT
+          cat > "$secrets_file" <<'SECRETS_EOF'
+          ${{ toJSON(secrets) }}
+          SECRETS_EOF
+
+          python3 - "$secrets_file" >> "$GITHUB_ENV" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              try:
+                  data = json.load(f)
+              except json.JSONDecodeError:
+                  data = {}
           bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
           print("FERRUM_CREDS_JSON<<__FERRUM_EOF__")
           print(json.dumps(bundles))

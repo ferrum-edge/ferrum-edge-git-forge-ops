@@ -87,25 +87,30 @@ jobs:
 
       - name: Load credential bundles
         id: load-bundles
-        env:
-          ALL_SECRETS: ${{ toJSON(secrets) }}
+        # Route `toJSON(secrets)` through a temp file on disk rather than an
+        # environment variable. OS env blocks are capped in the low MBs;
+        # multi-shard credential bundles at ~48 KB/shard can exceed that
+        # ceiling at scale, causing env-var truncation and silent
+        # partial-bundle loads. Heredoc-to-file bypasses the cap entirely
+        # and gets cleaned up on step exit.
         run: |
-          # Collect any FERRUM_CREDS_BUNDLE* secrets into a single JSON object and
-          # make it available to the binary. GitHub masks all referenced secrets
-          # in logs, so echoing the JSON here is mask-safe by the time it reaches
-          # stdout; but we still write it directly to the env file.
-          python3 - <<'PY' >> "$GITHUB_ENV"
-          import json, os
-          raw = os.environ.get("ALL_SECRETS", "{}")
-          try:
-              data = json.loads(raw)
-          except json.JSONDecodeError:
-              data = {}
+          set -euo pipefail
+          secrets_file=$(mktemp)
+          trap 'rm -f "$secrets_file"' EXIT
+          cat > "$secrets_file" <<'SECRETS_EOF'
+          ${{ toJSON(secrets) }}
+          SECRETS_EOF
+
+          python3 - "$secrets_file" >> "$GITHUB_ENV" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              try:
+                  data = json.load(f)
+              except json.JSONDecodeError:
+                  data = {}
           bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
-          payload = json.dumps(bundles)
-          # Multi-line env var with the EOF marker convention.
           print("FERRUM_CREDS_JSON<<__FERRUM_EOF__")
-          print(payload)
+          print(json.dumps(bundles))
           print("__FERRUM_EOF__")
           PY
 
@@ -164,6 +169,11 @@ jobs:
         if: vars.FERRUM_GATEWAY_MODE == 'file'
         env:
           FERRUM_ENV: ${{ matrix.environment }}
+          # Must match the path staged by the commit step below. Without
+          # this override, apply writes to the default
+          # ./assembled/resources.yaml and the per-env staged path doesn't
+          # exist, so placeholder-assembly changes never get committed.
+          FERRUM_FILE_OUTPUT_PATH: assembled/${{ matrix.environment }}.yaml
           FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
