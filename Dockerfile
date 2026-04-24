@@ -8,12 +8,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 RUN cargo build --release
 
-# Minimal distroless runtime image.
-# `-cc` variant provides glibc + libgcc for dynamically-linked Rust binaries,
-# plus ca-certificates for HTTPS (rustls reads /etc/ssl/certs). Debian 13
-# (trixie) distroless has glibc 2.40, forward-compatible with binaries built
-# on Debian 12 (bookworm, glibc 2.36).
-FROM gcr.io/distroless/cc-debian13
+# Slim Debian runtime. Not fully distroless because this image is also
+# used as a GitHub Actions job container (see validate-pr.yml), which
+# requires /bin/sh for action bootstrap. Trixie matches the glibc of
+# the upstream ferrum-edge image so the copied binary links cleanly.
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ferrum-edge /app/ferrum-edge /app/ferrum-edge
 COPY --from=builder /build/target/release/gitforgeops /app/gitforgeops
