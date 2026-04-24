@@ -80,14 +80,21 @@ jobs:
       - name: Install gitforgeops
         run: cargo install --path . --locked
 
+      # Pass env via FERRUM_ENV rather than interpolating `matrix.environment`
+      # into the shell command. Binary validates the name against a strict
+      # allowlist via ResolvedEnv::validate (ASCII alphanum + `-` + `_`), but
+      # avoiding shell interpolation of untrusted values is the
+      # defense-in-depth baseline.
       - name: Validate
-        run: gitforgeops --env ${{ matrix.environment }} validate --format github-annotations
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
+        run: gitforgeops validate --format github-annotations
 
       - name: Review
         if: github.event.pull_request.number
         env:
+          FERRUM_ENV: ${{ matrix.environment }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITFORGEOPS_PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gitforgeops --env ${{ matrix.environment }} review --pr ${{ github.event.pull_request.number }}
+        run: gitforgeops review --pr "$GITFORGEOPS_PR_NUMBER"

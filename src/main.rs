@@ -129,6 +129,22 @@ fn load_credential_bundles(
     ),
     Box<dyn std::error::Error>,
 > {
+    // Prefer the file-path form. At scale (many shards × 48 KB), the
+    // inline env-var form collides with OS env-block size limits; the
+    // file path skips that bound entirely.
+    if let Some(path) = &env_config.creds_bundle_json_file {
+        if !path.trim().is_empty() {
+            let raw = std::fs::read_to_string(path).map_err(|source| {
+                gitforgeops::error::Error::FileRead {
+                    path: std::path::PathBuf::from(path),
+                    source,
+                }
+            })?;
+            if !raw.trim().is_empty() {
+                return Ok(secrets::load_bundles_from_env(&raw)?);
+            }
+        }
+    }
     match &env_config.creds_bundle_json {
         Some(raw) if !raw.trim().is_empty() => Ok(secrets::load_bundles_from_env(raw)?),
         _ => Ok((BTreeMap::new(), BTreeMap::new())),
@@ -943,7 +959,24 @@ async fn cmd_apply(
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
                 .count();
-            let managed_total = state.resources.len().max(1);
+            // Only count managed resources in the namespaces we are actually
+            // reconciling. A scoped apply (FERRUM_NAMESPACE=ferrum) that
+            // deletes 100% of its namespace's resources would otherwise show
+            // a tiny percentage of the cross-namespace total and slip under
+            // the threshold — exactly the case the guard exists to catch.
+            let managed_total = {
+                let ns_set: std::collections::HashSet<&str> =
+                    namespaces.iter().map(String::as_str).collect();
+                state
+                    .resources
+                    .keys()
+                    .filter(|k| {
+                        let ns = k.split_once(':').map(|(n, _)| n).unwrap_or("");
+                        ns_set.contains(ns)
+                    })
+                    .count()
+                    .max(1)
+            };
             let delete_pct = (delete_count * 100) / managed_total;
             let threshold = resolved.ownership.large_prune_threshold_percent as usize;
             if delete_pct > threshold && !allow_large_prune {

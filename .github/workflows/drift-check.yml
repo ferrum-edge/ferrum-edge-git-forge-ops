@@ -73,18 +73,17 @@ jobs:
         run: cargo install --path . --locked
 
       - name: Load credential bundles
-        # Heredoc-to-file routing bypasses OS env-var size limits that
-        # would truncate multi-shard FERRUM_CREDS_BUNDLE* payloads at
-        # scale. See apply-on-merge.yml for the full rationale.
+        # File-path routing around OS env-block size limits. See
+        # apply-on-merge.yml for the full rationale.
         run: |
           set -euo pipefail
-          secrets_file=$(mktemp)
-          trap 'rm -f "$secrets_file"' EXIT
-          cat > "$secrets_file" <<'SECRETS_EOF'
+          all_secrets=$(mktemp)
+          trap 'rm -f "$all_secrets"' EXIT
+          cat > "$all_secrets" <<'SECRETS_EOF'
           ${{ toJSON(secrets) }}
           SECRETS_EOF
-
-          python3 - "$secrets_file" >> "$GITHUB_ENV" <<'PY'
+          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-$$.json"
+          python3 - "$all_secrets" "$creds_file" <<'PY'
           import json, sys
           with open(sys.argv[1]) as f:
               try:
@@ -92,10 +91,11 @@ jobs:
               except json.JSONDecodeError:
                   data = {}
           bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
-          print("FERRUM_CREDS_JSON<<__FERRUM_EOF__")
-          print(json.dumps(bundles))
-          print("__FERRUM_EOF__")
+          with open(sys.argv[2], "w") as out:
+              json.dump(bundles, out)
           PY
+          chmod 600 "$creds_file"
+          echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Check drift
         env:

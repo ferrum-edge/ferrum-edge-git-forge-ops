@@ -132,6 +132,13 @@ impl RepoConfig {
 
     fn validate(&self) -> crate::error::Result<()> {
         for (name, env) in &self.environments {
+            // Env name guards: reject anything that wouldn't be a safe
+            // filesystem path component OR contains shell metacharacters.
+            // `envs --format json` emits these names into CI matrix values
+            // that may hit shell command lines before `ResolvedEnv::validate`
+            // runs, so the guard belongs at load time too.
+            super::resolved::validate_env_name_is_safe_path_component(name)?;
+
             if matches!(env.ownership.mode, OwnershipMode::Exclusive)
                 && env
                     .ownership

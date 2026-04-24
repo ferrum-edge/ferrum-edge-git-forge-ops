@@ -58,21 +58,29 @@ impl ResolvedEnv {
     }
 }
 
-/// Reject environment names that would be unsafe as a filesystem path
-/// component (path separators, traversal segments, null bytes, empty
-/// string). Environment names flow from untrusted input (repo config keys,
-/// FERRUM_ENV env var, --env CLI flag) into a .state/<name>.json path.
+/// Environment names flow through three untrusted surfaces: repo config
+/// YAML keys, the FERRUM_ENV env var, and the `--env` CLI flag. They also
+/// get interpolated into `.state/<name>.json` paths and (via
+/// `gitforgeops envs --format json`) into CI matrix values that end up on
+/// shell command lines. A strict allowlist is the safest enforcement.
+///
+/// Accepted: ASCII letters, digits, `-`, `_`. Length 1..=64. That's
+/// enough for any sensible environment identifier and rejects shell
+/// metacharacters, whitespace, path separators, and traversal segments by
+/// construction.
 pub fn validate_env_name_is_safe_path_component(name: &str) -> crate::error::Result<()> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0')
-    {
+    if name.is_empty() || name.len() > 64 {
         return Err(crate::error::Error::Config(format!(
-            "environment name {name:?} is not safe for use as a filesystem path component. \
-             Names must not be empty, '.', '..', or contain '/', '\\', or null bytes."
+            "environment name {name:?} must be 1..=64 characters."
+        )));
+    }
+    let ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        return Err(crate::error::Error::Config(format!(
+            "environment name {name:?} contains disallowed characters. \
+             Accepted: ASCII letters, digits, '-', '_'."
         )));
     }
     Ok(())

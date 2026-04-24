@@ -14,6 +14,7 @@ fn base_env() -> EnvConfig {
         github_token: None,
         github_provisioner_token: None,
         creds_bundle_json: None,
+        creds_bundle_json_file: None,
         file_output_path: "./assembled/resources.yaml".to_string(),
         edge_binary_path: "ferrum-edge".to_string(),
         tls_no_verify: false,

@@ -48,7 +48,14 @@ pub struct EnvConfig {
     /// Token used to write GitHub Environment Secrets (provisioner).
     pub github_provisioner_token: Option<String>,
     /// JSON-encoded credential bundle map, loaded from workflow secrets.
+    /// Prefer `creds_bundle_json_file` for large bundles — a multi-MB env
+    /// var will collide with OS environment-block limits.
     pub creds_bundle_json: Option<String>,
+    /// Path to a file containing the same JSON as `creds_bundle_json`. When
+    /// set, the binary reads from disk and this takes precedence over the
+    /// inline `creds_bundle_json` — routes the bundle around env-var size
+    /// limits at scale.
+    pub creds_bundle_json_file: Option<String>,
     /// Output path for assembled file (file mode).
     pub file_output_path: String,
     /// Path to the `ferrum-edge` binary for validation.
@@ -95,6 +102,7 @@ pub struct EnvConfig {
 /// | `GITHUB_TOKEN`               | `github_token`     | `None`                           |
 /// | `FERRUM_GH_PROVISIONER_TOKEN`| `github_provisioner_token` | `None`                   |
 /// | `FERRUM_CREDS_JSON`          | `creds_bundle_json`| `None`                           |
+/// | `FERRUM_CREDS_JSON_FILE`     | `creds_bundle_json_file` | `None` (path, preferred at scale) |
 /// | `FERRUM_FILE_OUTPUT_PATH`    | `file_output_path` | `./assembled/resources.yaml`     |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
@@ -133,6 +141,7 @@ pub fn load_env_config() -> EnvConfig {
         github_token: env::var("GITHUB_TOKEN").ok(),
         github_provisioner_token: env::var("FERRUM_GH_PROVISIONER_TOKEN").ok(),
         creds_bundle_json: env::var("FERRUM_CREDS_JSON").ok(),
+        creds_bundle_json_file: env::var("FERRUM_CREDS_JSON_FILE").ok(),
         file_output_path: env::var("FERRUM_FILE_OUTPUT_PATH")
             .unwrap_or_else(|_| "./assembled/resources.yaml".to_string()),
         edge_binary_path: env::var("FERRUM_EDGE_BINARY_PATH")

@@ -174,7 +174,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 1. **Permissive schema** — Serde types mirror Ferrum Edge but accept unknown fields. The gateway (via `validate`) is the authoritative schema.
 2. **Path-component sanitization** — resource `namespace` and `id` flow into filesystem paths during `import`. `import::safe_path_component` rejects `..`, `/`, `\`, null bytes, and empty strings before `Path::join` to prevent traversal.
-3. **Deterministic state hashes** — resources hash through `serde_json::Value` first (BTreeMap-backed in default builds) so `HashMap` field ordering doesn't produce false-positive drift in `.state/state.json`.
+3. **Deterministic state hashes** — resources hash through `serde_json::Value` first (BTreeMap-backed in default builds) so `HashMap` field ordering doesn't produce false-positive drift in `.state/<env>.json`.
 4. **Namespace-scoped operations** — every API call, diff entry, and breaking-change lookup keys on `(namespace, id)`, never `id` alone.
 5. **Partial-failure visibility** — incremental apply reports per-resource errors via `ApplyResult`; failures don't abort the whole run.
 

@@ -120,6 +120,56 @@ environments:
 }
 
 #[test]
+fn env_name_allowlist_rejects_shell_metacharacters() {
+    use gitforgeops::config::resolved::validate_env_name_is_safe_path_component;
+    for bad in [
+        "",
+        "..",
+        ".",
+        "foo bar",      // whitespace
+        "foo/bar",      // separator
+        "foo\\bar",     // separator
+        "foo;rm -rf /", // shell metachar
+        "foo`evil`",    // backtick
+        "foo$x",        // dollar
+        "foo\"bar",     // quote
+        "foo\0bar",     // null
+        "foo'bar",      // apostrophe
+        "foo|bar",      // pipe
+        "foo&bar",      // ampersand
+    ] {
+        assert!(
+            validate_env_name_is_safe_path_component(bad).is_err(),
+            "expected {bad:?} to be rejected by strict allowlist"
+        );
+    }
+    for good in ["staging", "prod", "env-1", "team_alpha", "a", "A1_b-2"] {
+        assert!(
+            validate_env_name_is_safe_path_component(good).is_ok(),
+            "expected {good:?} to pass strict allowlist"
+        );
+    }
+}
+
+#[test]
+fn repo_config_rejects_env_name_with_shell_metacharacters() {
+    // Full path: YAML loader + validator rejects a weaponized env name at
+    // load time, so `envs --format json` can never emit a name that could
+    // inject into a workflow shell command.
+    let yaml = r#"
+environments:
+  "foo;rm -rf /":
+    overlay: staging
+"#;
+    let file = write_repo_config(yaml);
+    let err = RepoConfig::load_from_path(file.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("disallowed characters"),
+        "expected strict-allowlist rejection, got: {err}"
+    );
+}
+
+#[test]
 fn resolved_env_rejects_unsafe_environment_names() {
     // Environment names flow into `.state/<name>.json`. A name with path
     // separators or traversal segments would escape .state/ and could let
@@ -180,6 +230,7 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
         github_token: None,
         github_provisioner_token: None,
         creds_bundle_json: None,
+        creds_bundle_json_file: None,
         file_output_path: "./assembled/resources.yaml".to_string(),
         edge_binary_path: "ferrum-edge".to_string(),
         tls_no_verify: false,

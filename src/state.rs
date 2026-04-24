@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use crate::config::GatewayConfig;
 
 pub const STATE_DIR: &str = ".state";
-pub const LEGACY_STATE_FILE: &str = ".state/state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CredentialMetadata {
@@ -29,22 +28,15 @@ pub struct OverrideRecord {
     pub recorded_at: String,
 }
 
-// All fields carry serde defaults so v1 `.state/state.json` files — which
-// predate `environment`, `credentials`, `credential_bundle_versions`,
-// `credential_shard_count`, and `overrides` — deserialize cleanly into the
-// v2 struct during the legacy migration path in `load()`. The caller patches
-// `environment` after load, so its default ("") is never observable.
+/// Per-environment state file at `.state/<env>.json`. Written by apply +
+/// rotate; read by all commands that need to distinguish managed vs
+/// unmanaged gateway resources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFile {
-    #[serde(default = "default_version")]
     pub version: u32,
-    #[serde(default)]
     pub environment: String,
-    #[serde(default)]
     pub last_applied_at: Option<String>,
-    #[serde(default)]
     pub last_applied_commit: Option<String>,
-    #[serde(default)]
     pub resources: HashMap<String, String>,
     #[serde(default)]
     pub credentials: HashMap<String, CredentialMetadata>,
@@ -54,10 +46,6 @@ pub struct StateFile {
     pub credential_shard_count: u32,
     #[serde(default)]
     pub overrides: Vec<OverrideRecord>,
-}
-
-fn default_version() -> u32 {
-    2
 }
 
 fn default_shard_count() -> u32 {
@@ -90,61 +78,11 @@ impl StateFile {
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
                 if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
-                    // Normalize environment to the requested name. An
-                    // env-specific file may have been written during a
-                    // legacy migration triggered from a read-only command
-                    // (plan/diff/review) that never calls save() — in that
-                    // case the on-disk `environment` field is the serde
-                    // default (""), not the real name. Subsequent save()
-                    // uses self.environment to build the path, so we must
-                    // patch here or the next apply would write to
-                    // `.state/.json`.
+                    // Normalize environment to the requested name so save()
+                    // always targets the correct `.state/<env>.json` file,
+                    // regardless of what the on-disk field says.
                     state.environment = environment.to_string();
                     return state;
-                }
-            }
-        }
-
-        // Legacy migration: atomically rename `.state/state.json` into this
-        // environment's state file so the legacy content is adopted by
-        // exactly ONE environment. Without the rename, every env whose
-        // specific file didn't yet exist would inherit the same legacy
-        // `resources` set — shared-mode diffs would then double-count
-        // every resource as "managed by me" and apply could delete
-        // resources in the wrong environment on first multi-env rollout.
-        //
-        // Rename is atomic on POSIX within a filesystem. Whichever env
-        // calls load() first wins; concurrent calls see the legacy file
-        // already gone and fall through to default state. Operators can
-        // inspect the audit log (loud notice below) and, if the wrong env
-        // adopted, restore from git history and re-name manually.
-        let legacy = Path::new(LEGACY_STATE_FILE);
-        if legacy.exists() {
-            let _ = std::fs::create_dir_all(STATE_DIR);
-            if std::fs::rename(legacy, &path).is_ok() {
-                eprintln!(
-                    "Notice: migrated legacy .state/state.json -> .state/{environment}.json \
-                     (this is a one-time operation). If '{environment}' is not the environment \
-                     the legacy state represented, restore from git history and rename manually \
-                     before the next apply."
-                );
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
-                        state.environment = environment.to_string();
-                        state.version = 2;
-                        return state;
-                    }
-                }
-            }
-            // Rename failed — either legacy is gone (another env won the
-            // race) or the target already exists. Either way, fall through
-            // and retry reading `path` if it now exists.
-            if path.exists() {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
-                        state.environment = environment.to_string();
-                        return state;
-                    }
                 }
             }
         }
@@ -164,11 +102,10 @@ impl StateFile {
     }
 
     /// True when this appears to be the first apply for this environment: no
-    /// prior state on disk at all. Used to decide whether `shared` ownership
-    /// needs a bootstrap warning.
+    /// prior state on disk. Used to decide whether `shared` ownership needs
+    /// a bootstrap warning.
     pub fn is_first_apply(environment: &str) -> bool {
-        let path = Self::path_for(environment);
-        !path.exists() && !Path::new(LEGACY_STATE_FILE).exists()
+        !Self::path_for(environment).exists()
     }
 
     /// Rewrite the `resources` map with the hashes of every resource in

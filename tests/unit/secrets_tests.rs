@@ -58,6 +58,26 @@ fn parse_placeholder_ignores_non_matching_strings() {
 }
 
 #[test]
+fn load_bundles_handles_file_path_route() {
+    // Verify load_bundles_from_env is happy with the same JSON whether it
+    // comes from an inline env var or a file. The file route is what the
+    // workflows now use to avoid env-block size limits at scale.
+    let raw = r#"{"FERRUM_CREDS_BUNDLE": "{\"ferrum/app/api_key\":\"v1\"}"}"#;
+    let (merged_from_inline, _) = load_bundles_from_env(raw).unwrap();
+
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, raw.as_bytes()).unwrap();
+    let contents = std::fs::read_to_string(file.path()).unwrap();
+    let (merged_from_file, _) = load_bundles_from_env(&contents).unwrap();
+
+    assert_eq!(merged_from_inline, merged_from_file);
+    assert_eq!(
+        merged_from_file.get("ferrum/app/api_key"),
+        Some(&"v1".to_string())
+    );
+}
+
+#[test]
 fn load_bundles_parses_merged_map() {
     let raw = r#"{
         "FERRUM_CREDS_BUNDLE": "{\"ferrum/app/api_key\":\"v1\"}",
