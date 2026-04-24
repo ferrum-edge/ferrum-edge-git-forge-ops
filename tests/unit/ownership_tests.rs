@@ -131,6 +131,35 @@ fn shared_mode_deletes_resource_previously_managed_now_removed_from_repo() {
 }
 
 #[test]
+fn exclusive_mode_with_explicit_namespaces_iterates_empty_namespaces() {
+    // Scenario: repo used to manage `team-alpha` but now declares no resources
+    // there. In exclusive mode with `namespaces: [team-alpha]`, apply must
+    // still iterate team-alpha so it can prune resources left behind.
+    //
+    // We can exercise this by calling compute_diff_with_ownership on a
+    // per-namespace (empty-desired, non-empty-actual) pair the way apply
+    // would after load_namespace_pairs_for splits by ownership.namespaces.
+    let desired_for_team_alpha = gateway_with(vec![]);
+    let actual_for_team_alpha = gateway_with(vec![proxy("stale", "team-alpha")]);
+
+    // Exclusive mode — pass None for previously_managed.
+    let result = compute_diff_with_ownership(&desired_for_team_alpha, &actual_for_team_alpha, None);
+
+    assert!(
+        result.unmanaged.is_empty(),
+        "exclusive should not classify as unmanaged"
+    );
+    let deletes: Vec<_> = result
+        .diffs
+        .iter()
+        .filter(|d| matches!(d.action, DiffAction::Delete))
+        .collect();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].id, "stale");
+    assert_eq!(deletes[0].namespace, "team-alpha");
+}
+
+#[test]
 fn shared_mode_first_apply_with_empty_state_skips_all_deletes() {
     let desired = gateway_with(vec![proxy("new-one", "ferrum")]);
     let actual = gateway_with(vec![

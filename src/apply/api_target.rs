@@ -33,6 +33,13 @@ impl ApplyResult {
 
 /// Apply configuration to the gateway via the admin API.
 ///
+/// Iterates `namespaces` explicitly rather than inferring them from `desired`.
+/// This matters for `exclusive` ownership: a namespace the repo manages but no
+/// longer declares resources in still needs to be reconciled (to prune the
+/// resources that were removed). The caller decides the scope (typically
+/// `ownership.namespaces` for exclusive, or the namespaces present in
+/// `desired` for shared).
+///
 /// When `previously_managed` is `Some`, runs in `shared` ownership mode: only
 /// resources present in that set can be deleted; admin-added resources are
 /// reported in `unmanaged_skipped` but not touched.
@@ -40,21 +47,19 @@ pub async fn apply_api(
     desired: &GatewayConfig,
     client: &AdminClient,
     strategy: ApplyStrategy,
-    namespace_filter: Option<&str>,
+    namespaces: &[String],
     previously_managed: Option<&HashSet<String>>,
 ) -> crate::error::Result<ApplyResult> {
     let mut aggregate = ApplyResult::default();
 
-    for (namespace, desired_namespace) in
-        crate::config::split_config_by_namespace(desired, namespace_filter)
-    {
+    for namespace in namespaces {
+        let desired_namespace = crate::config::filter_config_by_namespace(desired, namespace);
         let namespace_result = match strategy {
             ApplyStrategy::FullReplace => {
-                apply_full_replace(&desired_namespace, client, &namespace).await?
+                apply_full_replace(&desired_namespace, client, namespace).await?
             }
             ApplyStrategy::Incremental => {
-                apply_incremental(&desired_namespace, client, &namespace, previously_managed)
-                    .await?
+                apply_incremental(&desired_namespace, client, namespace, previously_managed).await?
             }
         };
 

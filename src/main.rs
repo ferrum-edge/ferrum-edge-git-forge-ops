@@ -120,34 +120,199 @@ fn load_and_assemble_for(
     Ok(gateway_config)
 }
 
+fn load_credential_bundles(
+    env_config: &EnvConfig,
+) -> Result<
+    (
+        secrets::CredentialBundle,
+        BTreeMap<u32, secrets::CredentialBundle>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    match &env_config.creds_bundle_json {
+        Some(raw) if !raw.trim().is_empty() => Ok(secrets::load_bundles_from_env(raw)?),
+        _ => Ok((BTreeMap::new(), BTreeMap::new())),
+    }
+}
+
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
 ) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
-    let bundle = match &env_config.creds_bundle_json {
-        Some(raw) if !raw.trim().is_empty() => {
-            let (merged, _per_shard) = secrets::load_bundles_from_env(raw)?;
-            merged
-        }
-        _ => BTreeMap::new(),
-    };
+    let (bundle, _) = load_credential_bundles(env_config)?;
     Ok(secrets::resolve_secrets(cfg, &bundle)?)
 }
 
-async fn load_namespace_pairs(
-    client: &AdminClient,
-    desired: &GatewayConfig,
-    namespace_filter: Option<&str>,
-) -> gitforgeops::error::Result<Vec<(String, GatewayConfig, GatewayConfig)>> {
-    let mut pairs = Vec::new();
+fn resolved_namespaces(resolved: &ResolvedEnv, desired: &GatewayConfig) -> Vec<String> {
+    match resolved.ownership.mode {
+        OwnershipMode::Exclusive => resolved.ownership.namespaces.clone().unwrap_or_default(),
+        OwnershipMode::Shared => match resolved.namespace_filter.as_deref() {
+            Some(ns) => vec![ns.to_string()],
+            None => config::collect_namespaces(desired),
+        },
+    }
+}
 
-    for (namespace, desired_namespace) in
-        config::split_config_by_namespace(desired, namespace_filter)
+/// In `exclusive` mode, every resource in `desired` must live in a namespace
+/// declared in `ownership.namespaces`. Otherwise the repo would be silently
+/// pushing resources the ownership contract never signed for. Flag loudly.
+fn enforce_exclusive_scope(
+    resolved: &ResolvedEnv,
+    desired: &GatewayConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(resolved.ownership.mode, OwnershipMode::Exclusive) {
+        return Ok(());
+    }
+    let allowed: std::collections::HashSet<&str> = resolved
+        .ownership
+        .namespaces
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut violations = Vec::new();
+    let mut check = |ns: &str, kind: &str, id: &str| {
+        if !allowed.contains(ns) {
+            violations.push(format!("{kind} {id} in namespace '{ns}'"));
+        }
+    };
+    for p in &desired.proxies {
+        check(&p.namespace, "Proxy", &p.id);
+    }
+    for c in &desired.consumers {
+        check(&c.namespace, "Consumer", &c.id);
+    }
+    for u in &desired.upstreams {
+        check(&u.namespace, "Upstream", &u.id);
+    }
+    for p in &desired.plugin_configs {
+        check(&p.namespace, "PluginConfig", &p.id);
+    }
+    if !violations.is_empty() {
+        return Err(format!(
+            "exclusive env '{}' declares ownership.namespaces={:?}, but desired resources include namespaces outside that list:\n  {}\nEither add the namespace to ownership.namespaces, remove the resource, or switch ownership.mode to 'shared'.",
+            resolved.name,
+            resolved.ownership.namespaces.as_deref().unwrap_or(&[]),
+            violations.join("\n  ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Resolve the active PR number for the current command invocation.
+///
+/// Order:
+///   1. `GITFORGEOPS_PR_NUMBER` env var (set explicitly by review workflows).
+///   2. For post-merge applies: the PR associated with `GITHUB_SHA` via the
+///      `/repos/{repo}/commits/{sha}/pulls` endpoint. Requires GITHUB_TOKEN.
+async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
+    if let Some(n) = std::env::var("GITFORGEOPS_PR_NUMBER")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
     {
-        let actual_namespace = client.get_backup(&namespace).await?;
-        pairs.push((namespace, desired_namespace, actual_namespace));
+        return Some(n);
+    }
+    let token = env_config.github_token.as_deref()?;
+    let repo = env_config.github_repository.as_deref()?;
+    let sha = std::env::var("GITHUB_SHA").ok()?;
+    let client = reqwest::Client::builder()
+        .user_agent("gitforgeops/0.1")
+        .build()
+        .ok()?;
+    let url = format!("https://api.github.com/repos/{repo}/commits/{sha}/pulls");
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let prs: Vec<serde_json::Value> = resp.json().await.ok()?;
+    prs.first()
+        .and_then(|pr| pr.get("number"))
+        .and_then(|n| n.as_u64())
+}
+
+/// Generate + publish any credentials that need allocation or rotation, deliver
+/// them to the PR author (or workflow actor), and re-resolve placeholders so
+/// `desired` carries the real values for this apply run.
+///
+/// Returns the allocation outcome (or `None` if nothing needed allocation) and
+/// the final post-allocation shard map (for state-file updates).
+#[allow(clippy::too_many_arguments)]
+async fn allocate_if_needed(
+    desired: &mut GatewayConfig,
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    report: &secrets::ResolveReport,
+    per_shard: &mut BTreeMap<u32, secrets::CredentialBundle>,
+    shard_count: &mut u32,
+) -> Result<Option<secrets::AllocateOutcome>, Box<dyn std::error::Error>> {
+    if report.needs_allocation().is_empty() {
+        return Ok(None);
     }
 
+    let token = env_config
+        .github_provisioner_token
+        .as_deref()
+        .ok_or("FERRUM_GH_PROVISIONER_TOKEN not set; cannot allocate credential slots")?;
+    let repo = env_config
+        .github_repository
+        .as_deref()
+        .ok_or("GITHUB_REPOSITORY not set; cannot write to GitHub Environment Secrets")?;
+
+    let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
+
+    let client = reqwest::Client::builder()
+        .user_agent("gitforgeops/0.1")
+        .build()
+        .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))?;
+
+    let outcome = secrets::allocate_and_deliver(
+        &client,
+        repo,
+        &resolved.name,
+        token,
+        recipient.as_deref(),
+        report,
+        per_shard,
+        shard_count,
+    )
+    .await?;
+
+    // Re-resolve so desired picks up the generated values.
+    let merged = secrets::merge_bundles(per_shard);
+    let _ = secrets::resolve_secrets(desired, &merged)?;
+
+    Ok(Some(outcome))
+}
+
+/// Load per-namespace (desired, actual) pairs from the gateway for the given
+/// namespace list.
+///
+/// Unlike the old `namespace_filter`-based walk, this iterates an explicit
+/// list, so exclusive-mode apply can reconcile namespaces that the repo has
+/// emptied (still need to fetch gateway state to prune). For shared mode, the
+/// caller passes the namespaces present in `desired` (or a single-element list
+/// for a namespace filter).
+async fn load_namespace_pairs_for(
+    client: &AdminClient,
+    desired: &GatewayConfig,
+    namespaces: &[String],
+) -> gitforgeops::error::Result<Vec<(String, GatewayConfig, GatewayConfig)>> {
+    let mut pairs = Vec::new();
+    for namespace in namespaces {
+        let desired_namespace = config::filter_config_by_namespace(desired, namespace);
+        let actual_namespace = client.get_backup(namespace).await?;
+        pairs.push((namespace.clone(), desired_namespace, actual_namespace));
+    }
     Ok(pairs)
 }
 
@@ -334,12 +499,13 @@ async fn cmd_diff(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
+    enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
     let client = AdminClient::new(&env_config)?;
     let state = StateFile::load(&resolved.name);
     let managed = previously_managed(&resolved, &state);
-    let namespace_pairs =
-        load_namespace_pairs(&client, &desired, resolved.namespace_filter.as_deref()).await?;
+    let namespaces = resolved_namespaces(&resolved, &desired);
+    let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
     let (diffs, _breaking, unmanaged) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
     if diffs.is_empty() && unmanaged.is_empty() {
@@ -428,19 +594,18 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name);
     let managed = previously_managed(&resolved, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired);
     let (diffs, breaking, unmanaged, actual_available) = match &client {
-        Ok(c) => {
-            match load_namespace_pairs(c, &desired, resolved.namespace_filter.as_deref()).await {
-                Ok(namespace_pairs) => {
-                    let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
-                    (d, b, u, true)
-                }
-                Err(e) => {
-                    eprintln!("Could not fetch live config: {}", e);
-                    (Vec::new(), Vec::new(), Vec::new(), false)
-                }
+        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+            Ok(namespace_pairs) => {
+                let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                (d, b, u, true)
             }
-        }
+            Err(e) => {
+                eprintln!("Could not fetch live config: {}", e);
+                (Vec::new(), Vec::new(), Vec::new(), false)
+            }
+        },
         Err(e) => {
             eprintln!("Could not create API client: {}", e);
             (Vec::new(), Vec::new(), Vec::new(), false)
@@ -535,7 +700,18 @@ async fn cmd_apply(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
-    let secret_report = resolve_credentials(&mut desired, &env_config)?;
+
+    // Exclusive ownership: enforce namespace scope before anything else so the
+    // operator fails fast on a misconfigured resource, not deep in apply.
+    enforce_exclusive_scope(&resolved, &desired)?;
+
+    let mut state = StateFile::load(&resolved.name);
+
+    // First resolve: classify placeholders with the current bundle.
+    let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
+    let mut shard_count = state.credential_shard_count.max(1);
+    let initial_bundle = secrets::merge_bundles(&per_shard);
+    let secret_report = secrets::resolve_secrets(&mut desired, &initial_bundle)?;
 
     // Missing required credentials → fail fast before we touch the gateway.
     let missing = secret_report.missing_required();
@@ -550,6 +726,38 @@ async fn cmd_apply(
         process::exit(1);
     }
 
+    // Allocate/rotate any slots that need it. This writes to the GitHub
+    // Environment Secret, delivers the new value, and replaces placeholders in
+    // `desired` with the generated values.
+    let allocation = allocate_if_needed(
+        &mut desired,
+        &env_config,
+        &resolved,
+        &secret_report,
+        &mut per_shard,
+        &mut shard_count,
+    )
+    .await?;
+
+    if let Some(outcome) = &allocation {
+        eprintln!(
+            "Allocated/rotated {} credential slot(s):",
+            outcome.allocated.len()
+        );
+        for slot in &outcome.allocated {
+            match &slot.delivered {
+                Some(d) => eprintln!(
+                    "  {} -> @{} (ssh {})",
+                    slot.slot, d.login, d.key_fingerprint
+                ),
+                None => eprintln!(
+                    "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
+                    slot.slot
+                ),
+            }
+        }
+    }
+
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     if let Ok(ref r) = val_result {
         if !r.success {
@@ -561,9 +769,7 @@ async fn cmd_apply(
     // Policy enforcement (with optional override).
     if let Some(policy_cfg) = policy::load_policies()? {
         let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
-        let pr_number = std::env::var("GITFORGEOPS_PR_NUMBER")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok());
+        let pr_number = resolve_pr_number(&env_config).await;
         let override_decision = if let Some(pr) = pr_number {
             let d = policy::check_override(&env_config, &policy_cfg.overrides, pr).await?;
             policy::github_override::apply_override(&mut findings, &d);
@@ -586,21 +792,21 @@ async fn cmd_apply(
                     eprintln!("(override inactive: {})", d.reason);
                 }
             } else {
-                eprintln!("(no PR number provided; overrides not evaluated)");
+                eprintln!("(no PR associated with this commit; overrides not evaluated)");
             }
             process::exit(1);
         }
     }
 
-    let mut state = StateFile::load(&resolved.name);
     let is_first_apply = StateFile::is_first_apply(&resolved.name);
-
     if is_first_apply && matches!(resolved.ownership.mode, OwnershipMode::Shared) {
         eprintln!(
             "Notice: first apply for environment '{}' in shared mode. Resources on the gateway but not in this repo will be treated as unmanaged and left alone.",
             resolved.name
         );
     }
+
+    let namespaces = resolved_namespaces(&resolved, &desired);
 
     match env_config.gateway_mode {
         GatewayMode::Api => {
@@ -609,8 +815,7 @@ async fn cmd_apply(
 
             if !auto_approve {
                 let namespace_pairs =
-                    load_namespace_pairs(&client, &desired, resolved.namespace_filter.as_deref())
-                        .await?;
+                    load_namespace_pairs_for(&client, &desired, &namespaces).await?;
                 let (diffs, _, unmanaged) =
                     compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
@@ -638,9 +843,7 @@ async fn cmd_apply(
             }
 
             // Large-prune safety check.
-            let namespace_pairs =
-                load_namespace_pairs(&client, &desired, resolved.namespace_filter.as_deref())
-                    .await?;
+            let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
             let (diffs, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
             let delete_count = diffs
                 .iter()
@@ -661,7 +864,7 @@ async fn cmd_apply(
                 &desired,
                 &client,
                 resolved.apply_strategy.clone(),
-                resolved.namespace_filter.as_deref(),
+                &namespaces,
                 managed.as_ref(),
             )
             .await?
@@ -679,6 +882,19 @@ async fn cmd_apply(
     }
 
     state.record(&desired);
+    state.credential_shard_count = shard_count;
+    if let Some(outcome) = &allocation {
+        let run_id = std::env::var("GITHUB_RUN_ID").ok();
+        for slot in &outcome.allocated {
+            state.record_credential(
+                &slot.slot,
+                slot.shard,
+                &slot.value,
+                slot.delivered.as_ref().map(|d| d.login.as_str()),
+                run_id.as_deref(),
+            );
+        }
+    }
     state.save()?;
 
     Ok(())
@@ -728,22 +944,21 @@ async fn cmd_review(
     let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name);
     let managed = previously_managed(&resolved, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired);
 
     let (diffs, breaking, unmanaged, comparison_error) = match &client {
-        Ok(c) => {
-            match load_namespace_pairs(c, &desired, resolved.namespace_filter.as_deref()).await {
-                Ok(namespace_pairs) => {
-                    let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
-                    (d, b, u, None)
-                }
-                Err(e) => (
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Some(format!("Live gateway comparison skipped: {}", e)),
-                ),
+        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+            Ok(namespace_pairs) => {
+                let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                (d, b, u, None)
             }
-        }
+            Err(e) => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(format!("Live gateway comparison skipped: {}", e)),
+            ),
+        },
         Err(e) => (
             Vec::new(),
             Vec::new(),

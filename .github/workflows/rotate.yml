@@ -21,6 +21,10 @@ on:
         type: string
         default: ferrum
 
+# Rotation commits state back to main; needs write on contents.
+permissions:
+  contents: write
+
 jobs:
   rotate:
     runs-on: ubuntu-latest
@@ -78,9 +82,27 @@ jobs:
             --recipient "${{ github.actor }}"
 
       - name: Commit state update
+        # Rotation metadata (last_rotated, sha256_prefix, delivered_to) lives
+        # in .state/<env>.json. If we can't persist the update, a stale state
+        # misleads the next drift check — fail the job on push failure, and
+        # retry on rejection (possible if an apply landed concurrently).
         run: |
+          set -euo pipefail
           git config user.name "gitforgeops[bot]"
           git config user.email "gitforgeops[bot]@users.noreply.github.com"
-          git add .state/${{ inputs.environment }}.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "chore(gitforgeops): rotate ${{ inputs.consumer }}.${{ inputs.credential }} in ${{ inputs.environment }} [skip ci]"
-          git push || true
+          mkdir -p .state
+          git add ".state/${{ inputs.environment }}.json" 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(gitforgeops): rotate ${{ inputs.consumer }}.${{ inputs.credential }} in ${{ inputs.environment }} [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then exit 0; fi
+            echo "Push rejected on attempt $attempt; rebasing..."
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+            sleep $((attempt * 2))
+          done
+          echo "ERROR: failed to push rotation state after 5 attempts" >&2
+          exit 1
