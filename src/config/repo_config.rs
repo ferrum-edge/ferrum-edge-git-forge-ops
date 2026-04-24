@@ -159,6 +159,16 @@ impl RepoConfig {
                     "environment '{name}': apply_strategy='full_replace' is incompatible with ownership.mode='shared' (full_replace would wipe unmanaged resources)"
                 )));
             }
+
+            // `delete_pct` in cmd_apply is 0..=100. `u8` allows 0..=255, so
+            // a value like `200` in the YAML would silently disable the
+            // prune guard — `delete_pct > threshold` never fires.
+            if env.ownership.large_prune_threshold_percent > 100 {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': ownership.large_prune_threshold_percent={} is out of range 0..=100",
+                    env.ownership.large_prune_threshold_percent
+                )));
+            }
         }
 
         if let Some(default) = &self.default_environment {

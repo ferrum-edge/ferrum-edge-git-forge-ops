@@ -183,7 +183,18 @@ pub async fn rotate_and_deliver(
             match pick_shard(slot, value.len(), shards, *shard_count) {
                 Some(s) => break s,
                 None => {
+                    // Mirror allocate_and_deliver's cap. Without this, a
+                    // deeply sharded env that can't fit another slot would
+                    // keep incrementing and eventually try to PUT
+                    // FERRUM_CREDS_BUNDLE_100+, failing late at the GitHub
+                    // API instead of up front with a clear config error.
                     *shard_count += 1;
+                    if *shard_count > 100 {
+                        return Err(crate::error::Error::Config(
+                            "credential bundle shards exceeded 100 (GitHub env secret limit) during rotate"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
         },

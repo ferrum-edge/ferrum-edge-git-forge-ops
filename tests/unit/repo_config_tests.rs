@@ -98,6 +98,45 @@ environments:
 }
 
 #[test]
+fn repo_config_rejects_prune_threshold_above_100() {
+    // delete_pct in cmd_apply is 0..=100. A YAML value > 100 would make the
+    // guard `delete_pct > threshold` never fire — mass deletions would
+    // slip through. Reject at load time.
+    let yaml = r#"
+environments:
+  staging:
+    overlay: staging
+    ownership:
+      mode: shared
+      large_prune_threshold_percent: 250
+"#;
+    let file = write_repo_config(yaml);
+    let err = RepoConfig::load_from_path(file.path()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("large_prune_threshold_percent=250"),
+        "expected out-of-range rejection, got: {err}"
+    );
+    assert!(err.to_string().contains("0..=100"));
+}
+
+#[test]
+fn repo_config_accepts_prune_threshold_at_boundary() {
+    // 0 (prune-guard always fires on any delete) and 100 (guard never fires,
+    // equivalent to --allow-large-prune) are both valid.
+    for n in [0, 1, 50, 100] {
+        let yaml = format!(
+            "environments:\n  staging:\n    overlay: staging\n    ownership:\n      mode: shared\n      large_prune_threshold_percent: {n}\n"
+        );
+        let file = write_repo_config(&yaml);
+        assert!(
+            RepoConfig::load_from_path(file.path()).is_ok(),
+            "expected {n} to be accepted"
+        );
+    }
+}
+
+#[test]
 fn repo_config_drift_alert_defaults_flag_managed_changes_only() {
     // Default drift_alert_on should alert on managed modifications/deletions
     // but NOT on unmanaged additions (admin-GUI-added resources are expected
