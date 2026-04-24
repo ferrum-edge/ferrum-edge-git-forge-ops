@@ -79,8 +79,14 @@ pub async fn check_override(
         None => return Ok(OverrideDecision::inactive("GITHUB_REPOSITORY not set")),
     };
 
+    // Honor FERRUM_GITHUB_*_TIMEOUT_SECS. Without these, a stalled GitHub
+    // API call during override checks hangs apply/review indefinitely,
+    // blocking deployments or PR feedback on a transient GitHub incident.
+    use std::time::Duration;
     let client = Client::builder()
         .user_agent("gitforgeops/0.1")
+        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
+        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 

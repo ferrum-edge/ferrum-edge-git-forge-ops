@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
-use reqwest::Client;
 
 use gitforgeops::apply;
 use gitforgeops::config::{
@@ -294,10 +293,7 @@ async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
     let token = env_config.github_token.as_deref()?;
     let repo = env_config.github_repository.as_deref()?;
     let sha = std::env::var("GITHUB_SHA").ok()?;
-    let client = reqwest::Client::builder()
-        .user_agent("gitforgeops/0.1")
-        .build()
-        .ok()?;
+    let client = build_github_api_client(env_config).ok()?;
     let url = format!("https://api.github.com/repos/{repo}/commits/{sha}/pulls");
     let resp = client
         .get(&url)
@@ -323,6 +319,25 @@ async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
 /// Returns the allocation outcome (or `None` if nothing needed allocation) and
 /// the final post-allocation shard map (for state-file updates).
 #[allow(clippy::too_many_arguments)]
+/// Build a reqwest::Client configured to hit api.github.com with the
+/// `FERRUM_GITHUB_*_TIMEOUT_SECS` bounds applied. Every GitHub-API call
+/// site in the binary (PR lookup, override check, secret provisioning,
+/// SSH-key fetch, review comment post) must use this — a bare client
+/// with no timeouts can hang an apply indefinitely on a stalled endpoint
+/// and block deployment. The admin-gateway client has its own timeouts
+/// (see `http_client.rs`) and uses a different env-var pair.
+fn build_github_api_client(
+    env_config: &EnvConfig,
+) -> Result<reqwest::Client, gitforgeops::error::Error> {
+    use std::time::Duration;
+    reqwest::Client::builder()
+        .user_agent("gitforgeops/0.1")
+        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
+        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        .build()
+        .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))
+}
+
 /// Field names whose diff values must never be printed verbatim. These
 /// carry secret material — consumer credentials hold API keys, JWT
 /// signing keys, HMAC secrets, etc. Once resolved from the bundle, the
@@ -472,10 +487,7 @@ async fn allocate_if_needed(
 
     let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
 
-    let client = reqwest::Client::builder()
-        .user_agent("gitforgeops/0.1")
-        .build()
-        .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))?;
+    let client = build_github_api_client(env_config)?;
 
     let outcome = secrets::allocate_and_deliver(
         &client,
@@ -652,10 +664,7 @@ async fn cmd_export(
     let yaml = serde_yaml::to_string(&gateway_config)?;
 
     let payload: Vec<u8> = if let Some(login) = encrypt_to {
-        let client = reqwest::Client::builder()
-            .user_agent("gitforgeops/0.1")
-            .build()
-            .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))?;
+        let client = build_github_api_client(&env_config)?;
         match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
             Some(delivery) => {
                 eprintln!(
@@ -1571,10 +1580,7 @@ async fn cmd_rotate(
 
     let mut shard_count = state.credential_shard_count.max(1);
 
-    let client = Client::builder()
-        .user_agent("gitforgeops/0.1")
-        .build()
-        .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))?;
+    let client = build_github_api_client(&env_config)?;
 
     let outcome = secrets::rotate_and_deliver(
         &client,
