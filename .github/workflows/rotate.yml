@@ -68,12 +68,21 @@ jobs:
           PY
 
       - name: Rotate
+        # Rotate now pushes the updated consumer to the live gateway, so it
+        # needs the full gateway-connection secret set that apply-on-merge
+        # has. Without the TLS material, rotate fails to connect in envs
+        # that require a custom CA or mTLS, even though apply-on-merge and
+        # drift-check are configured correctly for the same env.
         env:
           FERRUM_ENV: ${{ inputs.environment }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+          FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
+          FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
           FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           gitforgeops rotate \
             --consumer "${{ inputs.consumer }}" \

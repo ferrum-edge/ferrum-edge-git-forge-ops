@@ -149,7 +149,25 @@ fn resolved_namespaces(
     state: &StateFile,
 ) -> Vec<String> {
     match resolved.ownership.mode {
-        OwnershipMode::Exclusive => resolved.ownership.namespaces.clone().unwrap_or_default(),
+        OwnershipMode::Exclusive => {
+            let owned = resolved.ownership.namespaces.clone().unwrap_or_default();
+            // Honor namespace_filter as an intersection. Without this,
+            // `FERRUM_NAMESPACE=ferrum` on an env with
+            // `ownership.namespaces: [ferrum, platform]` would still iterate
+            // `platform` — but `desired` has been filtered to `ferrum` only,
+            // so `platform` shows up as an all-deletions diff and prunes
+            // resources outside the operator's requested scope.
+            match resolved.namespace_filter.as_deref() {
+                Some(ns) if owned.iter().any(|o| o == ns) => vec![ns.to_string()],
+                Some(ns) => {
+                    eprintln!(
+                        "Warning: namespace_filter '{ns}' is not in ownership.namespaces {owned:?}; nothing to reconcile."
+                    );
+                    Vec::new()
+                }
+                None => owned,
+            }
+        }
         OwnershipMode::Shared => match resolved.namespace_filter.as_deref() {
             Some(ns) => vec![ns.to_string()],
             None => {
@@ -825,9 +843,9 @@ async fn cmd_apply(
     }
 
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
-    // Populated by the API-mode arm after the approve gate; None for file mode
-    // or when nothing needed allocating. State-record reads this after the
-    // match.
+    // Populated by both mode arms after their respective gates. State-record
+    // reads this after the match to persist credential metadata.
+    #[allow(unused_assignments)]
     let mut allocation: Option<secrets::AllocateOutcome> = None;
 
     match env_config.gateway_mode {
@@ -952,8 +970,69 @@ async fn cmd_apply(
             );
         }
         GatewayMode::File => {
+            // File mode has no gateway diff or auto-approve gate in the
+            // normal sense, but it DOES have a side-effecting allocation
+            // step. Preserve the same plan-preview semantics so a dry-run
+            // can inspect pending allocations without writing to GitHub.
+            let pending = secret_report.needs_allocation();
+            if !auto_approve && !pending.is_empty() {
+                println!(
+                    "Would write placeholder file to {} and allocate/rotate {} credential slot(s):",
+                    env_config.file_output_path,
+                    pending.len()
+                );
+                for r in pending {
+                    let kind = match r.status {
+                        secrets::SlotStatus::NeedsAllocation => "new",
+                        secrets::SlotStatus::NeedsRotation => "rotate",
+                        _ => "",
+                    };
+                    println!("  [{kind}] {}", r.slot);
+                }
+                println!("\nUse --auto-approve to proceed.");
+                process::exit(0);
+            }
+
+            // Write the placeholder-preserving file FIRST. `desired` still
+            // has `${gh-env-secret:...}` strings because the initial resolve
+            // doesn't replace rotate placeholders and the allocator hasn't
+            // run yet. This is the committed-to-repo form; the real values
+            // come via the separate `materialize-file.yml` workflow.
             apply::apply_file(&desired, &env_config.file_output_path)?;
             println!("Written to {}", env_config.file_output_path);
+
+            // Now allocate. The in-memory mutation after the disk write is
+            // harmless — the file has already been serialized with
+            // placeholders intact, and the allocated values go to the
+            // GitHub Env Secret for `materialize` to consume.
+            allocation = allocate_if_needed(
+                &mut desired,
+                &env_config,
+                &resolved,
+                &secret_report,
+                &mut per_shard,
+                &mut shard_count,
+            )
+            .await?;
+
+            if let Some(outcome) = &allocation {
+                eprintln!(
+                    "Allocated/rotated {} credential slot(s):",
+                    outcome.allocated.len()
+                );
+                for slot in &outcome.allocated {
+                    match &slot.delivered {
+                        Some(d) => eprintln!(
+                            "  {} -> @{} (ssh {})",
+                            slot.slot, d.login, d.key_fingerprint
+                        ),
+                        None => eprintln!(
+                            "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
+                            slot.slot
+                        ),
+                    }
+                }
+            }
         }
     }
 

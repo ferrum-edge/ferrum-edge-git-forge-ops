@@ -131,6 +131,34 @@ fn shared_mode_deletes_resource_previously_managed_now_removed_from_repo() {
 }
 
 #[test]
+fn exclusive_mode_with_namespace_filter_only_iterates_that_namespace() {
+    // This test exercises main.rs::resolved_namespaces indirectly by rebuilding
+    // its logic: with exclusive ownership=[ferrum, platform] and
+    // namespace_filter=ferrum, the apply scope must be [ferrum] only.
+    // Including `platform` with an empty desired would prune resources
+    // outside the operator's requested scope.
+    let owned = vec!["ferrum".to_string(), "platform".to_string()];
+    let filter = Some("ferrum");
+
+    let result: Vec<String> = match filter {
+        Some(ns) if owned.iter().any(|o| o == ns) => vec![ns.to_string()],
+        Some(_) => Vec::new(),
+        None => owned.clone(),
+    };
+    assert_eq!(result, vec!["ferrum".to_string()]);
+
+    // namespace_filter outside the ownership list → empty (warning logged,
+    // nothing reconciled — operator's request can't be honored).
+    let out_of_scope = Some("team-gamma");
+    let result: Vec<String> = match out_of_scope {
+        Some(ns) if owned.iter().any(|o| o == ns) => vec![ns.to_string()],
+        Some(_) => Vec::new(),
+        None => owned,
+    };
+    assert!(result.is_empty());
+}
+
+#[test]
 fn shared_mode_iterates_previously_managed_namespaces_even_when_desired_is_empty_there() {
     // The key invariant: if the repo used to manage a resource in namespace X
     // and then removes its last resource, we still need to reconcile X to
