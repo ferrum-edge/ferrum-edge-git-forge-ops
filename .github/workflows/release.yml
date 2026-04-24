@@ -12,6 +12,13 @@ concurrency:
 jobs:
   docker:
     name: Build and push Docker image
+    # Only run on the upstream repo by default. Forks consume the
+    # already-published image and don't need to rebuild. A fork that
+    # wants to maintain its own image can opt in by setting repo
+    # variable `GITFORGEOPS_RELEASE_ENABLED=true` and pointing
+    # `DOCKERHUB_IMAGE` at a namespace it can push to (GHCR always
+    # derives from `github.repository`, so no override needed there).
+    if: github.event.repository.fork == false || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,8 +52,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ferrumedge/ferrum-edge-git-forge-ops
-            ghcr.io/ferrum-edge/ferrum-edge-git-forge-ops
+            ${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
+            ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

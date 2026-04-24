@@ -107,6 +107,11 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)
 - `FERRUM_TLS_NO_VERIFY` (dev only)
 - `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` — base64-encoded PEM. mTLS requires BOTH cert and key; setting only one is rejected.
+- `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` (default `10`) — TCP/TLS handshake cap
+- `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` (default `60`) — end-to-end request cap; raise for large `/backup` or slow `/restore`
+- `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` (default `10`) — same shape, for `gitforgeops review --pr N`
+- `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` (default `30`) — GitHub API call is small; 30s is plenty
+- `FERRUM_GATEWAY_MAX_RETRIES` (default `3`) — retries on connect errors, 5xx, 429; exponential backoff 500ms·2^n capped at 8s. Timeouts NOT retried (ambiguous state).
 
 ## Testing
 

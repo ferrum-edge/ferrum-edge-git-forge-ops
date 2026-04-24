@@ -12,7 +12,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ferrum-edge /usr/local/bin/ferrum-edge /usr/local/bin/ferrum-edge
+COPY --from=ferrum-edge /app/ferrum-edge /usr/local/bin/ferrum-edge
 COPY --from=builder /build/target/release/gitforgeops /usr/local/bin/gitforgeops
 WORKDIR /repo
 ENTRYPOINT ["gitforgeops"]
