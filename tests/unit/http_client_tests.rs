@@ -19,6 +19,7 @@ fn base_env() -> EnvConfig {
         gateway_request_timeout_secs: 60,
         github_connect_timeout_secs: 10,
         github_request_timeout_secs: 30,
+        gateway_max_retries: 3,
     }
 }
 

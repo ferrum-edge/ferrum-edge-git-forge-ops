@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Response};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::EnvConfig;
@@ -11,6 +11,7 @@ pub struct AdminClient {
     client: Client,
     gateway_url: String,
     jwt_secret: String,
+    max_retries: u32,
 }
 
 impl AdminClient {
@@ -88,6 +89,7 @@ impl AdminClient {
             client,
             gateway_url: gateway_url.trim_end_matches('/').to_string(),
             jwt_secret,
+            max_retries: env.gateway_max_retries,
         })
     }
 
@@ -99,7 +101,56 @@ impl AdminClient {
         format!("{}{}", self.gateway_url, path)
     }
 
-    async fn check_response(&self, resp: reqwest::Response) -> crate::error::Result<()> {
+    /// Send an HTTP request with automatic retry on transient failures.
+    ///
+    /// Retries on:
+    /// - Connection errors (`is_connect()`) — the server never saw the request
+    /// - HTTP 5xx and 429 — server-side transient issue, typically safe to retry
+    ///
+    /// Does NOT retry on:
+    /// - HTTP 4xx (other than 429) — permanent, caller error
+    /// - Request timeouts — ambiguous state; the request may have applied.
+    ///   The higher-level workflow can re-run safely because the Ferrum
+    ///   admin API is idempotent for PUT/DELETE/POST-batch/POST-restore,
+    ///   and because `apply_incremental` re-diffs against live state.
+    ///
+    /// Backoff is exponential (500ms · 2^attempt) with a cap of 8s. No
+    /// jitter — retry volume from a single CLI run is too low to matter.
+    async fn send_with_retry<F>(&self, build: F) -> crate::error::Result<Response>
+    where
+        F: Fn() -> RequestBuilder,
+    {
+        let max_attempts = self.max_retries.saturating_add(1);
+        let mut last_error: Option<String> = None;
+
+        for attempt in 1..=max_attempts {
+            let result = build().send().await;
+            match result {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let retryable = status == 429 || (500..600).contains(&status);
+                    if retryable && attempt < max_attempts {
+                        last_error = Some(format!("HTTP {status}"));
+                        backoff_sleep(attempt).await;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if e.is_connect() && attempt < max_attempts => {
+                    last_error = Some(e.to_string());
+                    backoff_sleep(attempt).await;
+                }
+                Err(e) => return Err(crate::error::Error::HttpClient(e.to_string())),
+            }
+        }
+
+        Err(crate::error::Error::HttpClient(format!(
+            "retries exhausted after {max_attempts} attempts: {}",
+            last_error.unwrap_or_else(|| "unknown".to_string())
+        )))
+    }
+
+    async fn check_response(&self, resp: Response) -> crate::error::Result<()> {
         let status = resp.status().as_u16();
         if status >= 400 {
             let body = resp
@@ -115,14 +166,15 @@ impl AdminClient {
     }
 
     pub async fn get_backup(&self, namespace: &str) -> crate::error::Result<GatewayConfig> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .get(self.url("/backup"))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .get(self.url("/backup"))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
 
         let status = resp.status().as_u16();
         if status >= 400 {
@@ -142,13 +194,10 @@ impl AdminClient {
     }
 
     pub async fn list_namespaces(&self) -> crate::error::Result<Vec<String>> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .get(self.url("/namespaces"))
-            .bearer_auth(self.token()?)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| self.client.get(self.url("/namespaces")).bearer_auth(&token))
+            .await?;
 
         let status = resp.status().as_u16();
         if status >= 400 {
@@ -172,15 +221,16 @@ impl AdminClient {
         config: &GatewayConfig,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .post(self.url("/restore?confirm=true"))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(config)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(self.url("/restore?confirm=true"))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(config)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -189,53 +239,59 @@ impl AdminClient {
         config: &GatewayConfig,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .post(self.url("/batch"))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(config)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(self.url("/batch"))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(config)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
     pub async fn create_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .post(self.url("/proxies"))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(proxy)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(self.url("/proxies"))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(proxy)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
     pub async fn update_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/proxies/{}", proxy.id);
         let resp = self
-            .client
-            .put(self.url(&format!("/proxies/{}", proxy.id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(proxy)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .put(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(proxy)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
     pub async fn delete_proxy(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/proxies/{id}");
         let resp = self
-            .client
-            .delete(self.url(&format!("/proxies/{}", id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .delete(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -244,15 +300,16 @@ impl AdminClient {
         consumer: &Consumer,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .post(self.url("/consumers"))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(consumer)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(self.url("/consumers"))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(consumer)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -261,27 +318,31 @@ impl AdminClient {
         consumer: &Consumer,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/consumers/{}", consumer.id);
         let resp = self
-            .client
-            .put(self.url(&format!("/consumers/{}", consumer.id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(consumer)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .put(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(consumer)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
     pub async fn delete_consumer(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/consumers/{id}");
         let resp = self
-            .client
-            .delete(self.url(&format!("/consumers/{}", id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .delete(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -290,15 +351,16 @@ impl AdminClient {
         upstream: &Upstream,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .post(self.url("/upstreams"))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(upstream)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(self.url("/upstreams"))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(upstream)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -307,27 +369,31 @@ impl AdminClient {
         upstream: &Upstream,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/upstreams/{}", upstream.id);
         let resp = self
-            .client
-            .put(self.url(&format!("/upstreams/{}", upstream.id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(upstream)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .put(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(upstream)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
     pub async fn delete_upstream(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/upstreams/{id}");
         let resp = self
-            .client
-            .delete(self.url(&format!("/upstreams/{}", id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .delete(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -336,15 +402,16 @@ impl AdminClient {
         pc: &PluginConfig,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
         let resp = self
-            .client
-            .post(self.url("/plugins/config"))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(pc)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .post(self.url("/plugins/config"))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(pc)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -353,15 +420,17 @@ impl AdminClient {
         pc: &PluginConfig,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/plugins/config/{}", pc.id);
         let resp = self
-            .client
-            .put(self.url(&format!("/plugins/config/{}", pc.id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .json(pc)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .put(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .json(pc)
+            })
+            .await?;
         self.check_response(resp).await
     }
 
@@ -370,14 +439,23 @@ impl AdminClient {
         id: &str,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let token = self.token()?;
+        let path = format!("/plugins/config/{id}");
         let resp = self
-            .client
-            .delete(self.url(&format!("/plugins/config/{}", id)))
-            .bearer_auth(self.token()?)
-            .header("X-Ferrum-Namespace", namespace)
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+            .send_with_retry(|| {
+                self.client
+                    .delete(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
         self.check_response(resp).await
     }
+}
+
+async fn backoff_sleep(attempt: u32) {
+    // 500ms · 2^(attempt-1), capped at 8s: 500ms, 1s, 2s, 4s, 8s, 8s, …
+    let exp = attempt.saturating_sub(1).min(4);
+    let delay_ms = 500u64 * (1u64 << exp);
+    tokio::time::sleep(Duration::from_millis(delay_ms.min(8_000))).await;
 }

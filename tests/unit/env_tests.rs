@@ -1,4 +1,17 @@
+use std::sync::{Mutex, MutexGuard};
+
 use gitforgeops::config::env::{load_env_config, ApplyStrategy, GatewayMode};
+
+// Env tests mutate process-global state and must run serially. Cargo's test
+// harness runs tests in parallel by default; this mutex gates every env test
+// so they don't stomp on each other's `set_var` / `remove_var` calls.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+fn env_guard() -> MutexGuard<'static, ()> {
+    // `lock()` returns Err only on poisoning (a prior test panicked while
+    // holding the lock). The guard is still usable, so unwrap the inner value.
+    ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn clear_env() {
     for var in &[
@@ -18,6 +31,7 @@ fn clear_env() {
         "FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS",
         "FERRUM_GITHUB_CONNECT_TIMEOUT_SECS",
         "FERRUM_GITHUB_REQUEST_TIMEOUT_SECS",
+        "FERRUM_GATEWAY_MAX_RETRIES",
     ] {
         std::env::remove_var(var);
     }
@@ -25,6 +39,7 @@ fn clear_env() {
 
 #[test]
 fn env_config_defaults_and_overrides() {
+    let _guard = env_guard();
     clear_env();
 
     let config = load_env_config();
@@ -65,6 +80,7 @@ fn env_config_defaults_and_overrides() {
 
 #[test]
 fn env_config_timeout_defaults_and_overrides() {
+    let _guard = env_guard();
     clear_env();
 
     let config = load_env_config();
@@ -89,6 +105,30 @@ fn env_config_timeout_defaults_and_overrides() {
     let config = load_env_config();
     assert_eq!(config.gateway_connect_timeout_secs, 10);
     assert_eq!(config.github_connect_timeout_secs, 10);
+
+    clear_env();
+}
+
+#[test]
+fn env_config_max_retries_defaults_and_overrides() {
+    let _guard = env_guard();
+    clear_env();
+
+    let config = load_env_config();
+    assert_eq!(config.gateway_max_retries, 3);
+
+    std::env::set_var("FERRUM_GATEWAY_MAX_RETRIES", "0");
+    let config = load_env_config();
+    assert_eq!(config.gateway_max_retries, 0);
+
+    std::env::set_var("FERRUM_GATEWAY_MAX_RETRIES", "7");
+    let config = load_env_config();
+    assert_eq!(config.gateway_max_retries, 7);
+
+    // Non-numeric falls back to default.
+    std::env::set_var("FERRUM_GATEWAY_MAX_RETRIES", "many");
+    let config = load_env_config();
+    assert_eq!(config.gateway_max_retries, 3);
 
     clear_env();
 }

@@ -59,6 +59,11 @@ pub struct EnvConfig {
     pub github_connect_timeout_secs: u64,
     /// Timeout for a complete HTTP request/response cycle to `api.github.com`, in seconds.
     pub github_request_timeout_secs: u64,
+    /// Max automatic retries on transient admin-API failures (connection
+    /// errors, HTTP 5xx, 429). `0` disables retry. Retries use exponential
+    /// backoff starting at 500ms. Request timeouts are NOT retried — their
+    /// state is ambiguous (may or may not have applied).
+    pub gateway_max_retries: u32,
 }
 
 /// Load tool configuration from environment variables.
@@ -81,6 +86,7 @@ pub struct EnvConfig {
 /// | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `gateway_request_timeout_secs` | `60`        |
 /// | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS`  | `github_connect_timeout_secs`  | `10`        |
 /// | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`  | `github_request_timeout_secs`  | `30`        |
+/// | `FERRUM_GATEWAY_MAX_RETRIES`          | `gateway_max_retries`          | `3`         |
 pub fn load_env_config() -> EnvConfig {
     EnvConfig {
         gateway_url: env::var("FERRUM_GATEWAY_URL").ok(),
@@ -117,6 +123,7 @@ pub fn load_env_config() -> EnvConfig {
         gateway_request_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", 60),
         github_connect_timeout_secs: parse_timeout_env("FERRUM_GITHUB_CONNECT_TIMEOUT_SECS", 10),
         github_request_timeout_secs: parse_timeout_env("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", 30),
+        gateway_max_retries: parse_u32_env("FERRUM_GATEWAY_MAX_RETRIES", 3),
     }
 }
 
@@ -125,4 +132,11 @@ fn parse_timeout_env(var: &str, default_secs: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default_secs)
+}
+
+fn parse_u32_env(var: &str, default: u32) -> u32 {
+    env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
 }
