@@ -7,6 +7,13 @@ on:
       - 'overlays/**'
       - '.gitforgeops/**'
 
+# `review` posts a structured PR comment via the GitHub API; that requires
+# `pull-requests: write` on the GITHUB_TOKEN. `contents: read` is the default
+# but is repeated here for clarity (needed for checkout).
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   list-envs:
     runs-on: ubuntu-latest
