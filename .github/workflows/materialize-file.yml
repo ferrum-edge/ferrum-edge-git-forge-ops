@@ -1,0 +1,94 @@
+name: GitForgeOps Materialize File
+
+# Produce a fully-resolved flat YAML (credentials inlined) and deliver it
+# age-encrypted to the invoking admin's GitHub SSH key, as a short-retention
+# workflow artifact. The plaintext file is never committed and never leaves
+# the workflow runner unencrypted.
+#
+# Use this for file-mode gateways that consume a single assembled YAML at
+# boot. The committed `assembled/<env>.yaml` in the repo is the placeholder
+# version (safe for version control, no secrets). To get the real file, run
+# this workflow.
+#
+# Gate who can run this via the GitHub Environment's protection rules
+# (required reviewers, branch restrictions). Only users approved by those
+# rules can trigger materialization.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (must match .gitforgeops/config.yaml)
+        required: true
+        type: string
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: ferrum-materialize-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Load credential bundles
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, os
+          raw = os.environ.get("ALL_SECRETS", "{}")
+          try:
+              data = json.loads(raw)
+          except json.JSONDecodeError:
+              data = {}
+          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
+          print("FERRUM_CREDS_JSON<<__FERRUM_EOF__")
+          print(json.dumps(bundles))
+          print("__FERRUM_EOF__")
+          PY
+
+      - name: Materialize and encrypt
+        env:
+          FERRUM_ENV: ${{ inputs.environment }}
+        run: |
+          mkdir -p out
+          gitforgeops --env "${{ inputs.environment }}" \
+            export --materialize \
+            --encrypt-to "${{ github.actor }}" \
+            --output "out/assembled-${{ inputs.environment }}.age"
+
+      - name: Upload encrypted artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: assembled-${{ inputs.environment }}-${{ github.run_id }}
+          path: out/assembled-${{ inputs.environment }}.age
+          retention-days: 1
+
+      - name: Summary
+        run: |
+          echo "### Materialized config for \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download the artifact \`assembled-${{ inputs.environment }}-${{ github.run_id }}\` and decrypt:" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "age -d -i ~/.ssh/id_ed25519 < assembled-${{ inputs.environment }}.age > assembled.yaml" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Artifact retention: **1 day**. The encrypted blob is safe against GitHub-side compromise; the decrypted file never touches the repo." >> "$GITHUB_STEP_SUMMARY"

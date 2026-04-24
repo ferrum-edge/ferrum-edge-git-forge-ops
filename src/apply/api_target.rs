@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use crate::config::schema::GatewayConfig;
 use crate::config::ApplyStrategy;
-use crate::diff::resource_diff::{compute_diff, DiffAction};
+use crate::diff::resource_diff::{compute_diff_with_ownership, DiffAction, DiffResult};
 use crate::http_client::AdminClient;
 
 #[derive(Debug, Default)]
@@ -8,6 +10,7 @@ pub struct ApplyResult {
     pub created: usize,
     pub updated: usize,
     pub deleted: usize,
+    pub unmanaged_skipped: usize,
     pub errors: Vec<String>,
 }
 
@@ -28,11 +31,17 @@ impl ApplyResult {
     }
 }
 
+/// Apply configuration to the gateway via the admin API.
+///
+/// When `previously_managed` is `Some`, runs in `shared` ownership mode: only
+/// resources present in that set can be deleted; admin-added resources are
+/// reported in `unmanaged_skipped` but not touched.
 pub async fn apply_api(
     desired: &GatewayConfig,
     client: &AdminClient,
     strategy: ApplyStrategy,
     namespace_filter: Option<&str>,
+    previously_managed: Option<&HashSet<String>>,
 ) -> crate::error::Result<ApplyResult> {
     let mut aggregate = ApplyResult::default();
 
@@ -44,13 +53,15 @@ pub async fn apply_api(
                 apply_full_replace(&desired_namespace, client, &namespace).await?
             }
             ApplyStrategy::Incremental => {
-                apply_incremental(&desired_namespace, client, &namespace).await?
+                apply_incremental(&desired_namespace, client, &namespace, previously_managed)
+                    .await?
             }
         };
 
         aggregate.created += namespace_result.created;
         aggregate.updated += namespace_result.updated;
         aggregate.deleted += namespace_result.deleted;
+        aggregate.unmanaged_skipped += namespace_result.unmanaged_skipped;
         aggregate.errors.extend(
             namespace_result
                 .errors
@@ -81,11 +92,16 @@ async fn apply_incremental(
     desired: &GatewayConfig,
     client: &AdminClient,
     namespace: &str,
+    previously_managed: Option<&HashSet<String>>,
 ) -> crate::error::Result<ApplyResult> {
     let actual = client.get_backup(namespace).await?;
-    let diffs = compute_diff(desired, &actual);
+    let DiffResult { diffs, unmanaged } =
+        compute_diff_with_ownership(desired, &actual, previously_managed);
 
-    let mut result = ApplyResult::default();
+    let mut result = ApplyResult {
+        unmanaged_skipped: unmanaged.len(),
+        ..Default::default()
+    };
 
     for diff in &diffs {
         let outcome = match (&diff.action, diff.kind.as_str()) {

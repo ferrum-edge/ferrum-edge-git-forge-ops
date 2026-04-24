@@ -5,29 +5,45 @@ on:
     paths:
       - 'resources/**'
       - 'overlays/**'
+      - '.gitforgeops/**'
 
 jobs:
-  review:
-    # Only run the container-based job when an image tag is explicitly
-    # configured. Forks that haven't published an image fall through to
-    # `review-native` and pay the native-build cost instead of failing
-    # on `docker pull`.
-    if: vars.GITFORGEOPS_IMAGE_TAG != ''
+  list-envs:
     runs-on: ubuntu-latest
-    container:
-      image: ferrumedge/ferrum-edge-git-forge-ops:${{ vars.GITFORGEOPS_IMAGE_TAG }}
+    outputs:
+      envs: ${{ steps.list.outputs.envs }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate
-        run: gitforgeops validate --format github-annotations
-        env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-  review-native:
-    if: vars.GITFORGEOPS_IMAGE_TAG == ''
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Enumerate environments
+        id: list
+        run: |
+          envs=$(gitforgeops envs --format json)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: list-envs
+    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.list-envs.outputs.envs) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,10 +71,16 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install gitforgeops
-        run: cargo install --path .
+        run: cargo install --path . --locked
 
       - name: Validate
-        run: gitforgeops validate --format github-annotations
+        run: gitforgeops --env ${{ matrix.environment }} validate --format github-annotations
+
+      - name: Review
+        if: github.event.pull_request.number
         env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITFORGEOPS_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gitforgeops --env ${{ matrix.environment }} review --pr ${{ github.event.pull_request.number }}

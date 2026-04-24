@@ -1,0 +1,40 @@
+# gitforgeops policy configuration
+#
+# Rename to `.gitforgeops/policies.yaml` to enable. All rules default to
+# `enabled: false`, so the policy framework is opt-in. When a rule fires at
+# `severity: error`, it blocks `gitforgeops apply` until the violation is
+# fixed or overridden.
+
+version: 1
+
+policies:
+  # Enforce connection and read/write timeouts are within a reasonable band.
+  # Only fires on values explicitly set; don't bother with schema defaults.
+  proxy_timeout_bands:
+    enabled: true
+    severity: error
+    connect_timeout_ms: { min: 500,  max: 15000 }
+    read_timeout_ms:    { min: 1000, max: 60000 }
+    write_timeout_ms:   { min: 1000, max: 60000 }
+
+  # Enforce TLS-only backends by default.
+  backend_scheme:
+    enabled: true
+    severity: error
+    allowed_protocols: [https, wss, grpcs]
+
+  # Every proxy must have an auth plugin attached.
+  require_auth_plugin:
+    enabled: false
+    severity: error
+
+  # Refuse `backend_tls_verify_server_cert: false`.
+  forbid_tls_verify_disabled:
+    enabled: false
+    severity: error
+
+# Policy override — a PR labelled with `require_label` bypasses errors when the
+# account that added the label has at least `required_permission` on the repo.
+overrides:
+  require_label: gitforgeops/policy-override
+  required_permission: write     # admin | maintain | write

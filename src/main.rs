@@ -1,36 +1,85 @@
 mod cli;
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
+use reqwest::Client;
 
 use gitforgeops::apply;
-use gitforgeops::config::{self, GatewayConfig, GatewayMode};
+use gitforgeops::config::{
+    self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
+    ResolvedEnv,
+};
 use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
+use gitforgeops::policy;
 use gitforgeops::review;
+use gitforgeops::secrets;
 use gitforgeops::state::StateFile;
 use gitforgeops::validate;
 
 #[tokio::main]
 async fn main() {
     let cli = cli::Cli::parse();
+    let explicit_env = cli.env.clone();
 
     let result = match cli.command {
-        cli::Commands::Validate { format } => cmd_validate(&format),
-        cli::Commands::Export { output } => cmd_export(output.as_deref()),
-        cli::Commands::Diff { exit_on_drift } => cmd_diff(exit_on_drift).await,
-        cli::Commands::Plan {} => cmd_plan().await,
-        cli::Commands::Apply { auto_approve } => cmd_apply(auto_approve).await,
+        cli::Commands::Validate { format } => cmd_validate(&format, explicit_env.as_deref()),
+        cli::Commands::Export {
+            output,
+            materialize,
+            encrypt_to,
+        } => {
+            cmd_export(
+                output.as_deref(),
+                materialize,
+                encrypt_to.as_deref(),
+                explicit_env.as_deref(),
+            )
+            .await
+        }
+        cli::Commands::Diff { exit_on_drift } => {
+            cmd_diff(exit_on_drift, explicit_env.as_deref()).await
+        }
+        cli::Commands::Plan {} => cmd_plan(explicit_env.as_deref()).await,
+        cli::Commands::Apply {
+            auto_approve,
+            allow_large_prune,
+        } => cmd_apply(auto_approve, allow_large_prune, explicit_env.as_deref()).await,
         cli::Commands::Import {
             from_api,
             from_file,
             output_dir,
-        } => cmd_import(from_api.as_deref(), from_file.as_deref(), &output_dir).await,
-        cli::Commands::Review { pr } => cmd_review(pr).await,
+        } => {
+            cmd_import(
+                from_api.as_deref(),
+                from_file.as_deref(),
+                &output_dir,
+                explicit_env.as_deref(),
+            )
+            .await
+        }
+        cli::Commands::Review { pr } => cmd_review(pr, explicit_env.as_deref()).await,
+        cli::Commands::Envs { format } => cmd_envs(&format),
+        cli::Commands::Rotate {
+            consumer,
+            credential,
+            namespace,
+            recipient,
+        } => {
+            cmd_rotate(
+                &consumer,
+                &credential,
+                namespace.as_deref(),
+                recipient.as_deref(),
+                explicit_env.as_deref(),
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {
@@ -39,13 +88,26 @@ async fn main() {
     }
 }
 
-fn load_and_assemble() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
+fn load_repo_config() -> Result<Option<RepoConfig>, Box<dyn std::error::Error>> {
+    Ok(RepoConfig::load()?)
+}
 
+fn resolve_runtime(
+    explicit_env: Option<&str>,
+) -> Result<(EnvConfig, ResolvedEnv, Option<RepoConfig>), Box<dyn std::error::Error>> {
+    let env_config = config::load_env_config();
+    let repo = load_repo_config()?;
+    let resolved = resolve_env(repo.as_ref(), &env_config, explicit_env)?;
+    Ok((env_config, resolved, repo))
+}
+
+fn load_and_assemble_for(
+    resolved: &ResolvedEnv,
+) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
     let resources_dir = PathBuf::from("./resources");
     let mut resources = config::load_resources(&resources_dir)?;
 
-    if let Some(ref overlay_name) = env_config.overlay {
+    if let Some(ref overlay_name) = resolved.overlay {
         let overlay_dir = PathBuf::from("./overlays").join(overlay_name);
         if overlay_dir.is_dir() {
             config::apply_overlay(&mut resources, &overlay_dir)?;
@@ -54,8 +116,22 @@ fn load_and_assemble() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
 
     let gateway_config = config::assemble(resources);
     let gateway_config =
-        config::select_config_namespace(&gateway_config, env_config.namespace_filter.as_deref());
+        config::select_config_namespace(&gateway_config, resolved.namespace_filter.as_deref());
     Ok(gateway_config)
+}
+
+fn resolve_credentials(
+    cfg: &mut GatewayConfig,
+    env_config: &EnvConfig,
+) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
+    let bundle = match &env_config.creds_bundle_json {
+        Some(raw) if !raw.trim().is_empty() => {
+            let (merged, _per_shard) = secrets::load_bundles_from_env(raw)?;
+            merged
+        }
+        _ => BTreeMap::new(),
+    };
+    Ok(secrets::resolve_secrets(cfg, &bundle)?)
 }
 
 async fn load_namespace_pairs(
@@ -77,28 +153,64 @@ async fn load_namespace_pairs(
 
 fn compute_namespace_diffs(
     namespace_pairs: &[(String, GatewayConfig, GatewayConfig)],
+    previously_managed: Option<&HashSet<String>>,
 ) -> (
-    Vec<gitforgeops::diff::resource_diff::ResourceDiff>,
-    Vec<gitforgeops::diff::breaking::BreakingChange>,
+    Vec<diff::ResourceDiff>,
+    Vec<diff::BreakingChange>,
+    Vec<diff::UnmanagedResource>,
 ) {
     let mut diffs = Vec::new();
     let mut breaking = Vec::new();
+    let mut unmanaged = Vec::new();
 
     for (_, desired_namespace, actual_namespace) in namespace_pairs {
-        let namespace_diffs = diff::compute_diff(desired_namespace, actual_namespace);
+        let result = diff::compute_diff_with_ownership(
+            desired_namespace,
+            actual_namespace,
+            previously_managed,
+        );
         let namespace_breaking =
-            diff::detect_breaking_changes(&namespace_diffs, desired_namespace, actual_namespace);
+            diff::detect_breaking_changes(&result.diffs, desired_namespace, actual_namespace);
 
-        diffs.extend(namespace_diffs);
+        diffs.extend(result.diffs);
+        unmanaged.extend(result.unmanaged);
         breaking.extend(namespace_breaking);
     }
 
-    (diffs, breaking)
+    (diffs, breaking, unmanaged)
 }
 
-fn cmd_validate(format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let gateway_config = load_and_assemble()?;
+fn previously_managed(resolved: &ResolvedEnv, state: &StateFile) -> Option<HashSet<String>> {
+    match resolved.ownership.mode {
+        OwnershipMode::Shared => Some(state.previously_managed_keys()),
+        OwnershipMode::Exclusive => None,
+    }
+}
+
+fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) -> Option<String> {
+    if report.results.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!("Credential slots (env {}):", resolved.name)];
+    for r in &report.results {
+        let status = match r.status {
+            secrets::SlotStatus::Resolved => "resolved",
+            secrets::SlotStatus::NeedsAllocation => "needs-allocation",
+            secrets::SlotStatus::NeedsRotation => "needs-rotation",
+            secrets::SlotStatus::MissingRequired => "MISSING (required)",
+        };
+        lines.push(format!("  [{status}] {}", r.slot));
+    }
+    Some(lines.join("\n"))
+}
+
+fn cmd_validate(
+    format: &str,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut gateway_config = load_and_assemble_for(&resolved)?;
+    let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
     let result = validate::run_validation(&gateway_config, &env_config.edge_binary_path)?;
     let output_format = validate::OutputFormat::from_str_lossy(format);
@@ -113,9 +225,91 @@ fn cmd_validate(format: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_export(output_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let gateway_config = load_and_assemble()?;
+async fn cmd_export(
+    output_path: Option<&str>,
+    materialize: bool,
+    encrypt_to: Option<&str>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if encrypt_to.is_some() && !materialize {
+        return Err(
+            "`--encrypt-to` requires `--materialize` (encrypting placeholders is pointless)".into(),
+        );
+    }
+
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut gateway_config = load_and_assemble_for(&resolved)?;
+
+    if materialize {
+        // Fail fast if credentials cannot be fully resolved — we don't want to
+        // hand an admin a file that still has `${gh-env-secret:...}` strings in
+        // it, and we won't allocate fresh secrets during export (that's the job
+        // of `apply`).
+        let report = resolve_credentials(&mut gateway_config, &env_config)?;
+        let missing = report.missing_required();
+        if !missing.is_empty() {
+            return Err(format!(
+                "refusing to materialize: {} required credential slot(s) missing from bundle:\n  {}",
+                missing.len(),
+                missing
+                    .iter()
+                    .map(|r| r.slot.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            )
+            .into());
+        }
+        let pending: Vec<_> = report
+            .results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    secrets::SlotStatus::NeedsAllocation | secrets::SlotStatus::NeedsRotation
+                )
+            })
+            .collect();
+        if !pending.is_empty() {
+            return Err(format!(
+                "refusing to materialize: {} slot(s) need allocation or rotation — run `gitforgeops apply` first:\n  {}",
+                pending.len(),
+                pending
+                    .iter()
+                    .map(|r| r.slot.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            )
+            .into());
+        }
+    }
+    // When `!materialize`: skip resolve_credentials entirely so placeholder
+    // strings remain as `${gh-env-secret:...}`. Output is safe to commit.
+
     let yaml = serde_yaml::to_string(&gateway_config)?;
+
+    let payload: Vec<u8> = if let Some(login) = encrypt_to {
+        let client = reqwest::Client::builder()
+            .user_agent("gitforgeops/0.1")
+            .build()
+            .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))?;
+        match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
+            Some(delivery) => {
+                eprintln!(
+                    "Encrypted to @{} (ssh key {})",
+                    delivery.login, delivery.key_fingerprint
+                );
+                delivery.encrypted_b64.into_bytes()
+            }
+            None => {
+                return Err(format!(
+                    "@{login} has no compatible SSH public keys on GitHub; cannot encrypt. Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys."
+                )
+                .into());
+            }
+        }
+    } else {
+        yaml.into_bytes()
+    };
 
     match output_path {
         Some(path) => {
@@ -123,56 +317,89 @@ fn cmd_export(output_path: Option<&str>) -> Result<(), Box<dyn std::error::Error
                 std::fs::create_dir_all(parent)?;
             }
             let mut file = std::fs::File::create(path)?;
-            file.write_all(yaml.as_bytes())?;
+            file.write_all(&payload)?;
             eprintln!("Exported to {}", path);
         }
         None => {
-            print!("{}", yaml);
+            std::io::stdout().write_all(&payload)?;
         }
     }
 
     Ok(())
 }
 
-async fn cmd_diff(exit_on_drift: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_diff(
+    exit_on_drift: bool,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+    let _ = resolve_credentials(&mut desired, &env_config)?;
     let client = AdminClient::new(&env_config)?;
+    let state = StateFile::load(&resolved.name);
+    let managed = previously_managed(&resolved, &state);
     let namespace_pairs =
-        load_namespace_pairs(&client, &desired, env_config.namespace_filter.as_deref()).await?;
-    let (diffs, _) = compute_namespace_diffs(&namespace_pairs);
+        load_namespace_pairs(&client, &desired, resolved.namespace_filter.as_deref()).await?;
+    let (diffs, _breaking, unmanaged) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
-    if diffs.is_empty() {
+    if diffs.is_empty() && unmanaged.is_empty() {
         println!("No differences found. Configuration is in sync.");
         return Ok(());
     }
 
-    println!("Found {} difference(s):\n", diffs.len());
-    for d in &diffs {
-        let action = match d.action {
-            diff::DiffAction::Add => "ADD",
-            diff::DiffAction::Modify => "MODIFY",
-            diff::DiffAction::Delete => "DELETE",
-        };
-        println!("  {} {} {}", action, d.kind, d.id);
-        for change in &d.details {
-            println!(
-                "    {}: {} -> {}",
-                change.field, change.old_value, change.new_value
-            );
+    if !diffs.is_empty() {
+        println!("Found {} difference(s):\n", diffs.len());
+        for d in &diffs {
+            let action = match d.action {
+                diff::DiffAction::Add => "ADD",
+                diff::DiffAction::Modify => "MODIFY",
+                diff::DiffAction::Delete => "DELETE",
+            };
+            println!("  {} {} {} ({})", action, d.kind, d.id, d.namespace);
+            for change in &d.details {
+                println!(
+                    "    {}: {} -> {}",
+                    change.field, change.old_value, change.new_value
+                );
+            }
         }
     }
 
-    if exit_on_drift {
+    if !unmanaged.is_empty() && resolved.ownership.drift_report {
+        println!(
+            "\nUnmanaged resources (mode: {:?}, not touched by apply):",
+            resolved.ownership.mode
+        );
+        for u in &unmanaged {
+            println!("  {} {} ({})", u.kind, u.id, u.namespace);
+        }
+    }
+
+    let has_drift = !diffs.is_empty()
+        || (resolved.ownership.drift_alert_on.unmanaged_added && !unmanaged.is_empty());
+
+    if exit_on_drift && has_drift {
         process::exit(2);
     }
 
     Ok(())
 }
 
-async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+    let secret_report = resolve_credentials(&mut desired, &env_config)?;
+
+    println!("=== Environment ===");
+    println!(
+        "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
+        resolved.name,
+        resolved.overlay.as_deref().unwrap_or("<none>"),
+        resolved.namespace_filter.as_deref().unwrap_or("<all>"),
+        resolved.apply_strategy,
+        resolved.ownership.mode,
+    );
+    println!();
 
     println!("=== Validation ===");
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
@@ -193,23 +420,30 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
+        println!("=== Credentials ===");
+        println!("{}\n", note);
+    }
+
     let client = AdminClient::new(&env_config);
-    let (diffs, breaking, actual_available) = match &client {
+    let state = StateFile::load(&resolved.name);
+    let managed = previously_managed(&resolved, &state);
+    let (diffs, breaking, unmanaged, actual_available) = match &client {
         Ok(c) => {
-            match load_namespace_pairs(c, &desired, env_config.namespace_filter.as_deref()).await {
+            match load_namespace_pairs(c, &desired, resolved.namespace_filter.as_deref()).await {
                 Ok(namespace_pairs) => {
-                    let (d, b) = compute_namespace_diffs(&namespace_pairs);
-                    (d, b, true)
+                    let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                    (d, b, u, true)
                 }
                 Err(e) => {
                     eprintln!("Could not fetch live config: {}", e);
-                    (Vec::new(), Vec::new(), false)
+                    (Vec::new(), Vec::new(), Vec::new(), false)
                 }
             }
         }
         Err(e) => {
             eprintln!("Could not create API client: {}", e);
-            (Vec::new(), Vec::new(), false)
+            (Vec::new(), Vec::new(), Vec::new(), false)
         }
     };
 
@@ -226,6 +460,18 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
                 diff::DiffAction::Delete => "DELETE",
             };
             println!("  {} {} {}", action, d.kind, d.id);
+        }
+        println!();
+    }
+
+    if !unmanaged.is_empty() && resolved.ownership.drift_report {
+        println!("=== Unmanaged Resources ===");
+        println!(
+            "(mode={:?}; these exist on the gateway but were never managed by this repo)",
+            resolved.ownership.mode
+        );
+        for u in &unmanaged {
+            println!("  {} {} ({})", u.kind, u.id, u.namespace);
         }
         println!();
     }
@@ -256,6 +502,25 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    if let Some(policy_cfg) = policy::load_policies()? {
+        let policy_findings = policy::evaluate_policies(&desired, &policy_cfg);
+        if !policy_findings.is_empty() {
+            println!("=== Policy Violations ===");
+            for pf in &policy_findings {
+                println!(
+                    "  [{}] {}: {} {} ({}): {}",
+                    pf.severity.as_str(),
+                    pf.rule_id,
+                    pf.kind,
+                    pf.id,
+                    pf.namespace,
+                    pf.message
+                );
+            }
+            println!();
+        }
+    }
+
     if !validation_ok {
         process::exit(1);
     }
@@ -263,9 +528,27 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_apply(
+    auto_approve: bool,
+    allow_large_prune: bool,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+    let secret_report = resolve_credentials(&mut desired, &env_config)?;
+
+    // Missing required credentials → fail fast before we touch the gateway.
+    let missing = secret_report.missing_required();
+    if !missing.is_empty() {
+        eprintln!(
+            "Refusing to apply: {} required credential slot(s) have no value:",
+            missing.len()
+        );
+        for m in missing {
+            eprintln!("  {}", m.slot);
+        }
+        process::exit(1);
+    }
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     if let Ok(ref r) = val_result {
@@ -275,16 +558,63 @@ async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
+    // Policy enforcement (with optional override).
+    if let Some(policy_cfg) = policy::load_policies()? {
+        let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
+        let pr_number = std::env::var("GITFORGEOPS_PR_NUMBER")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        let override_decision = if let Some(pr) = pr_number {
+            let d = policy::check_override(&env_config, &policy_cfg.overrides, pr).await?;
+            policy::github_override::apply_override(&mut findings, &d);
+            Some(d)
+        } else {
+            None
+        };
+
+        let blockers: Vec<_> = findings.iter().filter(|f| f.is_blocking()).collect();
+        if !blockers.is_empty() {
+            eprintln!(
+                "Refusing to apply: {} unresolved policy violation(s):",
+                blockers.len()
+            );
+            for b in blockers {
+                eprintln!("  [{}] {}: {}", b.severity.as_str(), b.rule_id, b.message);
+            }
+            if let Some(d) = &override_decision {
+                if !d.active {
+                    eprintln!("(override inactive: {})", d.reason);
+                }
+            } else {
+                eprintln!("(no PR number provided; overrides not evaluated)");
+            }
+            process::exit(1);
+        }
+    }
+
+    let mut state = StateFile::load(&resolved.name);
+    let is_first_apply = StateFile::is_first_apply(&resolved.name);
+
+    if is_first_apply && matches!(resolved.ownership.mode, OwnershipMode::Shared) {
+        eprintln!(
+            "Notice: first apply for environment '{}' in shared mode. Resources on the gateway but not in this repo will be treated as unmanaged and left alone.",
+            resolved.name
+        );
+    }
+
     match env_config.gateway_mode {
         GatewayMode::Api => {
             let client = AdminClient::new(&env_config)?;
+            let managed = previously_managed(&resolved, &state);
 
             if !auto_approve {
                 let namespace_pairs =
-                    load_namespace_pairs(&client, &desired, env_config.namespace_filter.as_deref())
+                    load_namespace_pairs(&client, &desired, resolved.namespace_filter.as_deref())
                         .await?;
-                let (diffs, _) = compute_namespace_diffs(&namespace_pairs);
-                if diffs.is_empty() {
+                let (diffs, _, unmanaged) =
+                    compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+
+                if diffs.is_empty() && unmanaged.is_empty() {
                     println!("No changes to apply.");
                     return Ok(());
                 }
@@ -297,22 +627,49 @@ async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>>
                     };
                     println!("  {} {} {}", action, d.kind, d.id);
                 }
+                if !unmanaged.is_empty() {
+                    println!(
+                        "\n{} unmanaged resource(s) on gateway (not touched in shared mode).",
+                        unmanaged.len()
+                    );
+                }
                 println!("\nUse --auto-approve to skip this check.");
                 process::exit(0);
+            }
+
+            // Large-prune safety check.
+            let namespace_pairs =
+                load_namespace_pairs(&client, &desired, resolved.namespace_filter.as_deref())
+                    .await?;
+            let (diffs, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+            let delete_count = diffs
+                .iter()
+                .filter(|d| matches!(d.action, diff::DiffAction::Delete))
+                .count();
+            let managed_total = state.resources.len().max(1);
+            let delete_pct = (delete_count * 100) / managed_total;
+            let threshold = resolved.ownership.large_prune_threshold_percent as usize;
+            if delete_pct > threshold && !allow_large_prune {
+                eprintln!(
+                    "Refusing to apply: would delete {}% of managed resources (threshold {}%). Re-run with --allow-large-prune to proceed.",
+                    delete_pct, threshold
+                );
+                process::exit(1);
             }
 
             let result = apply::apply_api(
                 &desired,
                 &client,
-                env_config.apply_strategy.clone(),
-                env_config.namespace_filter.as_deref(),
+                resolved.apply_strategy.clone(),
+                resolved.namespace_filter.as_deref(),
+                managed.as_ref(),
             )
             .await?
             .into_result()?;
 
             println!(
-                "Applied: {} created, {} updated, {} deleted",
-                result.created, result.updated, result.deleted
+                "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped",
+                result.created, result.updated, result.deleted, result.unmanaged_skipped
             );
         }
         GatewayMode::File => {
@@ -321,7 +678,6 @@ async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
-    let mut state = StateFile::load();
     state.record(&desired);
     state.save()?;
 
@@ -332,18 +688,14 @@ async fn cmd_import(
     from_api: Option<&str>,
     from_file: Option<&str>,
     output_dir: &str,
+    explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_path = PathBuf::from(output_dir);
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
     let result = if from_api.is_some() {
-        let env_config = config::load_env_config();
         let client = AdminClient::new(&env_config)?;
-        import::import_from_api(
-            &client,
-            &output_path,
-            env_config.namespace_filter.as_deref(),
-        )
-        .await?
+        import::import_from_api(&client, &output_path, resolved.namespace_filter.as_deref()).await?
     } else if let Some(file_path) = from_file {
         import::import_from_file(&PathBuf::from(file_path), &output_path)?
     } else {
@@ -359,9 +711,13 @@ async fn cmd_import(
     Ok(())
 }
 
-async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_review(
+    pr: Option<u64>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+    let secret_report = resolve_credentials(&mut desired, &env_config)?;
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_ok, validation_output) = match &val_result {
@@ -370,15 +726,18 @@ async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client = AdminClient::new(&env_config);
+    let state = StateFile::load(&resolved.name);
+    let managed = previously_managed(&resolved, &state);
 
-    let (diffs, breaking, comparison_error) = match &client {
+    let (diffs, breaking, unmanaged, comparison_error) = match &client {
         Ok(c) => {
-            match load_namespace_pairs(c, &desired, env_config.namespace_filter.as_deref()).await {
+            match load_namespace_pairs(c, &desired, resolved.namespace_filter.as_deref()).await {
                 Ok(namespace_pairs) => {
-                    let (diffs, breaking) = compute_namespace_diffs(&namespace_pairs);
-                    (diffs, breaking, None)
+                    let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                    (d, b, u, None)
                 }
                 Err(e) => (
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Some(format!("Live gateway comparison skipped: {}", e)),
@@ -388,6 +747,7 @@ async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => (
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             Some(format!("Live gateway comparison skipped: {}", e)),
         ),
     };
@@ -395,14 +755,41 @@ async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     let security_findings = diff::audit_security(&desired);
     let bp_findings = diff::check_best_practices(&desired);
 
-    let comment = review::build_review_comment(
+    let (policy_findings, override_reason) = match policy::load_policies()? {
+        Some(policy_cfg) => {
+            let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
+            let decision = match pr {
+                Some(pr_number) => {
+                    let d = policy::check_override(&env_config, &policy_cfg.overrides, pr_number)
+                        .await?;
+                    policy::github_override::apply_override(&mut findings, &d);
+                    Some(d)
+                }
+                None => None,
+            };
+            (findings, decision.map(|d| d.reason))
+        }
+        None => (Vec::new(), None),
+    };
+
+    let ownership_note = format!(
+        "Environment: `{}` · Ownership: `{:?}` · Strategy: `{:?}`",
+        resolved.name, resolved.ownership.mode, resolved.apply_strategy
+    );
+
+    let comment = review::build_review_comment_v2(
         validation_ok,
         &validation_output,
         &diffs,
         &breaking,
         &security_findings,
         &bp_findings,
+        &policy_findings,
+        &unmanaged,
+        override_reason.as_deref(),
         comparison_error.as_deref(),
+        Some(&ownership_note),
+        &secret_report,
     );
 
     match pr {
@@ -412,6 +799,101 @@ async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             print!("{}", comment);
+        }
+    }
+
+    let _ = !secret_report.results.is_empty();
+    Ok(())
+}
+
+fn cmd_envs(format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = load_repo_config()?;
+    let names = match repo {
+        Some(r) => r.environment_names(),
+        None => vec![ResolvedEnv::default_env_name()],
+    };
+    match format {
+        "text" => {
+            for n in names {
+                println!("{n}");
+            }
+        }
+        _ => {
+            println!("{}", serde_json::to_string(&names)?);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_rotate(
+    consumer: &str,
+    credential: &str,
+    namespace: Option<&str>,
+    recipient: Option<&str>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+
+    let repo = env_config
+        .github_repository
+        .clone()
+        .ok_or_else(|| gitforgeops::error::Error::Config("GITHUB_REPOSITORY not set".into()))?;
+    let token = env_config.github_provisioner_token.clone().ok_or_else(|| {
+        gitforgeops::error::Error::Config("FERRUM_GH_PROVISIONER_TOKEN not set".into())
+    })?;
+
+    // Load current bundle to know shard layout.
+    let (_merged, mut per_shard) = match &env_config.creds_bundle_json {
+        Some(raw) if !raw.trim().is_empty() => secrets::load_bundles_from_env(raw)?,
+        _ => (BTreeMap::new(), BTreeMap::new()),
+    };
+
+    let mut state = StateFile::load(&resolved.name);
+    let ns = namespace.unwrap_or("ferrum");
+    let slot = secrets::resolver::slot_path(ns, consumer, credential);
+
+    let mut shard_count = state.credential_shard_count.max(1);
+
+    let client = Client::builder()
+        .user_agent("gitforgeops/0.1")
+        .build()
+        .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))?;
+
+    let outcome = secrets::rotate_and_deliver(
+        &client,
+        &repo,
+        &resolved.name,
+        &token,
+        recipient,
+        &slot,
+        &mut per_shard,
+        &mut shard_count,
+    )
+    .await?;
+
+    state.credential_shard_count = shard_count;
+    state.record_credential(
+        &slot,
+        outcome.shard,
+        &outcome.value,
+        outcome.delivered.as_ref().map(|d| d.login.as_str()),
+        None,
+    );
+    state.save()?;
+
+    println!("Rotated slot {slot} in shard {}", outcome.shard);
+    match outcome.delivered {
+        Some(d) => {
+            println!(
+                "Delivered age-encrypted blob to @{} (ssh key {}):\n",
+                d.login, d.key_fingerprint
+            );
+            println!("{}", d.encrypted_b64);
+        }
+        None => {
+            if recipient.is_some() {
+                println!("Warning: recipient had no compatible SSH keys; secret written but not delivered.");
+            }
         }
     }
 

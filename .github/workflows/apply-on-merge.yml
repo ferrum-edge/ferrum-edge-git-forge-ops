@@ -6,10 +6,49 @@ on:
     paths:
       - 'resources/**'
       - 'overlays/**'
+      - '.gitforgeops/**'
 
 jobs:
-  apply:
+  list-envs:
     runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.list.outputs.envs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Enumerate environments
+        id: list
+        run: |
+          envs=$(gitforgeops envs --format json)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+
+  apply:
+    needs: list-envs
+    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.list-envs.outputs.envs) }}
+    environment: ${{ matrix.environment }}
+    concurrency:
+      group: ferrum-apply-${{ matrix.environment }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -37,41 +76,65 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install gitforgeops
-        run: cargo install --path .
+        run: cargo install --path . --locked
+
+      - name: Load credential bundles
+        id: load-bundles
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          # Collect any FERRUM_CREDS_BUNDLE* secrets into a single JSON object and
+          # make it available to the binary. GitHub masks all referenced secrets
+          # in logs, so echoing the JSON here is mask-safe by the time it reaches
+          # stdout; but we still write it directly to the env file.
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, os
+          raw = os.environ.get("ALL_SECRETS", "{}")
+          try:
+              data = json.loads(raw)
+          except json.JSONDecodeError:
+              data = {}
+          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
+          payload = json.dumps(bundles)
+          # Multi-line env var with the EOF marker convention.
+          print("FERRUM_CREDS_JSON<<__FERRUM_EOF__")
+          print(payload)
+          print("__FERRUM_EOF__")
+          PY
 
       - name: Validate
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
         run: gitforgeops validate
-        env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
 
-      # --- API mode: push to gateway ---
-      - name: Apply to gateway (API mode)
+      - name: Apply
         if: vars.FERRUM_GATEWAY_MODE != 'file'
-        run: gitforgeops apply --auto-approve
         env:
+          FERRUM_ENV: ${{ matrix.environment }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
-          FERRUM_APPLY_STRATEGY: ${{ vars.FERRUM_APPLY_STRATEGY }}
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: gitforgeops apply --auto-approve
 
-      # --- File mode: assemble flat file and commit to main ---
-      - name: Assemble config (file mode)
+      # File mode: assemble a flat YAML preserving `${gh-env-secret:...}`
+      # placeholders. This is safe to commit — no credentials are resolved.
+      # To get a fully-populated file (for gateways that consume it), admins
+      # run the `materialize-file.yml` workflow, which produces an age-
+      # encrypted artifact delivered to the admin's SSH key.
+      - name: Assemble placeholder file (file mode)
         if: vars.FERRUM_GATEWAY_MODE == 'file'
-        run: gitforgeops export --output assembled/resources.yaml
         env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+          FERRUM_ENV: ${{ matrix.environment }}
+        run: gitforgeops export --output assembled/${{ matrix.environment }}.yaml
 
-      - name: Commit assembled config (file mode)
-        if: vars.FERRUM_GATEWAY_MODE == 'file'
+      - name: Commit state + assembled (if changed)
         run: |
           git config user.name "gitforgeops[bot]"
           git config user.email "gitforgeops[bot]@users.noreply.github.com"
-          git add assembled/resources.yaml
-          git diff --cached --quiet || git commit -m "chore: regenerate assembled config [skip ci]"
-          git push
+          git add .state/${{ matrix.environment }}.json assembled/ 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "chore(gitforgeops): state update for ${{ matrix.environment }} [skip ci]"
+          git push || true

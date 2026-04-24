@@ -10,14 +10,23 @@ Companion to [ferrum-edge](https://github.com/ferrum-edge/ferrum-edge) — shell
 
 ## Commands
 
+All commands accept `--env <name>` to select an environment declared in
+`.gitforgeops/config.yaml`. When unset, `FERRUM_ENV` is the fallback; when that
+is also unset and the repo config has one entry or a `default_environment`,
+that is used.
+
 ```bash
 gitforgeops validate [--format text|json|github]         # Assemble + shell to `ferrum-edge validate`
-gitforgeops export [--output PATH]                        # Emit flat YAML (file-mode gateways)
+gitforgeops export [--output PATH]                        # Emit flat YAML (placeholders preserved)
+gitforgeops export --materialize [--encrypt-to GH_LOGIN]  # Resolve creds; age-encrypt output (file mode stage 2)
 gitforgeops diff [--exit-on-drift]                        # Compare desired vs live gateway (/backup)
-gitforgeops plan                                          # Validate + diff + breaking + security + best-practice
-gitforgeops apply [--auto-approve]                        # Apply incrementally (CRUD) or full-replace (/restore)
+gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
+gitforgeops apply [--auto-approve] [--allow-large-prune]  # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH [--output-dir DIR]
 gitforgeops review [--pr N]                               # Post structured PR comment via GitHub API
+gitforgeops envs [--format json|text]                     # List environments (used by CI matrix)
+gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
+  [--namespace NS] [--recipient GH_LOGIN]
 ```
 
 ## Build / Test / Lint
@@ -45,9 +54,12 @@ CI runs the same three on every PR.
 ```
 resources/<ns>/{proxies,consumers,upstreams,plugins}/*.yaml
   → loader::load_resources   (walkdir, kind-tagged Resource enum)
-  → overlays/<env>/...       (optional deep-merge via apply_overlay)
+  → overlays/<env>/...       (deep-merge via apply_overlay, overlay picked by env)
   → assembler::assemble      (flat GatewayConfig, directory namespace inference)
-  → validate / export / diff / plan / apply / review
+  → secrets::resolve_secrets (replace ${gh-env-secret:...} placeholders in-memory
+                              from FERRUM_CREDS_JSON bundle, never written back to disk)
+  → policy::evaluate_policies
+  → validate / export / diff / plan / apply / review / rotate
 ```
 
 ### Gateway Modes
@@ -70,18 +82,88 @@ Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibilit
 - `FERRUM_NAMESPACE` filters everything (load, diff, apply, import). When unset, all namespaces round-trip.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
 
+### Multi-Environment (repo config)
+
+`.gitforgeops/config.yaml` declares logical environments. Each entry picks an
+overlay, apply strategy, and ownership mode. **No gateway URL, no JWT, no
+secret names** live in this file — those come from GitHub Environment Secrets
+of the same name as the entry (e.g. `production` entry → GitHub Environment
+`production`'s secrets are injected by the workflow). See
+`.gitforgeops/config.example.yaml`.
+
+Workflows run as a matrix over `gitforgeops envs --format json`, binding
+`environment: ${{ matrix.environment }}` to pull the scoped secrets. Concurrency
+groups serialize per-env applies so two concurrent writes to the same
+environment never interleave.
+
+### Ownership modes
+
+Configured per environment in repo config.
+
+- **`shared`** (default, safer): repo manages only what it has previously applied.
+  State file is the fence — unknown resources on the gateway are reported as
+  *unmanaged* and left alone. `full_replace` is rejected in this mode.
+- **`exclusive`**: repo is authoritative for the listed `namespaces`. Unmanaged
+  resources get pruned. Required for `full_replace`.
+
+`diff::compute_diff_with_ownership` takes an optional `previously_managed: &HashSet<String>`
+of `namespace:Kind:id` keys from the state file. `Some(set)` = shared mode,
+`None` = exclusive. Large-prune guard refuses applies that would delete more
+than `ownership.large_prune_threshold_percent` of the managed set unless
+`--allow-large-prune` is passed.
+
+### Policy framework
+
+`.gitforgeops/policies.yaml` declares enforceable standards. Each rule lives
+in `src/policy/rules/` and implements `PolicyCheck`. Register new rules in
+`src/policy/registry.rs::build_registry` and add its typed config to
+`src/policy/config.rs::PolicyRules`.
+
+Starter rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
+`forbid_tls_verify_disabled`.
+
+Severity `error` blocks `apply` unless overridden. Override = PR label
+(configurable name) added by a user whose repo permission is ≥
+`overrides.required_permission` (default `write`). Implementation:
+`src/policy/github_override.rs::check_override`.
+
+### Credential broker (in-GitHub, no third-party)
+
+Consumer credentials use placeholders like
+`key: "${gh-env-secret:alloc=generate}"`. Slot names are derived from
+`(namespace, consumer_id, cred_key)` — never hand-written.
+
+Storage: one or more GitHub Environment Secrets named `FERRUM_CREDS_BUNDLE[_N]`,
+each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
+auto-sharded by fnv-style hash when a bundle approaches 40 KB. The apply
+workflow's "Load credential bundles" step collects all matching secrets via
+`${{ toJSON(secrets) }}` and exports them as `FERRUM_CREDS_JSON`.
+
+Allocation (first apply, or rotation): generate random value → libsodium
+`crypto_box_seal` to the env's public key → PUT to
+`repos/.../environments/<env>/secrets/FERRUM_CREDS_BUNDLE[_N]`. Writes require
+`FERRUM_GH_PROVISIONER_TOKEN` (GitHub App installation token preferred, PAT
+with `Secrets: write` as fallback).
+
+Delivery: after allocation or rotation, the value is age-encrypted to the PR
+author's (or dispatcher's) SSH public key fetched from
+`GET /users/{login}/keys`, then posted as a PR comment or workflow output.
+Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
+
 ### Source Layout
 
 - `src/main.rs` — async Tokio entry, command dispatch
-- `src/cli.rs` — clap parser
-- `src/config/` — `schema.rs` (permissive serde mirror of Ferrum Edge types), `loader.rs`, `assembler.rs` (overlay deep-merge via `serde_json::Value`), `env.rs`
-- `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes), `breaking.rs`, `security.rs`, `best_practice.rs`
-- `src/apply/` — `api_target.rs` (incremental + full_replace), `file_target.rs`
+- `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
+- `src/config/` — `schema.rs` (permissive serde mirror of Ferrum Edge types), `loader.rs`, `assembler.rs` (overlay deep-merge via `serde_json::Value`), `env.rs` (process-env vars), `repo_config.rs` (`.gitforgeops/config.yaml`), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
+- `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes + unmanaged tracking), `breaking.rs`, `security.rs`, `best_practice.rs`
+- `src/apply/` — `api_target.rs` (incremental + full_replace, ownership-aware delete filter), `file_target.rs`
+- `src/policy/` — `config.rs` (yaml + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
+- `src/secrets/` — `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; base64-encoded PEM for CA / mTLS from env
 - `src/validate/` — `runner.rs` shells to `ferrum-edge validate`, `reporter.rs` formats (text/JSON/GitHub annotations)
-- `src/review/` — `pr_comment.rs` builds markdown, `github.rs` posts via GitHub API
+- `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (walks namespaces, pulls `/backup`), `from_file.rs`, `mod.rs::split_config` (emits per-resource YAML)
-- `src/state.rs` — `.state/state.json` tracks applied hashes + commit SHA
+- `src/state.rs` — `.state/<env>.json` tracks applied hashes, credential metadata, shard count, override history
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/error.rs` — unified `Error` enum via `thiserror`
 

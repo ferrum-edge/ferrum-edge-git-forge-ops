@@ -6,6 +6,7 @@ fn apply_result_into_result_rejects_partial_failure() {
         created: 1,
         updated: 2,
         deleted: 0,
+        unmanaged_skipped: 0,
         errors: vec!["Proxy proxy-a update: 500".to_string()],
     };
 

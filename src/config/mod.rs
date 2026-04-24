@@ -1,11 +1,17 @@
 pub mod assembler;
 pub mod env;
 pub mod loader;
+pub mod repo_config;
+pub mod resolved;
 pub mod schema;
 
 pub use assembler::{apply_overlay, assemble};
 pub use env::{load_env_config, ApplyStrategy, EnvConfig, GatewayMode};
 pub use loader::load_resources;
+pub use repo_config::{
+    EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
+};
+pub use resolved::{resolve_env, ResolvedEnv};
 pub use schema::{GatewayConfig, Resource};
 
 use std::collections::BTreeSet;

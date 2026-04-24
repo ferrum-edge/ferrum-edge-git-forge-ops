@@ -6,21 +6,45 @@ on:
   workflow_dispatch:
 
 jobs:
-  drift:
+  list-envs:
     runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.list.outputs.envs }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download ferrum-edge binary
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Enumerate environments
+        id: list
         run: |
-          VERSION="${{ vars.FERRUM_EDGE_VERSION || 'latest' }}"
-          if [ "$VERSION" = "latest" ]; then
-            URL="https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-linux-x86_64"
-          else
-            URL="https://github.com/ferrum-edge/ferrum-edge/releases/download/${VERSION}/ferrum-edge-linux-x86_64"
-          fi
-          curl -sL "$URL" -o /usr/local/bin/ferrum-edge
-          chmod +x /usr/local/bin/ferrum-edge
+          envs=$(gitforgeops envs --format json)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+
+  drift:
+    needs: list-envs
+    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.list-envs.outputs.envs) }}
+    environment: ${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -35,15 +59,31 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install gitforgeops
-        run: cargo install --path .
+        run: cargo install --path . --locked
+
+      - name: Load credential bundles
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, os
+          raw = os.environ.get("ALL_SECRETS", "{}")
+          try:
+              data = json.loads(raw)
+          except json.JSONDecodeError:
+              data = {}
+          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
+          print("FERRUM_CREDS_JSON<<__FERRUM_EOF__")
+          print(json.dumps(bundles))
+          print("__FERRUM_EOF__")
+          PY
 
       - name: Check drift
-        run: gitforgeops diff --exit-on-drift
         env:
+          FERRUM_ENV: ${{ matrix.environment }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+        run: gitforgeops diff --exit-on-drift

@@ -1,0 +1,203 @@
+use std::collections::BTreeMap;
+
+use gitforgeops::config::schema::{Consumer, GatewayConfig};
+use gitforgeops::secrets::{
+    bundle::{pick_shard, shard_secret_name},
+    load_bundles_from_env, parse_placeholder, resolve_secrets, PlaceholderAlloc, SlotStatus,
+};
+
+#[test]
+fn parse_placeholder_recognizes_valid_syntax() {
+    let p = parse_placeholder("${gh-env-secret:alloc=generate}")
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.alloc, PlaceholderAlloc::Generate);
+    assert_eq!(p.length_bytes, 32);
+
+    let p = parse_placeholder("${gh-env-secret:alloc=require|len=48}")
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.alloc, PlaceholderAlloc::Require);
+    assert_eq!(p.length_bytes, 48);
+
+    let p = parse_placeholder("${gh-env-secret:}").unwrap().unwrap();
+    assert_eq!(p.alloc, PlaceholderAlloc::Require); // default
+
+    let p = parse_placeholder("${gh-env-secret:alloc=rotate}")
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.alloc, PlaceholderAlloc::Rotate);
+}
+
+#[test]
+fn parse_placeholder_rejects_unknown_alloc() {
+    let err = parse_placeholder("${gh-env-secret:alloc=steal}")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("steal"));
+}
+
+#[test]
+fn parse_placeholder_rejects_out_of_range_length() {
+    let err = parse_placeholder("${gh-env-secret:alloc=generate|len=4}")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("out of range"));
+
+    let err = parse_placeholder("${gh-env-secret:alloc=generate|len=512}")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("out of range"));
+}
+
+#[test]
+fn parse_placeholder_ignores_non_matching_strings() {
+    assert!(parse_placeholder("plain value").is_none());
+    assert!(parse_placeholder("${env:FOO}").is_none());
+    assert!(parse_placeholder("${gh-env-secret:alloc=generate").is_none()); // no closing brace
+}
+
+#[test]
+fn load_bundles_parses_merged_map() {
+    let raw = r#"{
+        "FERRUM_CREDS_BUNDLE": "{\"ferrum/app/api_key\":\"v1\"}",
+        "FERRUM_CREDS_BUNDLE_1": "{\"ferrum/app2/api_key\":\"v2\"}",
+        "UNRELATED_SECRET": "ignored"
+    }"#;
+    let (merged, per_shard) = load_bundles_from_env(raw).unwrap();
+    assert_eq!(merged.get("ferrum/app/api_key"), Some(&"v1".to_string()));
+    assert_eq!(merged.get("ferrum/app2/api_key"), Some(&"v2".to_string()));
+    assert_eq!(merged.len(), 2);
+    assert_eq!(per_shard.len(), 2);
+    assert!(per_shard.contains_key(&0));
+    assert!(per_shard.contains_key(&1));
+}
+
+#[test]
+fn shard_secret_name_strips_suffix_for_shard_zero() {
+    assert_eq!(shard_secret_name(0), "FERRUM_CREDS_BUNDLE");
+    assert_eq!(shard_secret_name(3), "FERRUM_CREDS_BUNDLE_3");
+}
+
+#[test]
+fn pick_shard_is_deterministic_and_within_bounds() {
+    let shards = BTreeMap::new();
+    let a = pick_shard("slot-a", 32, &shards, 4).unwrap();
+    let a_again = pick_shard("slot-a", 32, &shards, 4).unwrap();
+    assert_eq!(a, a_again);
+    assert!(a < 4);
+}
+
+#[test]
+fn resolver_replaces_known_slot_and_reports_resolved() {
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=require}".to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/api_key".to_string(), "abcdef".to_string());
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(
+        cfg.consumers[0].credentials.get("api_key").unwrap(),
+        &serde_json::Value::String("abcdef".to_string())
+    );
+}
+
+#[test]
+fn resolver_reports_missing_required() {
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=require}".to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let bundle = BTreeMap::new();
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.missing_required().len(), 1);
+}
+
+#[test]
+fn skipping_resolve_preserves_placeholder_strings_verbatim() {
+    // Simulates the `export` (without `--materialize`) path: we never call
+    // resolve_secrets, so the placeholder lives on through YAML serialization
+    // and is safe to commit.
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let placeholder = "${gh-env-secret:alloc=generate}";
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String(placeholder.to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    // Intentionally don't call resolve_secrets — this is the export-without-
+    // materialize path.
+    let yaml = serde_yaml::to_string(&cfg).unwrap();
+    assert!(
+        yaml.contains(placeholder),
+        "placeholder must survive YAML serialization when not materialized; got:\n{yaml}"
+    );
+    // And confirm no plaintext "leaked" — there's no way a real secret could
+    // be in the output since we never touched the bundle.
+    assert!(!yaml.contains("randomsecret"));
+}
+
+#[test]
+fn resolver_reports_needs_allocation_for_generate() {
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let bundle = BTreeMap::new();
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.needs_allocation().len(), 1);
+}

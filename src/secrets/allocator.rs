@@ -1,0 +1,221 @@
+use std::collections::BTreeMap;
+
+use base64::Engine;
+use rand::RngCore;
+use reqwest::Client;
+
+use super::bundle::{
+    bundle_hash, merge_bundles, pick_shard, serialize_bundle, shard_secret_name, CredentialBundle,
+};
+use super::delivery::{deliver_to_author, DeliveryResult};
+use super::github_api::{fetch_public_key, put_environment_secret};
+use super::placeholder::PlaceholderAlloc;
+use super::resolver::{ResolveReport, ResolveResult, SlotStatus};
+
+#[derive(Debug, Clone)]
+pub struct AllocatedSlot {
+    pub slot: String,
+    pub shard: u32,
+    pub value: String,
+    pub alloc: PlaceholderAlloc,
+    pub delivered: Option<DeliveryResult>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AllocateOutcome {
+    pub allocated: Vec<AllocatedSlot>,
+    pub bundle_hashes: BTreeMap<u32, String>,
+    pub shard_count: u32,
+}
+
+/// Generate + publish any slots that need allocation (`generate` with no
+/// existing value, or `rotate` regardless), and deliver new values to the PR
+/// author via age encryption.
+///
+/// Modifies `shards` in place to reflect the new values; callers should persist
+/// the merged bundle and update state.json with hashes.
+#[allow(clippy::too_many_arguments)]
+pub async fn allocate_and_deliver(
+    client: &Client,
+    repo: &str,
+    environment: &str,
+    provisioner_token: &str,
+    pr_author: Option<&str>,
+    report: &ResolveReport,
+    shards: &mut BTreeMap<u32, CredentialBundle>,
+    shard_count: &mut u32,
+) -> crate::error::Result<AllocateOutcome> {
+    let mut outcome = AllocateOutcome::default();
+
+    let candidates: Vec<&ResolveResult> = report
+        .results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.status,
+                SlotStatus::NeedsAllocation | SlotStatus::NeedsRotation
+            )
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        outcome.shard_count = *shard_count;
+        return Ok(outcome);
+    }
+
+    let pubkey = fetch_public_key(client, repo, environment, provisioner_token).await?;
+
+    let mut touched_shards: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
+    for candidate in candidates {
+        let value = random_value(candidate.placeholder.length_bytes);
+
+        let shard = loop {
+            if *shard_count == 0 {
+                *shard_count = 1;
+            }
+            match pick_shard(&candidate.slot, value.len(), shards, *shard_count) {
+                Some(s) => break s,
+                None => {
+                    // Target shard would overflow — expand and redistribute lazily.
+                    *shard_count += 1;
+                    if *shard_count > 100 {
+                        return Err(crate::error::Error::Config(
+                            "credential bundle shards exceeded 100 (GitHub env secret limit)"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        };
+
+        shards
+            .entry(shard)
+            .or_default()
+            .insert(candidate.slot.clone(), value.clone());
+        touched_shards.insert(shard);
+
+        let delivered = if let Some(login) = pr_author {
+            deliver_to_author(client, login, value.as_bytes()).await?
+        } else {
+            None
+        };
+
+        outcome.allocated.push(AllocatedSlot {
+            slot: candidate.slot.clone(),
+            shard,
+            value: value.clone(),
+            alloc: candidate.placeholder.alloc,
+            delivered,
+        });
+    }
+
+    // Write touched shards to GitHub.
+    for shard in touched_shards {
+        let bundle = shards.get(&shard).cloned().unwrap_or_default();
+        let serialized = serialize_bundle(&bundle)?;
+        let secret_name = shard_secret_name(shard);
+
+        put_environment_secret(
+            client,
+            repo,
+            environment,
+            &secret_name,
+            serialized.as_bytes(),
+            &pubkey,
+            provisioner_token,
+        )
+        .await?;
+
+        outcome.bundle_hashes.insert(shard, bundle_hash(&bundle));
+    }
+
+    outcome.shard_count = *shard_count;
+    Ok(outcome)
+}
+
+/// Rotate a specific slot: generate a new value, write to GitHub, deliver to
+/// the invoking user.
+#[allow(clippy::too_many_arguments)]
+pub async fn rotate_and_deliver(
+    client: &Client,
+    repo: &str,
+    environment: &str,
+    provisioner_token: &str,
+    recipient_login: Option<&str>,
+    slot: &str,
+    shards: &mut BTreeMap<u32, CredentialBundle>,
+    shard_count: &mut u32,
+) -> crate::error::Result<AllocatedSlot> {
+    let pubkey = fetch_public_key(client, repo, environment, provisioner_token).await?;
+    let value = random_value(32);
+
+    // Find current shard if present.
+    let current_shard = shards.iter().find_map(|(s, bundle)| {
+        if bundle.contains_key(slot) {
+            Some(*s)
+        } else {
+            None
+        }
+    });
+
+    let target_shard = match current_shard {
+        Some(s) => s,
+        None => loop {
+            if *shard_count == 0 {
+                *shard_count = 1;
+            }
+            match pick_shard(slot, value.len(), shards, *shard_count) {
+                Some(s) => break s,
+                None => {
+                    *shard_count += 1;
+                }
+            }
+        },
+    };
+
+    shards
+        .entry(target_shard)
+        .or_default()
+        .insert(slot.to_string(), value.clone());
+
+    let bundle = shards.get(&target_shard).cloned().unwrap_or_default();
+    let serialized = serialize_bundle(&bundle)?;
+    let secret_name = shard_secret_name(target_shard);
+
+    put_environment_secret(
+        client,
+        repo,
+        environment,
+        &secret_name,
+        serialized.as_bytes(),
+        &pubkey,
+        provisioner_token,
+    )
+    .await?;
+
+    let delivered = if let Some(login) = recipient_login {
+        deliver_to_author(client, login, value.as_bytes()).await?
+    } else {
+        None
+    };
+
+    Ok(AllocatedSlot {
+        slot: slot.to_string(),
+        shard: target_shard,
+        value,
+        alloc: PlaceholderAlloc::Rotate,
+        delivered,
+    })
+}
+
+fn random_value(length_bytes: usize) -> String {
+    let mut buf = vec![0u8; length_bytes];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf)
+}
+
+/// Utility re-export for consumers who need to flatten shards after allocation.
+pub fn merged(shards: &BTreeMap<u32, CredentialBundle>) -> CredentialBundle {
+    merge_bundles(shards)
+}

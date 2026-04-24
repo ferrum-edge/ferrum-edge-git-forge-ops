@@ -1,0 +1,86 @@
+name: GitForgeOps Rotate Credential
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (name from .gitforgeops/config.yaml)
+        required: true
+        type: string
+      consumer:
+        description: Consumer id
+        required: true
+        type: string
+      credential:
+        description: Credential key (e.g. `api_key`, `basic_auth.password`)
+        required: true
+        type: string
+      namespace:
+        description: Namespace (defaults to `ferrum`)
+        required: false
+        type: string
+        default: ferrum
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: ferrum-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Load credential bundles
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, os
+          raw = os.environ.get("ALL_SECRETS", "{}")
+          try:
+              data = json.loads(raw)
+          except json.JSONDecodeError:
+              data = {}
+          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
+          print("FERRUM_CREDS_JSON<<__FERRUM_EOF__")
+          print(json.dumps(bundles))
+          print("__FERRUM_EOF__")
+          PY
+
+      - name: Rotate
+        env:
+          FERRUM_ENV: ${{ inputs.environment }}
+          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
+          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          gitforgeops rotate \
+            --consumer "${{ inputs.consumer }}" \
+            --credential "${{ inputs.credential }}" \
+            --namespace "${{ inputs.namespace }}" \
+            --recipient "${{ github.actor }}"
+
+      - name: Commit state update
+        run: |
+          git config user.name "gitforgeops[bot]"
+          git config user.email "gitforgeops[bot]@users.noreply.github.com"
+          git add .state/${{ inputs.environment }}.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "chore(gitforgeops): rotate ${{ inputs.consumer }}.${{ inputs.credential }} in ${{ inputs.environment }} [skip ci]"
+          git push || true

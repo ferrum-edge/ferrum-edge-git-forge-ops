@@ -1,7 +1,9 @@
 use crate::diff::best_practice::BestPractice;
 use crate::diff::breaking::BreakingChange;
-use crate::diff::resource_diff::{DiffAction, ResourceDiff};
+use crate::diff::resource_diff::{DiffAction, ResourceDiff, UnmanagedResource};
 use crate::diff::security::SecurityFinding;
+use crate::policy::PolicyFinding;
+use crate::secrets::{ResolveReport, SlotStatus};
 
 pub fn build_review_comment(
     validation_success: bool,
@@ -93,6 +95,104 @@ pub fn build_review_comment(
         md.push_str("### Best Practice Recommendations\n\n");
         for bp in best_practices {
             md.push_str(&format!("- **{} `{}`**: {}\n", bp.kind, bp.id, bp.message));
+        }
+        md.push('\n');
+    }
+
+    md
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_review_comment_v2(
+    validation_success: bool,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    policy: &[PolicyFinding],
+    unmanaged: &[UnmanagedResource],
+    override_reason: Option<&str>,
+    comparison_error: Option<&str>,
+    environment_note: Option<&str>,
+    secrets: &ResolveReport,
+) -> String {
+    let mut md = build_review_comment(
+        validation_success,
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        comparison_error,
+    );
+
+    if let Some(note) = environment_note {
+        md.insert_str(0, &format!("{note}\n\n"));
+    }
+
+    if !unmanaged.is_empty() {
+        md.push_str("### Unmanaged Resources (shared mode)\n\n");
+        md.push_str(
+            "These resources exist on the gateway but were not applied by this repo. They will not be modified or deleted.\n\n",
+        );
+        for u in unmanaged {
+            md.push_str(&format!(
+                "- **{} `{}`** (`{}`)\n",
+                u.kind, u.id, u.namespace
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !policy.is_empty() {
+        md.push_str("### Policy Violations\n\n");
+        let mut has_blocking = false;
+        for pf in policy {
+            let status_tag = match (&pf.overridden_by, pf.severity.blocks_apply()) {
+                (Some(by), _) => format!(" · OVERRIDDEN by @{by}"),
+                (None, true) => {
+                    has_blocking = true;
+                    " · BLOCKING".to_string()
+                }
+                (None, false) => String::new(),
+            };
+            md.push_str(&format!(
+                "- [{}] `{}` on **{} `{}`** (`{}`): {}{}\n",
+                pf.severity.as_str(),
+                pf.rule_id,
+                pf.kind,
+                pf.id,
+                pf.namespace,
+                pf.message,
+                status_tag
+            ));
+            if let Some(rem) = &pf.remediation {
+                md.push_str(&format!("  - _{}_\n", rem));
+            }
+        }
+        md.push('\n');
+        if has_blocking {
+            md.push_str(
+                "> **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label (requires `write` permission on this repo).\n\n",
+            );
+        }
+        if let Some(reason) = override_reason {
+            md.push_str(&format!("_Override status: {reason}_\n\n"));
+        }
+    }
+
+    if !secrets.results.is_empty() {
+        md.push_str("### Credential Slots\n\n");
+        md.push_str("| Slot | Status |\n|------|--------|\n");
+        for r in &secrets.results {
+            let label = match r.status {
+                SlotStatus::Resolved => "resolved",
+                SlotStatus::NeedsAllocation => "needs allocation (generated on apply)",
+                SlotStatus::NeedsRotation => "needs rotation (regenerated on apply)",
+                SlotStatus::MissingRequired => "**MISSING (required)**",
+            };
+            md.push_str(&format!("| `{}` | {} |\n", r.slot, label));
         }
         md.push('\n');
     }
