@@ -249,6 +249,68 @@ fn resolved_env_rejects_unsafe_environment_names() {
 }
 
 #[test]
+fn synthetic_default_honors_explicit_env_over_ferrum_env_var() {
+    // Regression guard: with no repo config, resolve_env went through
+    // synthetic_default which looked only at env_config.env_name
+    // (FERRUM_ENV) and ignored the explicit `--env` selection that had
+    // already been computed by resolve_env's `selected`. A call like
+    // `gitforgeops --env prod apply` with FERRUM_ENV=default unset would
+    // still resolve to "default" and write state to .state/default.json.
+    use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
+    use gitforgeops::config::resolve_env;
+
+    fn base_env() -> EnvConfig {
+        EnvConfig {
+            gateway_url: None,
+            admin_jwt_secret: None,
+            namespace_filter: None,
+            gateway_mode: GatewayMode::Api,
+            apply_strategy: ApplyStrategy::Incremental,
+            overlay: None,
+            env_name: None,
+            github_repository: None,
+            github_token: None,
+            github_provisioner_token: None,
+            creds_bundle_json: None,
+            creds_bundle_json_file: None,
+            file_output_path: "./assembled/resources.yaml".to_string(),
+            edge_binary_path: "ferrum-edge".to_string(),
+            tls_no_verify: false,
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            gateway_connect_timeout_secs: 10,
+            gateway_request_timeout_secs: 60,
+            github_connect_timeout_secs: 10,
+            github_request_timeout_secs: 30,
+            gateway_max_retries: 3,
+        }
+    }
+
+    // Case 1: `--env prod` passed, FERRUM_ENV unset. Resolves to "prod".
+    let env_cfg = base_env();
+    let resolved = resolve_env(None, &env_cfg, Some("prod")).unwrap();
+    assert_eq!(resolved.name, "prod");
+
+    // Case 2: `--env prod` passed, FERRUM_ENV=staging. Explicit wins.
+    let mut env_cfg = base_env();
+    env_cfg.env_name = Some("staging".to_string());
+    let resolved = resolve_env(None, &env_cfg, Some("prod")).unwrap();
+    assert_eq!(resolved.name, "prod");
+
+    // Case 3: no explicit, FERRUM_ENV=staging. Falls back to FERRUM_ENV.
+    let mut env_cfg = base_env();
+    env_cfg.env_name = Some("staging".to_string());
+    let resolved = resolve_env(None, &env_cfg, None).unwrap();
+    assert_eq!(resolved.name, "staging");
+
+    // Case 4: no explicit, no FERRUM_ENV. Falls back to "default".
+    let env_cfg = base_env();
+    let resolved = resolve_env(None, &env_cfg, None).unwrap();
+    assert_eq!(resolved.name, "default");
+}
+
+#[test]
 fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
     // Regression guard: RepoConfig::validate blocks the combination in YAML,
     // but the synthetic-default path (no .gitforgeops/config.yaml, pure

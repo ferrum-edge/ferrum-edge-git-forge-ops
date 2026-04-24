@@ -129,7 +129,7 @@ pub fn resolve_env(
                 let (name, env) = repo.environments.iter().next().unwrap();
                 merge(name.clone(), env, env_config)
             } else if repo.environments.is_empty() {
-                synthetic_default(env_config)
+                synthetic_default(env_config, selected.as_deref())
             } else {
                 let names = repo.environment_names().join(", ");
                 return Err(crate::error::Error::Config(format!(
@@ -138,7 +138,7 @@ pub fn resolve_env(
                 )));
             }
         }
-        (None, _) => synthetic_default(env_config),
+        (None, _) => synthetic_default(env_config, selected.as_deref()),
     };
 
     // Enforce shared + full_replace incompatibility (and other invariants)
@@ -167,12 +167,17 @@ fn merge(name: String, env: &EnvironmentConfig, env_config: &EnvConfig) -> Resol
     }
 }
 
-fn synthetic_default(env_config: &EnvConfig) -> ResolvedEnv {
+fn synthetic_default(env_config: &EnvConfig, explicit_env: Option<&str>) -> ResolvedEnv {
+    // Precedence: explicit CLI/caller selection > FERRUM_ENV > "default".
+    // Dropping `explicit_env` here let `--env prod` silently resolve as
+    // `default` (or stale FERRUM_ENV), writing state to the wrong
+    // `.state/<env>.json` and crossing ownership tracking between envs.
+    let name = explicit_env
+        .map(String::from)
+        .or_else(|| env_config.env_name.clone())
+        .unwrap_or_else(ResolvedEnv::default_env_name);
     ResolvedEnv {
-        name: env_config
-            .env_name
-            .clone()
-            .unwrap_or_else(ResolvedEnv::default_env_name),
+        name,
         overlay: env_config.overlay.clone(),
         namespace_filter: env_config.namespace_filter.clone(),
         apply_strategy: env_config.apply_strategy.clone(),
