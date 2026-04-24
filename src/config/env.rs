@@ -54,6 +54,11 @@ pub struct EnvConfig {
     /// configs or `/restore` on gateways with slow commit paths may need this
     /// raised above the 60s default.
     pub gateway_request_timeout_secs: u64,
+    /// Timeout for TCP/TLS connection establishment to `api.github.com`
+    /// (used by `gitforgeops review --pr <N>`), in seconds.
+    pub github_connect_timeout_secs: u64,
+    /// Timeout for a complete HTTP request/response cycle to `api.github.com`, in seconds.
+    pub github_request_timeout_secs: u64,
 }
 
 /// Load tool configuration from environment variables.
@@ -74,6 +79,8 @@ pub struct EnvConfig {
 /// | `FERRUM_GATEWAY_CLIENT_KEY`  | `client_key`       | `None`                           |
 /// | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `gateway_connect_timeout_secs` | `10`        |
 /// | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `gateway_request_timeout_secs` | `60`        |
+/// | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS`  | `github_connect_timeout_secs`  | `10`        |
+/// | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`  | `github_request_timeout_secs`  | `30`        |
 pub fn load_env_config() -> EnvConfig {
     EnvConfig {
         gateway_url: env::var("FERRUM_GATEWAY_URL").ok(),
@@ -108,6 +115,8 @@ pub fn load_env_config() -> EnvConfig {
         client_key: env::var("FERRUM_GATEWAY_CLIENT_KEY").ok(),
         gateway_connect_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", 10),
         gateway_request_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", 60),
+        github_connect_timeout_secs: parse_timeout_env("FERRUM_GITHUB_CONNECT_TIMEOUT_SECS", 10),
+        github_request_timeout_secs: parse_timeout_env("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", 30),
     }
 }
 

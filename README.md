@@ -183,6 +183,8 @@ Set in: Settings > Secrets and variables > Actions > Variables
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification (dev only) |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | Timeout for TCP/TLS connection establishment to the admin API. Raise if the gateway is behind a slow LB. |
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | Total HTTP request timeout (connect + send + receive). Raise for very large `/backup` responses or slow `/restore` commits; 60s is enough for typical configs. |
+| `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` | `10` | Timeout for TCP/TLS connection to `api.github.com` when posting PR review comments. |
+| `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` | `30` | Total HTTP timeout for the GitHub API call used by `gitforgeops review --pr N`. |
 | `GITFORGEOPS_IMAGE_TAG` | — | When set (e.g. `latest`, `v0.1.0`), PR validation runs in the pre-built `gitforgeops` container instead of compiling natively. Unset = native fallback (slower, always works). |
 | `GITFORGEOPS_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Image name the container job pulls from. Default points at the upstream-published image; override only if you're publishing your own. |
 | `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
@@ -264,6 +266,8 @@ The defaults are sized to cover typical configurations without fighting slow but
 - Gateway behind a slow load balancer or cold NLB — raise connect timeout.
 
 Override via `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` / `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS`. A timeout expiring surfaces as a clear HTTP-client error; nothing is silently retried.
+
+The same bounding applies to the GitHub API call used by `gitforgeops review --pr N` — tunable via `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` (default 10s) and `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` (default 30s). GitHub's public API is fast enough that these rarely need tuning, but they're bounded so a GitHub incident can't hang the CI run indefinitely.
 
 ## TLS Connectivity
 
