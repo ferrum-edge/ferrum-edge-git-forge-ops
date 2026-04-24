@@ -73,14 +73,21 @@ jobs:
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Materialize and encrypt
+        # Route inputs and actor through env vars. Interpolating
+        # `${{ inputs.environment }}` or `${{ github.actor }}` directly into
+        # the run block lets a crafted value break out of the quoted args
+        # — especially dangerous here because the env secrets are loaded
+        # in the previous step and a shell-escape could read them.
         env:
           FERRUM_ENV: ${{ inputs.environment }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_ACTOR: ${{ github.actor }}
         run: |
+          set -euo pipefail
           mkdir -p out
-          gitforgeops --env "${{ inputs.environment }}" \
-            export --materialize \
-            --encrypt-to "${{ github.actor }}" \
-            --output "out/assembled-${{ inputs.environment }}.age"
+          gitforgeops export --materialize \
+            --encrypt-to "$INPUT_ACTOR" \
+            --output "out/assembled-${INPUT_ENVIRONMENT}.age"
 
       - name: Upload encrypted artifact
         uses: actions/upload-artifact@v4
@@ -90,13 +97,19 @@ jobs:
           retention-days: 1
 
       - name: Summary
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          echo "### Materialized config for \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Download the artifact \`assembled-${{ inputs.environment }}-${{ github.run_id }}\` and decrypt:" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
-          echo "age -d -i ~/.ssh/id_ed25519 < assembled-${{ inputs.environment }}.age > assembled.yaml" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Artifact retention: **1 day**. The encrypted blob is safe against GitHub-side compromise; the decrypted file never touches the repo." >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          {
+            echo "### Materialized config for \`${INPUT_ENVIRONMENT}\`"
+            echo ""
+            echo "Download the artifact \`assembled-${INPUT_ENVIRONMENT}-${RUN_ID}\` and decrypt:"
+            echo ""
+            echo '```bash'
+            echo "age -d -i ~/.ssh/id_ed25519 < assembled-${INPUT_ENVIRONMENT}.age > assembled.yaml"
+            echo '```'
+            echo ""
+            echo "Artifact retention: **1 day**. The encrypted blob is safe against GitHub-side compromise; the decrypted file never touches the repo."
+          } >> "$GITHUB_STEP_SUMMARY"

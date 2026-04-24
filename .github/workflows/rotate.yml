@@ -81,8 +81,17 @@ jobs:
         # has. Without the TLS material, rotate fails to connect in envs
         # that require a custom CA or mTLS, even though apply-on-merge and
         # drift-check are configured correctly for the same env.
+        #
+        # Route workflow_dispatch inputs through env vars and reference
+        # $INPUT_* shell variables — never interpolate
+        # `${{ inputs.* }}` directly into the run block. Inputs are user-
+        # controlled and can contain quote/command-substitution sequences
+        # that would escape a double-quoted `"${{ inputs.X }}"` arg.
+        # FERRUM_GATEWAY_MODE set explicitly so the binary reads it from
+        # the process env, not just the `vars.*` gate context.
         env:
           FERRUM_ENV: ${{ inputs.environment }}
+          FERRUM_GATEWAY_MODE: api
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
@@ -91,29 +100,39 @@ jobs:
           FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          INPUT_CONSUMER: ${{ inputs.consumer }}
+          INPUT_CREDENTIAL: ${{ inputs.credential }}
+          INPUT_NAMESPACE: ${{ inputs.namespace }}
+          INPUT_RECIPIENT: ${{ github.actor }}
         run: |
           gitforgeops rotate \
-            --consumer "${{ inputs.consumer }}" \
-            --credential "${{ inputs.credential }}" \
-            --namespace "${{ inputs.namespace }}" \
-            --recipient "${{ github.actor }}"
+            --consumer "$INPUT_CONSUMER" \
+            --credential "$INPUT_CREDENTIAL" \
+            --namespace "$INPUT_NAMESPACE" \
+            --recipient "$INPUT_RECIPIENT"
 
       - name: Commit state update
         # Rotation metadata (last_rotated, sha256_prefix, delivered_to) lives
         # in .state/<env>.json. If we can't persist the update, a stale state
         # misleads the next drift check — fail the job on push failure, and
         # retry on rejection (possible if an apply landed concurrently).
+        # Same shell-injection protection as the Rotate step: route inputs
+        # through env vars.
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_CONSUMER: ${{ inputs.consumer }}
+          INPUT_CREDENTIAL: ${{ inputs.credential }}
         run: |
           set -euo pipefail
           git config user.name "gitforgeops[bot]"
           git config user.email "gitforgeops[bot]@users.noreply.github.com"
           mkdir -p .state
-          git add ".state/${{ inputs.environment }}.json" 2>/dev/null || true
+          git add ".state/${INPUT_ENVIRONMENT}.json" 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No state changes to commit."
             exit 0
           fi
-          git commit -m "chore(gitforgeops): rotate ${{ inputs.consumer }}.${{ inputs.credential }} in ${{ inputs.environment }} [skip ci]"
+          git commit -m "chore(gitforgeops): rotate ${INPUT_CONSUMER}.${INPUT_CREDENTIAL} in ${INPUT_ENVIRONMENT} [skip ci]"
           for attempt in 1 2 3 4 5; do
             if git push; then exit 0; fi
             echo "Push rejected on attempt $attempt; rebasing..."

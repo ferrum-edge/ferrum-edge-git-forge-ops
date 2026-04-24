@@ -14,6 +14,14 @@ impl RequireAuthPluginRule {
 
     fn proxy_has_auth(cfg: &GatewayConfig, proxy: &Proxy) -> bool {
         let in_scope = |plugin: &PluginConfig| -> bool {
+            // A disabled auth plugin provides no authentication — the gateway
+            // skips it on every request. Treating it as "satisfies auth"
+            // would let an attacker commit a plugin with enabled=false and
+            // pass this policy while the proxy actually accepts unauthenticated
+            // traffic.
+            if !plugin.enabled {
+                return false;
+            }
             if !plugin.plugin_name.contains("auth") {
                 return false;
             }

@@ -125,6 +125,76 @@ fn backend_scheme_policy_flags_http() {
 }
 
 #[test]
+fn require_auth_plugin_ignores_disabled_plugins() {
+    use gitforgeops::config::schema::{PluginConfig, PluginScope};
+    use gitforgeops::policy::config::RequireAuthPluginRuleConfig;
+
+    // Proxy exists; an auth plugin exists in the same namespace at Global
+    // scope but has enabled=false. The policy must still fire — disabled
+    // plugins don't actually authenticate traffic.
+    let p = proxy("p1", BackendProtocol::Https, 30_000, true);
+    let disabled_auth = PluginConfig {
+        id: "jwt-auth-disabled".to_string(),
+        namespace: "ferrum".to_string(),
+        plugin_name: "jwt-auth".to_string(),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: false,
+        priority_override: None,
+        config: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        plugin_configs: vec![disabled_auth],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: gitforgeops::policy::config::RequireAuthPluginRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(
+        findings.len(),
+        1,
+        "disabled auth plugin must not satisfy require_auth_plugin"
+    );
+    assert_eq!(findings[0].rule_id, "require_auth_plugin");
+
+    // Same setup but plugin enabled — policy should be satisfied.
+    let enabled_auth = PluginConfig {
+        id: "jwt-auth-on".to_string(),
+        namespace: "ferrum".to_string(),
+        plugin_name: "jwt-auth".to_string(),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        config: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let _ = RequireAuthPluginRuleConfig {
+        enabled: true,
+        severity: Severity::Error,
+    };
+    let cfg2 = GatewayConfig {
+        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        plugin_configs: vec![enabled_auth],
+        ..Default::default()
+    };
+    let findings2 = evaluate_policies(&cfg2, &policies);
+    assert!(findings2.is_empty(), "enabled auth plugin should satisfy");
+}
+
+#[test]
 fn forbid_tls_verify_disabled_triggers_on_false() {
     let cfg = GatewayConfig {
         proxies: vec![proxy("risky", BackendProtocol::Https, 30_000, false)],

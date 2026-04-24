@@ -312,6 +312,97 @@ async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
 /// Returns the allocation outcome (or `None` if nothing needed allocation) and
 /// the final post-allocation shard map (for state-file updates).
 #[allow(clippy::too_many_arguments)]
+/// Emit the age-armored ciphertext for each newly-allocated slot so the
+/// recipient can decrypt. Without this, the allocator produced encrypted
+/// blobs and the binary logged only the recipient's SSH fingerprint — the
+/// actual ciphertext was dropped, so the "delivery" was recorded in state
+/// but never reached the user.
+///
+/// Delivery routing:
+/// - If `GITFORGEOPS_PR_NUMBER`, `GITHUB_TOKEN`, and `GITHUB_REPOSITORY` are
+///   all set, post as a PR comment (so the PR author sees it even after
+///   merge).
+/// - Otherwise, print to stdout with decrypt instructions. Local runs and
+///   non-PR-driven applies (direct push to main) take this path.
+async fn surface_delivered_credentials(
+    env_config: &EnvConfig,
+    outcome: &secrets::AllocateOutcome,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if outcome.allocated.is_empty() {
+        return Ok(());
+    }
+
+    let mut body = String::from("## GitForgeOps — New Credentials Allocated\n\n");
+    body.push_str(
+        "The credentials below were generated during apply. Each blob is age-encrypted to the recipient's GitHub-published SSH key. Decrypt locally:\n\n",
+    );
+    body.push_str("```\nage -d -i ~/.ssh/id_ed25519 < blob.age\n```\n\n");
+
+    let mut undelivered: Vec<&str> = Vec::new();
+
+    for slot in &outcome.allocated {
+        body.push_str(&format!("### `{}`\n\n", slot.slot));
+        match &slot.delivered {
+            Some(d) => {
+                body.push_str(&format!(
+                    "Encrypted to **@{}** (SSH fingerprint `{}`):\n\n",
+                    d.login, d.key_fingerprint
+                ));
+                body.push_str("```\n");
+                body.push_str(&d.encrypted_b64);
+                if !d.encrypted_b64.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str("```\n\n");
+            }
+            None => {
+                undelivered.push(slot.slot.as_str());
+                body.push_str(
+                    "**NOT DELIVERED** — the recipient had no SSH key on file or was not provided. Run `gitforgeops rotate` after adding an SSH key to deliver the value.\n\n",
+                );
+            }
+        }
+    }
+
+    let pr_number = std::env::var("GITFORGEOPS_PR_NUMBER")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let can_post_pr = pr_number.is_some()
+        && env_config.github_token.is_some()
+        && env_config.github_repository.is_some();
+
+    if let (Some(pr), true) = (pr_number, can_post_pr) {
+        match review::post_pr_comment(env_config, pr, &body).await {
+            Ok(()) => {
+                eprintln!(
+                    "Posted encrypted credential delivery to PR #{pr} ({} slot(s)).",
+                    outcome.allocated.len()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Fall through to stdout — losing the blob is worse than
+                // double-printing it.
+                eprintln!(
+                    "Warning: failed to post credentials to PR #{pr}: {e}. Falling back to stdout."
+                );
+            }
+        }
+    }
+
+    // Stdout fallback. Also warn if any slots weren't delivered at all.
+    println!();
+    println!("{}", body);
+    if !undelivered.is_empty() {
+        eprintln!(
+            "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
+            undelivered.len(),
+            undelivered.join(", ")
+        );
+    }
+    Ok(())
+}
+
 async fn allocate_if_needed(
     desired: &mut GatewayConfig,
     env_config: &EnvConfig,
@@ -1031,6 +1122,16 @@ async fn cmd_apply(
                 "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped",
                 result.created, result.updated, result.deleted, result.unmanaged_skipped
             );
+
+            // Apply succeeded — now surface the encrypted delivery blobs.
+            // `allocate_if_needed` already produced the age-armored ciphertext
+            // for each new/rotated slot; without this step it was logged and
+            // discarded, so the recipient never had a way to retrieve the
+            // secret. Prefer PR comment (post-merge PR still accepts
+            // comments); fall back to stdout for local runs.
+            if let Some(outcome) = &allocation {
+                surface_delivered_credentials(&env_config, outcome).await?;
+            }
         }
         GatewayMode::File => {
             // File mode has no gateway diff or auto-approve gate in the
@@ -1079,22 +1180,7 @@ async fn cmd_apply(
             .await?;
 
             if let Some(outcome) = &allocation {
-                eprintln!(
-                    "Allocated/rotated {} credential slot(s):",
-                    outcome.allocated.len()
-                );
-                for slot in &outcome.allocated {
-                    match &slot.delivered {
-                        Some(d) => eprintln!(
-                            "  {} -> @{} (ssh {})",
-                            slot.slot, d.login, d.key_fingerprint
-                        ),
-                        None => eprintln!(
-                            "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
-                            slot.slot
-                        ),
-                    }
-                }
+                surface_delivered_credentials(&env_config, outcome).await?;
             }
         }
     }
@@ -1326,24 +1412,89 @@ async fn cmd_rotate(
     let ns = namespace.unwrap_or("ferrum");
     let slot = secrets::resolver::slot_path(ns, consumer, credential);
 
-    // Verify the target slot corresponds to an actual `${gh-env-secret:...}`
-    // placeholder in the repo's desired config. Without this, a typo in
-    // --credential or a credential field that holds a literal value would
-    // still "succeed": a fresh secret would be written to the GitHub Env
-    // Secret and delivered to the recipient, but the consumer on the gateway
-    // would never reference that value — a false-success rotation that
-    // orphans a secret and confuses the recipient.
+    // ALL preflight checks must run BEFORE rotate_and_deliver mutates the
+    // GitHub Environment Secret. If any of these fire after the secret is
+    // written, we've corrupted the store for a rotation that can't complete
+    // — the new value lives in GitHub, the gateway still has the old one,
+    // and the state file isn't updated because the push eventually fails.
+    //
+    // Preflight 1: gateway mode must be api. File mode has no gateway to
+    // push to; rotation in file mode has no completion path.
+    if !matches!(env_config.gateway_mode, GatewayMode::Api) {
+        return Err(
+            "Refusing to rotate: gateway_mode is 'file'. Rotation requires a live Admin API to push the new value. Use the materialize-file.yml workflow to get a new flat file for file-mode gateways."
+                .into(),
+        );
+    }
+
     let desired_for_check = load_and_assemble_for(&resolved)?;
+
+    // Preflight 2: target slot corresponds to an actual placeholder in the
+    // repo. A typo in --credential or pointing at a literal value would
+    // otherwise write random bytes into an orphaned Env Secret with no
+    // gateway-side reference.
     let empty_bundle = BTreeMap::new();
     let placeholder_report = secrets::report_secrets(&desired_for_check, &empty_bundle)?;
-    if !placeholder_report.results.iter().any(|r| r.slot == slot) {
+    let target_placeholder = placeholder_report.results.iter().find(|r| r.slot == slot);
+    let placeholder_length = match target_placeholder {
+        Some(r) => r.placeholder.length_bytes,
+        None => {
+            return Err(format!(
+                "Refusing to rotate: no `${{gh-env-secret:...}}` placeholder at slot '{slot}'.\n\
+                 Rotate only operates on consumer credential fields that reference a placeholder in\n\
+                 the repo. Check that consumer '{consumer}' in namespace '{ns}' has a credential\n\
+                 key '{credential}' whose value is a gh-env-secret placeholder."
+            )
+            .into());
+        }
+    };
+
+    // Preflight 3: target consumer is declared in the repo. Without this,
+    // rotate_and_deliver writes a secret the gateway push will then refuse
+    // because there's no consumer to update.
+    let target_consumer_exists = desired_for_check
+        .consumers
+        .iter()
+        .any(|c| c.namespace == ns && c.id == consumer);
+    if !target_consumer_exists {
         return Err(format!(
-            "Refusing to rotate: no `${{gh-env-secret:...}}` placeholder at slot '{slot}'.\n\
-             Rotate only operates on consumer credential fields that reference a placeholder in\n\
-             the repo. Check that consumer '{consumer}' in namespace '{ns}' has a credential\n\
-             key '{credential}' whose value is a gh-env-secret placeholder."
+            "Refusing to rotate: consumer '{ns}/{consumer}' is not present in repo desired state. Add the consumer to resources/ first."
         )
         .into());
+    }
+
+    // Preflight 4: no OTHER placeholders on this consumer remain unresolved
+    // against the current bundle. If they did, push_rotated_consumer_to_gateway
+    // would fail (by design) and leave the store/gateway split — mutating
+    // GitHub before running the check just guarantees that split happens.
+    let current_bundle = secrets::merge_bundles(&per_shard);
+    let sibling_consumer = desired_for_check
+        .consumers
+        .iter()
+        .find(|c| c.namespace == ns && c.id == consumer)
+        .cloned();
+    if let Some(mut c) = sibling_consumer {
+        let mut single = gitforgeops::config::GatewayConfig::default();
+        // Note: replace the target slot as if it were already rotated, so
+        // sibling-placeholder detection doesn't flag the slot we're about
+        // to rotate.
+        let mut shim_bundle = current_bundle.clone();
+        shim_bundle.insert(slot.clone(), "__rotate-preflight-shim__".to_string());
+        single.consumers.push(c.clone());
+        let _ = secrets::resolve_secrets_including_rotate(&mut single, &shim_bundle)?;
+        c = single.consumers.remove(0);
+        let mut remaining_cfg = gitforgeops::config::GatewayConfig::default();
+        remaining_cfg.consumers.push(c);
+        let sibling_report = secrets::report_secrets(&remaining_cfg, &BTreeMap::new())?;
+        if !sibling_report.results.is_empty() {
+            return Err(format!(
+                "Refusing to rotate: consumer '{ns}/{consumer}' has {} other unresolved placeholder(s):\n  {}\n\
+                 Run `gitforgeops apply` to allocate missing slots before rotating — otherwise the gateway push would fail after the new secret is already written.",
+                sibling_report.results.len(),
+                sibling_report.results.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
+            )
+            .into());
+        }
     }
 
     let mut shard_count = state.credential_shard_count.max(1);
@@ -1360,6 +1511,7 @@ async fn cmd_rotate(
         &token,
         recipient,
         &slot,
+        placeholder_length,
         &mut per_shard,
         &mut shard_count,
     )

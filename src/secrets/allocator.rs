@@ -159,11 +159,15 @@ pub async fn rotate_and_deliver(
     provisioner_token: &str,
     recipient_login: Option<&str>,
     slot: &str,
+    length_bytes: usize,
     shards: &mut BTreeMap<u32, CredentialBundle>,
     shard_count: &mut u32,
 ) -> crate::error::Result<AllocatedSlot> {
     let pubkey = fetch_public_key(client, repo, environment, provisioner_token).await?;
-    let value = random_value(32);
+    // Honor the placeholder's `len=...` field. Forcing 32 bytes would
+    // silently shrink credentials declared with a larger length and grow
+    // ones declared smaller.
+    let value = random_value(length_bytes);
 
     // Find current shard if present.
     let current_shard = shards.iter().find_map(|(s, bundle)| {
