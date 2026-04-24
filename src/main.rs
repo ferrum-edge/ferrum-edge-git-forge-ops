@@ -151,12 +151,23 @@ fn load_credential_bundles(
     }
 }
 
+/// Resolve credentials for read-only paths (diff, plan, review, validate).
+///
+/// Uses `resolve_secrets_including_rotate` so `alloc=rotate` placeholders get
+/// substituted with their bundle values — otherwise the placeholder literal
+/// `${gh-env-secret:alloc=rotate}` would be compared against the live gateway
+/// value on every diff and surface as persistent false drift (and fail
+/// `drift-check.yml --exit-on-drift`).
+///
+/// `cmd_apply` calls `resolve_secrets` directly (not through this helper)
+/// because its first pass deliberately keeps rotate placeholders in place so
+/// the allocator can generate fresh values.
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
 ) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
     let (bundle, _) = load_credential_bundles(env_config)?;
-    Ok(secrets::resolve_secrets(cfg, &bundle)?)
+    Ok(secrets::resolve_secrets_including_rotate(cfg, &bundle)?)
 }
 
 fn resolved_namespaces(
@@ -312,6 +323,16 @@ async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
 /// Returns the allocation outcome (or `None` if nothing needed allocation) and
 /// the final post-allocation shard map (for state-file updates).
 #[allow(clippy::too_many_arguments)]
+/// Field names whose diff values must never be printed verbatim. These
+/// carry secret material — consumer credentials hold API keys, JWT
+/// signing keys, HMAC secrets, etc. Once resolved from the bundle, the
+/// values ARE the secret. `cmd_diff` echoes to stdout which is captured
+/// in CI logs (especially drift-check.yml), so printing them would
+/// exfiltrate secrets through a side channel.
+fn is_sensitive_field(kind: &str, field: &str) -> bool {
+    matches!((kind, field), ("Consumer", "credentials"))
+}
+
 /// Append `comment` to `$GITHUB_STEP_SUMMARY` when running under GitHub
 /// Actions. The step summary is always writable, so this is a reliable
 /// fallback when PR comment posting is blocked (fork PRs, read-only
@@ -701,10 +722,19 @@ async fn cmd_diff(
             };
             println!("  {} {} {} ({})", action, d.kind, d.id, d.namespace);
             for change in &d.details {
-                println!(
-                    "    {}: {} -> {}",
-                    change.field, change.old_value, change.new_value
-                );
+                if is_sensitive_field(&d.kind, &change.field) {
+                    // Credentials carry actual secret material (rotated
+                    // values, generated keys). Printing them here would
+                    // leak to CI logs — drift-check.yml echoes stdout
+                    // into the workflow log, which is viewable by anyone
+                    // with read access to the run.
+                    println!("    {}: [REDACTED] -> [REDACTED]", change.field);
+                } else {
+                    println!(
+                        "    {}: {} -> {}",
+                        change.field, change.old_value, change.new_value
+                    );
+                }
             }
         }
     }

@@ -279,6 +279,48 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
 }
 
 #[test]
+fn resolver_including_rotate_closes_read_path_false_drift() {
+    // Regression guard: `cmd_diff`, `cmd_plan`, `cmd_review` need rotate
+    // placeholders replaced (not left in place), otherwise the desired-side
+    // config carries a literal `${gh-env-secret:...}` string that compares
+    // as modified against every live gateway value — `drift-check.yml
+    // --exit-on-drift` would fail constantly.
+    use gitforgeops::secrets::resolve_secrets_including_rotate;
+
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=rotate}".to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/api_key".to_string(),
+        "current-rotated-value".to_string(),
+    );
+
+    let _ = resolve_secrets_including_rotate(&mut cfg, &bundle).unwrap();
+
+    let resolved = cfg.consumers[0].credentials.get("api_key").unwrap();
+    assert_eq!(
+        resolved,
+        &serde_json::Value::String("current-rotated-value".to_string()),
+        "read-path resolver must replace rotate placeholders with bundle values; leaving the placeholder causes persistent false drift in diff/plan/review/drift-check"
+    );
+}
+
+#[test]
 fn resolver_does_not_replace_rotate_placeholder_with_stale_value() {
     // alloc=rotate with an existing (stale) bundle value must keep the
     // placeholder in place during the initial resolve — otherwise the
