@@ -90,8 +90,14 @@ jobs:
           FERRUM_ENV: ${{ matrix.environment }}
         run: gitforgeops validate --format github-annotations
 
+      # `always()` so the structured comment still posts when `Validate`
+      # fails — that is exactly when contributors need it most (consolidated
+      # errors + annotations surfaced in one place). The job's overall status
+      # still reflects the earlier Validate failure, so the PR check remains
+      # red. Without this, a schema error in the PR skips the comment step
+      # and the author only sees a generic "validate exited 1" in the logs.
       - name: Review
-        if: github.event.pull_request.number
+        if: always() && github.event.pull_request.number
         env:
           FERRUM_ENV: ${{ matrix.environment }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
