@@ -1514,6 +1514,14 @@ async fn cmd_rotate(
 
     let desired_for_check = load_and_assemble_for(&resolved)?;
 
+    // Preflight 1b: in exclusive mode, the same ownership-scope rules
+    // apply/diff/plan/review enforce must apply here too. A manual rotate
+    // on an exclusive env targeting a consumer whose namespace isn't in
+    // `ownership.namespaces` would push a consumer the ownership contract
+    // never signed for — exactly the violation enforce_exclusive_scope
+    // exists to prevent.
+    enforce_exclusive_scope(&resolved, &desired_for_check)?;
+
     // Preflight 2: target slot corresponds to an actual placeholder in the
     // repo. A typo in --credential or pointing at a literal value would
     // otherwise write random bytes into an orphaned Env Secret with no
