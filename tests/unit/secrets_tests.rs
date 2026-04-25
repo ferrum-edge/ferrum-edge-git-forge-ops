@@ -507,3 +507,118 @@ fn object_key_with_bracket_distinct_from_array_index() {
         "array index should emit literal [0]: {slots:?}"
     );
 }
+
+#[test]
+fn slot_path_matches_walker_for_keys_with_slash_or_tilde() {
+    // `gitforgeops rotate` calls slot_path(ns, id, cred_key) to look up the
+    // slot. report_secrets / resolve_secrets emit the same slot when walking
+    // consumer.credentials. If the two encoders disagree, rotate's preflight
+    // says the slot doesn't exist for any key containing `/` or `~`, and the
+    // user can't rotate that credential at all.
+    use gitforgeops::secrets::{report_secrets, slot_path};
+
+    let cases: &[&str] = &[
+        "api_key",   // boring case
+        "foo/bar",   // literal `/` → walker emits `~1`
+        "foo~bar",   // literal `~` → walker emits `~0`
+        "a/b~c",     // both
+        "~1literal", // user-typed `~1` must NOT be re-interpreted as `/`
+    ];
+
+    for cred_key in cases {
+        let mut cfg = GatewayConfig::default();
+        let mut consumer = Consumer {
+            id: "app".to_string(),
+            username: "app".to_string(),
+            namespace: "ferrum".to_string(),
+            custom_id: None,
+            credentials: Default::default(),
+            acl_groups: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        consumer.credentials.insert(
+            cred_key.to_string(),
+            serde_json::Value::String("${gh-env-secret:alloc=require}".to_string()),
+        );
+        cfg.consumers.push(consumer);
+
+        let walker_slot = report_secrets(&cfg, &BTreeMap::new())
+            .unwrap()
+            .results
+            .into_iter()
+            .next()
+            .expect("walker emitted exactly one result")
+            .slot;
+
+        let cli_slot = slot_path("ferrum", "app", cred_key);
+
+        assert_eq!(
+            walker_slot, cli_slot,
+            "slot_path must match the walker for cred_key {cred_key:?}"
+        );
+    }
+}
+
+#[test]
+fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
+    // Regression: phase 1 of allocate_and_deliver previously called
+    // pick_shard against the persisted `shards` map for every candidate
+    // without accounting for earlier candidates planned in the same run.
+    // With shard_count=1, every slot hashes to shard 0, and each
+    // candidate's projected size was computed against the same pre-batch
+    // bundle — so all candidates passed the soft-limit check and phase 2
+    // serialized one fat shard. The fix stages planned inserts during
+    // phase 1.
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle};
+
+    // 600-byte values × ~80 candidates ≈ 48 KB → well over the 40 KB soft
+    // limit on a single shard.
+    let value_len = 600usize;
+    let candidate_count = 80usize;
+
+    // Without staging: pick_shard against the same empty `shards` always
+    // succeeds for shard 0, regardless of how many we've already planned.
+    {
+        let shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+        let mut allowed_to_zero = 0usize;
+        for i in 0..candidate_count {
+            let slot = format!("ferrum/app/cred-{i}");
+            if pick_shard(&slot, value_len, &shards, 1) == Some(0) {
+                allowed_to_zero += 1;
+            }
+        }
+        assert_eq!(
+            allowed_to_zero, candidate_count,
+            "without staging, pick_shard wrongly accepts every candidate onto shard 0"
+        );
+    }
+
+    // With staging (the new behavior): mutate a clone after each pick. Once
+    // the projected shard size crosses the soft limit, pick_shard returns
+    // None and the caller would grow shard_count.
+    {
+        let mut staged: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+        let mut admitted_to_zero = 0usize;
+        let mut rejected = 0usize;
+        for i in 0..candidate_count {
+            let slot = format!("ferrum/app/cred-{i}");
+            match pick_shard(&slot, value_len, &staged, 1) {
+                Some(0) => {
+                    staged
+                        .entry(0)
+                        .or_default()
+                        .insert(slot, "x".repeat(value_len));
+                    admitted_to_zero += 1;
+                }
+                Some(other) => panic!("shard_count=1 must yield shard 0, got {other}"),
+                None => rejected += 1,
+            }
+        }
+        assert!(
+            admitted_to_zero < candidate_count,
+            "staging must reject some candidates once shard 0 fills"
+        );
+        assert!(rejected > 0, "at least one candidate must be rejected");
+    }
+}

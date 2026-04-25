@@ -105,21 +105,22 @@ fn join_slot_components(components: &[SlotComponent<'_>]) -> String {
         .join("/")
 }
 
-/// Build a slot path from the top-level credential key. `cred_key` is
-/// interpreted as a `/`-separated component path matching the walker's
-/// emission: a flat top-level key maps to a single component, and nested
-/// access uses `/` as the path separator. Callers that want to target a
-/// literal `/` inside a key must pre-escape it as `~1`, matching the
-/// walker's escape rules. There is no CLI syntax for array indices; rotate
-/// only targets slots keyed by object traversal.
+/// Build a slot path from the top-level credential key.
+///
+/// `cred_key` is treated as an opaque literal — exactly how `report_secrets`
+/// emits the same component when walking `consumer.credentials`
+/// (`BTreeMap<String, String>`, no path semantics). Splitting on `/` here
+/// would diverge from the walker: a key like `foo/bar` would round-trip to
+/// `<ns>/<id>/foo/bar` instead of the walker's `<ns>/<id>/foo~1bar`, and
+/// `gitforgeops rotate` would fail preflight on a slot that exists.
+/// Escaping (including `/` → `~1` and `~` → `~0`) is handled by
+/// `escape_slot_component` inside `join_slot_components`.
 pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
-    let mut components: Vec<SlotComponent<'_>> = vec![
+    let components = vec![
         SlotComponent::Literal(namespace),
         SlotComponent::Literal(consumer_id),
+        SlotComponent::Literal(cred_key),
     ];
-    for piece in cred_key.split('/') {
-        components.push(SlotComponent::Literal(piece));
-    }
     join_slot_components(&components)
 }
 

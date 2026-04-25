@@ -114,6 +114,15 @@ pub async fn allocate_and_deliver(
 
     // Phase 1: plan shard assignments, generate values, and encrypt delivery
     // ciphertexts. No GitHub writes and no mutation of `shards` yet.
+    //
+    // `staged` is a clone of `shards` that we mutate as we plan, so each
+    // `pick_shard` call sees the projected size including earlier candidates
+    // from this same batch. Without it, a first-apply with `shard_count=1`
+    // hashes every new slot to shard 0; each candidate's projected size is
+    // computed against the same pre-batch `shards`, so all candidates pass
+    // the soft-limit check independently and the resulting serialized shard
+    // can blow past GitHub's hard limit at PUT time. The real `shards` is
+    // still only mutated in phase 2 on successful PUT.
     struct Planned {
         slot: String,
         value: String,
@@ -122,6 +131,7 @@ pub async fn allocate_and_deliver(
         delivered: Option<DeliveryResult>,
     }
     let mut planned: Vec<Planned> = Vec::new();
+    let mut staged: BTreeMap<u32, CredentialBundle> = shards.clone();
 
     for candidate in candidates {
         let value = random_value(candidate.placeholder.length_bytes);
@@ -133,7 +143,7 @@ pub async fn allocate_and_deliver(
         // `merge_bundles` iterates shards in ascending order, whichever copy
         // sits on the higher shard index wins; that can silently revert to
         // the old value.
-        let existing_shard = shards
+        let existing_shard = staged
             .iter()
             .find_map(|(s, bundle)| bundle.contains_key(&candidate.slot).then_some(*s));
 
@@ -143,7 +153,7 @@ pub async fn allocate_and_deliver(
                 if *shard_count == 0 {
                     *shard_count = 1;
                 }
-                match pick_shard(&candidate.slot, value.len(), shards, *shard_count) {
+                match pick_shard(&candidate.slot, value.len(), &staged, *shard_count) {
                     Some(s) => break s,
                     None => {
                         *shard_count += 1;
@@ -188,6 +198,14 @@ pub async fn allocate_and_deliver(
         } else {
             None
         };
+
+        // Reserve in `staged` so the next `pick_shard` accounts for this
+        // candidate's bytes when deciding whether the same target shard
+        // still has room.
+        staged
+            .entry(shard)
+            .or_default()
+            .insert(candidate.slot.clone(), value.clone());
 
         planned.push(Planned {
             slot: candidate.slot.clone(),
