@@ -279,14 +279,13 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
 }
 
 #[test]
-fn resolver_including_rotate_closes_read_path_false_drift() {
-    // Regression guard: `cmd_diff`, `cmd_plan`, `cmd_review` need rotate
-    // placeholders replaced (not left in place), otherwise the desired-side
-    // config carries a literal `${gh-env-secret:...}` string that compares
-    // as modified against every live gateway value — `drift-check.yml
-    // --exit-on-drift` would fail constantly.
-    use gitforgeops::secrets::resolve_secrets_including_rotate;
-
+fn resolver_replaces_rotate_placeholder_with_bundle_value() {
+    // `alloc=rotate` with a valid bundle entry must resolve to that value —
+    // identical to `alloc=generate`. Leaving the placeholder literal in
+    // place would cause persistent false drift in diff/plan/review and
+    // break `drift-check.yml --exit-on-drift`. Re-rotation of an already-
+    // allocated slot is an explicit `gitforgeops rotate` operation, not
+    // something apply/diff does automatically.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
         id: "app".to_string(),
@@ -307,63 +306,28 @@ fn resolver_including_rotate_closes_read_path_false_drift() {
     let mut bundle = BTreeMap::new();
     bundle.insert(
         "ferrum/app/api_key".to_string(),
-        "current-rotated-value".to_string(),
+        "current-allocated-value".to_string(),
     );
-
-    let _ = resolve_secrets_including_rotate(&mut cfg, &bundle).unwrap();
-
-    let resolved = cfg.consumers[0].credentials.get("api_key").unwrap();
-    assert_eq!(
-        resolved,
-        &serde_json::Value::String("current-rotated-value".to_string()),
-        "read-path resolver must replace rotate placeholders with bundle values; leaving the placeholder causes persistent false drift in diff/plan/review/drift-check"
-    );
-}
-
-#[test]
-fn resolver_does_not_replace_rotate_placeholder_with_stale_value() {
-    // alloc=rotate with an existing (stale) bundle value must keep the
-    // placeholder in place during the initial resolve — otherwise the
-    // placeholder is masked before the allocator generates a fresh value,
-    // and the post-allocation resolve has no placeholder left to replace.
-    let mut cfg = GatewayConfig::default();
-    let mut consumer = Consumer {
-        id: "app".to_string(),
-        username: "app".to_string(),
-        namespace: "ferrum".to_string(),
-        custom_id: None,
-        credentials: Default::default(),
-        acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
-    let placeholder = "${gh-env-secret:alloc=rotate}";
-    consumer.credentials.insert(
-        "api_key".to_string(),
-        serde_json::Value::String(placeholder.to_string()),
-    );
-    cfg.consumers.push(consumer);
-
-    let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/api_key".to_string(), "stale-value".to_string());
 
     let report = resolve_secrets(&mut cfg, &bundle).unwrap();
     assert_eq!(report.results.len(), 1);
-    assert_eq!(report.results[0].status, SlotStatus::NeedsRotation);
-
-    // Placeholder must survive the initial resolve — NOT be replaced with
-    // the stale value.
+    assert_eq!(
+        report.results[0].status,
+        SlotStatus::Resolved,
+        "rotate placeholder with a bundle entry should classify as Resolved (same as generate)"
+    );
     assert_eq!(
         cfg.consumers[0].credentials.get("api_key").unwrap(),
-        &serde_json::Value::String(placeholder.to_string()),
-        "rotate placeholder should not be replaced until post-allocation resolve"
+        &serde_json::Value::String("current-allocated-value".to_string()),
+        "rotate placeholder should resolve to the bundle value"
     );
 }
 
 #[test]
-fn resolver_including_rotate_replaces_rotate_placeholders() {
-    use gitforgeops::secrets::resolve_secrets_including_rotate;
-
+fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
+    // First-apply rotate: no bundle value yet. Classify as NeedsAllocation
+    // so the allocator generates an initial value. Same semantics as
+    // first-apply generate.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
         id: "app".to_string(),
@@ -381,18 +345,10 @@ fn resolver_including_rotate_replaces_rotate_placeholders() {
     );
     cfg.consumers.push(consumer);
 
-    let mut bundle = BTreeMap::new();
-    bundle.insert(
-        "ferrum/app/api_key".to_string(),
-        "freshly-rotated".to_string(),
-    );
-
-    let _ = resolve_secrets_including_rotate(&mut cfg, &bundle).unwrap();
-    assert_eq!(
-        cfg.consumers[0].credentials.get("api_key").unwrap(),
-        &serde_json::Value::String("freshly-rotated".to_string()),
-        "post-allocation variant must replace rotate placeholders with fresh bundle values"
-    );
+    let empty = BTreeMap::new();
+    let report = resolve_secrets(&mut cfg, &empty).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::NeedsAllocation);
 }
 
 #[test]
@@ -417,4 +373,137 @@ fn resolver_reports_needs_allocation_for_generate() {
     let bundle = BTreeMap::new();
     let report = resolve_secrets(&mut cfg, &bundle).unwrap();
     assert_eq!(report.needs_allocation().len(), 1);
+}
+
+#[test]
+fn flat_and_nested_credentials_produce_distinct_slots() {
+    // Regression: previously the walker appended `.` for nested object
+    // keys, so a flat key `basic_auth.password` and a nested
+    // `basic_auth: { password: ... }` both produced slot
+    // `ns/consumer/basic_auth.password` and overwrote each other in the
+    // GitHub Env Secret bundle. With escaped component paths joined by
+    // `/`, the flat key stays a single component (literal dot kept),
+    // and the nested path uses two components — distinct slots.
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    // Flat top-level key with a literal dot in its name.
+    consumer.credentials.insert(
+        "basic_auth.password".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+    );
+    // Nested object with the same logical dotted-name.
+    let mut nested = serde_json::Map::new();
+    nested.insert(
+        "password".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+    );
+    consumer
+        .credentials
+        .insert("basic_auth".to_string(), serde_json::Value::Object(nested));
+    cfg.consumers.push(consumer);
+
+    let bundle = BTreeMap::new();
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    let slots: Vec<_> = report.results.iter().map(|r| r.slot.as_str()).collect();
+    assert_eq!(slots.len(), 2, "each placeholder should get its own slot");
+    assert!(
+        slots.contains(&"ferrum/app/basic_auth.password"),
+        "flat key slot missing from {slots:?}"
+    );
+    assert!(
+        slots.contains(&"ferrum/app/basic_auth/password"),
+        "nested path slot missing from {slots:?}"
+    );
+}
+
+#[test]
+fn slot_components_escape_slash_and_tilde_in_names() {
+    // Namespaces/consumer-ids can in principle contain `/` or `~`. Those
+    // characters are significant to the slot-path encoding (separator
+    // and escape prefix) and must be escaped inside component values to
+    // keep the encoding injective.
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "weird/id".to_string(),
+        username: "weird/id".to_string(),
+        namespace: "ns~with~tilde".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    consumer.credentials.insert(
+        "api_key".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+    );
+    cfg.consumers.push(consumer);
+
+    let bundle = BTreeMap::new();
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    // `~` → `~0`, `/` → `~1`
+    assert_eq!(report.results[0].slot, "ns~0with~0tilde/weird~1id/api_key");
+}
+
+#[test]
+fn object_key_with_bracket_distinct_from_array_index() {
+    // A literal object key `[0]` could collide with the array-index
+    // component `[0]` emitted by the walker unless `[` is escaped inside
+    // literal keys. Check that `foo: {"[0]": ...}` and `foo: [...]` with
+    // a placeholder at index 0 produce distinct slots.
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    // Object with a literal "[0]" key.
+    let mut bracket_obj = serde_json::Map::new();
+    bracket_obj.insert(
+        "[0]".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+    );
+    consumer.credentials.insert(
+        "literal".to_string(),
+        serde_json::Value::Object(bracket_obj),
+    );
+    // Actual array with a placeholder element.
+    consumer.credentials.insert(
+        "arr".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::String(
+            "${gh-env-secret:alloc=generate}".to_string(),
+        )]),
+    );
+    cfg.consumers.push(consumer);
+
+    let bundle = BTreeMap::new();
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    let slots: Vec<_> = report.results.iter().map(|r| r.slot.as_str()).collect();
+    assert_eq!(slots.len(), 2);
+    // `[` in object key escapes to `~2`; `]` is kept literal. Array index
+    // emits `[N]` via the SlotComponent::ArrayIndex path without escape,
+    // so the two forms remain distinct.
+    assert!(
+        slots.contains(&"ferrum/app/literal/~20]"),
+        "literal [0] key should escape bracket: {slots:?}"
+    );
+    assert!(
+        slots.contains(&"ferrum/app/arr/[0]"),
+        "array index should emit literal [0]: {slots:?}"
+    );
 }

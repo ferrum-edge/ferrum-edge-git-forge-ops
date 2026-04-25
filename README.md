@@ -207,7 +207,7 @@ ${gh-env-secret:alloc=<mode>|len=<bytes>}
 
 - `alloc=require` (default) — the value must already exist in the bundle; apply fails if it doesn't.
 - `alloc=generate` — if the value is missing, generate a new one on apply.
-- `alloc=rotate` — regenerate on every apply. Use sparingly — consumes delivery bandwidth.
+- `alloc=rotate` — marker for "this slot is eligible for rotation." Behaves identically to `generate` at apply time: first apply allocates, subsequent applies reuse the stored value. **Re-rotation is explicit** — trigger the `rotate.yml` workflow (see below) with a specific slot and recipient. The previous auto-rotate-on-every-apply behavior was removed because it redelivered persistent rotate slots to whichever user merged the latest PR, even when their PR didn't touch the consumer.
 - `len=<16..=256>` — bytes of entropy for generated values. Default 32.
 
 Slot names are derived automatically from `(namespace, consumer_id, cred_key)` — you don't write them anywhere. Renaming a consumer gets a new slot (and the ability to intentionally retire the old one).
@@ -225,7 +225,7 @@ The apply workflow reads all matching secrets via `${{ toJSON(secrets) }}`, filt
 
 ### Allocation, writing, and delivery
 
-On apply, for each `alloc=generate` or `alloc=rotate` placeholder with no existing value:
+On apply, for each `alloc=generate` or first-apply `alloc=rotate` placeholder with no existing value:
 
 1. Generate a 32-byte (or `len=`) random value with `OsRng`.
 2. Fetch the env's libsodium public key from `GET /repos/.../environments/<env>/secrets/public-key`.
@@ -330,7 +330,7 @@ Practical limits you should know about:
 There's no hard limit in `gitforgeops` on how many resources a single PR can add, modify, or delete. The loader streams one file at a time, the assembler flattens into a `GatewayConfig` in memory (tens of MB even at tens of thousands of resources), and apply runs per namespace.
 
 - **Sequential per-resource HTTP calls in incremental mode.** One PUT / DELETE / POST per changed resource. At ~100 ms round-trip per call, 1,000 changes take roughly 2 minutes. 10,000 changes would take ~20 minutes but are not fundamentally problematic.
-- **Full-replace mode is one HTTP call regardless of size.** `FERRUM_APPLY_STRATEGY=full_replace` calls `POST /restore` once atomically instead of doing per-resource CRUD. Trade-off: individual failures aren't surfaced separately, and in-flight gateway traffic during the restore may see inconsistent routing briefly.
+- **Full-replace mode is one HTTP call per namespace.** `FERRUM_APPLY_STRATEGY=full_replace` calls `POST /restore?confirm=true` once per namespace in scope. The `/restore` call is atomic for the single namespace it targets, but **atomicity does not extend across namespaces** — an exclusive-mode env with `ownership.namespaces: [alpha, beta]` issues two independent restores, and if `beta` fails after `alpha` succeeded, `alpha` is already replaced on the gateway side. The apply loop records every namespace that fails (instead of bailing on the first) so the error message enumerates partial state, but operators must reconcile it manually. For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 - **Namespaces apply independently.** `apply_api` iterates `split_config_by_namespace` and applies each namespace in turn. A failure applying to `team-alpha` doesn't abort `team-beta` — you get per-namespace error reporting via `ApplyResult`.
 
 ### Retry behavior

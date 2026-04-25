@@ -214,9 +214,6 @@ pub fn build_review_comment_v2(
                     SlotStatus::NeedsAllocation => {
                         "needs allocation (generated on apply)".to_string()
                     }
-                    SlotStatus::NeedsRotation => {
-                        "needs rotation (regenerated on apply)".to_string()
-                    }
                     SlotStatus::MissingRequired => "**MISSING (required)**".to_string(),
                 }
             } else {

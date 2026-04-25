@@ -75,9 +75,9 @@ Set via `FERRUM_GATEWAY_MODE`.
 ### Apply Strategies
 
 - **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource
-- **full_replace** — POST to `/restore?confirm=true` atomically
+- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a multi-namespace exclusive env can partial-fail if namespace N's restore errors after namespace N-1's succeeded, and the aggregate error enumerates both)
 
-Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (atomic, removes drift).
+Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
 ### Namespace Handling
 

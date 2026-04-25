@@ -43,6 +43,19 @@ impl ApplyResult {
 /// When `previously_managed` is `Some`, runs in `shared` ownership mode: only
 /// resources present in that set can be deleted; admin-added resources are
 /// reported in `unmanaged_skipped` but not touched.
+///
+/// **Atomicity:** both strategies are **per-namespace**, not environment-wide.
+/// `full_replace` delegates to the gateway's `/restore?confirm=true` endpoint
+/// which is atomic for the single namespace it targets, but when the scope
+/// spans multiple namespaces each namespace is restored in its own API call;
+/// a failure on namespace N leaves namespaces 0..N already restored. To make
+/// the per-namespace failure visible rather than swallowing subsequent
+/// namespaces, a restore error is recorded in `ApplyResult::errors` and the
+/// loop continues to the next namespace. The overall call still returns Err
+/// via `into_result()` so the workflow fails, but the error message now
+/// enumerates every namespace that failed (and implicitly, every one that
+/// succeeded). Operators running cross-namespace full_replace should
+/// understand this: partial restores need manual remediation.
 pub async fn apply_api(
     desired: &GatewayConfig,
     client: &AdminClient,
@@ -56,10 +69,31 @@ pub async fn apply_api(
         let desired_namespace = crate::config::filter_config_by_namespace(desired, namespace);
         let namespace_result = match strategy {
             ApplyStrategy::FullReplace => {
-                apply_full_replace(&desired_namespace, client, namespace).await?
+                // Record-and-continue on error so a multi-namespace restore
+                // reports every failing namespace, not just the first. The
+                // gateway's `/restore` is already atomic per-namespace, so
+                // a failure here doesn't cascade into the next namespace;
+                // the worst case is that namespaces 0..N restored and
+                // namespace N failed, which operators see in the aggregate
+                // error listing.
+                match apply_full_replace(&desired_namespace, client, namespace).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        aggregate.errors.push(format!("[{namespace}] {e}"));
+                        continue;
+                    }
+                }
             }
             ApplyStrategy::Incremental => {
-                apply_incremental(&desired_namespace, client, namespace, previously_managed).await?
+                match apply_incremental(&desired_namespace, client, namespace, previously_managed)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        aggregate.errors.push(format!("[{namespace}] {e}"));
+                        continue;
+                    }
+                }
             }
         };
 

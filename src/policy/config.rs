@@ -38,12 +38,52 @@ pub struct BackendSchemeRuleConfig {
     pub allowed_protocols: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequireAuthPluginRuleConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub severity: Severity,
+    /// Plugin names that count as authentication. Defaults cover the
+    /// Ferrum Edge built-in auth plugins. The previous substring match
+    /// on `"auth"` accepted anything whose name *contained* that
+    /// substring (e.g. `body_size_audit` as auth, or a hostile
+    /// `fake-auth-bypass`) and excluded `jwt` — which the README
+    /// recommends — because its canonical id is just `jwt`. An explicit
+    /// allowlist is easier to reason about and harder to smuggle past.
+    #[serde(default = "default_auth_plugin_names")]
+    pub auth_plugin_names: Vec<String>,
+}
+
+impl Default for RequireAuthPluginRuleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::default(),
+            auth_plugin_names: default_auth_plugin_names(),
+        }
+    }
+}
+
+/// Ferrum Edge built-in auth plugin ids (both hyphen and underscore
+/// spellings are accepted since the schema permits either form). Matching
+/// is case-insensitive against the plugin's `plugin_name` field.
+fn default_auth_plugin_names() -> Vec<String> {
+    vec![
+        "jwt".to_string(),
+        "basic_auth".to_string(),
+        "basic-auth".to_string(),
+        "key_auth".to_string(),
+        "key-auth".to_string(),
+        "oauth2".to_string(),
+        "oidc".to_string(),
+        "ldap_auth".to_string(),
+        "ldap-auth".to_string(),
+        "hmac_auth".to_string(),
+        "hmac-auth".to_string(),
+        "mtls_auth".to_string(),
+        "mtls-auth".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

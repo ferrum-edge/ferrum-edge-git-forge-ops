@@ -152,21 +152,19 @@ fn load_credential_bundles(
 
 /// Resolve credentials for read-only paths (diff, plan, review, validate).
 ///
-/// Uses `resolve_secrets_including_rotate` so `alloc=rotate` placeholders get
-/// substituted with their bundle values — otherwise the placeholder literal
-/// `${gh-env-secret:alloc=rotate}` would be compared against the live gateway
-/// value on every diff and surface as persistent false drift (and fail
-/// `drift-check.yml --exit-on-drift`).
-///
-/// `cmd_apply` calls `resolve_secrets` directly (not through this helper)
-/// because its first pass deliberately keeps rotate placeholders in place so
-/// the allocator can generate fresh values.
+/// `alloc=rotate` placeholders are resolved with their stored bundle values,
+/// identical to `alloc=generate` — otherwise the placeholder literal
+/// `${gh-env-secret:alloc=rotate}` would compare as modified against every
+/// live gateway value on every diff and surface as persistent false drift
+/// (and fail `drift-check.yml --exit-on-drift`). Rotation is now always
+/// explicit via `gitforgeops rotate`, so there's no two-pass allocate-then-
+/// replace dance to preserve.
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
 ) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
     let (bundle, _) = load_credential_bundles(env_config)?;
-    Ok(secrets::resolve_secrets_including_rotate(cfg, &bundle)?)
+    Ok(secrets::resolve_secrets(cfg, &bundle)?)
 }
 
 fn resolved_namespaces(
@@ -489,7 +487,7 @@ async fn allocate_if_needed(
 
     let client = build_github_api_client(env_config)?;
 
-    let outcome = secrets::allocate_and_deliver(
+    let outcome = match secrets::allocate_and_deliver(
         &client,
         repo,
         &resolved.name,
@@ -499,14 +497,33 @@ async fn allocate_if_needed(
         per_shard,
         shard_count,
     )
-    .await?;
+    .await
+    {
+        Ok(o) => o,
+        Err(failure) => {
+            // Shard-atomic commit failed partway through: the shards in
+            // `failure.partial.allocated` were successfully PUT to GitHub
+            // before the failure, so their new values are live on the
+            // gateway side. Surface those ciphertexts NOW — if we let the
+            // error propagate without surfacing, recipients for already-
+            // committed shards have no decryption material and the next
+            // apply will see the slot as resolved (bundle has the value)
+            // so no re-delivery fires. Subsequent shards in the batch are
+            // not in `partial.allocated` (their PUT never succeeded), so
+            // they'll show up as NeedsAllocation on the next apply.
+            if !failure.partial.allocated.is_empty() {
+                surface_delivered_credentials(env_config, &failure.partial).await?;
+            }
+            return Err(failure.source.into());
+        }
+    };
 
-    // Re-resolve so desired picks up the generated values. Use the rotate-
-    // aware variant: the initial resolve left rotate placeholders in place so
-    // the allocator could produce a fresh value; now that the bundle has
-    // fresh values, rotate placeholders are safe to replace.
+    // Re-resolve so `desired` picks up freshly allocated values. The
+    // allocator only produces values for slots classified as NeedsAllocation
+    // (first-apply generate OR first-apply rotate). Already-allocated
+    // placeholders were resolved in the initial `resolve_secrets` pass.
     let merged = secrets::merge_bundles(per_shard);
-    let _ = secrets::resolve_secrets_including_rotate(desired, &merged)?;
+    let _ = secrets::resolve_secrets(desired, &merged)?;
 
     Ok(Some(outcome))
 }
@@ -578,7 +595,6 @@ fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) 
         let status = match r.status {
             secrets::SlotStatus::Resolved => "resolved",
             secrets::SlotStatus::NeedsAllocation => "needs-allocation",
-            secrets::SlotStatus::NeedsRotation => "needs-rotation",
             secrets::SlotStatus::MissingRequired => "MISSING (required)",
         };
         lines.push(format!("  [{status}] {}", r.slot));
@@ -628,21 +644,14 @@ async fn cmd_export(
         // strings in it, and we won't allocate fresh secrets during export
         // (that's the job of `apply`).
         //
-        // Resolve with the rotate-aware variant so a rotate placeholder
-        // with a valid bundle entry is replaced (the prior `apply` wrote
-        // the value into the bundle). Rotate placeholders that still have
-        // no bundle entry stay in place and show up as "remaining" below.
-        //
-        // Don't trust the pre-resolve report's NeedsAllocation/NeedsRotation
-        // classification for the pending check: `alloc=rotate` is always
-        // classified as NeedsRotation regardless of whether the bundle
-        // carries a value, so keying the check off that status would block
-        // materialization forever on any config using rotate. Instead, run
-        // the post-resolve config back through report_secrets with an
-        // empty bundle — any placeholder still present in the config is a
-        // truly-unresolved slot.
+        // After resolve, any placeholder still present in the config is a
+        // truly-unresolved slot. We run the post-resolve config through
+        // report_secrets with an empty bundle as a defensive re-scan rather
+        // than trusting the pre-resolve report's NeedsAllocation
+        // classification, since that classification is computed against the
+        // PRE-resolve bundle snapshot.
         let (bundle, _) = load_credential_bundles(&env_config)?;
-        let _ = secrets::resolve_secrets_including_rotate(&mut gateway_config, &bundle)?;
+        let _ = secrets::resolve_secrets(&mut gateway_config, &bundle)?;
         let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
         if !remaining.results.is_empty() {
             return Err(format!(
@@ -958,7 +967,9 @@ async fn cmd_apply(
     //
     // In api mode we want the mutation: apply_api pushes `desired` to the
     // gateway, which needs real values for already-allocated slots. The
-    // allocator handles `alloc=generate` / `alloc=rotate` gaps afterward.
+    // allocator fills in first-apply gaps (generate or rotate with no
+    // existing value) afterward; rotation of an already-allocated slot is
+    // an explicit `gitforgeops rotate` operation, not something apply does.
     let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
     let mut shard_count = state.credential_shard_count.max(1);
     let initial_bundle = secrets::merge_bundles(&per_shard);
@@ -1085,16 +1096,11 @@ async fn cmd_apply(
                 let pending_creds = secret_report.needs_allocation();
                 if !pending_creds.is_empty() {
                     println!(
-                        "\n{} credential slot(s) would be allocated/rotated on apply:",
+                        "\n{} credential slot(s) would be allocated on apply:",
                         pending_creds.len()
                     );
                     for r in pending_creds {
-                        let kind = match r.status {
-                            secrets::SlotStatus::NeedsAllocation => "new",
-                            secrets::SlotStatus::NeedsRotation => "rotate",
-                            _ => "",
-                        };
-                        println!("  [{kind}] {}", r.slot);
+                        println!("  [new] {}", r.slot);
                     }
                 }
                 println!("\nUse --auto-approve to skip this check.");
@@ -1142,7 +1148,9 @@ async fn cmd_apply(
                 process::exit(1);
             }
 
-            // All safety gates passed — now allocate/rotate credentials.
+            // All safety gates passed — now allocate credentials. Rotation
+            // on an already-allocated slot is a separate explicit operation
+            // (`gitforgeops rotate`); apply never re-rotates automatically.
             allocation = allocate_if_needed(
                 &mut desired,
                 &env_config,
@@ -1154,10 +1162,7 @@ async fn cmd_apply(
             .await?;
 
             if let Some(outcome) = &allocation {
-                eprintln!(
-                    "Allocated/rotated {} credential slot(s):",
-                    outcome.allocated.len()
-                );
+                eprintln!("Allocated {} credential slot(s):", outcome.allocated.len());
                 for slot in &outcome.allocated {
                     match &slot.delivered {
                         Some(d) => eprintln!(
@@ -1209,17 +1214,12 @@ async fn cmd_apply(
             let pending = secret_report.needs_allocation();
             if !auto_approve && !pending.is_empty() {
                 println!(
-                    "Would write placeholder file to {} and allocate/rotate {} credential slot(s):",
+                    "Would write placeholder file to {} and allocate {} credential slot(s):",
                     env_config.file_output_path,
                     pending.len()
                 );
                 for r in pending {
-                    let kind = match r.status {
-                        secrets::SlotStatus::NeedsAllocation => "new",
-                        secrets::SlotStatus::NeedsRotation => "rotate",
-                        _ => "",
-                    };
-                    println!("  [{kind}] {}", r.slot);
+                    println!("  [new] {}", r.slot);
                 }
                 println!("\nUse --auto-approve to proceed.");
                 process::exit(0);
@@ -1574,7 +1574,7 @@ async fn cmd_rotate(
         let mut shim_bundle = current_bundle.clone();
         shim_bundle.insert(slot.clone(), "__rotate-preflight-shim__".to_string());
         single.consumers.push(c.clone());
-        let _ = secrets::resolve_secrets_including_rotate(&mut single, &shim_bundle)?;
+        let _ = secrets::resolve_secrets(&mut single, &shim_bundle)?;
         c = single.consumers.remove(0);
         let mut remaining_cfg = gitforgeops::config::GatewayConfig::default();
         remaining_cfg.consumers.push(c);
@@ -1692,9 +1692,9 @@ async fn push_rotated_consumer_to_gateway(
 
     let mut desired = load_and_assemble_for(resolved)?;
     let merged = secrets::merge_bundles(per_shard);
-    // Use the rotate-aware variant so rotate placeholders pick up the fresh
-    // value that rotate_and_deliver just wrote into the bundle.
-    let _ = secrets::resolve_secrets_including_rotate(&mut desired, &merged)?;
+    // `rotate_and_deliver` just wrote the fresh value into the bundle; this
+    // resolve picks it up for the consumer being pushed to the gateway.
+    let _ = secrets::resolve_secrets(&mut desired, &merged)?;
 
     let consumer = desired
         .consumers

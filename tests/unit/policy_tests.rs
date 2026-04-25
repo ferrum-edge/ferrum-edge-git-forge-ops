@@ -127,16 +127,15 @@ fn backend_scheme_policy_flags_http() {
 #[test]
 fn require_auth_plugin_ignores_disabled_plugins() {
     use gitforgeops::config::schema::{PluginConfig, PluginScope};
-    use gitforgeops::policy::config::RequireAuthPluginRuleConfig;
 
     // Proxy exists; an auth plugin exists in the same namespace at Global
     // scope but has enabled=false. The policy must still fire — disabled
     // plugins don't actually authenticate traffic.
     let p = proxy("p1", BackendProtocol::Https, 30_000, true);
     let disabled_auth = PluginConfig {
-        id: "jwt-auth-disabled".to_string(),
+        id: "jwt-disabled".to_string(),
         namespace: "ferrum".to_string(),
-        plugin_name: "jwt-auth".to_string(),
+        plugin_name: "jwt".to_string(),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: false,
@@ -155,6 +154,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
             require_auth_plugin: gitforgeops::policy::config::RequireAuthPluginRuleConfig {
                 enabled: true,
                 severity: Severity::Error,
+                ..Default::default()
             },
             ..Default::default()
         },
@@ -170,9 +170,9 @@ fn require_auth_plugin_ignores_disabled_plugins() {
 
     // Same setup but plugin enabled — policy should be satisfied.
     let enabled_auth = PluginConfig {
-        id: "jwt-auth-on".to_string(),
+        id: "jwt-on".to_string(),
         namespace: "ferrum".to_string(),
-        plugin_name: "jwt-auth".to_string(),
+        plugin_name: "jwt".to_string(),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -181,10 +181,6 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
-    let _ = RequireAuthPluginRuleConfig {
-        enabled: true,
-        severity: Severity::Error,
-    };
     let cfg2 = GatewayConfig {
         proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
         plugin_configs: vec![enabled_auth],
@@ -192,6 +188,110 @@ fn require_auth_plugin_ignores_disabled_plugins() {
     };
     let findings2 = evaluate_policies(&cfg2, &policies);
     assert!(findings2.is_empty(), "enabled auth plugin should satisfy");
+}
+
+#[test]
+fn require_auth_plugin_uses_explicit_allowlist() {
+    // Regression: the old substring match on "auth" accepted
+    // unrelated plugin names that merely contained the substring
+    // (e.g. `body_size_audit`, `fake-auth-bypass`) and excluded `jwt`
+    // — whose canonical id doesn't include the substring. The
+    // allowlist fixes both directions.
+    use gitforgeops::config::schema::{PluginConfig, PluginScope};
+
+    let make_plugin = |id: &str, name: &str| PluginConfig {
+        id: id.to_string(),
+        namespace: "ferrum".to_string(),
+        plugin_name: name.to_string(),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        config: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: gitforgeops::policy::config::RequireAuthPluginRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Case 1: `jwt` is on the default allowlist — proxy passes.
+    let cfg_jwt = GatewayConfig {
+        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        plugin_configs: vec![make_plugin("jwt-1", "jwt")],
+        ..Default::default()
+    };
+    assert!(
+        evaluate_policies(&cfg_jwt, &policies).is_empty(),
+        "jwt should satisfy require_auth_plugin under default allowlist"
+    );
+
+    // Case 2: `basic-auth` is on the default allowlist — proxy passes.
+    let cfg_basic = GatewayConfig {
+        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        plugin_configs: vec![make_plugin("ba-1", "basic-auth")],
+        ..Default::default()
+    };
+    assert!(
+        evaluate_policies(&cfg_basic, &policies).is_empty(),
+        "basic-auth should satisfy under default allowlist"
+    );
+
+    // Case 3: plugin name containing `auth` substring but not on the
+    // allowlist (e.g. an audit plugin) — policy must STILL fire.
+    let cfg_substring = GatewayConfig {
+        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        plugin_configs: vec![make_plugin("audit-1", "body_size_audit")],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg_substring, &policies);
+    assert_eq!(
+        findings.len(),
+        1,
+        "substring-only match must not satisfy the rule under the allowlist"
+    );
+
+    // Case 4: custom allowlist lets an org approve a non-default name.
+    let custom_policies = PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: gitforgeops::policy::config::RequireAuthPluginRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                auth_plugin_names: vec!["company_sso".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let cfg_custom = GatewayConfig {
+        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        plugin_configs: vec![make_plugin("sso-1", "company_sso")],
+        ..Default::default()
+    };
+    assert!(
+        evaluate_policies(&cfg_custom, &custom_policies).is_empty(),
+        "custom allowlist entry should satisfy the rule"
+    );
+    // With the custom allowlist, `jwt` is no longer accepted.
+    let cfg_custom_jwt = GatewayConfig {
+        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        plugin_configs: vec![make_plugin("jwt-1", "jwt")],
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_policies(&cfg_custom_jwt, &custom_policies).len(),
+        1,
+        "custom allowlist should not fall back to defaults"
+    );
 }
 
 #[test]

@@ -20,7 +20,18 @@ pub enum ApplyStrategy {
     /// Only apply changed resources (diff-based).
     #[default]
     Incremental,
-    /// Replace entire config atomically.
+    /// Replace an entire namespace atomically via `/restore?confirm=true`.
+    ///
+    /// **Atomicity scope is per-namespace, not environment-wide.** When an
+    /// apply targets multiple namespaces (exclusive mode with an
+    /// `ownership.namespaces` list longer than one), each namespace is
+    /// restored in its own API call. A failure on the Nth namespace
+    /// leaves namespaces 0..N already replaced. The apply result
+    /// enumerates which namespaces succeeded and which failed (rather
+    /// than bailing on the first error and hiding later namespaces), but
+    /// operators must still manually reconcile any partial state. For
+    /// strict environment-wide atomicity, scope `full_replace` to a
+    /// single namespace or use `incremental`.
     FullReplace,
 }
 

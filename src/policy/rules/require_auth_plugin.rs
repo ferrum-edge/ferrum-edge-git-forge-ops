@@ -12,7 +12,20 @@ impl RequireAuthPluginRule {
         Self { config }
     }
 
-    fn proxy_has_auth(cfg: &GatewayConfig, proxy: &Proxy) -> bool {
+    fn proxy_has_auth(&self, cfg: &GatewayConfig, proxy: &Proxy) -> bool {
+        // Explicit allowlist matching. The prior substring check for
+        // `"auth"` missed valid auth plugins whose canonical id is `jwt`
+        // (no `auth` substring) and simultaneously accepted unrelated or
+        // hostile names that merely contained the substring (e.g.
+        // `body_size_audit` ends in `audit`, `fake-auth-bypass`).
+        // Matching is case-insensitive against the allowlist entries.
+        let allowlist: Vec<String> = self
+            .config
+            .auth_plugin_names
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+
         let in_scope = |plugin: &PluginConfig| -> bool {
             // A disabled auth plugin provides no authentication — the gateway
             // skips it on every request. Treating it as "satisfies auth"
@@ -22,7 +35,7 @@ impl RequireAuthPluginRule {
             if !plugin.enabled {
                 return false;
             }
-            if !plugin.plugin_name.contains("auth") {
+            if !allowlist.contains(&plugin.plugin_name.to_ascii_lowercase()) {
                 return false;
             }
             if plugin.namespace != proxy.namespace {
@@ -59,7 +72,7 @@ impl PolicyCheck for RequireAuthPluginRule {
         }
 
         for proxy in &cfg.proxies {
-            if !Self::proxy_has_auth(cfg, proxy) {
+            if !self.proxy_has_auth(cfg, proxy) {
                 findings.push(PolicyFinding {
                     rule_id: self.rule_id().to_string(),
                     severity: self.config.severity,
