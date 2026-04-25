@@ -509,23 +509,23 @@ fn object_key_with_bracket_distinct_from_array_index() {
 }
 
 #[test]
-fn slot_path_matches_walker_for_keys_with_slash_or_tilde() {
-    // `gitforgeops rotate` calls slot_path(ns, id, cred_key) to look up the
-    // slot. report_secrets / resolve_secrets emit the same slot when walking
-    // consumer.credentials. If the two encoders disagree, rotate's preflight
-    // says the slot doesn't exist for any key containing `/` or `~`, and the
-    // user can't rotate that credential at all.
+fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
+    // `gitforgeops rotate --credential <X>` calls slot_path(ns, id, X) to
+    // look up the slot. report_secrets walks `consumer.credentials` and
+    // recurses into nested objects, emitting one slot per leaf placeholder.
+    //
+    // Verify slot_path round-trips against the walker for the cases the CLI
+    // is expected to support:
+    //   - flat top-level key with a string placeholder
+    //   - nested object placeholder addressed via `parent/child` in the CLI
+    //   - keys containing `~` (must escape consistently in both directions)
+    //
+    // Literal `/` inside a flat key is intentionally NOT supported here —
+    // see slot_path's doc comment for the rationale (no CLI escape that
+    // round-trips through escape_slot_component without double-escaping).
     use gitforgeops::secrets::{report_secrets, slot_path};
 
-    let cases: &[&str] = &[
-        "api_key",   // boring case
-        "foo/bar",   // literal `/` → walker emits `~1`
-        "foo~bar",   // literal `~` → walker emits `~0`
-        "a/b~c",     // both
-        "~1literal", // user-typed `~1` must NOT be re-interpreted as `/`
-    ];
-
-    for cred_key in cases {
+    fn config_with_credential(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
         let mut cfg = GatewayConfig::default();
         let mut consumer = Consumer {
             id: "app".to_string(),
@@ -537,26 +537,60 @@ fn slot_path_matches_walker_for_keys_with_slash_or_tilde() {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        consumer.credentials.insert(
-            cred_key.to_string(),
-            serde_json::Value::String("${gh-env-secret:alloc=require}".to_string()),
-        );
+        consumer.credentials.insert(cred_key.to_string(), value);
         cfg.consumers.push(consumer);
+        cfg
+    }
 
+    let placeholder = || serde_json::Value::String("${gh-env-secret:alloc=require}".to_string());
+
+    // Case 1: flat top-level string credential → slot_path("api_key").
+    {
+        let cfg = config_with_credential("api_key", placeholder());
         let walker_slot = report_secrets(&cfg, &BTreeMap::new())
             .unwrap()
             .results
             .into_iter()
             .next()
-            .expect("walker emitted exactly one result")
+            .unwrap()
             .slot;
+        let cli_slot = slot_path("ferrum", "app", "api_key");
+        assert_eq!(walker_slot, cli_slot, "flat top-level key");
+    }
 
-        let cli_slot = slot_path("ferrum", "app", cred_key);
+    // Case 2: nested object credential → CLI addresses with "parent/child".
+    // This is the primary use case the split-on-`/` design supports —
+    // walker recurses through the object value and emits a multi-component
+    // slot.
+    {
+        let mut nested = serde_json::Map::new();
+        nested.insert("password".to_string(), placeholder());
+        let cfg = config_with_credential("basic_auth", serde_json::Value::Object(nested));
+        let walker_slot = report_secrets(&cfg, &BTreeMap::new())
+            .unwrap()
+            .results
+            .into_iter()
+            .next()
+            .unwrap()
+            .slot;
+        let cli_slot = slot_path("ferrum", "app", "basic_auth/password");
+        assert_eq!(walker_slot, cli_slot, "nested object credential");
+    }
 
-        assert_eq!(
-            walker_slot, cli_slot,
-            "slot_path must match the walker for cred_key {cred_key:?}"
-        );
+    // Case 3: top-level key with `~` character. Walker treats it as a
+    // single literal and escapes `~` → `~0`. CLI sees no `/`, so it also
+    // produces a single literal segment with the same escape.
+    {
+        let cfg = config_with_credential("foo~bar", placeholder());
+        let walker_slot = report_secrets(&cfg, &BTreeMap::new())
+            .unwrap()
+            .results
+            .into_iter()
+            .next()
+            .unwrap()
+            .slot;
+        let cli_slot = slot_path("ferrum", "app", "foo~bar");
+        assert_eq!(walker_slot, cli_slot, "top-level key containing ~");
     }
 }
 

@@ -105,22 +105,31 @@ fn join_slot_components(components: &[SlotComponent<'_>]) -> String {
         .join("/")
 }
 
-/// Build a slot path from the top-level credential key.
+/// Build a slot path from the CLI `--credential` argument.
 ///
-/// `cred_key` is treated as an opaque literal — exactly how `report_secrets`
-/// emits the same component when walking `consumer.credentials`
-/// (`BTreeMap<String, String>`, no path semantics). Splitting on `/` here
-/// would diverge from the walker: a key like `foo/bar` would round-trip to
-/// `<ns>/<id>/foo/bar` instead of the walker's `<ns>/<id>/foo~1bar`, and
-/// `gitforgeops rotate` would fail preflight on a slot that exists.
-/// Escaping (including `/` → `~1` and `~` → `~0`) is handled by
-/// `escape_slot_component` inside `join_slot_components`.
+/// `cred_key` is interpreted as a `/`-separated path matching the walker's
+/// nested-object emission: a top-level string credential maps to a single
+/// component (`api_key` → `<ns>/<id>/api_key`), and a placeholder reached
+/// by object traversal uses `/` as the path separator (`basic_auth.password`
+/// → `<ns>/<id>/basic_auth/password`). Each segment is run through
+/// `escape_slot_component`, so `~` in a segment escapes to `~0` and matches
+/// the walker for top-level keys containing `~`.
+///
+/// Limitation: a literal `/` inside a single credential key (e.g. a flat
+/// top-level key spelled `foo/bar`) cannot be addressed from the CLI — the
+/// walker emits `<ns>/<id>/foo~1bar` for that, but this function will always
+/// interpret `/` as a path separator. There is no CLI escape syntax because
+/// routing a user-typed `~1` through `escape_slot_component` would
+/// double-escape the `~` to `~01`. Such keys are vanishingly rare in
+/// practice; if you hit this, rename the key to avoid `/`.
 pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
-    let components = vec![
+    let mut components: Vec<SlotComponent<'_>> = vec![
         SlotComponent::Literal(namespace),
         SlotComponent::Literal(consumer_id),
-        SlotComponent::Literal(cred_key),
     ];
+    for piece in cred_key.split('/') {
+        components.push(SlotComponent::Literal(piece));
+    }
     join_slot_components(&components)
 }
 
