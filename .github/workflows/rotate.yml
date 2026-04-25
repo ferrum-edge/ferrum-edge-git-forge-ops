@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       credential:
-        description: Credential key (e.g. `api_key`, `basic_auth.password`)
+        description: Credential key. Top-level key (e.g. `api_key`) or `/`-separated path into nested object credentials (e.g. `basic_auth/password`).
         required: true
         type: string
       namespace:
