@@ -8,6 +8,7 @@ fn apply_result_into_result_rejects_partial_failure() {
         deleted: 0,
         unmanaged_skipped: 0,
         errors: vec!["Proxy proxy-a update: 500".to_string()],
+        ..Default::default()
     };
 
     let error = result.into_result().unwrap_err();
@@ -36,6 +37,7 @@ fn apply_result_into_result_propagates_via_err_for_deferred_pattern() {
         deleted: 0,
         unmanaged_skipped: 0,
         errors: vec!["Consumer alice create: 500".to_string()],
+        ..Default::default()
     };
     assert!(
         partial.into_result().err().is_some(),
@@ -50,6 +52,7 @@ fn apply_result_into_result_propagates_via_err_for_deferred_pattern() {
         deleted: 0,
         unmanaged_skipped: 0,
         errors: vec![],
+        ..Default::default()
     };
     assert!(
         success.into_result().err().is_none(),

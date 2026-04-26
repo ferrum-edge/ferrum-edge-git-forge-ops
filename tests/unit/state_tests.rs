@@ -196,3 +196,191 @@ fn state_file_records_credential_metadata() {
         assert_ne!(meta.sha256_prefix, "secretvalue");
     });
 }
+
+#[test]
+fn record_op_preserves_state_for_failed_delete() {
+    // Regression: cmd_apply previously used `state.record(&desired,
+    // &namespaces)` which rewrites the in-scope managed set from desired.
+    // For a failed Delete, the resource is absent from `desired` (user
+    // removed it from the repo) but still live on the gateway because the
+    // delete failed. The wholesale rewrite drops the resource's state
+    // entry; the next compute_diff_with_ownership classifies the still-
+    // live resource as unmanaged and stops retrying the deletion,
+    // orphaning it indefinitely.
+    //
+    // The fix: cmd_apply walks `ApplyResult::applied_incremental` and
+    // calls `state.record_op` for each successful op. Failed ops never
+    // appear in that list, so their state entries persist untouched and
+    // the next apply's diff still sees the resource as managed →
+    // generates another Delete → retries.
+    use gitforgeops::apply::AppliedOp;
+    use gitforgeops::config::schema::{BackendProtocol, Consumer, GatewayConfig, Proxy};
+    use gitforgeops::diff::resource_diff::DiffAction;
+
+    fn proxy(id: &str, ns: &str) -> Proxy {
+        Proxy {
+            id: id.to_string(),
+            name: None,
+            namespace: ns.to_string(),
+            hosts: vec![],
+            listen_path: Some(format!("/{id}")),
+            backend_protocol: BackendProtocol::Https,
+            backend_host: "b".to_string(),
+            backend_port: 443,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5000,
+            backend_read_timeout_ms: 30000,
+            backend_write_timeout_ms: 30000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: Default::default(),
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: Default::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 30,
+            udp_max_response_amplification_factor: None,
+            tcp_idle_timeout_seconds: None,
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    // Prior state: two managed resources in `ferrum`.
+    let mut state = StateFile::default();
+    state
+        .resources
+        .insert("ferrum:Proxy:keep-me".to_string(), "sha256:OLD".to_string());
+    state.resources.insert(
+        "ferrum:Proxy:to-delete".to_string(),
+        "sha256:DEL".to_string(),
+    );
+
+    // User removed `to-delete` from the repo. Apply tried Delete but the
+    // gateway returned 500. Apply also successfully created `new-one`.
+    // `desired` reflects the repo state (no `to-delete`).
+    let desired = GatewayConfig {
+        proxies: vec![proxy("keep-me", "ferrum"), proxy("new-one", "ferrum")],
+        ..GatewayConfig::default()
+    };
+
+    // Successful ops: only the create. The failed delete is NOT in this list.
+    let successful_ops = vec![AppliedOp {
+        kind: "Proxy".to_string(),
+        namespace: "ferrum".to_string(),
+        id: "new-one".to_string(),
+        action: DiffAction::Add,
+    }];
+
+    for op in &successful_ops {
+        state.record_op(op, &desired).unwrap();
+    }
+
+    // Successful create is in state.
+    assert!(
+        state.resources.contains_key("ferrum:Proxy:new-one"),
+        "successful Add must record into state"
+    );
+    // Failed delete's key is PRESERVED — the resource is still managed,
+    // and the next diff will retry the delete instead of treating it as
+    // unmanaged.
+    assert!(
+        state.resources.contains_key("ferrum:Proxy:to-delete"),
+        "failed Delete must NOT remove the key from state, otherwise the resource is orphaned"
+    );
+    // Pre-existing managed entry is untouched.
+    assert!(
+        state.resources.contains_key("ferrum:Proxy:keep-me"),
+        "unchanged managed entry must persist"
+    );
+
+    // Now confirm the successful-Delete path also works: same scenario but
+    // the delete succeeds. record_op for a Delete should remove the key.
+    let mut state2 = state.clone();
+    state2
+        .record_op(
+            &AppliedOp {
+                kind: "Proxy".to_string(),
+                namespace: "ferrum".to_string(),
+                id: "to-delete".to_string(),
+                action: DiffAction::Delete,
+            },
+            &desired,
+        )
+        .unwrap();
+    assert!(
+        !state2.resources.contains_key("ferrum:Proxy:to-delete"),
+        "successful Delete must remove the key from state"
+    );
+
+    // Successful Modify on a Consumer should refresh the hash and not
+    // touch other namespaces.
+    let mut state3 = StateFile::default();
+    state3.resources.insert(
+        "platform:Consumer:other".to_string(),
+        "sha256:OTHER".to_string(),
+    );
+    state3.resources.insert(
+        "ferrum:Consumer:app".to_string(),
+        "sha256:STALE".to_string(),
+    );
+    let consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let cfg = GatewayConfig {
+        consumers: vec![consumer],
+        ..GatewayConfig::default()
+    };
+    state3
+        .record_op(
+            &AppliedOp {
+                kind: "Consumer".to_string(),
+                namespace: "ferrum".to_string(),
+                id: "app".to_string(),
+                action: DiffAction::Modify,
+            },
+            &cfg,
+        )
+        .unwrap();
+    assert_ne!(
+        state3.resources.get("ferrum:Consumer:app"),
+        Some(&"sha256:STALE".to_string()),
+        "Modify must refresh the hash"
+    );
+    assert_eq!(
+        state3.resources.get("platform:Consumer:other"),
+        Some(&"sha256:OTHER".to_string()),
+        "out-of-namespace entry must remain untouched"
+    );
+}

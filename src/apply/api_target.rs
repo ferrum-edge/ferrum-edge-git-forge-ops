@@ -5,6 +5,20 @@ use crate::config::ApplyStrategy;
 use crate::diff::resource_diff::{compute_diff_with_ownership, DiffAction, DiffResult};
 use crate::http_client::AdminClient;
 
+/// A single per-resource operation that completed successfully against the
+/// gateway. cmd_apply uses this to update `state.resources` incrementally,
+/// so partial-failure runs don't touch state for failed ops. Critical for
+/// shared mode: a failed Delete must NOT drop the resource from state, or
+/// `compute_diff_with_ownership` will reclassify it as unmanaged on the
+/// next run and stop retrying the deletion.
+#[derive(Debug, Clone)]
+pub struct AppliedOp {
+    pub kind: String,
+    pub namespace: String,
+    pub id: String,
+    pub action: DiffAction,
+}
+
 #[derive(Debug, Default)]
 pub struct ApplyResult {
     pub created: usize,
@@ -12,6 +26,14 @@ pub struct ApplyResult {
     pub deleted: usize,
     pub unmanaged_skipped: usize,
     pub errors: Vec<String>,
+    /// Per-resource operations that succeeded in `apply_incremental`.
+    /// Empty for `apply_full_replace` runs — see `fully_replaced_namespaces`.
+    pub applied_incremental: Vec<AppliedOp>,
+    /// Namespaces where `apply_full_replace` completed successfully.
+    /// /restore is atomic per namespace, so on success the entire
+    /// namespace's desired state is now live and state.resources for that
+    /// namespace can be rebuilt from desired without per-op tracking.
+    pub fully_replaced_namespaces: Vec<String>,
 }
 
 impl ApplyResult {
@@ -101,6 +123,12 @@ pub async fn apply_api(
         aggregate.updated += namespace_result.updated;
         aggregate.deleted += namespace_result.deleted;
         aggregate.unmanaged_skipped += namespace_result.unmanaged_skipped;
+        aggregate
+            .applied_incremental
+            .extend(namespace_result.applied_incremental);
+        aggregate
+            .fully_replaced_namespaces
+            .extend(namespace_result.fully_replaced_namespaces);
         aggregate.errors.extend(
             namespace_result
                 .errors
@@ -123,6 +151,11 @@ async fn apply_full_replace(
             + desired.consumers.len()
             + desired.upstreams.len()
             + desired.plugin_configs.len(),
+        // /restore is atomic for the namespace — on success, the entire
+        // namespace's desired state is live. cmd_apply rebuilds
+        // state.resources for this namespace from `desired` without per-op
+        // tracking.
+        fully_replaced_namespaces: vec![namespace.to_string()],
         ..Default::default()
     })
 }
@@ -238,11 +271,24 @@ async fn apply_incremental(
         };
 
         match outcome {
-            Ok(()) => match diff.action {
-                DiffAction::Add => result.created += 1,
-                DiffAction::Modify => result.updated += 1,
-                DiffAction::Delete => result.deleted += 1,
-            },
+            Ok(()) => {
+                match diff.action {
+                    DiffAction::Add => result.created += 1,
+                    DiffAction::Modify => result.updated += 1,
+                    DiffAction::Delete => result.deleted += 1,
+                }
+                // Track per-op success so cmd_apply updates state.resources
+                // only for ops that actually landed. Failed ops leave their
+                // state entry untouched — for shared mode, this preserves
+                // the managed flag on resources whose Delete failed (so the
+                // next run retries deletion instead of orphaning them).
+                result.applied_incremental.push(AppliedOp {
+                    kind: diff.kind.clone(),
+                    namespace: diff.namespace.clone(),
+                    id: diff.id.clone(),
+                    action: diff.action.clone(),
+                });
+            }
             Err(e) => {
                 result.errors.push(format!(
                     "{} {} {}: {}",

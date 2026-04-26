@@ -1070,6 +1070,17 @@ async fn cmd_apply(
     // partial successes can be observed.
     let mut deferred_apply_error: Option<gitforgeops::error::Error> = None;
 
+    // Per-op success records from apply_api. cmd_apply uses these to update
+    // state.resources INCREMENTALLY (only for ops that actually landed),
+    // not by full-replace from `desired`. The full-replace approach drops
+    // failed-Delete keys from state — in shared mode that orphans the
+    // resource (next diff classifies it as unmanaged, no more delete
+    // retries). File mode leaves these empty, and the file-mode state path
+    // below stamps everything from `desired` as managed (no per-op concept
+    // — the file write is atomic, success means everything's recorded).
+    let mut successful_ops: Vec<apply::AppliedOp> = Vec::new();
+    let mut fully_replaced: Vec<String> = Vec::new();
+
     match env_config.gateway_mode {
         GatewayMode::Api => {
             let client = AdminClient::new(&env_config)?;
@@ -1207,7 +1218,7 @@ async fn cmd_apply(
                 surface_delivered_credentials(&env_config, outcome).await?;
             }
 
-            let raw = apply::apply_api(
+            let mut raw = apply::apply_api(
                 &desired,
                 &client,
                 resolved.apply_strategy.clone(),
@@ -1222,6 +1233,11 @@ async fn cmd_apply(
                 "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped",
                 raw.created, raw.updated, raw.deleted, raw.unmanaged_skipped
             );
+
+            // Pull the per-op records out before `into_result()` consumes
+            // `raw`. These drive the incremental state update below.
+            successful_ops = std::mem::take(&mut raw.applied_incremental);
+            fully_replaced = std::mem::take(&mut raw.fully_replaced_namespaces);
 
             // Defer propagation: record state for the successful portion
             // first, then surface the partial-failure summary at the end of
@@ -1276,12 +1292,37 @@ async fn cmd_apply(
         }
     }
 
-    // Scoped record: only overwrite entries for namespaces we just
-    // reconciled. In shared mode with multiple namespaces and a scoped
-    // apply (e.g. FERRUM_NAMESPACE=ferrum), the previous clear-all
-    // behavior dropped managed-resource hashes for every other namespace
-    // — next diff would classify those as unmanaged and stop reconciling.
-    state.record(&desired, &namespaces);
+    // Update state.resources from what actually succeeded, not from
+    // `desired`. A wholesale rewrite from `desired` would drop the entry
+    // for any failed Delete (the resource is absent from `desired`, so
+    // its key gets removed from state) — in shared mode that orphans the
+    // still-live resource: the next compute_diff_with_ownership would
+    // classify it as unmanaged and stop retrying the deletion.
+    //
+    //   - File mode: no per-op concept. The file write is atomic, success
+    //     means the entire desired set is recorded. Use record() with the
+    //     full namespaces scope.
+    //   - Api mode incremental: walk successful_ops; Add/Modify update the
+    //     hash from desired, Delete removes the key. Failed ops are never
+    //     in this list, so their state entries persist untouched.
+    //   - Api mode full_replace: any namespace that completed gets a clean
+    //     rebuild from desired (atomic /restore semantics). Namespaces
+    //     that failed full_replace are NOT in `fully_replaced` and so are
+    //     left alone.
+    match env_config.gateway_mode {
+        GatewayMode::File => {
+            state.record(&desired, &namespaces);
+        }
+        GatewayMode::Api => {
+            for ns in &fully_replaced {
+                state.record_full_replace(ns, &desired);
+            }
+            for op in &successful_ops {
+                state.record_op(op, &desired)?;
+            }
+            state.stamp_last_applied();
+        }
+    }
     state.credential_shard_count = shard_count;
     if let Some(outcome) = &allocation {
         let run_id = std::env::var("GITHUB_RUN_ID").ok();

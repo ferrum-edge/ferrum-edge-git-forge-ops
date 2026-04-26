@@ -163,6 +163,112 @@ impl StateFile {
         self.last_applied_commit = git_rev_parse_head();
     }
 
+    /// Apply a single successful per-resource operation to `resources`.
+    ///
+    /// Use this for partial-failure-safe state updates: cmd_apply iterates
+    /// `ApplyResult::applied_incremental` and calls this for each Op,
+    /// leaving failed-op entries untouched. Critical for shared mode: a
+    /// failed Delete must NOT remove its key from state, or the next run
+    /// classifies the still-live resource as unmanaged and stops retrying
+    /// deletion. Add/Modify look up the latest hash from `desired`; Delete
+    /// removes the key. Out-of-scope entries are never touched here.
+    pub fn record_op(
+        &mut self,
+        op: &crate::apply::AppliedOp,
+        desired: &GatewayConfig,
+    ) -> crate::error::Result<()> {
+        use crate::diff::resource_diff::DiffAction;
+        let key = format!("{}:{}:{}", op.namespace, op.kind, op.id);
+
+        match op.action {
+            DiffAction::Delete => {
+                self.resources.remove(&key);
+            }
+            DiffAction::Add | DiffAction::Modify => {
+                let hash = match op.kind.as_str() {
+                    "Proxy" => desired
+                        .proxies
+                        .iter()
+                        .find(|p| p.namespace == op.namespace && p.id == op.id)
+                        .map(hash_resource),
+                    "Consumer" => desired
+                        .consumers
+                        .iter()
+                        .find(|c| c.namespace == op.namespace && c.id == op.id)
+                        .map(hash_resource),
+                    "Upstream" => desired
+                        .upstreams
+                        .iter()
+                        .find(|u| u.namespace == op.namespace && u.id == op.id)
+                        .map(hash_resource),
+                    "PluginConfig" => desired
+                        .plugin_configs
+                        .iter()
+                        .find(|p| p.namespace == op.namespace && p.id == op.id)
+                        .map(hash_resource),
+                    _ => None,
+                };
+                if let Some(h) = hash {
+                    self.resources.insert(key, h);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop all `resources` entries in `namespace` and rebuild from `desired`.
+    /// Use only after a successful `apply_full_replace` for that namespace —
+    /// /restore is atomic, so on success the namespace's live state is
+    /// authoritative and equals `desired`.
+    pub fn record_full_replace(&mut self, namespace: &str, desired: &GatewayConfig) {
+        self.resources.retain(|key, _| {
+            let ns = key.split_once(':').map(|(n, _)| n).unwrap_or("");
+            ns != namespace
+        });
+        for p in desired.proxies.iter().filter(|p| p.namespace == namespace) {
+            self.resources
+                .insert(format!("{}:Proxy:{}", p.namespace, p.id), hash_resource(p));
+        }
+        for c in desired
+            .consumers
+            .iter()
+            .filter(|c| c.namespace == namespace)
+        {
+            self.resources.insert(
+                format!("{}:Consumer:{}", c.namespace, c.id),
+                hash_resource(c),
+            );
+        }
+        for u in desired
+            .upstreams
+            .iter()
+            .filter(|u| u.namespace == namespace)
+        {
+            self.resources.insert(
+                format!("{}:Upstream:{}", u.namespace, u.id),
+                hash_resource(u),
+            );
+        }
+        for p in desired
+            .plugin_configs
+            .iter()
+            .filter(|p| p.namespace == namespace)
+        {
+            self.resources.insert(
+                format!("{}:PluginConfig:{}", p.namespace, p.id),
+                hash_resource(p),
+            );
+        }
+    }
+
+    /// Stamp last_applied_* metadata. Call after recording per-op or
+    /// full-replace results, so the timestamp reflects the latest run
+    /// regardless of which code path updated `resources`.
+    pub fn stamp_last_applied(&mut self) {
+        self.last_applied_at = Some(chrono::Utc::now().to_rfc3339());
+        self.last_applied_commit = git_rev_parse_head();
+    }
+
     pub fn record_credential(
         &mut self,
         slot: &str,
