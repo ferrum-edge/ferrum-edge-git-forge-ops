@@ -214,6 +214,41 @@ fn allowed_proxy_plugins_flags_disallowed_associations() {
 }
 
 #[test]
+fn allowed_proxy_plugins_flags_unresolved_associations() {
+    let mut p = proxy("p1", BackendProtocol::Https, 30_000, true);
+    p.plugins = vec![PluginAssociation {
+        plugin_config_id: "plugin-other-namespace".to_string(),
+    }];
+
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        plugin_configs: vec![plugin_config(
+            "plugin-other-namespace",
+            "request_transformer",
+            "team-alpha",
+        )],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_plugin_names: vec!["request_transformer".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "allowed_proxy_plugins");
+    assert!(findings[0].message.contains("could not be resolved"));
+    assert!(findings[0].message.contains("plugin-other-namespace"));
+}
+
+#[test]
 fn allowed_backend_domains_checks_proxies_and_upstream_targets() {
     let mut exact_proxy = proxy("exact", BackendProtocol::Https, 30_000, true);
     exact_proxy.backend_host = "API.Internal.Example.COM.".to_string();
@@ -253,9 +288,45 @@ fn allowed_backend_domains_checks_proxies_and_upstream_targets() {
     assert!(findings
         .iter()
         .any(|f| f.kind == "Proxy" && f.id == "disallowed-proxy"));
-    assert!(findings
+    assert!(findings.iter().any(|f| f.kind == "Upstream"
+        && f.id == "api-pool"
+        && f.message.contains("db.other.example")));
+    assert!(!findings
         .iter()
-        .any(|f| f.kind == "Upstream" && f.id == "api-pool"));
+        .any(|f| f.message.contains("blue.svc.cluster.local")));
+    assert!(!findings
+        .iter()
+        .any(|f| f.message.contains("deep.team.prod.example.com")));
+}
+
+#[test]
+fn allowed_backend_domains_skips_proxy_backend_host_when_upstream_is_used() {
+    let mut p = proxy("upstream-backed", BackendProtocol::Https, 30_000, true);
+    p.backend_host = "placeholder.invalid".to_string();
+    p.upstream_id = Some("api-pool".to_string());
+
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        upstreams: vec![upstream("api-pool", vec![target("blue.svc.cluster.local")])],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert!(
+        findings.is_empty(),
+        "upstream-backed proxy backend_host should not be checked: {findings:?}"
+    );
 }
 
 #[test]
@@ -281,6 +352,29 @@ fn allowed_backend_domains_wildcard_does_not_match_root_domain() {
     let findings = evaluate_policies(&cfg, &policies);
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].rule_id, "allowed_backend_domains");
+}
+
+#[test]
+fn allowed_backend_domains_matches_ip_literals_exactly() {
+    let mut p = proxy("loopback", BackendProtocol::Https, 30_000, true);
+    p.backend_host = "[::1]".to_string();
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["[::1]".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(evaluate_policies(&cfg, &policies).is_empty());
 }
 
 #[test]

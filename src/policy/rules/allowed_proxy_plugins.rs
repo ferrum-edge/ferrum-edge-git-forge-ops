@@ -31,6 +31,7 @@ impl PolicyCheck for AllowedProxyPluginsRule {
             .iter()
             .map(|s| s.to_ascii_lowercase())
             .collect();
+        let allowed_for_message = allowed.join(", ");
         let plugins_by_key: HashMap<(&str, &str), &str> = cfg
             .plugin_configs
             .iter()
@@ -47,6 +48,22 @@ impl PolicyCheck for AllowedProxyPluginsRule {
                 let Some(plugin_name) = plugins_by_key
                     .get(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
                 else {
+                    findings.push(PolicyFinding {
+                        rule_id: self.rule_id().to_string(),
+                        severity: self.config.severity,
+                        kind: "Proxy".to_string(),
+                        id: proxy.id.clone(),
+                        namespace: proxy.namespace.clone(),
+                        message: format!(
+                            "plugin {} could not be resolved in namespace {}",
+                            assoc.plugin_config_id, proxy.namespace
+                        ),
+                        remediation: Some(format!(
+                            "Reference an existing plugin config in namespace {} whose plugin_name is one of: {allowed_for_message}",
+                            proxy.namespace
+                        )),
+                        overridden_by: None,
+                    });
                     continue;
                 };
                 let actual = plugin_name.to_ascii_lowercase();
@@ -63,11 +80,11 @@ impl PolicyCheck for AllowedProxyPluginsRule {
                     message: format!(
                         "plugin {} uses plugin_name={plugin_name}, which is not in the allowed list ({})",
                         assoc.plugin_config_id,
-                        allowed.join(", ")
+                        allowed_for_message
                     ),
                     remediation: Some(format!(
                         "Attach only proxy plugins with plugin_name set to one of: {}",
-                        allowed.join(", ")
+                        allowed_for_message
                     )),
                     overridden_by: None,
                 });

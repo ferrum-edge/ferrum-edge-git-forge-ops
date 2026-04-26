@@ -51,8 +51,10 @@ policies:
       - rate_limiting
 
   # Restrict direct proxy backends and upstream target hosts by domain.
+  # Proxies with `upstream_id` are checked through their upstream targets.
   # Exact FQDNs match one host; wildcard entries like `*.svc.cluster.local`
   # match any subdomain depth under that suffix.
+  # IP literals must be listed exactly; wildcard entries only apply to DNS names.
   allowed_backend_domains:
     enabled: false
     severity: error

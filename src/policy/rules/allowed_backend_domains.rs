@@ -16,7 +16,6 @@ impl AllowedBackendDomainsRule {
     }
 
     fn domain_matches(host: &str, pattern: &str) -> bool {
-        let pattern = Self::normalize_domain(pattern);
         if host.is_empty() || pattern.is_empty() {
             return false;
         }
@@ -24,27 +23,19 @@ impl AllowedBackendDomainsRule {
             return true;
         }
         if let Some(suffix) = pattern.strip_prefix("*.") {
-            return host != suffix && host.ends_with(&format!(".{suffix}"));
+            return host
+                .strip_suffix(suffix)
+                .map(|prefix| prefix.ends_with('.'))
+                .unwrap_or(false);
         }
         host == pattern
     }
 
-    fn is_allowed(&self, host: &str) -> bool {
+    fn is_allowed(host: &str, allowed_domains: &[String]) -> bool {
         let host = Self::normalize_domain(host);
-        self.config
-            .allowed_domains
+        allowed_domains
             .iter()
             .any(|pattern| Self::domain_matches(&host, pattern))
-    }
-
-    fn allowed_domains_for_message(&self) -> String {
-        self.config
-            .allowed_domains
-            .iter()
-            .map(|domain| Self::normalize_domain(domain))
-            .filter(|domain| !domain.is_empty())
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 }
 
@@ -59,10 +50,26 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             return findings;
         }
 
-        let allowed = self.allowed_domains_for_message();
+        let allowed_domains: Vec<String> = self
+            .config
+            .allowed_domains
+            .iter()
+            .map(|domain| Self::normalize_domain(domain))
+            .filter(|domain| !domain.is_empty())
+            .collect();
+        if allowed_domains.is_empty() {
+            return findings;
+        }
+        let allowed = allowed_domains.join(", ");
 
         for proxy in &cfg.proxies {
-            if !self.is_allowed(&proxy.backend_host) {
+            // When a proxy delegates to an upstream, backend_host is schema
+            // filler rather than the routed backend. The upstream target loop
+            // below enforces the actual destinations.
+            if proxy.upstream_id.is_some() {
+                continue;
+            }
+            if !Self::is_allowed(&proxy.backend_host, &allowed_domains) {
                 findings.push(PolicyFinding {
                     rule_id: self.rule_id().to_string(),
                     severity: self.config.severity,
@@ -83,7 +90,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
 
         for upstream in &cfg.upstreams {
             for target in &upstream.targets {
-                if self.is_allowed(&target.host) {
+                if Self::is_allowed(&target.host, &allowed_domains) {
                     continue;
                 }
                 findings.push(PolicyFinding {
