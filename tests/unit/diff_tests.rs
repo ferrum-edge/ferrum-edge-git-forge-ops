@@ -302,6 +302,66 @@ fn security_passes_template_credential() {
 }
 
 #[test]
+fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
+    // Regression guard: audit_security classifies any string that doesn't
+    // start with `${` as a literal credential. If the caller (cmd_plan,
+    // cmd_review) runs audit AFTER resolve_secrets, legitimate placeholders
+    // have been replaced with real values and the auditor spuriously flags
+    // them as literal credentials — drowning real findings in noise.
+    //
+    // This test verifies the invariant by simulating both orderings.
+
+    // Pre-resolve: placeholder in the config. Audit sees a ${...} string.
+    let mut creds_pre = std::collections::HashMap::new();
+    creds_pre.insert(
+        "keyauth".to_string(),
+        serde_json::json!({"key": "${gh-env-secret:alloc=require}"}),
+    );
+    let config_pre = GatewayConfig {
+        consumers: vec![Consumer {
+            credentials: creds_pre,
+            ..make_consumer("c1", "alice")
+        }],
+        ..GatewayConfig::default()
+    };
+    let findings_pre = audit_security(&config_pre);
+    let literal_pre: Vec<_> = findings_pre
+        .iter()
+        .filter(|f| f.message.contains("Literal credential"))
+        .collect();
+    assert!(
+        literal_pre.is_empty(),
+        "pre-resolve: placeholder must not be flagged as literal"
+    );
+
+    // Post-resolve (simulated): the placeholder has been replaced with a real
+    // value. Audit now incorrectly sees a "literal" credential. This is the
+    // behavior we want to AVOID by auditing before resolve.
+    let mut creds_post = std::collections::HashMap::new();
+    creds_post.insert(
+        "keyauth".to_string(),
+        serde_json::json!({"key": "real-random-value"}),
+    );
+    let config_post = GatewayConfig {
+        consumers: vec![Consumer {
+            credentials: creds_post,
+            ..make_consumer("c1", "alice")
+        }],
+        ..GatewayConfig::default()
+    };
+    let findings_post = audit_security(&config_post);
+    let literal_post: Vec<_> = findings_post
+        .iter()
+        .filter(|f| f.message.contains("Literal credential"))
+        .collect();
+    assert_eq!(
+        literal_post.len(),
+        1,
+        "post-resolve: resolved value IS flagged as literal — this is why cmd_plan/cmd_review must audit before resolve"
+    );
+}
+
+#[test]
 fn security_detects_tls_verify_disabled() {
     let mut proxy = make_proxy("p1", "/api", "localhost");
     proxy.backend_tls_verify_server_cert = false;

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::config::GatewayConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +25,38 @@ pub struct ResourceDiff {
     pub details: Vec<FieldChange>,
 }
 
+#[derive(Debug, Clone)]
+pub struct UnmanagedResource {
+    pub kind: String,
+    pub id: String,
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiffResult {
+    pub diffs: Vec<ResourceDiff>,
+    pub unmanaged: Vec<UnmanagedResource>,
+}
+
 pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<ResourceDiff> {
-    let mut diffs = Vec::new();
+    compute_diff_with_ownership(desired, actual, None).diffs
+}
+
+/// Compute a diff, honoring ownership constraints.
+///
+/// When `previously_managed` is `Some`, resources present in `actual` but not in
+/// `previously_managed` (and not in `desired`) are classified as *unmanaged*
+/// rather than as deletions. This models `shared` ownership: we only touch what
+/// this repo has previously applied.
+///
+/// When `previously_managed` is `None`, all resources in `actual` not in
+/// `desired` are emitted as `Delete` actions (the classic `exclusive` mode).
+pub fn compute_diff_with_ownership(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    previously_managed: Option<&HashSet<String>>,
+) -> DiffResult {
+    let mut result = DiffResult::default();
 
     diff_collection(
         &desired.proxies,
@@ -32,7 +64,8 @@ pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<Reso
         "Proxy",
         |p| p.id.clone(),
         |p| p.namespace.clone(),
-        &mut diffs,
+        previously_managed,
+        &mut result,
     );
     diff_collection(
         &desired.consumers,
@@ -40,7 +73,8 @@ pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<Reso
         "Consumer",
         |c| c.id.clone(),
         |c| c.namespace.clone(),
-        &mut diffs,
+        previously_managed,
+        &mut result,
     );
     diff_collection(
         &desired.upstreams,
@@ -48,7 +82,8 @@ pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<Reso
         "Upstream",
         |u| u.id.clone(),
         |u| u.namespace.clone(),
-        &mut diffs,
+        previously_managed,
+        &mut result,
     );
     diff_collection(
         &desired.plugin_configs,
@@ -56,19 +91,26 @@ pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<Reso
         "PluginConfig",
         |p| p.id.clone(),
         |p| p.namespace.clone(),
-        &mut diffs,
+        previously_managed,
+        &mut result,
     );
 
-    diffs
+    result
 }
 
+pub fn state_key(namespace: &str, kind: &str, id: &str) -> String {
+    format!("{namespace}:{kind}:{id}")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn diff_collection<T: serde::Serialize>(
     desired: &[T],
     actual: &[T],
     kind: &str,
     id_fn: impl Fn(&T) -> String,
     ns_fn: impl Fn(&T) -> String,
-    diffs: &mut Vec<ResourceDiff>,
+    previously_managed: Option<&HashSet<String>>,
+    result: &mut DiffResult,
 ) {
     let desired_map: std::collections::HashMap<(String, String), &T> =
         desired.iter().map(|r| ((ns_fn(r), id_fn(r)), r)).collect();
@@ -80,7 +122,7 @@ fn diff_collection<T: serde::Serialize>(
             Some(actual_res) => {
                 let details = compare_fields(desired_res, actual_res);
                 if !details.is_empty() {
-                    diffs.push(ResourceDiff {
+                    result.diffs.push(ResourceDiff {
                         action: DiffAction::Modify,
                         kind: kind.to_string(),
                         id: id.clone(),
@@ -90,7 +132,7 @@ fn diff_collection<T: serde::Serialize>(
                 }
             }
             None => {
-                diffs.push(ResourceDiff {
+                result.diffs.push(ResourceDiff {
                     action: DiffAction::Add,
                     kind: kind.to_string(),
                     id: id.clone(),
@@ -102,14 +144,42 @@ fn diff_collection<T: serde::Serialize>(
     }
 
     for (namespace, id) in actual_map.keys() {
-        if !desired_map.contains_key(&(namespace.clone(), id.clone())) {
-            diffs.push(ResourceDiff {
-                action: DiffAction::Delete,
-                kind: kind.to_string(),
-                id: id.clone(),
-                namespace: namespace.clone(),
-                details: Vec::new(),
-            });
+        if desired_map.contains_key(&(namespace.clone(), id.clone())) {
+            continue;
+        }
+
+        match previously_managed {
+            Some(managed) => {
+                let key = state_key(namespace, kind, id);
+                if managed.contains(&key) {
+                    // We previously applied this resource, repo no longer declares
+                    // it → delete.
+                    result.diffs.push(ResourceDiff {
+                        action: DiffAction::Delete,
+                        kind: kind.to_string(),
+                        id: id.clone(),
+                        namespace: namespace.clone(),
+                        details: Vec::new(),
+                    });
+                } else {
+                    // Admin-added, never managed by us → leave alone.
+                    result.unmanaged.push(UnmanagedResource {
+                        kind: kind.to_string(),
+                        id: id.clone(),
+                        namespace: namespace.clone(),
+                    });
+                }
+            }
+            None => {
+                // Exclusive mode: everything not in desired gets deleted.
+                result.diffs.push(ResourceDiff {
+                    action: DiffAction::Delete,
+                    kind: kind.to_string(),
+                    id: id.clone(),
+                    namespace: namespace.clone(),
+                    details: Vec::new(),
+                });
+            }
         }
     }
 }

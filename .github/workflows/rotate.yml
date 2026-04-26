@@ -1,0 +1,149 @@
+name: GitForgeOps Rotate Credential
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (name from .gitforgeops/config.yaml)
+        required: true
+        type: string
+      consumer:
+        description: Consumer id
+        required: true
+        type: string
+      credential:
+        description: Credential key. Top-level key (e.g. `api_key`) or `/`-separated path into nested object credentials (e.g. `basic_auth/password`).
+        required: true
+        type: string
+      namespace:
+        description: Namespace (defaults to `ferrum`)
+        required: false
+        type: string
+        default: ferrum
+
+# Rotation commits state back to main; needs write on contents.
+permissions:
+  contents: write
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: ferrum-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Load credential bundles
+        # File-path routing around OS env-block size limits. See
+        # apply-on-merge.yml for the full rationale.
+        run: |
+          set -euo pipefail
+          all_secrets=$(mktemp)
+          trap 'rm -f "$all_secrets"' EXIT
+          cat > "$all_secrets" <<'SECRETS_EOF'
+          ${{ toJSON(secrets) }}
+          SECRETS_EOF
+          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-$$.json"
+          python3 - "$all_secrets" "$creds_file" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              try:
+                  data = json.load(f)
+              except json.JSONDecodeError:
+                  data = {}
+          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
+          with open(sys.argv[2], "w") as out:
+              json.dump(bundles, out)
+          PY
+          chmod 600 "$creds_file"
+          echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
+
+      - name: Rotate
+        # Rotate now pushes the updated consumer to the live gateway, so it
+        # needs the full gateway-connection secret set that apply-on-merge
+        # has. Without the TLS material, rotate fails to connect in envs
+        # that require a custom CA or mTLS, even though apply-on-merge and
+        # drift-check are configured correctly for the same env.
+        #
+        # Route workflow_dispatch inputs through env vars and reference
+        # $INPUT_* shell variables — never interpolate
+        # `${{ inputs.* }}` directly into the run block. Inputs are user-
+        # controlled and can contain quote/command-substitution sequences
+        # that would escape a double-quoted `"${{ inputs.X }}"` arg.
+        # FERRUM_GATEWAY_MODE set explicitly so the binary reads it from
+        # the process env, not just the `vars.*` gate context.
+        env:
+          FERRUM_ENV: ${{ inputs.environment }}
+          # Pass the repo's actual gateway mode through. Hardcoding `api`
+          # here meant a file-mode repo's rotate would slip past the
+          # binary's mode preflight, write the GitHub Env Secret, and only
+          # fail later when the Admin API config was missing — leaving
+          # the store mutated with no corresponding gateway push path.
+          FERRUM_GATEWAY_MODE: ${{ vars.FERRUM_GATEWAY_MODE || 'api' }}
+          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
+          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+          FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
+          FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          INPUT_CONSUMER: ${{ inputs.consumer }}
+          INPUT_CREDENTIAL: ${{ inputs.credential }}
+          INPUT_NAMESPACE: ${{ inputs.namespace }}
+          INPUT_RECIPIENT: ${{ github.actor }}
+        run: |
+          gitforgeops rotate \
+            --consumer "$INPUT_CONSUMER" \
+            --credential "$INPUT_CREDENTIAL" \
+            --namespace "$INPUT_NAMESPACE" \
+            --recipient "$INPUT_RECIPIENT"
+
+      - name: Commit state update
+        # Rotation metadata (last_rotated, sha256_prefix, delivered_to) lives
+        # in .state/<env>.json. If we can't persist the update, a stale state
+        # misleads the next drift check — fail the job on push failure, and
+        # retry on rejection (possible if an apply landed concurrently).
+        # Same shell-injection protection as the Rotate step: route inputs
+        # through env vars.
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_CONSUMER: ${{ inputs.consumer }}
+          INPUT_CREDENTIAL: ${{ inputs.credential }}
+        run: |
+          set -euo pipefail
+          git config user.name "gitforgeops[bot]"
+          git config user.email "gitforgeops[bot]@users.noreply.github.com"
+          mkdir -p .state
+          git add ".state/${INPUT_ENVIRONMENT}.json" 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(gitforgeops): rotate ${INPUT_CONSUMER}.${INPUT_CREDENTIAL} in ${INPUT_ENVIRONMENT} [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then exit 0; fi
+            echo "Push rejected on attempt $attempt; rebasing..."
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+            sleep $((attempt * 2))
+          done
+          echo "ERROR: failed to push rotation state after 5 attempts" >&2
+          exit 1

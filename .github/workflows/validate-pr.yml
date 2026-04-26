@@ -5,33 +5,58 @@ on:
     paths:
       - 'resources/**'
       - 'overlays/**'
+      - '.gitforgeops/**'
+
+# `review` posts a structured PR comment via the GitHub API; that requires
+# `pull-requests: write` on the GITHUB_TOKEN. `contents: read` is the default
+# but is repeated here for clarity (needed for checkout).
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
-  review:
-    # Only run the container-based job when an image tag is explicitly
-    # configured. Forks that haven't set it fall through to
-    # `review-native` and pay the native-build cost instead of failing
-    # on `docker pull`.
-    #
-    # The image defaults to the upstream-published
-    # `ferrumedge/ferrum-edge-git-forge-ops`; override
-    # `vars.GITFORGEOPS_IMAGE` to point at your own fork's image.
-    if: vars.GITFORGEOPS_IMAGE_TAG != ''
+  list-envs:
     runs-on: ubuntu-latest
-    container:
-      image: ${{ vars.GITFORGEOPS_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}:${{ vars.GITFORGEOPS_IMAGE_TAG }}
+    outputs:
+      envs: ${{ steps.list.outputs.envs }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate
-        run: gitforgeops validate --format github-annotations
-        env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-  review-native:
-    if: vars.GITFORGEOPS_IMAGE_TAG == ''
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Enumerate environments
+        id: list
+        run: |
+          envs=$(gitforgeops envs --format json)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: list-envs
+    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.list-envs.outputs.envs) }}
+    # Bind the job to the matched GitHub Environment so env-scoped secrets
+    # (FERRUM_GATEWAY_URL, FERRUM_ADMIN_JWT_SECRET, TLS bundle) resolve in
+    # the Review step. Matches drift-check.yml. Fork PRs still get empty
+    # secrets per GitHub's pull_request rules and fall back to static-only
+    # review output.
+    environment: ${{ matrix.environment }}
     steps:
       - uses: actions/checkout@v4
 
@@ -59,10 +84,43 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install gitforgeops
-        run: cargo install --path .
+        run: cargo install --path . --locked
 
+      # Pass env via FERRUM_ENV rather than interpolating `matrix.environment`
+      # into the shell command. Binary validates the name against a strict
+      # allowlist via ResolvedEnv::validate (ASCII alphanum + `-` + `_`), but
+      # avoiding shell interpolation of untrusted values is the
+      # defense-in-depth baseline.
       - name: Validate
-        run: gitforgeops validate --format github-annotations
         env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+          FERRUM_ENV: ${{ matrix.environment }}
+        run: gitforgeops validate --format github-annotations
+
+      # `always()` so the structured comment still posts when `Validate`
+      # fails — that is exactly when contributors need it most (consolidated
+      # errors + annotations surfaced in one place). The job's overall status
+      # still reflects the earlier Validate failure, so the PR check remains
+      # red. Without this, a schema error in the PR skips the comment step
+      # and the author only sees a generic "validate exited 1" in the logs.
+      #
+      # Gateway secrets are passed so cmd_review can construct an
+      # AdminClient and include live-vs-desired diff, unmanaged-resource
+      # listing, and breaking-change detection in the PR comment. Without
+      # them, review degrades to "Live gateway comparison skipped" and PRs
+      # only get static checks. For fork PRs these secrets resolve to
+      # empty (GitHub blocks secret access from forks on `pull_request`
+      # events), and the existing graceful fallback in cmd_review still
+      # produces a static-only comment — same as before this change.
+      - name: Review
+        if: always() && github.event.pull_request.number
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITFORGEOPS_PR_NUMBER: ${{ github.event.pull_request.number }}
+          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
+          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+          FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
+          FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+        run: gitforgeops review --pr "$GITFORGEOPS_PR_NUMBER"

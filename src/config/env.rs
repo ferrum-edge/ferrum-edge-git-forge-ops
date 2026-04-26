@@ -1,7 +1,10 @@
 use std::env;
 
+use serde::{Deserialize, Serialize};
+
 /// Gateway interaction mode.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GatewayMode {
     /// Push config via the admin REST API.
     #[default]
@@ -11,12 +14,24 @@ pub enum GatewayMode {
 }
 
 /// Strategy for applying configuration changes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApplyStrategy {
     /// Only apply changed resources (diff-based).
     #[default]
     Incremental,
-    /// Replace entire config atomically.
+    /// Replace an entire namespace atomically via `/restore?confirm=true`.
+    ///
+    /// **Atomicity scope is per-namespace, not environment-wide.** When an
+    /// apply targets multiple namespaces (exclusive mode with an
+    /// `ownership.namespaces` list longer than one), each namespace is
+    /// restored in its own API call. A failure on the Nth namespace
+    /// leaves namespaces 0..N already replaced. The apply result
+    /// enumerates which namespaces succeeded and which failed (rather
+    /// than bailing on the first error and hiding later namespaces), but
+    /// operators must still manually reconcile any partial state. For
+    /// strict environment-wide atomicity, scope `full_replace` to a
+    /// single namespace or use `incremental`.
     FullReplace,
 }
 
@@ -35,6 +50,23 @@ pub struct EnvConfig {
     pub apply_strategy: ApplyStrategy,
     /// Overlay name to apply (e.g. `production`, `staging`).
     pub overlay: Option<String>,
+    /// Selected environment name (from repo config). Takes precedence over `overlay` if set.
+    pub env_name: Option<String>,
+    /// GitHub repository slug in `owner/repo` form (used for policy/secret APIs).
+    pub github_repository: Option<String>,
+    /// Token used for GitHub API calls (policy overrides, PR comments, author lookup).
+    pub github_token: Option<String>,
+    /// Token used to write GitHub Environment Secrets (provisioner).
+    pub github_provisioner_token: Option<String>,
+    /// JSON-encoded credential bundle map, loaded from workflow secrets.
+    /// Prefer `creds_bundle_json_file` for large bundles — a multi-MB env
+    /// var will collide with OS environment-block limits.
+    pub creds_bundle_json: Option<String>,
+    /// Path to a file containing the same JSON as `creds_bundle_json`. When
+    /// set, the binary reads from disk and this takes precedence over the
+    /// inline `creds_bundle_json` — routes the bundle around env-var size
+    /// limits at scale.
+    pub creds_bundle_json_file: Option<String>,
     /// Output path for assembled file (file mode).
     pub file_output_path: String,
     /// Path to the `ferrum-edge` binary for validation.
@@ -76,6 +108,12 @@ pub struct EnvConfig {
 /// | `FERRUM_GATEWAY_MODE`        | `gateway_mode`     | `api`                            |
 /// | `FERRUM_APPLY_STRATEGY`      | `apply_strategy`   | `incremental`                    |
 /// | `FERRUM_OVERLAY`             | `overlay`          | `None`                           |
+/// | `FERRUM_ENV`                 | `env_name`         | `None`                           |
+/// | `GITHUB_REPOSITORY`          | `github_repository`| `None`                           |
+/// | `GITHUB_TOKEN`               | `github_token`     | `None`                           |
+/// | `FERRUM_GH_PROVISIONER_TOKEN`| `github_provisioner_token` | `None`                   |
+/// | `FERRUM_CREDS_JSON`          | `creds_bundle_json`| `None`                           |
+/// | `FERRUM_CREDS_JSON_FILE`     | `creds_bundle_json_file` | `None` (path, preferred at scale) |
 /// | `FERRUM_FILE_OUTPUT_PATH`    | `file_output_path` | `./assembled/resources.yaml`     |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
@@ -109,6 +147,12 @@ pub fn load_env_config() -> EnvConfig {
             _ => ApplyStrategy::Incremental,
         },
         overlay: env::var("FERRUM_OVERLAY").ok(),
+        env_name: env::var("FERRUM_ENV").ok(),
+        github_repository: env::var("GITHUB_REPOSITORY").ok(),
+        github_token: env::var("GITHUB_TOKEN").ok(),
+        github_provisioner_token: env::var("FERRUM_GH_PROVISIONER_TOKEN").ok(),
+        creds_bundle_json: env::var("FERRUM_CREDS_JSON").ok(),
+        creds_bundle_json_file: env::var("FERRUM_CREDS_JSON_FILE").ok(),
         file_output_path: env::var("FERRUM_FILE_OUTPUT_PATH")
             .unwrap_or_else(|_| "./assembled/resources.yaml".to_string()),
         edge_binary_path: env::var("FERRUM_EDGE_BINARY_PATH")

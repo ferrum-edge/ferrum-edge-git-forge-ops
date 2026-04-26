@@ -26,6 +26,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+crypto_box = { version = "0.9", features = ["seal"] }
+rand = "0.8"
+age = { version = "0.10", features = ["ssh", "armor"] }
+ssh-key = { version = "0.6", features = ["ed25519"] }
 
 [dev-dependencies]
 tempfile = "3"

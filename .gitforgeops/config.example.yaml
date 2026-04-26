@@ -1,0 +1,40 @@
+# gitforgeops repo configuration
+#
+# Rename to `.gitforgeops/config.yaml` to enable multi-environment support.
+# When present, `gitforgeops` reads environment names, overlays, apply
+# strategies, and ownership modes from this file. Deployment targeting
+# (gateway URL, JWT secret, TLS certs) lives in GitHub Environment Secrets,
+# *not* in this file — each env name here maps by-convention to a GitHub
+# Environment of the same name.
+
+version: 1
+
+environments:
+  staging:
+    overlay: staging            # → overlays/staging/
+    apply_strategy: incremental
+    ownership:
+      mode: shared              # repo only manages what it has declared
+      drift_report: true        # surface admin-added resources in PR review
+      drift_alert_on:
+        managed_modified: true
+        managed_deleted: true
+        unmanaged_added: false  # don't alert on ops-team experiments
+
+  production:
+    overlay: production
+    apply_strategy: full_replace
+    ownership:
+      mode: exclusive           # repo is the source of truth
+      namespaces: [ferrum]      # scope of exclusivity (required for exclusive)
+      drift_report: true
+      large_prune_threshold_percent: 25
+
+  sandbox:
+    overlay: sandbox
+    apply_strategy: incremental
+    ownership:
+      mode: shared
+      drift_report: false       # wild-west env; don't flood review comments
+
+default_environment: staging

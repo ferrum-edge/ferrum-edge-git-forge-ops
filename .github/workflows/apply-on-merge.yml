@@ -6,10 +6,60 @@ on:
     paths:
       - 'resources/**'
       - 'overlays/**'
+      - '.gitforgeops/**'
+
+# `apply` commits state updates (and, in file mode, the assembled placeholder
+# YAML) back to main, and queries the GitHub API to resolve the PR that
+# produced this merge (for policy-override lookups). `write` on
+# pull-requests is required so `surface_delivered_credentials` can POST
+# the age-encrypted credential blob back to the merged PR for the author
+# — with `read` the POST is rejected and delivery falls back to stdout
+# (log-only), which the intended recipient is very likely to miss.
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  apply:
+  list-envs:
     runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.list.outputs.envs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Enumerate environments
+        id: list
+        run: |
+          envs=$(gitforgeops envs --format json)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+
+  apply:
+    needs: list-envs
+    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.list-envs.outputs.envs) }}
+    environment: ${{ matrix.environment }}
+    concurrency:
+      group: ferrum-apply-${{ matrix.environment }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -37,41 +87,175 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install gitforgeops
-        run: cargo install --path .
+        run: cargo install --path . --locked
+
+      - name: Load credential bundles
+        id: load-bundles
+        # Write the filtered FERRUM_CREDS_BUNDLE* payload to a file on the
+        # runner and pass the PATH to the binary via FERRUM_CREDS_JSON_FILE.
+        # The earlier env-var pipeline hit OS env-block limits at scale
+        # (100 shards × ~48 KB = multi-MB) — $GITHUB_ENV materializes into
+        # the next step's process environment, where kernel caps would
+        # truncate the payload. File path has no practical size bound.
+        # Kept under $RUNNER_TEMP so GitHub Actions cleans it up when the
+        # runner is recycled.
+        run: |
+          set -euo pipefail
+          all_secrets=$(mktemp)
+          trap 'rm -f "$all_secrets"' EXIT
+          cat > "$all_secrets" <<'SECRETS_EOF'
+          ${{ toJSON(secrets) }}
+          SECRETS_EOF
+
+          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-$$.json"
+          python3 - "$all_secrets" "$creds_file" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              try:
+                  data = json.load(f)
+              except json.JSONDecodeError:
+                  data = {}
+          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
+          with open(sys.argv[2], "w") as out:
+              json.dump(bundles, out)
+          PY
+          chmod 600 "$creds_file"
+          echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Validate
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
         run: gitforgeops validate
-        env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
 
-      # --- API mode: push to gateway ---
-      - name: Apply to gateway (API mode)
-        if: vars.FERRUM_GATEWAY_MODE != 'file'
-        run: gitforgeops apply --auto-approve
+      # Map the merge commit back to the PR that produced it. The binary uses
+      # this for (a) policy-override label/permission lookups and (b) routing
+      # age-encrypted credential delivery to the PR author. Using
+      # ${{ github.actor }} for delivery would target the merger (or a bot),
+      # not the contributor who actually requested the credential slot.
+      - name: Derive PR metadata from merge commit
+        id: pr
         env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          info=$(gh api "/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0] // {}')
+          pr=$(echo "$info" | jq -r '.number // ""')
+          author=$(echo "$info" | jq -r '.user.login // ""')
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+          echo "author=$author" >> "$GITHUB_OUTPUT"
+
+      - name: Apply
+        if: vars.FERRUM_GATEWAY_MODE != 'file'
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
+          # The workflow-level `if:` only gates whether this step runs; it
+          # does NOT propagate FERRUM_GATEWAY_MODE into the process env.
+          # Without this line, `gitforgeops apply` reads the unset var and
+          # falls back to its default (api). Default happens to be `api`
+          # so the non-file arm works by accident, but we make it explicit
+          # for symmetry with the file-mode step.
+          FERRUM_GATEWAY_MODE: api
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
-          FERRUM_APPLY_STRATEGY: ${{ vars.FERRUM_APPLY_STRATEGY }}
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          # Delivery recipient: prefer the PR author (the contributor who
+          # added the placeholder); fall back to the pusher only when no PR
+          # is associated with this commit (e.g. a direct push to main).
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author || github.actor }}
+          GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gitforgeops apply --auto-approve
 
-      # --- File mode: assemble flat file and commit to main ---
-      - name: Assemble config (file mode)
+      # File mode: `gitforgeops apply` in file mode writes the placeholder-
+      # preserving YAML to disk AND runs the credential allocator (so
+      # alloc=generate/rotate slots get real values in the GitHub Env
+      # Secret, deliveries go out, and state is updated). Calling plain
+      # `export` here would skip allocation and state tracking, leaving
+      # slots permanently pending and breaking later materialization.
+      # To pull the fully-populated YAML (credentials inlined), admins run
+      # the separate `materialize-file.yml` workflow which produces an
+      # age-encrypted artifact.
+      - name: Apply (file mode)
         if: vars.FERRUM_GATEWAY_MODE == 'file'
-        run: gitforgeops export --output assembled/resources.yaml
         env:
-          FERRUM_OVERLAY: ${{ vars.FERRUM_OVERLAY }}
-          FERRUM_NAMESPACE: ${{ vars.FERRUM_NAMESPACE }}
+          FERRUM_ENV: ${{ matrix.environment }}
+          # `vars.FERRUM_GATEWAY_MODE` gates expression evaluation, not the
+          # process environment. Without this explicit export the binary
+          # reads an unset FERRUM_GATEWAY_MODE, defaults to api, and tries
+          # to push to a gateway — typically failing on missing URL/JWT
+          # secrets. Must set to `file` here so apply takes the file-mode
+          # branch.
+          FERRUM_GATEWAY_MODE: file
+          # Must match the path staged by the commit step below. Without
+          # this override, apply writes to the default
+          # ./assembled/resources.yaml and the per-env staged path doesn't
+          # exist, so placeholder-assembly changes never get committed.
+          FERRUM_FILE_OUTPUT_PATH: assembled/${{ matrix.environment }}.yaml
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author || github.actor }}
+          GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gitforgeops apply --auto-approve
 
-      - name: Commit assembled config (file mode)
-        if: vars.FERRUM_GATEWAY_MODE == 'file'
+      - name: Commit state + assembled (if changed)
+        # Run on partial-failure paths too: cmd_apply persists state for the
+        # successful portion of an apply BEFORE returning the deferred
+        # error, so the .state/<env>.json on disk reflects what actually
+        # landed even when the overall command exits non-zero. Default
+        # `if: success()` would skip this step on partial failure and the
+        # next shared-mode run would lose managed tracking for resources
+        # that did change — failed-Delete keys would also stay flagged
+        # only in memory and lose their retry signal. `!cancelled()` runs
+        # on success and failure but still respects job cancellation.
+        #
+        # Persisting state is load-bearing: shared-mode diffs, credential shard
+        # counts, and rotation metadata all live in .state/<env>.json. A silent
+        # push failure would leave the next run reading stale state while
+        # reporting success, so we fail the job if we can't push.
+        #
+        # When the matrix runs multiple envs in parallel and they all try to
+        # push to main, contention is normal — retry with rebase on rejection.
+        if: ${{ !cancelled() }}
         run: |
+          set -euo pipefail
           git config user.name "gitforgeops[bot]"
           git config user.email "gitforgeops[bot]@users.noreply.github.com"
-          git add assembled/resources.yaml
-          git diff --cached --quiet || git commit -m "chore: regenerate assembled config [skip ci]"
-          git push
+
+          # Stage only the paths this job owns so we don't accidentally pick up
+          # anything else that landed in the workdir.
+          mkdir -p .state assembled
+          git add ".state/${{ matrix.environment }}.json" 2>/dev/null || true
+          git add "assembled/${{ matrix.environment }}.yaml" 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(gitforgeops): state update for ${{ matrix.environment }} [skip ci]"
+
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed state on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt; fetching + rebasing..."
+            git fetch origin main
+            # Rebase preserves the single state commit on top of whatever
+            # other envs pushed in the meantime. Each env's state file is
+            # independent so there's no real conflict to resolve — but abort
+            # cleanly if one somehow surfaces.
+            git rebase origin/main || { git rebase --abort; echo "Rebase failed" >&2; exit 1; }
+            sleep $((attempt * 2))
+          done
+
+          echo "ERROR: failed to push state for ${{ matrix.environment }} after 5 attempts" >&2
+          exit 1

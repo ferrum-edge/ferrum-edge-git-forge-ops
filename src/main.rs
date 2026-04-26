@@ -1,5 +1,6 @@
 mod cli;
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process;
@@ -7,30 +8,77 @@ use std::process;
 use clap::Parser;
 
 use gitforgeops::apply;
-use gitforgeops::config::{self, GatewayConfig, GatewayMode};
+use gitforgeops::config::{
+    self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
+    ResolvedEnv,
+};
 use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
+use gitforgeops::policy;
 use gitforgeops::review;
+use gitforgeops::secrets;
 use gitforgeops::state::StateFile;
 use gitforgeops::validate;
 
 #[tokio::main]
 async fn main() {
     let cli = cli::Cli::parse();
+    let explicit_env = cli.env.clone();
 
     let result = match cli.command {
-        cli::Commands::Validate { format } => cmd_validate(&format),
-        cli::Commands::Export { output } => cmd_export(output.as_deref()),
-        cli::Commands::Diff { exit_on_drift } => cmd_diff(exit_on_drift).await,
-        cli::Commands::Plan {} => cmd_plan().await,
-        cli::Commands::Apply { auto_approve } => cmd_apply(auto_approve).await,
+        cli::Commands::Validate { format } => cmd_validate(&format, explicit_env.as_deref()),
+        cli::Commands::Export {
+            output,
+            materialize,
+            encrypt_to,
+        } => {
+            cmd_export(
+                output.as_deref(),
+                materialize,
+                encrypt_to.as_deref(),
+                explicit_env.as_deref(),
+            )
+            .await
+        }
+        cli::Commands::Diff { exit_on_drift } => {
+            cmd_diff(exit_on_drift, explicit_env.as_deref()).await
+        }
+        cli::Commands::Plan {} => cmd_plan(explicit_env.as_deref()).await,
+        cli::Commands::Apply {
+            auto_approve,
+            allow_large_prune,
+        } => cmd_apply(auto_approve, allow_large_prune, explicit_env.as_deref()).await,
         cli::Commands::Import {
             from_api,
             from_file,
             output_dir,
-        } => cmd_import(from_api.as_deref(), from_file.as_deref(), &output_dir).await,
-        cli::Commands::Review { pr } => cmd_review(pr).await,
+        } => {
+            cmd_import(
+                from_api.as_deref(),
+                from_file.as_deref(),
+                &output_dir,
+                explicit_env.as_deref(),
+            )
+            .await
+        }
+        cli::Commands::Review { pr } => cmd_review(pr, explicit_env.as_deref()).await,
+        cli::Commands::Envs { format } => cmd_envs(&format),
+        cli::Commands::Rotate {
+            consumer,
+            credential,
+            namespace,
+            recipient,
+        } => {
+            cmd_rotate(
+                &consumer,
+                &credential,
+                namespace.as_deref(),
+                recipient.as_deref(),
+                explicit_env.as_deref(),
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {
@@ -39,13 +87,26 @@ async fn main() {
     }
 }
 
-fn load_and_assemble() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
+fn load_repo_config() -> Result<Option<RepoConfig>, Box<dyn std::error::Error>> {
+    Ok(RepoConfig::load()?)
+}
 
+fn resolve_runtime(
+    explicit_env: Option<&str>,
+) -> Result<(EnvConfig, ResolvedEnv, Option<RepoConfig>), Box<dyn std::error::Error>> {
+    let env_config = config::load_env_config();
+    let repo = load_repo_config()?;
+    let resolved = resolve_env(repo.as_ref(), &env_config, explicit_env)?;
+    Ok((env_config, resolved, repo))
+}
+
+fn load_and_assemble_for(
+    resolved: &ResolvedEnv,
+) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
     let resources_dir = PathBuf::from("./resources");
     let mut resources = config::load_resources(&resources_dir)?;
 
-    if let Some(ref overlay_name) = env_config.overlay {
+    if let Some(ref overlay_name) = resolved.overlay {
         let overlay_dir = PathBuf::from("./overlays").join(overlay_name);
         if overlay_dir.is_dir() {
             config::apply_overlay(&mut resources, &overlay_dir)?;
@@ -54,51 +115,500 @@ fn load_and_assemble() -> Result<GatewayConfig, Box<dyn std::error::Error>> {
 
     let gateway_config = config::assemble(resources);
     let gateway_config =
-        config::select_config_namespace(&gateway_config, env_config.namespace_filter.as_deref());
+        config::select_config_namespace(&gateway_config, resolved.namespace_filter.as_deref());
     Ok(gateway_config)
 }
 
-async fn load_namespace_pairs(
-    client: &AdminClient,
-    desired: &GatewayConfig,
-    namespace_filter: Option<&str>,
-) -> gitforgeops::error::Result<Vec<(String, GatewayConfig, GatewayConfig)>> {
-    let mut pairs = Vec::new();
+fn load_credential_bundles(
+    env_config: &EnvConfig,
+) -> Result<
+    (
+        secrets::CredentialBundle,
+        BTreeMap<u32, secrets::CredentialBundle>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    // Prefer the file-path form. At scale (many shards × 48 KB), the
+    // inline env-var form collides with OS env-block size limits; the
+    // file path skips that bound entirely.
+    if let Some(path) = &env_config.creds_bundle_json_file {
+        if !path.trim().is_empty() {
+            let raw = std::fs::read_to_string(path).map_err(|source| {
+                gitforgeops::error::Error::FileRead {
+                    path: std::path::PathBuf::from(path),
+                    source,
+                }
+            })?;
+            if !raw.trim().is_empty() {
+                return Ok(secrets::load_bundles_from_env(&raw)?);
+            }
+        }
+    }
+    match &env_config.creds_bundle_json {
+        Some(raw) if !raw.trim().is_empty() => Ok(secrets::load_bundles_from_env(raw)?),
+        _ => Ok((BTreeMap::new(), BTreeMap::new())),
+    }
+}
 
-    for (namespace, desired_namespace) in
-        config::split_config_by_namespace(desired, namespace_filter)
-    {
-        let actual_namespace = client.get_backup(&namespace).await?;
-        pairs.push((namespace, desired_namespace, actual_namespace));
+/// Resolve credentials for read-only paths (diff, plan, review, validate).
+///
+/// `alloc=rotate` placeholders are resolved with their stored bundle values,
+/// identical to `alloc=generate` — otherwise the placeholder literal
+/// `${gh-env-secret:alloc=rotate}` would compare as modified against every
+/// live gateway value on every diff and surface as persistent false drift
+/// (and fail `drift-check.yml --exit-on-drift`). Rotation is now always
+/// explicit via `gitforgeops rotate`, so there's no two-pass allocate-then-
+/// replace dance to preserve.
+fn resolve_credentials(
+    cfg: &mut GatewayConfig,
+    env_config: &EnvConfig,
+) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
+    let (bundle, _) = load_credential_bundles(env_config)?;
+    Ok(secrets::resolve_secrets(cfg, &bundle)?)
+}
+
+fn resolved_namespaces(
+    resolved: &ResolvedEnv,
+    desired: &GatewayConfig,
+    state: &StateFile,
+) -> Vec<String> {
+    match resolved.ownership.mode {
+        OwnershipMode::Exclusive => {
+            let owned = resolved.ownership.namespaces.clone().unwrap_or_default();
+            // Honor namespace_filter as an intersection. Without this,
+            // `FERRUM_NAMESPACE=ferrum` on an env with
+            // `ownership.namespaces: [ferrum, platform]` would still iterate
+            // `platform` — but `desired` has been filtered to `ferrum` only,
+            // so `platform` shows up as an all-deletions diff and prunes
+            // resources outside the operator's requested scope.
+            // The mismatched-filter case (namespace_filter not in owned set)
+            // is rejected upstream by `enforce_exclusive_scope`. If we reach
+            // here with a filter set, it's guaranteed to be in the allowed
+            // list.
+            match resolved.namespace_filter.as_deref() {
+                Some(ns) => vec![ns.to_string()],
+                None => owned,
+            }
+        }
+        OwnershipMode::Shared => match resolved.namespace_filter.as_deref() {
+            Some(ns) => vec![ns.to_string()],
+            None => {
+                // Shared mode: iterate every namespace the repo *currently*
+                // declares AND every namespace it has previously managed.
+                // Missing the latter means a PR that removes the last resource
+                // from a namespace silently stops reconciling it — the gateway
+                // keeps the orphan forever.
+                use std::collections::BTreeSet;
+                let mut set: BTreeSet<String> =
+                    config::collect_namespaces(desired).into_iter().collect();
+                for key in state.resources.keys() {
+                    // state key format: "<namespace>:<Kind>:<id>"
+                    if let Some((ns, _)) = key.split_once(':') {
+                        set.insert(ns.to_string());
+                    }
+                }
+                set.into_iter().collect()
+            }
+        },
+    }
+}
+
+/// In `exclusive` mode, every resource in `desired` must live in a namespace
+/// declared in `ownership.namespaces`, and any `namespace_filter` must be one
+/// of those allowed namespaces. Otherwise the repo would be silently pushing
+/// resources the ownership contract never signed for — or a filter typo
+/// would produce a "successful" no-op apply that still mutates the local
+/// state baseline to reflect a desired set that never reached the gateway.
+fn enforce_exclusive_scope(
+    resolved: &ResolvedEnv,
+    desired: &GatewayConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(resolved.ownership.mode, OwnershipMode::Exclusive) {
+        return Ok(());
+    }
+    let owned: Vec<String> = resolved.ownership.namespaces.clone().unwrap_or_default();
+    let allowed: std::collections::HashSet<&str> = owned.iter().map(String::as_str).collect();
+
+    // Reject namespace_filter outside the ownership list BEFORE we touch
+    // anything else. Letting it through would produce an empty reconcile
+    // scope while state.record still ran against the already-filtered
+    // desired — a no-op apply that still drifts the local baseline.
+    if let Some(filter) = resolved.namespace_filter.as_deref() {
+        if !allowed.contains(filter) {
+            return Err(format!(
+                "namespace_filter '{filter}' is not in ownership.namespaces {owned:?} for env '{}'. \
+                 Apply would reconcile nothing but still record state, which desyncs ownership tracking. \
+                 Either add '{filter}' to ownership.namespaces, remove FERRUM_NAMESPACE, or target a different env.",
+                resolved.name
+            )
+            .into());
+        }
     }
 
+    let mut violations = Vec::new();
+    let mut check = |ns: &str, kind: &str, id: &str| {
+        if !allowed.contains(ns) {
+            violations.push(format!("{kind} {id} in namespace '{ns}'"));
+        }
+    };
+    for p in &desired.proxies {
+        check(&p.namespace, "Proxy", &p.id);
+    }
+    for c in &desired.consumers {
+        check(&c.namespace, "Consumer", &c.id);
+    }
+    for u in &desired.upstreams {
+        check(&u.namespace, "Upstream", &u.id);
+    }
+    for p in &desired.plugin_configs {
+        check(&p.namespace, "PluginConfig", &p.id);
+    }
+    if !violations.is_empty() {
+        return Err(format!(
+            "exclusive env '{}' declares ownership.namespaces={:?}, but desired resources include namespaces outside that list:\n  {}\nEither add the namespace to ownership.namespaces, remove the resource, or switch ownership.mode to 'shared'.",
+            resolved.name,
+            resolved.ownership.namespaces.as_deref().unwrap_or(&[]),
+            violations.join("\n  ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Resolve the active PR number for the current command invocation.
+///
+/// Order:
+///   1. `GITFORGEOPS_PR_NUMBER` env var (set explicitly by review workflows).
+///   2. For post-merge applies: the PR associated with `GITHUB_SHA` via the
+///      `/repos/{repo}/commits/{sha}/pulls` endpoint. Requires GITHUB_TOKEN.
+async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
+    if let Some(n) = std::env::var("GITFORGEOPS_PR_NUMBER")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return Some(n);
+    }
+    let token = env_config.github_token.as_deref()?;
+    let repo = env_config.github_repository.as_deref()?;
+    let sha = std::env::var("GITHUB_SHA").ok()?;
+    let client = build_github_api_client(env_config).ok()?;
+    let url = format!("https://api.github.com/repos/{repo}/commits/{sha}/pulls");
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let prs: Vec<serde_json::Value> = resp.json().await.ok()?;
+    prs.first()
+        .and_then(|pr| pr.get("number"))
+        .and_then(|n| n.as_u64())
+}
+
+/// Generate + publish any credentials that need allocation or rotation, deliver
+/// them to the PR author (or workflow actor), and re-resolve placeholders so
+/// `desired` carries the real values for this apply run.
+///
+/// Returns the allocation outcome (or `None` if nothing needed allocation) and
+/// the final post-allocation shard map (for state-file updates).
+#[allow(clippy::too_many_arguments)]
+/// Build a reqwest::Client configured to hit api.github.com with the
+/// `FERRUM_GITHUB_*_TIMEOUT_SECS` bounds applied. Every GitHub-API call
+/// site in the binary (PR lookup, override check, secret provisioning,
+/// SSH-key fetch, review comment post) must use this — a bare client
+/// with no timeouts can hang an apply indefinitely on a stalled endpoint
+/// and block deployment. The admin-gateway client has its own timeouts
+/// (see `http_client.rs`) and uses a different env-var pair.
+fn build_github_api_client(
+    env_config: &EnvConfig,
+) -> Result<reqwest::Client, gitforgeops::error::Error> {
+    use std::time::Duration;
+    reqwest::Client::builder()
+        .user_agent("gitforgeops/0.1")
+        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
+        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        .build()
+        .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))
+}
+
+/// Field names whose diff values must never be printed verbatim. These
+/// carry secret material — consumer credentials hold API keys, JWT
+/// signing keys, HMAC secrets, etc. Once resolved from the bundle, the
+/// values ARE the secret. `cmd_diff` echoes to stdout which is captured
+/// in CI logs (especially drift-check.yml), so printing them would
+/// exfiltrate secrets through a side channel.
+fn is_sensitive_field(kind: &str, field: &str) -> bool {
+    matches!((kind, field), ("Consumer", "credentials"))
+}
+
+/// Append `comment` to `$GITHUB_STEP_SUMMARY` when running under GitHub
+/// Actions. The step summary is always writable, so this is a reliable
+/// fallback when PR comment posting is blocked (fork PRs, read-only
+/// tokens). No-op when the env var is unset (local runs).
+fn write_review_to_step_summary(comment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = match std::env::var("GITHUB_STEP_SUMMARY") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return Ok(()),
+    };
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(
+        file,
+        "> _PR comment posting was blocked (typical on fork PRs). The review is shown below as a step summary fallback._\n"
+    )?;
+    file.write_all(comment.as_bytes())?;
+    if !comment.ends_with('\n') {
+        writeln!(file)?;
+    }
+    Ok(())
+}
+
+/// Emit the age-armored ciphertext for each newly-allocated slot so the
+/// recipient can decrypt. Without this, the allocator produced encrypted
+/// blobs and the binary logged only the recipient's SSH fingerprint — the
+/// actual ciphertext was dropped, so the "delivery" was recorded in state
+/// but never reached the user.
+///
+/// Delivery routing:
+/// - If `GITFORGEOPS_PR_NUMBER`, `GITHUB_TOKEN`, and `GITHUB_REPOSITORY` are
+///   all set, post as a PR comment (so the PR author sees it even after
+///   merge).
+/// - Otherwise, print to stdout with decrypt instructions. Local runs and
+///   non-PR-driven applies (direct push to main) take this path.
+async fn surface_delivered_credentials(
+    env_config: &EnvConfig,
+    outcome: &secrets::AllocateOutcome,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if outcome.allocated.is_empty() {
+        return Ok(());
+    }
+
+    let mut body = String::from("## GitForgeOps — New Credentials Allocated\n\n");
+    body.push_str(
+        "The credentials below were generated during apply. Each blob is age-encrypted to the recipient's GitHub-published SSH key. Decrypt locally:\n\n",
+    );
+    body.push_str("```\nage -d -i ~/.ssh/id_ed25519 < blob.age\n```\n\n");
+
+    let mut undelivered: Vec<&str> = Vec::new();
+
+    for slot in &outcome.allocated {
+        body.push_str(&format!("### `{}`\n\n", slot.slot));
+        match &slot.delivered {
+            Some(d) => {
+                body.push_str(&format!(
+                    "Encrypted to **@{}** (SSH fingerprint `{}`):\n\n",
+                    d.login, d.key_fingerprint
+                ));
+                body.push_str("```\n");
+                body.push_str(&d.encrypted_b64);
+                if !d.encrypted_b64.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str("```\n\n");
+            }
+            None => {
+                undelivered.push(slot.slot.as_str());
+                body.push_str(
+                    "**NOT DELIVERED** — the recipient had no SSH key on file or was not provided. Run `gitforgeops rotate` after adding an SSH key to deliver the value.\n\n",
+                );
+            }
+        }
+    }
+
+    let pr_number = std::env::var("GITFORGEOPS_PR_NUMBER")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let can_post_pr = pr_number.is_some()
+        && env_config.github_token.is_some()
+        && env_config.github_repository.is_some();
+
+    if let (Some(pr), true) = (pr_number, can_post_pr) {
+        match review::post_pr_comment(env_config, pr, &body).await {
+            Ok(()) => {
+                eprintln!(
+                    "Posted encrypted credential delivery to PR #{pr} ({} slot(s)).",
+                    outcome.allocated.len()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Fall through to stdout — losing the blob is worse than
+                // double-printing it.
+                eprintln!(
+                    "Warning: failed to post credentials to PR #{pr}: {e}. Falling back to stdout."
+                );
+            }
+        }
+    }
+
+    // Stdout fallback. Also warn if any slots weren't delivered at all.
+    println!();
+    println!("{}", body);
+    if !undelivered.is_empty() {
+        eprintln!(
+            "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
+            undelivered.len(),
+            undelivered.join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn allocate_if_needed(
+    desired: &mut GatewayConfig,
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    report: &secrets::ResolveReport,
+    per_shard: &mut BTreeMap<u32, secrets::CredentialBundle>,
+    shard_count: &mut u32,
+) -> Result<Option<secrets::AllocateOutcome>, Box<dyn std::error::Error>> {
+    if report.needs_allocation().is_empty() {
+        return Ok(None);
+    }
+
+    let token = env_config
+        .github_provisioner_token
+        .as_deref()
+        .ok_or("FERRUM_GH_PROVISIONER_TOKEN not set; cannot allocate credential slots")?;
+    let repo = env_config
+        .github_repository
+        .as_deref()
+        .ok_or("GITHUB_REPOSITORY not set; cannot write to GitHub Environment Secrets")?;
+
+    let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
+
+    let client = build_github_api_client(env_config)?;
+
+    let outcome = match secrets::allocate_and_deliver(
+        &client,
+        repo,
+        &resolved.name,
+        token,
+        recipient.as_deref(),
+        report,
+        per_shard,
+        shard_count,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(failure) => {
+            // Shard-atomic commit failed partway through: the shards in
+            // `failure.partial.allocated` were successfully PUT to GitHub
+            // before the failure, so their new values are live on the
+            // gateway side. Surface those ciphertexts NOW — if we let the
+            // error propagate without surfacing, recipients for already-
+            // committed shards have no decryption material and the next
+            // apply will see the slot as resolved (bundle has the value)
+            // so no re-delivery fires. Subsequent shards in the batch are
+            // not in `partial.allocated` (their PUT never succeeded), so
+            // they'll show up as NeedsAllocation on the next apply.
+            if !failure.partial.allocated.is_empty() {
+                surface_delivered_credentials(env_config, &failure.partial).await?;
+            }
+            return Err(failure.source.into());
+        }
+    };
+
+    // Re-resolve so `desired` picks up freshly allocated values. The
+    // allocator only produces values for slots classified as NeedsAllocation
+    // (first-apply generate OR first-apply rotate). Already-allocated
+    // placeholders were resolved in the initial `resolve_secrets` pass.
+    let merged = secrets::merge_bundles(per_shard);
+    let _ = secrets::resolve_secrets(desired, &merged)?;
+
+    Ok(Some(outcome))
+}
+
+/// Load per-namespace (desired, actual) pairs from the gateway for the given
+/// namespace list.
+///
+/// Unlike the old `namespace_filter`-based walk, this iterates an explicit
+/// list, so exclusive-mode apply can reconcile namespaces that the repo has
+/// emptied (still need to fetch gateway state to prune). For shared mode, the
+/// caller passes the namespaces present in `desired` (or a single-element list
+/// for a namespace filter).
+async fn load_namespace_pairs_for(
+    client: &AdminClient,
+    desired: &GatewayConfig,
+    namespaces: &[String],
+) -> gitforgeops::error::Result<Vec<(String, GatewayConfig, GatewayConfig)>> {
+    let mut pairs = Vec::new();
+    for namespace in namespaces {
+        let desired_namespace = config::filter_config_by_namespace(desired, namespace);
+        let actual_namespace = client.get_backup(namespace).await?;
+        pairs.push((namespace.clone(), desired_namespace, actual_namespace));
+    }
     Ok(pairs)
 }
 
 fn compute_namespace_diffs(
     namespace_pairs: &[(String, GatewayConfig, GatewayConfig)],
+    previously_managed: Option<&HashSet<String>>,
 ) -> (
-    Vec<gitforgeops::diff::resource_diff::ResourceDiff>,
-    Vec<gitforgeops::diff::breaking::BreakingChange>,
+    Vec<diff::ResourceDiff>,
+    Vec<diff::BreakingChange>,
+    Vec<diff::UnmanagedResource>,
 ) {
     let mut diffs = Vec::new();
     let mut breaking = Vec::new();
+    let mut unmanaged = Vec::new();
 
     for (_, desired_namespace, actual_namespace) in namespace_pairs {
-        let namespace_diffs = diff::compute_diff(desired_namespace, actual_namespace);
+        let result = diff::compute_diff_with_ownership(
+            desired_namespace,
+            actual_namespace,
+            previously_managed,
+        );
         let namespace_breaking =
-            diff::detect_breaking_changes(&namespace_diffs, desired_namespace, actual_namespace);
+            diff::detect_breaking_changes(&result.diffs, desired_namespace, actual_namespace);
 
-        diffs.extend(namespace_diffs);
+        diffs.extend(result.diffs);
+        unmanaged.extend(result.unmanaged);
         breaking.extend(namespace_breaking);
     }
 
-    (diffs, breaking)
+    (diffs, breaking, unmanaged)
 }
 
-fn cmd_validate(format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let gateway_config = load_and_assemble()?;
+fn previously_managed(resolved: &ResolvedEnv, state: &StateFile) -> Option<HashSet<String>> {
+    match resolved.ownership.mode {
+        OwnershipMode::Shared => Some(state.previously_managed_keys()),
+        OwnershipMode::Exclusive => None,
+    }
+}
+
+fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) -> Option<String> {
+    if report.results.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!("Credential slots (env {}):", resolved.name)];
+    for r in &report.results {
+        let status = match r.status {
+            secrets::SlotStatus::Resolved => "resolved",
+            secrets::SlotStatus::NeedsAllocation => "needs-allocation",
+            secrets::SlotStatus::MissingRequired => "MISSING (required)",
+        };
+        lines.push(format!("  [{status}] {}", r.slot));
+    }
+    Some(lines.join("\n"))
+}
+
+fn cmd_validate(
+    format: &str,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut gateway_config = load_and_assemble_for(&resolved)?;
+    let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
     let result = validate::run_validation(&gateway_config, &env_config.edge_binary_path)?;
     let output_format = validate::OutputFormat::from_str_lossy(format);
@@ -113,9 +623,75 @@ fn cmd_validate(format: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_export(output_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let gateway_config = load_and_assemble()?;
+async fn cmd_export(
+    output_path: Option<&str>,
+    materialize: bool,
+    encrypt_to: Option<&str>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if encrypt_to.is_some() && !materialize {
+        return Err(
+            "`--encrypt-to` requires `--materialize` (encrypting placeholders is pointless)".into(),
+        );
+    }
+
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut gateway_config = load_and_assemble_for(&resolved)?;
+
+    if materialize {
+        // Fail fast if credentials cannot be fully resolved — we don't want
+        // to hand an admin a file that still has `${gh-env-secret:...}`
+        // strings in it, and we won't allocate fresh secrets during export
+        // (that's the job of `apply`).
+        //
+        // After resolve, any placeholder still present in the config is a
+        // truly-unresolved slot. We run the post-resolve config through
+        // report_secrets with an empty bundle as a defensive re-scan rather
+        // than trusting the pre-resolve report's NeedsAllocation
+        // classification, since that classification is computed against the
+        // PRE-resolve bundle snapshot.
+        let (bundle, _) = load_credential_bundles(&env_config)?;
+        let _ = secrets::resolve_secrets(&mut gateway_config, &bundle)?;
+        let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
+        if !remaining.results.is_empty() {
+            return Err(format!(
+                "refusing to materialize: {} credential slot(s) have no value yet — run `gitforgeops apply` to allocate/rotate, then retry:\n  {}",
+                remaining.results.len(),
+                remaining
+                    .results
+                    .iter()
+                    .map(|r| r.slot.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            )
+            .into());
+        }
+    }
+    // When `!materialize`: skip resolve entirely so placeholder strings
+    // remain as `${gh-env-secret:...}`. Output is safe to commit.
+
     let yaml = serde_yaml::to_string(&gateway_config)?;
+
+    let payload: Vec<u8> = if let Some(login) = encrypt_to {
+        let client = build_github_api_client(&env_config)?;
+        match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
+            Some(delivery) => {
+                eprintln!(
+                    "Encrypted to @{} (ssh key {})",
+                    delivery.login, delivery.key_fingerprint
+                );
+                delivery.encrypted_b64.into_bytes()
+            }
+            None => {
+                return Err(format!(
+                    "@{login} has no compatible SSH public keys on GitHub; cannot encrypt. Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys."
+                )
+                .into());
+            }
+        }
+    } else {
+        yaml.into_bytes()
+    };
 
     match output_path {
         Some(path) => {
@@ -123,56 +699,123 @@ fn cmd_export(output_path: Option<&str>) -> Result<(), Box<dyn std::error::Error
                 std::fs::create_dir_all(parent)?;
             }
             let mut file = std::fs::File::create(path)?;
-            file.write_all(yaml.as_bytes())?;
+            file.write_all(&payload)?;
             eprintln!("Exported to {}", path);
         }
         None => {
-            print!("{}", yaml);
+            std::io::stdout().write_all(&payload)?;
         }
     }
 
     Ok(())
 }
 
-async fn cmd_diff(exit_on_drift: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_diff(
+    exit_on_drift: bool,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+    enforce_exclusive_scope(&resolved, &desired)?;
+    let _ = resolve_credentials(&mut desired, &env_config)?;
     let client = AdminClient::new(&env_config)?;
-    let namespace_pairs =
-        load_namespace_pairs(&client, &desired, env_config.namespace_filter.as_deref()).await?;
-    let (diffs, _) = compute_namespace_diffs(&namespace_pairs);
+    let state = StateFile::load(&resolved.name);
+    let managed = previously_managed(&resolved, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+    let (diffs, _breaking, unmanaged) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
-    if diffs.is_empty() {
+    if diffs.is_empty() && unmanaged.is_empty() {
         println!("No differences found. Configuration is in sync.");
         return Ok(());
     }
 
-    println!("Found {} difference(s):\n", diffs.len());
-    for d in &diffs {
-        let action = match d.action {
-            diff::DiffAction::Add => "ADD",
-            diff::DiffAction::Modify => "MODIFY",
-            diff::DiffAction::Delete => "DELETE",
-        };
-        println!("  {} {} {}", action, d.kind, d.id);
-        for change in &d.details {
-            println!(
-                "    {}: {} -> {}",
-                change.field, change.old_value, change.new_value
-            );
+    if !diffs.is_empty() {
+        println!("Found {} difference(s):\n", diffs.len());
+        for d in &diffs {
+            let action = match d.action {
+                diff::DiffAction::Add => "ADD",
+                diff::DiffAction::Modify => "MODIFY",
+                diff::DiffAction::Delete => "DELETE",
+            };
+            println!("  {} {} {} ({})", action, d.kind, d.id, d.namespace);
+            for change in &d.details {
+                if is_sensitive_field(&d.kind, &change.field) {
+                    // Credentials carry actual secret material (rotated
+                    // values, generated keys). Printing them here would
+                    // leak to CI logs — drift-check.yml echoes stdout
+                    // into the workflow log, which is viewable by anyone
+                    // with read access to the run.
+                    println!("    {}: [REDACTED] -> [REDACTED]", change.field);
+                } else {
+                    println!(
+                        "    {}: {} -> {}",
+                        change.field, change.old_value, change.new_value
+                    );
+                }
+            }
         }
     }
 
-    if exit_on_drift {
+    if !unmanaged.is_empty() && resolved.ownership.drift_report {
+        println!(
+            "\nUnmanaged resources (mode: {:?}, not touched by apply):",
+            resolved.ownership.mode
+        );
+        for u in &unmanaged {
+            println!("  {} {} ({})", u.kind, u.id, u.namespace);
+        }
+    }
+
+    // Honor drift_alert_on flags so operators can selectively suppress
+    // categories (e.g. a noisy staging env where only destructive changes
+    // should alert). Only categories with their flag set contribute to the
+    // drift decision.
+    let alert = &resolved.ownership.drift_alert_on;
+    let managed_modify_or_add = diffs
+        .iter()
+        .any(|d| matches!(d.action, diff::DiffAction::Modify | diff::DiffAction::Add));
+    let managed_delete = diffs
+        .iter()
+        .any(|d| matches!(d.action, diff::DiffAction::Delete));
+    let has_drift = (alert.managed_modified && managed_modify_or_add)
+        || (alert.managed_deleted && managed_delete)
+        || (alert.unmanaged_added && !unmanaged.is_empty());
+
+    if exit_on_drift && has_drift {
         process::exit(2);
     }
 
     Ok(())
 }
 
-async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+    // Plan must see the same scope/validation errors as apply would hit, so
+    // the preview matches reality. Without this, a plan could print "None
+    // (in sync)" for an exclusive env whose filter doesn't match ownership —
+    // apply would then fail when the operator tries to act on the preview.
+    enforce_exclusive_scope(&resolved, &desired)?;
+    // Audit security BEFORE resolving credentials. audit_security flags
+    // literal (non-placeholder) credential strings as a security issue
+    // ("use ${...} for secrets"). If we resolve first, placeholders are
+    // replaced with real values — which, post-substitution, look like
+    // literals to the auditor. Running pre-resolve keeps the audit on
+    // the repo's actual committed state.
+    let security_findings = diff::audit_security(&desired);
+    let secret_report = resolve_credentials(&mut desired, &env_config)?;
+
+    println!("=== Environment ===");
+    println!(
+        "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
+        resolved.name,
+        resolved.overlay.as_deref().unwrap_or("<none>"),
+        resolved.namespace_filter.as_deref().unwrap_or("<all>"),
+        resolved.apply_strategy,
+        resolved.ownership.mode,
+    );
+    println!();
 
     println!("=== Validation ===");
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
@@ -193,23 +836,29 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
+        println!("=== Credentials ===");
+        println!("{}\n", note);
+    }
+
     let client = AdminClient::new(&env_config);
-    let (diffs, breaking, actual_available) = match &client {
-        Ok(c) => {
-            match load_namespace_pairs(c, &desired, env_config.namespace_filter.as_deref()).await {
-                Ok(namespace_pairs) => {
-                    let (d, b) = compute_namespace_diffs(&namespace_pairs);
-                    (d, b, true)
-                }
-                Err(e) => {
-                    eprintln!("Could not fetch live config: {}", e);
-                    (Vec::new(), Vec::new(), false)
-                }
+    let state = StateFile::load(&resolved.name);
+    let managed = previously_managed(&resolved, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    let (diffs, breaking, unmanaged, actual_available) = match &client {
+        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+            Ok(namespace_pairs) => {
+                let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                (d, b, u, true)
             }
-        }
+            Err(e) => {
+                eprintln!("Could not fetch live config: {}", e);
+                (Vec::new(), Vec::new(), Vec::new(), false)
+            }
+        },
         Err(e) => {
             eprintln!("Could not create API client: {}", e);
-            (Vec::new(), Vec::new(), false)
+            (Vec::new(), Vec::new(), Vec::new(), false)
         }
     };
 
@@ -230,6 +879,18 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    if !unmanaged.is_empty() && resolved.ownership.drift_report {
+        println!("=== Unmanaged Resources ===");
+        println!(
+            "(mode={:?}; these exist on the gateway but were never managed by this repo)",
+            resolved.ownership.mode
+        );
+        for u in &unmanaged {
+            println!("  {} {} ({})", u.kind, u.id, u.namespace);
+        }
+        println!();
+    }
+
     if !breaking.is_empty() {
         println!("=== Breaking Changes ===");
         for bc in &breaking {
@@ -238,7 +899,7 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    let security_findings = diff::audit_security(&desired);
+    // security_findings was computed pre-resolve above; reuse it here.
     if !security_findings.is_empty() {
         println!("=== Security Findings ===");
         for sf in &security_findings {
@@ -256,6 +917,25 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    if let Some(policy_cfg) = policy::load_policies()? {
+        let policy_findings = policy::evaluate_policies(&desired, &policy_cfg);
+        if !policy_findings.is_empty() {
+            println!("=== Policy Violations ===");
+            for pf in &policy_findings {
+                println!(
+                    "  [{}] {}: {} {} ({}): {}",
+                    pf.severity.as_str(),
+                    pf.rule_id,
+                    pf.kind,
+                    pf.id,
+                    pf.namespace,
+                    pf.message
+                );
+            }
+            println!();
+        }
+    }
+
     if !validation_ok {
         process::exit(1);
     }
@@ -263,9 +943,53 @@ async fn cmd_plan() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_apply(
+    auto_approve: bool,
+    allow_large_prune: bool,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+
+    // Exclusive ownership: enforce namespace scope before anything else so the
+    // operator fails fast on a misconfigured resource, not deep in apply.
+    enforce_exclusive_scope(&resolved, &desired)?;
+
+    let mut state = StateFile::load(&resolved.name);
+
+    // First resolve: classify placeholders with the current bundle.
+    //
+    // In file mode we MUST NOT mutate `desired`: the file-mode branch below
+    // serializes `desired` to a committed-to-repo YAML, and replacing
+    // placeholders with real bundle values here would leak credentials into
+    // the committed artifact. `report_secrets` walks and classifies without
+    // touching `cfg`.
+    //
+    // In api mode we want the mutation: apply_api pushes `desired` to the
+    // gateway, which needs real values for already-allocated slots. The
+    // allocator fills in first-apply gaps (generate or rotate with no
+    // existing value) afterward; rotation of an already-allocated slot is
+    // an explicit `gitforgeops rotate` operation, not something apply does.
+    let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
+    let mut shard_count = state.credential_shard_count.max(1);
+    let initial_bundle = secrets::merge_bundles(&per_shard);
+    let secret_report = match env_config.gateway_mode {
+        GatewayMode::File => secrets::report_secrets(&desired, &initial_bundle)?,
+        GatewayMode::Api => secrets::resolve_secrets(&mut desired, &initial_bundle)?,
+    };
+
+    // Missing required credentials → fail fast before we touch the gateway.
+    let missing = secret_report.missing_required();
+    if !missing.is_empty() {
+        eprintln!(
+            "Refusing to apply: {} required credential slot(s) have no value:",
+            missing.len()
+        );
+        for m in missing {
+            eprintln!("  {}", m.slot);
+        }
+        process::exit(1);
+    }
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     if let Ok(ref r) = val_result {
@@ -275,16 +999,103 @@ async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
+    // Policy enforcement (with optional override). Overridden rule_ids are
+    // captured here and written into state after a successful apply so audits
+    // can see which blocking findings were bypassed by whom.
+    let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
+    if let Some(policy_cfg) = policy::load_policies()? {
+        let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
+        let pr_number = resolve_pr_number(&env_config).await;
+        let override_decision = if let Some(pr) = pr_number {
+            let d = policy::check_override(&env_config, &policy_cfg.overrides, pr).await?;
+            policy::github_override::apply_override(&mut findings, &d);
+            Some(d)
+        } else {
+            None
+        };
+
+        if let Some(d) = &override_decision {
+            if d.active {
+                if let Some(approver) = &d.approver {
+                    for f in &findings {
+                        if f.overridden_by.is_some() {
+                            overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let blockers: Vec<_> = findings.iter().filter(|f| f.is_blocking()).collect();
+        if !blockers.is_empty() {
+            eprintln!(
+                "Refusing to apply: {} unresolved policy violation(s):",
+                blockers.len()
+            );
+            for b in blockers {
+                eprintln!("  [{}] {}: {}", b.severity.as_str(), b.rule_id, b.message);
+            }
+            if let Some(d) = &override_decision {
+                if !d.active {
+                    eprintln!("(override inactive: {})", d.reason);
+                }
+            } else {
+                eprintln!("(no PR associated with this commit; overrides not evaluated)");
+            }
+            process::exit(1);
+        }
+    }
+
+    let is_first_apply = StateFile::is_first_apply(&resolved.name);
+    if is_first_apply && matches!(resolved.ownership.mode, OwnershipMode::Shared) {
+        eprintln!(
+            "Notice: first apply for environment '{}' in shared mode. Resources on the gateway but not in this repo will be treated as unmanaged and left alone.",
+            resolved.name
+        );
+    }
+
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    // Populated by both mode arms after their respective gates. State-record
+    // reads this after the match to persist credential metadata.
+    #[allow(unused_assignments)]
+    let mut allocation: Option<secrets::AllocateOutcome> = None;
+
+    // Stash partial-failure errors from apply_api so state.record/save runs
+    // BEFORE we propagate. In shared ownership this is critical: if some
+    // resources were created/updated successfully and we exit on error
+    // without recording, those resources lose their managed flag, the next
+    // apply classifies them as unmanaged, and future removals stop being
+    // pruned. See apply_api comments — per-resource errors are aggregated
+    // (record-and-continue) rather than aborting the batch, precisely so
+    // partial successes can be observed.
+    let mut deferred_apply_error: Option<gitforgeops::error::Error> = None;
+
+    // Per-op success records from apply_api. cmd_apply uses these to update
+    // state.resources INCREMENTALLY (only for ops that actually landed),
+    // not by full-replace from `desired`. The full-replace approach drops
+    // failed-Delete keys from state — in shared mode that orphans the
+    // resource (next diff classifies it as unmanaged, no more delete
+    // retries). File mode leaves these empty, and the file-mode state path
+    // below stamps everything from `desired` as managed (no per-op concept
+    // — the file write is atomic, success means everything's recorded).
+    let mut successful_ops: Vec<apply::AppliedOp> = Vec::new();
+    let mut fully_replaced: Vec<String> = Vec::new();
+
     match env_config.gateway_mode {
         GatewayMode::Api => {
             let client = AdminClient::new(&env_config)?;
+            let managed = previously_managed(&resolved, &state);
 
             if !auto_approve {
                 let namespace_pairs =
-                    load_namespace_pairs(&client, &desired, env_config.namespace_filter.as_deref())
-                        .await?;
-                let (diffs, _) = compute_namespace_diffs(&namespace_pairs);
-                if diffs.is_empty() {
+                    load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+                let (diffs, _, unmanaged) =
+                    compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+
+                if diffs.is_empty()
+                    && unmanaged.is_empty()
+                    && secret_report.needs_allocation().is_empty()
+                {
                     println!("No changes to apply.");
                     return Ok(());
                 }
@@ -297,33 +1108,280 @@ async fn cmd_apply(auto_approve: bool) -> Result<(), Box<dyn std::error::Error>>
                     };
                     println!("  {} {} {}", action, d.kind, d.id);
                 }
+                if !unmanaged.is_empty() {
+                    println!(
+                        "\n{} unmanaged resource(s) on gateway (not touched in shared mode).",
+                        unmanaged.len()
+                    );
+                }
+                let pending_creds = secret_report.needs_allocation();
+                if !pending_creds.is_empty() {
+                    println!(
+                        "\n{} credential slot(s) would be allocated on apply:",
+                        pending_creds.len()
+                    );
+                    for r in pending_creds {
+                        println!("  [new] {}", r.slot);
+                    }
+                }
                 println!("\nUse --auto-approve to skip this check.");
                 process::exit(0);
             }
 
-            let result = apply::apply_api(
+            // Large-prune safety check runs BEFORE allocation. The check
+            // inspects the diff against the placeholder-containing desired
+            // (allocation would only replace string values, not change which
+            // resources exist), so pruning behavior is unaffected. Placing
+            // allocation after this gate means a blocked apply leaves GitHub
+            // env secrets untouched — otherwise we'd burn a generated value
+            // that the gateway never receives.
+            let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+            let (diffs, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+            let delete_count = diffs
+                .iter()
+                .filter(|d| matches!(d.action, diff::DiffAction::Delete))
+                .count();
+            // Pick the denominator from the same set the diff uses to
+            // bound deletes — otherwise the percentage gets diluted by
+            // resources the diff would never touch.
+            //
+            //   - Shared mode: deletes only target previously-managed
+            //     resources (compute_diff_with_ownership filters on the
+            //     `previously_managed` set). Denominator = managed set in
+            //     scope. CLAUDE.md defines large_prune_threshold_percent
+            //     against managed resources for this reason: deleting 8 of
+            //     10 managed should report 80%, not get diluted to 8% just
+            //     because 90 admin-added resources also exist on the
+            //     gateway.
+            //
+            //   - Exclusive mode: every live resource in scope is part of
+            //     the ownership scope (no managed-set filter on deletes),
+            //     so live total is the right denominator. This also fixes
+            //     the bootstrap/takeover bug the prior live_total fix was
+            //     after: fresh state with N live resources reports
+            //     percentages bounded by N, not N*100/1.
+            //
+            // Both branches naturally cap at 100% (delete_count is bounded
+            // by the same set used as the denominator), so threshold = 100
+            // disables the guard as documented.
+            let denominator = match managed.as_ref() {
+                Some(managed_set) => {
+                    let ns_set: std::collections::HashSet<&str> =
+                        namespaces.iter().map(String::as_str).collect();
+                    managed_set
+                        .iter()
+                        .filter(|k| {
+                            let ns = k.split_once(':').map(|(n, _)| n).unwrap_or("");
+                            ns_set.contains(ns)
+                        })
+                        .count()
+                }
+                None => namespace_pairs
+                    .iter()
+                    .map(|(_, _, actual)| {
+                        actual.proxies.len()
+                            + actual.consumers.len()
+                            + actual.plugin_configs.len()
+                            + actual.upstreams.len()
+                    })
+                    .sum(),
+            };
+            // No managed resources (shared bootstrap) or no live resources
+            // (exclusive bootstrap with empty gateway) → no delete is
+            // possible; skip the guard rather than dividing by zero.
+            if delete_count > 0 && denominator > 0 {
+                let delete_pct = (delete_count * 100) / denominator;
+                let threshold = resolved.ownership.large_prune_threshold_percent as usize;
+                if delete_pct > threshold && !allow_large_prune {
+                    let scope_label = if managed.is_some() {
+                        "managed resources"
+                    } else {
+                        "live resources"
+                    };
+                    eprintln!(
+                        "Refusing to apply: would delete {}% of {} in scope ({}/{}, threshold {}%). Re-run with --allow-large-prune to proceed.",
+                        delete_pct, scope_label, delete_count, denominator, threshold
+                    );
+                    process::exit(1);
+                }
+            }
+
+            // All safety gates passed — now allocate credentials. Rotation
+            // on an already-allocated slot is a separate explicit operation
+            // (`gitforgeops rotate`); apply never re-rotates automatically.
+            allocation = allocate_if_needed(
+                &mut desired,
+                &env_config,
+                &resolved,
+                &secret_report,
+                &mut per_shard,
+                &mut shard_count,
+            )
+            .await?;
+
+            if let Some(outcome) = &allocation {
+                eprintln!("Allocated {} credential slot(s):", outcome.allocated.len());
+                for slot in &outcome.allocated {
+                    match &slot.delivered {
+                        Some(d) => eprintln!(
+                            "  {} -> @{} (ssh {})",
+                            slot.slot, d.login, d.key_fingerprint
+                        ),
+                        None => eprintln!(
+                            "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
+                            slot.slot
+                        ),
+                    }
+                }
+            }
+
+            // Surface the encrypted delivery blob BEFORE apply_api. The
+            // allocator has already written the new value to the GitHub
+            // Env Secret, so if apply_api fails here, the bundle will be
+            // treated as resolved on the next run and no later delivery
+            // attempt will happen — the recipient would be permanently
+            // locked out. By surfacing first, we guarantee the ciphertext
+            // reaches the recipient (PR comment or stdout) regardless of
+            // whether the gateway push succeeds. A failed gateway push
+            // just means a subsequent apply will pick up the already-
+            // committed bundle value and push it again.
+            if let Some(outcome) = &allocation {
+                surface_delivered_credentials(&env_config, outcome).await?;
+            }
+
+            let mut raw = apply::apply_api(
                 &desired,
                 &client,
-                env_config.apply_strategy.clone(),
-                env_config.namespace_filter.as_deref(),
+                resolved.apply_strategy.clone(),
+                &namespaces,
+                managed.as_ref(),
             )
-            .await?
-            .into_result()?;
+            .await?;
 
+            // Print counts up front so partial-success runs surface what
+            // landed even when we're about to propagate an error.
             println!(
-                "Applied: {} created, {} updated, {} deleted",
-                result.created, result.updated, result.deleted
+                "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped",
+                raw.created, raw.updated, raw.deleted, raw.unmanaged_skipped
             );
+
+            // Pull the per-op records out before `into_result()` consumes
+            // `raw`. These drive the incremental state update below.
+            successful_ops = std::mem::take(&mut raw.applied_incremental);
+            fully_replaced = std::mem::take(&mut raw.fully_replaced_namespaces);
+
+            // Defer propagation: record state for the successful portion
+            // first, then surface the partial-failure summary at the end of
+            // cmd_apply. `into_result()` produces the same aggregated error
+            // message it always did.
+            deferred_apply_error = raw.into_result().err();
         }
         GatewayMode::File => {
+            // File mode has no gateway diff or auto-approve gate in the
+            // normal sense, but it DOES have a side-effecting allocation
+            // step. Preserve the same plan-preview semantics so a dry-run
+            // can inspect pending allocations without writing to GitHub.
+            let pending = secret_report.needs_allocation();
+            if !auto_approve && !pending.is_empty() {
+                println!(
+                    "Would write placeholder file to {} and allocate {} credential slot(s):",
+                    env_config.file_output_path,
+                    pending.len()
+                );
+                for r in pending {
+                    println!("  [new] {}", r.slot);
+                }
+                println!("\nUse --auto-approve to proceed.");
+                process::exit(0);
+            }
+
+            // Write the placeholder-preserving file FIRST. `desired` still
+            // has `${gh-env-secret:...}` strings because the initial resolve
+            // doesn't replace rotate placeholders and the allocator hasn't
+            // run yet. This is the committed-to-repo form; the real values
+            // come via the separate `materialize-file.yml` workflow.
             apply::apply_file(&desired, &env_config.file_output_path)?;
             println!("Written to {}", env_config.file_output_path);
+
+            // Now allocate. The in-memory mutation after the disk write is
+            // harmless — the file has already been serialized with
+            // placeholders intact, and the allocated values go to the
+            // GitHub Env Secret for `materialize` to consume.
+            allocation = allocate_if_needed(
+                &mut desired,
+                &env_config,
+                &resolved,
+                &secret_report,
+                &mut per_shard,
+                &mut shard_count,
+            )
+            .await?;
+
+            if let Some(outcome) = &allocation {
+                surface_delivered_credentials(&env_config, outcome).await?;
+            }
         }
     }
 
-    let mut state = StateFile::load();
-    state.record(&desired);
+    // Update state.resources from what actually succeeded, not from
+    // `desired`. A wholesale rewrite from `desired` would drop the entry
+    // for any failed Delete (the resource is absent from `desired`, so
+    // its key gets removed from state) — in shared mode that orphans the
+    // still-live resource: the next compute_diff_with_ownership would
+    // classify it as unmanaged and stop retrying the deletion.
+    //
+    //   - File mode: no per-op concept. The file write is atomic, success
+    //     means the entire desired set is recorded. Use record() with the
+    //     full namespaces scope.
+    //   - Api mode incremental: walk successful_ops; Add/Modify update the
+    //     hash from desired, Delete removes the key. Failed ops are never
+    //     in this list, so their state entries persist untouched.
+    //   - Api mode full_replace: any namespace that completed gets a clean
+    //     rebuild from desired (atomic /restore semantics). Namespaces
+    //     that failed full_replace are NOT in `fully_replaced` and so are
+    //     left alone.
+    match env_config.gateway_mode {
+        GatewayMode::File => {
+            state.record(&desired, &namespaces);
+        }
+        GatewayMode::Api => {
+            for ns in &fully_replaced {
+                state.record_full_replace(ns, &desired);
+            }
+            for op in &successful_ops {
+                state.record_op(op, &desired)?;
+            }
+            state.stamp_last_applied();
+        }
+    }
+    state.credential_shard_count = shard_count;
+    if let Some(outcome) = &allocation {
+        let run_id = std::env::var("GITHUB_RUN_ID").ok();
+        for slot in &outcome.allocated {
+            state.record_credential(
+                &slot.slot,
+                slot.shard,
+                &slot.value,
+                slot.delivered.as_ref().map(|d| d.login.as_str()),
+                run_id.as_deref(),
+            );
+        }
+    }
+    if !overridden_for_audit.is_empty() {
+        let commit = state
+            .last_applied_commit
+            .clone()
+            .or_else(|| std::env::var("GITHUB_SHA").ok())
+            .unwrap_or_default();
+        for (rule_id, approver) in &overridden_for_audit {
+            state.record_override(rule_id, &commit, approver);
+        }
+    }
     state.save()?;
+
+    if let Some(e) = deferred_apply_error {
+        return Err(e.into());
+    }
 
     Ok(())
 }
@@ -332,18 +1390,14 @@ async fn cmd_import(
     from_api: Option<&str>,
     from_file: Option<&str>,
     output_dir: &str,
+    explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_path = PathBuf::from(output_dir);
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
     let result = if from_api.is_some() {
-        let env_config = config::load_env_config();
         let client = AdminClient::new(&env_config)?;
-        import::import_from_api(
-            &client,
-            &output_path,
-            env_config.namespace_filter.as_deref(),
-        )
-        .await?
+        import::import_from_api(&client, &output_path, resolved.namespace_filter.as_deref()).await?
     } else if let Some(file_path) = from_file {
         import::import_from_file(&PathBuf::from(file_path), &output_path)?
     } else {
@@ -359,9 +1413,20 @@ async fn cmd_import(
     Ok(())
 }
 
-async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
-    let desired = load_and_assemble()?;
+async fn cmd_review(
+    pr: Option<u64>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let mut desired = load_and_assemble_for(&resolved)?;
+    // PR review preview must match apply's real validation surface, so a
+    // reviewer looking at the comment sees the same errors the post-merge
+    // apply would produce.
+    enforce_exclusive_scope(&resolved, &desired)?;
+    // Audit pre-resolve so placeholder-resolved values aren't misreported as
+    // literal credentials (see cmd_plan for full rationale).
+    let security_findings = diff::audit_security(&desired);
+    let secret_report = resolve_credentials(&mut desired, &env_config)?;
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_ok, validation_output) = match &val_result {
@@ -370,50 +1435,398 @@ async fn cmd_review(pr: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client = AdminClient::new(&env_config);
+    let state = StateFile::load(&resolved.name);
+    let managed = previously_managed(&resolved, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired, &state);
 
-    let (diffs, breaking, comparison_error) = match &client {
-        Ok(c) => {
-            match load_namespace_pairs(c, &desired, env_config.namespace_filter.as_deref()).await {
-                Ok(namespace_pairs) => {
-                    let (diffs, breaking) = compute_namespace_diffs(&namespace_pairs);
-                    (diffs, breaking, None)
-                }
-                Err(e) => (
-                    Vec::new(),
-                    Vec::new(),
-                    Some(format!("Live gateway comparison skipped: {}", e)),
-                ),
+    let (diffs, breaking, unmanaged, comparison_error) = match &client {
+        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+            Ok(namespace_pairs) => {
+                let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                (d, b, u, None)
             }
-        }
+            Err(e) => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(format!("Live gateway comparison skipped: {}", e)),
+            ),
+        },
         Err(e) => (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Some(format!("Live gateway comparison skipped: {}", e)),
         ),
     };
 
-    let security_findings = diff::audit_security(&desired);
+    // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
-    let comment = review::build_review_comment(
+    let (policy_findings, override_reason, override_cfg) = match policy::load_policies()? {
+        Some(policy_cfg) => {
+            let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
+            let decision = match pr {
+                Some(pr_number) => {
+                    let d = policy::check_override(&env_config, &policy_cfg.overrides, pr_number)
+                        .await?;
+                    policy::github_override::apply_override(&mut findings, &d);
+                    Some(d)
+                }
+                None => None,
+            };
+            (
+                findings,
+                decision.map(|d| d.reason),
+                Some(policy_cfg.overrides),
+            )
+        }
+        None => (Vec::new(), None, None),
+    };
+
+    let ownership_note = format!(
+        "Environment: `{}` · Ownership: `{:?}` · Strategy: `{:?}`",
+        resolved.name, resolved.ownership.mode, resolved.apply_strategy
+    );
+
+    let bundle_loaded = env_config
+        .creds_bundle_json_file
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || env_config
+            .creds_bundle_json
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+
+    let comment = review::build_review_comment_v2(
         validation_ok,
         &validation_output,
         &diffs,
         &breaking,
         &security_findings,
         &bp_findings,
+        &policy_findings,
+        &unmanaged,
+        override_reason.as_deref(),
+        override_cfg.as_ref(),
         comparison_error.as_deref(),
+        Some(&ownership_note),
+        &secret_report,
+        bundle_loaded,
     );
 
     match pr {
         Some(pr_number) => {
-            review::post_pr_comment(&env_config, pr_number, &comment).await?;
-            println!("Posted review comment to PR #{}", pr_number);
+            // Fork PRs: GITHUB_TOKEN is downgraded to read-only by GitHub
+            // regardless of the workflow's `permissions:` block, so the
+            // POST to /issues/{n}/comments returns 403. We still want the
+            // review content visible, so fall back to $GITHUB_STEP_SUMMARY
+            // (which the runner always lets us write) and to stdout.
+            // Never fail the job on a delivery-channel error — the
+            // validation itself succeeded; only the report delivery didn't.
+            match review::post_pr_comment(&env_config, pr_number, &comment).await {
+                Ok(()) => {
+                    println!("Posted review comment to PR #{}", pr_number);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {e}"
+                    );
+                    write_review_to_step_summary(&comment)?;
+                    print!("{}", comment);
+                }
+            }
         }
         None => {
             print!("{}", comment);
         }
     }
 
+    let _ = !secret_report.results.is_empty();
+    Ok(())
+}
+
+fn cmd_envs(format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = load_repo_config()?;
+    let names = match repo {
+        Some(r) => r.environment_names(),
+        None => vec![ResolvedEnv::default_env_name()],
+    };
+    match format {
+        "text" => {
+            for n in names {
+                println!("{n}");
+            }
+        }
+        _ => {
+            println!("{}", serde_json::to_string(&names)?);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_rotate(
+    consumer: &str,
+    credential: &str,
+    namespace: Option<&str>,
+    recipient: Option<&str>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+
+    let repo = env_config
+        .github_repository
+        .clone()
+        .ok_or_else(|| gitforgeops::error::Error::Config("GITHUB_REPOSITORY not set".into()))?;
+    let token = env_config.github_provisioner_token.clone().ok_or_else(|| {
+        gitforgeops::error::Error::Config("FERRUM_GH_PROVISIONER_TOKEN not set".into())
+    })?;
+
+    // Load current bundle to know shard layout.
+    // Use the shared helper so both FERRUM_CREDS_JSON (inline) and
+    // FERRUM_CREDS_JSON_FILE (path) are honored. The workflow uses the file
+    // form — reading only the inline var left per_shard empty, and
+    // rotate_and_deliver would then write a shard containing ONLY the
+    // rotated slot, overwriting every other slot in that shard on GitHub.
+    let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
+
+    let mut state = StateFile::load(&resolved.name);
+    let ns = namespace.unwrap_or("ferrum");
+    let slot = secrets::resolver::slot_path(ns, consumer, credential);
+
+    // ALL preflight checks must run BEFORE rotate_and_deliver mutates the
+    // GitHub Environment Secret. If any of these fire after the secret is
+    // written, we've corrupted the store for a rotation that can't complete
+    // — the new value lives in GitHub, the gateway still has the old one,
+    // and the state file isn't updated because the push eventually fails.
+    //
+    // Preflight 1: gateway mode must be api. File mode has no gateway to
+    // push to; rotation in file mode has no completion path.
+    if !matches!(env_config.gateway_mode, GatewayMode::Api) {
+        return Err(
+            "Refusing to rotate: gateway_mode is 'file'. Rotation requires a live Admin API to push the new value. Use the materialize-file.yml workflow to get a new flat file for file-mode gateways."
+                .into(),
+        );
+    }
+
+    let desired_for_check = load_and_assemble_for(&resolved)?;
+
+    // Preflight 1b: in exclusive mode, the same ownership-scope rules
+    // apply/diff/plan/review enforce must apply here too. A manual rotate
+    // on an exclusive env targeting a consumer whose namespace isn't in
+    // `ownership.namespaces` would push a consumer the ownership contract
+    // never signed for — exactly the violation enforce_exclusive_scope
+    // exists to prevent.
+    enforce_exclusive_scope(&resolved, &desired_for_check)?;
+
+    // Preflight 2: target slot corresponds to an actual placeholder in the
+    // repo. A typo in --credential or pointing at a literal value would
+    // otherwise write random bytes into an orphaned Env Secret with no
+    // gateway-side reference.
+    let empty_bundle = BTreeMap::new();
+    let placeholder_report = secrets::report_secrets(&desired_for_check, &empty_bundle)?;
+    let target_placeholder = placeholder_report.results.iter().find(|r| r.slot == slot);
+    let placeholder_length = match target_placeholder {
+        Some(r) => r.placeholder.length_bytes,
+        None => {
+            return Err(format!(
+                "Refusing to rotate: no `${{gh-env-secret:...}}` placeholder at slot '{slot}'.\n\
+                 Rotate only operates on consumer credential fields that reference a placeholder in\n\
+                 the repo. Check that consumer '{consumer}' in namespace '{ns}' has a credential\n\
+                 key '{credential}' whose value is a gh-env-secret placeholder."
+            )
+            .into());
+        }
+    };
+
+    // Preflight 3: target consumer is declared in the repo. Without this,
+    // rotate_and_deliver writes a secret the gateway push will then refuse
+    // because there's no consumer to update.
+    let target_consumer_exists = desired_for_check
+        .consumers
+        .iter()
+        .any(|c| c.namespace == ns && c.id == consumer);
+    if !target_consumer_exists {
+        return Err(format!(
+            "Refusing to rotate: consumer '{ns}/{consumer}' is not present in repo desired state. Add the consumer to resources/ first."
+        )
+        .into());
+    }
+
+    // Preflight 4: no OTHER placeholders on this consumer remain unresolved
+    // against the current bundle. If they did, push_rotated_consumer_to_gateway
+    // would fail (by design) and leave the store/gateway split — mutating
+    // GitHub before running the check just guarantees that split happens.
+    let current_bundle = secrets::merge_bundles(&per_shard);
+    let sibling_consumer = desired_for_check
+        .consumers
+        .iter()
+        .find(|c| c.namespace == ns && c.id == consumer)
+        .cloned();
+    if let Some(mut c) = sibling_consumer {
+        let mut single = gitforgeops::config::GatewayConfig::default();
+        // Note: replace the target slot as if it were already rotated, so
+        // sibling-placeholder detection doesn't flag the slot we're about
+        // to rotate.
+        let mut shim_bundle = current_bundle.clone();
+        shim_bundle.insert(slot.clone(), "__rotate-preflight-shim__".to_string());
+        single.consumers.push(c.clone());
+        let _ = secrets::resolve_secrets(&mut single, &shim_bundle)?;
+        c = single.consumers.remove(0);
+        let mut remaining_cfg = gitforgeops::config::GatewayConfig::default();
+        remaining_cfg.consumers.push(c);
+        let sibling_report = secrets::report_secrets(&remaining_cfg, &BTreeMap::new())?;
+        if !sibling_report.results.is_empty() {
+            return Err(format!(
+                "Refusing to rotate: consumer '{ns}/{consumer}' has {} other unresolved placeholder(s):\n  {}\n\
+                 Run `gitforgeops apply` to allocate missing slots before rotating — otherwise the gateway push would fail after the new secret is already written.",
+                sibling_report.results.len(),
+                sibling_report.results.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
+            )
+            .into());
+        }
+    }
+
+    let mut shard_count = state.credential_shard_count.max(1);
+
+    let client = build_github_api_client(&env_config)?;
+
+    let outcome = secrets::rotate_and_deliver(
+        &client,
+        &repo,
+        &resolved.name,
+        &token,
+        recipient,
+        &slot,
+        placeholder_length,
+        &mut per_shard,
+        &mut shard_count,
+    )
+    .await?;
+
+    // Emit the encrypted delivery blob FIRST, before attempting the
+    // gateway push. rotate_and_deliver has already written the new value
+    // to the GitHub Env Secret; if we returned Err from the push without
+    // having printed the ciphertext, the recipient would have no way to
+    // recover the value — the bundle's new entry would be treated as
+    // resolved on subsequent runs and the allocator wouldn't re-deliver.
+    //
+    // A gateway push failure after successful delivery is recoverable:
+    // the next `gitforgeops apply` picks up the bundle value and pushes
+    // it through. Lost blob is not recoverable; order must be delivery
+    // first.
+    match &outcome.delivered {
+        Some(d) => {
+            println!(
+                "Delivered age-encrypted blob to @{} (ssh key {}):\n",
+                d.login, d.key_fingerprint
+            );
+            println!("{}", d.encrypted_b64);
+        }
+        None => {
+            if recipient.is_some() {
+                println!("Warning: recipient had no compatible SSH keys; secret written but not delivered.");
+            }
+        }
+    }
+
+    // Now push to the gateway.
+    let push_status =
+        push_rotated_consumer_to_gateway(&env_config, &resolved, &per_shard, ns, consumer).await;
+
+    // Persist rotation state ONLY on full success. Saving before the gateway
+    // push check would claim the rotation completed even when the gateway
+    // never received the new value — audits would show "rotated at T" while
+    // the old credential kept authenticating. On failure, leave state alone;
+    // the next successful `gitforgeops apply` (which picks up the fresh
+    // bundle value naturally) or re-rotate will record accurate metadata.
+    match push_status {
+        Ok(()) => {
+            state.credential_shard_count = shard_count;
+            state.record_credential(
+                &slot,
+                outcome.shard,
+                &outcome.value,
+                outcome.delivered.as_ref().map(|d| d.login.as_str()),
+                std::env::var("GITHUB_RUN_ID").ok().as_deref(),
+            );
+            state.save()?;
+            println!("Rotated slot {slot} in shard {}", outcome.shard);
+            println!("Gateway consumer '{}/{}' updated.", ns, consumer);
+        }
+        Err(e) => {
+            // Hard-fail: the credential store and gateway are out of sync.
+            // The recipient has the blob (printed above), so they're not
+            // stranded; run apply to close the gap.
+            return Err(format!(
+                "Rotated credential stored (GitHub Env Secret) + delivered, but gateway push FAILED: {e}\n\
+                 State NOT persisted (the gateway still has the old value). The new value lives\n\
+                 in the GitHub Env Secret; run `gitforgeops apply` to push it through and record\n\
+                 rotation metadata. If the recipient tries to authenticate with the new value\n\
+                 before apply runs, they will be rejected."
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Push just the rotated consumer to the live gateway so the new credential
+/// is immediately usable. Loads desired config, resolves placeholders against
+/// the post-rotation bundle (including rotate slots), finds the target
+/// consumer, and calls `update_consumer`.
+async fn push_rotated_consumer_to_gateway(
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
+    namespace: &str,
+    consumer_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(env_config.gateway_mode, GatewayMode::Api) {
+        return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
+    }
+
+    let mut desired = load_and_assemble_for(resolved)?;
+    let merged = secrets::merge_bundles(per_shard);
+    // `rotate_and_deliver` just wrote the fresh value into the bundle; this
+    // resolve picks it up for the consumer being pushed to the gateway.
+    let _ = secrets::resolve_secrets(&mut desired, &merged)?;
+
+    let consumer = desired
+        .consumers
+        .iter()
+        .find(|c| c.namespace == namespace && c.id == consumer_id)
+        .ok_or_else(|| {
+            format!(
+                "consumer '{namespace}/{consumer_id}' not present in repo desired state; cannot push rotated credential. Add the consumer to resources/ first, or if it was intentionally removed, rotation has no consumer to update."
+            )
+        })?;
+
+    // Guard: the consumer may carry OTHER credentials besides the one we
+    // just rotated. If any of those other credentials are placeholders
+    // without a bundle value (e.g. alloc=require that was never
+    // pre-populated, or alloc=generate never run through apply), pushing
+    // the consumer now would send a literal `${gh-env-secret:...}` string
+    // to the gateway as a credential value — breaking auth for that
+    // credential. Refuse and tell the operator to run apply first.
+    let single_consumer_cfg = gitforgeops::config::GatewayConfig {
+        consumers: vec![consumer.clone()],
+        ..Default::default()
+    };
+    let remaining = secrets::report_secrets(&single_consumer_cfg, &BTreeMap::new())?;
+    if !remaining.results.is_empty() {
+        return Err(format!(
+            "refusing to push rotated consumer '{namespace}/{consumer_id}': {} unresolved placeholder(s) remain on this consumer:\n  {}\n\
+             Run `gitforgeops apply` to allocate missing slots before rotating (or pre-populate FERRUM_CREDS_JSON).",
+            remaining.results.len(),
+            remaining.results.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
+        ).into());
+    }
+
+    let client = AdminClient::new(env_config)?;
+    client.update_consumer(consumer, namespace).await?;
     Ok(())
 }
