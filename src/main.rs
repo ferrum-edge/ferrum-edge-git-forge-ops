@@ -1141,35 +1141,66 @@ async fn cmd_apply(
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
                 .count();
-            // Use the LIVE gateway resource count (in scope) as the
-            // denominator. The user-facing meaning of
-            // `large_prune_threshold_percent` is "block if more than X% of
-            // what's there in the gateway would be removed" — which is
-            // bounded by the live total, naturally caps at 100%, and stays
-            // meaningful on bootstrap/takeover. The previous denominator
-            // (`state.resources` with `.max(1)`) misbehaved when state was
-            // empty: an exclusive-mode first apply against a populated
-            // gateway would compute `delete_count * 100 / 1` and trip even
-            // at threshold = 100, leaving operators no way to disable the
-            // guard via config.
-            let live_total: usize = namespace_pairs
-                .iter()
-                .map(|(_, _, actual)| {
-                    actual.proxies.len()
-                        + actual.consumers.len()
-                        + actual.plugin_configs.len()
-                        + actual.upstreams.len()
-                })
-                .sum();
-            // If the live gateway has no resources in scope, no delete is
-            // possible — skip the guard rather than dividing by a fudged 1.
-            if delete_count > 0 && live_total > 0 {
-                let delete_pct = (delete_count * 100) / live_total;
+            // Pick the denominator from the same set the diff uses to
+            // bound deletes — otherwise the percentage gets diluted by
+            // resources the diff would never touch.
+            //
+            //   - Shared mode: deletes only target previously-managed
+            //     resources (compute_diff_with_ownership filters on the
+            //     `previously_managed` set). Denominator = managed set in
+            //     scope. CLAUDE.md defines large_prune_threshold_percent
+            //     against managed resources for this reason: deleting 8 of
+            //     10 managed should report 80%, not get diluted to 8% just
+            //     because 90 admin-added resources also exist on the
+            //     gateway.
+            //
+            //   - Exclusive mode: every live resource in scope is part of
+            //     the ownership scope (no managed-set filter on deletes),
+            //     so live total is the right denominator. This also fixes
+            //     the bootstrap/takeover bug the prior live_total fix was
+            //     after: fresh state with N live resources reports
+            //     percentages bounded by N, not N*100/1.
+            //
+            // Both branches naturally cap at 100% (delete_count is bounded
+            // by the same set used as the denominator), so threshold = 100
+            // disables the guard as documented.
+            let denominator = match managed.as_ref() {
+                Some(managed_set) => {
+                    let ns_set: std::collections::HashSet<&str> =
+                        namespaces.iter().map(String::as_str).collect();
+                    managed_set
+                        .iter()
+                        .filter(|k| {
+                            let ns = k.split_once(':').map(|(n, _)| n).unwrap_or("");
+                            ns_set.contains(ns)
+                        })
+                        .count()
+                }
+                None => namespace_pairs
+                    .iter()
+                    .map(|(_, _, actual)| {
+                        actual.proxies.len()
+                            + actual.consumers.len()
+                            + actual.plugin_configs.len()
+                            + actual.upstreams.len()
+                    })
+                    .sum(),
+            };
+            // No managed resources (shared bootstrap) or no live resources
+            // (exclusive bootstrap with empty gateway) → no delete is
+            // possible; skip the guard rather than dividing by zero.
+            if delete_count > 0 && denominator > 0 {
+                let delete_pct = (delete_count * 100) / denominator;
                 let threshold = resolved.ownership.large_prune_threshold_percent as usize;
                 if delete_pct > threshold && !allow_large_prune {
+                    let scope_label = if managed.is_some() {
+                        "managed resources"
+                    } else {
+                        "live resources"
+                    };
                     eprintln!(
-                        "Refusing to apply: would delete {}% of live resources in scope ({}/{}, threshold {}%). Re-run with --allow-large-prune to proceed.",
-                        delete_pct, delete_count, live_total, threshold
+                        "Refusing to apply: would delete {}% of {} in scope ({}/{}, threshold {}%). Re-run with --allow-large-prune to proceed.",
+                        delete_pct, scope_label, delete_count, denominator, threshold
                     );
                     process::exit(1);
                 }

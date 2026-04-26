@@ -144,6 +144,67 @@ fn pick_shard_is_deterministic_and_within_bounds() {
 }
 
 #[test]
+fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
+    // Regression: pick_shard previously returned None as soon as the
+    // hash-target shard exceeded the soft limit, even when other existing
+    // shards had free space. The caller would then increment shard_count
+    // and the system could hit the 100-shard cap prematurely. The fix
+    // probes the remaining shards 0..shard_count before signaling overflow.
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES};
+
+    // Build 4 shards. Fill the slot's hash-target with junk past the soft
+    // limit; leave the others empty.
+    let slot = "ferrum/app/big-cred";
+    let value_len = 256;
+    let shard_count: u32 = 4;
+
+    // Find which shard the hash points to (with empty shards, target is
+    // selected purely by hash).
+    let empty: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    let target = pick_shard(slot, value_len, &empty, shard_count).unwrap();
+
+    let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    let stuffing: String = "x".repeat(BUNDLE_SOFT_LIMIT_BYTES);
+    shards
+        .entry(target)
+        .or_default()
+        .insert("filler".to_string(), stuffing);
+
+    let chosen = pick_shard(slot, value_len, &shards, shard_count)
+        .expect("must find capacity in another shard, not return None");
+    assert_ne!(
+        chosen, target,
+        "slot landed on the full hash-target instead of probing free shards"
+    );
+    assert!(chosen < shard_count);
+}
+
+#[test]
+fn pick_shard_returns_none_only_when_all_shards_full() {
+    // Probing must NOT mask a genuinely-full state — the caller still
+    // needs the None signal to grow shard_count. Fill every shard past
+    // the soft limit and confirm pick_shard returns None.
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES};
+
+    let slot = "ferrum/app/another-cred";
+    let value_len = 64;
+    let shard_count: u32 = 3;
+
+    let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    for s in 0..shard_count {
+        shards
+            .entry(s)
+            .or_default()
+            .insert(format!("filler-{s}"), "x".repeat(BUNDLE_SOFT_LIMIT_BYTES));
+    }
+
+    assert!(
+        pick_shard(slot, value_len, &shards, shard_count).is_none(),
+        "every shard is full; pick_shard must signal overflow with None"
+    );
+}
+
+#[test]
 fn resolver_replaces_known_slot_and_reports_resolved() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {

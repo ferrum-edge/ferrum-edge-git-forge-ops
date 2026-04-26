@@ -98,9 +98,20 @@ pub fn bundle_hash(bundle: &CredentialBundle) -> String {
 
 /// Pick a shard for a new slot.
 ///
-/// Deterministic within a given shard count: sha256(slot) mod shard_count. If
-/// the target shard would exceed `BUNDLE_SOFT_LIMIT_BYTES` after insertion,
-/// returns `None` and the caller should increment `shard_count` and retry.
+/// Deterministic within a given shard count when the hash-target shard has
+/// room: `sha256(slot) mod shard_count`. When the hash-target shard would
+/// exceed `BUNDLE_SOFT_LIMIT_BYTES`, falls back to scanning the remaining
+/// shards `0..shard_count` for one with capacity. Returns `None` only when
+/// EVERY existing shard is full — at that point the caller should grow
+/// `shard_count` to add a new shard. Without the fallback scan, a slot
+/// hashing to a full shard would force shard growth even when other
+/// existing shards have free space, hitting the 100-shard cap prematurely.
+///
+/// Determinism note: the hash-based placement is preferred for new slots so
+/// steady-state distribution stays predictable. The probe is a fallback for
+/// the overflow case; once a slot is written, callers locate it via
+/// `bundle.contains_key` lookups, so the chosen shard is recorded and
+/// subsequent operations always find it (no re-probe needed).
 pub fn pick_shard(
     slot: &str,
     value_len: usize,
@@ -116,12 +127,24 @@ pub fn pick_shard(
     let first_8 = u64::from_be_bytes(digest[0..8].try_into().unwrap());
     let target = (first_8 % shard_count as u64) as u32;
 
-    let projected_size = projected_shard_size(slot, value_len, shards, target);
-    if projected_size > BUNDLE_SOFT_LIMIT_BYTES {
-        return None;
+    if projected_shard_size(slot, value_len, shards, target) <= BUNDLE_SOFT_LIMIT_BYTES {
+        return Some(target);
     }
 
-    Some(target)
+    // Hash target is full. Probe the remaining shards before signaling
+    // overflow — heterogeneous slot/value sizes mean the target can be
+    // full while neighbours have room, especially when shard_count is
+    // already at the 100 cap.
+    for s in 0..shard_count {
+        if s == target {
+            continue;
+        }
+        if projected_shard_size(slot, value_len, shards, s) <= BUNDLE_SOFT_LIMIT_BYTES {
+            return Some(s);
+        }
+    }
+
+    None
 }
 
 fn projected_shard_size(
