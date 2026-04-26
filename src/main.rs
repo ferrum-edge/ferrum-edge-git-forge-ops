@@ -1120,32 +1120,38 @@ async fn cmd_apply(
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
                 .count();
-            // Only count managed resources in the namespaces we are actually
-            // reconciling. A scoped apply (FERRUM_NAMESPACE=ferrum) that
-            // deletes 100% of its namespace's resources would otherwise show
-            // a tiny percentage of the cross-namespace total and slip under
-            // the threshold — exactly the case the guard exists to catch.
-            let managed_total = {
-                let ns_set: std::collections::HashSet<&str> =
-                    namespaces.iter().map(String::as_str).collect();
-                state
-                    .resources
-                    .keys()
-                    .filter(|k| {
-                        let ns = k.split_once(':').map(|(n, _)| n).unwrap_or("");
-                        ns_set.contains(ns)
-                    })
-                    .count()
-                    .max(1)
-            };
-            let delete_pct = (delete_count * 100) / managed_total;
-            let threshold = resolved.ownership.large_prune_threshold_percent as usize;
-            if delete_pct > threshold && !allow_large_prune {
-                eprintln!(
-                    "Refusing to apply: would delete {}% of managed resources (threshold {}%). Re-run with --allow-large-prune to proceed.",
-                    delete_pct, threshold
-                );
-                process::exit(1);
+            // Use the LIVE gateway resource count (in scope) as the
+            // denominator. The user-facing meaning of
+            // `large_prune_threshold_percent` is "block if more than X% of
+            // what's there in the gateway would be removed" — which is
+            // bounded by the live total, naturally caps at 100%, and stays
+            // meaningful on bootstrap/takeover. The previous denominator
+            // (`state.resources` with `.max(1)`) misbehaved when state was
+            // empty: an exclusive-mode first apply against a populated
+            // gateway would compute `delete_count * 100 / 1` and trip even
+            // at threshold = 100, leaving operators no way to disable the
+            // guard via config.
+            let live_total: usize = namespace_pairs
+                .iter()
+                .map(|(_, _, actual)| {
+                    actual.proxies.len()
+                        + actual.consumers.len()
+                        + actual.plugin_configs.len()
+                        + actual.upstreams.len()
+                })
+                .sum();
+            // If the live gateway has no resources in scope, no delete is
+            // possible — skip the guard rather than dividing by a fudged 1.
+            if delete_count > 0 && live_total > 0 {
+                let delete_pct = (delete_count * 100) / live_total;
+                let threshold = resolved.ownership.large_prune_threshold_percent as usize;
+                if delete_pct > threshold && !allow_large_prune {
+                    eprintln!(
+                        "Refusing to apply: would delete {}% of live resources in scope ({}/{}, threshold {}%). Re-run with --allow-large-prune to proceed.",
+                        delete_pct, delete_count, live_total, threshold
+                    );
+                    process::exit(1);
+                }
             }
 
             // All safety gates passed — now allocate credentials. Rotation

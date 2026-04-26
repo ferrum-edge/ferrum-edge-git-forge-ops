@@ -367,3 +367,22 @@ default_environment: production
     let err = RepoConfig::load_from_path(file.path()).unwrap_err();
     assert!(err.to_string().contains("default_environment"));
 }
+
+#[test]
+fn repo_config_rejects_empty_environments_map() {
+    // An empty `environments` map would emit `[]` from `gitforgeops envs`,
+    // and the matrix-job workflows gate on `outputs.envs != '[]'` — so
+    // validate/apply/drift jobs would silently skip with no error,
+    // producing a no-op pipeline from a "valid" config. The fix is to
+    // hard-fail at config load. Operators who don't want a multi-env
+    // config should delete the file entirely (synthetic-default kicks in).
+    let yaml = r#"
+environments: {}
+"#;
+    let file = write_repo_config(yaml);
+    let err = RepoConfig::load_from_path(file.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("empty `environments`"),
+        "expected an empty-environments error, got: {err}"
+    );
+}

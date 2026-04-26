@@ -131,6 +131,24 @@ impl RepoConfig {
     }
 
     fn validate(&self) -> crate::error::Result<()> {
+        // An empty `environments` map is almost always an operator
+        // mistake (e.g., commenting out every entry). `cmd_envs` would
+        // emit `[]`, and the matrix-job workflows gate on
+        // `outputs.envs != '[]'`, so validate/apply/drift would silently
+        // skip the entire pipeline with no error. Fail loudly here so the
+        // misconfiguration surfaces at config load instead of as a
+        // mysterious no-op deploy. Repos that genuinely don't want a
+        // multi-env config should delete `.gitforgeops/config.yaml`
+        // entirely; the synthetic-default path then provides a single
+        // implicit env.
+        if self.environments.is_empty() {
+            return Err(crate::error::Error::Config(
+                ".gitforgeops/config.yaml has an empty `environments` map. \
+                 Define at least one environment, or delete the file to fall back to the single implicit env."
+                    .to_string(),
+            ));
+        }
+
         for (name, env) in &self.environments {
             // Env name guards: reject anything that wouldn't be a safe
             // filesystem path component OR contains shell metacharacters.
