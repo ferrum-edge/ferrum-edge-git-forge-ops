@@ -1,7 +1,11 @@
-use gitforgeops::config::schema::{BackendProtocol, GatewayConfig, Proxy};
+use gitforgeops::config::schema::{
+    BackendProtocol, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
+    PluginScope, Proxy, Upstream, UpstreamTarget,
+};
 use gitforgeops::policy::config::{
-    BackendSchemeRuleConfig, ForbidTlsVerifyDisabledRuleConfig, PolicyConfig, PolicyRules,
-    TimeoutBand, TimeoutBandsRuleConfig,
+    AllowedBackendDomainsRuleConfig, AllowedProxyPluginsRuleConfig, BackendSchemeRuleConfig,
+    ForbidTlsVerifyDisabledRuleConfig, PolicyConfig, PolicyRules, TimeoutBand,
+    TimeoutBandsRuleConfig,
 };
 use gitforgeops::policy::{evaluate_policies, Severity};
 
@@ -55,6 +59,51 @@ fn proxy(id: &str, protocol: BackendProtocol, read_timeout: u64, tls_verify: boo
         allowed_ws_origins: vec![],
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+    }
+}
+
+fn plugin_config(id: &str, plugin_name: &str, namespace: &str) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        plugin_name: plugin_name.to_string(),
+        scope: PluginScope::Proxy,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        config: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        name: None,
+        namespace: "ferrum".to_string(),
+        targets,
+        algorithm: LoadBalancerAlgorithm::default(),
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn target(host: &str) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port: 443,
+        weight: 1,
+        tags: Default::default(),
+        path: None,
     }
 }
 
@@ -125,9 +174,117 @@ fn backend_scheme_policy_flags_http() {
 }
 
 #[test]
-fn require_auth_plugin_ignores_disabled_plugins() {
-    use gitforgeops::config::schema::{PluginConfig, PluginScope};
+fn allowed_proxy_plugins_flags_disallowed_associations() {
+    let mut p = proxy("p1", BackendProtocol::Https, 30_000, true);
+    p.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: "plugin-keyauth".to_string(),
+        },
+        PluginAssociation {
+            plugin_config_id: "plugin-transform".to_string(),
+        },
+    ];
 
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        plugin_configs: vec![
+            plugin_config("plugin-keyauth", "key_auth", "ferrum"),
+            plugin_config("plugin-transform", "request_transformer", "ferrum"),
+        ],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_plugin_names: vec!["KEY_AUTH".to_string(), "rate_limiting".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "allowed_proxy_plugins");
+    assert_eq!(findings[0].id, "p1");
+    assert!(findings[0].message.contains("plugin-transform"));
+    assert!(findings[0].message.contains("request_transformer"));
+}
+
+#[test]
+fn allowed_backend_domains_checks_proxies_and_upstream_targets() {
+    let mut exact_proxy = proxy("exact", BackendProtocol::Https, 30_000, true);
+    exact_proxy.backend_host = "API.Internal.Example.COM.".to_string();
+    let mut disallowed_proxy = proxy("disallowed-proxy", BackendProtocol::Https, 30_000, true);
+    disallowed_proxy.backend_host = "api.evil.example".to_string();
+
+    let cfg = GatewayConfig {
+        proxies: vec![exact_proxy, disallowed_proxy],
+        upstreams: vec![upstream(
+            "api-pool",
+            vec![
+                target("blue.svc.cluster.local"),
+                target("deep.team.prod.example.com"),
+                target("db.other.example"),
+            ],
+        )],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec![
+                    "api.internal.example.com".to_string(),
+                    "*.svc.cluster.local".to_string(),
+                    "*.prod.example.com".to_string(),
+                ],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 2);
+    assert!(findings
+        .iter()
+        .any(|f| f.kind == "Proxy" && f.id == "disallowed-proxy"));
+    assert!(findings
+        .iter()
+        .any(|f| f.kind == "Upstream" && f.id == "api-pool"));
+}
+
+#[test]
+fn allowed_backend_domains_wildcard_does_not_match_root_domain() {
+    let mut p = proxy("root", BackendProtocol::Https, 30_000, true);
+    p.backend_host = "example.com".to_string();
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.example.com".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].rule_id, "allowed_backend_domains");
+}
+
+#[test]
+fn require_auth_plugin_ignores_disabled_plugins() {
     // Proxy exists; an auth plugin exists in the same namespace at Global
     // scope but has enabled=false. The policy must still fire — disabled
     // plugins don't actually authenticate traffic.

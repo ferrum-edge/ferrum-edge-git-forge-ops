@@ -2,7 +2,8 @@ use crate::config::GatewayConfig;
 
 use super::config::PolicyConfig;
 use super::rules::{
-    BackendSchemeRule, ForbidTlsVerifyDisabledRule, RequireAuthPluginRule, TimeoutBandsRule,
+    AllowedBackendDomainsRule, AllowedProxyPluginsRule, BackendSchemeRule,
+    ForbidTlsVerifyDisabledRule, RequireAuthPluginRule, TimeoutBandsRule,
 };
 use super::{PolicyCheck, PolicyFinding};
 
@@ -27,6 +28,16 @@ pub fn build_registry(policy_cfg: &PolicyConfig) -> Vec<Box<dyn PolicyCheck>> {
     if policy_cfg.policies.forbid_tls_verify_disabled.enabled {
         rules.push(Box::new(ForbidTlsVerifyDisabledRule::new(
             policy_cfg.policies.forbid_tls_verify_disabled.clone(),
+        )));
+    }
+    if policy_cfg.policies.allowed_proxy_plugins.enabled {
+        rules.push(Box::new(AllowedProxyPluginsRule::new(
+            policy_cfg.policies.allowed_proxy_plugins.clone(),
+        )));
+    }
+    if policy_cfg.policies.allowed_backend_domains.enabled {
+        rules.push(Box::new(AllowedBackendDomainsRule::new(
+            policy_cfg.policies.allowed_backend_domains.clone(),
         )));
     }
 
