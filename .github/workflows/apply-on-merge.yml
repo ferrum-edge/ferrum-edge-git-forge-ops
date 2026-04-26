@@ -206,6 +206,16 @@ jobs:
         run: gitforgeops apply --auto-approve
 
       - name: Commit state + assembled (if changed)
+        # Run on partial-failure paths too: cmd_apply persists state for the
+        # successful portion of an apply BEFORE returning the deferred
+        # error, so the .state/<env>.json on disk reflects what actually
+        # landed even when the overall command exits non-zero. Default
+        # `if: success()` would skip this step on partial failure and the
+        # next shared-mode run would lose managed tracking for resources
+        # that did change — failed-Delete keys would also stay flagged
+        # only in memory and lose their retry signal. `!cancelled()` runs
+        # on success and failure but still respects job cancellation.
+        #
         # Persisting state is load-bearing: shared-mode diffs, credential shard
         # counts, and rotation metadata all live in .state/<env>.json. A silent
         # push failure would leave the next run reading stale state while
@@ -213,6 +223,7 @@ jobs:
         #
         # When the matrix runs multiple envs in parallel and they all try to
         # push to main, contention is normal — retry with rebase on rejection.
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           git config user.name "gitforgeops[bot]"
