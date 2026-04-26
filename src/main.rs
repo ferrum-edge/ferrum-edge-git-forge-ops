@@ -1060,6 +1060,16 @@ async fn cmd_apply(
     #[allow(unused_assignments)]
     let mut allocation: Option<secrets::AllocateOutcome> = None;
 
+    // Stash partial-failure errors from apply_api so state.record/save runs
+    // BEFORE we propagate. In shared ownership this is critical: if some
+    // resources were created/updated successfully and we exit on error
+    // without recording, those resources lose their managed flag, the next
+    // apply classifies them as unmanaged, and future removals stop being
+    // pruned. See apply_api comments — per-resource errors are aggregated
+    // (record-and-continue) rather than aborting the batch, precisely so
+    // partial successes can be observed.
+    let mut deferred_apply_error: Option<gitforgeops::error::Error> = None;
+
     match env_config.gateway_mode {
         GatewayMode::Api => {
             let client = AdminClient::new(&env_config)?;
@@ -1197,20 +1207,27 @@ async fn cmd_apply(
                 surface_delivered_credentials(&env_config, outcome).await?;
             }
 
-            let result = apply::apply_api(
+            let raw = apply::apply_api(
                 &desired,
                 &client,
                 resolved.apply_strategy.clone(),
                 &namespaces,
                 managed.as_ref(),
             )
-            .await?
-            .into_result()?;
+            .await?;
 
+            // Print counts up front so partial-success runs surface what
+            // landed even when we're about to propagate an error.
             println!(
                 "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped",
-                result.created, result.updated, result.deleted, result.unmanaged_skipped
+                raw.created, raw.updated, raw.deleted, raw.unmanaged_skipped
             );
+
+            // Defer propagation: record state for the successful portion
+            // first, then surface the partial-failure summary at the end of
+            // cmd_apply. `into_result()` produces the same aggregated error
+            // message it always did.
+            deferred_apply_error = raw.into_result().err();
         }
         GatewayMode::File => {
             // File mode has no gateway diff or auto-approve gate in the
@@ -1289,6 +1306,10 @@ async fn cmd_apply(
         }
     }
     state.save()?;
+
+    if let Some(e) = deferred_apply_error {
+        return Err(e.into());
+    }
 
     Ok(())
 }
