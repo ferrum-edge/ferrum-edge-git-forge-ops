@@ -28,7 +28,7 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 crypto_box = { version = "0.9", features = ["seal"] }
 rand = "0.9"
-age = { version = "0.10", features = ["ssh", "armor"] }
+age = { version = "0.11", features = ["ssh", "armor"] }
 ssh-key = { version = "0.6", features = ["ed25519"] }
 
 [dev-dependencies]
