@@ -147,10 +147,24 @@ policies:
   require_auth_plugin:
     enabled: false
     severity: error
+    auth_plugin_names: [jwt, key_auth, basic_auth, oauth2, oidc]
 
   forbid_tls_verify_disabled:
     enabled: false
     severity: error
+
+  allowed_proxy_plugins:
+    enabled: false
+    severity: error
+    allowed_plugin_names: [jwt, key_auth, rate_limiting]
+
+  allowed_backend_domains:
+    enabled: false
+    severity: error
+    allowed_domains:
+      - api.internal.example.com
+      - "*.svc.cluster.local"
+      - "*.corp.example.com"
 
 overrides:
   require_label: gitforgeops/policy-override
@@ -162,6 +176,8 @@ overrides:
 - `severity: error` → **blocks `gitforgeops apply`** until the violation is fixed or overridden.
 - `severity: warning` / `info` → surfaced in PR review, but apply proceeds.
 - Each violation includes the rule id, the resource, the current value, and a remediation hint in the PR comment.
+- `allowed_backend_domains` checks direct proxy `backend_host` values when no `upstream_id` is set, and always checks upstream `targets[*].host` values. `*.example.com` matches subdomains like `api.example.com` and `deep.api.example.com`; list `example.com` separately if the root domain is allowed too. IP literals must be listed exactly; wildcard entries only apply to DNS names.
+- `allowed_proxy_plugins` checks plugin configs explicitly referenced from a proxy's `plugins:` list, matching `plugin_name` case-insensitively.
 
 ### Override flow (B2: label + permission)
 
