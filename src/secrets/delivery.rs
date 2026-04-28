@@ -58,8 +58,9 @@ pub async fn deliver_to_author(
 
         let fingerprint = fingerprint_for(trimmed).unwrap_or_else(|| "unknown".to_string());
 
-        let encryptor = age::Encryptor::with_recipients(vec![Box::new(recipient)])
-            .ok_or_else(|| crate::error::Error::Config("age encryptor init".to_string()))?;
+        let recipients: [&dyn age::Recipient; 1] = [&recipient];
+        let encryptor = age::Encryptor::with_recipients(recipients.into_iter())
+            .map_err(|e| crate::error::Error::Config(format!("age encryptor init: {e}")))?;
 
         let mut out = Vec::new();
         let mut writer = encryptor
