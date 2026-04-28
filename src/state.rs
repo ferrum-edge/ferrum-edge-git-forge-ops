@@ -279,7 +279,7 @@ impl StateFile {
     ) {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
-        let full = format!("{:x}", hasher.finalize());
+        let full = hex::encode(hasher.finalize());
         let prefix = full.chars().take(16).collect();
         self.credentials.insert(
             slot.to_string(),
@@ -319,7 +319,7 @@ fn hash_resource<T: serde::Serialize>(resource: &T) -> String {
     let canonical = serde_json::to_string(&value).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn git_rev_parse_head() -> Option<String> {

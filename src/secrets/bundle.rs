@@ -93,7 +93,7 @@ pub fn bundle_hash(bundle: &CredentialBundle) -> String {
     let mut hasher = Sha256::new();
     let serialized = serde_json::to_string(bundle).unwrap_or_default();
     hasher.update(serialized.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 /// Pick a shard for a new slot.
