@@ -25,7 +25,7 @@ jobs:
     outputs:
       envs: ${{ steps.list.outputs.envs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -61,7 +61,7 @@ jobs:
       group: ferrum-apply-${{ matrix.environment }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download ferrum-edge binary
         run: |
