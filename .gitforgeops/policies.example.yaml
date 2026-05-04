@@ -27,11 +27,41 @@ policies:
   require_auth_plugin:
     enabled: false
     severity: error
+    # Plugin names that count as authentication. Matching is case-insensitive.
+    auth_plugin_names:
+      - jwt
+      - key_auth
+      - basic_auth
+      - oauth2
+      - oidc
 
   # Refuse `backend_tls_verify_server_cert: false`.
   forbid_tls_verify_disabled:
     enabled: false
     severity: error
+
+  # Restrict plugins explicitly attached in each proxy's `plugins:` list.
+  # Use this to constrain allowed auth types or other proxy-level plugins.
+  allowed_proxy_plugins:
+    enabled: false
+    severity: error
+    allowed_plugin_names:
+      - jwt
+      - key_auth
+      - rate_limiting
+
+  # Restrict direct proxy backends and upstream target hosts by domain.
+  # Proxies with `upstream_id` are checked through their upstream targets.
+  # Exact FQDNs match one host; wildcard entries like `*.svc.cluster.local`
+  # match any subdomain depth under that suffix.
+  # IP literals must be listed exactly; wildcard entries only apply to DNS names.
+  allowed_backend_domains:
+    enabled: false
+    severity: error
+    allowed_domains:
+      - api.internal.example.com
+      - "*.svc.cluster.local"
+      - "*.corp.example.com"
 
 # Policy override — a PR labelled with `require_label` bypasses errors when the
 # account that added the label has at least `required_permission` on the repo.

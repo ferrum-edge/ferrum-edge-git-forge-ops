@@ -95,6 +95,26 @@ pub struct ForbidTlsVerifyDisabledRuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AllowedProxyPluginsRuleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub severity: Severity,
+    #[serde(default)]
+    pub allowed_plugin_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AllowedBackendDomainsRuleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub severity: Severity,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PolicyRules {
     #[serde(default)]
     pub proxy_timeout_bands: TimeoutBandsRuleConfig,
@@ -104,6 +124,10 @@ pub struct PolicyRules {
     pub require_auth_plugin: RequireAuthPluginRuleConfig,
     #[serde(default)]
     pub forbid_tls_verify_disabled: ForbidTlsVerifyDisabledRuleConfig,
+    #[serde(default)]
+    pub allowed_proxy_plugins: AllowedProxyPluginsRuleConfig,
+    #[serde(default)]
+    pub allowed_backend_domains: AllowedBackendDomainsRuleConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
