@@ -90,7 +90,7 @@ jobs:
             --output "out/assembled-${INPUT_ENVIRONMENT}.age"
 
       - name: Upload encrypted artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: assembled-${{ inputs.environment }}-${{ github.run_id }}
           path: out/assembled-${{ inputs.environment }}.age
