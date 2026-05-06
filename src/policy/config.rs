@@ -45,12 +45,9 @@ pub struct RequireAuthPluginRuleConfig {
     #[serde(default)]
     pub severity: Severity,
     /// Plugin names that count as authentication. Defaults cover the
-    /// Ferrum Edge built-in auth plugins. The previous substring match
-    /// on `"auth"` accepted anything whose name *contained* that
-    /// substring (e.g. `body_size_audit` as auth, or a hostile
-    /// `fake-auth-bypass`) and excluded `jwt` — which the README
-    /// recommends — because its canonical id is just `jwt`. An explicit
-    /// allowlist is easier to reason about and harder to smuggle past.
+    /// Ferrum Edge built-in auth plugins. The explicit allowlist accepts
+    /// canonical auth plugin ids such as `jwt` and rejects unrelated plugin
+    /// names that merely contain auth-like substrings.
     #[serde(default = "default_auth_plugin_names")]
     pub auth_plugin_names: Vec<String>,
 }

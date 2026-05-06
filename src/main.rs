@@ -542,11 +542,10 @@ async fn allocate_if_needed(
 /// Load per-namespace (desired, actual) pairs from the gateway for the given
 /// namespace list.
 ///
-/// Unlike the old `namespace_filter`-based walk, this iterates an explicit
-/// list, so exclusive-mode apply can reconcile namespaces that the repo has
-/// emptied (still need to fetch gateway state to prune). For shared mode, the
-/// caller passes the namespaces present in `desired` (or a single-element list
-/// for a namespace filter).
+/// Iterates an explicit namespace list so exclusive-mode apply can reconcile
+/// namespaces that the repo has emptied (still need to fetch gateway state to
+/// prune). For shared mode, the caller passes the namespaces present in
+/// `desired` (or a single-element list for a namespace filter).
 async fn load_namespace_pairs_for(
     client: &AdminClient,
     desired: &GatewayConfig,
@@ -1173,10 +1172,9 @@ async fn cmd_apply(
             //
             //   - Exclusive mode: every live resource in scope is part of
             //     the ownership scope (no managed-set filter on deletes),
-            //     so live total is the right denominator. This also fixes
-            //     the bootstrap/takeover bug the prior live_total fix was
-            //     after: fresh state with N live resources reports
-            //     percentages bounded by N, not N*100/1.
+            //     so live total is the right denominator. Fresh state with
+            //     N live resources reports percentages bounded by N, not
+            //     N*100/1.
             //
             // Both branches naturally cap at 100% (delete_count is bounded
             // by the same set used as the denominator), so threshold = 100

@@ -160,11 +160,9 @@ fn pick_shard_is_deterministic_and_within_bounds() {
 
 #[test]
 fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
-    // Regression: pick_shard previously returned None as soon as the
-    // hash-target shard exceeded the soft limit, even when other existing
-    // shards had free space. The caller would then increment shard_count
-    // and the system could hit the 100-shard cap prematurely. The fix
-    // probes the remaining shards 0..shard_count before signaling overflow.
+    // A full hash-target shard must not hide free space on other existing
+    // shards. Probe the remaining shards 0..shard_count before signaling
+    // overflow.
     use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES};
 
     // Build 4 shards. Fill the slot's hash-target with junk past the soft
@@ -453,13 +451,10 @@ fn resolver_reports_needs_allocation_for_generate() {
 
 #[test]
 fn flat_and_nested_credentials_produce_distinct_slots() {
-    // Regression: previously the walker appended `.` for nested object
-    // keys, so a flat key `basic_auth.password` and a nested
-    // `basic_auth: { password: ... }` both produced slot
-    // `ns/consumer/basic_auth.password` and overwrote each other in the
-    // GitHub Env Secret bundle. With escaped component paths joined by
-    // `/`, the flat key stays a single component (literal dot kept),
-    // and the nested path uses two components — distinct slots.
+    // Escaped component paths keep a flat key `basic_auth.password` distinct
+    // from a nested `basic_auth: { password: ... }` credential. The flat key
+    // stays a single component (literal dot kept), and the nested path uses
+    // two components.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
         id: "app".to_string(),
@@ -672,14 +667,10 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
 
 #[test]
 fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
-    // Regression: phase 1 of allocate_and_deliver previously called
-    // pick_shard against the persisted `shards` map for every candidate
-    // without accounting for earlier candidates planned in the same run.
-    // With shard_count=1, every slot hashes to shard 0, and each
-    // candidate's projected size was computed against the same pre-batch
-    // bundle — so all candidates passed the soft-limit check and phase 2
-    // serialized one fat shard. The fix stages planned inserts during
-    // phase 1.
+    // Allocation stages planned inserts during phase 1, so each candidate's
+    // projected size accounts for earlier candidates in the same run. With
+    // shard_count=1, every slot hashes to shard 0; without staging, phase 2
+    // could serialize one oversized shard.
     use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle};
 
     // 600-byte values × ~80 candidates ≈ 48 KB → well over the 40 KB soft

@@ -91,7 +91,7 @@ pub fn validate_env_name_is_safe_path_component(name: &str) -> crate::error::Res
 ///   1. `env_name` (CLI `--env` flag or `FERRUM_ENV` env var) matched against repo config
 ///   2. `RepoConfig.default_environment`
 ///   3. Sole entry of `RepoConfig.environments` (if exactly one)
-///   4. Synthetic "default" env built from env vars alone (back-compat path)
+///   4. Synthetic "default" env built from env vars alone
 ///
 /// When no repo config exists, a synthetic env is built from `FERRUM_OVERLAY`,
 /// `FERRUM_NAMESPACE`, and `FERRUM_APPLY_STRATEGY`. Ownership defaults to `shared`

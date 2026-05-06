@@ -223,7 +223,7 @@ ${gh-env-secret:alloc=<mode>|len=<bytes>}
 
 - `alloc=require` (default) — the value must already exist in the bundle; apply fails if it doesn't.
 - `alloc=generate` — if the value is missing, generate a new one on apply.
-- `alloc=rotate` — marker for "this slot is eligible for rotation." Behaves identically to `generate` at apply time: first apply allocates, subsequent applies reuse the stored value. **Re-rotation is explicit** — trigger the `rotate.yml` workflow (see below) with a specific slot and recipient. The previous auto-rotate-on-every-apply behavior was removed because it redelivered persistent rotate slots to whichever user merged the latest PR, even when their PR didn't touch the consumer.
+- `alloc=rotate` — marker for "this slot is eligible for rotation." Behaves identically to `generate` at apply time: first apply allocates, subsequent applies reuse the stored value. **Re-rotation is explicit** — trigger the `rotate.yml` workflow (see below) with a specific slot and recipient.
 - `len=<16..=256>` — bytes of entropy for generated values. Default 32.
 
 Slot names are derived automatically from `(namespace, consumer_id, cred_key)` — you don't write them anywhere. Renaming a consumer gets a new slot (and the ability to intentionally retire the old one).

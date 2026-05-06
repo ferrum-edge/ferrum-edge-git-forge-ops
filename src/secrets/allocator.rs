@@ -141,8 +141,8 @@ pub async fn allocate_and_deliver(
         // from the slot's current shard — we'd write the fresh value to
         // shard N while a stale copy lingers on shard M. Because
         // `merge_bundles` iterates shards in ascending order, whichever copy
-        // sits on the higher shard index wins; that can silently revert to
-        // the old value.
+        // sits on the higher shard index wins; that can silently revert to a
+        // stale value.
         let existing_shard = staged
             .iter()
             .find_map(|(s, bundle)| bundle.contains_key(&candidate.slot).then_some(*s));
@@ -289,13 +289,9 @@ pub async fn allocate_and_deliver(
 ///
 /// Ordering matters: encrypt the delivery ciphertext **before** PUT, and fail
 /// closed when the caller requested a recipient but `deliver_to_author`
-/// returns `None` (recipient has no compatible SSH key). The prior flow
-/// wrote the new secret to GitHub first, attempted delivery after, and
-/// treated `Ok(None)` as success — so a recipient with no SSH key (or a
-/// transient /users/{login}/keys failure) silently rotated the gateway
-/// credential to a value nobody received. That left the deployed consumer
-/// credential in a state where the rotator couldn't authenticate again and
-/// no re-delivery path existed without another explicit rotate.
+/// returns `None` (recipient has no compatible SSH key). This keeps rotation
+/// atomic from the operator's perspective: the GitHub secret is changed only
+/// after the new value has a deliverable ciphertext.
 #[allow(clippy::too_many_arguments)]
 pub async fn rotate_and_deliver(
     client: &Client,

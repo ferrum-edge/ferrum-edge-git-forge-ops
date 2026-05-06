@@ -280,19 +280,16 @@ fn state_file_records_credential_metadata() {
 
 #[test]
 fn record_op_preserves_state_for_failed_delete() {
-    // Regression: cmd_apply previously used `state.record(&desired,
-    // &namespaces)` which rewrites the in-scope managed set from desired.
     // For a failed Delete, the resource is absent from `desired` (user
     // removed it from the repo) but still live on the gateway because the
-    // delete failed. The wholesale rewrite drops the resource's state
-    // entry; the next compute_diff_with_ownership classifies the still-
-    // live resource as unmanaged and stops retrying the deletion,
-    // orphaning it indefinitely.
+    // delete failed. State must keep tracking that resource so the next
+    // compute_diff_with_ownership run retries the deletion instead of
+    // classifying it as unmanaged.
     //
-    // The fix: cmd_apply walks `ApplyResult::applied_incremental` and
-    // calls `state.record_op` for each successful op. Failed ops never
-    // appear in that list, so their state entries persist untouched and
-    // the next apply's diff still sees the resource as managed →
+    // cmd_apply walks `ApplyResult::applied_incremental` and calls
+    // `state.record_op` for each successful op. Failed ops never appear in
+    // that list, so their state entries persist untouched and the next
+    // apply's diff still sees the resource as managed →
     // generates another Delete → retries.
     use gitforgeops::apply::AppliedOp;
     use gitforgeops::config::schema::{BackendProtocol, Consumer, GatewayConfig, Proxy};
