@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use gitforgeops::config::{
     apply_overlay, assemble, filter_config_by_namespace, load_resources, schema::Resource,
-    select_config_namespace, split_config_by_namespace,
+    select_config_namespace, split_config_by_namespace, validate_unique_resource_keys,
 };
 
 fn fixtures_dir() -> PathBuf {
@@ -84,6 +84,168 @@ fn overlay_nonexistent_dir_is_noop() {
 }
 
 #[test]
+fn overlay_matches_by_kind_namespace_and_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let overlay_path = temp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&overlay_path).unwrap();
+    std::fs::write(
+        overlay_path.join("shared.yaml"),
+        r#"
+kind: Proxy
+spec:
+  id: shared
+  backend_host: overlayed.internal
+"#,
+    )
+    .unwrap();
+
+    let mut resources = vec![
+        ("team-alpha".to_string(), make_consumer("shared")),
+        ("team-alpha".to_string(), make_proxy("shared")),
+        ("team-beta".to_string(), make_proxy("shared")),
+    ];
+
+    apply_overlay(&mut resources, temp.path()).unwrap();
+    let config = assemble(resources);
+
+    let alpha = config
+        .proxies
+        .iter()
+        .find(|p| p.namespace == "team-alpha" && p.id == "shared")
+        .unwrap();
+    let beta = config
+        .proxies
+        .iter()
+        .find(|p| p.namespace == "team-beta" && p.id == "shared")
+        .unwrap();
+
+    assert_eq!(alpha.backend_host, "overlayed.internal");
+    assert_eq!(beta.backend_host, "localhost");
+    assert_eq!(config.consumers[0].username, "shared");
+}
+
+#[test]
+fn overlay_merges_arrays_without_losing_base_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let proxy_overlay_path = temp.path().join("team-alpha/proxies");
+    let upstream_overlay_path = temp.path().join("team-alpha/upstreams");
+    std::fs::create_dir_all(&proxy_overlay_path).unwrap();
+    std::fs::create_dir_all(&upstream_overlay_path).unwrap();
+    std::fs::write(
+        proxy_overlay_path.join("shared.yaml"),
+        r#"
+kind: Proxy
+spec:
+  id: shared
+  hosts:
+    - overlay.example.com
+  plugins:
+    - plugin_config_id: auth-overlay
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        upstream_overlay_path.join("pool.yaml"),
+        r#"
+kind: Upstream
+spec:
+  id: pool
+  targets:
+    - host: base.internal
+      port: 8080
+      weight: 5
+      tags:
+        role: canary
+    - host: overlay.internal
+      port: 9090
+"#,
+    )
+    .unwrap();
+
+    let mut proxy = make_proxy("shared");
+    if let Resource::Proxy { spec } = &mut proxy {
+        spec.hosts.push("base.example.com".to_string());
+        spec.plugins
+            .push(gitforgeops::config::schema::PluginAssociation {
+                plugin_config_id: "auth-base".to_string(),
+            });
+    }
+
+    let mut resources = vec![
+        ("team-alpha".to_string(), proxy),
+        ("team-alpha".to_string(), make_upstream("pool")),
+    ];
+
+    apply_overlay(&mut resources, temp.path()).unwrap();
+    let config = assemble(resources);
+
+    let proxy = &config.proxies[0];
+    assert_eq!(proxy.hosts, vec!["base.example.com", "overlay.example.com"]);
+    assert_eq!(proxy.plugins.len(), 2);
+    assert_eq!(proxy.plugins[0].plugin_config_id, "auth-base");
+    assert_eq!(proxy.plugins[1].plugin_config_id, "auth-overlay");
+
+    let upstream = &config.upstreams[0];
+    assert_eq!(upstream.targets.len(), 2);
+    assert_eq!(upstream.targets[0].host, "base.internal");
+    assert_eq!(upstream.targets[0].weight, 5);
+    assert_eq!(upstream.targets[0].tags.get("role").unwrap(), "canary");
+    assert_eq!(upstream.targets[1].host, "overlay.internal");
+}
+
+#[test]
+fn overlay_rejects_kind_that_disagrees_with_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let overlay_path = temp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&overlay_path).unwrap();
+    std::fs::write(
+        overlay_path.join("bad.yaml"),
+        r#"
+kind: Upstream
+spec:
+  id: shared
+"#,
+    )
+    .unwrap();
+
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+    let err = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("declares kind"),
+        "expected kind mismatch error, got: {err}"
+    );
+}
+
+#[test]
+fn overlay_rejects_orphan_resource() {
+    let temp = tempfile::tempdir().unwrap();
+    let overlay_path = temp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&overlay_path).unwrap();
+    std::fs::write(
+        overlay_path.join("missing.yaml"),
+        r#"
+kind: Proxy
+spec:
+  id: missing
+"#,
+    )
+    .unwrap();
+
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("present"))];
+    let err = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("team-alpha/Proxy/missing"),
+        "expected full overlay key in orphan error, got: {err}"
+    );
+}
+
+#[test]
 fn assemble_empty_resources() {
     let config = assemble(vec![]);
     assert!(config.proxies.is_empty());
@@ -141,6 +303,23 @@ fn select_config_namespace_leaves_all_namespaces_when_unfiltered() {
     assert_eq!(selected.proxies.len(), 2);
 }
 
+#[test]
+fn validate_unique_resource_keys_rejects_duplicates() {
+    let config = assemble(vec![
+        ("ferrum".to_string(), make_proxy("same")),
+        ("ferrum".to_string(), make_proxy("same")),
+    ]);
+
+    let err = validate_unique_resource_keys(&config)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("duplicate resource key"),
+        "expected duplicate resource key error, got: {err}"
+    );
+}
+
 fn make_proxy(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Proxy {
@@ -191,6 +370,51 @@ fn make_proxy(id: &str) -> Resource {
             tcp_idle_timeout_seconds: None,
             allowed_methods: None,
             allowed_ws_origins: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+    }
+}
+
+fn make_consumer(id: &str) -> Resource {
+    use gitforgeops::config::schema::*;
+    Resource::Consumer {
+        spec: Consumer {
+            id: id.to_string(),
+            username: id.to_string(),
+            namespace: "ferrum".to_string(),
+            custom_id: None,
+            credentials: Default::default(),
+            acl_groups: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+    }
+}
+
+fn make_upstream(id: &str) -> Resource {
+    use gitforgeops::config::schema::*;
+    Resource::Upstream {
+        spec: Upstream {
+            id: id.to_string(),
+            name: None,
+            namespace: "ferrum".to_string(),
+            targets: vec![UpstreamTarget {
+                host: "base.internal".to_string(),
+                port: 8080,
+                weight: 1,
+                tags: Default::default(),
+                path: None,
+            }],
+            algorithm: LoadBalancerAlgorithm::default(),
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         },

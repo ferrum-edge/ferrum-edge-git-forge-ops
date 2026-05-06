@@ -16,15 +16,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1"
 thiserror = "2"
-glob = "0.3"
 sha2 = "0.11"
 hex = "0.4"
 walkdir = "2"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 crypto_box = { version = "0.9", features = ["seal"] }

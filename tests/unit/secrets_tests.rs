@@ -94,6 +94,21 @@ fn load_bundles_parses_merged_map() {
 }
 
 #[test]
+fn load_bundles_rejects_duplicate_slots_across_shards() {
+    let raw = r#"{
+        "FERRUM_CREDS_BUNDLE": "{\"ferrum/app/api_key\":\"v1\"}",
+        "FERRUM_CREDS_BUNDLE_1": "{\"ferrum/app/api_key\":\"v2\"}"
+    }"#;
+
+    let err = load_bundles_from_env(raw).unwrap_err().to_string();
+
+    assert!(
+        err.contains("appears in multiple bundle shards"),
+        "expected duplicate-slot error, got: {err}"
+    );
+}
+
+#[test]
 fn shard_secret_name_strips_suffix_for_shard_zero() {
     assert_eq!(shard_secret_name(0), "FERRUM_CREDS_BUNDLE");
     assert_eq!(shard_secret_name(3), "FERRUM_CREDS_BUNDLE_3");

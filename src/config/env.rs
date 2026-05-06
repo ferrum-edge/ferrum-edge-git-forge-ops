@@ -73,11 +73,11 @@ pub struct EnvConfig {
     pub edge_binary_path: String,
     /// Skip TLS certificate verification when talking to the gateway.
     pub tls_no_verify: bool,
-    /// Path to CA certificate for gateway TLS.
+    /// Base64-encoded PEM CA certificate for gateway TLS.
     pub ca_cert: Option<String>,
-    /// Path to client certificate for mTLS to gateway.
+    /// Base64-encoded PEM client certificate for mTLS to gateway.
     pub client_cert: Option<String>,
-    /// Path to client key for mTLS to gateway.
+    /// Base64-encoded PEM client key for mTLS to gateway.
     pub client_key: Option<String>,
     /// Timeout for TCP/TLS connection establishment to the gateway, in seconds.
     pub gateway_connect_timeout_secs: u64,

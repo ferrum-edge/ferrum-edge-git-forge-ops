@@ -1,5 +1,6 @@
 mod apply_tests;
 mod assembler_tests;
+mod cli_tests;
 mod diff_tests;
 mod env_tests;
 mod http_client_tests;
@@ -13,3 +14,4 @@ mod review_tests;
 mod schema_tests;
 mod secrets_tests;
 mod state_tests;
+mod validate_tests;

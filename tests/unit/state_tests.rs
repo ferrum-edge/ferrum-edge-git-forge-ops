@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use gitforgeops::diff::resource_diff::{state_key, state_key_namespace};
 use gitforgeops::state::StateFile;
 use tempfile::TempDir;
 
@@ -11,8 +12,11 @@ fn with_cwd<F: FnOnce()>(dir: &std::path::Path, f: F) {
     let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let original = std::env::current_dir().unwrap();
     std::env::set_current_dir(dir).unwrap();
-    f();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     std::env::set_current_dir(original).unwrap();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 #[test]
@@ -22,7 +26,7 @@ fn state_file_writes_and_reads_per_env() {
     with_cwd(dir.path(), || {
         assert!(StateFile::is_first_apply("staging"));
 
-        let mut state = StateFile::load("staging");
+        let mut state = StateFile::load("staging").unwrap();
         state
             .resources
             .insert("ferrum:Proxy:p1".to_string(), "sha256:abc".to_string());
@@ -32,7 +36,7 @@ fn state_file_writes_and_reads_per_env() {
         assert!(!StateFile::is_first_apply("staging"));
         assert!(StateFile::is_first_apply("production"));
 
-        let reloaded = StateFile::load("staging");
+        let reloaded = StateFile::load("staging").unwrap();
         assert_eq!(reloaded.resources.len(), 1);
         assert_eq!(reloaded.environment, "staging");
     });
@@ -145,7 +149,7 @@ fn state_load_normalizes_environment_to_requested_name() {
         }"#;
         std::fs::write(".state/production.json", state_json).unwrap();
 
-        let state = StateFile::load("production");
+        let state = StateFile::load("production").unwrap();
         assert_eq!(state.environment, "production");
 
         // Save must go to .state/production.json, not .state/.json.
@@ -156,15 +160,56 @@ fn state_load_normalizes_environment_to_requested_name() {
 }
 
 #[test]
+fn state_load_rejects_malformed_existing_state() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        std::fs::write(".state/production.json", "{not-json").unwrap();
+
+        let err = StateFile::load("production").unwrap_err().to_string();
+        assert!(
+            err.contains("failed to parse state file"),
+            "expected parse error for malformed state, got: {err}"
+        );
+    });
+}
+
+#[test]
+fn state_lock_rejects_concurrent_mutation_and_cleans_up_on_drop() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let lock = StateFile::lock("production").unwrap();
+        let err = StateFile::lock("production").unwrap_err().to_string();
+        assert!(
+            err.contains("locked by another gitforgeops process"),
+            "expected lock contention error, got: {err}"
+        );
+
+        drop(lock);
+        let second = StateFile::lock("production").unwrap();
+        drop(second);
+        assert!(!std::path::Path::new(".state/production.lock").exists());
+    });
+}
+
+#[test]
+fn state_keys_escape_colons_in_namespace_and_id() {
+    let key = state_key("team:alpha", "Proxy", "api:v1");
+
+    assert_eq!(state_key_namespace(&key).as_deref(), Some("team:alpha"));
+    assert_eq!(key, "team%3Aalpha:Proxy:api%3Av1");
+}
+
+#[test]
 fn state_file_persists_override_records_for_audit() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
-        let mut state = StateFile::load("production");
+        let mut state = StateFile::load("production").unwrap();
         state.record_override("backend_scheme", "abc123", "alice");
         state.record_override("proxy_timeout_bands", "abc123", "alice");
         state.save().unwrap();
 
-        let reloaded = StateFile::load("production");
+        let reloaded = StateFile::load("production").unwrap();
         assert_eq!(reloaded.overrides.len(), 2);
         assert_eq!(reloaded.overrides[0].rule_id, "backend_scheme");
         assert_eq!(reloaded.overrides[0].approver, "alice");
@@ -177,7 +222,7 @@ fn state_file_persists_override_records_for_audit() {
 fn state_file_records_credential_metadata() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
-        let mut state = StateFile::load("staging");
+        let mut state = StateFile::load("staging").unwrap();
         state.record_credential(
             "ferrum/app/api_key",
             0,
@@ -187,7 +232,7 @@ fn state_file_records_credential_metadata() {
         );
         state.save().unwrap();
 
-        let reloaded = StateFile::load("staging");
+        let reloaded = StateFile::load("staging").unwrap();
         let meta = reloaded.credentials.get("ferrum/app/api_key").unwrap();
         assert_eq!(meta.delivered_to.as_deref(), Some("alice"));
         assert_eq!(meta.delivered_run_id.as_deref(), Some("42"));

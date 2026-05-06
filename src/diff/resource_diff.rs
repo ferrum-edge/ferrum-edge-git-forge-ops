@@ -38,8 +38,16 @@ pub struct DiffResult {
     pub unmanaged: Vec<UnmanagedResource>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OwnershipScope<'a> {
+    Shared {
+        previously_managed: &'a HashSet<String>,
+    },
+    Exclusive,
+}
+
 pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<ResourceDiff> {
-    compute_diff_with_ownership(desired, actual, None).diffs
+    compute_diff_with_scope(desired, actual, OwnershipScope::Exclusive).diffs
 }
 
 /// Compute a diff, honoring ownership constraints.
@@ -56,6 +64,18 @@ pub fn compute_diff_with_ownership(
     actual: &GatewayConfig,
     previously_managed: Option<&HashSet<String>>,
 ) -> DiffResult {
+    let scope = match previously_managed {
+        Some(previously_managed) => OwnershipScope::Shared { previously_managed },
+        None => OwnershipScope::Exclusive,
+    };
+    compute_diff_with_scope(desired, actual, scope)
+}
+
+pub fn compute_diff_with_scope(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    ownership_scope: OwnershipScope<'_>,
+) -> DiffResult {
     let mut result = DiffResult::default();
 
     diff_collection(
@@ -64,7 +84,7 @@ pub fn compute_diff_with_ownership(
         "Proxy",
         |p| p.id.clone(),
         |p| p.namespace.clone(),
-        previously_managed,
+        ownership_scope,
         &mut result,
     );
     diff_collection(
@@ -73,7 +93,7 @@ pub fn compute_diff_with_ownership(
         "Consumer",
         |c| c.id.clone(),
         |c| c.namespace.clone(),
-        previously_managed,
+        ownership_scope,
         &mut result,
     );
     diff_collection(
@@ -82,7 +102,7 @@ pub fn compute_diff_with_ownership(
         "Upstream",
         |u| u.id.clone(),
         |u| u.namespace.clone(),
-        previously_managed,
+        ownership_scope,
         &mut result,
     );
     diff_collection(
@@ -91,7 +111,7 @@ pub fn compute_diff_with_ownership(
         "PluginConfig",
         |p| p.id.clone(),
         |p| p.namespace.clone(),
-        previously_managed,
+        ownership_scope,
         &mut result,
     );
 
@@ -99,7 +119,50 @@ pub fn compute_diff_with_ownership(
 }
 
 pub fn state_key(namespace: &str, kind: &str, id: &str) -> String {
-    format!("{namespace}:{kind}:{id}")
+    format!(
+        "{}:{kind}:{}",
+        encode_state_key_component(namespace),
+        encode_state_key_component(id)
+    )
+}
+
+pub fn state_key_namespace(key: &str) -> Option<String> {
+    let mut parts = key.splitn(3, ':');
+    let namespace = parts.next()?;
+    let _kind = parts.next()?;
+    Some(decode_state_key_component(namespace))
+}
+
+fn encode_state_key_component(value: &str) -> String {
+    value.replace('%', "%25").replace(':', "%3A")
+}
+
+fn decode_state_key_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let first = chars.next();
+            let second = chars.next();
+            match (first, second) {
+                (Some('2'), Some('5')) => out.push('%'),
+                (Some('3'), Some('A')) | (Some('3'), Some('a')) => out.push(':'),
+                (Some(a), Some(b)) => {
+                    out.push('%');
+                    out.push(a);
+                    out.push(b);
+                }
+                (Some(a), None) => {
+                    out.push('%');
+                    out.push(a);
+                }
+                (None, _) => out.push('%'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -109,7 +172,7 @@ fn diff_collection<T: serde::Serialize>(
     kind: &str,
     id_fn: impl Fn(&T) -> String,
     ns_fn: impl Fn(&T) -> String,
-    previously_managed: Option<&HashSet<String>>,
+    ownership_scope: OwnershipScope<'_>,
     result: &mut DiffResult,
 ) {
     let desired_map: std::collections::HashMap<(String, String), &T> =
@@ -148,10 +211,10 @@ fn diff_collection<T: serde::Serialize>(
             continue;
         }
 
-        match previously_managed {
-            Some(managed) => {
+        match ownership_scope {
+            OwnershipScope::Shared { previously_managed } => {
                 let key = state_key(namespace, kind, id);
-                if managed.contains(&key) {
+                if previously_managed.contains(&key) {
                     // We previously applied this resource, repo no longer declares
                     // it → delete.
                     result.diffs.push(ResourceDiff {
@@ -170,7 +233,7 @@ fn diff_collection<T: serde::Serialize>(
                     });
                 }
             }
-            None => {
+            OwnershipScope::Exclusive => {
                 // Exclusive mode: everything not in desired gets deleted.
                 result.diffs.push(ResourceDiff {
                     action: DiffAction::Delete,
@@ -189,6 +252,9 @@ fn compare_fields<T: serde::Serialize>(desired: &T, actual: &T) -> Vec<FieldChan
     let actual_val = serde_json::to_value(actual).unwrap_or_default();
 
     let mut changes = Vec::new();
+    if desired_val == actual_val {
+        return changes;
+    }
 
     if let (serde_json::Value::Object(d_map), serde_json::Value::Object(a_map)) =
         (&desired_val, &actual_val)

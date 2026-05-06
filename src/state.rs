@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::config::GatewayConfig;
+use crate::diff::resource_diff::{state_key, state_key_namespace};
 
 pub const STATE_DIR: &str = ".state";
 
@@ -34,6 +37,7 @@ pub struct OverrideRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFile {
     pub version: u32,
+    #[serde(default)]
     pub environment: String,
     pub last_applied_at: Option<String>,
     pub last_applied_commit: Option<String>,
@@ -46,6 +50,17 @@ pub struct StateFile {
     pub credential_shard_count: u32,
     #[serde(default)]
     pub overrides: Vec<OverrideRecord>,
+}
+
+#[derive(Debug)]
+pub struct StateLock {
+    path: PathBuf,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn default_shard_count() -> u32 {
@@ -73,32 +88,88 @@ impl StateFile {
         Path::new(STATE_DIR).join(format!("{environment}.json"))
     }
 
-    pub fn load(environment: &str) -> Self {
-        let path = Self::path_for(environment);
-        if path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(mut state) = serde_json::from_str::<Self>(&contents) {
-                    // Normalize environment to the requested name so save()
-                    // always targets the correct `.state/<env>.json` file,
-                    // regardless of what the on-disk field says.
-                    state.environment = environment.to_string();
-                    return state;
-                }
+    pub fn lock(environment: &str) -> crate::error::Result<StateLock> {
+        std::fs::create_dir_all(STATE_DIR)?;
+        let path = Path::new(STATE_DIR).join(format!("{environment}.lock"));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(crate::error::Error::Config(format!(
+                    "state file for environment '{environment}' is locked by another gitforgeops process; wait for it to finish or remove {} if the prior process crashed",
+                    path.display()
+                )));
             }
-        }
+            Err(source) => return Err(crate::error::Error::Io(source)),
+        };
 
-        Self {
-            environment: environment.to_string(),
-            ..Self::default()
+        if let Err(source) = writeln!(
+            file,
+            "pid={}\ncreated_at={}",
+            std::process::id(),
+            chrono::Utc::now().to_rfc3339()
+        ) {
+            let _ = std::fs::remove_file(&path);
+            return Err(crate::error::Error::Io(source));
         }
+        Ok(StateLock { path })
+    }
+
+    pub fn load(environment: &str) -> crate::error::Result<Self> {
+        let path = Self::path_for(environment);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    environment: environment.to_string(),
+                    ..Self::default()
+                });
+            }
+            Err(source) => return Err(crate::error::Error::FileRead { path, source }),
+        };
+
+        let mut state = serde_json::from_str::<Self>(&contents)
+            .map_err(|source| crate::error::Error::StateParse { path, source })?;
+        // Normalize environment to the requested name so save() always targets
+        // the correct `.state/<env>.json` file, regardless of what the on-disk
+        // field says.
+        state.environment = environment.to_string();
+        Ok(state)
     }
 
     pub fn save(&self) -> crate::error::Result<()> {
         std::fs::create_dir_all(STATE_DIR)?;
         let path = Self::path_for(&self.environment);
+        let tmp_path = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
-        Ok(())
+
+        let write_result = (|| -> crate::error::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, &path)?;
+            if let Ok(dir) = std::fs::File::open(STATE_DIR) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+
+        write_result
     }
 
     /// True when this appears to be the first apply for this environment: no
@@ -126,36 +197,36 @@ impl StateFile {
         // Drop only the entries for namespaces we're reconciling right now;
         // everything else stays as the last apply recorded it.
         self.resources.retain(|key, _| {
-            let ns = key.split_once(':').map(|(n, _)| n).unwrap_or("");
-            !scope.contains(ns)
+            let ns = state_key_namespace(key).unwrap_or_default();
+            !scope.contains(ns.as_str())
         });
 
         for proxy in &config.proxies {
             if !scope.contains(proxy.namespace.as_str()) {
                 continue;
             }
-            let key = format!("{}:Proxy:{}", proxy.namespace, proxy.id);
+            let key = state_key(&proxy.namespace, "Proxy", &proxy.id);
             self.resources.insert(key, hash_resource(proxy));
         }
         for consumer in &config.consumers {
             if !scope.contains(consumer.namespace.as_str()) {
                 continue;
             }
-            let key = format!("{}:Consumer:{}", consumer.namespace, consumer.id);
+            let key = state_key(&consumer.namespace, "Consumer", &consumer.id);
             self.resources.insert(key, hash_resource(consumer));
         }
         for upstream in &config.upstreams {
             if !scope.contains(upstream.namespace.as_str()) {
                 continue;
             }
-            let key = format!("{}:Upstream:{}", upstream.namespace, upstream.id);
+            let key = state_key(&upstream.namespace, "Upstream", &upstream.id);
             self.resources.insert(key, hash_resource(upstream));
         }
         for pc in &config.plugin_configs {
             if !scope.contains(pc.namespace.as_str()) {
                 continue;
             }
-            let key = format!("{}:PluginConfig:{}", pc.namespace, pc.id);
+            let key = state_key(&pc.namespace, "PluginConfig", &pc.id);
             self.resources.insert(key, hash_resource(pc));
         }
 
@@ -178,7 +249,7 @@ impl StateFile {
         desired: &GatewayConfig,
     ) -> crate::error::Result<()> {
         use crate::diff::resource_diff::DiffAction;
-        let key = format!("{}:{}:{}", op.namespace, op.kind, op.id);
+        let key = state_key(&op.namespace, &op.kind, &op.id);
 
         match op.action {
             DiffAction::Delete => {
@@ -222,32 +293,28 @@ impl StateFile {
     /// authoritative and equals `desired`.
     pub fn record_full_replace(&mut self, namespace: &str, desired: &GatewayConfig) {
         self.resources.retain(|key, _| {
-            let ns = key.split_once(':').map(|(n, _)| n).unwrap_or("");
+            let ns = state_key_namespace(key).unwrap_or_default();
             ns != namespace
         });
         for p in desired.proxies.iter().filter(|p| p.namespace == namespace) {
             self.resources
-                .insert(format!("{}:Proxy:{}", p.namespace, p.id), hash_resource(p));
+                .insert(state_key(&p.namespace, "Proxy", &p.id), hash_resource(p));
         }
         for c in desired
             .consumers
             .iter()
             .filter(|c| c.namespace == namespace)
         {
-            self.resources.insert(
-                format!("{}:Consumer:{}", c.namespace, c.id),
-                hash_resource(c),
-            );
+            self.resources
+                .insert(state_key(&c.namespace, "Consumer", &c.id), hash_resource(c));
         }
         for u in desired
             .upstreams
             .iter()
             .filter(|u| u.namespace == namespace)
         {
-            self.resources.insert(
-                format!("{}:Upstream:{}", u.namespace, u.id),
-                hash_resource(u),
-            );
+            self.resources
+                .insert(state_key(&u.namespace, "Upstream", &u.id), hash_resource(u));
         }
         for p in desired
             .plugin_configs
@@ -255,7 +322,7 @@ impl StateFile {
             .filter(|p| p.namespace == namespace)
         {
             self.resources.insert(
-                format!("{}:PluginConfig:{}", p.namespace, p.id),
+                state_key(&p.namespace, "PluginConfig", &p.id),
                 hash_resource(p),
             );
         }

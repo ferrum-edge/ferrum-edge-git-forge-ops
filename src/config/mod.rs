@@ -93,3 +93,42 @@ pub fn split_config_by_namespace(
             .collect(),
     }
 }
+
+pub fn validate_unique_resource_keys(config: &GatewayConfig) -> crate::error::Result<()> {
+    let mut seen = BTreeSet::new();
+
+    for proxy in &config.proxies {
+        insert_resource_key(&mut seen, &proxy.namespace, "Proxy", &proxy.id)?;
+    }
+    for consumer in &config.consumers {
+        insert_resource_key(&mut seen, &consumer.namespace, "Consumer", &consumer.id)?;
+    }
+    for upstream in &config.upstreams {
+        insert_resource_key(&mut seen, &upstream.namespace, "Upstream", &upstream.id)?;
+    }
+    for plugin_config in &config.plugin_configs {
+        insert_resource_key(
+            &mut seen,
+            &plugin_config.namespace,
+            "PluginConfig",
+            &plugin_config.id,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn insert_resource_key(
+    seen: &mut BTreeSet<(String, &'static str, String)>,
+    namespace: &str,
+    kind: &'static str,
+    id: &str,
+) -> crate::error::Result<()> {
+    let key = (namespace.to_string(), kind, id.to_string());
+    if !seen.insert(key) {
+        return Err(crate::error::Error::Config(format!(
+            "duplicate resource key: namespace={namespace:?}, kind={kind}, id={id:?}"
+        )));
+    }
+    Ok(())
+}

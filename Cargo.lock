@@ -943,12 +943,10 @@ name = "gitforgeops"
 version = "0.1.0"
 dependencies = [
  "age",
- "anyhow",
  "base64 0.22.1",
  "chrono",
  "clap",
  "crypto_box",
- "glob",
  "hex",
  "jsonwebtoken",
  "rand 0.9.4",
@@ -964,12 +962,6 @@ dependencies = [
  "uuid",
  "walkdir",
 ]
-
-[[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "group"

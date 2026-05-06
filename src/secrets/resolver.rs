@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::config::GatewayConfig;
 
 use super::bundle::CredentialBundle;
@@ -188,29 +186,13 @@ pub fn resolve_secrets(
     for consumer in cfg.consumers.iter_mut() {
         let namespace = consumer.namespace.clone();
         let consumer_id = consumer.id.clone();
-        let mut replacements: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-
-        for (cred_key, value) in consumer.credentials.iter() {
-            let components = vec![
+        for (cred_key, value) in consumer.credentials.iter_mut() {
+            let mut components = vec![
                 SlotComponent::Literal(namespace.as_str()),
                 SlotComponent::Literal(consumer_id.as_str()),
                 SlotComponent::Literal(cred_key.as_str()),
             ];
-            walk_and_report(value, &components, bundle, &mut report)?;
-        }
-
-        for (cred_key, value) in consumer.credentials.iter() {
-            let components = vec![
-                SlotComponent::Literal(namespace.as_str()),
-                SlotComponent::Literal(consumer_id.as_str()),
-                SlotComponent::Literal(cred_key.as_str()),
-            ];
-            let replaced = walk_and_replace(value.clone(), &components, bundle)?;
-            replacements.insert(cred_key.clone(), replaced);
-        }
-
-        for (k, v) in replacements {
-            consumer.credentials.insert(k, v);
+            walk_report_and_replace(value, &mut components, bundle, &mut report)?;
         }
     }
 
@@ -293,47 +275,70 @@ fn walk_and_report(
     Ok(())
 }
 
-fn walk_and_replace(
-    value: serde_json::Value,
-    components: &[SlotComponent<'_>],
+fn walk_report_and_replace<'a>(
+    value: &'a mut serde_json::Value,
+    components: &mut Vec<SlotComponent<'a>>,
     bundle: &CredentialBundle,
-) -> crate::error::Result<serde_json::Value> {
+    report: &mut ResolveReport,
+) -> crate::error::Result<()> {
     match value {
         serde_json::Value::String(s) => {
-            if let Some(res) = parse_placeholder(&s) {
-                let _placeholder = res?;
+            if let Some(res) = parse_placeholder(s) {
+                let placeholder = res?;
                 let slot = join_slot_components(components);
-                match bundle.get(&slot) {
-                    Some(v) => Ok(serde_json::Value::String(v.clone())),
-                    None => Ok(serde_json::Value::String(s)),
+                let status = classify_status(&placeholder, bundle.get(&slot));
+                let (namespace, consumer_id, cred_key) = decompose_components(components);
+                let replacement = bundle.get(&slot).cloned();
+                report_push(
+                    report,
+                    placeholder,
+                    status,
+                    &slot,
+                    namespace,
+                    consumer_id,
+                    cred_key,
+                );
+                if let Some(v) = replacement {
+                    *s = v;
                 }
-            } else {
-                Ok(serde_json::Value::String(s))
             }
         }
         serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (child_key, child_val) in map {
-                let mut child_components = components.to_vec();
-                child_components.push(SlotComponent::Literal(child_key.as_str()));
-                out.insert(
-                    child_key.clone(),
-                    walk_and_replace(child_val, &child_components, bundle)?,
-                );
+            for (child_key, child_val) in map.iter_mut() {
+                components.push(SlotComponent::Literal(child_key.as_str()));
+                walk_report_and_replace(child_val, components, bundle, report)?;
+                components.pop();
             }
-            Ok(serde_json::Value::Object(out))
         }
         serde_json::Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for (i, item) in items.into_iter().enumerate() {
-                let mut child_components = components.to_vec();
-                child_components.push(SlotComponent::ArrayIndex(i));
-                out.push(walk_and_replace(item, &child_components, bundle)?);
+            for (i, item) in items.iter_mut().enumerate() {
+                components.push(SlotComponent::ArrayIndex(i));
+                walk_report_and_replace(item, components, bundle, report)?;
+                components.pop();
             }
-            Ok(serde_json::Value::Array(out))
         }
-        other => Ok(other),
+        _ => {}
     }
+    Ok(())
+}
+
+fn report_push(
+    report: &mut ResolveReport,
+    placeholder: SecretPlaceholder,
+    status: SlotStatus,
+    slot: &str,
+    namespace: String,
+    consumer_id: String,
+    cred_key: String,
+) {
+    report.results.push(ResolveResult {
+        consumer_id,
+        namespace,
+        cred_key,
+        slot: slot.to_string(),
+        placeholder,
+        status,
+    });
 }
 
 /// Split a component slice back into (namespace, consumer_id, joined_cred_key)

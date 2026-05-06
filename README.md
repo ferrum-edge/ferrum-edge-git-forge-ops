@@ -271,7 +271,7 @@ File-mode gateways consume a single assembled YAML at boot. We can't commit that
 
 **Stage 1 — placeholder assembly (automatic, on every merge)**
 
-`apply-on-merge.yml` in file mode runs `gitforgeops export --output assembled/<env>.yaml` **without** resolving credentials. The committed file still contains the `${gh-env-secret:alloc=...}` strings for each consumer credential — safe for version control, useful as a diff artifact for PR review, useless to an attacker.
+`apply-on-merge.yml` in file mode runs `gitforgeops apply --auto-approve` with `FERRUM_GATEWAY_MODE=file`. The committed file still contains the `${gh-env-secret:alloc=...}` strings for each consumer credential — safe for version control, useful as a diff artifact for PR review, useless to an attacker. File-mode apply can still allocate GitHub Environment Secret slots, deliver encrypted credentials, update `.state/<env>.json`, and commit the assembled placeholder file.
 
 **Stage 2 — on-demand materialization (admin-initiated, delivered encrypted)**
 
@@ -510,7 +510,7 @@ These resources exist on the gateway but were not applied by this repo. They wil
 
 ## Trust and security posture
 
-- **Fork PRs cannot see production secrets.** The `validate-pr.yml` workflow runs with no `environment:` binding, so GitHub Environment Secrets are not available. Contributors can propose credential slots but cannot cause allocation.
+- **Fork PRs cannot see production secrets.** The `validate-pr.yml` workflow binds the matrix GitHub Environment so same-repo PRs can include live gateway comparison in review comments. Fork PRs still receive empty environment secrets under GitHub's `pull_request` secret rules and degrade to static-only review output. Contributors from forks can propose credential slots but cannot cause allocation.
 - **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions).
 - **Credential values are never written back to the repo.** Only hashes and metadata in `.state/`.
 - **Policy overrides leave a permanent trail.** PR label event + approver permission + `.state/<env>.json.overrides` record.

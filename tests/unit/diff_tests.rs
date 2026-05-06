@@ -280,6 +280,27 @@ fn security_detects_literal_credential() {
 }
 
 #[test]
+fn security_detects_nested_literal_credential() {
+    let mut creds = std::collections::HashMap::new();
+    creds.insert(
+        "keyauth".to_string(),
+        serde_json::json!({"outer": {"inner": "literal-secret-key"}}),
+    );
+    let config = GatewayConfig {
+        consumers: vec![Consumer {
+            credentials: creds,
+            ..make_consumer("c1", "alice")
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let findings = audit_security(&config);
+    assert!(findings
+        .iter()
+        .any(|f| f.message.contains("keyauth.outer.inner")));
+}
+
+#[test]
 fn security_passes_template_credential() {
     let mut creds = std::collections::HashMap::new();
     creds.insert(
@@ -394,6 +415,27 @@ fn security_respects_global_auth_plugin() {
 
     let findings = audit_security(&config);
     assert!(!findings
+        .iter()
+        .any(|f| f.message.contains("No auth plugin")));
+}
+
+#[test]
+fn security_ignores_disabled_auth_plugin() {
+    let mut proxy = make_proxy("p1", "/api", "localhost");
+    proxy.namespace = "team-alpha".to_string();
+
+    let mut disabled_auth =
+        make_plugin_config("global-auth", "team-alpha", "key_auth", PluginScope::Global);
+    disabled_auth.enabled = false;
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![disabled_auth],
+        ..GatewayConfig::default()
+    };
+
+    let findings = audit_security(&config);
+    assert!(findings
         .iter()
         .any(|f| f.message.contains("No auth plugin")));
 }

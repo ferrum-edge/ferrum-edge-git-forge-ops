@@ -29,6 +29,7 @@ pub fn load_bundles_from_env(
 
     let mut per_shard: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
     let mut merged: CredentialBundle = BTreeMap::new();
+    let mut slot_sources: BTreeMap<String, u32> = BTreeMap::new();
 
     for (secret_name, secret_value) in obj {
         let shard_idx = match parse_shard_index(secret_name) {
@@ -51,6 +52,11 @@ pub fn load_bundles_from_env(
         };
 
         for (slot, value) in &inner {
+            if let Some(previous_shard) = slot_sources.insert(slot.clone(), shard_idx) {
+                return Err(crate::error::Error::Config(format!(
+                    "credential slot '{slot}' appears in multiple bundle shards ({previous_shard} and {shard_idx}); repair FERRUM_CREDS_BUNDLE secrets before continuing"
+                )));
+            }
             merged.insert(slot.clone(), value.clone());
         }
         per_shard.insert(shard_idx, inner);

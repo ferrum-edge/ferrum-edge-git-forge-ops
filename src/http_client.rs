@@ -1,12 +1,17 @@
 use std::time::Duration;
 
 use base64::Engine;
+use rand::Rng;
 use reqwest::{Client, RequestBuilder, Response};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::EnvConfig;
 use crate::jwt;
 
+/// Client for the Ferrum Edge Admin API.
+///
+/// The client owns a reusable `reqwest::Client`, so per-command gateway calls
+/// share connection pooling, TLS configuration, JWT auth, and retry behavior.
 pub struct AdminClient {
     client: Client,
     gateway_url: String,
@@ -15,6 +20,7 @@ pub struct AdminClient {
 }
 
 impl AdminClient {
+    /// Build an Admin API client from resolved process/repo environment config.
     pub fn new(env: &EnvConfig) -> crate::error::Result<Self> {
         let gateway_url = env
             .gateway_url
@@ -24,6 +30,11 @@ impl AdminClient {
             .admin_jwt_secret
             .clone()
             .ok_or(crate::error::Error::NoJwtSecret)?;
+        if jwt_secret.len() < 32 {
+            return Err(crate::error::Error::Config(
+                "FERRUM_ADMIN_JWT_SECRET must be at least 32 characters".to_string(),
+            ));
+        }
 
         // Timeouts prevent CI from hanging indefinitely when the gateway is
         // unreachable or slow. Defaults: connect 10s, total request 60s.
@@ -454,8 +465,9 @@ impl AdminClient {
 }
 
 async fn backoff_sleep(attempt: u32) {
-    // 500ms · 2^(attempt-1), capped at 8s: 500ms, 1s, 2s, 4s, 8s, 8s, …
+    // Full-jitter backoff based on 500ms · 2^(attempt-1), capped at 8s.
     let exp = attempt.saturating_sub(1).min(4);
-    let delay_ms = 500u64 * (1u64 << exp);
-    tokio::time::sleep(Duration::from_millis(delay_ms.min(8_000))).await;
+    let cap_ms = (500u64 * (1u64 << exp)).min(8_000);
+    let delay_ms = rand::rng().random_range(0..=cap_ms);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
