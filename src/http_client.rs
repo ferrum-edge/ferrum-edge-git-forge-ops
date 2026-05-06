@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use base64::Engine;
-use rand::Rng;
 use reqwest::{Client, RequestBuilder, Response};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
@@ -470,6 +469,6 @@ async fn backoff_sleep(attempt: u32) {
     // immediate zero-delay retry.
     let exp = attempt.saturating_sub(1).min(4);
     let cap_ms = (500u64 * (1u64 << exp)).min(8_000);
-    let delay_ms = rand::rng().random_range(100..=cap_ms.max(100));
+    let delay_ms = rand::random_range(100..=cap_ms.max(100));
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
