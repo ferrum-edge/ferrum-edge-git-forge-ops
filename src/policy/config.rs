@@ -62,25 +62,40 @@ impl Default for RequireAuthPluginRuleConfig {
     }
 }
 
-/// Ferrum Edge built-in auth plugin ids (both hyphen and underscore
-/// spellings are accepted since the schema permits either form). Matching
-/// is case-insensitive against the plugin's `plugin_name` field.
-fn default_auth_plugin_names() -> Vec<String> {
-    vec![
-        "jwt".to_string(),
-        "basic_auth".to_string(),
-        "basic-auth".to_string(),
-        "key_auth".to_string(),
-        "key-auth".to_string(),
-        "oauth2".to_string(),
-        "oidc".to_string(),
-        "ldap_auth".to_string(),
-        "ldap-auth".to_string(),
-        "hmac_auth".to_string(),
-        "hmac-auth".to_string(),
-        "mtls_auth".to_string(),
-        "mtls-auth".to_string(),
-    ]
+const DEFAULT_AUTH_PLUGIN_NAMES: &[&str] = &[
+    "jwt",
+    "basic_auth",
+    "basic-auth",
+    "basic auth",
+    "basicauth",
+    "key_auth",
+    "key-auth",
+    "keyauth",
+    "oauth2",
+    "oidc",
+    "ldap_auth",
+    "ldap-auth",
+    "ldapauth",
+    "hmac_auth",
+    "hmac-auth",
+    "hmacauth",
+    "mtls_auth",
+    "mtls-auth",
+    "mtlsauth",
+];
+
+/// Ferrum Edge built-in auth plugin ids. Matching is case-insensitive against
+/// the plugin's `plugin_name` field.
+pub fn default_auth_plugin_names() -> Vec<String> {
+    DEFAULT_AUTH_PLUGIN_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+pub fn is_default_auth_plugin_name(plugin_name: &str) -> bool {
+    let plugin_name = plugin_name.to_ascii_lowercase();
+    DEFAULT_AUTH_PLUGIN_NAMES.contains(&plugin_name.as_str())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

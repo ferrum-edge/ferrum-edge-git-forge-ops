@@ -1,4 +1,5 @@
 use crate::config::GatewayConfig;
+use crate::policy::config::is_default_auth_plugin_name;
 
 use super::resource_diff::{DiffAction, ResourceDiff};
 
@@ -38,7 +39,7 @@ pub fn detect_breaking_changes(
                         .plugin_configs
                         .iter()
                         .find(|p| p.id == diff.id && p.namespace == diff.namespace)
-                        .map(|p| p.plugin_name.contains("auth"))
+                        .map(|p| is_default_auth_plugin_name(&p.plugin_name))
                         .unwrap_or(false);
                     if is_auth {
                         breaking.push(BreakingChange {

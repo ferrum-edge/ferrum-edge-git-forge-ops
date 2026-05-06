@@ -125,11 +125,13 @@ spec:
 }
 
 #[test]
-fn overlay_merges_arrays_without_losing_base_entries() {
+fn overlay_replaces_arrays_by_default_and_merges_additive_fields() {
     let temp = tempfile::tempdir().unwrap();
     let proxy_overlay_path = temp.path().join("team-alpha/proxies");
+    let consumer_overlay_path = temp.path().join("team-alpha/consumers");
     let upstream_overlay_path = temp.path().join("team-alpha/upstreams");
     std::fs::create_dir_all(&proxy_overlay_path).unwrap();
+    std::fs::create_dir_all(&consumer_overlay_path).unwrap();
     std::fs::create_dir_all(&upstream_overlay_path).unwrap();
     std::fs::write(
         proxy_overlay_path.join("shared.yaml"),
@@ -139,8 +141,23 @@ spec:
   id: shared
   hosts:
     - overlay.example.com
+  allowed_methods:
+    - GET
+  allowed_ws_origins:
+    - https://prod.example.com
   plugins:
     - plugin_config_id: auth-overlay
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        consumer_overlay_path.join("app.yaml"),
+        r#"
+kind: Consumer
+spec:
+  id: app
+  acl_groups:
+    - prod
 "#,
     )
     .unwrap();
@@ -165,14 +182,22 @@ spec:
     let mut proxy = make_proxy("shared");
     if let Resource::Proxy { spec } = &mut proxy {
         spec.hosts.push("base.example.com".to_string());
+        spec.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+        spec.allowed_ws_origins
+            .push("https://base.example.com".to_string());
         spec.plugins
             .push(gitforgeops::config::schema::PluginAssociation {
                 plugin_config_id: "auth-base".to_string(),
             });
     }
+    let mut consumer = make_consumer("app");
+    if let Resource::Consumer { spec } = &mut consumer {
+        spec.acl_groups = vec!["base".to_string(), "ops".to_string()];
+    }
 
     let mut resources = vec![
         ("team-alpha".to_string(), proxy),
+        ("team-alpha".to_string(), consumer),
         ("team-alpha".to_string(), make_upstream("pool")),
     ];
 
@@ -180,10 +205,17 @@ spec:
     let config = assemble(resources);
 
     let proxy = &config.proxies[0];
-    assert_eq!(proxy.hosts, vec!["base.example.com", "overlay.example.com"]);
+    assert_eq!(proxy.hosts, vec!["overlay.example.com"]);
+    assert_eq!(proxy.allowed_methods, Some(vec!["GET".to_string()]));
+    assert_eq!(
+        proxy.allowed_ws_origins,
+        vec!["https://prod.example.com".to_string()]
+    );
     assert_eq!(proxy.plugins.len(), 2);
     assert_eq!(proxy.plugins[0].plugin_config_id, "auth-base");
     assert_eq!(proxy.plugins[1].plugin_config_id, "auth-overlay");
+
+    assert_eq!(config.consumers[0].acl_groups, vec!["prod".to_string()]);
 
     let upstream = &config.upstreams[0];
     assert_eq!(upstream.targets.len(), 2);

@@ -50,9 +50,9 @@ pub fn assemble(resources: Vec<(String, Resource)>) -> GatewayConfig {
 /// Overlay files are **partial** — they only contain the fields to override,
 /// not all required fields. This function parses them as raw YAML values
 /// (not typed `Resource` structs) and merges into the base resource's JSON
-/// representation. Arrays are merged rather than replaced so partial overlays
-/// can add hosts, plugin associations, or upstream targets without dropping
-/// entries from the base resource.
+/// representation. Arrays replace the base value by default so overlays can
+/// narrow restrictive lists. The known additive arrays (`spec.plugins`,
+/// `spec.targets`) merge by item identity.
 pub fn apply_overlay(
     base: &mut [(String, Resource)],
     overlay_dir: &Path,
@@ -101,7 +101,7 @@ pub fn apply_overlay(
         {
             Some((ref mut base_ns, ref mut base_resource)) => {
                 let base_value = serde_json::to_value(&*base_resource)?;
-                let merged = deep_merge_values(base_value, overlay.value);
+                let merged = deep_merge_values(base_value, overlay.value, &mut Vec::new());
                 *base_resource = serde_json::from_value(merged)?;
 
                 if *base_ns == "ferrum" && overlay_key.namespace != "ferrum" {
@@ -270,26 +270,40 @@ fn overlay_effective_namespace(value: &serde_json::Value, directory_namespace: &
         .unwrap_or_else(|| directory_namespace.to_string())
 }
 
-fn deep_merge_values(base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
+fn deep_merge_values(
+    base: serde_json::Value,
+    overlay: serde_json::Value,
+    path: &mut Vec<String>,
+) -> serde_json::Value {
     use serde_json::Value;
 
     match (base, overlay) {
         (Value::Object(mut base_map), Value::Object(overlay_map)) => {
             for (key, overlay_val) in overlay_map {
+                path.push(key.clone());
                 let merged = if let Some(base_val) = base_map.remove(&key) {
-                    deep_merge_values(base_val, overlay_val)
+                    deep_merge_values(base_val, overlay_val, path)
                 } else {
                     overlay_val
                 };
+                path.pop();
                 base_map.insert(key, merged);
             }
             Value::Object(base_map)
         }
         (Value::Array(base_items), Value::Array(overlay_items)) => {
-            merge_array_values(base_items, overlay_items)
+            if should_merge_array(path) {
+                merge_array_values(base_items, overlay_items)
+            } else {
+                Value::Array(overlay_items)
+            }
         }
         (_, overlay) => overlay,
     }
+}
+
+fn should_merge_array(path: &[String]) -> bool {
+    matches!(path, [spec, field] if spec == "spec" && (field == "plugins" || field == "targets"))
 }
 
 fn merge_array_values(
@@ -304,7 +318,7 @@ fn merge_array_values(
             {
                 let base_item =
                     std::mem::replace(&mut base_items[position], serde_json::Value::Null);
-                base_items[position] = deep_merge_values(base_item, overlay_item);
+                base_items[position] = deep_merge_values(base_item, overlay_item, &mut Vec::new());
             } else {
                 base_items.push(overlay_item);
             }

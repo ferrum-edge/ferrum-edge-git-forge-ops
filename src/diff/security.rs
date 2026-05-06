@@ -1,5 +1,6 @@
 use crate::config::schema::{PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
+use crate::policy::config::is_default_auth_plugin_name;
 
 #[derive(Debug, Clone)]
 pub struct SecurityFinding {
@@ -19,8 +20,9 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
     }
 
     for proxy in &config.proxies {
-        let has_auth =
-            proxy_has_plugin(config, proxy, |plugin| plugin.plugin_name.contains("auth"));
+        let has_auth = proxy_has_plugin(config, proxy, |plugin| {
+            is_default_auth_plugin_name(&plugin.plugin_name)
+        });
         if !has_auth {
             findings.push(SecurityFinding {
                 severity: "warning".to_string(),

@@ -257,11 +257,11 @@ fn breaking_auth_plugin_deletion_scoped_by_namespace() {
     let desired = GatewayConfig::default();
     let actual = GatewayConfig {
         plugin_configs: vec![
-            make_plugin_config("plugin-shared", "team-alpha", "keyauth", PluginScope::Proxy),
+            make_plugin_config("plugin-shared", "team-alpha", "jwt", PluginScope::Proxy),
             make_plugin_config(
                 "plugin-shared",
                 "team-beta",
-                "rate_limiting",
+                "fake-auth-bypass",
                 PluginScope::Proxy,
             ),
         ],
@@ -272,7 +272,8 @@ fn breaking_auth_plugin_deletion_scoped_by_namespace() {
     let breaking = detect_breaking_changes(&diffs, &desired, &actual);
 
     // Only the team-alpha deletion should be flagged as breaking — the
-    // team-beta plugin with the same id is rate_limiting, not auth.
+    // team-beta plugin with the same id contains "auth" in its name but is
+    // not on the auth allowlist.
     let auth_breaking: Vec<_> = breaking
         .iter()
         .filter(|bc| bc.kind == "PluginConfig" && bc.reason.contains("Auth"))
@@ -439,6 +440,41 @@ fn security_respects_global_auth_plugin() {
 
     let findings = audit_security(&config);
     assert!(!findings
+        .iter()
+        .any(|f| f.message.contains("No auth plugin")));
+}
+
+#[test]
+fn security_audit_uses_auth_allowlist() {
+    let proxy = make_proxy("p1", "/api", "localhost");
+
+    let jwt_config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        plugin_configs: vec![make_plugin_config(
+            "global-auth",
+            "ferrum",
+            "jwt",
+            PluginScope::Global,
+        )],
+        ..GatewayConfig::default()
+    };
+    let jwt_findings = audit_security(&jwt_config);
+    assert!(!jwt_findings
+        .iter()
+        .any(|f| f.message.contains("No auth plugin")));
+
+    let fake_auth_config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![make_plugin_config(
+            "global-auth",
+            "ferrum",
+            "fake-auth-bypass",
+            PluginScope::Global,
+        )],
+        ..GatewayConfig::default()
+    };
+    let fake_auth_findings = audit_security(&fake_auth_config);
+    assert!(fake_auth_findings
         .iter()
         .any(|f| f.message.contains("No auth plugin")));
 }

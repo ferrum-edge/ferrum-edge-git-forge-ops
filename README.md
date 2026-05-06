@@ -60,6 +60,11 @@ overlays/                        # environment-specific deep-merge fragments
   release.yml                    # builds multi-arch image on push to main / v* tag
 ```
 
+Overlay object fields deep-merge. Arrays replace by default so environment
+overlays can narrow lists such as `allowed_methods`, `hosts`,
+`allowed_ws_origins`, and `acl_groups`; `spec.plugins` and `spec.targets` are
+additive and merge by item identity.
+
 ### What a single PR can change
 
 One PR can include any number of new, modified, or deleted resources across any number of namespaces, in any mix of kinds (proxies, consumers, upstreams, plugin configs). The loader walks every `resources/<namespace>/{proxies,consumers,upstreams,plugins}/` directory, the assembler flattens into a single `GatewayConfig`, and apply groups by namespace on the way out — each namespace gets its own `X-Ferrum-Namespace` header and its own incremental diff against the live gateway. Namespaces are isolated: a failure applying to `team-alpha` doesn't block `team-beta`.
