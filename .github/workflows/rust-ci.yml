@@ -88,13 +88,15 @@ jobs:
             ${{ runner.os }}-rust-coverage-
 
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: cargo llvm-cov
         run: cargo llvm-cov --test unit_tests --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: lcov
           path: lcov.info

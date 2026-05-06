@@ -210,6 +210,63 @@ fn legacy_state_key_namespace_is_not_percent_decoded() {
     let key = "team%3Ablue:Proxy:api";
 
     assert_eq!(state_key_namespace(key).as_deref(), Some("team%3Ablue"));
+    assert_eq!(
+        state_key_namespace("team:alpha:Proxy:api:v1").as_deref(),
+        Some("team:alpha")
+    );
+}
+
+#[test]
+fn state_load_migrates_legacy_resource_keys_with_colons() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let state_json = r#"{
+            "version": 2,
+            "environment": "production",
+            "resources": {"team:alpha:Proxy:api:v1": "sha256:abc"}
+        }"#;
+        std::fs::write(".state/production.json", state_json).unwrap();
+
+        let state = StateFile::load("production").unwrap();
+        let migrated = state_key("team:alpha", "Proxy", "api:v1");
+
+        assert_eq!(
+            state.resources.get(&migrated),
+            Some(&"sha256:abc".to_string())
+        );
+        assert!(!state.resources.contains_key("team:alpha:Proxy:api:v1"));
+        assert_eq!(
+            state_key_namespace(&migrated).as_deref(),
+            Some("team:alpha")
+        );
+    });
+}
+
+#[test]
+fn state_load_rejects_conflicting_legacy_and_versioned_keys() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let migrated = state_key("ferrum", "Proxy", "api");
+        let state_json = format!(
+            r#"{{
+                "version": 2,
+                "environment": "production",
+                "resources": {{
+                    "ferrum:Proxy:api": "sha256:old",
+                    "{migrated}": "sha256:new"
+                }}
+            }}"#
+        );
+        std::fs::write(".state/production.json", state_json).unwrap();
+
+        let err = StateFile::load("production").unwrap_err().to_string();
+        assert!(
+            err.contains("conflicting resource hashes"),
+            "expected conflict error, got: {err}"
+        );
+    });
 }
 
 #[test]

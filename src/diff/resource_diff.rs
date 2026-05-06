@@ -147,13 +147,23 @@ pub fn state_key_namespace(key: &str) -> Option<String> {
     // percent-decode this branch: a pre-upgrade namespace may legitimately
     // contain literal `%3A` or `%25`, and changing its meaning would mis-scope
     // shared-mode reconciliation.
-    let mut parts = key.splitn(3, ':');
-    let namespace = parts.next()?;
-    let _kind = parts.next()?;
-    Some(namespace.to_string())
+    parse_legacy_state_key(key).map(|(namespace, _kind, _id)| namespace.to_string())
+}
+
+pub fn normalize_state_key(key: &str) -> Option<String> {
+    if let Some((namespace, kind, id)) = parse_versioned_state_key(key) {
+        return Some(state_key(
+            &decode_state_key_component(namespace),
+            kind,
+            &decode_state_key_component(id),
+        ));
+    }
+
+    parse_legacy_state_key(key).map(|(namespace, kind, id)| state_key(namespace, kind, id))
 }
 
 const STATE_KEY_PREFIX: &str = "__gitforgeops_state_key_v2";
+const STATE_KEY_KINDS: [&str; 4] = ["Proxy", "Consumer", "Upstream", "PluginConfig"];
 
 fn parse_versioned_state_key(key: &str) -> Option<(&str, &str, &str)> {
     let mut parts = key.splitn(4, ':');
@@ -164,11 +174,42 @@ fn parse_versioned_state_key(key: &str) -> Option<(&str, &str, &str)> {
     let namespace = parts.next()?;
     let kind = parts.next()?;
     let id = parts.next()?;
-    if matches!(kind, "Proxy" | "Consumer" | "Upstream" | "PluginConfig") {
+    if is_state_key_kind(kind) {
         Some((namespace, kind, id))
     } else {
         None
     }
+}
+
+fn parse_legacy_state_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut cursor = 0;
+    let mut segments = Vec::new();
+    for segment in key.split(':') {
+        let start = cursor;
+        let end = start + segment.len();
+        segments.push((start, end, segment));
+        cursor = end + 1;
+    }
+
+    if segments.len() < 3 {
+        return None;
+    }
+
+    for &(kind_start, kind_end, kind) in segments.iter().take(segments.len() - 1).skip(1) {
+        if is_state_key_kind(kind) {
+            let namespace = key.get(..kind_start.saturating_sub(1))?;
+            let id = key.get(kind_end + 1..)?;
+            if !namespace.is_empty() && !id.is_empty() {
+                return Some((namespace, kind, id));
+            }
+        }
+    }
+
+    None
+}
+
+fn is_state_key_kind(value: &str) -> bool {
+    STATE_KEY_KINDS.contains(&value)
 }
 
 fn encode_state_key_component(value: &str) -> String {

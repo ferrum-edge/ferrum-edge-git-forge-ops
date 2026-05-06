@@ -7,7 +7,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::GatewayConfig;
-use crate::diff::resource_diff::{state_key, state_key_candidates, state_key_namespace};
+use crate::diff::resource_diff::{
+    normalize_state_key, state_key, state_key_candidates, state_key_namespace,
+};
 
 pub const STATE_DIR: &str = ".state";
 
@@ -91,6 +93,10 @@ impl StateFile {
     pub fn lock(environment: &str) -> crate::error::Result<StateLock> {
         std::fs::create_dir_all(STATE_DIR)?;
         let path = Path::new(STATE_DIR).join(format!("{environment}.lock"));
+        // This lock is deliberately fail-closed: a crashed process can leave a
+        // stale file behind, and operators must remove it after inspecting the
+        // recorded PID/time. Automatic stale detection is unreliable across CI
+        // runners and could permit overlapping read-modify-write applies.
         let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -137,7 +143,27 @@ impl StateFile {
         // the correct `.state/<env>.json` file, regardless of what the on-disk
         // field says.
         state.environment = environment.to_string();
+        state.normalize_resource_keys()?;
         Ok(state)
+    }
+
+    fn normalize_resource_keys(&mut self) -> crate::error::Result<()> {
+        let existing = std::mem::take(&mut self.resources);
+        for (key, value) in existing {
+            let normalized = normalize_state_key(&key).unwrap_or(key);
+            match self.resources.get(&normalized) {
+                Some(existing_value) if existing_value != &value => {
+                    return Err(crate::error::Error::Config(format!(
+                        "state file contains conflicting resource hashes for normalized key {normalized:?}; repair duplicate legacy/new state entries before continuing"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.resources.insert(normalized, value);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn save(&self) -> crate::error::Result<()> {

@@ -466,8 +466,10 @@ impl AdminClient {
 
 async fn backoff_sleep(attempt: u32) {
     // Full-jitter backoff based on 500ms · 2^(attempt-1), capped at 8s.
+    // Keep a small floor so retries never hammer a recovering gateway with an
+    // immediate zero-delay retry.
     let exp = attempt.saturating_sub(1).min(4);
     let cap_ms = (500u64 * (1u64 << exp)).min(8_000);
-    let delay_ms = rand::rng().random_range(0..=cap_ms);
+    let delay_ms = rand::rng().random_range(100..=cap_ms.max(100));
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
