@@ -320,6 +320,18 @@ fn validate_unique_resource_keys_rejects_duplicates() {
     );
 }
 
+#[test]
+fn validate_unique_resource_keys_runs_after_namespace_selection() {
+    let config = assemble(vec![
+        ("ferrum".to_string(), make_proxy("ok")),
+        ("team-alpha".to_string(), make_proxy("same")),
+        ("team-alpha".to_string(), make_proxy("same")),
+    ]);
+
+    let selected = select_config_namespace(&config, Some("ferrum"));
+    validate_unique_resource_keys(&selected).unwrap();
+}
+
 fn make_proxy(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Proxy {

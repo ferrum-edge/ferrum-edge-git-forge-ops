@@ -308,7 +308,7 @@ pub async fn rotate_and_deliver(
     shards: &mut BTreeMap<u32, CredentialBundle>,
     shard_count: &mut u32,
 ) -> Result<AllocatedSlot, AllocationFailure> {
-    let mut partial = AllocateOutcome::default();
+    let partial = AllocateOutcome::default();
     let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
         .await
         .map_err(|source| AllocationFailure {
@@ -401,11 +401,6 @@ pub async fn rotate_and_deliver(
         alloc: PlaceholderAlloc::Rotate,
         delivered,
     };
-    partial.allocated.push(allocated.clone());
-    partial
-        .bundle_hashes
-        .insert(target_shard, bundle_hash(&staged_bundle));
-    partial.shard_count = *shard_count;
 
     put_environment_secret(
         client,

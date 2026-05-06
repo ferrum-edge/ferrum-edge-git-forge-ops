@@ -125,9 +125,9 @@ fn load_and_assemble_for(
     }
 
     let gateway_config = config::assemble(resources);
-    config::validate_unique_resource_keys(&gateway_config)?;
     let gateway_config =
         config::select_config_namespace(&gateway_config, resolved.namespace_filter.as_deref());
+    config::validate_unique_resource_keys(&gateway_config)?;
     Ok(gateway_config)
 }
 
