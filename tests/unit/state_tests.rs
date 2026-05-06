@@ -29,7 +29,7 @@ fn state_file_writes_and_reads_per_env() {
         let mut state = StateFile::load("staging").unwrap();
         state
             .resources
-            .insert("ferrum:Proxy:p1".to_string(), "sha256:abc".to_string());
+            .insert(state_key("ferrum", "Proxy", "p1"), "sha256:abc".to_string());
         state.last_applied_at = Some("2026-04-23T00:00:00Z".to_string());
         state.save().unwrap();
 
@@ -108,10 +108,11 @@ fn scoped_record_preserves_entries_outside_scope() {
     // Prior state has entries in two namespaces.
     state
         .resources
-        .insert("ferrum:Proxy:one".to_string(), "sha256:A".to_string());
+        .insert(state_key("ferrum", "Proxy", "one"), "sha256:A".to_string());
+    let platform_key = state_key("platform", "Proxy", "two");
     state
         .resources
-        .insert("platform:Proxy:two".to_string(), "sha256:B".to_string());
+        .insert(platform_key.clone(), "sha256:B".to_string());
 
     // Scoped apply: only ferrum is in scope, and desired has been filtered
     // to ferrum.
@@ -125,30 +126,33 @@ fn scoped_record_preserves_entries_outside_scope() {
     assert!(state
         .resources
         .contains_key(&state_key("ferrum", "Proxy", "one-updated")));
-    assert!(!state.resources.contains_key("ferrum:Proxy:one"));
+    assert!(!state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "one")));
     // platform entry preserved — this is the invariant the scoped apply
     // must honor.
     assert_eq!(
-        state.resources.get("platform:Proxy:two"),
+        state.resources.get(&platform_key),
         Some(&"sha256:B".to_string())
     );
 }
 
 #[test]
-fn state_load_normalizes_environment_to_requested_name() {
-    // Regression guard: if an env-specific state file was created via the
-    // legacy migration from a read-only command, the on-disk `environment`
-    // field is empty (serde default). Loading that file must patch the
-    // in-memory state to the requested env name; otherwise the next
-    // save() would path to `.state/.json`.
+fn state_load_uses_requested_environment_name() {
+    // The selected environment path is authoritative. Loading a file through
+    // `.state/production.json` should save back to the same path even if the
+    // embedded environment field was edited by hand.
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
         std::fs::create_dir_all(".state").unwrap();
-        // Write a state file whose environment field is missing/default.
-        let state_json = r#"{
+        let key = state_key("ferrum", "Proxy", "p1");
+        let state_json = format!(
+            r#"{{
             "version": 2,
-            "resources": {"ferrum:Proxy:p1": "sha256:abc"}
-        }"#;
+            "environment": "staging",
+            "resources": {{"{key}": "sha256:abc"}}
+        }}"#
+        );
         std::fs::write(".state/production.json", state_json).unwrap();
 
         let state = StateFile::load("production").unwrap();
@@ -206,94 +210,28 @@ fn state_keys_escape_colons_in_namespace_and_id() {
 }
 
 #[test]
-fn legacy_state_key_namespace_is_not_percent_decoded() {
-    let key = "team%3Ablue:Proxy:api";
-
-    assert_eq!(state_key_namespace(key).as_deref(), Some("team%3Ablue"));
-    assert_eq!(
-        state_key_namespace("team:alpha:Proxy:api:v1").as_deref(),
-        Some("team:alpha")
-    );
-    assert_eq!(
-        state_key_namespace("team:Proxy:alpha:Consumer:api").as_deref(),
-        Some("team:Proxy:alpha")
-    );
+fn raw_state_key_namespace_is_rejected() {
+    assert_eq!(state_key_namespace("team%3Ablue:Proxy:api"), None);
+    assert_eq!(state_key_namespace("team:alpha:Proxy:api:v1"), None);
+    assert_eq!(state_key_namespace("team:Proxy:alpha:Consumer:api"), None);
 }
 
 #[test]
-fn state_load_migrates_legacy_resource_keys_with_colons() {
+fn state_load_rejects_raw_resource_keys() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
         std::fs::create_dir_all(".state").unwrap();
         let state_json = r#"{
             "version": 2,
             "environment": "production",
-            "resources": {"team:alpha:Proxy:api:v1": "sha256:abc"}
+            "resources": {"ferrum:Proxy:api": "sha256:old"}
         }"#;
-        std::fs::write(".state/production.json", state_json).unwrap();
-
-        let state = StateFile::load("production").unwrap();
-        let migrated = state_key("team:alpha", "Proxy", "api:v1");
-
-        assert_eq!(
-            state.resources.get(&migrated),
-            Some(&"sha256:abc".to_string())
-        );
-        assert!(!state.resources.contains_key("team:alpha:Proxy:api:v1"));
-        assert_eq!(
-            state_key_namespace(&migrated).as_deref(),
-            Some("team:alpha")
-        );
-    });
-}
-
-#[test]
-fn state_load_migrates_legacy_key_using_rightmost_kind_segment() {
-    let dir = TempDir::new().unwrap();
-    with_cwd(dir.path(), || {
-        std::fs::create_dir_all(".state").unwrap();
-        let state_json = r#"{
-            "version": 2,
-            "environment": "production",
-            "resources": {"team:Proxy:alpha:Consumer:api": "sha256:abc"}
-        }"#;
-        std::fs::write(".state/production.json", state_json).unwrap();
-
-        let state = StateFile::load("production").unwrap();
-        let migrated = state_key("team:Proxy:alpha", "Consumer", "api");
-
-        assert_eq!(
-            state.resources.get(&migrated),
-            Some(&"sha256:abc".to_string())
-        );
-        assert!(!state
-            .resources
-            .contains_key("team:Proxy:alpha:Consumer:api"));
-    });
-}
-
-#[test]
-fn state_load_rejects_conflicting_legacy_and_versioned_keys() {
-    let dir = TempDir::new().unwrap();
-    with_cwd(dir.path(), || {
-        std::fs::create_dir_all(".state").unwrap();
-        let migrated = state_key("ferrum", "Proxy", "api");
-        let state_json = format!(
-            r#"{{
-                "version": 2,
-                "environment": "production",
-                "resources": {{
-                    "ferrum:Proxy:api": "sha256:old",
-                    "{migrated}": "sha256:new"
-                }}
-            }}"#
-        );
         std::fs::write(".state/production.json", state_json).unwrap();
 
         let err = StateFile::load("production").unwrap_err().to_string();
         assert!(
-            err.contains("conflicting resource hashes"),
-            "expected conflict error, got: {err}"
+            err.contains("invalid resource key"),
+            "expected invalid key error, got: {err}"
         );
     });
 }
@@ -415,13 +353,14 @@ fn record_op_preserves_state_for_failed_delete() {
 
     // Prior state: two managed resources in `ferrum`.
     let mut state = StateFile::default();
+    let keep_key = state_key("ferrum", "Proxy", "keep-me");
+    let delete_key = state_key("ferrum", "Proxy", "to-delete");
     state
         .resources
-        .insert("ferrum:Proxy:keep-me".to_string(), "sha256:OLD".to_string());
-    state.resources.insert(
-        "ferrum:Proxy:to-delete".to_string(),
-        "sha256:DEL".to_string(),
-    );
+        .insert(keep_key.clone(), "sha256:OLD".to_string());
+    state
+        .resources
+        .insert(delete_key.clone(), "sha256:DEL".to_string());
 
     // User removed `to-delete` from the repo. Apply tried Delete but the
     // gateway returned 500. Apply also successfully created `new-one`.
@@ -454,12 +393,12 @@ fn record_op_preserves_state_for_failed_delete() {
     // and the next diff will retry the delete instead of treating it as
     // unmanaged.
     assert!(
-        state.resources.contains_key("ferrum:Proxy:to-delete"),
+        state.resources.contains_key(&delete_key),
         "failed Delete must NOT remove the key from state, otherwise the resource is orphaned"
     );
     // Pre-existing managed entry is untouched.
     assert!(
-        state.resources.contains_key("ferrum:Proxy:keep-me"),
+        state.resources.contains_key(&keep_key),
         "unchanged managed entry must persist"
     );
 
@@ -478,21 +417,21 @@ fn record_op_preserves_state_for_failed_delete() {
         )
         .unwrap();
     assert!(
-        !state2.resources.contains_key("ferrum:Proxy:to-delete"),
+        !state2.resources.contains_key(&delete_key),
         "successful Delete must remove the key from state"
     );
 
     // Successful Modify on a Consumer should refresh the hash and not
     // touch other namespaces.
     let mut state3 = StateFile::default();
-    state3.resources.insert(
-        "platform:Consumer:other".to_string(),
-        "sha256:OTHER".to_string(),
-    );
-    state3.resources.insert(
-        "ferrum:Consumer:app".to_string(),
-        "sha256:STALE".to_string(),
-    );
+    let other_key = state_key("platform", "Consumer", "other");
+    let app_key = state_key("ferrum", "Consumer", "app");
+    state3
+        .resources
+        .insert(other_key.clone(), "sha256:OTHER".to_string());
+    state3
+        .resources
+        .insert(app_key.clone(), "sha256:STALE".to_string());
     let consumer = Consumer {
         id: "app".to_string(),
         username: "app".to_string(),
@@ -519,42 +458,13 @@ fn record_op_preserves_state_for_failed_delete() {
         )
         .unwrap();
     assert_ne!(
-        state3
-            .resources
-            .get(&state_key("ferrum", "Consumer", "app")),
+        state3.resources.get(&app_key),
         Some(&"sha256:STALE".to_string()),
         "Modify must refresh the hash"
     );
     assert_eq!(
-        state3.resources.get("platform:Consumer:other"),
+        state3.resources.get(&other_key),
         Some(&"sha256:OTHER".to_string()),
         "out-of-namespace entry must remain untouched"
     );
-
-    // Legacy state keys from pre-upgrade files should be cleaned up when the
-    // same resource is successfully modified under the new key format.
-    let mut state4 = StateFile::default();
-    state4.resources.insert(
-        "ferrum:Proxy:legacy".to_string(),
-        "sha256:LEGACY".to_string(),
-    );
-    let desired = GatewayConfig {
-        proxies: vec![proxy("legacy", "ferrum")],
-        ..GatewayConfig::default()
-    };
-    state4
-        .record_op(
-            &AppliedOp {
-                kind: "Proxy".to_string(),
-                namespace: "ferrum".to_string(),
-                id: "legacy".to_string(),
-                action: DiffAction::Modify,
-            },
-            &desired,
-        )
-        .unwrap();
-    assert!(!state4.resources.contains_key("ferrum:Proxy:legacy"));
-    assert!(state4
-        .resources
-        .contains_key(&state_key("ferrum", "Proxy", "legacy")));
 }

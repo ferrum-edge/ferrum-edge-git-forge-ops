@@ -418,7 +418,7 @@ Only three kinds of configuration source exist:
 | `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML (two-stage) |
 | `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all. |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` (CRUD) or `full_replace` (POST /restore). Ignored when repo config sets it. |
-| `FERRUM_OVERLAY` | — | Legacy overlay selector (superseded by `FERRUM_ENV` + repo config) |
+| `FERRUM_OVERLAY` | — | Overlay selector override; prefer `FERRUM_ENV` + repo config |
 | `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification (dev only) |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | Timeout for TCP/TLS connection to the admin API. Raise if the gateway is behind a slow LB. |

@@ -7,9 +7,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::GatewayConfig;
-use crate::diff::resource_diff::{
-    normalize_state_key, state_key, state_key_candidates, state_key_namespace,
-};
+use crate::diff::resource_diff::{state_key, state_key_namespace};
 
 pub const STATE_DIR: &str = ".state";
 
@@ -39,7 +37,6 @@ pub struct OverrideRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFile {
     pub version: u32,
-    #[serde(default)]
     pub environment: String,
     pub last_applied_at: Option<String>,
     pub last_applied_commit: Option<String>,
@@ -143,30 +140,23 @@ impl StateFile {
         // the correct `.state/<env>.json` file, regardless of what the on-disk
         // field says.
         state.environment = environment.to_string();
-        state.normalize_resource_keys()?;
+        state.validate_resource_keys()?;
         Ok(state)
     }
 
-    fn normalize_resource_keys(&mut self) -> crate::error::Result<()> {
-        let existing = std::mem::take(&mut self.resources);
-        for (key, value) in existing {
-            let normalized = normalize_state_key(&key).unwrap_or(key);
-            match self.resources.get(&normalized) {
-                Some(existing_value) if existing_value != &value => {
-                    return Err(crate::error::Error::Config(format!(
-                        "state file contains conflicting resource hashes for normalized key {normalized:?}; repair duplicate legacy/new state entries before continuing"
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    self.resources.insert(normalized, value);
-                }
+    fn validate_resource_keys(&self) -> crate::error::Result<()> {
+        for key in self.resources.keys() {
+            if state_key_namespace(key).is_none() {
+                return Err(crate::error::Error::Config(format!(
+                    "state file contains invalid resource key {key:?}; expected __gitforgeops_state_key_v2:<namespace>:<kind>:<id>"
+                )));
             }
         }
         Ok(())
     }
 
     pub fn save(&self) -> crate::error::Result<()> {
+        self.validate_resource_keys()?;
         std::fs::create_dir_all(STATE_DIR)?;
         let path = Self::path_for(&self.environment);
         let tmp_path = path.with_extension(format!(
@@ -223,8 +213,9 @@ impl StateFile {
         // Drop only the entries for namespaces we're reconciling right now;
         // everything else stays as the last apply recorded it.
         self.resources.retain(|key, _| {
-            let ns = state_key_namespace(key).unwrap_or_default();
-            !scope.contains(ns.as_str())
+            state_key_namespace(key)
+                .map(|ns| !scope.contains(ns.as_str()))
+                .unwrap_or(false)
         });
 
         for proxy in &config.proxies {
@@ -275,13 +266,11 @@ impl StateFile {
         desired: &GatewayConfig,
     ) -> crate::error::Result<()> {
         use crate::diff::resource_diff::DiffAction;
-        let key_candidates = state_key_candidates(&op.namespace, &op.kind, &op.id);
+        let key = state_key(&op.namespace, &op.kind, &op.id);
 
         match op.action {
             DiffAction::Delete => {
-                for key in &key_candidates {
-                    self.resources.remove(key);
-                }
+                self.resources.remove(&key);
             }
             DiffAction::Add | DiffAction::Modify => {
                 let hash = match op.kind.as_str() {
@@ -308,10 +297,6 @@ impl StateFile {
                     _ => None,
                 };
                 if let Some(h) = hash {
-                    for key in &key_candidates {
-                        self.resources.remove(key);
-                    }
-                    let key = state_key(&op.namespace, &op.kind, &op.id);
                     self.resources.insert(key, h);
                 }
             }
@@ -325,8 +310,9 @@ impl StateFile {
     /// authoritative and equals `desired`.
     pub fn record_full_replace(&mut self, namespace: &str, desired: &GatewayConfig) {
         self.resources.retain(|key, _| {
-            let ns = state_key_namespace(key).unwrap_or_default();
-            ns != namespace
+            state_key_namespace(key)
+                .map(|ns| ns != namespace)
+                .unwrap_or(false)
         });
         for p in desired.proxies.iter().filter(|p| p.namespace == namespace) {
             self.resources

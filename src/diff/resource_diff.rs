@@ -127,45 +127,14 @@ pub fn state_key(namespace: &str, kind: &str, id: &str) -> String {
     )
 }
 
-pub fn legacy_state_key(namespace: &str, kind: &str, id: &str) -> String {
-    format!("{namespace}:{kind}:{id}")
-}
-
-pub fn state_key_candidates(namespace: &str, kind: &str, id: &str) -> [String; 2] {
-    [
-        state_key(namespace, kind, id),
-        legacy_state_key(namespace, kind, id),
-    ]
-}
-
 pub fn state_key_namespace(key: &str) -> Option<String> {
-    if let Some((namespace, _kind, _id)) = parse_versioned_state_key(key) {
-        return Some(decode_state_key_component(namespace));
-    }
-
-    // Legacy keys were stored as raw `<namespace>:<kind>:<id>` strings. Do not
-    // percent-decode this branch: a pre-upgrade namespace may legitimately
-    // contain literal `%3A` or `%25`, and changing its meaning would mis-scope
-    // shared-mode reconciliation.
-    parse_legacy_state_key(key).map(|(namespace, _kind, _id)| namespace.to_string())
-}
-
-pub fn normalize_state_key(key: &str) -> Option<String> {
-    if let Some((namespace, kind, id)) = parse_versioned_state_key(key) {
-        return Some(state_key(
-            &decode_state_key_component(namespace),
-            kind,
-            &decode_state_key_component(id),
-        ));
-    }
-
-    parse_legacy_state_key(key).map(|(namespace, kind, id)| state_key(namespace, kind, id))
+    parse_state_key(key).map(|(namespace, _kind, _id)| decode_state_key_component(namespace))
 }
 
 const STATE_KEY_PREFIX: &str = "__gitforgeops_state_key_v2";
 const STATE_KEY_KINDS: [&str; 4] = ["Proxy", "Consumer", "Upstream", "PluginConfig"];
 
-fn parse_versioned_state_key(key: &str) -> Option<(&str, &str, &str)> {
+fn parse_state_key(key: &str) -> Option<(&str, &str, &str)> {
     let mut parts = key.splitn(4, ':');
     let prefix = parts.next()?;
     if prefix != STATE_KEY_PREFIX {
@@ -174,38 +143,11 @@ fn parse_versioned_state_key(key: &str) -> Option<(&str, &str, &str)> {
     let namespace = parts.next()?;
     let kind = parts.next()?;
     let id = parts.next()?;
-    if is_state_key_kind(kind) {
+    if !namespace.is_empty() && !id.is_empty() && is_state_key_kind(kind) {
         Some((namespace, kind, id))
     } else {
         None
     }
-}
-
-fn parse_legacy_state_key(key: &str) -> Option<(&str, &str, &str)> {
-    let mut cursor = 0;
-    let mut segments = Vec::new();
-    for segment in key.split(':') {
-        let start = cursor;
-        let end = start + segment.len();
-        segments.push((start, end, segment));
-        cursor = end + 1;
-    }
-
-    if segments.len() < 3 {
-        return None;
-    }
-
-    for &(kind_start, kind_end, kind) in segments.iter().rev().skip(1).take(segments.len() - 2) {
-        if is_state_key_kind(kind) {
-            let namespace = key.get(..kind_start.saturating_sub(1))?;
-            let id = key.get(kind_end + 1..)?;
-            if !namespace.is_empty() && !id.is_empty() {
-                return Some((namespace, kind, id));
-            }
-        }
-    }
-
-    None
 }
 
 fn is_state_key_kind(value: &str) -> bool {
@@ -292,9 +234,7 @@ fn diff_collection<T: serde::Serialize>(
 
         match ownership_scope {
             OwnershipScope::Shared { previously_managed } => {
-                let was_managed = state_key_candidates(namespace, kind, id)
-                    .iter()
-                    .any(|key| previously_managed.contains(key));
+                let was_managed = previously_managed.contains(&state_key(namespace, kind, id));
                 if was_managed {
                     // We previously applied this resource, repo no longer declares
                     // it → delete.

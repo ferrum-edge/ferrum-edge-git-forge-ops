@@ -21,8 +21,7 @@ impl ResolvedEnv {
     }
 
     /// Enforce the invariants that `RepoConfig::validate` enforces on the
-    /// YAML side, so the synthetic-default path (legacy env-var-only
-    /// deployments, no .gitforgeops/config.yaml) can't construct a
+    /// YAML side, so the env-var-only path (no .gitforgeops/config.yaml) can't construct a
     /// configuration the YAML validator would reject. Run this at the end
     /// of resolve_env so both branches go through the same gate.
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -143,7 +142,7 @@ pub fn resolve_env(
 
     // Enforce shared + full_replace incompatibility (and other invariants)
     // on every path — the YAML validator guards the repo-config side but
-    // the synthetic path picks up legacy FERRUM_APPLY_STRATEGY=full_replace
+    // the synthetic path picks up FERRUM_APPLY_STRATEGY=full_replace
     // env vars without going through that check.
     resolved.validate()?;
     Ok(resolved)
