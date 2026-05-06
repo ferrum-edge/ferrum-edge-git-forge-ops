@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_AUDIT_VERSION: 0.22.1
     steps:
       - uses: actions/checkout@v6
 
@@ -43,12 +45,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-
             ${{ runner.os }}-cargo-audit-
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: |
+          if ! cargo audit --version | grep -q "$CARGO_AUDIT_VERSION"; then
+            cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --force
+          fi
+          cargo audit --version
 
       - name: cargo audit
         run: |
