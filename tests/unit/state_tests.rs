@@ -122,7 +122,9 @@ fn scoped_record_preserves_entries_outside_scope() {
     state.record(&desired, &["ferrum".to_string()]);
 
     // ferrum entries refreshed.
-    assert!(state.resources.contains_key("ferrum:Proxy:one-updated"));
+    assert!(state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "one-updated")));
     assert!(!state.resources.contains_key("ferrum:Proxy:one"));
     // platform entry preserved — this is the invariant the scoped apply
     // must honor.
@@ -197,7 +199,17 @@ fn state_keys_escape_colons_in_namespace_and_id() {
     let key = state_key("team:alpha", "Proxy", "api:v1");
 
     assert_eq!(state_key_namespace(&key).as_deref(), Some("team:alpha"));
-    assert_eq!(key, "team%3Aalpha:Proxy:api%3Av1");
+    assert_eq!(
+        key,
+        "__gitforgeops_state_key_v2:team%3Aalpha:Proxy:api%3Av1"
+    );
+}
+
+#[test]
+fn legacy_state_key_namespace_is_not_percent_decoded() {
+    let key = "team%3Ablue:Proxy:api";
+
+    assert_eq!(state_key_namespace(key).as_deref(), Some("team%3Ablue"));
 }
 
 #[test]
@@ -347,7 +359,9 @@ fn record_op_preserves_state_for_failed_delete() {
 
     // Successful create is in state.
     assert!(
-        state.resources.contains_key("ferrum:Proxy:new-one"),
+        state
+            .resources
+            .contains_key(&state_key("ferrum", "Proxy", "new-one")),
         "successful Add must record into state"
     );
     // Failed delete's key is PRESERVED — the resource is still managed,
@@ -419,7 +433,9 @@ fn record_op_preserves_state_for_failed_delete() {
         )
         .unwrap();
     assert_ne!(
-        state3.resources.get("ferrum:Consumer:app"),
+        state3
+            .resources
+            .get(&state_key("ferrum", "Consumer", "app")),
         Some(&"sha256:STALE".to_string()),
         "Modify must refresh the hash"
     );
@@ -428,4 +444,31 @@ fn record_op_preserves_state_for_failed_delete() {
         Some(&"sha256:OTHER".to_string()),
         "out-of-namespace entry must remain untouched"
     );
+
+    // Legacy state keys from pre-upgrade files should be cleaned up when the
+    // same resource is successfully modified under the new key format.
+    let mut state4 = StateFile::default();
+    state4.resources.insert(
+        "ferrum:Proxy:legacy".to_string(),
+        "sha256:LEGACY".to_string(),
+    );
+    let desired = GatewayConfig {
+        proxies: vec![proxy("legacy", "ferrum")],
+        ..GatewayConfig::default()
+    };
+    state4
+        .record_op(
+            &AppliedOp {
+                kind: "Proxy".to_string(),
+                namespace: "ferrum".to_string(),
+                id: "legacy".to_string(),
+                action: DiffAction::Modify,
+            },
+            &desired,
+        )
+        .unwrap();
+    assert!(!state4.resources.contains_key("ferrum:Proxy:legacy"));
+    assert!(state4
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "legacy")));
 }

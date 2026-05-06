@@ -1,7 +1,8 @@
 use gitforgeops::config::schema::*;
 use gitforgeops::diff::{
     best_practice::check_best_practices, breaking::detect_breaking_changes,
-    resource_diff::compute_diff, resource_diff::DiffAction, security::audit_security,
+    resource_diff::compute_diff, resource_diff::compute_diff_with_scope, resource_diff::DiffAction,
+    resource_diff::OwnershipScope, security::audit_security,
 };
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
@@ -197,6 +198,29 @@ fn diff_treats_same_id_in_different_namespaces_as_distinct() {
     assert!(diffs
         .iter()
         .any(|diff| matches!(diff.action, DiffAction::Delete) && diff.namespace == "ferrum"));
+}
+
+#[test]
+fn shared_diff_honors_legacy_managed_state_keys() {
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        proxies: vec![make_proxy("legacy-managed", "/api", "localhost")],
+        ..GatewayConfig::default()
+    };
+    let mut previously_managed = std::collections::HashSet::new();
+    previously_managed.insert("ferrum:Proxy:legacy-managed".to_string());
+
+    let result = compute_diff_with_scope(
+        &desired,
+        &actual,
+        OwnershipScope::Shared {
+            previously_managed: &previously_managed,
+        },
+    );
+
+    assert_eq!(result.diffs.len(), 1);
+    assert!(matches!(result.diffs[0].action, DiffAction::Delete));
+    assert!(result.unmanaged.is_empty());
 }
 
 #[test]

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::GatewayConfig;
-use crate::diff::resource_diff::{state_key, state_key_namespace};
+use crate::diff::resource_diff::{state_key, state_key_candidates, state_key_namespace};
 
 pub const STATE_DIR: &str = ".state";
 
@@ -249,11 +249,13 @@ impl StateFile {
         desired: &GatewayConfig,
     ) -> crate::error::Result<()> {
         use crate::diff::resource_diff::DiffAction;
-        let key = state_key(&op.namespace, &op.kind, &op.id);
+        let key_candidates = state_key_candidates(&op.namespace, &op.kind, &op.id);
 
         match op.action {
             DiffAction::Delete => {
-                self.resources.remove(&key);
+                for key in &key_candidates {
+                    self.resources.remove(key);
+                }
             }
             DiffAction::Add | DiffAction::Modify => {
                 let hash = match op.kind.as_str() {
@@ -280,6 +282,10 @@ impl StateFile {
                     _ => None,
                 };
                 if let Some(h) = hash {
+                    for key in &key_candidates {
+                        self.resources.remove(key);
+                    }
+                    let key = state_key(&op.namespace, &op.kind, &op.id);
                     self.resources.insert(key, h);
                 }
             }

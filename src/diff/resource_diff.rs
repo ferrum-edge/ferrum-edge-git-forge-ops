@@ -120,17 +120,55 @@ pub fn compute_diff_with_scope(
 
 pub fn state_key(namespace: &str, kind: &str, id: &str) -> String {
     format!(
-        "{}:{kind}:{}",
+        "{}:{}:{kind}:{}",
+        STATE_KEY_PREFIX,
         encode_state_key_component(namespace),
         encode_state_key_component(id)
     )
 }
 
+pub fn legacy_state_key(namespace: &str, kind: &str, id: &str) -> String {
+    format!("{namespace}:{kind}:{id}")
+}
+
+pub fn state_key_candidates(namespace: &str, kind: &str, id: &str) -> [String; 2] {
+    [
+        state_key(namespace, kind, id),
+        legacy_state_key(namespace, kind, id),
+    ]
+}
+
 pub fn state_key_namespace(key: &str) -> Option<String> {
+    if let Some((namespace, _kind, _id)) = parse_versioned_state_key(key) {
+        return Some(decode_state_key_component(namespace));
+    }
+
+    // Legacy keys were stored as raw `<namespace>:<kind>:<id>` strings. Do not
+    // percent-decode this branch: a pre-upgrade namespace may legitimately
+    // contain literal `%3A` or `%25`, and changing its meaning would mis-scope
+    // shared-mode reconciliation.
     let mut parts = key.splitn(3, ':');
     let namespace = parts.next()?;
     let _kind = parts.next()?;
-    Some(decode_state_key_component(namespace))
+    Some(namespace.to_string())
+}
+
+const STATE_KEY_PREFIX: &str = "__gitforgeops_state_key_v2";
+
+fn parse_versioned_state_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = key.splitn(4, ':');
+    let prefix = parts.next()?;
+    if prefix != STATE_KEY_PREFIX {
+        return None;
+    }
+    let namespace = parts.next()?;
+    let kind = parts.next()?;
+    let id = parts.next()?;
+    if matches!(kind, "Proxy" | "Consumer" | "Upstream" | "PluginConfig") {
+        Some((namespace, kind, id))
+    } else {
+        None
+    }
 }
 
 fn encode_state_key_component(value: &str) -> String {
@@ -213,8 +251,10 @@ fn diff_collection<T: serde::Serialize>(
 
         match ownership_scope {
             OwnershipScope::Shared { previously_managed } => {
-                let key = state_key(namespace, kind, id);
-                if previously_managed.contains(&key) {
+                let was_managed = state_key_candidates(namespace, kind, id)
+                    .iter()
+                    .any(|key| previously_managed.contains(key));
+                if was_managed {
                     // We previously applied this resource, repo no longer declares
                     // it → delete.
                     result.diffs.push(ResourceDiff {
