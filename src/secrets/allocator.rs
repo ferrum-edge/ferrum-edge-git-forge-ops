@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use reqwest::Client;
 
 use super::bundle::{
