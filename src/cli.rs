@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -24,8 +24,8 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     Validate {
-        #[arg(long, default_value = "text")]
-        format: String,
+        #[arg(long, value_enum, default_value_t = ValidateFormat::Text)]
+        format: ValidateFormat,
     },
     Export {
         #[arg(long, short)]
@@ -56,9 +56,9 @@ pub enum Commands {
         allow_large_prune: bool,
     },
     Import {
-        #[arg(long)]
-        from_api: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_file")]
+        from_api: bool,
+        #[arg(long, conflicts_with = "from_api")]
         from_file: Option<String>,
         #[arg(long, default_value = "./resources")]
         output_dir: String,
@@ -69,8 +69,8 @@ pub enum Commands {
     },
     /// Emit JSON listing environments declared in repo config (used by CI matrix).
     Envs {
-        #[arg(long, default_value = "json")]
-        format: String,
+        #[arg(long, value_enum, default_value_t = EnvsFormat::Json)]
+        format: EnvsFormat,
     },
     /// Rotate a specific credential slot. Requires provisioner token.
     Rotate {
@@ -84,4 +84,18 @@ pub enum Commands {
         #[arg(long)]
         recipient: Option<String>,
     },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum ValidateFormat {
+    Text,
+    Json,
+    Github,
+    GithubAnnotations,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum EnvsFormat {
+    Json,
+    Text,
 }

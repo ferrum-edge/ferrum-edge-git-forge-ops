@@ -141,8 +141,8 @@ pub async fn allocate_and_deliver(
         // from the slot's current shard — we'd write the fresh value to
         // shard N while a stale copy lingers on shard M. Because
         // `merge_bundles` iterates shards in ascending order, whichever copy
-        // sits on the higher shard index wins; that can silently revert to
-        // the old value.
+        // sits on the higher shard index wins; that can silently revert to a
+        // stale value.
         let existing_shard = staged
             .iter()
             .find_map(|(s, bundle)| bundle.contains_key(&candidate.slot).then_some(*s));
@@ -289,13 +289,9 @@ pub async fn allocate_and_deliver(
 ///
 /// Ordering matters: encrypt the delivery ciphertext **before** PUT, and fail
 /// closed when the caller requested a recipient but `deliver_to_author`
-/// returns `None` (recipient has no compatible SSH key). The prior flow
-/// wrote the new secret to GitHub first, attempted delivery after, and
-/// treated `Ok(None)` as success — so a recipient with no SSH key (or a
-/// transient /users/{login}/keys failure) silently rotated the gateway
-/// credential to a value nobody received. That left the deployed consumer
-/// credential in a state where the rotator couldn't authenticate again and
-/// no re-delivery path existed without another explicit rotate.
+/// returns `None` (recipient has no compatible SSH key). This keeps rotation
+/// atomic from the operator's perspective: the GitHub secret is changed only
+/// after the new value has a deliverable ciphertext.
 #[allow(clippy::too_many_arguments)]
 pub async fn rotate_and_deliver(
     client: &Client,
@@ -307,8 +303,14 @@ pub async fn rotate_and_deliver(
     length_bytes: usize,
     shards: &mut BTreeMap<u32, CredentialBundle>,
     shard_count: &mut u32,
-) -> crate::error::Result<AllocatedSlot> {
-    let pubkey = fetch_public_key(client, repo, environment, provisioner_token).await?;
+) -> Result<AllocatedSlot, AllocationFailure> {
+    let partial = AllocateOutcome::default();
+    let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
+        .await
+        .map_err(|source| AllocationFailure {
+            source,
+            partial: partial.clone(),
+        })?;
     // Honor the placeholder's `len=...` field. Forcing 32 bytes would
     // silently shrink credentials declared with a larger length and grow
     // ones declared smaller.
@@ -320,14 +322,22 @@ pub async fn rotate_and_deliver(
     // once the recipient fixes their keys. Mirrors the same invariant
     // allocate_and_deliver already enforces.
     let delivered = if let Some(login) = recipient_login {
-        match deliver_to_author(client, login, value.as_bytes()).await? {
+        match deliver_to_author(client, login, value.as_bytes())
+            .await
+            .map_err(|source| AllocationFailure {
+                source,
+                partial: partial.clone(),
+            })? {
             Some(d) => Some(d),
             None => {
-                return Err(crate::error::Error::Config(format!(
-                    "Refusing to rotate slot '{slot}': recipient @{login} has no compatible SSH public key on GitHub. \
-                     Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys, then retry. \
-                     To rotate without delivery, re-run without --recipient."
-                )));
+                return Err(AllocationFailure {
+                    source: crate::error::Error::Config(format!(
+                        "Refusing to rotate slot '{slot}': recipient @{login} has no compatible SSH public key on GitHub. \
+                         Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys, then retry. \
+                         To rotate without delivery, re-run without --recipient."
+                    )),
+                    partial,
+                });
             }
         }
     } else {
@@ -359,24 +369,34 @@ pub async fn rotate_and_deliver(
                     // API instead of up front with a clear config error.
                     *shard_count += 1;
                     if *shard_count > 100 {
-                        return Err(crate::error::Error::Config(
-                            "credential bundle shards exceeded 100 (GitHub env secret limit) during rotate"
-                                .to_string(),
-                        ));
+                        return Err(AllocationFailure {
+                            source: crate::error::Error::Config(
+                                "credential bundle shards exceeded 100 (GitHub env secret limit) during rotate"
+                                    .to_string(),
+                            ),
+                            partial,
+                        });
                     }
                 }
             }
         },
     };
 
-    shards
-        .entry(target_shard)
-        .or_default()
-        .insert(slot.to_string(), value.clone());
-
     let bundle = shards.get(&target_shard).cloned().unwrap_or_default();
-    let serialized = serialize_bundle(&bundle)?;
+    let mut staged_bundle = bundle;
+    staged_bundle.insert(slot.to_string(), value.clone());
+    let serialized = serialize_bundle(&staged_bundle).map_err(|source| AllocationFailure {
+        source,
+        partial: partial.clone(),
+    })?;
     let secret_name = shard_secret_name(target_shard);
+    let allocated = AllocatedSlot {
+        slot: slot.to_string(),
+        shard: target_shard,
+        value,
+        alloc: PlaceholderAlloc::Rotate,
+        delivered,
+    };
 
     put_environment_secret(
         client,
@@ -387,15 +407,11 @@ pub async fn rotate_and_deliver(
         &pubkey,
         provisioner_token,
     )
-    .await?;
+    .await
+    .map_err(|source| AllocationFailure { source, partial })?;
 
-    Ok(AllocatedSlot {
-        slot: slot.to_string(),
-        shard: target_shard,
-        value,
-        alloc: PlaceholderAlloc::Rotate,
-        delivered,
-    })
+    shards.insert(target_shard, staged_bundle);
+    Ok(allocated)
 }
 
 fn random_value(length_bytes: usize) -> String {

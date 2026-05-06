@@ -29,6 +29,12 @@ pub enum Error {
     #[error("overlay resource {id:?} in {path} has no matching base resource")]
     OrphanOverlay { id: String, path: PathBuf },
 
+    #[error("failed to parse state file {path}: {source}")]
+    StateParse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
     #[error("ferrum-edge binary not found: {0}")]
     BinaryNotFound(String),
 

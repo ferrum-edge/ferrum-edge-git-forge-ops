@@ -1,5 +1,3 @@
-mod cli;
-
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,6 +6,7 @@ use std::process;
 use clap::Parser;
 
 use gitforgeops::apply;
+use gitforgeops::cli;
 use gitforgeops::config::{
     self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
     ResolvedEnv,
@@ -21,13 +20,15 @@ use gitforgeops::secrets;
 use gitforgeops::state::StateFile;
 use gitforgeops::validate;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = cli::Cli::parse();
     let explicit_env = cli.env.clone();
 
     let result = match cli.command {
-        cli::Commands::Validate { format } => cmd_validate(&format, explicit_env.as_deref()),
+        cli::Commands::Validate { format } => {
+            cmd_validate(validate_format(format), explicit_env.as_deref())
+        }
         cli::Commands::Export {
             output,
             materialize,
@@ -55,7 +56,7 @@ async fn main() {
             output_dir,
         } => {
             cmd_import(
-                from_api.as_deref(),
+                from_api,
                 from_file.as_deref(),
                 &output_dir,
                 explicit_env.as_deref(),
@@ -63,7 +64,7 @@ async fn main() {
             .await
         }
         cli::Commands::Review { pr } => cmd_review(pr, explicit_env.as_deref()).await,
-        cli::Commands::Envs { format } => cmd_envs(&format),
+        cli::Commands::Envs { format } => cmd_envs(format),
         cli::Commands::Rotate {
             consumer,
             credential,
@@ -84,6 +85,16 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         process::exit(1);
+    }
+}
+
+fn validate_format(format: cli::ValidateFormat) -> validate::OutputFormat {
+    match format {
+        cli::ValidateFormat::Text => validate::OutputFormat::Text,
+        cli::ValidateFormat::Json => validate::OutputFormat::Json,
+        cli::ValidateFormat::Github | cli::ValidateFormat::GithubAnnotations => {
+            validate::OutputFormat::GithubAnnotations
+        }
     }
 }
 
@@ -116,6 +127,7 @@ fn load_and_assemble_for(
     let gateway_config = config::assemble(resources);
     let gateway_config =
         config::select_config_namespace(&gateway_config, resolved.namespace_filter.as_deref());
+    config::validate_unique_resource_keys(&gateway_config)?;
     Ok(gateway_config)
 }
 
@@ -202,9 +214,8 @@ fn resolved_namespaces(
                 let mut set: BTreeSet<String> =
                     config::collect_namespaces(desired).into_iter().collect();
                 for key in state.resources.keys() {
-                    // state key format: "<namespace>:<Kind>:<id>"
-                    if let Some((ns, _)) = key.split_once(':') {
-                        set.insert(ns.to_string());
+                    if let Some(ns) = diff::resource_diff::state_key_namespace(key) {
+                        set.insert(ns);
                     }
                 }
                 set.into_iter().collect()
@@ -531,11 +542,10 @@ async fn allocate_if_needed(
 /// Load per-namespace (desired, actual) pairs from the gateway for the given
 /// namespace list.
 ///
-/// Unlike the old `namespace_filter`-based walk, this iterates an explicit
-/// list, so exclusive-mode apply can reconcile namespaces that the repo has
-/// emptied (still need to fetch gateway state to prune). For shared mode, the
-/// caller passes the namespaces present in `desired` (or a single-element list
-/// for a namespace filter).
+/// Iterates an explicit namespace list so exclusive-mode apply can reconcile
+/// namespaces that the repo has emptied (still need to fetch gateway state to
+/// prune). For shared mode, the caller passes the namespaces present in
+/// `desired` (or a single-element list for a namespace filter).
 async fn load_namespace_pairs_for(
     client: &AdminClient,
     desired: &GatewayConfig,
@@ -562,12 +572,14 @@ fn compute_namespace_diffs(
     let mut breaking = Vec::new();
     let mut unmanaged = Vec::new();
 
+    let ownership_scope = match previously_managed {
+        Some(previously_managed) => diff::OwnershipScope::Shared { previously_managed },
+        None => diff::OwnershipScope::Exclusive,
+    };
+
     for (_, desired_namespace, actual_namespace) in namespace_pairs {
-        let result = diff::compute_diff_with_ownership(
-            desired_namespace,
-            actual_namespace,
-            previously_managed,
-        );
+        let result =
+            diff::compute_diff_with_scope(desired_namespace, actual_namespace, ownership_scope);
         let namespace_breaking =
             diff::detect_breaking_changes(&result.diffs, desired_namespace, actual_namespace);
 
@@ -603,7 +615,7 @@ fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) 
 }
 
 fn cmd_validate(
-    format: &str,
+    output_format: validate::OutputFormat,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
@@ -611,7 +623,6 @@ fn cmd_validate(
     let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
     let result = validate::run_validation(&gateway_config, &env_config.edge_binary_path)?;
-    let output_format = validate::OutputFormat::from_str_lossy(format);
     let formatted = validate::format_result(&result, output_format);
 
     print!("{}", formatted);
@@ -719,7 +730,7 @@ async fn cmd_diff(
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
     let client = AdminClient::new(&env_config)?;
-    let state = StateFile::load(&resolved.name);
+    let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
@@ -842,7 +853,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     }
 
     let client = AdminClient::new(&env_config);
-    let state = StateFile::load(&resolved.name);
+    let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let (diffs, breaking, unmanaged, actual_available) = match &client {
@@ -955,7 +966,8 @@ async fn cmd_apply(
     // operator fails fast on a misconfigured resource, not deep in apply.
     enforce_exclusive_scope(&resolved, &desired)?;
 
-    let mut state = StateFile::load(&resolved.name);
+    let _state_lock = StateFile::lock(&resolved.name)?;
+    let mut state = StateFile::load(&resolved.name)?;
 
     // First resolve: classify placeholders with the current bundle.
     //
@@ -988,15 +1000,15 @@ async fn cmd_apply(
         for m in missing {
             eprintln!("  {}", m.slot);
         }
-        process::exit(1);
+        return Err("required credential slots are missing".into());
     }
 
-    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
-    if let Ok(ref r) = val_result {
-        if !r.success {
-            eprintln!("Validation failed. Fix errors before applying.");
-            process::exit(1);
-        }
+    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path)?;
+    if !val_result.success {
+        let formatted = validate::format_result(&val_result, validate::OutputFormat::Text);
+        eprint!("{}", formatted);
+        eprintln!("Refusing to apply because validation failed.");
+        return Err("validation failed".into());
     }
 
     // Policy enforcement (with optional override). Overridden rule_ids are
@@ -1042,7 +1054,7 @@ async fn cmd_apply(
             } else {
                 eprintln!("(no PR associated with this commit; overrides not evaluated)");
             }
-            process::exit(1);
+            return Err("unresolved policy violations".into());
         }
     }
 
@@ -1125,7 +1137,7 @@ async fn cmd_apply(
                     }
                 }
                 println!("\nUse --auto-approve to skip this check.");
-                process::exit(0);
+                return Ok(());
             }
 
             // Large-prune safety check runs BEFORE allocation. The check
@@ -1137,6 +1149,10 @@ async fn cmd_apply(
             // that the gateway never receives.
             let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
             let (diffs, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+            let actual_by_namespace: BTreeMap<String, GatewayConfig> = namespace_pairs
+                .iter()
+                .map(|(namespace, _, actual)| (namespace.clone(), actual.clone()))
+                .collect();
             let delete_count = diffs
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
@@ -1156,10 +1172,9 @@ async fn cmd_apply(
             //
             //   - Exclusive mode: every live resource in scope is part of
             //     the ownership scope (no managed-set filter on deletes),
-            //     so live total is the right denominator. This also fixes
-            //     the bootstrap/takeover bug the prior live_total fix was
-            //     after: fresh state with N live resources reports
-            //     percentages bounded by N, not N*100/1.
+            //     so live total is the right denominator. Fresh state with
+            //     N live resources reports percentages bounded by N, not
+            //     N*100/1.
             //
             // Both branches naturally cap at 100% (delete_count is bounded
             // by the same set used as the denominator), so threshold = 100
@@ -1171,8 +1186,9 @@ async fn cmd_apply(
                     managed_set
                         .iter()
                         .filter(|k| {
-                            let ns = k.split_once(':').map(|(n, _)| n).unwrap_or("");
-                            ns_set.contains(ns)
+                            diff::resource_diff::state_key_namespace(k)
+                                .map(|ns| ns_set.contains(ns.as_str()))
+                                .unwrap_or(false)
                         })
                         .count()
                 }
@@ -1198,11 +1214,11 @@ async fn cmd_apply(
                     } else {
                         "live resources"
                     };
-                    eprintln!(
+                    return Err(format!(
                         "Refusing to apply: would delete {}% of {} in scope ({}/{}, threshold {}%). Re-run with --allow-large-prune to proceed.",
                         delete_pct, scope_label, delete_count, denominator, threshold
-                    );
-                    process::exit(1);
+                    )
+                    .into());
                 }
             }
 
@@ -1254,7 +1270,11 @@ async fn cmd_apply(
                 &client,
                 resolved.apply_strategy.clone(),
                 &namespaces,
-                managed.as_ref(),
+                match managed.as_ref() {
+                    Some(previously_managed) => diff::OwnershipScope::Shared { previously_managed },
+                    None => diff::OwnershipScope::Exclusive,
+                },
+                Some(&actual_by_namespace),
             )
             .await?;
 
@@ -1292,7 +1312,7 @@ async fn cmd_apply(
                     println!("  [new] {}", r.slot);
                 }
                 println!("\nUse --auto-approve to proceed.");
-                process::exit(0);
+                return Ok(());
             }
 
             // Write the placeholder-preserving file FIRST. `desired` still
@@ -1387,7 +1407,7 @@ async fn cmd_apply(
 }
 
 async fn cmd_import(
-    from_api: Option<&str>,
+    from_api: bool,
     from_file: Option<&str>,
     output_dir: &str,
     explicit_env: Option<&str>,
@@ -1395,7 +1415,7 @@ async fn cmd_import(
     let output_path = PathBuf::from(output_dir);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
-    let result = if from_api.is_some() {
+    let result = if from_api {
         let client = AdminClient::new(&env_config)?;
         import::import_from_api(&client, &output_path, resolved.namespace_filter.as_deref()).await?
     } else if let Some(file_path) = from_file {
@@ -1435,7 +1455,7 @@ async fn cmd_review(
     };
 
     let client = AdminClient::new(&env_config);
-    let state = StateFile::load(&resolved.name);
+    let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
 
@@ -1548,19 +1568,19 @@ async fn cmd_review(
     Ok(())
 }
 
-fn cmd_envs(format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_envs(format: cli::EnvsFormat) -> Result<(), Box<dyn std::error::Error>> {
     let repo = load_repo_config()?;
     let names = match repo {
         Some(r) => r.environment_names(),
         None => vec![ResolvedEnv::default_env_name()],
     };
     match format {
-        "text" => {
+        cli::EnvsFormat::Text => {
             for n in names {
                 println!("{n}");
             }
         }
-        _ => {
+        cli::EnvsFormat::Json => {
             println!("{}", serde_json::to_string(&names)?);
         }
     }
@@ -1592,7 +1612,8 @@ async fn cmd_rotate(
     // rotated slot, overwriting every other slot in that shard on GitHub.
     let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
 
-    let mut state = StateFile::load(&resolved.name);
+    let _state_lock = StateFile::lock(&resolved.name)?;
+    let mut state = StateFile::load(&resolved.name)?;
     let ns = namespace.unwrap_or("ferrum");
     let slot = secrets::resolver::slot_path(ns, consumer, credential);
 
@@ -1693,7 +1714,7 @@ async fn cmd_rotate(
 
     let client = build_github_api_client(&env_config)?;
 
-    let outcome = secrets::rotate_and_deliver(
+    let outcome = match secrets::rotate_and_deliver(
         &client,
         &repo,
         &resolved.name,
@@ -1704,7 +1725,16 @@ async fn cmd_rotate(
         &mut per_shard,
         &mut shard_count,
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            if !failure.partial.allocated.is_empty() {
+                surface_delivered_credentials(&env_config, &failure.partial).await?;
+            }
+            return Err(failure.source.into());
+        }
+    };
 
     // Emit the encrypted delivery blob FIRST, before attempting the
     // gateway push. rotate_and_deliver has already written the new value

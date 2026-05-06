@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
 use crate::config::schema::GatewayConfig;
 use crate::config::ApplyStrategy;
-use crate::diff::resource_diff::{compute_diff_with_ownership, DiffAction, DiffResult};
+use crate::diff::resource_diff::{compute_diff_with_scope, DiffAction, DiffResult, OwnershipScope};
 use crate::http_client::AdminClient;
 
 /// A single per-resource operation that completed successfully against the
@@ -62,9 +62,9 @@ impl ApplyResult {
 /// `ownership.namespaces` for exclusive, or the namespaces present in
 /// `desired` for shared).
 ///
-/// When `previously_managed` is `Some`, runs in `shared` ownership mode: only
-/// resources present in that set can be deleted; admin-added resources are
-/// reported in `unmanaged_skipped` but not touched.
+/// In shared ownership mode, only resources in the caller-provided managed set
+/// can be deleted; admin-added resources are reported in `unmanaged_skipped`
+/// but not touched. Exclusive mode treats every live resource in scope as owned.
 ///
 /// **Atomicity:** both strategies are **per-namespace**, not environment-wide.
 /// `full_replace` delegates to the gateway's `/restore?confirm=true` endpoint
@@ -83,7 +83,8 @@ pub async fn apply_api(
     client: &AdminClient,
     strategy: ApplyStrategy,
     namespaces: &[String],
-    previously_managed: Option<&HashSet<String>>,
+    ownership_scope: OwnershipScope<'_>,
+    actual_by_namespace: Option<&BTreeMap<String, GatewayConfig>>,
 ) -> crate::error::Result<ApplyResult> {
     let mut aggregate = ApplyResult::default();
 
@@ -107,8 +108,15 @@ pub async fn apply_api(
                 }
             }
             ApplyStrategy::Incremental => {
-                match apply_incremental(&desired_namespace, client, namespace, previously_managed)
-                    .await
+                let actual = actual_by_namespace.and_then(|actuals| actuals.get(namespace));
+                match apply_incremental(
+                    &desired_namespace,
+                    client,
+                    namespace,
+                    ownership_scope,
+                    actual,
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(e) => {
@@ -164,11 +172,18 @@ async fn apply_incremental(
     desired: &GatewayConfig,
     client: &AdminClient,
     namespace: &str,
-    previously_managed: Option<&HashSet<String>>,
+    ownership_scope: OwnershipScope<'_>,
+    actual: Option<&GatewayConfig>,
 ) -> crate::error::Result<ApplyResult> {
-    let actual = client.get_backup(namespace).await?;
-    let DiffResult { diffs, unmanaged } =
-        compute_diff_with_ownership(desired, &actual, previously_managed);
+    let fetched_actual;
+    let actual = match actual {
+        Some(actual) => actual,
+        None => {
+            fetched_actual = client.get_backup(namespace).await?;
+            &fetched_actual
+        }
+    };
+    let DiffResult { diffs, unmanaged } = compute_diff_with_scope(desired, actual, ownership_scope);
 
     let mut result = ApplyResult {
         unmanaged_skipped: unmanaged.len(),

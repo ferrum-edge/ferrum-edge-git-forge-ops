@@ -1,5 +1,8 @@
 use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
 use gitforgeops::http_client::AdminClient;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::mpsc;
 
 fn base_env() -> EnvConfig {
     EnvConfig {
@@ -62,6 +65,21 @@ fn admin_client_rejects_client_key_without_cert() {
 }
 
 #[test]
+fn admin_client_rejects_short_jwt_secret() {
+    let mut env = base_env();
+    env.admin_jwt_secret = Some("too-short".to_string());
+
+    let err = match AdminClient::new(&env) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
+    assert!(
+        err.contains("at least 32 characters"),
+        "expected short-secret error, got: {err}"
+    );
+}
+
+#[test]
 fn admin_client_builds_without_mtls() {
     let env = base_env();
     AdminClient::new(&env).expect("client should build without mTLS");
@@ -73,4 +91,40 @@ fn admin_client_honors_custom_timeouts() {
     env.gateway_connect_timeout_secs = 3;
     env.gateway_request_timeout_secs = 15;
     AdminClient::new(&env).expect("client should build with custom timeouts");
+}
+
+#[tokio::test]
+async fn admin_client_get_backup_sends_namespace_and_bearer_token() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        tx.send(request).unwrap();
+        let body =
+            r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let mut env = base_env();
+    env.gateway_url = Some(format!("http://{addr}"));
+    let client = AdminClient::new(&env).unwrap();
+
+    let backup = client.get_backup("team-alpha").await.unwrap();
+    assert!(backup.proxies.is_empty());
+
+    let request = rx.recv().unwrap();
+    assert!(request.starts_with("GET /backup HTTP/1.1"));
+    assert!(request.contains("authorization: Bearer "));
+    assert!(request.contains("x-ferrum-namespace: team-alpha"));
 }

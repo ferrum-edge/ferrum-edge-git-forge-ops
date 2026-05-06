@@ -81,9 +81,15 @@ fn format_github_annotations(result: &ValidationResult) -> String {
 
         let lower = trimmed.to_lowercase();
         if lower.contains("error") {
-            output.push_str(&format!("::error ::{}\n", trimmed));
+            output.push_str(&format!(
+                "::error ::{}\n",
+                escape_workflow_command_data(trimmed)
+            ));
         } else if lower.contains("warn") {
-            output.push_str(&format!("::warning ::{}\n", trimmed));
+            output.push_str(&format!(
+                "::warning ::{}\n",
+                escape_workflow_command_data(trimmed)
+            ));
         }
     }
 
@@ -96,9 +102,15 @@ fn format_github_annotations(result: &ValidationResult) -> String {
 
         let lower = trimmed.to_lowercase();
         if lower.contains("error") {
-            output.push_str(&format!("::error ::{}\n", trimmed));
+            output.push_str(&format!(
+                "::error ::{}\n",
+                escape_workflow_command_data(trimmed)
+            ));
         } else if lower.contains("warn") {
-            output.push_str(&format!("::warning ::{}\n", trimmed));
+            output.push_str(&format!(
+                "::warning ::{}\n",
+                escape_workflow_command_data(trimmed)
+            ));
         }
     }
 
@@ -111,4 +123,11 @@ fn format_github_annotations(result: &ValidationResult) -> String {
     }
 
     output
+}
+
+fn escape_workflow_command_data(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
 }

@@ -146,6 +146,37 @@ fn split_config_rejects_absolute_path_in_id() {
 }
 
 #[test]
+fn split_config_rejects_duplicate_output_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    let mut duplicate = config.proxies[0].clone();
+    duplicate.backend_host = "other".to_string();
+    config.proxies.push(duplicate);
+
+    let err = split_config(&config, tmp.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("duplicate namespace/kind/id"),
+        "expected duplicate target error, got: {err}"
+    );
+}
+
+#[test]
+fn split_config_refuses_to_overwrite_existing_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target_dir = tmp.path().join("ferrum/proxies");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    std::fs::write(target_dir.join("proxy-test.yaml"), "existing").unwrap();
+
+    let config = make_test_config();
+    let err = split_config(&config, tmp.path()).unwrap_err().to_string();
+
+    assert!(
+        err.contains("refusing to overwrite"),
+        "expected overwrite refusal, got: {err}"
+    );
+}
+
+#[test]
 fn import_from_file_roundtrip() {
     let tmp_export = tempfile::tempdir().unwrap();
     let config = make_test_config();

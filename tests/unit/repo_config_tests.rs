@@ -324,7 +324,7 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
         admin_jwt_secret: None,
         namespace_filter: None,
         gateway_mode: GatewayMode::Api,
-        apply_strategy: ApplyStrategy::FullReplace, // <-- legacy setting
+        apply_strategy: ApplyStrategy::FullReplace,
         overlay: None,
         env_name: None,
         github_repository: None,

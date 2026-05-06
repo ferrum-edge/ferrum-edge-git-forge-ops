@@ -57,7 +57,8 @@ and run `validate-pr.yml` instead; the two paths are mutually exclusive.
 ```
 resources/<ns>/{proxies,consumers,upstreams,plugins}/*.yaml
   → loader::load_resources   (walkdir, kind-tagged Resource enum)
-  → overlays/<env>/...       (deep-merge via apply_overlay, overlay picked by env)
+  → overlays/<env>/...       (object deep-merge via apply_overlay; arrays replace
+                              except additive spec.plugins/spec.targets)
   → assembler::assemble      (flat GatewayConfig, directory namespace inference)
   → secrets::resolve_secrets (replace ${gh-env-secret:...} placeholders in-memory
                               from FERRUM_CREDS_JSON bundle, never written back to disk)

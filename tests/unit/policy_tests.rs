@@ -443,11 +443,9 @@ fn require_auth_plugin_ignores_disabled_plugins() {
 
 #[test]
 fn require_auth_plugin_uses_explicit_allowlist() {
-    // Regression: the old substring match on "auth" accepted
-    // unrelated plugin names that merely contained the substring
-    // (e.g. `body_size_audit`, `fake-auth-bypass`) and excluded `jwt`
-    // — whose canonical id doesn't include the substring. The
-    // allowlist fixes both directions.
+    // The allowlist accepts canonical auth plugin ids such as `jwt` and
+    // rejects unrelated plugin names that merely contain auth-like
+    // substrings (e.g. `body_size_audit`, `fake-auth-bypass`).
     use gitforgeops::config::schema::{PluginConfig, PluginScope};
 
     let make_plugin = |id: &str, name: &str| PluginConfig {

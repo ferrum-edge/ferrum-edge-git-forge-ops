@@ -1,5 +1,6 @@
 use crate::config::schema::{PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
+use crate::policy::config::is_default_auth_plugin_name;
 
 #[derive(Debug, Clone)]
 pub struct SecurityFinding {
@@ -19,8 +20,9 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
     }
 
     for proxy in &config.proxies {
-        let has_auth =
-            proxy_has_plugin(config, proxy, |plugin| plugin.plugin_name.contains("auth"));
+        let has_auth = proxy_has_plugin(config, proxy, |plugin| {
+            is_default_auth_plugin_name(&plugin.plugin_name)
+        });
         if !has_auth {
             findings.push(SecurityFinding {
                 severity: "warning".to_string(),
@@ -53,6 +55,10 @@ fn proxy_has_plugin(
         .iter()
         .filter(|plugin| plugin.namespace == proxy.namespace)
         .any(|plugin| {
+            if !plugin.enabled {
+                return false;
+            }
+
             if !predicate(plugin) {
                 return false;
             }
@@ -91,23 +97,14 @@ fn check_literal_credentials(
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                if let serde_json::Value::String(s) = v {
-                    if !s.starts_with("${") {
-                        findings.push(SecurityFinding {
-                            severity: "error".to_string(),
-                            kind: "Consumer".to_string(),
-                            id: consumer_id.to_string(),
-                            message: format!(
-                                "Literal credential in '{cred_type}.{k}' (use ${{...}} for secrets)"
-                            ),
-                        });
-                    }
-                }
+                let nested_path = format!("{cred_type}.{k}");
+                check_literal_credentials(consumer_id, &nested_path, v, findings);
             }
         }
         serde_json::Value::Array(arr) => {
-            for item in arr {
-                check_literal_credentials(consumer_id, cred_type, item, findings);
+            for (idx, item) in arr.iter().enumerate() {
+                let nested_path = format!("{cred_type}[{idx}]");
+                check_literal_credentials(consumer_id, &nested_path, item, findings);
             }
         }
         _ => {}

@@ -13,12 +13,10 @@ impl RequireAuthPluginRule {
     }
 
     fn proxy_has_auth(&self, cfg: &GatewayConfig, proxy: &Proxy) -> bool {
-        // Explicit allowlist matching. The prior substring check for
-        // `"auth"` missed valid auth plugins whose canonical id is `jwt`
-        // (no `auth` substring) and simultaneously accepted unrelated or
-        // hostile names that merely contained the substring (e.g.
-        // `body_size_audit` ends in `audit`, `fake-auth-bypass`).
-        // Matching is case-insensitive against the allowlist entries.
+        // Explicit allowlist matching keeps valid auth plugin ids such as
+        // `jwt` accepted while rejecting unrelated names that merely contain
+        // auth-like substrings. Matching is case-insensitive against the
+        // allowlist entries.
         let allowlist: Vec<String> = self
             .config
             .auth_plugin_names

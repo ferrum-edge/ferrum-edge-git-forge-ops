@@ -60,6 +60,11 @@ overlays/                        # environment-specific deep-merge fragments
   release.yml                    # builds multi-arch image on push to main / v* tag
 ```
 
+Overlay object fields deep-merge. Arrays replace by default so environment
+overlays can narrow lists such as `allowed_methods`, `hosts`,
+`allowed_ws_origins`, and `acl_groups`; `spec.plugins` and `spec.targets` are
+additive and merge by item identity.
+
 ### What a single PR can change
 
 One PR can include any number of new, modified, or deleted resources across any number of namespaces, in any mix of kinds (proxies, consumers, upstreams, plugin configs). The loader walks every `resources/<namespace>/{proxies,consumers,upstreams,plugins}/` directory, the assembler flattens into a single `GatewayConfig`, and apply groups by namespace on the way out — each namespace gets its own `X-Ferrum-Namespace` header and its own incremental diff against the live gateway. Namespaces are isolated: a failure applying to `team-alpha` doesn't block `team-beta`.
@@ -223,7 +228,7 @@ ${gh-env-secret:alloc=<mode>|len=<bytes>}
 
 - `alloc=require` (default) — the value must already exist in the bundle; apply fails if it doesn't.
 - `alloc=generate` — if the value is missing, generate a new one on apply.
-- `alloc=rotate` — marker for "this slot is eligible for rotation." Behaves identically to `generate` at apply time: first apply allocates, subsequent applies reuse the stored value. **Re-rotation is explicit** — trigger the `rotate.yml` workflow (see below) with a specific slot and recipient. The previous auto-rotate-on-every-apply behavior was removed because it redelivered persistent rotate slots to whichever user merged the latest PR, even when their PR didn't touch the consumer.
+- `alloc=rotate` — marker for "this slot is eligible for rotation." Behaves identically to `generate` at apply time: first apply allocates, subsequent applies reuse the stored value. **Re-rotation is explicit** — trigger the `rotate.yml` workflow (see below) with a specific slot and recipient.
 - `len=<16..=256>` — bytes of entropy for generated values. Default 32.
 
 Slot names are derived automatically from `(namespace, consumer_id, cred_key)` — you don't write them anywhere. Renaming a consumer gets a new slot (and the ability to intentionally retire the old one).
@@ -271,7 +276,7 @@ File-mode gateways consume a single assembled YAML at boot. We can't commit that
 
 **Stage 1 — placeholder assembly (automatic, on every merge)**
 
-`apply-on-merge.yml` in file mode runs `gitforgeops export --output assembled/<env>.yaml` **without** resolving credentials. The committed file still contains the `${gh-env-secret:alloc=...}` strings for each consumer credential — safe for version control, useful as a diff artifact for PR review, useless to an attacker.
+`apply-on-merge.yml` in file mode runs `gitforgeops apply --auto-approve` with `FERRUM_GATEWAY_MODE=file`. The committed file still contains the `${gh-env-secret:alloc=...}` strings for each consumer credential — safe for version control, useful as a diff artifact for PR review, useless to an attacker. File-mode apply can still allocate GitHub Environment Secret slots, deliver encrypted credentials, update `.state/<env>.json`, and commit the assembled placeholder file.
 
 **Stage 2 — on-demand materialization (admin-initiated, delivered encrypted)**
 
@@ -418,7 +423,7 @@ Only three kinds of configuration source exist:
 | `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML (two-stage) |
 | `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all. |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` (CRUD) or `full_replace` (POST /restore). Ignored when repo config sets it. |
-| `FERRUM_OVERLAY` | — | Legacy overlay selector (superseded by `FERRUM_ENV` + repo config) |
+| `FERRUM_OVERLAY` | — | Overlay selector override; prefer `FERRUM_ENV` + repo config |
 | `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification (dev only) |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | Timeout for TCP/TLS connection to the admin API. Raise if the gateway is behind a slow LB. |
@@ -510,7 +515,7 @@ These resources exist on the gateway but were not applied by this repo. They wil
 
 ## Trust and security posture
 
-- **Fork PRs cannot see production secrets.** The `validate-pr.yml` workflow runs with no `environment:` binding, so GitHub Environment Secrets are not available. Contributors can propose credential slots but cannot cause allocation.
+- **Fork PRs cannot see production secrets.** The `validate-pr.yml` workflow binds the matrix GitHub Environment so same-repo PRs can include live gateway comparison in review comments. Fork PRs still receive empty environment secrets under GitHub's `pull_request` secret rules and degrade to static-only review output. Contributors from forks can propose credential slots but cannot cause allocation.
 - **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions).
 - **Credential values are never written back to the repo.** Only hashes and metadata in `.state/`.
 - **Policy overrides leave a permanent trail.** PR label event + approver permission + `.state/<env>.json.overrides` record.

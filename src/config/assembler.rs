@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use walkdir::WalkDir;
@@ -43,12 +44,15 @@ pub fn assemble(resources: Vec<(String, Resource)>) -> GatewayConfig {
     config
 }
 
-/// Deep-merge overlay resources into the base set by matching on resource `id`.
+/// Deep-merge overlay resources into the base set by matching on resource
+/// kind, effective namespace, and `id`.
 ///
 /// Overlay files are **partial** — they only contain the fields to override,
 /// not all required fields. This function parses them as raw YAML values
 /// (not typed `Resource` structs) and merges into the base resource's JSON
-/// representation.
+/// representation. Arrays replace the base value by default so overlays can
+/// narrow restrictive lists. The known additive arrays (`spec.plugins`,
+/// `spec.targets`) merge by item identity.
 pub fn apply_overlay(
     base: &mut [(String, Resource)],
     overlay_dir: &Path,
@@ -57,37 +61,61 @@ pub fn apply_overlay(
         return Ok(());
     }
 
+    let mut base_index = HashMap::new();
+    for (idx, (base_ns, base_res)) in base.iter().enumerate() {
+        let key = resource_key(base_ns, base_res);
+        if let Some(previous) = base_index.insert(key.clone(), idx) {
+            return Err(crate::error::Error::Config(format!(
+                "duplicate base resource key for overlay lookup: {}/{}/{} at indexes {} and {}",
+                key.namespace, key.kind, key.id, previous, idx
+            )));
+        }
+    }
+
     let overlay_fragments = load_overlay_fragments(overlay_dir)?;
 
-    for (overlay_ns, overlay_value) in overlay_fragments {
-        let overlay_id = overlay_value
+    for overlay in overlay_fragments {
+        let overlay_id = overlay
+            .value
             .get("spec")
             .and_then(|s| s.get("id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        let base_entry = base
-            .iter_mut()
-            .find(|(_, base_res)| resource_id(base_res) == overlay_id);
+        if overlay_id.is_empty() {
+            continue;
+        }
 
-        match base_entry {
+        let overlay_ns = overlay_effective_namespace(&overlay.value, &overlay.namespace);
+        let overlay_key = ResourceKey {
+            kind: overlay.kind,
+            namespace: overlay_ns,
+            id: overlay_id,
+        };
+
+        match base_index
+            .get(&overlay_key)
+            .copied()
+            .map(|idx| &mut base[idx])
+        {
             Some((ref mut base_ns, ref mut base_resource)) => {
                 let base_value = serde_json::to_value(&*base_resource)?;
-                let merged = deep_merge_values(base_value, overlay_value);
+                let merged = deep_merge_values(base_value, overlay.value, &mut Vec::new());
                 *base_resource = serde_json::from_value(merged)?;
 
-                if *base_ns == "ferrum" && overlay_ns != "ferrum" {
-                    *base_ns = overlay_ns;
+                if *base_ns == "ferrum" && overlay_key.namespace != "ferrum" {
+                    *base_ns = overlay_key.namespace;
                 }
             }
             None => {
-                if !overlay_id.is_empty() {
-                    return Err(crate::error::Error::OrphanOverlay {
-                        id: overlay_id,
-                        path: overlay_dir.to_path_buf(),
-                    });
-                }
+                return Err(crate::error::Error::OrphanOverlay {
+                    id: format!(
+                        "{}/{}/{}",
+                        overlay_key.namespace, overlay_key.kind, overlay_key.id
+                    ),
+                    path: overlay_dir.to_path_buf(),
+                });
             }
         }
     }
@@ -97,9 +125,13 @@ pub fn apply_overlay(
 
 /// Load overlay files as raw JSON values (not typed structs).
 /// Overlay files are partial and may lack required fields.
-fn load_overlay_fragments(
-    overlay_dir: &Path,
-) -> crate::error::Result<Vec<(String, serde_json::Value)>> {
+struct OverlayFragment {
+    namespace: String,
+    kind: &'static str,
+    value: serde_json::Value,
+}
+
+fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<OverlayFragment>> {
     let mut results = Vec::new();
 
     let namespace_entries =
@@ -125,7 +157,12 @@ fn load_overlay_fragments(
             .unwrap_or("ferrum")
             .to_string();
 
-        for subdir in &["proxies", "consumers", "upstreams", "plugins"] {
+        for (subdir, kind) in [
+            ("proxies", "Proxy"),
+            ("consumers", "Consumer"),
+            ("upstreams", "Upstream"),
+            ("plugins", "PluginConfig"),
+        ] {
             let subdir_path = ns_path.join(subdir);
             if !subdir_path.is_dir() {
                 continue;
@@ -163,8 +200,20 @@ fn load_overlay_fragments(
                     })?;
                 let json_value: serde_json::Value =
                     serde_json::to_value(yaml_value).map_err(crate::error::Error::SerdeJson)?;
+                if let Some(declared_kind) = json_value.get("kind").and_then(|v| v.as_str()) {
+                    if declared_kind != kind {
+                        return Err(crate::error::Error::Config(format!(
+                            "overlay file {} declares kind {declared_kind:?} but is under {subdir}/ ({kind})",
+                            path.display()
+                        )));
+                    }
+                }
 
-                results.push((namespace.clone(), json_value));
+                results.push(OverlayFragment {
+                    namespace: namespace.clone(),
+                    kind,
+                    value: json_value,
+                });
             }
         }
     }
@@ -172,30 +221,134 @@ fn load_overlay_fragments(
     Ok(results)
 }
 
-fn resource_id(resource: &Resource) -> String {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ResourceKey {
+    kind: &'static str,
+    namespace: String,
+    id: String,
+}
+
+fn resource_key(directory_namespace: &str, resource: &Resource) -> ResourceKey {
     match resource {
-        Resource::Proxy { spec } => spec.id.clone(),
-        Resource::Consumer { spec } => spec.id.clone(),
-        Resource::Upstream { spec } => spec.id.clone(),
-        Resource::PluginConfig { spec } => spec.id.clone(),
+        Resource::Proxy { spec } => ResourceKey {
+            kind: "Proxy",
+            namespace: effective_namespace(directory_namespace, &spec.namespace),
+            id: spec.id.clone(),
+        },
+        Resource::Consumer { spec } => ResourceKey {
+            kind: "Consumer",
+            namespace: effective_namespace(directory_namespace, &spec.namespace),
+            id: spec.id.clone(),
+        },
+        Resource::Upstream { spec } => ResourceKey {
+            kind: "Upstream",
+            namespace: effective_namespace(directory_namespace, &spec.namespace),
+            id: spec.id.clone(),
+        },
+        Resource::PluginConfig { spec } => ResourceKey {
+            kind: "PluginConfig",
+            namespace: effective_namespace(directory_namespace, &spec.namespace),
+            id: spec.id.clone(),
+        },
     }
 }
 
-fn deep_merge_values(base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
+fn effective_namespace(directory_namespace: &str, spec_namespace: &str) -> String {
+    if spec_namespace == "ferrum" {
+        directory_namespace.to_string()
+    } else {
+        spec_namespace.to_string()
+    }
+}
+
+fn overlay_effective_namespace(value: &serde_json::Value, directory_namespace: &str) -> String {
+    value
+        .get("spec")
+        .and_then(|s| s.get("namespace"))
+        .and_then(|v| v.as_str())
+        .map(|ns| effective_namespace(directory_namespace, ns))
+        .unwrap_or_else(|| directory_namespace.to_string())
+}
+
+fn deep_merge_values(
+    base: serde_json::Value,
+    overlay: serde_json::Value,
+    path: &mut Vec<String>,
+) -> serde_json::Value {
     use serde_json::Value;
 
     match (base, overlay) {
         (Value::Object(mut base_map), Value::Object(overlay_map)) => {
             for (key, overlay_val) in overlay_map {
+                path.push(key.clone());
                 let merged = if let Some(base_val) = base_map.remove(&key) {
-                    deep_merge_values(base_val, overlay_val)
+                    deep_merge_values(base_val, overlay_val, path)
                 } else {
                     overlay_val
                 };
+                path.pop();
                 base_map.insert(key, merged);
             }
             Value::Object(base_map)
         }
+        (Value::Array(base_items), Value::Array(overlay_items)) => {
+            if should_merge_array(path) {
+                merge_array_values(base_items, overlay_items)
+            } else {
+                Value::Array(overlay_items)
+            }
+        }
         (_, overlay) => overlay,
     }
+}
+
+fn should_merge_array(path: &[String]) -> bool {
+    matches!(path, [spec, field] if spec == "spec" && (field == "plugins" || field == "targets"))
+}
+
+fn merge_array_values(
+    mut base_items: Vec<serde_json::Value>,
+    overlay_items: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    for overlay_item in overlay_items {
+        if let Some(identity) = array_item_identity(&overlay_item) {
+            if let Some(position) = base_items
+                .iter()
+                .position(|item| array_item_identity(item).as_ref() == Some(&identity))
+            {
+                let base_item =
+                    std::mem::replace(&mut base_items[position], serde_json::Value::Null);
+                base_items[position] = deep_merge_values(base_item, overlay_item, &mut Vec::new());
+            } else {
+                base_items.push(overlay_item);
+            }
+        } else if !base_items.iter().any(|item| item == &overlay_item) {
+            base_items.push(overlay_item);
+        }
+    }
+
+    serde_json::Value::Array(base_items)
+}
+
+fn array_item_identity(value: &serde_json::Value) -> Option<String> {
+    let map = value.as_object()?;
+
+    for key in ["id", "plugin_config_id", "name"] {
+        if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
+            return Some(format!("{key}:{value}"));
+        }
+    }
+
+    if let (Some(host), Some(port)) = (
+        map.get("host").and_then(|value| value.as_str()),
+        map.get("port"),
+    ) {
+        let path = map
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        return Some(format!("target:{host}:{port}:{path}"));
+    }
+
+    None
 }
