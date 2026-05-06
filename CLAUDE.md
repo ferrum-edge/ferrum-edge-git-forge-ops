@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`gitforgeops` — GitOps CLI that turns a directory of per-resource YAML files into a Ferrum Edge gateway configuration and reconciles it with a running gateway. Consumed by the CI workflows in `.github/workflows/` on the user's fork; forks add resources under `resources/<namespace>/`, open a PR, and CI validates + previews + applies.
+`gitforgeops` — GitOps CLI that turns a directory of per-resource YAML files into a Ferrum Edge gateway configuration and reconciles it with a running gateway. Consumed by the CI workflows in `.github/workflows/` on the user's fork; forks add resources under `resources/<namespace>/`, open a PR, CI validates + previews, and post-merge workflows apply.
 
 Rust 2021 edition. Single binary `gitforgeops`. License: PolyForm Noncommercial 1.0.0.
 
@@ -16,13 +16,13 @@ is also unset and the repo config has one entry or a `default_environment`,
 that is used.
 
 ```bash
-gitforgeops validate [--format text|json|github]         # Assemble + shell to `ferrum-edge validate`
+gitforgeops validate [--format text|json|github-annotations] # Assemble + shell to `ferrum-edge validate`
 gitforgeops export [--output PATH]                        # Emit flat YAML (placeholders preserved)
 gitforgeops export --materialize [--encrypt-to GH_LOGIN]  # Resolve creds; age-encrypt output (file mode stage 2)
 gitforgeops diff [--exit-on-drift]                        # Compare desired vs live gateway (/backup)
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
 gitforgeops apply [--auto-approve] [--allow-large-prune]  # Apply incrementally (CRUD) or full-replace (/restore)
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR]
+gitforgeops import --from-api <ignored> | --from-file PATH [--output-dir DIR]
 gitforgeops review [--pr N]                               # Post structured PR comment via GitHub API
 gitforgeops envs [--format json|text]                     # List environments (used by CI matrix)
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -61,14 +61,15 @@ resources/<ns>/{proxies,consumers,upstreams,plugins}/*.yaml
                               except additive spec.plugins/spec.targets)
   → assembler::assemble      (flat GatewayConfig, directory namespace inference)
   → secrets::resolve_secrets (replace ${gh-env-secret:...} placeholders in-memory
-                              from FERRUM_CREDS_JSON bundle, never written back to disk)
+                              from FERRUM_CREDS_JSON_FILE or FERRUM_CREDS_JSON,
+                              never written back to disk)
   → policy::evaluate_policies
   → validate / export / diff / plan / apply / review / rotate
 ```
 
 ### Gateway Modes
 
-- **api** — push to admin REST (POST `/batch` or `/restore`, PUT/DELETE per resource)
+- **api** — push to admin REST (POST creates, PUT updates, DELETE removes, or POST `/restore` for full-replace)
 - **file** — assemble flat YAML for a file-mode Ferrum Edge gateway
 
 Set via `FERRUM_GATEWAY_MODE`.
@@ -141,7 +142,9 @@ Storage: one or more GitHub Environment Secrets named `FERRUM_CREDS_BUNDLE[_N]`,
 each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
 auto-sharded by fnv-style hash when a bundle approaches 40 KB. The apply
 workflow's "Load credential bundles" step collects all matching secrets via
-`${{ toJSON(secrets) }}` and exports them as `FERRUM_CREDS_JSON`.
+`${{ toJSON(secrets) }}`, writes the filtered payload to a runner-local file,
+and exports the path as `FERRUM_CREDS_JSON_FILE`. Inline `FERRUM_CREDS_JSON`
+is still supported for small local tests.
 
 Allocation (first apply, or rotation): generate random value → libsodium
 `crypto_box_seal` to the env's public key → PUT to
