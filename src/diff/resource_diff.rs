@@ -195,7 +195,7 @@ fn parse_legacy_state_key(key: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
 
-    for &(kind_start, kind_end, kind) in segments.iter().take(segments.len() - 1).skip(1) {
+    for &(kind_start, kind_end, kind) in segments.iter().rev().skip(1).take(segments.len() - 2) {
         if is_state_key_kind(kind) {
             let namespace = key.get(..kind_start.saturating_sub(1))?;
             let id = key.get(kind_end + 1..)?;

@@ -214,6 +214,10 @@ fn legacy_state_key_namespace_is_not_percent_decoded() {
         state_key_namespace("team:alpha:Proxy:api:v1").as_deref(),
         Some("team:alpha")
     );
+    assert_eq!(
+        state_key_namespace("team:Proxy:alpha:Consumer:api").as_deref(),
+        Some("team:Proxy:alpha")
+    );
 }
 
 #[test]
@@ -240,6 +244,31 @@ fn state_load_migrates_legacy_resource_keys_with_colons() {
             state_key_namespace(&migrated).as_deref(),
             Some("team:alpha")
         );
+    });
+}
+
+#[test]
+fn state_load_migrates_legacy_key_using_rightmost_kind_segment() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let state_json = r#"{
+            "version": 2,
+            "environment": "production",
+            "resources": {"team:Proxy:alpha:Consumer:api": "sha256:abc"}
+        }"#;
+        std::fs::write(".state/production.json", state_json).unwrap();
+
+        let state = StateFile::load("production").unwrap();
+        let migrated = state_key("team:Proxy:alpha", "Consumer", "api");
+
+        assert_eq!(
+            state.resources.get(&migrated),
+            Some(&"sha256:abc".to_string())
+        );
+        assert!(!state
+            .resources
+            .contains_key("team:Proxy:alpha:Consumer:api"));
     });
 }
 
