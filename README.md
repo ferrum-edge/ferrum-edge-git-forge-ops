@@ -438,7 +438,7 @@ Required only if you're the upstream maintainer, or if your fork has opted in vi
 | `DOCKERHUB_USERNAME` | Docker Hub account that owns the target namespace |
 | `DOCKERHUB_TOKEN` | Docker Hub access token with push access |
 
-The `release` workflow also pushes to GHCR using the built-in `GITHUB_TOKEN` — no extra secret needed. Ensure Settings → Actions → General → Workflow permissions is set to **Read and write** so `GITHUB_TOKEN` can push to `ghcr.io/<owner>/…`.
+The `release` workflow also pushes to GHCR using the built-in `GITHUB_TOKEN` — no extra secret needed. Keep repository default workflow permissions at **Read repository contents permission**; `release.yml` explicitly grants `packages: write` only to the release job for GHCR publishing.
 
 ### Local environment variables
 
@@ -571,7 +571,7 @@ Platforms: `linux/amd64` + `linux/arm64`.
 
 1. Docker Hub repo `ferrumedge/ferrum-edge-git-forge-ops` exists (public)
 2. Repo secrets `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` are set
-3. Settings → Actions → General → Workflow permissions = **Read and write** (for GHCR push)
+3. Settings → Actions → General → Workflow permissions = **Read repository contents permission** (recommended default; `release.yml` grants `packages: write` at job scope)
 
 ### Building locally
 
