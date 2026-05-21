@@ -497,6 +497,52 @@ fn flat_and_nested_credentials_produce_distinct_slots() {
 }
 
 #[test]
+fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let mut nested = serde_json::Map::new();
+    nested.insert(
+        "password".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+    );
+    consumer
+        .credentials
+        .insert("basic_auth".to_string(), serde_json::Value::Object(nested));
+    cfg.consumers.push(consumer);
+
+    // Legacy bundle key used by pre-migration resolver behavior.
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/basic_auth.password".to_string(),
+        "legacy-secret".to_string(),
+    );
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(
+        cfg.consumers[0].credentials.get("basic_auth").unwrap(),
+        &serde_json::Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "password".to_string(),
+                serde_json::Value::String("legacy-secret".to_string()),
+            );
+            m
+        })
+    );
+}
+
+#[test]
 fn slot_components_escape_slash_and_tilde_in_names() {
     // Namespaces/consumer-ids can in principle contain `/` or `~`. Those
     // characters are significant to the slot-path encoding (separator
