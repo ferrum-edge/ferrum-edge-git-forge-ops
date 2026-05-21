@@ -179,11 +179,7 @@ fn resolve_credentials(
     Ok(secrets::resolve_secrets(cfg, &bundle)?)
 }
 
-fn resolved_namespaces(
-    resolved: &ResolvedEnv,
-    desired: &GatewayConfig,
-    state: &StateFile,
-) -> Vec<String> {
+fn resolved_namespaces(resolved: &ResolvedEnv, desired: &GatewayConfig) -> Vec<String> {
     match resolved.ownership.mode {
         OwnershipMode::Exclusive => {
             let owned = resolved.ownership.namespaces.clone().unwrap_or_default();
@@ -204,22 +200,7 @@ fn resolved_namespaces(
         }
         OwnershipMode::Shared => match resolved.namespace_filter.as_deref() {
             Some(ns) => vec![ns.to_string()],
-            None => {
-                // Shared mode: iterate every namespace the repo *currently*
-                // declares AND every namespace it has previously managed.
-                // Missing the latter means a PR that removes the last resource
-                // from a namespace silently stops reconciling it — the gateway
-                // keeps the orphan forever.
-                use std::collections::BTreeSet;
-                let mut set: BTreeSet<String> =
-                    config::collect_namespaces(desired).into_iter().collect();
-                for key in state.resources.keys() {
-                    if let Some(ns) = diff::resource_diff::state_key_namespace(key) {
-                        set.insert(ns);
-                    }
-                }
-                set.into_iter().collect()
-            }
+            None => config::collect_namespaces(desired),
         },
     }
 }
@@ -732,7 +713,7 @@ async fn cmd_diff(
     let client = AdminClient::new(&env_config)?;
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
-    let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired);
     let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
     let (diffs, _breaking, unmanaged) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
@@ -855,7 +836,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
-    let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired);
     let (diffs, breaking, unmanaged, actual_available) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
@@ -1066,7 +1047,7 @@ async fn cmd_apply(
         );
     }
 
-    let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired);
     // Populated by both mode arms after their respective gates. State-record
     // reads this after the match to persist credential metadata.
     #[allow(unused_assignments)]
@@ -1457,7 +1438,7 @@ async fn cmd_review(
     let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
-    let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    let namespaces = resolved_namespaces(&resolved, &desired);
 
     let (diffs, breaking, unmanaged, comparison_error) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
