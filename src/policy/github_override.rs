@@ -161,6 +161,12 @@ pub async fn check_override(
 /// "latest" = highest page, later index within a page. We scan pages in order
 /// and keep the most recent matching add event, tracking whether a later
 /// unlabel supersedes it.
+const MAX_ISSUE_EVENT_PAGES: usize = 20;
+
+pub fn hit_pagination_safety_cap(page_idx: usize, has_next_page: bool) -> bool {
+    page_idx + 1 == MAX_ISSUE_EVENT_PAGES && has_next_page
+}
+
 async fn find_override_labeler(
     client: &Client,
     repo: &str,
@@ -175,7 +181,9 @@ async fn find_override_labeler(
     let mut latest_labeler: Option<String> = None;
 
     // Hard cap on pages so a pathological PR can't spin this forever.
-    for _ in 0..20 {
+    // Fail closed if the cap is reached while another page still exists;
+    // otherwise a later relabel could supersede the actor we observed.
+    for page_idx in 0..MAX_ISSUE_EVENT_PAGES {
         let url = match next_url.take() {
             Some(u) => u,
             None => break,
@@ -230,6 +238,13 @@ async fn find_override_labeler(
                 }
                 _ => {}
             }
+        }
+
+        if hit_pagination_safety_cap(page_idx, next_url.is_some()) {
+            return Err(crate::error::Error::Config(
+                "override label event history exceeds pagination safety cap; refusing stale approver attribution"
+                    .to_string(),
+            ));
         }
     }
 
