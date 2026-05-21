@@ -103,6 +103,56 @@ fn join_slot_components(components: &[SlotComponent<'_>]) -> String {
         .join("/")
 }
 
+fn legacy_slot_from_components(components: &[SlotComponent<'_>]) -> Option<String> {
+    if components.len() <= 3 {
+        return None;
+    }
+    let namespace = match components.first() {
+        Some(SlotComponent::Literal(s)) => *s,
+        _ => return None,
+    };
+    let consumer_id = match components.get(1) {
+        Some(SlotComponent::Literal(s)) => *s,
+        _ => return None,
+    };
+    let top_cred_key = match components.get(2) {
+        Some(SlotComponent::Literal(s)) => *s,
+        _ => return None,
+    };
+
+    let mut path = top_cred_key.to_string();
+    for c in components.iter().skip(3) {
+        match c {
+            SlotComponent::Literal(s) => {
+                // Legacy dotted paths are ambiguous once a nested key itself
+                // contains a dot or bracket marker.
+                if s.contains('.') || s.contains('[') || s.contains(']') {
+                    return None;
+                }
+                path.push('.');
+                path.push_str(s);
+            }
+            SlotComponent::ArrayIndex(i) => path.push_str(&format!("[{i}]")),
+        }
+    }
+    Some(format!("{namespace}/{consumer_id}/{path}"))
+}
+
+fn lookup_slot_value<'a>(
+    components: &[SlotComponent<'_>],
+    slot: &str,
+    bundle: &'a CredentialBundle,
+) -> crate::error::Result<Option<&'a String>> {
+    let current = bundle.get(slot);
+    if current.is_some() {
+        return Ok(current);
+    }
+    if let Some(legacy_slot) = legacy_slot_from_components(components) {
+        return Ok(bundle.get(&legacy_slot));
+    }
+    Ok(None)
+}
+
 /// Build a slot path from the CLI `--credential` argument.
 ///
 /// `cred_key` is interpreted as a `/`-separated path matching the walker's
@@ -244,7 +294,8 @@ fn walk_and_report(
             if let Some(res) = parse_placeholder(s) {
                 let placeholder = res?;
                 let slot = join_slot_components(components);
-                let status = classify_status(&placeholder, bundle.get(&slot));
+                let existing = lookup_slot_value(components, &slot, bundle)?;
+                let status = classify_status(&placeholder, existing);
                 let (namespace, consumer_id, cred_key) = decompose_components(components);
                 report.results.push(ResolveResult {
                     consumer_id,
@@ -286,9 +337,10 @@ fn walk_report_and_replace<'a>(
             if let Some(res) = parse_placeholder(s) {
                 let placeholder = res?;
                 let slot = join_slot_components(components);
-                let status = classify_status(&placeholder, bundle.get(&slot));
+                let existing = lookup_slot_value(components, &slot, bundle)?;
+                let status = classify_status(&placeholder, existing);
                 let (namespace, consumer_id, cred_key) = decompose_components(components);
-                let replacement = bundle.get(&slot).cloned();
+                let replacement = existing.cloned();
                 report_push(
                     report,
                     placeholder,
