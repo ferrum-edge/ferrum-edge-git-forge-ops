@@ -625,6 +625,15 @@ fn parse_next_link_extracts_next_page_url() {
 }
 
 #[test]
+fn override_pagination_cap_fails_closed_when_more_pages_exist() {
+    use gitforgeops::policy::github_override::hit_pagination_safety_cap;
+
+    assert!(!hit_pagination_safety_cap(0, true));
+    assert!(!hit_pagination_safety_cap(19, false));
+    assert!(hit_pagination_safety_cap(19, true));
+}
+
+#[test]
 fn override_config_permission_rank_is_monotonic() {
     use gitforgeops::policy::config::OverrideConfig;
 
