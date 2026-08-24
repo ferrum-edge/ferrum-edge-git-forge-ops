@@ -278,6 +278,7 @@ impl AdminClient {
 
     pub async fn update_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(&proxy.id)?;
         let path = format!("/proxies/{}", proxy.id);
         let resp = self
             .send_with_retry(|| {
@@ -293,6 +294,7 @@ impl AdminClient {
 
     pub async fn delete_proxy(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(id)?;
         let path = format!("/proxies/{id}");
         let resp = self
             .send_with_retry(|| {
@@ -329,6 +331,7 @@ impl AdminClient {
         namespace: &str,
     ) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(&consumer.id)?;
         let path = format!("/consumers/{}", consumer.id);
         let resp = self
             .send_with_retry(|| {
@@ -344,6 +347,7 @@ impl AdminClient {
 
     pub async fn delete_consumer(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(id)?;
         let path = format!("/consumers/{id}");
         let resp = self
             .send_with_retry(|| {
@@ -380,6 +384,7 @@ impl AdminClient {
         namespace: &str,
     ) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(&upstream.id)?;
         let path = format!("/upstreams/{}", upstream.id);
         let resp = self
             .send_with_retry(|| {
@@ -395,6 +400,7 @@ impl AdminClient {
 
     pub async fn delete_upstream(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(id)?;
         let path = format!("/upstreams/{id}");
         let resp = self
             .send_with_retry(|| {
@@ -431,6 +437,7 @@ impl AdminClient {
         namespace: &str,
     ) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(&pc.id)?;
         let path = format!("/plugins/config/{}", pc.id);
         let resp = self
             .send_with_retry(|| {
@@ -450,6 +457,7 @@ impl AdminClient {
         namespace: &str,
     ) -> crate::error::Result<()> {
         let token = self.token()?;
+        validate_resource_id_for_path(id)?;
         let path = format!("/plugins/config/{id}");
         let resp = self
             .send_with_retry(|| {
@@ -461,6 +469,26 @@ impl AdminClient {
             .await?;
         self.check_response(resp).await
     }
+}
+
+fn validate_resource_id_for_path(id: &str) -> crate::error::Result<()> {
+    if id.is_empty() {
+        return Err(crate::error::Error::Config(
+            "resource id cannot be empty when used in API path".to_string(),
+        ));
+    }
+
+    let is_safe = id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'));
+
+    if !is_safe {
+        return Err(crate::error::Error::Config(format!(
+            "resource id contains unsafe characters for API path segment: {id}",
+        )));
+    }
+
+    Ok(())
 }
 
 async fn backoff_sleep(attempt: u32) {
