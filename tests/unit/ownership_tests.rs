@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use gitforgeops::config::schema::{BackendProtocol, GatewayConfig, Proxy};
+use gitforgeops::config::schema::{BackendScheme, GatewayConfig, Proxy};
 use gitforgeops::diff::{compute_diff_with_ownership, state_key, DiffAction};
 
 fn proxy(id: &str, namespace: &str) -> Proxy {
@@ -10,7 +10,7 @@ fn proxy(id: &str, namespace: &str) -> Proxy {
         namespace: namespace.to_string(),
         hosts: vec![],
         listen_path: Some(format!("/{id}")),
-        backend_protocol: BackendProtocol::Https,
+        backend_scheme: Some(BackendScheme::Https),
         backend_host: "backend.example".to_string(),
         backend_port: 443,
         backend_path: None,
@@ -51,6 +51,13 @@ fn proxy(id: &str, namespace: &str) -> Proxy {
         tcp_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
+        pool_max_requests_per_connection: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        websocket_idle_timeout_seconds: None,
+        stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
+        stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

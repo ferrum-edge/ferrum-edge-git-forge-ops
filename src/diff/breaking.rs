@@ -92,11 +92,51 @@ fn check_proxy_breaking_fields(
                 reason: "hosts changed".to_string(),
             });
         }
-        if d.backend_protocol != a.backend_protocol {
+        if d.backend_scheme != a.backend_scheme {
             breaking.push(BreakingChange {
                 kind: "Proxy".to_string(),
                 id: diff.id.clone(),
-                reason: "backend_protocol changed".to_string(),
+                reason: "backend_scheme changed".to_string(),
+            });
+        }
+        if d.upstream_subset != a.upstream_subset {
+            breaking.push(BreakingChange {
+                kind: "Proxy".to_string(),
+                id: diff.id.clone(),
+                reason: "upstream_subset changed — traffic is rerouted to a different \
+                         set of upstream targets"
+                    .to_string(),
+            });
+        }
+        if d.listen_port != a.listen_port {
+            breaking.push(BreakingChange {
+                kind: "Proxy".to_string(),
+                id: diff.id.clone(),
+                reason: "listen_port changed — the old listener is torn down and \
+                         existing connections are dropped"
+                    .to_string(),
+            });
+        }
+        if d.frontend_tls != a.frontend_tls {
+            breaking.push(BreakingChange {
+                kind: "Proxy".to_string(),
+                id: diff.id.clone(),
+                reason: format!(
+                    "frontend_tls changed ({} -> {}) — clients must switch between \
+                     plaintext and TLS on this listener",
+                    a.frontend_tls, d.frontend_tls
+                ),
+            });
+        }
+        if d.passthrough != a.passthrough {
+            breaking.push(BreakingChange {
+                kind: "Proxy".to_string(),
+                id: diff.id.clone(),
+                reason: format!(
+                    "passthrough changed ({} -> {}) — TLS termination moves between \
+                     the gateway and the backend, and plugins stop or start seeing traffic",
+                    a.passthrough, d.passthrough
+                ),
             });
         }
     }

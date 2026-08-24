@@ -501,7 +501,7 @@ Environment: `staging` · Ownership: `Shared` · Strategy: `Incremental`
 | Modify | Proxy | my-api | backend_read_timeout_ms |
 
 ### Breaking Changes
-- **Proxy `my-api`**: backend_protocol change (http → https) will reject existing connections
+- **Proxy `my-api`**: backend_scheme change (http → https) will reject existing connections
 
 ### Security Findings
 - [WARNING] **Proxy `new-service`**: No auth plugin attached
@@ -514,8 +514,8 @@ These resources exist on the gateway but were not applied by this repo. They wil
 - **Proxy `admin-experiment`** (`ferrum`)
 
 ### Policy Violations
-- [error] `backend_scheme` on **Proxy `my-api`** (`ferrum`): backend_protocol=http is not in the allowed list (https, wss, grpcs) · BLOCKING
-  - _Change backend_protocol to one of: https, wss, grpcs_
+- [error] `backend_scheme` on **Proxy `my-api`** (`ferrum`): backend_scheme=http is not in the allowed list (https) · BLOCKING
+  - _Change backend_scheme to one of: https_
 
 > **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label (requires `write` permission on this repo).
 

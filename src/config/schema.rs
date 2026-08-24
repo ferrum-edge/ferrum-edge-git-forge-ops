@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 fn default_namespace() -> String {
     "ferrum".to_string()
@@ -37,20 +37,87 @@ fn default_udp_idle_timeout() -> u64 {
 
 // --- Enums ---
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendProtocol {
+/// Backend wire scheme, mirroring `ferrum_edge::config::types::BackendScheme`.
+///
+/// The gateway cut this enum from eleven variants down to six: WebSocket and
+/// gRPC are now detected per request rather than declared, and HTTP/3 is
+/// negotiated per backend. Since users' git trees still hold YAML written
+/// against the old `backend_protocol` field and its wider variant set, this
+/// mirror deserializes the legacy wire values and folds them onto the six
+/// canonical ones:
+///
+/// | legacy value | canonical scheme |
+/// |---|---|
+/// | `ws`       | `http`  |
+/// | `wss`      | `https` |
+/// | `grpc`     | `http`  |
+/// | `grpcs`    | `https` |
+/// | `h3`       | `https` |
+/// | `tcp_tls`  | `tcps`  |
+///
+/// Serialization **always** emits a canonical value, so a load/export cycle
+/// upgrades a legacy tree in place. The legacy field name `backend_protocol`
+/// is likewise accepted (via `#[serde(alias)]` on `Proxy::backend_scheme`) but
+/// never emitted.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendScheme {
     Http,
     Https,
-    Ws,
-    Wss,
-    Grpc,
-    Grpcs,
-    H3,
     Tcp,
-    TcpTls,
+    Tcps,
     Udp,
     Dtls,
+}
+
+impl BackendScheme {
+    /// Canonical wire name — matches what `Serialize` emits.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackendScheme::Http => "http",
+            BackendScheme::Https => "https",
+            BackendScheme::Tcp => "tcp",
+            BackendScheme::Tcps => "tcps",
+            BackendScheme::Udp => "udp",
+            BackendScheme::Dtls => "dtls",
+        }
+    }
+
+    /// Accepts both canonical and legacy wire values. Returns `None` for
+    /// anything else.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "http" => Some(BackendScheme::Http),
+            "https" => Some(BackendScheme::Https),
+            "tcp" => Some(BackendScheme::Tcp),
+            "tcps" => Some(BackendScheme::Tcps),
+            "udp" => Some(BackendScheme::Udp),
+            "dtls" => Some(BackendScheme::Dtls),
+            // Legacy `backend_protocol` values, folded onto the canonical set.
+            "ws" => Some(BackendScheme::Http),
+            "wss" => Some(BackendScheme::Https),
+            "grpc" => Some(BackendScheme::Http),
+            "grpcs" => Some(BackendScheme::Https),
+            "h3" => Some(BackendScheme::Https),
+            "tcp_tls" => Some(BackendScheme::Tcps),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendScheme {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        BackendScheme::from_wire(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown backend scheme `{raw}`, expected one of: http, https, tcp, tcps, udp, dtls \
+                 (legacy: ws, wss, grpc, grpcs, h3, tcp_tls)"
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +130,39 @@ pub enum LoadBalancerAlgorithm {
     LeastLatency,
     ConsistentHashing,
     Random,
+    Passthrough,
+}
+
+/// Outbound PROXY-protocol mode for stream backend connects.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendProxyProtocol {
+    V2,
+}
+
+/// Destination mesh topology for mesh service discovery.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshSdTopology {
+    #[default]
+    Ambient,
+    Sidecar,
+}
+
+impl MeshSdTopology {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// What the gateway does with a discovered target set that has gone stale.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SdStalePolicy {
+    Retain,
+    #[default]
+    Withdraw,
+    FailReadiness,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +181,7 @@ pub enum SdProvider {
     DnsSd,
     Kubernetes,
     Consul,
+    Mesh,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,8 +223,22 @@ pub struct UpstreamTarget {
     pub weight: u32,
     #[serde(default)]
     pub tags: HashMap<String, String>,
+    /// Istio-style `region/zone/subzone` locality for this target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+/// A named subset of upstream targets identified by label selectors.
+///
+/// `traffic_policy` is deliberately not mirrored: ferrum-edge rejects it as
+/// operator input (it is projected from mesh DestinationRules).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubsetDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +291,14 @@ pub struct PassiveHealthCheck {
     pub unhealthy_window_seconds: u64,
     #[serde(default = "default_passive_window")]
     pub healthy_after_seconds: u64,
+    /// Cap (0-100) on the share of targets that may be ejected at once.
+    /// `None` means no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ejection_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_error_codes: Option<Vec<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_external_local_origin_errors: Option<bool>,
 }
 
 fn default_passive_unhealthy_codes() -> Vec<u16> {
@@ -199,6 +322,9 @@ pub struct HashOnCookieConfig {
     pub path: String,
     #[serde(default = "default_cookie_ttl")]
     pub ttl_seconds: u64,
+    /// Emit the hash cookie as a session cookie (no `Max-Age`/`Expires`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_cookie: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
     #[serde(default = "default_true")]
@@ -260,6 +386,20 @@ pub struct ConsulConfig {
     pub poll_interval_seconds: u64,
 }
 
+/// Ferrum mesh service discovery. Required when `provider = mesh`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshSdConfig {
+    pub service_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default = "default_sd_poll_interval")]
+    pub poll_interval_seconds: u64,
+    #[serde(default, skip_serializing_if = "MeshSdTopology::is_default")]
+    pub topology: MeshSdTopology,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDiscoveryConfig {
     pub provider: SdProvider,
@@ -269,6 +409,14 @@ pub struct ServiceDiscoveryConfig {
     pub kubernetes: Option<KubernetesConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consul: Option<ConsulConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<MeshSdConfig>,
+    /// Maximum tolerated discovery staleness in seconds (5..=86400; `0` means
+    /// unbounded and is env-gated by the gateway).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stale_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_policy: Option<SdStalePolicy>,
     #[serde(default = "default_weight")]
     pub default_weight: u32,
 }
@@ -345,6 +493,153 @@ fn default_retryable_methods() -> Vec<String> {
     ]
 }
 
+// --- Stream (L4) match predicates ---
+
+/// VirtualService-style L4 match predicates for a stream proxy. Arms are OR'd;
+/// predicates within an arm are AND'd. Rejected by the gateway on udp/dtls
+/// proxies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamMatchCriteria {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arms: Vec<StreamMatchArm>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamMatchArm {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_subnets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_subnets: Vec<String>,
+    /// `mesh` or `namespace/name` gateway selectors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateways: Vec<String>,
+}
+
+// --- Plugin trigger predicates ---
+
+/// Conditional-execution predicate tree for a plugin instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginTrigger {
+    pub when: PluginTriggerNode,
+}
+
+/// One node of the predicate tree. Exactly one field is expected to be set;
+/// the gateway is the authority on that constraint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginTriggerNode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all: Option<Vec<PluginTriggerNode>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub any: Option<Vec<PluginTriggerNode>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not: Option<Box<PluginTriggerNode>>,
+    #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_: Option<PluginTriggerMatch>,
+}
+
+/// A leaf predicate. Exactly one field is expected to be set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginTriggerMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PluginTriggerStringMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<PluginTriggerStringMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<PluginTriggerStringMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<PluginTriggerFieldMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<PluginTriggerFieldMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie: Option<PluginTriggerFieldMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<Vec<PluginTriggerProtocol>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cidr: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<Vec<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<PluginTriggerIdentityMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spiffe_id: Option<PluginTriggerIdentityMatch>,
+}
+
+/// String comparison. Exactly one of `exact` / `prefix` / `regex` is expected.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginTriggerStringMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub case_insensitive: bool,
+}
+
+/// Header / query / cookie predicate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginTriggerFieldMatch {
+    pub name: String,
+    #[serde(default)]
+    pub presence: PluginTriggerPresence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<PluginTriggerStringMatch>,
+    #[serde(default)]
+    pub multi_value: PluginTriggerMultiValue,
+}
+
+/// Authenticated-identity predicate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginTriggerIdentityMatch {
+    #[serde(default)]
+    pub presence: PluginTriggerPresence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<PluginTriggerStringMatch>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginTriggerPresence {
+    #[default]
+    Present,
+    Absent,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginTriggerMultiValue {
+    #[default]
+    Any,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginTriggerProtocol {
+    Http1,
+    Http2,
+    Http3,
+    Grpc,
+    GrpcWeb,
+    Websocket,
+    Tcp,
+    Udp,
+    Dtls,
+}
+
 // --- Top-level resources ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,8 +654,16 @@ pub struct Proxy {
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_path: Option<String>,
-    pub backend_protocol: BackendProtocol,
+    /// Backend wire scheme. Optional on HTTP-family proxies (the gateway
+    /// defaults it to `https`), required on stream proxies. Accepts the legacy
+    /// field name `backend_protocol` on read; always emits `backend_scheme`.
+    #[serde(default, alias = "backend_protocol")]
+    pub backend_scheme: Option<BackendScheme>,
+    /// Optional (empty) when `upstream_id` supplies the dial address.
+    #[serde(default)]
     pub backend_host: String,
+    /// Optional (0) when `upstream_id` supplies the dial address.
+    #[serde(default)]
     pub backend_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_path: Option<String>,
@@ -414,8 +717,18 @@ pub struct Proxy {
     pub pool_http2_max_concurrent_streams: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_http3_connections_per_backend: Option<usize>,
+    /// Deprecated upstream carrier, still persisted — mirrored for fidelity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_max_requests_per_connection: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_id: Option<String>,
+    /// Names a subset declared in the referenced upstream's `subsets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_subset: Option<String>,
+    /// Admin-only ownership tag set by the spec-import API. Never hand-authored,
+    /// but must round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_spec_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -434,6 +747,18 @@ pub struct Proxy {
     pub udp_max_response_amplification_factor: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_idle_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_idle_timeout_seconds: Option<u64>,
+    /// Trust an inbound PROXY-protocol header on this stream listener. Only
+    /// safe behind a trusted L4 hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_proxy_protocol: Option<bool>,
+    /// Emit an outbound PROXY-protocol header on stream backend connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_proxy_protocol: Option<BackendProxyProtocol>,
+    /// L4 match predicates evaluated before this stream route is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_match: Option<StreamMatchCriteria>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_methods: Option<Vec<String>>,
     #[serde(default)]
@@ -482,6 +807,9 @@ pub struct Upstream {
     pub health_checks: Option<HealthCheckConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_discovery: Option<ServiceDiscoveryConfig>,
+    /// Named subsets of targets, selected by `Proxy.upstream_subset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsets: Option<Vec<SubsetDefinition>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_tls_client_cert_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -490,6 +818,15 @@ pub struct Upstream {
     pub backend_tls_verify_server_cert: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_tls_server_ca_cert_path: Option<String>,
+    /// Backend TLS SNI override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_tls_sni: Option<String>,
+    /// Backend certificate SAN allow-list (cert pinning by SAN).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_tls_san_allow_list: Vec<String>,
+    /// Admin-only ownership tag set by the spec-import API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_spec_id: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -512,6 +849,12 @@ pub struct PluginConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_override: Option<u16>,
+    /// Conditional-execution predicate tree for this plugin instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<PluginTrigger>,
+    /// Admin-only ownership tag set by the spec-import API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_spec_id: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]

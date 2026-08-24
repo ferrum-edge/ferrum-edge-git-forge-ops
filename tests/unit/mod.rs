@@ -3,6 +3,7 @@ mod assembler_tests;
 mod cli_tests;
 mod diff_tests;
 mod env_tests;
+mod file_target_tests;
 mod http_client_tests;
 mod import_tests;
 mod jwt_tests;

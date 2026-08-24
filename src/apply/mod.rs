@@ -2,4 +2,4 @@ pub mod api_target;
 pub mod file_target;
 
 pub use api_target::{apply_api, AppliedOp, ApplyResult};
-pub use file_target::apply_file;
+pub use file_target::{apply_file, render_file_yaml};

@@ -1,5 +1,5 @@
 use gitforgeops::config::schema::{
-    BackendProtocol, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
+    BackendScheme, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
     PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use gitforgeops::policy::config::{
@@ -9,14 +9,14 @@ use gitforgeops::policy::config::{
 };
 use gitforgeops::policy::{evaluate_policies, Severity};
 
-fn proxy(id: &str, protocol: BackendProtocol, read_timeout: u64, tls_verify: bool) -> Proxy {
+fn proxy(id: &str, protocol: BackendScheme, read_timeout: u64, tls_verify: bool) -> Proxy {
     Proxy {
         id: id.to_string(),
         name: None,
         namespace: "ferrum".to_string(),
         hosts: vec![],
         listen_path: Some("/".to_string()),
-        backend_protocol: protocol,
+        backend_scheme: Some(protocol),
         backend_host: "b.example".to_string(),
         backend_port: 443,
         backend_path: None,
@@ -57,6 +57,13 @@ fn proxy(id: &str, protocol: BackendProtocol, read_timeout: u64, tls_verify: boo
         tcp_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
+        pool_max_requests_per_connection: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        websocket_idle_timeout_seconds: None,
+        stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
+        stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -71,6 +78,8 @@ fn plugin_config(id: &str, plugin_name: &str, namespace: &str) -> PluginConfig {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
+        api_spec_id: None,
         config: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -92,6 +101,10 @@ fn upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        subsets: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: vec![],
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -103,6 +116,7 @@ fn target(host: &str) -> UpstreamTarget {
         port: 443,
         weight: 1,
         tags: Default::default(),
+        locality: None,
         path: None,
     }
 }
@@ -110,7 +124,7 @@ fn target(host: &str) -> UpstreamTarget {
 #[test]
 fn disabled_policy_produces_no_findings() {
     let cfg = GatewayConfig {
-        proxies: vec![proxy("p1", BackendProtocol::Http, 120_000, true)],
+        proxies: vec![proxy("p1", BackendScheme::Http, 120_000, true)],
         ..Default::default()
     };
     let policies = PolicyConfig::default();
@@ -121,7 +135,7 @@ fn disabled_policy_produces_no_findings() {
 #[test]
 fn timeout_band_upper_bound_triggers_error() {
     let cfg = GatewayConfig {
-        proxies: vec![proxy("slow-one", BackendProtocol::Https, 120_000, true)],
+        proxies: vec![proxy("slow-one", BackendScheme::Https, 120_000, true)],
         ..Default::default()
     };
     let policies = PolicyConfig {
@@ -151,8 +165,8 @@ fn timeout_band_upper_bound_triggers_error() {
 fn backend_scheme_policy_flags_http() {
     let cfg = GatewayConfig {
         proxies: vec![
-            proxy("secure", BackendProtocol::Https, 30_000, true),
-            proxy("insecure", BackendProtocol::Http, 30_000, true),
+            proxy("secure", BackendScheme::Https, 30_000, true),
+            proxy("insecure", BackendScheme::Http, 30_000, true),
         ],
         ..Default::default()
     };
@@ -175,7 +189,7 @@ fn backend_scheme_policy_flags_http() {
 
 #[test]
 fn allowed_proxy_plugins_flags_disallowed_associations() {
-    let mut p = proxy("p1", BackendProtocol::Https, 30_000, true);
+    let mut p = proxy("p1", BackendScheme::Https, 30_000, true);
     p.plugins = vec![
         PluginAssociation {
             plugin_config_id: "plugin-keyauth".to_string(),
@@ -215,7 +229,7 @@ fn allowed_proxy_plugins_flags_disallowed_associations() {
 
 #[test]
 fn allowed_proxy_plugins_flags_unresolved_associations() {
-    let mut p = proxy("p1", BackendProtocol::Https, 30_000, true);
+    let mut p = proxy("p1", BackendScheme::Https, 30_000, true);
     p.plugins = vec![PluginAssociation {
         plugin_config_id: "plugin-other-namespace".to_string(),
     }];
@@ -250,9 +264,9 @@ fn allowed_proxy_plugins_flags_unresolved_associations() {
 
 #[test]
 fn allowed_backend_domains_checks_proxies_and_upstream_targets() {
-    let mut exact_proxy = proxy("exact", BackendProtocol::Https, 30_000, true);
+    let mut exact_proxy = proxy("exact", BackendScheme::Https, 30_000, true);
     exact_proxy.backend_host = "API.Internal.Example.COM.".to_string();
-    let mut disallowed_proxy = proxy("disallowed-proxy", BackendProtocol::Https, 30_000, true);
+    let mut disallowed_proxy = proxy("disallowed-proxy", BackendScheme::Https, 30_000, true);
     disallowed_proxy.backend_host = "api.evil.example".to_string();
 
     let cfg = GatewayConfig {
@@ -301,7 +315,7 @@ fn allowed_backend_domains_checks_proxies_and_upstream_targets() {
 
 #[test]
 fn allowed_backend_domains_skips_proxy_backend_host_when_upstream_is_used() {
-    let mut p = proxy("upstream-backed", BackendProtocol::Https, 30_000, true);
+    let mut p = proxy("upstream-backed", BackendScheme::Https, 30_000, true);
     p.backend_host = "placeholder.invalid".to_string();
     p.upstream_id = Some("api-pool".to_string());
 
@@ -331,7 +345,7 @@ fn allowed_backend_domains_skips_proxy_backend_host_when_upstream_is_used() {
 
 #[test]
 fn allowed_backend_domains_wildcard_does_not_match_root_domain() {
-    let mut p = proxy("root", BackendProtocol::Https, 30_000, true);
+    let mut p = proxy("root", BackendScheme::Https, 30_000, true);
     p.backend_host = "example.com".to_string();
     let cfg = GatewayConfig {
         proxies: vec![p],
@@ -356,7 +370,7 @@ fn allowed_backend_domains_wildcard_does_not_match_root_domain() {
 
 #[test]
 fn allowed_backend_domains_matches_ip_literals_exactly() {
-    let mut p = proxy("loopback", BackendProtocol::Https, 30_000, true);
+    let mut p = proxy("loopback", BackendScheme::Https, 30_000, true);
     p.backend_host = "[::1]".to_string();
     let cfg = GatewayConfig {
         proxies: vec![p],
@@ -382,7 +396,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
     // Proxy exists; an auth plugin exists in the same namespace at Global
     // scope but has enabled=false. The policy must still fire — disabled
     // plugins don't actually authenticate traffic.
-    let p = proxy("p1", BackendProtocol::Https, 30_000, true);
+    let p = proxy("p1", BackendScheme::Https, 30_000, true);
     let disabled_auth = PluginConfig {
         id: "jwt-disabled".to_string(),
         namespace: "ferrum".to_string(),
@@ -391,6 +405,8 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         proxy_id: None,
         enabled: false,
         priority_override: None,
+        trigger: None,
+        api_spec_id: None,
         config: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -428,12 +444,14 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
+        api_spec_id: None,
         config: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
     let cfg2 = GatewayConfig {
-        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
         plugin_configs: vec![enabled_auth],
         ..Default::default()
     };
@@ -456,6 +474,8 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
+        api_spec_id: None,
         config: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -475,7 +495,7 @@ fn require_auth_plugin_uses_explicit_allowlist() {
 
     // Case 1: `jwt` is on the default allowlist — proxy passes.
     let cfg_jwt = GatewayConfig {
-        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
         plugin_configs: vec![make_plugin("jwt-1", "jwt")],
         ..Default::default()
     };
@@ -486,7 +506,7 @@ fn require_auth_plugin_uses_explicit_allowlist() {
 
     // Case 2: `basic-auth` is on the default allowlist — proxy passes.
     let cfg_basic = GatewayConfig {
-        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
         plugin_configs: vec![make_plugin("ba-1", "basic-auth")],
         ..Default::default()
     };
@@ -498,7 +518,7 @@ fn require_auth_plugin_uses_explicit_allowlist() {
     // Case 3: plugin name containing `auth` substring but not on the
     // allowlist (e.g. an audit plugin) — policy must STILL fire.
     let cfg_substring = GatewayConfig {
-        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
         plugin_configs: vec![make_plugin("audit-1", "body_size_audit")],
         ..Default::default()
     };
@@ -522,7 +542,7 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         ..Default::default()
     };
     let cfg_custom = GatewayConfig {
-        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
         plugin_configs: vec![make_plugin("sso-1", "company_sso")],
         ..Default::default()
     };
@@ -532,7 +552,7 @@ fn require_auth_plugin_uses_explicit_allowlist() {
     );
     // With the custom allowlist, `jwt` is no longer accepted.
     let cfg_custom_jwt = GatewayConfig {
-        proxies: vec![proxy("p1", BackendProtocol::Https, 30_000, true)],
+        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
         plugin_configs: vec![make_plugin("jwt-1", "jwt")],
         ..Default::default()
     };
@@ -563,6 +583,10 @@ fn forbid_tls_verify_disabled_covers_upstreams() {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: false, // <-- the violation
         backend_tls_server_ca_cert_path: None,
+        subsets: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: vec![],
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -589,7 +613,7 @@ fn forbid_tls_verify_disabled_covers_upstreams() {
 #[test]
 fn forbid_tls_verify_disabled_triggers_on_false() {
     let cfg = GatewayConfig {
-        proxies: vec![proxy("risky", BackendProtocol::Https, 30_000, false)],
+        proxies: vec![proxy("risky", BackendScheme::Https, 30_000, false)],
         ..Default::default()
     };
     let policies = PolicyConfig {
