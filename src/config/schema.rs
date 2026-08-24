@@ -889,13 +889,170 @@ impl Default for GatewayConfig {
     }
 }
 
+// --- Mesh configuration ---
+
+/// Permissive mirror of the **user-authored** fields of ferrum-edge's
+/// `modes::mesh::config::MeshConfig`.
+///
+/// # Why this is not a deep mirror
+///
+/// ferrum-edge's `MeshConfig` is *not* `deny_unknown_fields`, and
+/// `ferrum-edge validate -m mesh` is the authoritative validator for its
+/// contents (gitforgeops shells out to it for every mesh document it
+/// produces). Mirroring the ~40 nested Istio-shaped types would buy nothing
+/// but a second, always-stale schema — so the top level is typed (one field
+/// per mesh collection, which is what fragment merging and overlay identity
+/// need) and every per-item shape stays a `serde_json::Value` that
+/// round-trips verbatim.
+///
+/// # What is deliberately absent
+///
+/// The runtime-derived `#[serde(skip)]` fields on ferrum-edge's `MeshConfig`
+/// (`node_waypoint_assertors`, `local_inbound_services`,
+/// `local_ingress_listeners`, `declared_ingress_http_ports`,
+/// `local_workload_addresses`, the node-waypoint capture inventories, the
+/// sidecar-ingress projections and the UDP egress tables) are never
+/// operator-settable and never on the wire. They are not mirrored: authoring
+/// them is meaningless and emitting them would be rejected noise.
+///
+/// # Namespaces
+///
+/// A mesh document has **no** top-level namespace. Its constituent resources
+/// (workloads, services, peer authentications, ...) carry their own
+/// `namespace` fields inside their `Value` payloads. The directory a fragment
+/// is loaded from (`resources/<ns>/mesh/`) is bookkeeping for
+/// `FERRUM_NAMESPACE` filtering and overlay matching only — it never rewrites
+/// anything inside the mesh document.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MeshConfigSpec {
+    /// Istio root namespace for mesh-wide policy resources. `None` leaves
+    /// ferrum-edge's own default (`istio-system`) in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub istio_root_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workloads: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mesh_policies: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_authz_providers: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_authentications: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_entries: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_authentications: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub telemetry_resources: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_rules: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_cors_policies: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_configs: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waypoint_bindings: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundles: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_cluster: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_traffic_policy: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_configs: Vec<serde_json::Value>,
+}
+
+impl MeshConfigSpec {
+    /// True when the fragment declares nothing at all. Used to decide whether
+    /// a mesh document is worth emitting or validating.
+    pub fn is_empty(&self) -> bool {
+        *self == MeshConfigSpec::default()
+    }
+
+    /// Non-empty collection counts, in declaration order, as
+    /// `"3 workloads, 1 service"`. Empty string when nothing is declared.
+    /// Drives the lightweight `plan` summary — mesh resources have no live
+    /// admin API to diff against, so counts are all a preview can honestly
+    /// report.
+    pub fn summary(&self) -> String {
+        let counts: [(&str, usize); 14] = [
+            ("workload", self.workloads.len()),
+            ("service", self.services.len()),
+            ("mesh policy", self.mesh_policies.len()),
+            ("ext authz provider", self.ext_authz_providers.len()),
+            ("peer authentication", self.peer_authentications.len()),
+            ("service entry", self.service_entries.len()),
+            ("request authentication", self.request_authentications.len()),
+            ("telemetry resource", self.telemetry_resources.len()),
+            ("destination rule", self.destination_rules.len()),
+            ("CORS policy", self.virtual_service_cors_policies.len()),
+            ("proxy config", self.proxy_configs.len()),
+            ("sidecar", self.sidecars.len()),
+            ("waypoint binding", self.waypoint_bindings.len()),
+            ("extension config", self.extension_configs.len()),
+        ];
+
+        let mut parts: Vec<String> = counts
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(label, n)| {
+                if *n == 1 {
+                    format!("1 {label}")
+                } else {
+                    format!("{n} {label}s")
+                }
+            })
+            .collect();
+
+        for (label, present) in [
+            ("trust bundles", self.trust_bundles.is_some()),
+            ("multi-cluster", self.multi_cluster.is_some()),
+            (
+                "outbound traffic policy",
+                self.outbound_traffic_policy.is_some(),
+            ),
+        ] {
+            if present {
+                parts.push(label.to_string());
+            }
+        }
+
+        parts.join(", ")
+    }
+}
+
 // --- Resource file wrapper ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Resource {
-    Proxy { spec: Proxy },
-    Consumer { spec: Consumer },
-    Upstream { spec: Upstream },
-    PluginConfig { spec: PluginConfig },
+    Proxy {
+        spec: Proxy,
+    },
+    Consumer {
+        spec: Consumer,
+    },
+    Upstream {
+        spec: Upstream,
+    },
+    PluginConfig {
+        spec: PluginConfig,
+    },
+    /// A mesh-configuration **fragment**. Unlike the gateway kinds, several
+    /// fragments merge into a single document rather than each becoming one
+    /// addressable gateway resource.
+    ///
+    /// `id` is a gitforgeops-side fragment name, not part of the mesh schema:
+    /// mesh documents have no resource ids, so overlays need *something* to
+    /// match on. The loader defaults it to the file stem, and it is never
+    /// serialized into the emitted mesh document (which carries only
+    /// `version` and `mesh`).
+    MeshConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        spec: MeshConfigSpec,
+    },
 }

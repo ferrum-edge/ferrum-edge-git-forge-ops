@@ -4,7 +4,9 @@ use gitforgeops::diff::{
 };
 use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
-use gitforgeops::review::pr_comment::{build_review_comment, build_review_comment_v2};
+use gitforgeops::review::pr_comment::{
+    build_review_comment, build_review_comment_v2, render_spec_owned,
+};
 use gitforgeops::secrets::ResolveReport;
 
 #[test]
@@ -119,6 +121,7 @@ fn review_comment_v2_uses_configured_override_label_and_permission() {
         &[],
         &policy,
         &[],
+        &[],
         None,
         Some(&override_cfg),
         None,
@@ -163,6 +166,7 @@ fn review_comment_v2_falls_back_to_defaults_when_no_override_config() {
         &[],
         &policy,
         &[],
+        &[],
         None,
         None,
         None,
@@ -205,6 +209,7 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
         &[],
         &[],
         &[],
+        &[],
         None,
         None,
         None,
@@ -230,6 +235,7 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
         &[],
         &[],
         &[],
+        &[],
         None,
         None,
         None,
@@ -239,4 +245,105 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     );
     assert!(!with_bundle.contains("actual allocation status is determined at apply time"));
     assert!(with_bundle.contains("needs allocation (generated on apply)"));
+}
+
+// --- Spec-owned section ------------------------------------------------------
+
+fn spec_owned_entry(id: &str, declared_in_repo: bool, pruned: bool) -> SpecOwnedResource {
+    SpecOwnedResource {
+        kind: "Proxy".to_string(),
+        id: id.to_string(),
+        namespace: "ferrum".to_string(),
+        api_spec_id: "spec-7".to_string(),
+        declared_in_repo,
+        pruned,
+    }
+}
+
+#[test]
+fn spec_owned_section_is_omitted_when_empty() {
+    assert!(render_spec_owned(&[]).is_empty());
+}
+
+#[test]
+fn spec_owned_section_lists_resources_with_owning_spec() {
+    let md = render_spec_owned(&[spec_owned_entry("from-spec", false, false)]);
+
+    assert!(md.contains("### Spec-owned Resources"), "{md}");
+    assert!(md.contains("`from-spec`"), "{md}");
+    assert!(md.contains("spec `spec-7`"), "{md}");
+    assert!(md.contains("api_spec_id"), "{md}");
+    assert!(!md.contains("CONFLICT"), "{md}");
+}
+
+#[test]
+fn spec_owned_section_calls_out_repo_conflicts() {
+    let md = render_spec_owned(&[
+        spec_owned_entry("from-spec", false, false),
+        spec_owned_entry("shared-id", true, false),
+    ]);
+
+    assert!(md.contains("CONFLICT: this repo also declares it"), "{md}");
+    assert!(
+        md.contains("1 resource(s) are declared both here and by an API spec"),
+        "{md}"
+    );
+}
+
+#[test]
+fn spec_owned_section_marks_confirmed_deletions() {
+    let md = render_spec_owned(&[spec_owned_entry("from-spec", false, true)]);
+
+    assert!(md.contains("will be DELETED"), "{md}");
+    assert!(md.contains("--confirm-api-spec-deletion"), "{md}");
+}
+
+#[test]
+fn review_comment_v2_renders_spec_owned_section() {
+    let spec_owned = vec![spec_owned_entry("shared-id", true, false)];
+
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &spec_owned,
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(comment.contains("### Spec-owned Resources"), "{comment}");
+    assert!(comment.contains("`shared-id`"), "{comment}");
+    assert!(comment.contains("CONFLICT"), "{comment}");
+}
+
+#[test]
+fn review_comment_v2_omits_spec_owned_section_when_empty() {
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(!comment.contains("Spec-owned"), "{comment}");
 }

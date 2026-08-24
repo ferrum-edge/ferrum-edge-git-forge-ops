@@ -1,6 +1,6 @@
 use crate::diff::best_practice::BestPractice;
 use crate::diff::breaking::BreakingChange;
-use crate::diff::resource_diff::{DiffAction, ResourceDiff, UnmanagedResource};
+use crate::diff::resource_diff::{DiffAction, ResourceDiff, SpecOwnedResource, UnmanagedResource};
 use crate::diff::security::SecurityFinding;
 use crate::policy::config::OverrideConfig;
 use crate::policy::PolicyFinding;
@@ -106,6 +106,51 @@ pub fn build_review_comment(
     md
 }
 
+/// The "Spec-owned resources" section, or an empty string when there are none.
+///
+/// Split out from `build_review_comment_v2` so the wording is testable on its
+/// own, and so conflicts (the repo declares a row an API spec owns) get louder
+/// treatment than the merely-informational entries.
+pub fn render_spec_owned(spec_owned: &[SpecOwnedResource]) -> String {
+    if spec_owned.is_empty() {
+        return String::new();
+    }
+
+    let mut md = String::from("### Spec-owned Resources\n\n");
+    md.push_str(
+        "These gateway resources carry an `api_spec_id`: they are provisioned by an OpenAPI \
+         spec import, not by this repo. gitforgeops does not modify or prune them.\n\n",
+    );
+
+    let conflicts: Vec<&SpecOwnedResource> =
+        spec_owned.iter().filter(|s| s.is_conflict()).collect();
+    for s in spec_owned {
+        let note = if s.is_conflict() {
+            " — **CONFLICT: this repo also declares it**"
+        } else if s.pruned {
+            " — will be DELETED (`--confirm-api-spec-deletion`)"
+        } else {
+            ""
+        };
+        md.push_str(&format!(
+            "- **{} `{}`** (`{}`) owned by spec `{}`{}\n",
+            s.kind, s.id, s.namespace, s.api_spec_id, note
+        ));
+    }
+    md.push('\n');
+
+    if !conflicts.is_empty() {
+        md.push_str(&format!(
+            "> {} resource(s) are declared both here and by an API spec. The spec importer wins \
+             on its next run, so the repo's version will be silently reverted. Remove the \
+             resource file, or stop managing that spec through `/api-specs`.\n\n",
+            conflicts.len()
+        ));
+    }
+
+    md
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_review_comment_v2(
     validation_success: bool,
@@ -116,6 +161,7 @@ pub fn build_review_comment_v2(
     best_practices: &[BestPractice],
     policy: &[PolicyFinding],
     unmanaged: &[UnmanagedResource],
+    spec_owned: &[SpecOwnedResource],
     override_reason: Option<&str>,
     override_cfg: Option<&OverrideConfig>,
     comparison_error: Option<&str>,
@@ -150,6 +196,8 @@ pub fn build_review_comment_v2(
         }
         md.push('\n');
     }
+
+    md.push_str(&render_spec_owned(spec_owned));
 
     if !policy.is_empty() {
         md.push_str("### Policy Violations\n\n");

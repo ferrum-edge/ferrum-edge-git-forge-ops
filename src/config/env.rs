@@ -85,6 +85,15 @@ pub struct EnvConfig {
     pub creds_bundle_json_file: Option<String>,
     /// Output path for assembled file (file mode).
     pub file_output_path: String,
+    /// Output path for the standalone mesh document (`{version, mesh}`).
+    ///
+    /// Written by file-mode `apply` and by `export` whenever the repo declares
+    /// any `MeshConfig` resource. This is a **separate document** from
+    /// `file_output_path`: a mesh node's loader is `deny_unknown_fields` and
+    /// rejects a document carrying `proxies:` / `upstreams:`, and the gateway's
+    /// own `mesh:` key is inert. Points at whatever a mesh node reads via its
+    /// `FERRUM_MESH_FILE_CONFIG_PATH`.
+    pub mesh_file_output_path: String,
     /// Path to the `ferrum-edge` binary for validation.
     pub edge_binary_path: String,
     /// Skip TLS certificate verification when talking to the gateway.
@@ -138,6 +147,7 @@ impl Default for EnvConfig {
             creds_bundle_json: None,
             creds_bundle_json_file: None,
             file_output_path: "./assembled/resources.yaml".to_string(),
+            mesh_file_output_path: DEFAULT_MESH_FILE_OUTPUT_PATH.to_string(),
             edge_binary_path: "ferrum-edge".to_string(),
             tls_no_verify: false,
             ca_cert: None,
@@ -173,6 +183,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_CREDS_JSON`          | `creds_bundle_json`| `None`                           |
 /// | `FERRUM_CREDS_JSON_FILE`     | `creds_bundle_json_file` | `None` (path, preferred at scale) |
 /// | `FERRUM_FILE_OUTPUT_PATH`    | `file_output_path` | `./assembled/resources.yaml`     |
+/// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
 /// | `FERRUM_GATEWAY_CA_CERT`     | `ca_cert`          | `None`                           |
@@ -219,6 +230,8 @@ pub fn load_env_config() -> EnvConfig {
         creds_bundle_json_file: env::var("FERRUM_CREDS_JSON_FILE").ok(),
         file_output_path: env::var("FERRUM_FILE_OUTPUT_PATH")
             .unwrap_or_else(|_| "./assembled/resources.yaml".to_string()),
+        mesh_file_output_path: non_empty_env("FERRUM_MESH_FILE_OUTPUT_PATH")
+            .unwrap_or_else(|| DEFAULT_MESH_FILE_OUTPUT_PATH.to_string()),
         edge_binary_path: env::var("FERRUM_EDGE_BINARY_PATH")
             .unwrap_or_else(|_| "ferrum-edge".to_string()),
         tls_no_verify: env::var("FERRUM_TLS_NO_VERIFY")
@@ -234,6 +247,12 @@ pub fn load_env_config() -> EnvConfig {
         gateway_max_retries: parse_u32_env("FERRUM_GATEWAY_MAX_RETRIES", 3),
     }
 }
+
+/// Where the standalone `{version, mesh}` document lands when
+/// `FERRUM_MESH_FILE_OUTPUT_PATH` is unset. Sits alongside the assembled
+/// gateway file rather than overwriting it — the two documents are mutually
+/// exclusive in shape.
+pub const DEFAULT_MESH_FILE_OUTPUT_PATH: &str = "./assembled/mesh.yaml";
 
 /// `iss` the gateway expects by default (`FERRUM_ADMIN_JWT_ISSUER` there).
 pub const DEFAULT_JWT_ISSUER: &str = "ferrum-edge";

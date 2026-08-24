@@ -118,6 +118,34 @@ of `namespace:Kind:id` keys from the state file. `Some(set)` = shared mode,
 than `ownership.large_prune_threshold_percent` of the managed set unless
 `--allow-large-prune` is passed.
 
+#### Spec-owned tier
+
+There is a third owner besides this repo and a human admin: the gateway's
+OpenAPI **spec ingestion** (`/api-specs`), which atomically provisions proxies,
+upstreams and plugin configs and tags them `api_spec_id: Some(...)`. Its
+re-imports are authoritative, so gitforgeops stays off those rows entirely —
+in *both* ownership modes, and regardless of what the state file says.
+
+Any **live** resource with `api_spec_id` set is classified `spec_owned`
+(`DiffResult::spec_owned`, its own bucket — not `unmanaged`):
+
+- Never emitted as a Modify. If the repo also declares the same
+  `(namespace, kind, id)`, that is reported as a **conflict**
+  (`DiffResult::spec_conflicts()`): two owners writing one row, and the spec
+  importer wins on its next run.
+- Never emitted as a Delete, except in **exclusive** mode with
+  `apply --confirm-api-spec-deletion` (`DiffOptions::prune_spec_owned`).
+  Otherwise apply skips them with a per-resource message and counts them in
+  `ApplyResult::spec_owned_skipped`. Shared mode ignores the flag — the state
+  file is its fence and a spec-owned row was never behind it.
+- Rendered in `plan` / `diff` stdout and in the PR comment's "Spec-owned
+  Resources" section. Unlike the unmanaged block, it is *not* gated on
+  `ownership.drift_report`: a repo fighting the spec importer is a correctness
+  problem, not drift noise.
+
+The same flag also drives `full_replace`, where `/restore` would otherwise wipe
+the namespace's `api_specs` section (see Apply Strategies).
+
 ### Policy framework
 
 `.gitforgeops/policies.yaml` declares enforceable standards. Each rule lives

@@ -252,6 +252,24 @@ impl AdminClient {
             .map_err(|e| crate::error::Error::HttpClient(format!("GET /health: {e}")))
     }
 
+    /// Authenticated `GET /cluster`. CP/DP connection state, used for the
+    /// best-effort post-apply convergence report.
+    ///
+    /// Advisory only: every caller must treat a failure as "unknown", never as
+    /// an apply failure. Database/file-mode gateways answer with an
+    /// informational `{mode, message}` rather than an error.
+    pub async fn get_cluster(&self) -> crate::error::Result<ClusterStatus> {
+        let token = self.token()?;
+        let resp = self
+            .send_with_retry(RequestKind::Read, || {
+                self.client.get(self.url("/cluster")).bearer_auth(&token)
+            })
+            .await?;
+        self.check(&resp, RequestKind::Read)?;
+        serde_json::from_str::<ClusterStatus>(&resp.body)
+            .map_err(|e| crate::error::Error::HttpClient(format!("GET /cluster: {e}")))
+    }
+
     /// Fetch the namespace's live configuration plus the backup-only sections
     /// (`api_specs`, `gateway_trust_bundles`) that `GatewayConfig` does not
     /// model.
@@ -1161,6 +1179,180 @@ pub fn write_block_reason(health: &HealthStatus) -> Option<String> {
         ));
     }
     None
+}
+
+// --- Cluster / convergence ---------------------------------------------------
+
+/// `GET /cluster`, modeled loosely.
+///
+/// The endpoint returns one of three shapes (CP, DP, or an informational
+/// `{mode, message}` for database/file gateways). Rather than a tagged enum
+/// that breaks on an unknown `mode`, every field is optional and the union is
+/// flattened: a shape this build has never seen still deserializes, and
+/// [`convergence_summary`] just reports less.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClusterStatus {
+    /// `cp` | `dp` | `database` | `file` | …
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Set on the informational (non-CP/DP) shape.
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub connected_data_planes: Option<u64>,
+    #[serde(default)]
+    pub data_planes: Vec<ClusterNode>,
+    #[serde(default)]
+    pub connected_mesh_nodes: Option<u64>,
+    #[serde(default)]
+    pub mesh_nodes: Vec<ClusterNode>,
+    /// DP mode: this node's view of its control plane.
+    #[serde(default)]
+    pub control_plane: Option<ControlPlaneStatus>,
+}
+
+/// A connected data-plane or mesh node as the CP reports it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClusterNode {
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub connected_at: Option<String>,
+    /// RFC 3339. When the CP last broadcast config to this node.
+    #[serde(default)]
+    pub last_sync_at: Option<String>,
+    /// Not in the CP-mode schema today, but read if a build starts reporting
+    /// per-node divergence — the warning is worth surfacing wherever it shows.
+    #[serde(default)]
+    pub config_diverged: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ControlPlaneStatus {
+    #[serde(default)]
+    pub url: Option<String>,
+    /// `online` | `offline`.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub is_primary: Option<bool>,
+    #[serde(default)]
+    pub connected_since: Option<String>,
+    #[serde(default)]
+    pub last_config_received_at: Option<String>,
+    /// Sticky: a non-empty ConfigSync delta was rejected and no authoritative
+    /// snapshot has landed since.
+    #[serde(default)]
+    pub config_diverged: Option<bool>,
+    #[serde(default)]
+    pub config_diverged_since: Option<String>,
+    #[serde(default)]
+    pub config_divergence_recoveries_total: Option<u64>,
+}
+
+/// Text shown when `/cluster` could not be reached or parsed. Never a failure —
+/// convergence is advisory, and a gateway that does not serve `/cluster` is
+/// perfectly healthy.
+pub const CONVERGENCE_UNAVAILABLE: &str = "convergence status unavailable";
+
+impl ClusterStatus {
+    /// Number of connected nodes, preferring the CP's own counters over the
+    /// array lengths (they can disagree if a node disconnects mid-serialize).
+    fn node_counts(&self) -> (u64, u64) {
+        (
+            self.connected_data_planes
+                .unwrap_or(self.data_planes.len() as u64),
+            self.connected_mesh_nodes
+                .unwrap_or(self.mesh_nodes.len() as u64),
+        )
+    }
+
+    fn nodes(&self) -> impl Iterator<Item = &ClusterNode> {
+        self.data_planes.iter().chain(self.mesh_nodes.iter())
+    }
+
+    fn diverged(&self) -> bool {
+        self.nodes().any(|n| n.config_diverged == Some(true))
+            || self
+                .control_plane
+                .as_ref()
+                .and_then(|cp| cp.config_diverged)
+                == Some(true)
+    }
+}
+
+/// One-line post-apply convergence report.
+///
+/// Pure, so the wording is unit-testable without a gateway. Callers hand it
+/// whatever `/cluster` returned; anything the response does not carry is simply
+/// left out of the line.
+pub fn convergence_summary(status: &ClusterStatus) -> String {
+    let mode = status.mode.as_deref().unwrap_or("unknown");
+
+    if let Some(cp) = &status.control_plane {
+        let mut line = format!(
+            "convergence: mode={mode}, control plane {} is {}",
+            cp.url.as_deref().unwrap_or("<unknown url>"),
+            cp.status.as_deref().unwrap_or("unknown"),
+        );
+        if let Some(at) = &cp.last_config_received_at {
+            line.push_str(&format!("; last config received {at}"));
+        }
+        if cp.config_diverged == Some(true) {
+            line.push_str(&format!(
+                "; WARNING: config_diverged since {}",
+                cp.config_diverged_since.as_deref().unwrap_or("unknown")
+            ));
+        }
+        return line;
+    }
+
+    let (data_planes, mesh_nodes) = status.node_counts();
+    if data_planes == 0 && mesh_nodes == 0 && status.control_plane.is_none() {
+        // Database/file-mode gateways answer `{mode, message}` — there is no
+        // cluster to converge, which is information, not a warning.
+        return match status.message.as_deref() {
+            Some(message) => format!("convergence: mode={mode} ({message})"),
+            None => format!("convergence: mode={mode}, no connected nodes reported"),
+        };
+    }
+
+    let mut line = format!(
+        "convergence: mode={mode}, {data_planes} data-plane node(s), {mesh_nodes} mesh node(s) connected"
+    );
+    match oldest_last_sync(status) {
+        Some(oldest) => line.push_str(&format!("; oldest last_sync_at {oldest}")),
+        None => line.push_str("; no last_sync_at reported"),
+    }
+    if status.diverged() {
+        line.push_str("; WARNING: at least one node reports config_diverged");
+    }
+    line
+}
+
+/// The least-recently-synced node's `last_sync_at`, echoed back in its original
+/// spelling.
+///
+/// Ordering is done on the parsed instant rather than the raw string, so a node
+/// reporting a non-UTC offset does not sort as if it were UTC. Values that do
+/// not parse as RFC 3339 are ignored — the summary is advisory and a garbage
+/// stamp should not become the headline.
+fn oldest_last_sync(status: &ClusterStatus) -> Option<&str> {
+    status
+        .nodes()
+        .filter_map(|n| {
+            let raw = n.last_sync_at.as_deref()?;
+            let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+            Some((parsed, raw))
+        })
+        .min_by_key(|(parsed, _)| *parsed)
+        .map(|(_, raw)| raw)
 }
 
 // --- Path safety -------------------------------------------------------------

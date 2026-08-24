@@ -120,9 +120,14 @@ fn resolve_runtime(
     Ok((env_config, resolved, repo))
 }
 
-fn load_and_assemble_for(
+/// Load, overlay and assemble the repo into the gateway document plus the
+/// optional standalone mesh document.
+///
+/// Most commands only care about the gateway half and take `.gateway`;
+/// `validate`, `plan`, `export` and file-mode `apply` also act on `.mesh`.
+fn load_and_assemble_all(
     resolved: &ResolvedEnv,
-) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
+) -> Result<config::AssembledOutput, Box<dyn std::error::Error>> {
     let resources_dir = PathBuf::from("./resources");
     let mut resources = config::load_resources(&resources_dir)?;
 
@@ -133,11 +138,28 @@ fn load_and_assemble_for(
         }
     }
 
-    let gateway_config = config::assemble(resources);
+    // The namespace filter is applied to mesh fragments during assembly (a
+    // mesh fragment's directory is its only namespace handle) and to gateway
+    // resources afterwards, on their effective namespace (which a spec may
+    // override).
+    let assembled =
+        config::assemble_with_namespace_filter(resources, resolved.namespace_filter.as_deref())?;
     let gateway_config =
-        config::select_config_namespace(&gateway_config, resolved.namespace_filter.as_deref());
+        config::select_config_namespace(&assembled.gateway, resolved.namespace_filter.as_deref());
     config::validate_unique_resource_keys(&gateway_config)?;
-    Ok(gateway_config)
+    Ok(config::AssembledOutput {
+        gateway: gateway_config,
+        mesh: assembled.mesh,
+    })
+}
+
+/// [`load_and_assemble_all`] for the commands that only reconcile gateway
+/// resources. Mesh config has no live admin API, so `diff`, `review` and
+/// `rotate` have nothing to do with it.
+fn load_and_assemble_for(
+    resolved: &ResolvedEnv,
+) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
+    Ok(load_and_assemble_all(resolved)?.gateway)
 }
 
 fn load_credential_bundles(
@@ -576,10 +598,12 @@ fn compute_namespace_diffs(
     Vec<diff::ResourceDiff>,
     Vec<diff::BreakingChange>,
     Vec<diff::UnmanagedResource>,
+    Vec<diff::SpecOwnedResource>,
 ) {
     let mut diffs = Vec::new();
     let mut breaking = Vec::new();
     let mut unmanaged = Vec::new();
+    let mut spec_owned = Vec::new();
 
     let ownership_scope = match previously_managed {
         Some(previously_managed) => diff::OwnershipScope::Shared { previously_managed },
@@ -587,6 +611,9 @@ fn compute_namespace_diffs(
     };
 
     for (_, desired_namespace, actual_namespace) in namespace_pairs {
+        // Preview paths never prune spec-owned resources: `--confirm-api-spec-
+        // deletion` is an apply-time decision, and showing the deletion here
+        // would imply diff/plan had already made it.
         let result =
             diff::compute_diff_with_scope(desired_namespace, actual_namespace, ownership_scope);
         let namespace_breaking =
@@ -594,10 +621,47 @@ fn compute_namespace_diffs(
 
         diffs.extend(result.diffs);
         unmanaged.extend(result.unmanaged);
+        spec_owned.extend(result.spec_owned);
         breaking.extend(namespace_breaking);
     }
 
-    (diffs, breaking, unmanaged)
+    (diffs, breaking, unmanaged, spec_owned)
+}
+
+/// Render the spec-owned bucket for `diff` / `plan` stdout.
+///
+/// Mirrors the unmanaged block: a header, then one line per resource. Unlike
+/// unmanaged, it is NOT gated on `ownership.drift_report` — a repo declaring a
+/// resource an API spec owns is a correctness problem in both ownership modes,
+/// not drift noise an operator may want muted.
+fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
+    if spec_owned.is_empty() {
+        return;
+    }
+    println!("=== Spec-owned Resources ===");
+    println!("(carry an `api_spec_id`; provisioned by an OpenAPI spec import, never touched here)");
+    for s in spec_owned {
+        let note = if s.declared_in_repo {
+            "  [CONFLICT: also declared in this repo]"
+        } else {
+            ""
+        };
+        println!(
+            "  {} {} ({}) spec={}{}",
+            s.kind, s.id, s.namespace, s.api_spec_id, note
+        );
+    }
+    println!();
+}
+
+/// Best-effort post-apply convergence line. Never fails an apply — a gateway
+/// that cannot answer `GET /cluster` (older build, DP/CP not in play, network
+/// blip) produces one "unavailable" line and nothing else.
+async fn convergence_line(client: &AdminClient) -> String {
+    match client.get_cluster().await {
+        Ok(status) => gitforgeops::http_client::convergence_summary(&status),
+        Err(_) => gitforgeops::http_client::CONVERGENCE_UNAVAILABLE.to_string(),
+    }
 }
 
 fn previously_managed(resolved: &ResolvedEnv, state: &StateFile) -> Option<HashSet<String>> {
@@ -623,21 +687,83 @@ fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) 
     Some(lines.join("\n"))
 }
 
+/// One-line inventory of a merged mesh document.
+///
+/// Mesh resources never reach the gateway diff — there is no mesh admin API
+/// to compare against, and every mesh node derives its own slice from the
+/// same published document — so counts are the honest limit of what a preview
+/// can say about them.
+fn mesh_summary_line(mesh: &config::MeshConfigSpec) -> String {
+    let summary = mesh.summary();
+    if summary.is_empty() {
+        "empty mesh document".to_string()
+    } else {
+        summary
+    }
+}
+
+/// Print one document's plan-time validation verdict and return whether it
+/// counts as passing.
+///
+/// A missing `ferrum-edge` binary is SKIPPED-not-failed, matching the
+/// pre-existing behavior: `plan` is a preview and should still show the diff
+/// on a machine without the gateway binary installed. `apply` treats the same
+/// condition as fatal.
+fn report_plan_validation(
+    label: &str,
+    result: &Result<validate::ValidationResult, gitforgeops::error::Error>,
+) -> bool {
+    match result {
+        Ok(r) => {
+            if r.success {
+                println!("{label}: PASSED");
+            } else {
+                println!("{label}: FAILED");
+                print!("{}", r.stderr);
+            }
+            r.success
+        }
+        Err(e) => {
+            println!("{label}: SKIPPED ({e})");
+            true
+        }
+    }
+}
+
 fn cmd_validate(
     output_format: validate::OutputFormat,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut gateway_config = load_and_assemble_for(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved)?;
+    let mut gateway_config = assembled.gateway;
     let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
     let result = validate::run_validation(&gateway_config, &env_config.edge_binary_path)?;
-    let formatted = validate::format_result(&result, output_format);
 
+    // Mesh config is a second, independently-loaded document with its own
+    // validator mode. Only run it when the repo actually declares mesh
+    // resources — otherwise behavior (and output) is exactly as before.
+    let mesh_result = match &assembled.mesh {
+        Some(mesh) => Some(validate::run_mesh_validation(
+            mesh,
+            &env_config.edge_binary_path,
+        )?),
+        None => None,
+    };
+
+    let formatted = validate::format_results(&result, mesh_result.as_ref(), output_format);
     print!("{}", formatted);
 
+    // A failure in either document is a failure overall: both get published,
+    // and a node refusing either one is a broken deploy.
     if !result.success {
         process::exit(result.exit_code);
+    }
+    if let Some(mesh_result) = &mesh_result {
+        if !mesh_result.success {
+            process::exit(mesh_result.exit_code);
+        }
     }
 
     Ok(())
@@ -656,7 +782,8 @@ async fn cmd_export(
     }
 
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut gateway_config = load_and_assemble_for(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved)?;
+    let mut gateway_config = assembled.gateway;
 
     if materialize {
         // Fail fast if credentials cannot be fully resolved — we don't want
@@ -696,6 +823,21 @@ async fn cmd_export(
     // from this one document, so the seal travels with either — a materialized
     // export is exactly the artifact a file-mode gateway consumes.
     let yaml = apply::render_file_yaml(&gateway_config)?;
+
+    // The mesh document is a separate artifact with a separate destination —
+    // it cannot ride inside the gateway document (the mesh loader is
+    // deny_unknown_fields and would reject `proxies:`), and `--output` names
+    // the gateway file. It also carries no credential placeholders, so
+    // `--materialize` / `--encrypt-to` have nothing to act on: it is always
+    // published verbatim to FERRUM_MESH_FILE_OUTPUT_PATH.
+    if let Some(mesh) = &assembled.mesh {
+        apply::apply_mesh_file(mesh, &env_config.mesh_file_output_path)?;
+        eprintln!(
+            "Exported mesh document to {} ({})",
+            env_config.mesh_file_output_path,
+            mesh_summary_line(mesh)
+        );
+    }
 
     let payload: Vec<u8> = if let Some(login) = encrypt_to {
         let client = build_github_api_client(&env_config)?;
@@ -750,9 +892,10 @@ async fn cmd_diff(
     client.set_namespace_scope(&namespaces);
     let client = client;
     let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
-    let (diffs, _breaking, unmanaged) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+    let (diffs, _breaking, unmanaged, spec_owned) =
+        compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
-    if diffs.is_empty() && unmanaged.is_empty() {
+    if diffs.is_empty() && unmanaged.is_empty() && spec_owned.is_empty() {
         println!("No differences found. Configuration is in sync.");
         return Ok(());
     }
@@ -794,6 +937,11 @@ async fn cmd_diff(
         }
     }
 
+    if !spec_owned.is_empty() {
+        println!();
+        print_spec_owned(&spec_owned);
+    }
+
     // Honor drift_alert_on flags so operators can selectively suppress
     // categories (e.g. a noisy staging env where only destructive changes
     // should alert). Only categories with their flag set contribute to the
@@ -818,7 +966,9 @@ async fn cmd_diff(
 
 async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved)?;
+    let desired_mesh = assembled.mesh;
+    let mut desired = assembled.gateway;
     // Plan must see the same scope/validation errors as apply would hit, so
     // the preview matches reality. Without this, a plan could print "None
     // (in sync)" for an exclusive env whose filter doesn't match ownership —
@@ -847,22 +997,23 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
 
     println!("=== Validation ===");
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
-    let validation_ok = match &val_result {
-        Ok(r) => {
-            if r.success {
-                println!("PASSED\n");
-            } else {
-                println!("FAILED");
-                print!("{}", r.stderr);
-                println!();
-            }
-            r.success
-        }
-        Err(e) => {
-            println!("SKIPPED ({})\n", e);
-            true
-        }
-    };
+    let mut validation_ok = report_plan_validation("gateway", &val_result);
+    if let Some(mesh) = &desired_mesh {
+        let mesh_result = validate::run_mesh_validation(mesh, &env_config.edge_binary_path);
+        validation_ok &= report_plan_validation("mesh", &mesh_result);
+    }
+    println!();
+
+    if let Some(mesh) = &desired_mesh {
+        // Counts only: mesh resources have no live gateway API to diff
+        // against, so they never appear under "=== Changes ===".
+        println!("=== Mesh ===");
+        println!(
+            "mesh: {} (published to {})\n",
+            mesh_summary_line(mesh),
+            env_config.mesh_file_output_path
+        );
+    }
 
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
         println!("=== Credentials ===");
@@ -873,20 +1024,20 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
-    let (diffs, breaking, unmanaged, actual_available) = match &client {
+    let (diffs, breaking, unmanaged, spec_owned, actual_available) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
-                let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
-                (d, b, u, true)
+                let (d, b, u, s) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                (d, b, u, s, true)
             }
             Err(e) => {
                 eprintln!("Could not fetch live config: {}", e);
-                (Vec::new(), Vec::new(), Vec::new(), false)
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false)
             }
         },
         Err(e) => {
             eprintln!("Could not create API client: {}", e);
-            (Vec::new(), Vec::new(), Vec::new(), false)
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false)
         }
     };
 
@@ -918,6 +1069,8 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
         }
         println!();
     }
+
+    print_spec_owned(&spec_owned);
 
     if !breaking.is_empty() {
         println!("=== Breaking Changes ===");
@@ -978,7 +1131,9 @@ async fn cmd_apply(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved)?;
+    let desired_mesh = assembled.mesh;
+    let mut desired = assembled.gateway;
 
     // Exclusive ownership: enforce namespace scope before anything else so the
     // operator fails fast on a misconfigured resource, not deep in apply.
@@ -1027,6 +1182,30 @@ async fn cmd_apply(
         eprint!("{}", formatted);
         eprintln!("Refusing to apply because validation failed.");
         return Err("validation failed".into());
+    }
+
+    // The mesh document is published by the file-mode arm below, so it must
+    // clear the same gate the gateway document does. Checked here, before any
+    // credential allocation or gateway write, so a bad mesh document cannot
+    // half-apply an environment.
+    if let Some(mesh) = &desired_mesh {
+        let mesh_result = validate::run_mesh_validation(mesh, &env_config.edge_binary_path)?;
+        if !mesh_result.success {
+            let formatted = validate::format_result(&mesh_result, validate::OutputFormat::Text);
+            eprint!("{}", formatted);
+            eprintln!("Refusing to apply because mesh validation failed.");
+            return Err("mesh validation failed".into());
+        }
+        if matches!(env_config.gateway_mode, GatewayMode::Api) {
+            // There is no mesh admin API — no push endpoint, no `mesh`
+            // section on /backup or /restore. Say so rather than letting an
+            // api-mode apply look like it delivered the mesh document.
+            eprintln!(
+                "Notice: {} mesh fragment(s) assembled, but FERRUM_GATEWAY_MODE=api has no mesh push path (ferrum-edge exposes no mesh admin API). Run `gitforgeops export` or a file-mode apply to publish {} for mesh nodes.",
+                mesh_summary_line(mesh),
+                env_config.mesh_file_output_path
+            );
+        }
     }
 
     // Policy enforcement (with optional override). Overridden rule_ids are
@@ -1123,11 +1302,12 @@ async fn cmd_apply(
             if !auto_approve {
                 let namespace_pairs =
                     load_namespace_pairs_for(&client, &desired, &namespaces).await?;
-                let (diffs, _, unmanaged) =
+                let (diffs, _, unmanaged, spec_owned) =
                     compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
                 if diffs.is_empty()
                     && unmanaged.is_empty()
+                    && spec_owned.is_empty()
                     && secret_report.needs_allocation().is_empty()
                 {
                     println!("No changes to apply.");
@@ -1147,6 +1327,10 @@ async fn cmd_apply(
                         "\n{} unmanaged resource(s) on gateway (not touched in shared mode).",
                         unmanaged.len()
                     );
+                }
+                if !spec_owned.is_empty() {
+                    println!();
+                    print_spec_owned(&spec_owned);
                 }
                 let pending_creds = secret_report.needs_allocation();
                 if !pending_creds.is_empty() {
@@ -1170,7 +1354,7 @@ async fn cmd_apply(
             // env secrets untouched — otherwise we'd burn a generated value
             // that the gateway never receives.
             let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
-            let (diffs, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+            let (diffs, _, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
             let actual_by_namespace: BTreeMap<String, GatewayConfig> = namespace_pairs
                 .iter()
                 .map(|(namespace, _, actual)| (namespace.clone(), actual.clone()))
@@ -1307,8 +1491,12 @@ async fn cmd_apply(
             // Print counts up front so partial-success runs surface what
             // landed even when we're about to propagate an error.
             println!(
-                "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped",
-                raw.created, raw.updated, raw.deleted, raw.unmanaged_skipped
+                "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped, {} spec-owned skipped",
+                raw.created,
+                raw.updated,
+                raw.deleted,
+                raw.unmanaged_skipped,
+                raw.spec_owned_skipped
             );
 
             // Pull the per-op records out before `into_result()` consumes
@@ -1321,6 +1509,16 @@ async fn cmd_apply(
             // cmd_apply. `into_result()` produces the same aggregated error
             // message it always did.
             deferred_apply_error = raw.into_result().err();
+
+            // Convergence is a read-only, advisory postscript: with a CP/DP
+            // deployment the admin write lands on the control plane and the
+            // data planes pick it up asynchronously, so "apply succeeded" is
+            // not yet "the fleet is serving it". Only reported on a clean run
+            // — after a partial failure the divergence question is moot until
+            // the errors above are dealt with.
+            if deferred_apply_error.is_none() {
+                println!("{}", convergence_line(&client).await);
+            }
         }
         GatewayMode::File => {
             // File mode has no gateway diff or auto-approve gate in the
@@ -1348,6 +1546,22 @@ async fn cmd_apply(
             // come via the separate `materialize-file.yml` workflow.
             apply::apply_file(&desired, &env_config.file_output_path)?;
             println!("Written to {}", env_config.file_output_path);
+
+            // The mesh document goes to its own path as its own
+            // `{version, mesh}` document. It is never folded into the gateway
+            // file: gateway file mode ignores a `mesh:` key entirely, and the
+            // mesh node's loader rejects a document that carries gateway
+            // resources. Mesh config holds no credential placeholders, so
+            // there is no materialize step for it — what is written here is
+            // final.
+            if let Some(mesh) = &desired_mesh {
+                apply::apply_mesh_file(mesh, &env_config.mesh_file_output_path)?;
+                println!(
+                    "Written mesh document to {} ({})",
+                    env_config.mesh_file_output_path,
+                    mesh_summary_line(mesh)
+                );
+            }
 
             // Now allocate. The in-memory mutation after the disk write is
             // harmless — the file has already been serialized with
@@ -1489,13 +1703,14 @@ async fn cmd_review(
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
 
-    let (diffs, breaking, unmanaged, comparison_error) = match &client {
+    let (diffs, breaking, unmanaged, spec_owned, comparison_error) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
-                let (d, b, u) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
-                (d, b, u, None)
+                let (d, b, u, s) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                (d, b, u, s, None)
             }
             Err(e) => (
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -1503,6 +1718,7 @@ async fn cmd_review(
             ),
         },
         Err(e) => (
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1559,6 +1775,7 @@ async fn cmd_review(
         &bp_findings,
         &policy_findings,
         &unmanaged,
+        &spec_owned,
         override_reason.as_deref(),
         override_cfg.as_ref(),
         comparison_error.as_deref(),

@@ -3,16 +3,53 @@ use std::path::Path;
 
 use walkdir::WalkDir;
 
-use super::schema::{GatewayConfig, Resource};
+use super::schema::{GatewayConfig, MeshConfigSpec, Resource};
 
-/// Assemble loaded resources into a `GatewayConfig`.
+/// Everything one load+assemble pass produces.
 ///
-/// Sets each resource's `namespace` field to the directory-inferred namespace,
-/// unless the spec already has a non-default namespace explicitly set, then
-/// canonicalizes consumer credentials via
-/// [`normalize_consumer_credentials`].
-pub fn assemble(resources: Vec<(String, Resource)>) -> GatewayConfig {
+/// Mesh configuration is deliberately **not** a field on `GatewayConfig`.
+/// ferrum-edge does have a `mesh:` key on its own gateway document, but it is
+/// inert there — gateway file mode never reads it, and there is no `mesh`
+/// section on `GET /backup` / `POST /restore`. The only consumer of a mesh
+/// document is a mesh-protocol node reading a *standalone*
+/// `{version: "1", mesh: {...}}` file whose loader is `deny_unknown_fields`
+/// and rejects `proxies:` outright. Keeping the two documents apart in the
+/// type system is what stops mesh config from ever leaking into the gateway
+/// output (or a gateway resource into the mesh document).
+#[derive(Debug, Clone, Default)]
+pub struct AssembledOutput {
+    pub gateway: GatewayConfig,
+    /// `None` when the repo declares no `MeshConfig` resources at all — the
+    /// signal that no mesh document should be written or validated.
+    pub mesh: Option<MeshConfigSpec>,
+}
+
+/// Assemble loaded resources into a `GatewayConfig` plus an optional merged
+/// mesh document.
+///
+/// Sets each gateway resource's `namespace` field to the directory-inferred
+/// namespace, unless the spec already has a non-default namespace explicitly
+/// set, then canonicalizes consumer credentials via
+/// [`normalize_consumer_credentials`]. Mesh fragments are merged by
+/// [`merge_mesh_fragments`].
+pub fn assemble(resources: Vec<(String, Resource)>) -> crate::error::Result<AssembledOutput> {
+    assemble_with_namespace_filter(resources, None)
+}
+
+/// [`assemble`], restricting **mesh fragments** to those loaded from
+/// `resources/<namespace_filter>/mesh/`.
+///
+/// Gateway resources are intentionally left alone here: they carry their own
+/// `namespace` field (which may override the directory), so they are filtered
+/// downstream by `select_config_namespace` on the effective namespace. A mesh
+/// fragment has no such field — its directory *is* its only handle — so the
+/// filter has to be applied at merge time or not at all.
+pub fn assemble_with_namespace_filter(
+    resources: Vec<(String, Resource)>,
+    namespace_filter: Option<&str>,
+) -> crate::error::Result<AssembledOutput> {
     let mut config = GatewayConfig::default();
+    let mut mesh_fragments: Vec<(String, MeshConfigSpec)> = Vec::new();
 
     for (namespace, resource) in resources {
         match resource {
@@ -40,12 +77,165 @@ pub fn assemble(resources: Vec<(String, Resource)>) -> GatewayConfig {
                 }
                 config.plugin_configs.push(spec);
             }
+            Resource::MeshConfig { id, spec } => {
+                if let Some(filter) = namespace_filter {
+                    if namespace != filter {
+                        continue;
+                    }
+                }
+                let label = match id {
+                    Some(id) if !id.trim().is_empty() => format!("{namespace}/mesh/{id}"),
+                    _ => format!("{namespace}/mesh"),
+                };
+                mesh_fragments.push((label, spec));
+            }
         }
     }
 
     normalize_consumer_credentials(&mut config);
 
-    config
+    Ok(AssembledOutput {
+        gateway: config,
+        mesh: merge_mesh_fragments(mesh_fragments)?,
+    })
+}
+
+/// Fold every `MeshConfig` fragment into the single document a mesh node
+/// loads.
+///
+/// Every mesh node reads the *same* `{version, mesh}` document and derives its
+/// own slice from it, so there is exactly one merged object no matter how many
+/// files or namespaces contributed to it.
+///
+/// * **Collection fields concatenate** in load order. Cross-references inside
+///   a mesh document (a service naming a workload's SPIFFE ID, a policy naming
+///   a service) are resolved against the merged whole, so splitting a mesh
+///   across files is purely an authoring convenience.
+/// * **Scalar / singleton fields take the one value that is set.** Two
+///   fragments setting the *same* value agree and are accepted; two fragments
+///   setting *different* values are a genuine authoring conflict with no
+///   defensible resolution (last-writer-wins would depend on directory walk
+///   order), so it is an error naming both fragments.
+///
+/// Returns `None` when there were no fragments at all — distinct from
+/// `Some(default)`, which would mean "a mesh document was authored and it
+/// happens to be empty".
+pub fn merge_mesh_fragments(
+    fragments: Vec<(String, MeshConfigSpec)>,
+) -> crate::error::Result<Option<MeshConfigSpec>> {
+    if fragments.is_empty() {
+        return Ok(None);
+    }
+
+    let mut merged = MeshConfigSpec::default();
+    // Remembers which fragment last set each singleton, so a conflict error
+    // can name both sides instead of just the loser.
+    let mut singleton_origin: HashMap<&'static str, String> = HashMap::new();
+
+    for (origin, fragment) in fragments {
+        let MeshConfigSpec {
+            istio_root_namespace,
+            workloads,
+            services,
+            mesh_policies,
+            ext_authz_providers,
+            peer_authentications,
+            service_entries,
+            request_authentications,
+            telemetry_resources,
+            destination_rules,
+            virtual_service_cors_policies,
+            proxy_configs,
+            sidecars,
+            waypoint_bindings,
+            trust_bundles,
+            multi_cluster,
+            outbound_traffic_policy,
+            extension_configs,
+        } = fragment;
+
+        merged.workloads.extend(workloads);
+        merged.services.extend(services);
+        merged.mesh_policies.extend(mesh_policies);
+        merged.ext_authz_providers.extend(ext_authz_providers);
+        merged.peer_authentications.extend(peer_authentications);
+        merged.service_entries.extend(service_entries);
+        merged
+            .request_authentications
+            .extend(request_authentications);
+        merged.telemetry_resources.extend(telemetry_resources);
+        merged.destination_rules.extend(destination_rules);
+        merged
+            .virtual_service_cors_policies
+            .extend(virtual_service_cors_policies);
+        merged.proxy_configs.extend(proxy_configs);
+        merged.sidecars.extend(sidecars);
+        merged.waypoint_bindings.extend(waypoint_bindings);
+        merged.extension_configs.extend(extension_configs);
+
+        merge_mesh_singleton(
+            "istio_root_namespace",
+            &mut merged.istio_root_namespace,
+            istio_root_namespace,
+            &origin,
+            &mut singleton_origin,
+        )?;
+        merge_mesh_singleton(
+            "trust_bundles",
+            &mut merged.trust_bundles,
+            trust_bundles,
+            &origin,
+            &mut singleton_origin,
+        )?;
+        merge_mesh_singleton(
+            "multi_cluster",
+            &mut merged.multi_cluster,
+            multi_cluster,
+            &origin,
+            &mut singleton_origin,
+        )?;
+        merge_mesh_singleton(
+            "outbound_traffic_policy",
+            &mut merged.outbound_traffic_policy,
+            outbound_traffic_policy,
+            &origin,
+            &mut singleton_origin,
+        )?;
+    }
+
+    Ok(Some(merged))
+}
+
+fn merge_mesh_singleton<T: PartialEq + std::fmt::Debug>(
+    field: &'static str,
+    slot: &mut Option<T>,
+    incoming: Option<T>,
+    origin: &str,
+    origins: &mut HashMap<&'static str, String>,
+) -> crate::error::Result<()> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+
+    match slot {
+        Some(existing) if *existing != incoming => {
+            let previous = origins
+                .get(field)
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            Err(crate::error::Error::Config(format!(
+                "conflicting mesh `{field}`: fragment {previous} sets {existing:?} but fragment \
+                 {origin} sets {incoming:?}. A mesh document has exactly one value for this \
+                 field — set it in one fragment, or make both fragments agree."
+            )))
+        }
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(incoming);
+            origins.insert(field, origin.to_string());
+            Ok(())
+        }
+    }
 }
 
 /// Canonicalize every consumer credential to ferrum-edge's array-of-entries
@@ -105,8 +295,15 @@ pub fn normalize_consumer_credentials(config: &mut GatewayConfig) {
 /// not all required fields. This function parses them as raw YAML values
 /// (not typed `Resource` structs) and merges into the base resource's JSON
 /// representation. Arrays replace the base value by default so overlays can
-/// narrow restrictive lists. The known additive arrays (`spec.plugins`,
-/// `spec.targets`) merge by item identity.
+/// narrow restrictive lists. A short, kind-specific list of arrays is
+/// *additive* instead, merging by item identity — see
+/// [`array_merge_identity`].
+///
+/// Mesh fragments participate on the same terms as the gateway kinds. They
+/// match on `(namespace, "MeshConfig", fragment id)`, where the fragment id
+/// defaults to the file stem on both sides, so
+/// `overlays/<env>/<ns>/mesh/core.yaml` deep-merges onto
+/// `resources/<ns>/mesh/core.yaml`.
 pub fn apply_overlay(
     base: &mut [(String, Resource)],
     overlay_dir: &Path,
@@ -129,19 +326,20 @@ pub fn apply_overlay(
     let overlay_fragments = load_overlay_fragments(overlay_dir)?;
 
     for overlay in overlay_fragments {
-        let overlay_id = overlay
-            .value
-            .get("spec")
-            .and_then(|s| s.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let overlay_id = overlay_fragment_id(&overlay);
 
         if overlay_id.is_empty() {
             continue;
         }
 
-        let overlay_ns = overlay_effective_namespace(&overlay.value, &overlay.namespace);
+        // A mesh fragment's namespace is its directory, full stop — there is
+        // no `spec.namespace` to consult (the namespaces inside a mesh
+        // document belong to its individual workloads and services).
+        let overlay_ns = if overlay.kind == "MeshConfig" {
+            overlay.namespace.clone()
+        } else {
+            overlay_effective_namespace(&overlay.value, &overlay.namespace)
+        };
         let overlay_key = ResourceKey {
             kind: overlay.kind,
             namespace: overlay_ns,
@@ -155,7 +353,8 @@ pub fn apply_overlay(
         {
             Some((ref mut base_ns, ref mut base_resource)) => {
                 let base_value = serde_json::to_value(&*base_resource)?;
-                let merged = deep_merge_values(base_value, overlay.value, &mut Vec::new());
+                let merged =
+                    deep_merge_values(base_value, overlay.value, &mut Vec::new(), overlay.kind);
                 *base_resource = serde_json::from_value(merged)?;
 
                 if *base_ns == "ferrum" && overlay_key.namespace != "ferrum" {
@@ -182,7 +381,37 @@ pub fn apply_overlay(
 struct OverlayFragment {
     namespace: String,
     kind: &'static str,
+    /// File stem, used as the fragment id for kinds whose documents carry no
+    /// `spec.id` (mesh).
+    stem: String,
     value: serde_json::Value,
+}
+
+/// Identity an overlay fragment targets.
+///
+/// Gateway kinds address a resource by `spec.id`. Mesh fragments have no id
+/// in the mesh schema, so they use the gitforgeops-side fragment name:
+/// explicit top-level `id`, else the file stem — matching what
+/// `loader::load_resources` stamps onto the base fragment.
+fn overlay_fragment_id(overlay: &OverlayFragment) -> String {
+    if overlay.kind == "MeshConfig" {
+        return overlay
+            .value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(overlay.stem.as_str())
+            .to_string();
+    }
+
+    overlay
+        .value
+        .get("spec")
+        .and_then(|s| s.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<OverlayFragment>> {
@@ -216,6 +445,7 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
             ("consumers", "Consumer"),
             ("upstreams", "Upstream"),
             ("plugins", "PluginConfig"),
+            ("mesh", "MeshConfig"),
         ] {
             let subdir_path = ns_path.join(subdir);
             if !subdir_path.is_dir() {
@@ -266,6 +496,11 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
                 results.push(OverlayFragment {
                     namespace: namespace.clone(),
                     kind,
+                    stem: path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     value: json_value,
                 });
             }
@@ -304,6 +539,15 @@ fn resource_key(directory_namespace: &str, resource: &Resource) -> ResourceKey {
             namespace: effective_namespace(directory_namespace, &spec.namespace),
             id: spec.id.clone(),
         },
+        // Mesh fragments key on the directory namespace and the fragment name
+        // (file stem unless the file declares an `id`). There is no
+        // `spec.namespace` to override with: the namespaces in a mesh
+        // document belong to its individual entries, not the document.
+        Resource::MeshConfig { id, .. } => ResourceKey {
+            kind: "MeshConfig",
+            namespace: directory_namespace.to_string(),
+            id: id.clone().unwrap_or_default(),
+        },
     }
 }
 
@@ -328,6 +572,7 @@ fn deep_merge_values(
     base: serde_json::Value,
     overlay: serde_json::Value,
     path: &mut Vec<String>,
+    kind: &'static str,
 ) -> serde_json::Value {
     use serde_json::Value;
 
@@ -336,7 +581,7 @@ fn deep_merge_values(
             for (key, overlay_val) in overlay_map {
                 path.push(key.clone());
                 let merged = if let Some(base_val) = base_map.remove(&key) {
-                    deep_merge_values(base_val, overlay_val, path)
+                    deep_merge_values(base_val, overlay_val, path, kind)
                 } else {
                     overlay_val
                 };
@@ -346,33 +591,84 @@ fn deep_merge_values(
             Value::Object(base_map)
         }
         (Value::Array(base_items), Value::Array(overlay_items)) => {
-            if should_merge_array(path) {
-                merge_array_values(base_items, overlay_items)
-            } else {
-                Value::Array(overlay_items)
+            match array_merge_identity(path, kind) {
+                Some(identity) => merge_array_values(base_items, overlay_items, identity, kind),
+                None => Value::Array(overlay_items),
             }
         }
         (_, overlay) => overlay,
     }
 }
 
-fn should_merge_array(path: &[String]) -> bool {
-    matches!(path, [spec, field] if spec == "spec" && (field == "plugins" || field == "targets"))
+/// How an item inside an additive array is identified for merge purposes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ArrayIdentity {
+    /// `id` / `plugin_config_id` / `name`, else `host:port:path` — covers
+    /// `Proxy.spec.plugins` and `Upstream.spec.targets`.
+    Generic,
+    /// A mesh `Workload`, identified by its SPIFFE ID — the mesh's own
+    /// primary key for a workload.
+    MeshWorkloadSpiffeId,
+    /// A mesh `MeshService`, identified by `(name, namespace)`. Name alone is
+    /// not enough: the same service name legitimately exists in several mesh
+    /// namespaces, and collapsing them would let a `staging` overlay silently
+    /// rewrite the `prod` namespace's service.
+    MeshServiceNameNamespace,
+}
+
+/// Decide whether an array at `path` (within a resource of `kind`) merges by
+/// item identity instead of being replaced wholesale.
+///
+/// **Replace is the default and stays the default.** An overlay that sets a
+/// list is usually narrowing it (allow-lists, CORS origins, retryable status
+/// codes), and additive semantics would make narrowing impossible to express.
+/// Only lists where an environment overlay plausibly wants to *add a member
+/// or tweak one member's fields* are additive:
+///
+/// | kind | path | identity |
+/// |---|---|---|
+/// | Proxy | `spec.plugins` | `plugin_config_id` |
+/// | Upstream | `spec.targets` | `host:port:path` |
+/// | MeshConfig | `spec.workloads` | `spiffe_id` |
+/// | MeshConfig | `spec.services` | `(name, namespace)` |
+///
+/// Every other mesh array (`mesh_policies`, `peer_authentications`,
+/// `service_entries`, `destination_rules`, `sidecars`, ...) keeps replace
+/// semantics: those are security- and routing-relevant policy lists where an
+/// overlay saying "these are the peer authentications for staging" must mean
+/// exactly that, not "these plus whatever the base declared".
+fn array_merge_identity(path: &[String], kind: &'static str) -> Option<ArrayIdentity> {
+    let [spec, field] = path else {
+        return None;
+    };
+    if spec != "spec" {
+        return None;
+    }
+
+    match (kind, field.as_str()) {
+        ("MeshConfig", "workloads") => Some(ArrayIdentity::MeshWorkloadSpiffeId),
+        ("MeshConfig", "services") => Some(ArrayIdentity::MeshServiceNameNamespace),
+        ("MeshConfig", _) => None,
+        (_, "plugins") | (_, "targets") => Some(ArrayIdentity::Generic),
+        _ => None,
+    }
 }
 
 fn merge_array_values(
     mut base_items: Vec<serde_json::Value>,
     overlay_items: Vec<serde_json::Value>,
+    identity: ArrayIdentity,
+    kind: &'static str,
 ) -> serde_json::Value {
     for overlay_item in overlay_items {
-        if let Some(identity) = array_item_identity(&overlay_item) {
-            if let Some(position) = base_items
-                .iter()
-                .position(|item| array_item_identity(item).as_ref() == Some(&identity))
-            {
+        if let Some(overlay_identity) = array_item_identity(&overlay_item, identity) {
+            if let Some(position) = base_items.iter().position(|item| {
+                array_item_identity(item, identity).as_ref() == Some(&overlay_identity)
+            }) {
                 let base_item =
                     std::mem::replace(&mut base_items[position], serde_json::Value::Null);
-                base_items[position] = deep_merge_values(base_item, overlay_item, &mut Vec::new());
+                base_items[position] =
+                    deep_merge_values(base_item, overlay_item, &mut Vec::new(), kind);
             } else {
                 base_items.push(overlay_item);
             }
@@ -384,25 +680,41 @@ fn merge_array_values(
     serde_json::Value::Array(base_items)
 }
 
-fn array_item_identity(value: &serde_json::Value) -> Option<String> {
+fn array_item_identity(value: &serde_json::Value, identity: ArrayIdentity) -> Option<String> {
     let map = value.as_object()?;
 
-    for key in ["id", "plugin_config_id", "name"] {
-        if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
-            return Some(format!("{key}:{value}"));
+    match identity {
+        ArrayIdentity::MeshWorkloadSpiffeId => map
+            .get("spiffe_id")
+            .and_then(|value| value.as_str())
+            .map(|spiffe_id| format!("spiffe_id:{spiffe_id}")),
+        ArrayIdentity::MeshServiceNameNamespace => {
+            let name = map.get("name").and_then(|value| value.as_str())?;
+            // A mesh service without an explicit namespace is not the same
+            // service as one in `ferrum` — ferrum-edge resolves that default
+            // itself, and guessing it here could merge two distinct entries.
+            let namespace = map.get("namespace").and_then(|value| value.as_str())?;
+            Some(format!("service:{namespace}/{name}"))
+        }
+        ArrayIdentity::Generic => {
+            for key in ["id", "plugin_config_id", "name"] {
+                if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
+                    return Some(format!("{key}:{value}"));
+                }
+            }
+
+            if let (Some(host), Some(port)) = (
+                map.get("host").and_then(|value| value.as_str()),
+                map.get("port"),
+            ) {
+                let path = map
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                return Some(format!("target:{host}:{port}:{path}"));
+            }
+
+            None
         }
     }
-
-    if let (Some(host), Some(port)) = (
-        map.get("host").and_then(|value| value.as_str()),
-        map.get("port"),
-    ) {
-        let path = map
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        return Some(format!("target:{host}:{port}:{path}"));
-    }
-
-    None
 }

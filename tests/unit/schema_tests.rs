@@ -626,3 +626,116 @@ spec:
         _ => panic!("expected Proxy"),
     }
 }
+
+// --- MeshConfig mirror ------------------------------------------------------
+
+#[test]
+fn parse_mesh_config_resource_from_yaml() {
+    let yaml = r#"
+kind: MeshConfig
+id: core
+spec:
+  istio_root_namespace: mesh-system
+  workloads:
+    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+      service_name: api
+      namespace: ferrum
+      trust_domain: cluster.local
+  services:
+    - name: api
+      namespace: ferrum
+  peer_authentications:
+    - name: strict
+      namespace: ferrum
+      mtls_mode: strict
+  outbound_traffic_policy:
+    mode: registry_only
+"#;
+    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    match resource {
+        Resource::MeshConfig { id, spec } => {
+            assert_eq!(id.as_deref(), Some("core"));
+            assert_eq!(spec.istio_root_namespace.as_deref(), Some("mesh-system"));
+            assert_eq!(spec.workloads.len(), 1);
+            assert_eq!(spec.services.len(), 1);
+            assert_eq!(spec.peer_authentications.len(), 1);
+            assert_eq!(
+                spec.outbound_traffic_policy.unwrap()["mode"],
+                "registry_only"
+            );
+            assert!(spec.sidecars.is_empty());
+        }
+        other => panic!("expected MeshConfig, got {other:?}"),
+    }
+}
+
+/// The mirror is permissive by design: `ferrum-edge validate -m mesh` is the
+/// authority on the deep shapes, so unknown keys inside a workload or service
+/// must survive verbatim rather than being rejected or silently dropped.
+#[test]
+fn mesh_item_shapes_round_trip_unknown_fields_verbatim() {
+    let yaml = r#"
+kind: MeshConfig
+spec:
+  workloads:
+    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+      some_future_istio_field:
+        nested: [1, 2, 3]
+"#;
+    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let Resource::MeshConfig { spec, .. } = resource else {
+        panic!("expected MeshConfig");
+    };
+
+    assert_eq!(spec.workloads[0]["some_future_istio_field"]["nested"][2], 3);
+
+    let reparsed: MeshConfigSpec =
+        serde_yaml::from_str(&serde_yaml::to_string(&spec).unwrap()).unwrap();
+    assert_eq!(reparsed, spec);
+}
+
+/// Runtime-derived `#[serde(skip)]` fields on ferrum-edge's own `MeshConfig`
+/// are never operator-settable and never on the wire. They must not be part of
+/// the mirror, and a document that mentions one must not grow it back on
+/// serialization.
+#[test]
+fn mesh_mirror_omits_runtime_derived_fields() {
+    let spec: MeshConfigSpec = serde_yaml::from_str(
+        "local_inbound_services: []\nnode_waypoint_assertors: []\nsidecar_ingress_declared: true\n",
+    )
+    .expect("unknown keys are tolerated, not mirrored");
+
+    let emitted = serde_yaml::to_string(&spec).unwrap();
+    for runtime_only in [
+        "local_inbound_services",
+        "node_waypoint_assertors",
+        "node_waypoint_capture_destinations",
+        "local_ingress_listeners",
+        "sidecar_ingress_declared",
+        "declared_ingress_http_ports",
+        "local_inbound_tcp_routes",
+        "local_workload_addresses",
+        "sidecar_ingress_bind_overrides",
+        "egress_udp_destinations",
+        "external_udp_egress_routes",
+    ] {
+        assert!(
+            !emitted.contains(runtime_only),
+            "{runtime_only} in {emitted}"
+        );
+    }
+}
+
+#[test]
+fn mesh_config_id_is_absent_from_a_default_fragment() {
+    // `id` is a gitforgeops-side handle for overlay matching, not part of the
+    // mesh schema — it must never reach the published mesh document, which
+    // serializes `spec` alone.
+    let resource: Resource = serde_yaml::from_str("kind: MeshConfig\nspec: {}\n").unwrap();
+    let Resource::MeshConfig { id, spec } = resource else {
+        panic!("expected MeshConfig");
+    };
+    assert!(id.is_none());
+    assert!(spec.is_empty());
+    assert_eq!(serde_yaml::to_string(&spec).unwrap().trim(), "{}");
+}

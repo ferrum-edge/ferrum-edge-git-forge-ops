@@ -3,7 +3,17 @@ use std::path::PathBuf;
 use gitforgeops::config::{
     apply_overlay, assemble, filter_config_by_namespace, load_resources, schema::Resource,
     select_config_namespace, split_config_by_namespace, validate_unique_resource_keys,
+    GatewayConfig,
 };
+
+/// `assemble` now returns the gateway document alongside the optional merged
+/// mesh document. These tests predate mesh support and only care about the
+/// gateway half; mesh assembly has its own coverage in `mesh_tests`.
+fn assemble_gateway(resources: Vec<(String, Resource)>) -> GatewayConfig {
+    assemble(resources)
+        .expect("assemble should succeed")
+        .gateway
+}
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-config")
@@ -16,7 +26,7 @@ fn overlay_dir() -> PathBuf {
 #[test]
 fn assemble_produces_gateway_config() {
     let resources = load_resources(&fixtures_dir()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     assert_eq!(config.version, "1");
     assert_eq!(config.proxies.len(), 1);
@@ -28,7 +38,7 @@ fn assemble_produces_gateway_config() {
 #[test]
 fn assemble_sets_namespace_from_directory() {
     let resources = load_resources(&fixtures_dir()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     assert_eq!(config.proxies[0].namespace, "ferrum");
     assert_eq!(config.consumers[0].namespace, "ferrum");
@@ -39,7 +49,7 @@ fn assemble_sets_namespace_from_directory() {
 #[test]
 fn assemble_preserves_resource_ids() {
     let resources = load_resources(&fixtures_dir()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     assert_eq!(config.proxies[0].id, "proxy-httpbin");
     assert_eq!(config.consumers[0].id, "consumer-alice");
@@ -50,7 +60,7 @@ fn assemble_preserves_resource_ids() {
 #[test]
 fn assemble_serializes_to_valid_yaml() {
     let resources = load_resources(&fixtures_dir()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
     let yaml = serde_yaml::to_string(&config).unwrap();
 
     assert!(yaml.contains("proxy-httpbin"));
@@ -63,7 +73,7 @@ fn assemble_serializes_to_valid_yaml() {
 fn overlay_merges_fields() {
     let mut resources = load_resources(&fixtures_dir()).unwrap();
     apply_overlay(&mut resources, &overlay_dir()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     let proxy = &config.proxies[0];
     assert_eq!(proxy.id, "proxy-httpbin");
@@ -106,7 +116,7 @@ spec:
     ];
 
     apply_overlay(&mut resources, temp.path()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     let alpha = config
         .proxies
@@ -202,7 +212,7 @@ spec:
     ];
 
     apply_overlay(&mut resources, temp.path()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     let proxy = &config.proxies[0];
     assert_eq!(proxy.hosts, vec!["overlay.example.com"]);
@@ -279,7 +289,7 @@ spec:
 
 #[test]
 fn assemble_empty_resources() {
-    let config = assemble(vec![]);
+    let config = assemble_gateway(vec![]);
     assert!(config.proxies.is_empty());
     assert!(config.consumers.is_empty());
     assert!(config.upstreams.is_empty());
@@ -292,7 +302,7 @@ fn multi_namespace_assembly() {
         ("ferrum".to_string(), make_proxy("proxy-default")),
         ("team-alpha".to_string(), make_proxy("proxy-alpha")),
     ];
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     assert_eq!(config.proxies.len(), 2);
     assert_eq!(config.proxies[0].namespace, "ferrum");
@@ -305,7 +315,7 @@ fn namespace_filter_only_keeps_target_namespace() {
         ("ferrum".to_string(), make_proxy("proxy-default")),
         ("team-alpha".to_string(), make_proxy("proxy-alpha")),
     ];
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
     let filtered = filter_config_by_namespace(&config, "team-alpha");
 
     assert_eq!(filtered.proxies.len(), 1);
@@ -315,7 +325,7 @@ fn namespace_filter_only_keeps_target_namespace() {
 
 #[test]
 fn split_config_by_namespace_preserves_empty_filtered_namespace() {
-    let config = assemble(vec![("ferrum".to_string(), make_proxy("proxy-default"))]);
+    let config = assemble_gateway(vec![("ferrum".to_string(), make_proxy("proxy-default"))]);
     let split = split_config_by_namespace(&config, Some("team-alpha"));
 
     assert_eq!(split.len(), 1);
@@ -329,7 +339,7 @@ fn select_config_namespace_leaves_all_namespaces_when_unfiltered() {
         ("ferrum".to_string(), make_proxy("proxy-default")),
         ("team-alpha".to_string(), make_proxy("proxy-alpha")),
     ];
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
     let selected = select_config_namespace(&config, None);
 
     assert_eq!(selected.proxies.len(), 2);
@@ -337,7 +347,7 @@ fn select_config_namespace_leaves_all_namespaces_when_unfiltered() {
 
 #[test]
 fn validate_unique_resource_keys_rejects_duplicates() {
-    let config = assemble(vec![
+    let config = assemble_gateway(vec![
         ("ferrum".to_string(), make_proxy("same")),
         ("ferrum".to_string(), make_proxy("same")),
     ]);
@@ -354,7 +364,7 @@ fn validate_unique_resource_keys_rejects_duplicates() {
 
 #[test]
 fn validate_unique_resource_keys_runs_after_namespace_selection() {
-    let config = assemble(vec![
+    let config = assemble_gateway(vec![
         ("ferrum".to_string(), make_proxy("ok")),
         ("team-alpha".to_string(), make_proxy("same")),
         ("team-alpha".to_string(), make_proxy("same")),
@@ -588,7 +598,7 @@ fn normalize_leaves_scalar_credentials_alone() {
 #[test]
 fn assemble_emits_canonical_array_credentials_from_the_fixture() {
     let resources = load_resources(&fixtures_dir()).unwrap();
-    let config = assemble(resources);
+    let config = assemble_gateway(resources);
 
     let creds = &config.consumers[0].credentials;
     assert_eq!(
@@ -622,4 +632,44 @@ fn normalization_preserves_credential_slot_names() {
         before.results[0].slot, after.results[0].slot,
         "slot name must survive object -> array normalization"
     );
+}
+
+/// Mesh fragments ride along in the same `Vec<(String, Resource)>` as gateway
+/// resources but land in a different document. Assembling a mixed set must
+/// keep them separated in both directions.
+#[test]
+fn assemble_separates_mesh_fragments_from_gateway_resources() {
+    let mesh: Resource =
+        serde_yaml::from_str("kind: MeshConfig\nid: core\nspec:\n  sidecars:\n    - name: s\n")
+            .unwrap();
+    let output = assemble(vec![
+        ("ferrum".to_string(), make_proxy("proxy-a")),
+        ("ferrum".to_string(), mesh),
+    ])
+    .expect("assemble");
+
+    assert_eq!(output.gateway.proxies.len(), 1);
+    assert_eq!(output.mesh.expect("mesh document").sidecars.len(), 1);
+}
+
+/// The additive-array special case must not leak across kinds: an overlay
+/// list on a gateway resource keeps its existing semantics, and mesh identity
+/// rules apply only to mesh fragments.
+#[test]
+fn overlay_additive_arrays_stay_scoped_to_their_kind() {
+    let mut base = vec![("ferrum".to_string(), make_upstream("pool"))];
+    let overlay_root = tempfile::tempdir().unwrap();
+    let dir = overlay_root.path().join("ferrum/upstreams");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("pool.yaml"),
+        "kind: Upstream\nspec:\n  id: pool\n  targets:\n    - host: 10.9.9.9\n      port: 80\n",
+    )
+    .unwrap();
+
+    apply_overlay(&mut base, overlay_root.path()).unwrap();
+    let config = assemble_gateway(base);
+
+    // `spec.targets` is additive by host:port:path, unchanged by mesh support.
+    assert!(config.upstreams[0].targets.len() > 1);
 }

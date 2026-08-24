@@ -42,10 +42,37 @@ const FERRUM_ENV_PREFIX: &str = "FERRUM_";
 ///   settings too, so an unrelated file in the checkout can fail the run.
 ///   Pointing `-s` at an empty settings file pins settings to defaults.
 pub fn build_validate_args(settings_path: &Path, spec_path: &Path) -> Vec<OsString> {
+    build_validate_args_for_mode(GATEWAY_VALIDATE_MODE, settings_path, spec_path)
+}
+
+/// `-m` value that makes ferrum-edge validate a flat gateway document.
+pub const GATEWAY_VALIDATE_MODE: &str = "file";
+
+/// `-m` value that makes ferrum-edge validate a standalone
+/// `{version, mesh}` document.
+///
+/// Under `-m mesh`, ferrum-edge's `prepare_validate_file_source` inspects the
+/// document handed to `-c`: a localized `{version?, mesh}` shape infers
+/// `FERRUM_MESH_CONFIG_PROTOCOL=file` and validates it as a mesh slice
+/// (parse + normalize + `validate_mesh_fields` + slice derivation), the same
+/// pipeline a mesh node runs at startup. A gateway document handed to this
+/// mode fails, and a mesh document handed to `-m file` fails — the two are
+/// not interchangeable, which is why they are separate invocations rather
+/// than one document with a `mesh:` key.
+pub const MESH_VALIDATE_MODE: &str = "mesh";
+
+/// [`build_validate_args`] with an explicit `-m` value. See
+/// [`GATEWAY_VALIDATE_MODE`] / [`MESH_VALIDATE_MODE`]; the `-m` and `-s`
+/// arguments are load-bearing for both.
+pub fn build_validate_args_for_mode(
+    mode: &str,
+    settings_path: &Path,
+    spec_path: &Path,
+) -> Vec<OsString> {
     vec![
         OsString::from("validate"),
         OsString::from("-m"),
-        OsString::from("file"),
+        OsString::from(mode),
         OsString::from("-s"),
         settings_path.as_os_str().to_os_string(),
         OsString::from("-c"),
@@ -129,6 +156,38 @@ pub fn run_validation(
     config: &GatewayConfig,
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
+    let yaml = serde_yaml::to_string(config)?;
+    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path)
+}
+
+/// Validate the standalone mesh document with
+/// `ferrum-edge validate -m mesh -s <empty settings> -c <mesh doc>`.
+///
+/// The document is rendered by `apply::render_mesh_yaml`, so what is
+/// validated is byte-for-byte what `apply` / `export` publish — including the
+/// `version` stamp, which the mesh loader checks.
+///
+/// Mesh documents hold no credential material (the gh-env-secret broker only
+/// walks consumer credentials), but the temp file is still 0600 with an
+/// unpredictable name: mesh documents do carry SPIFFE identities, trust
+/// bundles and workload addresses, which is not information to leave in a
+/// world-readable shared temp directory either.
+pub fn run_mesh_validation(
+    mesh: &crate::config::MeshConfigSpec,
+    binary_path: &str,
+) -> crate::error::Result<ValidationResult> {
+    let yaml = crate::apply::render_mesh_yaml(mesh)?;
+    run_validate_command(MESH_VALIDATE_MODE, &yaml, binary_path)
+}
+
+/// Shared body of [`run_validation`] and [`run_mesh_validation`]: locate the
+/// binary, write `yaml` to a private temp file, and run `validate` in `mode`
+/// with a scrubbed environment and pinned settings.
+fn run_validate_command(
+    mode: &str,
+    yaml: &str,
+    binary_path: &str,
+) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
     let which_result = Command::new("which").arg(binary_path).output();
     let binary_exists = match which_result {
@@ -150,10 +209,8 @@ pub fn run_validation(
         }
     }
 
-    // Serialize config to YAML. The `.yaml` suffix matters: ferrum-edge
-    // selects its parser from the spec file extension.
-    let yaml = serde_yaml::to_string(config)?;
-
+    // The `.yaml` suffix matters: ferrum-edge selects its parser from the
+    // spec file extension.
     let mut spec_file = private_temp_file("gitforgeops-spec-", ".yaml")?;
     spec_file.write_all(yaml.as_bytes())?;
     spec_file.flush()?;
@@ -164,7 +221,11 @@ pub fn run_validation(
     let settings_file = private_temp_file("gitforgeops-settings-", ".conf")?;
 
     let mut command = Command::new(binary_path);
-    command.args(build_validate_args(settings_file.path(), spec_file.path()));
+    command.args(build_validate_args_for_mode(
+        mode,
+        settings_file.path(),
+        spec_file.path(),
+    ));
     for name in scrubbed_env_names(std::env::vars().map(|(name, _)| name)) {
         command.env_remove(name);
     }

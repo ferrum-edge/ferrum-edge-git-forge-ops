@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use crate::config::schema::GatewayConfig;
 use crate::config::ApplyStrategy;
 use crate::diff::resource_diff::{
-    compute_diff_with_scope, DiffAction, DiffResult, OwnershipScope, ResourceDiff,
+    compute_diff_with_options, DiffAction, DiffOptions, DiffResult, OwnershipScope, ResourceDiff,
+    SpecOwnedResource,
 };
 use crate::http_client::{self, AdminClient, BackupExtras, BatchCreate, BATCH_MAX_BODY_BYTES};
 
@@ -31,7 +32,10 @@ pub struct ApplyOptions {
     /// should" decisions.
     pub allow_large_prune: bool,
     /// `--confirm-api-spec-deletion`. Full replace drops the namespace's
-    /// `api_specs` section instead of carrying it through.
+    /// `api_specs` section instead of carrying it through, and an exclusive
+    /// incremental apply is allowed to prune live resources tagged with an
+    /// `api_spec_id`. Without it, spec-owned resources are reported and
+    /// skipped.
     pub confirm_api_spec_deletion: bool,
 }
 
@@ -41,6 +45,9 @@ pub struct ApplyResult {
     pub updated: usize,
     pub deleted: usize,
     pub unmanaged_skipped: usize,
+    /// Live resources owned by an API-spec import that this run deliberately
+    /// left alone (see [`spec_owned_skip_messages`]).
+    pub spec_owned_skipped: usize,
     pub errors: Vec<String>,
     /// Per-resource operations that succeeded in `apply_incremental`.
     /// Empty for `apply_full_replace` runs — see `fully_replaced_namespaces`.
@@ -209,6 +216,7 @@ pub async fn apply_api(
         aggregate.updated += namespace_result.updated;
         aggregate.deleted += namespace_result.deleted;
         aggregate.unmanaged_skipped += namespace_result.unmanaged_skipped;
+        aggregate.spec_owned_skipped += namespace_result.spec_owned_skipped;
         aggregate
             .applied_incremental
             .extend(namespace_result.applied_incremental);
@@ -325,8 +333,24 @@ async fn apply_incremental(
             &fetched_actual
         }
     };
-    let DiffResult { diffs, unmanaged } = compute_diff_with_scope(desired, actual, ownership_scope);
+    let DiffResult {
+        diffs,
+        unmanaged,
+        spec_owned,
+    } = compute_diff_with_options(
+        desired,
+        actual,
+        ownership_scope,
+        DiffOptions {
+            prune_spec_owned: options.confirm_api_spec_deletion,
+        },
+    );
     let diffs = order_diffs(diffs);
+
+    for message in spec_owned_skip_messages(&spec_owned) {
+        eprintln!("[{namespace}] {message}");
+    }
+    let spec_owned_skipped = spec_owned.iter().filter(|s| !s.pruned).count();
 
     let delete_count = diffs
         .iter()
@@ -348,6 +372,7 @@ async fn apply_incremental(
 
     let mut result = ApplyResult {
         unmanaged_skipped: unmanaged.len(),
+        spec_owned_skipped,
         ..Default::default()
     };
 
@@ -359,6 +384,7 @@ async fn apply_incremental(
             Some(batched) => {
                 return Ok(ApplyResult {
                     unmanaged_skipped: result.unmanaged_skipped,
+                    spec_owned_skipped: result.spec_owned_skipped,
                     ..batched
                 })
             }
@@ -509,6 +535,43 @@ async fn apply_incremental(
     }
 
     Ok(result)
+}
+
+/// One operator-facing line per spec-owned live resource the run touched.
+///
+/// Three shapes, because there are three ways a spec-owned row shows up:
+///
+/// - the repo declares the same id (an ownership conflict — the repo and the
+///   `/api-specs` importer are both trying to own one row),
+/// - the run is leaving it alone (the default), or
+/// - the run is deleting it because `--confirm-api-spec-deletion` was passed.
+///
+/// Pure so the wording is testable without a gateway.
+pub fn spec_owned_skip_messages(spec_owned: &[SpecOwnedResource]) -> Vec<String> {
+    spec_owned
+        .iter()
+        .map(|s| {
+            if s.declared_in_repo {
+                format!(
+                    "conflict: {} `{}` is owned by API spec `{}` but this repo also declares it. \
+                     Skipping — the next spec import would revert the change. Remove the resource \
+                     file, or stop managing the spec through /api-specs.",
+                    s.kind, s.id, s.api_spec_id
+                )
+            } else if s.pruned {
+                format!(
+                    "deleting {} `{}` owned by API spec `{}` (--confirm-api-spec-deletion)",
+                    s.kind, s.id, s.api_spec_id
+                )
+            } else {
+                format!(
+                    "skipping {} `{}`: owned by API spec `{}`. Re-run with \
+                     --confirm-api-spec-deletion to prune spec-owned resources.",
+                    s.kind, s.id, s.api_spec_id
+                )
+            }
+        })
+        .collect()
 }
 
 /// Refuse to compute prunes from a cached (potentially stale) gateway view.

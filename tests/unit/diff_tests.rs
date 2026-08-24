@@ -680,3 +680,91 @@ fn best_practice_respects_global_plugins() {
         .any(|check| check.message.contains("rate_limiting")));
     assert!(!checks.iter().any(|check| check.message.contains("logging")));
 }
+
+// --- Spec-owned classification across kinds ----------------------------------
+//
+// `api_spec_id` lives on Proxy, Upstream and PluginConfig (never Consumer —
+// spec ingestion does not provision identities). These cover the per-kind
+// wiring; the ownership-mode semantics live in ownership_tests.rs.
+
+#[test]
+fn spec_owned_upstream_is_not_pruned_by_plain_compute_diff() {
+    // `compute_diff` is the plain exclusive entry point used by callers with
+    // no ownership context — it must protect spec-owned rows too.
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        upstreams: vec![Upstream {
+            api_spec_id: Some("spec-3".to_string()),
+            ..make_upstream("u-from-spec", 1)
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    assert!(
+        diffs.is_empty(),
+        "spec-owned upstream must not produce a Delete: {diffs:?}"
+    );
+}
+
+#[test]
+fn spec_owned_plugin_config_is_bucketed_not_deleted() {
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        plugin_configs: vec![PluginConfig {
+            api_spec_id: Some("spec-4".to_string()),
+            ..make_plugin_config("pc-from-spec", "ferrum", "rate-limit", PluginScope::Global)
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    assert!(result.diffs.is_empty(), "{:?}", result.diffs);
+    assert_eq!(result.spec_owned.len(), 1);
+    assert_eq!(result.spec_owned[0].kind, "PluginConfig");
+    assert_eq!(result.spec_owned[0].api_spec_id, "spec-4");
+}
+
+#[test]
+fn consumers_are_never_classified_as_spec_owned() {
+    // Consumers carry no `api_spec_id`; an admin-added one in exclusive mode
+    // stays an ordinary prune candidate.
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        consumers: vec![make_consumer("c1", "alice")],
+        ..GatewayConfig::default()
+    };
+
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    assert!(result.spec_owned.is_empty());
+    assert_eq!(result.diffs.len(), 1);
+    assert!(matches!(result.diffs[0].action, DiffAction::Delete));
+}
+
+#[test]
+fn spec_owned_upstream_declared_in_repo_suppresses_modify() {
+    // Repo declares two targets, the spec-provisioned live row has one. That
+    // is a Modify under normal ownership — here it must become a conflict.
+    let desired = GatewayConfig {
+        upstreams: vec![make_upstream("u-shared", 2)],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        upstreams: vec![Upstream {
+            api_spec_id: Some("spec-3".to_string()),
+            ..make_upstream("u-shared", 1)
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    assert!(
+        result.diffs.is_empty(),
+        "no Modify against a spec-owned row: {:?}",
+        result.diffs
+    );
+    let conflicts: Vec<_> = result.spec_conflicts().collect();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].kind, "Upstream");
+    assert_eq!(conflicts[0].id, "u-shared");
+}

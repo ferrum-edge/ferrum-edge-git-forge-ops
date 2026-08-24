@@ -186,3 +186,58 @@ fn republish_preserves_destination_permissions() {
         & 0o777;
     assert_eq!(mode, 0o640, "mode was {mode:o}");
 }
+
+/// The two documents are published side by side and must not contaminate each
+/// other: the gateway file keeps its `resource_counts` seal and gains no
+/// `mesh:` key, and the mesh file carries neither the seal nor any gateway
+/// array.
+#[test]
+fn gateway_and_mesh_documents_are_published_independently() {
+    use gitforgeops::apply::apply_mesh_file;
+    use gitforgeops::config::MeshConfigSpec;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gateway_path = dir.path().join("resources.yaml");
+    let mesh_path = dir.path().join("mesh.yaml");
+
+    let mut mesh = MeshConfigSpec::default();
+    mesh.services
+        .push(serde_json::json!({"name": "api", "namespace": "ferrum"}));
+
+    apply_file(&fixture(), gateway_path.to_str().expect("utf-8 path")).expect("gateway write");
+    apply_mesh_file(&mesh, mesh_path.to_str().expect("utf-8 path")).expect("mesh write");
+
+    let gateway = std::fs::read_to_string(&gateway_path).expect("read gateway");
+    let mesh_doc = std::fs::read_to_string(&mesh_path).expect("read mesh");
+
+    assert!(gateway.contains("resource_counts"));
+    assert!(!gateway.contains("mesh:"), "{gateway}");
+
+    assert!(!mesh_doc.contains("resource_counts"), "{mesh_doc}");
+    assert!(!mesh_doc.contains("proxies:"), "{mesh_doc}");
+    assert!(mesh_doc.starts_with("version:"), "{mesh_doc}");
+}
+
+#[cfg(unix)]
+#[test]
+fn mesh_republish_preserves_destination_permissions() {
+    use gitforgeops::apply::apply_mesh_file;
+    use gitforgeops::config::MeshConfigSpec;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mesh.yaml");
+    let mesh = MeshConfigSpec::default();
+
+    apply_mesh_file(&mesh, path.to_str().expect("utf-8 path")).expect("first write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+        .expect("chmod destination");
+    apply_mesh_file(&mesh, path.to_str().expect("utf-8 path")).expect("second write");
+
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640, "mode was {mode:o}");
+}

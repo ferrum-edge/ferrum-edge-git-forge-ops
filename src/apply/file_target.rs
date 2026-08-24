@@ -1,11 +1,16 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, MeshConfigSpec};
 
 /// Top-level key holding the anti-truncation seal understood by ferrum-edge's
 /// file-mode loader.
 const RESOURCE_COUNTS_KEY: &str = "resource_counts";
+
+/// The only `version` a mesh document may declare. ferrum-edge's mesh file
+/// loader treats `version` as optional but rejects anything other than the
+/// current config version — there are no mesh file migrations.
+pub const MESH_DOCUMENT_VERSION: &str = "1";
 
 /// Serialize `config` into the flat file-mode YAML document, including the
 /// optional `resource_counts` integrity seal.
@@ -68,7 +73,46 @@ pub fn render_file_yaml(config: &GatewayConfig) -> crate::error::Result<String> 
     Ok(serde_yaml::to_string(&serde_yaml::Value::Mapping(sealed))?)
 }
 
+/// Serialize `mesh` into the standalone mesh document a mesh-protocol node
+/// loads from `FERRUM_MESH_FILE_CONFIG_PATH`.
+///
+/// The document carries **exactly two keys**, `version` and `mesh`, and
+/// nothing else. ferrum-edge's `MeshFileDocument` is `deny_unknown_fields`
+/// precisely so a document that also carries gateway resources fails loudly
+/// instead of silently dropping them — so the mesh document is built key by
+/// key here rather than by serializing a struct that might one day grow a
+/// third field.
+///
+/// Conversely the gateway document never gains a `mesh:` key: gateway file
+/// mode ignores it entirely, so writing it there would produce a config that
+/// looks like it configures a mesh and does not.
+pub fn render_mesh_yaml(mesh: &MeshConfigSpec) -> crate::error::Result<String> {
+    let mut document = serde_yaml::Mapping::with_capacity(2);
+    document.insert(
+        serde_yaml::Value::from("version"),
+        serde_yaml::Value::from(MESH_DOCUMENT_VERSION),
+    );
+    document.insert(serde_yaml::Value::from("mesh"), serde_yaml::to_value(mesh)?);
+    Ok(serde_yaml::to_string(&serde_yaml::Value::Mapping(
+        document,
+    ))?)
+}
+
 pub fn apply_file(config: &GatewayConfig, output_path: &str) -> crate::error::Result<()> {
+    publish_document(output_path, render_file_yaml(config)?.as_bytes())
+}
+
+/// Publish the standalone `{version, mesh}` document at `output_path`
+/// (`FERRUM_MESH_FILE_OUTPUT_PATH`), with the same atomic-publish guarantees
+/// as the gateway file: mesh nodes read their document through the identical
+/// stable-file primitive (two reads, 20 ms apart, required byte-identical),
+/// so an in-place rewrite can cost a mesh reload just as it can a gateway one.
+pub fn apply_mesh_file(mesh: &MeshConfigSpec, output_path: &str) -> crate::error::Result<()> {
+    publish_document(output_path, render_mesh_yaml(mesh)?.as_bytes())
+}
+
+/// Create the destination directory and atomically publish `bytes` into it.
+fn publish_document(output_path: &str, bytes: &[u8]) -> crate::error::Result<()> {
     let path = Path::new(output_path);
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -76,8 +120,7 @@ pub fn apply_file(config: &GatewayConfig, output_path: &str) -> crate::error::Re
     };
     std::fs::create_dir_all(parent)?;
 
-    let yaml = render_file_yaml(config)?;
-    write_atomically(path, parent, yaml.as_bytes())
+    write_atomically(path, parent, bytes)
 }
 
 /// Publish `bytes` at `path` with write-temp → fsync → `rename(2)`.

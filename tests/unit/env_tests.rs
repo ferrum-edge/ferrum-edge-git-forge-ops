@@ -22,6 +22,7 @@ fn clear_env() {
         "FERRUM_APPLY_STRATEGY",
         "FERRUM_OVERLAY",
         "FERRUM_FILE_OUTPUT_PATH",
+        "FERRUM_MESH_FILE_OUTPUT_PATH",
         "FERRUM_EDGE_BINARY_PATH",
         "FERRUM_TLS_NO_VERIFY",
         "FERRUM_GATEWAY_CA_CERT",
@@ -98,6 +99,36 @@ fn env_config_treats_blank_jwt_vars_as_unset() {
     clear_env();
 }
 
+/// `FERRUM_MESH_FILE_OUTPUT_PATH` follows the same shape as every other
+/// path-valued variable: absent or blank falls back to the documented default,
+/// a real value wins. Blank matters because CI writes these from `secrets` /
+/// `vars` expansions that render to an empty string when unset.
+#[test]
+fn mesh_file_output_path_defaults_and_overrides() {
+    let _guard = env_guard();
+    clear_env();
+
+    assert_eq!(
+        load_env_config().mesh_file_output_path,
+        "./assembled/mesh.yaml"
+    );
+
+    std::env::set_var("FERRUM_MESH_FILE_OUTPUT_PATH", "   ");
+    assert_eq!(
+        load_env_config().mesh_file_output_path,
+        "./assembled/mesh.yaml",
+        "a blank value must not produce an empty output path"
+    );
+
+    std::env::set_var("FERRUM_MESH_FILE_OUTPUT_PATH", "/srv/mesh/slice.yaml");
+    assert_eq!(
+        load_env_config().mesh_file_output_path,
+        "/srv/mesh/slice.yaml"
+    );
+
+    clear_env();
+}
+
 #[test]
 fn env_config_defaults_and_overrides() {
     let _guard = env_guard();
@@ -111,6 +142,7 @@ fn env_config_defaults_and_overrides() {
     assert_eq!(config.apply_strategy, ApplyStrategy::Incremental);
     assert!(config.overlay.is_none());
     assert_eq!(config.file_output_path, "./assembled/resources.yaml");
+    assert_eq!(config.mesh_file_output_path, "./assembled/mesh.yaml");
     assert_eq!(config.edge_binary_path, "ferrum-edge");
     assert!(!config.tls_no_verify);
 

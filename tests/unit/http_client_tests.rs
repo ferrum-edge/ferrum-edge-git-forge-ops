@@ -1,9 +1,11 @@
 use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
 use gitforgeops::config::schema::{GatewayConfig, Proxy, Upstream};
+use gitforgeops::http_client::convergence_summary;
 use gitforgeops::http_client::{
     build_restore_body, classify_retry, delete_succeeded, map_api_error, merge_pages,
     next_page_offset, split_batch, write_block_reason, AdminClient, ApiErrorBody, BackupExtras,
-    BackupSnapshot, BatchCreate, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
+    BackupSnapshot, BatchCreate, ClusterStatus, HealthStatus, RequestKind, RetryDecision,
+    BATCH_MAX_BODY_BYTES,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -677,4 +679,155 @@ fn write_block_reason_tolerates_a_sparse_health_body() {
     // Absence of the flag is not evidence of read-only mode.
     let health = serde_json::from_str::<HealthStatus>(r#"{"status":"ok","ready":true}"#).unwrap();
     assert!(write_block_reason(&health).is_none());
+}
+
+// --- GET /cluster + convergence summary --------------------------------------
+
+#[test]
+fn cluster_status_parses_cp_shape() {
+    let body = r#"{
+      "mode": "cp",
+      "connected_data_planes": 2,
+      "data_planes": [
+        {"node_id":"abc-123","version":"0.9.0","namespace":"ferrum","status":"online",
+         "connected_at":"2025-01-15T10:30:00Z","last_sync_at":"2025-01-15T10:35:00Z"},
+        {"node_id":"def-456","version":"0.9.0","namespace":"staging","status":"online",
+         "connected_at":"2025-01-15T10:31:00Z","last_sync_at":"2025-01-15T10:32:00Z"}
+      ],
+      "connected_mesh_nodes": 1,
+      "mesh_nodes": [
+        {"node_id":"mesh-789","version":"0.9.0","namespace":"ferrum","status":"online",
+         "connected_at":"2025-01-15T10:32:00Z","last_sync_at":"2025-01-15T10:40:00Z"}
+      ]
+    }"#;
+
+    let status: ClusterStatus = serde_json::from_str(body).expect("cp shape parses");
+    assert_eq!(status.mode.as_deref(), Some("cp"));
+    assert_eq!(status.data_planes.len(), 2);
+    assert_eq!(status.mesh_nodes.len(), 1);
+
+    let summary = convergence_summary(&status);
+    assert!(summary.contains("2 data-plane node(s)"), "{summary}");
+    assert!(summary.contains("1 mesh node(s)"), "{summary}");
+    // Oldest across BOTH node lists, not just the first one.
+    assert!(
+        summary.contains("oldest last_sync_at 2025-01-15T10:32:00Z"),
+        "{summary}"
+    );
+    assert!(!summary.contains("WARNING"), "{summary}");
+}
+
+#[test]
+fn cluster_status_parses_dp_shape_and_warns_on_divergence() {
+    let body = r#"{
+      "mode": "dp",
+      "control_plane": {
+        "url": "http://cp-host:50051",
+        "status": "online",
+        "is_primary": true,
+        "connected_since": "2025-01-15T10:30:00Z",
+        "last_config_received_at": "2025-01-15T10:35:00Z",
+        "config_diverged": true,
+        "config_diverged_since": "2025-01-15T10:36:00Z",
+        "config_divergence_recoveries_total": 3
+      }
+    }"#;
+
+    let status: ClusterStatus = serde_json::from_str(body).expect("dp shape parses");
+    let summary = convergence_summary(&status);
+    assert!(summary.contains("http://cp-host:50051"), "{summary}");
+    assert!(summary.contains("online"), "{summary}");
+    assert!(
+        summary.contains("last config received 2025-01-15T10:35:00Z"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("WARNING: config_diverged since 2025-01-15T10:36:00Z"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn cluster_status_parses_informational_shape() {
+    let body =
+        r#"{"mode":"database","message":"cluster status is only meaningful in CP/DP modes"}"#;
+
+    let status: ClusterStatus = serde_json::from_str(body).expect("informational shape parses");
+    let summary = convergence_summary(&status);
+    assert!(summary.contains("mode=database"), "{summary}");
+    assert!(summary.contains("only meaningful in CP/DP"), "{summary}");
+    assert!(!summary.contains("WARNING"), "{summary}");
+}
+
+#[test]
+fn cluster_status_tolerates_missing_fields() {
+    // Every field optional: an empty object, a node with no timestamps, and an
+    // unknown extra key must all survive. The endpoint is advisory; a shape
+    // this build has not seen must not become an error.
+    let empty: ClusterStatus = serde_json::from_str("{}").expect("empty object parses");
+    assert!(empty.mode.is_none());
+    let summary = convergence_summary(&empty);
+    assert!(summary.contains("mode=unknown"), "{summary}");
+
+    let partial: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","data_planes":[{"node_id":"a"}],"future_field":{"nested":1}}"#,
+    )
+    .expect("partial + unknown fields parse");
+    assert_eq!(partial.data_planes.len(), 1);
+    assert!(partial.data_planes[0].last_sync_at.is_none());
+    let summary = convergence_summary(&partial);
+    assert!(summary.contains("1 data-plane node(s)"), "{summary}");
+    assert!(summary.contains("no last_sync_at reported"), "{summary}");
+}
+
+#[test]
+fn convergence_summary_warns_on_per_node_divergence() {
+    let status: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","connected_data_planes":1,
+            "data_planes":[{"node_id":"a","last_sync_at":"2025-01-15T10:35:00Z",
+                            "config_diverged":true}]}"#,
+    )
+    .expect("parses");
+
+    let summary = convergence_summary(&status);
+    assert!(
+        summary.contains("WARNING: at least one node reports config_diverged"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn convergence_summary_ignores_unparsable_timestamps() {
+    // A garbage stamp must not become the headline "oldest" value.
+    let status: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","connected_data_planes":2,
+            "data_planes":[{"node_id":"a","last_sync_at":"not-a-timestamp"},
+                           {"node_id":"b","last_sync_at":"2025-01-15T10:35:00Z"}]}"#,
+    )
+    .expect("parses");
+
+    let summary = convergence_summary(&status);
+    assert!(
+        summary.contains("oldest last_sync_at 2025-01-15T10:35:00Z"),
+        "{summary}"
+    );
+    assert!(!summary.contains("not-a-timestamp"), "{summary}");
+}
+
+#[test]
+fn convergence_summary_orders_by_instant_not_string() {
+    // 09:00-01:00 is 10:00Z, which is LATER than 09:30Z despite sorting
+    // earlier lexicographically.
+    let status: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","connected_data_planes":2,
+            "data_planes":[{"node_id":"a","last_sync_at":"2025-01-15T09:00:00-01:00"},
+                           {"node_id":"b","last_sync_at":"2025-01-15T09:30:00Z"}]}"#,
+    )
+    .expect("parses");
+
+    let summary = convergence_summary(&status);
+    assert!(
+        summary.contains("oldest last_sync_at 2025-01-15T09:30:00Z"),
+        "{summary}"
+    );
 }

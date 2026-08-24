@@ -66,3 +66,51 @@ fn load_skips_underscore_prefixed_files() {
         "files starting with _ should be skipped"
     );
 }
+
+/// `mesh/` is walked alongside the four gateway directories. It is listed last
+/// so mesh support cannot reorder — or drop — any existing kind.
+#[test]
+fn load_walks_the_mesh_subdirectory_alongside_gateway_kinds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ns = tmp.path().join("ferrum");
+    for (subdir, file, body) in [
+        (
+            "proxies",
+            "api.yaml",
+            "kind: Proxy\nspec:\n  id: api\n  listen_path: /api\n  backend_scheme: http\n  backend_host: h\n  backend_port: 80\n",
+        ),
+        (
+            "consumers",
+            "alice.yaml",
+            "kind: Consumer\nspec:\n  id: alice\n  username: alice\n",
+        ),
+        (
+            "upstreams",
+            "pool.yaml",
+            "kind: Upstream\nspec:\n  id: pool\n  targets:\n    - host: h\n      port: 80\n",
+        ),
+        (
+            "plugins",
+            "rl.yaml",
+            "kind: PluginConfig\nspec:\n  id: rl\n  plugin_name: rate_limiting\n  scope: global\n",
+        ),
+        ("mesh", "core.yaml", "kind: MeshConfig\nspec: {}\n"),
+    ] {
+        std::fs::create_dir_all(ns.join(subdir)).unwrap();
+        std::fs::write(ns.join(subdir).join(file), body).unwrap();
+    }
+
+    let resources = load_resources(tmp.path()).unwrap();
+
+    assert_eq!(resources.len(), 5);
+    assert_eq!(
+        resources
+            .iter()
+            .filter(|(_, r)| matches!(r, Resource::MeshConfig { .. }))
+            .count(),
+        1
+    );
+    for (namespace, _) in &resources {
+        assert_eq!(namespace, "ferrum");
+    }
+}

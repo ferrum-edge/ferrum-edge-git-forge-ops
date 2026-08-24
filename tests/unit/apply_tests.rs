@@ -1,5 +1,6 @@
-use gitforgeops::apply::{apply_file, ApplyResult};
+use gitforgeops::apply::{apply_file, spec_owned_skip_messages, ApplyResult};
 use gitforgeops::config::schema::{GatewayConfig, Proxy};
+use gitforgeops::diff::SpecOwnedResource;
 
 #[test]
 fn apply_result_into_result_rejects_partial_failure() {
@@ -288,4 +289,84 @@ fn stale_view_allows_a_pure_write_apply() {
 fn stale_view_is_overridable_and_inert_on_a_fresh_view() {
     assert!(stale_view_block(true, 5, true).is_none());
     assert!(stale_view_block(false, 5, false).is_none());
+}
+
+// --- Spec-owned skip messages ------------------------------------------------
+
+fn spec_owned(id: &str, declared_in_repo: bool, pruned: bool) -> SpecOwnedResource {
+    SpecOwnedResource {
+        kind: "Proxy".to_string(),
+        id: id.to_string(),
+        namespace: "ferrum".to_string(),
+        api_spec_id: "spec-7".to_string(),
+        declared_in_repo,
+        pruned,
+    }
+}
+
+#[test]
+fn spec_owned_skip_message_names_the_owning_spec() {
+    let messages = spec_owned_skip_messages(&[spec_owned("from-spec", false, false)]);
+
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].contains("skipping Proxy `from-spec`"),
+        "{}",
+        messages[0]
+    );
+    assert!(messages[0].contains("spec-7"), "{}", messages[0]);
+    assert!(
+        messages[0].contains("--confirm-api-spec-deletion"),
+        "the skip message must say how to override it: {}",
+        messages[0]
+    );
+}
+
+#[test]
+fn spec_owned_skip_message_flags_repo_conflict() {
+    let messages = spec_owned_skip_messages(&[spec_owned("shared-id", true, false)]);
+
+    assert!(messages[0].starts_with("conflict:"), "{}", messages[0]);
+    assert!(
+        messages[0].contains("this repo also declares it"),
+        "{}",
+        messages[0]
+    );
+    assert!(
+        !messages[0].contains("--confirm-api-spec-deletion"),
+        "a conflict is not fixed by the deletion flag: {}",
+        messages[0]
+    );
+}
+
+#[test]
+fn spec_owned_skip_message_announces_confirmed_deletion() {
+    let messages = spec_owned_skip_messages(&[spec_owned("from-spec", false, true)]);
+
+    assert!(
+        messages[0].contains("deleting Proxy `from-spec`"),
+        "{}",
+        messages[0]
+    );
+    assert!(
+        messages[0].contains("--confirm-api-spec-deletion"),
+        "{}",
+        messages[0]
+    );
+}
+
+#[test]
+fn spec_owned_skip_messages_is_empty_without_spec_owned_resources() {
+    assert!(spec_owned_skip_messages(&[]).is_empty());
+}
+
+#[test]
+fn apply_result_reports_spec_owned_skips() {
+    let result = ApplyResult {
+        created: 1,
+        spec_owned_skipped: 2,
+        ..Default::default()
+    };
+    let ok = result.into_result().expect("no errors means Ok");
+    assert_eq!(ok.spec_owned_skipped, 2);
 }

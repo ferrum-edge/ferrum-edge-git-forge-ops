@@ -9,6 +9,7 @@ mod http_client_tests;
 mod import_tests;
 mod jwt_tests;
 mod loader_tests;
+mod mesh_tests;
 mod ownership_tests;
 mod policy_tests;
 mod repo_config_tests;
