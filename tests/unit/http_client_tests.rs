@@ -128,3 +128,51 @@ async fn admin_client_get_backup_sends_namespace_and_bearer_token() {
     assert!(request.contains("authorization: Bearer "));
     assert!(request.contains("x-ferrum-namespace: team-alpha"));
 }
+
+#[tokio::test]
+async fn admin_client_rejects_unsafe_resource_ids_in_paths() {
+    let env = base_env();
+    let client = AdminClient::new(&env).unwrap();
+
+    let err = client
+        .delete_proxy("../consumers/victim?confirm=true", "team-alpha")
+        .await;
+    assert!(err.is_err(), "expected unsafe id to be rejected");
+    let msg = err.err().unwrap().to_string();
+    assert!(
+        msg.contains("unsafe characters"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn admin_client_accepts_safe_resource_id_in_paths() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        tx.send(request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n"
+        )
+        .unwrap();
+    });
+
+    let mut env = base_env();
+    env.gateway_url = Some(format!("http://{addr}"));
+    let client = AdminClient::new(&env).unwrap();
+
+    client
+        .delete_proxy("proxy-01._~A", "team-alpha")
+        .await
+        .unwrap();
+
+    let request = rx.recv().unwrap();
+    assert!(request.starts_with("DELETE /proxies/proxy-01._~A HTTP/1.1"));
+}
