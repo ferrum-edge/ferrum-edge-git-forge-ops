@@ -10,7 +10,11 @@ use super::bundle::{
 use super::delivery::{deliver_to_author, DeliveryResult};
 use super::github_api::{fetch_public_key, put_environment_secret};
 use super::placeholder::PlaceholderAlloc;
-use super::resolver::{ResolveReport, ResolveResult, SlotStatus};
+use super::resolver::{
+    base64_chars, credential_type_from_slot, ResolveReport, ResolveResult, SlotStatus,
+    MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS,
+    REDACTED_SENTINEL,
+};
 
 #[derive(Debug, Clone)]
 pub struct AllocatedSlot {
@@ -134,7 +138,13 @@ pub async fn allocate_and_deliver(
     let mut staged: BTreeMap<u32, CredentialBundle> = shards.clone();
 
     for candidate in candidates {
-        let value = random_value(candidate.placeholder.length_bytes);
+        // Fails before any GitHub write, so a `len=` that violates the
+        // gateway's minimum leaves `shards` untouched.
+        let value = generate_credential_value(&candidate.slot, candidate.placeholder.length_bytes)
+            .map_err(|source| AllocationFailure {
+                source,
+                partial: outcome.clone(),
+            })?;
 
         // Prefer the shard the slot already lives on. If we ran pick_shard
         // after `shard_count` has grown, the hash-based target could differ
@@ -305,16 +315,22 @@ pub async fn rotate_and_deliver(
     shard_count: &mut u32,
 ) -> Result<AllocatedSlot, AllocationFailure> {
     let partial = AllocateOutcome::default();
+
+    // Validate the requested length against the credential type BEFORE the
+    // GitHub round-trip, so `rotate --credential jwt/secret` with an
+    // undersized `len=` fails without touching the environment's secrets.
+    let value =
+        generate_credential_value(slot, length_bytes).map_err(|source| AllocationFailure {
+            source,
+            partial: partial.clone(),
+        })?;
+
     let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
         .await
         .map_err(|source| AllocationFailure {
             source,
             partial: partial.clone(),
         })?;
-    // Honor the placeholder's `len=...` field. Forcing 32 bytes would
-    // silently shrink credentials declared with a larger length and grow
-    // ones declared smaller.
-    let value = random_value(length_bytes);
 
     // Encrypt delivery BEFORE the PUT. If the recipient has no compatible
     // SSH key (or the API fails), we bail with a hard error and the
@@ -418,6 +434,72 @@ fn random_value(length_bytes: usize) -> String {
     let mut buf = vec![0u8; length_bytes];
     rand::rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf)
+}
+
+/// Generate a credential value for `slot`, enforcing ferrum-edge's value
+/// constraints at the point of generation.
+///
+/// The generator emits base64url-no-pad, so `length_bytes` entropy bytes
+/// become `ceil(n*4/3)` characters. The `len=` range the placeholder parser
+/// accepts is `16..=256`, i.e. 22..=342 characters — always within the
+/// 4096-character cap, and always ≥32 characters *except* for the low end of
+/// the range, which is why `jwt`/`hmac_auth` need a floor of their own.
+///
+/// Enforced here:
+///
+/// * `jwt` / `hmac_auth` secrets must be ≥32 characters, so `len=` must be at
+///   least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] (24). `len=16` is rejected with
+///   an actionable error rather than silently clamped — silently growing a
+///   credential the operator explicitly sized would be a surprise, and the
+///   alternative (emitting a 22-character secret) is a credential the gateway
+///   rejects at write time.
+/// * No value may exceed [`MAX_CREDENTIAL_VALUE_CHARS`].
+/// * The reserved sentinel [`REDACTED_SENTINEL`] is never stored. base64url
+///   cannot produce it, so this is a tripwire for a future encoding change.
+///
+/// The resolver runs the same `len=` check at plan time
+/// (`check_generation_constraints`) so `plan`/`diff` fail before any GitHub
+/// write; this is the last line of defense for callers that reach the
+/// allocator directly (notably `gitforgeops rotate`, whose `--credential`
+/// argument never passes through the resolver's placeholder walk).
+pub fn generate_credential_value(slot: &str, length_bytes: usize) -> crate::error::Result<String> {
+    let cred_type = credential_type_from_slot(slot).unwrap_or_default();
+
+    if MIN32_CREDENTIAL_TYPES.contains(&cred_type.as_str())
+        && length_bytes < MIN_ENTROPY_BYTES_FOR_32_CHARS
+    {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': {cred_type} secrets must be at least 32 characters, but \
+             'len={length_bytes}' generates only {} base64url characters. Use \
+             'len={MIN_ENTROPY_BYTES_FOR_32_CHARS}' or higher (the default len=32 yields 43 \
+             characters).",
+            base64_chars(length_bytes)
+        )));
+    }
+
+    let value = random_value(length_bytes);
+    let chars = value.chars().count();
+
+    if MIN32_CREDENTIAL_TYPES.contains(&cred_type.as_str()) && chars < 32 {
+        return Err(crate::error::Error::Config(format!(
+            "internal: generated {cred_type} secret for slot '{slot}' is {chars} characters, \
+             below ferrum-edge's 32-character minimum"
+        )));
+    }
+    if chars > MAX_CREDENTIAL_VALUE_CHARS {
+        return Err(crate::error::Error::Config(format!(
+            "internal: generated value for slot '{slot}' is {chars} characters, above \
+             ferrum-edge's {MAX_CREDENTIAL_VALUE_CHARS}-character cap"
+        )));
+    }
+    if value == REDACTED_SENTINEL {
+        return Err(crate::error::Error::Config(format!(
+            "internal: generated value for slot '{slot}' is the reserved sentinel \
+             '{REDACTED_SENTINEL}'"
+        )));
+    }
+
+    Ok(value)
 }
 
 /// Utility re-export for consumers who need to flatten shards after allocation.

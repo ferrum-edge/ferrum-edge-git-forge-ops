@@ -521,6 +521,10 @@ fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
 #[test]
 fn security_detects_tls_verify_disabled() {
     let mut proxy = make_proxy("p1", "/api", "localhost");
+    // The check is scheme-aware: the gateway rejects
+    // `backend_tls_verify_server_cert: false` outright on plaintext schemes,
+    // so only a TLS-capable scheme makes the flag meaningful.
+    proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.backend_tls_verify_server_cert = false;
     let config = GatewayConfig {
         proxies: vec![proxy],
@@ -657,10 +661,13 @@ fn best_practice_respects_global_plugins() {
                 "rate_limiting",
                 PluginScope::Global,
             ),
+            // `request_logging` is not a gateway plugin — the observability
+            // check matches the explicit built-in set, not a "logging"
+            // substring.
             make_plugin_config(
                 "global-logging",
                 "team-alpha",
-                "request_logging",
+                "http_logging",
                 PluginScope::Global,
             ),
         ],

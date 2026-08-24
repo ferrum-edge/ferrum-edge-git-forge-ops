@@ -51,21 +51,29 @@ fn review_comment_includes_security_findings() {
         severity: "warning".to_string(),
         kind: "Consumer".to_string(),
         id: "consumer-1".to_string(),
+        namespace: "team-alpha".to_string(),
         message: "Literal credential detected".to_string(),
     }];
     let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
     assert!(comment.contains("Literal credential"));
+    // Two namespaces can hold same-named resources, so a finding is only
+    // actionable when the reader can tell which one it names.
+    assert!(comment.contains("team-alpha"));
 }
 
 #[test]
 fn review_comment_includes_best_practices() {
     let practices = vec![BestPractice {
+        severity: "warning".to_string(),
         kind: "Proxy".to_string(),
         id: "proxy-1".to_string(),
+        namespace: "team-alpha".to_string(),
         message: "No rate limiting plugin".to_string(),
     }];
     let comment = build_review_comment(true, "", &[], &[], &[], &practices, None);
     assert!(comment.contains("rate limiting"));
+    assert!(comment.contains("team-alpha"));
+    assert!(comment.contains("[warning]"));
 }
 
 #[test]

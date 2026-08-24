@@ -10,4 +10,4 @@ pub use resource_diff::{
     state_key_namespace, DiffAction, DiffResult, FieldChange, OwnershipScope, ResourceDiff,
     UnmanagedResource,
 };
-pub use security::{audit_security, SecurityFinding};
+pub use security::{audit_security, audit_security_with_policy, SecurityFinding};

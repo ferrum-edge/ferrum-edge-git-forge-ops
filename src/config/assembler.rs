@@ -8,7 +8,9 @@ use super::schema::{GatewayConfig, Resource};
 /// Assemble loaded resources into a `GatewayConfig`.
 ///
 /// Sets each resource's `namespace` field to the directory-inferred namespace,
-/// unless the spec already has a non-default namespace explicitly set.
+/// unless the spec already has a non-default namespace explicitly set, then
+/// canonicalizes consumer credentials via
+/// [`normalize_consumer_credentials`].
 pub fn assemble(resources: Vec<(String, Resource)>) -> GatewayConfig {
     let mut config = GatewayConfig::default();
 
@@ -41,7 +43,59 @@ pub fn assemble(resources: Vec<(String, Resource)>) -> GatewayConfig {
         }
     }
 
+    normalize_consumer_credentials(&mut config);
+
     config
+}
+
+/// Canonicalize every consumer credential to ferrum-edge's array-of-entries
+/// form: `keyauth: {key: K}` becomes `keyauth: [{key: K}]`.
+///
+/// ferrum-edge stores each credential type as an **array**. A bare object is
+/// tolerated by admin-API writes (normalized server-side), but `GET /backup`
+/// always returns the array form — so a repo YAML written in the object form
+/// diffs as modified against the live gateway on every single run, forever,
+/// and `drift-check --exit-on-drift` never goes green. Normalizing here, once,
+/// before anything diffs, hashes, or serializes, means the desired config and
+/// the gateway's own representation agree.
+///
+/// Applied to **all** credential keys, recognized (`basicauth`, `keyauth`,
+/// `jwt`, `hmac_auth`, `mtls_auth`) or not: the gateway normalizes every entry
+/// in the map on write, so limiting this to the known five would leave custom
+/// types drifting for exactly the same reason.
+///
+/// Only objects are wrapped. Arrays are already canonical (this function is
+/// idempotent), and scalars are left alone — wrapping a string would change
+/// its meaning, and ferrum-edge rejects that shape anyway with a better
+/// message than gitforgeops could produce.
+///
+/// # Slot stability
+///
+/// This runs before `secrets::resolve_secrets` walks the credential tree, so
+/// placeholders are now one array level deeper than they used to be. Slot
+/// names are unaffected: the walker elides array index 0, so
+/// `keyauth: {key: "${…}"}` and `keyauth: [{key: "${…}"}]` both derive
+/// `<ns>/<id>/keyauth/key`. Existing allocations therefore survive the
+/// upgrade instead of orphaning and regenerating. See
+/// `secrets::resolver::is_elided`.
+///
+/// # Round-trip hazard
+///
+/// Omitting `keyauth`, `jwt`, `hmac_auth` or `mtls_auth` from a consumer
+/// **deletes** those entries on the gateway; omitting `basicauth` or an
+/// unrecognized type **preserves** what is already stored. Normalization does
+/// not change which keys are present, so it cannot itself delete anything —
+/// but it is worth knowing that an empty array (`keyauth: []`) is the
+/// explicit "remove these" spelling, not a no-op.
+pub fn normalize_consumer_credentials(config: &mut GatewayConfig) {
+    for consumer in config.consumers.iter_mut() {
+        for value in consumer.credentials.values_mut() {
+            if value.is_object() {
+                let entry = std::mem::replace(value, serde_json::Value::Null);
+                *value = serde_json::Value::Array(vec![entry]);
+            }
+        }
+    }
 }
 
 /// Deep-merge overlay resources into the base set by matching on resource

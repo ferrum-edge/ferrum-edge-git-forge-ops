@@ -476,3 +476,150 @@ fn make_upstream(id: &str) -> Resource {
         },
     }
 }
+
+// ---------------------------------------------------------------------------
+// Consumer credential canonicalization
+//
+// ferrum-edge stores every credential type as an array of entries and
+// `GET /backup` always returns that form, so an object-form credential in the
+// repo YAML diffs as modified on every run, forever. The assembler normalizes
+// object -> single-element array before anything diffs, hashes or serializes.
+// ---------------------------------------------------------------------------
+
+fn consumer_config_with_credentials(
+    credentials: serde_json::Value,
+) -> gitforgeops::config::GatewayConfig {
+    use gitforgeops::config::schema::Consumer;
+
+    let mut cfg = gitforgeops::config::GatewayConfig::default();
+    let map: std::collections::HashMap<String, serde_json::Value> =
+        serde_json::from_value(credentials).unwrap();
+    cfg.consumers.push(Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: map,
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    cfg
+}
+
+#[test]
+fn normalize_wraps_object_form_credentials_in_a_single_element_array() {
+    use gitforgeops::config::assembler::normalize_consumer_credentials;
+
+    let mut cfg = consumer_config_with_credentials(serde_json::json!({
+        "keyauth": {"key": "k"},
+        "jwt": {"secret": "s"},
+        "basicauth": {"password_hash": "hmac_sha256:aa"},
+    }));
+
+    normalize_consumer_credentials(&mut cfg);
+
+    let creds = &cfg.consumers[0].credentials;
+    assert_eq!(creds["keyauth"], serde_json::json!([{"key": "k"}]));
+    assert_eq!(creds["jwt"], serde_json::json!([{"secret": "s"}]));
+    assert_eq!(
+        creds["basicauth"],
+        serde_json::json!([{"password_hash": "hmac_sha256:aa"}])
+    );
+}
+
+#[test]
+fn normalize_is_idempotent_on_already_canonical_credentials() {
+    use gitforgeops::config::assembler::normalize_consumer_credentials;
+
+    let canonical = serde_json::json!({
+        "keyauth": [{"key": "k1"}, {"key": "k2"}],
+        "mtls_auth": [{"identity": "CN=app"}],
+    });
+    let mut cfg = consumer_config_with_credentials(canonical.clone());
+
+    normalize_consumer_credentials(&mut cfg);
+    let once = cfg.consumers[0].credentials.clone();
+    normalize_consumer_credentials(&mut cfg);
+    let twice = cfg.consumers[0].credentials.clone();
+
+    assert_eq!(once, twice, "normalization must be idempotent");
+    assert_eq!(once["keyauth"], canonical["keyauth"]);
+    assert_eq!(once["mtls_auth"], canonical["mtls_auth"]);
+}
+
+#[test]
+fn normalize_covers_unknown_credential_types_too() {
+    // The gateway normalizes every entry in the credentials map on write,
+    // not just the five recognized types — so limiting normalization to the
+    // known types would leave custom types drifting for the same reason.
+    use gitforgeops::config::assembler::normalize_consumer_credentials;
+
+    let mut cfg = consumer_config_with_credentials(serde_json::json!({
+        "some_future_auth": {"token": "t"},
+    }));
+
+    normalize_consumer_credentials(&mut cfg);
+
+    assert_eq!(
+        cfg.consumers[0].credentials["some_future_auth"],
+        serde_json::json!([{"token": "t"}])
+    );
+}
+
+#[test]
+fn normalize_leaves_scalar_credentials_alone() {
+    // Wrapping a bare string would change its meaning; ferrum-edge rejects
+    // that shape with a better message than gitforgeops could produce.
+    use gitforgeops::config::assembler::normalize_consumer_credentials;
+
+    let mut cfg = consumer_config_with_credentials(serde_json::json!({
+        "legacy_flat": "a-plain-string",
+    }));
+
+    normalize_consumer_credentials(&mut cfg);
+
+    assert_eq!(
+        cfg.consumers[0].credentials["legacy_flat"],
+        serde_json::json!("a-plain-string")
+    );
+}
+
+#[test]
+fn assemble_emits_canonical_array_credentials_from_the_fixture() {
+    let resources = load_resources(&fixtures_dir()).unwrap();
+    let config = assemble(resources);
+
+    let creds = &config.consumers[0].credentials;
+    assert_eq!(
+        creds["keyauth"],
+        serde_json::json!([{"key": "alice-secret-key-12345"}]),
+        "assemble must hand downstream diff/apply the array form the gateway returns"
+    );
+}
+
+#[test]
+fn normalization_preserves_credential_slot_names() {
+    // Cross-module upgrade guard: normalizing object -> array must NOT
+    // rename slots, or every already-allocated credential orphans in the
+    // GitHub Environment Secret bundle and gets regenerated.
+    use gitforgeops::config::assembler::normalize_consumer_credentials;
+    use gitforgeops::secrets::report_secrets;
+
+    let placeholder = serde_json::json!("${gh-env-secret:alloc=require}");
+    let mut object_form = consumer_config_with_credentials(serde_json::json!({
+        "keyauth": {"key": placeholder},
+    }));
+
+    let before = report_secrets(&object_form, &std::collections::BTreeMap::new()).unwrap();
+    normalize_consumer_credentials(&mut object_form);
+    let after = report_secrets(&object_form, &std::collections::BTreeMap::new()).unwrap();
+
+    assert_eq!(before.results.len(), 1);
+    assert_eq!(after.results.len(), 1);
+    assert_eq!(before.results[0].slot, "ferrum/app/keyauth/key");
+    assert_eq!(
+        before.results[0].slot, after.results[0].slot,
+        "slot name must survive object -> array normalization"
+    );
+}

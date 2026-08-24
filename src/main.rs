@@ -49,7 +49,16 @@ async fn main() {
         cli::Commands::Apply {
             auto_approve,
             allow_large_prune,
-        } => cmd_apply(auto_approve, allow_large_prune, explicit_env.as_deref()).await,
+            confirm_api_spec_deletion,
+        } => {
+            cmd_apply(
+                auto_approve,
+                allow_large_prune,
+                confirm_api_spec_deletion,
+                explicit_env.as_deref(),
+            )
+            .await
+        }
         cli::Commands::Import {
             from_api,
             from_file,
@@ -681,7 +690,12 @@ async fn cmd_export(
     // When `!materialize`: skip resolve entirely so placeholder strings
     // remain as `${gh-env-secret:...}`. Output is safe to commit.
 
-    let yaml = serde_yaml::to_string(&gateway_config)?;
+    // Route through the file-target renderer so exported YAML carries the
+    // `resource_counts` anti-truncation seal that ferrum-edge's file-mode
+    // loader checks. Both output paths below (plain and age-encrypted) derive
+    // from this one document, so the seal travels with either — a materialized
+    // export is exactly the artifact a file-mode gateway consumes.
+    let yaml = apply::render_file_yaml(&gateway_config)?;
 
     let payload: Vec<u8> = if let Some(login) = encrypt_to {
         let client = build_github_api_client(&env_config)?;
@@ -729,10 +743,12 @@ async fn cmd_diff(
     let mut desired = load_and_assemble_for(&resolved)?;
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
-    let client = AdminClient::new(&env_config)?;
+    let mut client = AdminClient::new(&env_config)?;
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    client.set_namespace_scope(&namespaces);
+    let client = client;
     let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
     let (diffs, _breaking, unmanaged) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
 
@@ -814,7 +830,8 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     // replaced with real values — which, post-substitution, look like
     // literals to the auditor. Running pre-resolve keeps the audit on
     // the repo's actual committed state.
-    let security_findings = diff::audit_security(&desired);
+    let policy_cfg = policy::load_policies()?;
+    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
 
     println!("=== Environment ===");
@@ -928,7 +945,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
         println!();
     }
 
-    if let Some(policy_cfg) = policy::load_policies()? {
+    if let Some(policy_cfg) = policy_cfg {
         let policy_findings = policy::evaluate_policies(&desired, &policy_cfg);
         if !policy_findings.is_empty() {
             println!("=== Policy Violations ===");
@@ -957,6 +974,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
 async fn cmd_apply(
     auto_approve: bool,
     allow_large_prune: bool,
+    confirm_api_spec_deletion: bool,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
@@ -1095,7 +1113,11 @@ async fn cmd_apply(
 
     match env_config.gateway_mode {
         GatewayMode::Api => {
-            let client = AdminClient::new(&env_config)?;
+            let mut client = AdminClient::new(&env_config)?;
+            // Scope the `ns` claim to the namespaces this run touches. Inert
+            // unless the gateway runs with FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM.
+            client.set_namespace_scope(&namespaces);
+            let client = client;
             let managed = previously_managed(&resolved, &state);
 
             if !auto_approve {
@@ -1268,13 +1290,17 @@ async fn cmd_apply(
             let mut raw = apply::apply_api(
                 &desired,
                 &client,
-                resolved.apply_strategy.clone(),
                 &namespaces,
                 match managed.as_ref() {
                     Some(previously_managed) => diff::OwnershipScope::Shared { previously_managed },
                     None => diff::OwnershipScope::Exclusive,
                 },
                 Some(&actual_by_namespace),
+                &apply::ApplyOptions {
+                    strategy: resolved.apply_strategy.clone(),
+                    allow_large_prune,
+                    confirm_api_spec_deletion,
+                },
             )
             .await?;
 
@@ -1429,6 +1455,9 @@ async fn cmd_import(
         "Imported: {} proxies, {} consumers, {} upstreams, {} plugin_configs",
         result.proxies, result.consumers, result.upstreams, result.plugin_configs
     );
+    if let Some(notice) = result.unmanaged_sections_notice() {
+        println!("{notice}");
+    }
 
     Ok(())
 }
@@ -1445,7 +1474,8 @@ async fn cmd_review(
     enforce_exclusive_scope(&resolved, &desired)?;
     // Audit pre-resolve so placeholder-resolved values aren't misreported as
     // literal credentials (see cmd_plan for full rationale).
-    let security_findings = diff::audit_security(&desired);
+    let policy_cfg = policy::load_policies()?;
+    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
@@ -1483,7 +1513,7 @@ async fn cmd_review(
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
-    let (policy_findings, override_reason, override_cfg) = match policy::load_policies()? {
+    let (policy_findings, override_reason, override_cfg) = match policy_cfg {
         Some(policy_cfg) => {
             let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
             let decision = match pr {

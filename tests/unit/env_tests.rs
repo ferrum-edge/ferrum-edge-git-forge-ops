@@ -32,9 +32,70 @@ fn clear_env() {
         "FERRUM_GITHUB_CONNECT_TIMEOUT_SECS",
         "FERRUM_GITHUB_REQUEST_TIMEOUT_SECS",
         "FERRUM_GATEWAY_MAX_RETRIES",
+        "FERRUM_ADMIN_JWT_ISSUER",
+        "FERRUM_ADMIN_JWT_ROLE",
+        "FERRUM_ADMIN_JWT_AUDIENCE",
+        "FERRUM_ADMIN_JWT_TTL_SECS",
     ] {
         std::env::remove_var(var);
     }
+}
+
+#[test]
+fn env_config_jwt_claim_defaults_match_the_gateway() {
+    let _guard = env_guard();
+    clear_env();
+
+    let config = load_env_config();
+    // The gateway's own defaults: iss `ferrum-edge`, no audience, TTL at the
+    // 3600s max. Role must be `admin` — /backup, /restore, /batch and consumer
+    // CRUD are all admin-only.
+    assert_eq!(config.admin_jwt_issuer, "ferrum-edge");
+    assert_eq!(config.admin_jwt_role, "admin");
+    assert!(config.admin_jwt_audience.is_none());
+    assert_eq!(config.admin_jwt_ttl_secs, 3600);
+
+    clear_env();
+}
+
+#[test]
+fn env_config_jwt_claim_overrides() {
+    let _guard = env_guard();
+    clear_env();
+
+    std::env::set_var("FERRUM_ADMIN_JWT_ISSUER", "my-gateway");
+    std::env::set_var("FERRUM_ADMIN_JWT_ROLE", "operator");
+    std::env::set_var("FERRUM_ADMIN_JWT_AUDIENCE", "ferrum-admin");
+    std::env::set_var("FERRUM_ADMIN_JWT_TTL_SECS", "600");
+
+    let config = load_env_config();
+    assert_eq!(config.admin_jwt_issuer, "my-gateway");
+    assert_eq!(config.admin_jwt_role, "operator");
+    assert_eq!(config.admin_jwt_audience.as_deref(), Some("ferrum-admin"));
+    assert_eq!(config.admin_jwt_ttl_secs, 600);
+
+    clear_env();
+}
+
+#[test]
+fn env_config_treats_blank_jwt_vars_as_unset() {
+    let _guard = env_guard();
+    clear_env();
+
+    // A workflow that interpolates an unset secret produces an empty string.
+    // An empty `aud` must stay absent — a gateway with no configured audience
+    // rejects any token that carries the claim at all.
+    std::env::set_var("FERRUM_ADMIN_JWT_AUDIENCE", "  ");
+    std::env::set_var("FERRUM_ADMIN_JWT_ISSUER", "");
+    std::env::set_var("FERRUM_ADMIN_JWT_TTL_SECS", "0");
+
+    let config = load_env_config();
+    assert!(config.admin_jwt_audience.is_none());
+    assert_eq!(config.admin_jwt_issuer, "ferrum-edge");
+    // A non-positive TTL would serialize as `exp <= iat` and be rejected.
+    assert_eq!(config.admin_jwt_ttl_secs, 3600);
+
+    clear_env();
 }
 
 #[test]

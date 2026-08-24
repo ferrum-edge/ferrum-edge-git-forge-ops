@@ -85,8 +85,8 @@ pub fn build_review_comment(
                 "WARNING"
             };
             md.push_str(&format!(
-                "- [{}] **{} `{}`**: {}\n",
-                icon, sf.kind, sf.id, sf.message
+                "- [{}] **{} `{}`** (`{}`): {}\n",
+                icon, sf.kind, sf.id, sf.namespace, sf.message
             ));
         }
         md.push('\n');
@@ -95,7 +95,10 @@ pub fn build_review_comment(
     if !best_practices.is_empty() {
         md.push_str("### Best Practice Recommendations\n\n");
         for bp in best_practices {
-            md.push_str(&format!("- **{} `{}`**: {}\n", bp.kind, bp.id, bp.message));
+            md.push_str(&format!(
+                "- [{}] **{} `{}`** (`{}`): {}\n",
+                bp.severity, bp.kind, bp.id, bp.namespace, bp.message
+            ));
         }
         md.push('\n');
     }

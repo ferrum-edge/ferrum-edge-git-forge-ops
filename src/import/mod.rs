@@ -21,6 +21,29 @@ pub struct ImportResult {
     pub upstreams: usize,
     /// Number of plugin config files written.
     pub plugin_configs: usize,
+    /// API spec documents present in the source backup but **not** written.
+    /// `Resource` models four kinds; API specs are managed through the admin
+    /// API (`/api-specs`) and have no GitOps representation here.
+    pub skipped_api_specs: usize,
+    /// Gateway trust-bundle records present in the source backup but not
+    /// written, for the same reason.
+    pub skipped_trust_bundles: usize,
+}
+
+impl ImportResult {
+    /// Operator-facing note about backup sections this tool does not import,
+    /// or `None` when the backup carried none.
+    pub fn unmanaged_sections_notice(&self) -> Option<String> {
+        if self.skipped_api_specs == 0 && self.skipped_trust_bundles == 0 {
+            return None;
+        }
+        Some(format!(
+            "Not imported: {} API spec(s) and {} gateway trust-bundle record(s). These are managed \
+             through the admin API (`/api-specs`, `/gateway-trust-bundles`), not through this repo, \
+             and are left untouched by `gitforgeops apply`.",
+            self.skipped_api_specs, self.skipped_trust_bundles
+        ))
+    }
 }
 
 /// Split a flat gateway configuration into per-resource YAML files.

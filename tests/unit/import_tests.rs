@@ -206,3 +206,32 @@ fn import_from_file_roundtrip() {
     assert!(content.contains("kind: Proxy"));
     assert!(content.contains("proxy-test"));
 }
+
+#[test]
+fn import_reports_backup_sections_it_cannot_represent() {
+    // `Resource` models four kinds. API specs and gateway trust bundles are
+    // admin-API-managed and must not be written as resource files that
+    // `apply` could never round-trip — they are counted and reported instead.
+    let result = gitforgeops::import::ImportResult {
+        proxies: 2,
+        skipped_api_specs: 3,
+        skipped_trust_bundles: 1,
+        ..Default::default()
+    };
+
+    let notice = result
+        .unmanaged_sections_notice()
+        .expect("expected a notice");
+    assert!(notice.contains("3 API spec(s)"), "{notice}");
+    assert!(notice.contains("1 gateway trust-bundle"), "{notice}");
+    assert!(notice.contains("/api-specs"), "{notice}");
+}
+
+#[test]
+fn import_is_quiet_when_the_backup_has_no_unmanaged_sections() {
+    let result = gitforgeops::import::ImportResult {
+        proxies: 1,
+        ..Default::default()
+    };
+    assert!(result.unmanaged_sections_notice().is_none());
+}

@@ -67,3 +67,42 @@ fn cli_accepts_global_env_before_or_after_subcommand() {
     let after = Cli::try_parse_from(["gitforgeops", "validate", "--env", "staging"]).unwrap();
     assert_eq!(after.env.as_deref(), Some("staging"));
 }
+
+#[test]
+fn cli_apply_exposes_the_api_spec_deletion_opt_in() {
+    // Default: API specs are preserved by carrying the live section through
+    // the restore. Deleting them has to be asked for explicitly.
+    let default = Cli::try_parse_from(["gitforgeops", "apply", "--auto-approve"]).unwrap();
+    match default.command {
+        Commands::Apply {
+            auto_approve,
+            allow_large_prune,
+            confirm_api_spec_deletion,
+        } => {
+            assert!(auto_approve);
+            assert!(!allow_large_prune);
+            assert!(!confirm_api_spec_deletion);
+        }
+        _ => panic!("expected apply command"),
+    }
+
+    let destructive = Cli::try_parse_from([
+        "gitforgeops",
+        "apply",
+        "--auto-approve",
+        "--allow-large-prune",
+        "--confirm-api-spec-deletion",
+    ])
+    .unwrap();
+    match destructive.command {
+        Commands::Apply {
+            allow_large_prune,
+            confirm_api_spec_deletion,
+            ..
+        } => {
+            assert!(allow_large_prune);
+            assert!(confirm_api_spec_deletion);
+        }
+        _ => panic!("expected apply command"),
+    }
+}

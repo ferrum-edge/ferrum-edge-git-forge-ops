@@ -21,7 +21,8 @@ gitforgeops export [--output PATH]                        # Emit flat YAML (plac
 gitforgeops export --materialize [--encrypt-to GH_LOGIN]  # Resolve creds; age-encrypt output (file mode stage 2)
 gitforgeops diff [--exit-on-drift]                        # Compare desired vs live gateway (/backup)
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
-gitforgeops apply [--auto-approve] [--allow-large-prune]  # Apply incrementally (CRUD) or full-replace (/restore)
+gitforgeops apply [--auto-approve] [--allow-large-prune] \
+  [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api <ignored> | --from-file PATH [--output-dir DIR]
 gitforgeops review [--pr N]                               # Post structured PR comment via GitHub API
 gitforgeops envs [--format json|text]                     # List environments (used by CI matrix)
@@ -188,6 +189,10 @@ See `.env.example` for the full list. Essentials:
 
 - `FERRUM_GATEWAY_URL` (required for api mode)
 - `FERRUM_ADMIN_JWT_SECRET` (required for api mode; ≥32 chars to match ferrum-edge)
+- `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`) — must equal the gateway's own issuer or every call is 401
+- `FERRUM_ADMIN_JWT_ROLE` (default `admin`) — `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only
+- `FERRUM_ADMIN_JWT_AUDIENCE` (default unset) — `aud` is emitted only when set; a gateway with no audience rejects tokens carrying it
+- `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`) — must be within the gateway's `FERRUM_ADMIN_JWT_MAX_TTL`
 - `FERRUM_NAMESPACE` (filter; default = all namespaces)
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)

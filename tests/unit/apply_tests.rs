@@ -132,3 +132,160 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
     assert!(written.contains("p1"));
     assert!(written.contains("proxies:"));
 }
+
+// --- Apply ordering ----------------------------------------------------------
+
+use gitforgeops::apply::{operation_rank, order_diffs, stale_view_block};
+use gitforgeops::diff::resource_diff::{DiffAction, ResourceDiff};
+
+fn diff(action: DiffAction, kind: &str, id: &str) -> ResourceDiff {
+    ResourceDiff {
+        action,
+        kind: kind.to_string(),
+        id: id.to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }
+}
+
+fn issued(diffs: Vec<ResourceDiff>) -> Vec<String> {
+    order_diffs(diffs)
+        .into_iter()
+        .map(|d| format!("{:?} {} {}", d.action, d.kind, d.id))
+        .collect()
+}
+
+#[test]
+fn adds_follow_the_dependency_graph() {
+    // The old kind-major order issued the Proxy add before the Upstream add,
+    // and the gateway rejected it: "upstream_id '…' does not exist in
+    // namespace '…'".
+    let order = issued(vec![
+        diff(DiffAction::Add, "Proxy", "p1"),
+        diff(DiffAction::Add, "PluginConfig", "pc1"),
+        diff(DiffAction::Add, "Upstream", "u1"),
+        diff(DiffAction::Add, "Consumer", "c1"),
+    ]);
+
+    assert_eq!(
+        order,
+        vec![
+            "Add Upstream u1",
+            "Add Consumer c1",
+            "Add Proxy p1",
+            "Add PluginConfig pc1",
+        ]
+    );
+}
+
+#[test]
+fn deletes_run_in_reverse_dependency_order() {
+    let order = issued(vec![
+        diff(DiffAction::Delete, "Upstream", "u1"),
+        diff(DiffAction::Delete, "Proxy", "p1"),
+        diff(DiffAction::Delete, "PluginConfig", "pc1"),
+        diff(DiffAction::Delete, "Consumer", "c1"),
+    ]);
+
+    assert_eq!(
+        order,
+        vec![
+            "Delete PluginConfig pc1",
+            "Delete Proxy p1",
+            "Delete Upstream u1",
+            "Delete Consumer c1",
+        ]
+    );
+}
+
+#[test]
+fn a_mixed_diff_applies_writes_before_deletes() {
+    // Deleting an upstream only succeeds once nothing references it, so the
+    // proxy modify that drops the reference has to land first.
+    let order = issued(vec![
+        diff(DiffAction::Delete, "Upstream", "old-upstream"),
+        diff(DiffAction::Add, "Proxy", "new-proxy"),
+        diff(DiffAction::Modify, "Proxy", "moved-proxy"),
+        diff(DiffAction::Add, "Upstream", "new-upstream"),
+        diff(DiffAction::Delete, "PluginConfig", "stale-pc"),
+        diff(DiffAction::Modify, "PluginConfig", "kept-pc"),
+    ]);
+
+    assert_eq!(
+        order,
+        vec![
+            "Add Upstream new-upstream",
+            "Add Proxy new-proxy",
+            "Modify Proxy moved-proxy",
+            "Modify PluginConfig kept-pc",
+            "Delete PluginConfig stale-pc",
+            "Delete Upstream old-upstream",
+        ]
+    );
+}
+
+#[test]
+fn ordering_is_stable_within_a_rank() {
+    // Same rank ⇒ original (deterministic) diff order is preserved, so
+    // repeated runs issue identical request sequences.
+    let order = issued(vec![
+        diff(DiffAction::Add, "Upstream", "u-b"),
+        diff(DiffAction::Add, "Consumer", "c-a"),
+        diff(DiffAction::Add, "Upstream", "u-a"),
+    ]);
+    assert_eq!(
+        order,
+        vec!["Add Upstream u-b", "Add Consumer c-a", "Add Upstream u-a"]
+    );
+}
+
+#[test]
+fn every_write_rank_precedes_every_delete_rank() {
+    for kind in ["Upstream", "Consumer", "Proxy", "PluginConfig"] {
+        let write = operation_rank(&DiffAction::Add, kind);
+        let modify = operation_rank(&DiffAction::Modify, kind);
+        assert_eq!(write, modify, "Add and Modify share a rank for {kind}");
+        for other in ["Upstream", "Consumer", "Proxy", "PluginConfig"] {
+            assert!(
+                write < operation_rank(&DiffAction::Delete, other),
+                "{kind} write must precede {other} delete"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_kinds_get_a_defined_rank() {
+    // Forward compatibility: a resource kind this build doesn't know about
+    // must still sort deterministically rather than panicking or vanishing.
+    let order = issued(vec![
+        diff(DiffAction::Add, "FutureKind", "x"),
+        diff(DiffAction::Add, "Upstream", "u1"),
+    ]);
+    assert_eq!(order, vec!["Add Upstream u1", "Add FutureKind x"]);
+}
+
+// --- Stale gateway view ------------------------------------------------------
+
+#[test]
+fn stale_view_blocks_prunes_from_a_cached_backup() {
+    // During a config-database outage /backup falls back to the in-memory
+    // snapshot; resources created since then read as "should be deleted".
+    let block = stale_view_block(true, 3, false).expect("should block");
+    assert!(block.contains("X-Data-Source: cached"), "{block}");
+    assert!(block.contains("3 computed deletion"), "{block}");
+    assert!(block.contains("--allow-large-prune"), "{block}");
+}
+
+#[test]
+fn stale_view_allows_a_pure_write_apply() {
+    // No deletes means nothing can be wrongly pruned, so a cached view is
+    // merely a warning.
+    assert!(stale_view_block(true, 0, false).is_none());
+}
+
+#[test]
+fn stale_view_is_overridable_and_inert_on_a_fresh_view() {
+    assert!(stale_view_block(true, 5, true).is_none());
+    assert!(stale_view_block(false, 5, false).is_none());
+}

@@ -263,6 +263,10 @@ fn synthetic_default_honors_explicit_env_over_ferrum_env_var() {
         EnvConfig {
             gateway_url: None,
             admin_jwt_secret: None,
+            admin_jwt_issuer: "ferrum-edge".to_string(),
+            admin_jwt_role: "admin".to_string(),
+            admin_jwt_audience: None,
+            admin_jwt_ttl_secs: 3600,
             namespace_filter: None,
             gateway_mode: GatewayMode::Api,
             apply_strategy: ApplyStrategy::Incremental,
@@ -322,6 +326,10 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
     let env_config = EnvConfig {
         gateway_url: None,
         admin_jwt_secret: None,
+        admin_jwt_issuer: "ferrum-edge".to_string(),
+        admin_jwt_role: "admin".to_string(),
+        admin_jwt_audience: None,
+        admin_jwt_ttl_secs: 3600,
         namespace_filter: None,
         gateway_mode: GatewayMode::Api,
         apply_strategy: ApplyStrategy::FullReplace,
