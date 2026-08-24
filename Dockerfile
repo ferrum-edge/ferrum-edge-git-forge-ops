@@ -13,7 +13,10 @@ RUN cargo build --release
 # requires /bin/sh for action bootstrap. Trixie matches the glibc of
 # the upstream ferrum-edge image so the copied binary links cleanly.
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `upgrade` picks up security fixes published after the base image tag was
+# last rebuilt (e.g. util-linux CVE-2026-53612/53613/53614). Without it the
+# image ships known-fixed CVEs and the Trivy scan fails.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
