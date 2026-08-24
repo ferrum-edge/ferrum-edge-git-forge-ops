@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       credential:
-        description: Credential key. Top-level key (e.g. `api_key`) or `/`-separated path into nested object credentials (e.g. `basic_auth/password`).
+        description: "Credential slot path: <type>/<field>, e.g. `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `basicauth/password`. Credentials are arrays and index 0 is elided, so a second entry is `keyauth/[1]/key`."
         required: true
         type: string
       namespace:

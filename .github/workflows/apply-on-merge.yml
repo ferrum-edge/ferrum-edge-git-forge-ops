@@ -203,6 +203,12 @@ jobs:
           # ./assembled/resources.yaml and the per-env staged path doesn't
           # exist, so placeholder-assembly changes never get committed.
           FERRUM_FILE_OUTPUT_PATH: assembled/${{ matrix.environment }}.yaml
+          # The mesh document is a SEPARATE artifact with its own destination:
+          # a mesh node's loader rejects a document carrying proxies:/
+          # upstreams:, and gateway file mode ignores a mesh: key. Written
+          # only when the repo declares `kind: MeshConfig` fragments under
+          # resources/<ns>/mesh/. Staged by the same commit step below.
+          FERRUM_MESH_FILE_OUTPUT_PATH: assembled/${{ matrix.environment }}-mesh.yaml
           FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -241,6 +247,9 @@ jobs:
           mkdir -p .state assembled
           git add ".state/${{ matrix.environment }}.json" 2>/dev/null || true
           git add "assembled/${{ matrix.environment }}.yaml" 2>/dev/null || true
+          # Mesh document, written only when the repo declares MeshConfig
+          # fragments. Absent otherwise, hence the same tolerant `git add`.
+          git add "assembled/${{ matrix.environment }}-mesh.yaml" 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No state changes to commit."

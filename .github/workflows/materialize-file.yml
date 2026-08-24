@@ -82,6 +82,13 @@ jobs:
           FERRUM_ENV: ${{ inputs.environment }}
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
           INPUT_ACTOR: ${{ github.actor }}
+          # `export` also publishes the standalone {version, mesh} document
+          # when the repo declares `kind: MeshConfig` fragments. It is a
+          # separate artifact from the gateway file (`--output` names only the
+          # gateway one) and carries no credential placeholders, so it is
+          # written in the clear alongside the encrypted blob rather than
+          # inside it. Kept under out/ so both land in the same upload.
+          FERRUM_MESH_FILE_OUTPUT_PATH: out/assembled-${{ inputs.environment }}-mesh.yaml
         run: |
           set -euo pipefail
           mkdir -p out
@@ -93,7 +100,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: assembled-${{ inputs.environment }}-${{ github.run_id }}
-          path: out/assembled-${{ inputs.environment }}.age
+          # The mesh document is only present in repos that declare mesh
+          # fragments; a missing path is skipped as long as the .age file
+          # matches, so no `if-no-files-found` tuning is needed.
+          path: |
+            out/assembled-${{ inputs.environment }}.age
+            out/assembled-${{ inputs.environment }}-mesh.yaml
           retention-days: 1
 
       - name: Summary
@@ -110,6 +122,8 @@ jobs:
             echo '```bash'
             echo "age -d -i ~/.ssh/id_ed25519 < assembled-${INPUT_ENVIRONMENT}.age > assembled.yaml"
             echo '```'
+            echo ""
+            echo "If this repo declares mesh fragments, the artifact also holds \`assembled-${INPUT_ENVIRONMENT}-mesh.yaml\` — the standalone \`{version, mesh}\` document for mesh nodes (\`FERRUM_MESH_FILE_CONFIG_PATH\`). It holds no credentials, so it is not encrypted."
             echo ""
             echo "Artifact retention: **1 day**. The encrypted blob is safe against GitHub-side compromise; the decrypted file never touches the repo."
           } >> "$GITHUB_STEP_SUMMARY"
