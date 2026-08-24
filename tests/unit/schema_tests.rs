@@ -273,6 +273,36 @@ spec:
     assert_eq!(reparsed.listen_port, Some(15432));
 }
 
+/// An unset `backend_scheme` must serialize as an *absent key*, never as
+/// `backend_scheme: null`. A DB-backed gateway always reports a resolved
+/// scheme, so emitting an explicit null diffs against the live value forever
+/// (and, before this, raised a breaking "backend_scheme changed" on every PR).
+#[test]
+fn absent_backend_scheme_is_omitted_not_serialized_as_null() {
+    let spec = proxy_from_yaml(
+        r#"
+kind: Proxy
+spec:
+  id: "proxy-schemeless"
+  listen_path: "/api"
+  upstream_id: "pool-a"
+"#,
+    );
+    assert_eq!(spec.backend_scheme, None);
+
+    let yaml = serde_yaml::to_string(&spec).unwrap();
+    assert!(
+        !yaml.contains("backend_scheme"),
+        "an unset scheme must be omitted entirely, not emitted as null:\n{yaml}"
+    );
+
+    let json = serde_json::to_value(&spec).unwrap();
+    assert!(
+        json.get("backend_scheme").is_none(),
+        "the JSON form feeds compare_fields; a null key there is perpetual drift"
+    );
+}
+
 #[test]
 fn proxy_backed_by_upstream_omits_host_port_and_scheme() {
     let spec = proxy_from_yaml(

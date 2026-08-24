@@ -15,7 +15,7 @@
 //! (`docs/plugins.md`, "Plugin Scope Merging"), which the analysis passes and
 //! policy rules all share.
 
-use crate::config::schema::{PluginConfig, PluginScope, Proxy};
+use crate::config::schema::{BackendScheme, PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
 
 /// Priority assigned to a plugin the gateway does not recognize. Matches
@@ -166,6 +166,36 @@ pub const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[
 /// hard-reject them rather than pass them through as "custom" plugins.
 pub const RETIRED_PLUGIN_NAMES: &[&str] = &["oauth2_auth", "semantic_ai_firewall"];
 
+/// What to do about a retired plugin name — the *fact*, not the sentence.
+///
+/// The security audit and the `plugin_name_is_known` policy rule both tell the
+/// operator how to fix a retired name, in their own voice (lowercase clause
+/// versus imperative remediation line). Only the mapping from retired name to
+/// successor is shared knowledge, so that is what lives here; each consumer
+/// still phrases its own finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiredRemediation {
+    /// The plugin's job moved to one of these successors.
+    ReplaceWith(&'static [&'static str]),
+    /// Same plugin, new `plugin_name` spelling.
+    RenamedTo(&'static str),
+    /// No successor — the config entry should go.
+    Remove,
+}
+
+/// Successor for a retired `plugin_name`. Returns
+/// [`RetiredRemediation::Remove`] for anything without a known successor, so
+/// callers always have something actionable to say.
+pub fn retired_replacement(plugin_name: &str) -> RetiredRemediation {
+    match plugin_name {
+        "oauth2_auth" => {
+            RetiredRemediation::ReplaceWith(&["oauth2_introspection", "oidc_relying_party"])
+        }
+        "semantic_ai_firewall" => RetiredRemediation::RenamedTo("ai_semantic_firewall"),
+        _ => RetiredRemediation::Remove,
+    }
+}
+
 /// Names the mesh data plane auto-injects. Operators must never configure
 /// them by hand — a hand-written instance collides with the injected one.
 pub const RESERVED_PLUGIN_NAMES: &[&str] = &["__mesh_bpf_metrics"];
@@ -260,11 +290,6 @@ pub fn is_auth_plugin(plugin_name: &str) -> bool {
 /// `ai_` prefix.
 pub fn is_ai_plugin(plugin_name: &str) -> bool {
     category(plugin_name) == Some(Ai)
-}
-
-/// Does this plugin enforce a request or token budget?
-pub fn is_rate_limit_plugin(plugin_name: &str) -> bool {
-    RATE_LIMIT_PLUGIN_NAMES.contains(&plugin_name)
 }
 
 /// Does this plugin emit per-request telemetry?
@@ -362,13 +387,135 @@ pub fn effective_plugins<'a>(config: &'a GatewayConfig, proxy: &Proxy) -> Vec<&'
     effective
 }
 
-/// Convenience wrapper: does any effective plugin on this proxy match?
-pub fn proxy_has_effective_plugin(
-    config: &GatewayConfig,
-    proxy: &Proxy,
-    predicate: impl Fn(&PluginConfig) -> bool,
-) -> bool {
-    effective_plugins(config, proxy).into_iter().any(predicate)
+// --- Backend scheme ---
+
+/// Is this a stream (L4) proxy? The gateway's discriminator is the presence of
+/// `listen_port`: a stream proxy binds its own listener, an HTTP-family proxy
+/// is routed by host/path on the shared HTTP listener.
+pub fn is_stream_proxy(proxy: &Proxy) -> bool {
+    proxy.listen_port.is_some()
+}
+
+/// The scheme the gateway will actually dial.
+///
+/// Mirrors `Proxy::effective_scheme()` in ferrum-edge (`src/config/types.rs`):
+/// an absent `backend_scheme` means `https` on the HTTP family, so `None` must
+/// never be read as "plaintext". On a *stream* proxy an absent scheme is not a
+/// default at all — the gateway rejects it in validation — and the upstream
+/// sentinel is `tcp`.
+///
+/// The gateway also writes this resolution back into the stored proxy
+/// (`resolve_dispatch_kind_fields` normalizes `None` → `Some(https)` for
+/// non-stream proxies), which is why
+/// `config::assembler::normalize_proxy_backend_schemes` applies the same rule
+/// to the desired config: otherwise every schemeless proxy diffs forever
+/// against the value the gateway resolved for it.
+pub fn effective_scheme(proxy: &Proxy) -> BackendScheme {
+    proxy.backend_scheme.unwrap_or({
+        if is_stream_proxy(proxy) {
+            BackendScheme::Tcp
+        } else {
+            BackendScheme::Https
+        }
+    })
+}
+
+/// Does this scheme negotiate TLS on the backend connection? Only these carry
+/// a server certificate, so only these give
+/// `backend_tls_verify_server_cert: false` any meaning — the gateway rejects
+/// the field outright on the plaintext schemes.
+pub fn scheme_is_tls(scheme: BackendScheme) -> bool {
+    matches!(
+        scheme,
+        BackendScheme::Https | BackendScheme::Tcps | BackendScheme::Dtls
+    )
+}
+
+/// Is this an HTTP-family scheme (as opposed to a raw L4 stream)?
+pub fn scheme_is_http_family(scheme: BackendScheme) -> bool {
+    matches!(scheme, BackendScheme::Http | BackendScheme::Https)
+}
+
+// --- Shared plugin-configuration predicates ---
+//
+// These read the untyped `PluginConfig.config` and answer a question about the
+// gateway's *behavior*. The security audit, the best-practice audit and the
+// policy rules all need the same answers; only the wording and severity of the
+// resulting finding differ, so the predicates live here and the phrasing stays
+// with each consumer.
+
+/// WAF rule actions that actually reject a matched request. The gateway spells
+/// the enforcing action `enforce`; `block` / `reject` are accepted so a config
+/// using the response-oriented wording is not misread as monitor-only.
+pub const WAF_ENFORCING_ACTIONS: &[&str] = &["enforce", "block", "reject"];
+
+/// Effective `waf.mode`, lowercased. Absent means `enforce` (the gateway's
+/// default).
+pub fn waf_mode(config: &serde_json::Value) -> String {
+    cfg_str(config, &["mode"]).unwrap_or_else(|| "enforce".to_string())
+}
+
+/// Is this WAF mode one that never rejects (`monitor` / `disabled`)?
+pub fn waf_mode_is_passive(mode: &str) -> bool {
+    matches!(mode, "monitor" | "disabled")
+}
+
+/// Does any rule-level setting promote at least one WAF rule to enforcement?
+///
+/// The built-in rule pack ships every rule at `monitor`, so `mode: enforce` on
+/// its own blocks nothing. Enforcement arrives through the bulk
+/// `default_rule_action` switch, a per-rule `rule_modes` entry, a
+/// `rule_overrides.<id>.action`, or a `custom_rules[].action`.
+pub fn waf_has_enforcing_rule(config: &serde_json::Value) -> bool {
+    let enforcing = |value: Option<String>| {
+        value.is_some_and(|action| WAF_ENFORCING_ACTIONS.contains(&action.as_str()))
+    };
+
+    if enforcing(cfg_str(config, &["default_rule_action"])) {
+        return true;
+    }
+    if let Some(modes) = cfg_at(config, &["rule_modes"]).and_then(|v| v.as_object()) {
+        if modes
+            .values()
+            .any(|v| enforcing(v.as_str().map(|s| s.to_ascii_lowercase())))
+        {
+            return true;
+        }
+    }
+    if let Some(overrides) = cfg_at(config, &["rule_overrides"]).and_then(|v| v.as_object()) {
+        if overrides
+            .values()
+            .any(|v| enforcing(cfg_str(v, &["action"])))
+        {
+            return true;
+        }
+    }
+    if let Some(custom) = cfg_array(config, &["custom_rules"]) {
+        if custom.iter().any(|v| enforcing(cfg_str(v, &["action"]))) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does this WAF instance wave through bodies it could not scan?
+/// `on_body_too_large` defaults to `fail_closed`; `skip` forwards a body the
+/// scanner never looked at.
+pub fn waf_skips_oversized_body(config: &serde_json::Value) -> bool {
+    cfg_str(config, &["on_body_too_large"]).as_deref() == Some("skip")
+}
+
+/// Fail-open escape hatch: on a Redis outage the plugin falls back to a
+/// per-replica budget instead of failing closed, silently multiplying the
+/// shared limit by the replica count.
+pub fn has_local_redis_fallback(config: &serde_json::Value) -> bool {
+    cfg_str(config, &["redis_failure_policy"]).as_deref() == Some("local_fallback")
+}
+
+/// Fail-open escape hatch: a body the plugin cannot parse is forwarded
+/// unchecked rather than rejected.
+pub fn allows_uninspectable_body(config: &serde_json::Value) -> bool {
+    cfg_bool(config, &["fail_on_uninspectable_body"]) == Some(false)
 }
 
 // --- Untyped plugin-config accessors ---

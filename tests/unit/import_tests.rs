@@ -227,6 +227,101 @@ fn import_reports_backup_sections_it_cannot_represent() {
     assert!(notice.contains("/api-specs"), "{notice}");
 }
 
+// --- Spec-owned resources (G2) ----------------------------------------------
+
+/// A resource carrying an `api_spec_id` is owned by the gateway's OpenAPI-spec
+/// ingestion, which rewrites it on every spec import. Writing it as a repo file
+/// would give it a second owner and produce drift no edit resolves, so import
+/// skips and counts it.
+#[test]
+fn split_config_skips_spec_provisioned_resources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+
+    // A second proxy, identical except that the spec owns it.
+    let mut spec_proxy = config.proxies[0].clone();
+    spec_proxy.id = "proxy-from-spec".to_string();
+    spec_proxy.api_spec_id = Some("spec-petstore".to_string());
+    config.proxies.push(spec_proxy);
+
+    let result = split_config(&config, tmp.path()).unwrap();
+
+    assert_eq!(result.proxies, 1, "only the repo-owned proxy is written");
+    assert_eq!(result.skipped_spec_owned, 1);
+    assert!(tmp.path().join("ferrum/proxies/proxy-test.yaml").exists());
+    assert!(
+        !tmp.path()
+            .join("ferrum/proxies/proxy-from-spec.yaml")
+            .exists(),
+        "a spec-provisioned proxy must not be written as a repo file"
+    );
+}
+
+#[test]
+fn split_config_skips_spec_provisioned_upstreams_and_plugin_configs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream: Upstream = serde_yaml::from_str(
+        "id: pool-from-spec\nnamespace: ferrum\ntargets: []\napi_spec_id: spec-petstore\n",
+    )
+    .unwrap();
+    let plugin: PluginConfig = serde_yaml::from_str(
+        "id: plugin-from-spec\nnamespace: ferrum\nplugin_name: cors\nscope: global\napi_spec_id: spec-petstore\n",
+    )
+    .unwrap();
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        plugin_configs: vec![plugin],
+        ..GatewayConfig::default()
+    };
+
+    let result = split_config(&config, tmp.path()).unwrap();
+
+    assert_eq!(result.upstreams, 0);
+    assert_eq!(result.plugin_configs, 0);
+    assert_eq!(result.skipped_spec_owned, 2);
+    assert!(
+        gitforgeops::config::load_resources(tmp.path())
+            .unwrap()
+            .is_empty(),
+        "nothing spec-owned may land in the resource tree"
+    );
+}
+
+#[test]
+fn import_notice_reports_skipped_spec_provisioned_resources() {
+    let result = gitforgeops::import::ImportResult {
+        proxies: 2,
+        skipped_spec_owned: 4,
+        ..Default::default()
+    };
+
+    let notice = result
+        .unmanaged_sections_notice()
+        .expect("expected a notice");
+    assert!(
+        notice.contains("4 spec-provisioned resources skipped — managed by API spec ingestion"),
+        "{notice}"
+    );
+    assert!(notice.contains("api_spec_id"), "{notice}");
+}
+
+#[test]
+fn import_notice_covers_spec_owned_and_unmanaged_sections_together() {
+    let result = gitforgeops::import::ImportResult {
+        skipped_api_specs: 1,
+        skipped_trust_bundles: 2,
+        skipped_spec_owned: 3,
+        ..Default::default()
+    };
+
+    let notice = result
+        .unmanaged_sections_notice()
+        .expect("expected a notice");
+    assert!(notice.contains("1 API spec(s)"), "{notice}");
+    assert!(notice.contains("2 gateway trust-bundle"), "{notice}");
+    assert!(notice.contains("3 spec-provisioned resources"), "{notice}");
+}
+
 #[test]
 fn import_is_quiet_when_the_backup_has_no_unmanaged_sections() {
     let result = gitforgeops::import::ImportResult {

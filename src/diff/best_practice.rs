@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use crate::config::schema::{BackendScheme, PluginConfig, Proxy, SdStalePolicy, Upstream};
 use crate::config::GatewayConfig;
-use crate::diff::security::{effective_scheme, scheme_is_http_family};
 use crate::plugin_catalog::{
-    effective_plugins, is_ai_plugin, is_observability_plugin, over_attached_chargeback,
-    AI_GUARDRAIL_PLUGIN_NAMES, OBSERVABILITY_PLUGIN_NAMES, RATE_LIMIT_PLUGIN_NAMES,
+    effective_plugins, effective_scheme, is_ai_plugin, is_observability_plugin,
+    over_attached_chargeback, scheme_is_http_family, AI_GUARDRAIL_PLUGIN_NAMES,
+    OBSERVABILITY_PLUGIN_NAMES, RATE_LIMIT_PLUGIN_NAMES,
 };
 
 #[derive(Debug, Clone)]
@@ -60,9 +60,13 @@ pub fn check_best_practices(config: &GatewayConfig) -> Vec<BestPractice> {
 /// `rate_limiting` never sees a UDP datagram or a raw TCP connection, so
 /// recommending it on a stream proxy is advice the operator cannot follow.
 ///
+/// `effective` is the proxy's already-computed effective plugin list — the
+/// caller has one in hand, and recomputing it here meant running the whole
+/// scope merge (a full scan of `plugin_configs`) twice per HTTP proxy.
+///
 /// Returns `(accepted plugin names, the name to recommend)`.
 fn rate_limit_expectation(
-    config: &GatewayConfig,
+    effective: &[&PluginConfig],
     proxy: &Proxy,
 ) -> (Vec<&'static str>, &'static str) {
     match effective_scheme(proxy) {
@@ -73,7 +77,7 @@ fn rate_limit_expectation(
             (vec!["tcp_connection_throttle"], "tcp_connection_throttle")
         }
         BackendScheme::Http | BackendScheme::Https => {
-            let recommended = if effective_plugins(config, proxy)
+            let recommended = if effective
                 .iter()
                 .any(|plugin| is_ai_plugin(&plugin.plugin_name))
             {
@@ -97,7 +101,7 @@ fn check_proxy(config: &GatewayConfig, proxy: &Proxy, findings: &mut Vec<BestPra
     let ns = proxy.namespace.as_str();
     let scheme = effective_scheme(proxy);
 
-    let (accepted, recommended) = rate_limit_expectation(config, proxy);
+    let (accepted, recommended) = rate_limit_expectation(&effective, proxy);
     if !effective
         .iter()
         .any(|plugin| accepted.contains(&plugin.plugin_name.as_str()))

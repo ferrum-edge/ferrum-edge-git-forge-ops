@@ -434,6 +434,86 @@ fn shared_mode_ignores_prune_confirmation_for_spec_owned() {
 }
 
 #[test]
+fn confirmed_spec_prunes_are_visible_to_the_preview_and_the_large_prune_guard() {
+    // cmd_apply computes its interactive preview and its large-prune
+    // denominator from this diff. Running it with DiffOptions::default() while
+    // applying with `--confirm-api-spec-deletion` meant the preview printed no
+    // DELETE line for `from-spec` and the guard counted it as zero — then the
+    // apply deleted it anyway. The flag has to reach both.
+    let desired = gateway_with(vec![proxy("from-repo", "ferrum")]);
+    let actual = gateway_with(vec![
+        proxy("from-repo", "ferrum"),
+        proxy("admin-added", "ferrum"),
+        spec_owned_proxy("from-spec", "ferrum", "spec-7"),
+    ]);
+
+    let delete_count = |options| {
+        compute_diff_with_options(&desired, &actual, OwnershipScope::Exclusive, options)
+            .diffs
+            .iter()
+            .filter(|d| matches!(d.action, DiffAction::Delete))
+            .count()
+    };
+
+    assert_eq!(delete_count(DiffOptions::default()), 1);
+    assert_eq!(
+        delete_count(DiffOptions {
+            prune_spec_owned: true
+        }),
+        2,
+        "the confirmed spec prune must be a counted deletion, not an invisible one"
+    );
+}
+
+#[test]
+fn informational_spec_owned_resources_leave_the_config_in_sync() {
+    // The in-sync gate in `diff` (and the "No changes to apply" early return in
+    // `apply`) used to require an empty spec_owned bucket, so a gateway that
+    // ingests API specs could never report in sync and interactive apply
+    // prompted on every no-op run. A spec-owned row that is not a conflict is
+    // a stable steady state: report it, then say in sync.
+    let desired = gateway_with(vec![proxy("from-repo", "ferrum")]);
+    let actual = gateway_with(vec![
+        proxy("from-repo", "ferrum"),
+        spec_owned_proxy("from-spec", "ferrum", "spec-7"),
+    ]);
+
+    let result = compute_diff_with_options(
+        &desired,
+        &actual,
+        OwnershipScope::Exclusive,
+        DiffOptions::default(),
+    );
+
+    assert!(result.diffs.is_empty(), "got {:?}", result.diffs);
+    assert!(result.unmanaged.is_empty());
+    assert_eq!(result.spec_owned.len(), 1);
+    assert!(
+        !result.spec_owned[0].is_conflict(),
+        "a resource the repo does not declare is informational, not a conflict"
+    );
+    assert_eq!(result.spec_conflicts().count(), 0);
+}
+
+#[test]
+fn a_spec_owned_conflict_still_blocks_in_sync() {
+    // The repo and the spec importer both claiming one row is exactly the case
+    // that must keep reporting drift.
+    let desired = gateway_with(vec![proxy("shared-id", "ferrum")]);
+    let actual = gateway_with(vec![spec_owned_proxy("shared-id", "ferrum", "spec-9")]);
+
+    let result = compute_diff_with_options(
+        &desired,
+        &actual,
+        OwnershipScope::Exclusive,
+        DiffOptions::default(),
+    );
+
+    assert_eq!(result.spec_conflicts().count(), 1);
+    assert!(result.spec_owned[0].is_conflict());
+}
+
+#[test]
 fn spec_owned_bucket_is_sorted_deterministically() {
     let desired = gateway_with(vec![]);
     let actual = gateway_with(vec![

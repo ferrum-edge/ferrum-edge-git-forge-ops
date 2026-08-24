@@ -1,6 +1,6 @@
 use gitforgeops::validate::{
-    build_validate_args, build_validate_args_for_mode, format_result, format_results,
-    scrubbed_env_names, OutputFormat, ValidationResult, GATEWAY_VALIDATE_MODE, MESH_VALIDATE_MODE,
+    build_validate_args_for_mode, format_result, format_results, scrubbed_env_names, OutputFormat,
+    ValidationResult, GATEWAY_VALIDATE_MODE, MESH_VALIDATE_MODE,
 };
 use std::path::Path;
 
@@ -33,7 +33,7 @@ fn github_annotations_emit_generic_error_when_no_line_matches() {
 }
 
 fn args_as_strings(settings: &str, spec: &str) -> Vec<String> {
-    build_validate_args(Path::new(settings), Path::new(spec))
+    build_validate_args_for_mode(GATEWAY_VALIDATE_MODE, Path::new(settings), Path::new(spec))
         .into_iter()
         .map(|a| a.to_string_lossy().to_string())
         .collect()
@@ -135,10 +135,10 @@ fn mesh_validate_args_pin_mesh_mode_and_settings() {
 fn gateway_and_mesh_modes_are_distinct() {
     assert_eq!(GATEWAY_VALIDATE_MODE, "file");
     assert_eq!(MESH_VALIDATE_MODE, "mesh");
-    assert_eq!(
-        build_validate_args(Path::new("s"), Path::new("c")),
+    assert_ne!(
         build_validate_args_for_mode(GATEWAY_VALIDATE_MODE, Path::new("s"), Path::new("c")),
-        "the gateway helper must stay pinned to -m file"
+        build_validate_args_for_mode(MESH_VALIDATE_MODE, Path::new("s"), Path::new("c")),
+        "the two documents must not be validated in the same ferrum-edge mode"
     );
 }
 

@@ -517,6 +517,87 @@ fn consumer_config_with_credentials(
     cfg
 }
 
+// --- Backend-scheme normalization (G1) --------------------------------------
+
+/// Parse one `kind: Proxy` document into a loaded resource, so these tests
+/// exercise exactly what the loader hands the assembler.
+fn proxy_resource_from_yaml(yaml: &str) -> (String, Resource) {
+    ("ferrum".to_string(), serde_yaml::from_str(yaml).unwrap())
+}
+
+/// The gateway canonicalizes a non-stream proxy's scheme on write, so the
+/// desired config has to carry the same resolved value or it diffs against the
+/// live gateway on every run.
+#[test]
+fn assembly_resolves_a_schemeless_http_proxy_to_https() {
+    use gitforgeops::config::schema::BackendScheme;
+
+    let config = assemble_gateway(vec![proxy_resource_from_yaml(
+        "kind: Proxy\nspec:\n  id: api\n  listen_path: /api\n  backend_host: api.internal\n  backend_port: 443\n",
+    )]);
+
+    assert_eq!(
+        config.proxies[0].backend_scheme,
+        Some(BackendScheme::Https),
+        "a proxy with no scheme and no listen_port is HTTP-family and defaults to https"
+    );
+
+    let yaml = serde_yaml::to_string(&config.proxies[0]).unwrap();
+    assert!(
+        yaml.contains("backend_scheme: https") && !yaml.contains("null"),
+        "the assembled proxy must serialize the resolved scheme:\n{yaml}"
+    );
+}
+
+/// A stream proxy's scheme is *not* defaulted by the gateway — it is rejected
+/// in validation. Inventing `tcp` here would turn a clear "missing scheme"
+/// error into a silently wrong proxy that may have meant `tcps` or `udp`.
+#[test]
+fn assembly_leaves_a_stream_proxy_scheme_unset() {
+    let config = assemble_gateway(vec![proxy_resource_from_yaml(
+        "kind: Proxy\nspec:\n  id: db\n  listen_port: 15432\n  backend_host: db.internal\n  backend_port: 5432\n",
+    )]);
+
+    assert_eq!(
+        config.proxies[0].backend_scheme, None,
+        "stream proxies keep an absent scheme so `validate` reports it"
+    );
+}
+
+#[test]
+fn assembly_never_rewrites_an_explicit_scheme() {
+    use gitforgeops::config::schema::BackendScheme;
+
+    let config = assemble_gateway(vec![
+        proxy_resource_from_yaml(
+            "kind: Proxy\nspec:\n  id: plain\n  listen_path: /p\n  backend_scheme: http\n",
+        ),
+        proxy_resource_from_yaml(
+            "kind: Proxy\nspec:\n  id: stream\n  listen_port: 9000\n  backend_scheme: tcps\n",
+        ),
+    ]);
+
+    assert_eq!(
+        config.proxies[0].backend_scheme,
+        Some(BackendScheme::Http),
+        "an explicit http must not be upgraded to https"
+    );
+    assert_eq!(config.proxies[1].backend_scheme, Some(BackendScheme::Tcps));
+}
+
+#[test]
+fn backend_scheme_normalization_is_idempotent() {
+    use gitforgeops::config::assembler::normalize_proxy_backend_schemes;
+
+    let mut config = assemble_gateway(vec![proxy_resource_from_yaml(
+        "kind: Proxy\nspec:\n  id: api\n  listen_path: /api\n",
+    )]);
+    let once = config.proxies[0].backend_scheme;
+    normalize_proxy_backend_schemes(&mut config);
+
+    assert_eq!(config.proxies[0].backend_scheme, once);
+}
+
 #[test]
 fn normalize_wraps_object_form_credentials_in_a_single_element_array() {
     use gitforgeops::config::assembler::normalize_consumer_credentials;

@@ -3,12 +3,6 @@ use crate::config::{GatewayConfig, GatewayMode};
 use super::bundle::CredentialBundle;
 use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 
-/// The five credential types ferrum-edge recognizes on a `Consumer`
-/// (`ALLOWED_CREDENTIAL_TYPES`). Anything else is stored verbatim and ignored
-/// at runtime; the broker still brokers it, it just has no gateway meaning.
-pub const KNOWN_CREDENTIAL_TYPES: [&str; 5] =
-    ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
-
 /// Credential types whose secret must be at least 32 characters
 /// (`jwt.secret`, `hmac_auth.secret`).
 pub const MIN32_CREDENTIAL_TYPES: [&str; 2] = ["jwt", "hmac_auth"];
@@ -25,6 +19,19 @@ pub const MAX_CREDENTIAL_VALUE_CHARS: usize = 4096;
 /// values). It is reserved: writing it back is rejected by the gateway, so a
 /// bundle that contains it was seeded from the wrong endpoint.
 pub const REDACTED_SENTINEL: &str = "[REDACTED]";
+
+/// Whether generation constraints ([`check_generation_constraints`]) abort the
+/// walk or are merely reflected in the returned statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintMode {
+    /// Return `Err` for a placeholder the broker provably cannot satisfy.
+    /// Used by `plan`/`diff`/`apply`, where allocation is about to happen.
+    Enforce,
+    /// Never fail on a generation constraint. Used by the `rotate` preflight,
+    /// which walks the whole config to locate one slot and must not be blocked
+    /// by an unrelated consumer's unsatisfiable placeholder.
+    ReportOnly,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotStatus {
@@ -60,9 +67,32 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default)]
 pub struct ResolveReport {
     pub results: Vec<ResolveResult>,
+    /// Non-fatal advisories raised while walking the credential tree.
+    ///
+    /// Currently these are the array-slot-identity hazards described on
+    /// [`is_elided`]: entry *position* is the slot identity, so removing or
+    /// reordering entries of a multi-entry credential array silently hands a
+    /// retired slot's value to whichever entry shifted into its index. Each
+    /// message is also echoed to stderr by the entrypoints so it shows up in
+    /// CI logs even when the caller ignores this field.
+    pub warnings: Vec<String>,
+    /// `slot → credential type` for every slot in `results`, captured
+    /// structurally while walking (the type is the third path component, known
+    /// before the slot string is ever joined).
+    ///
+    /// The allocator consumes this so it does not have to recover the type by
+    /// string-splitting the slot back apart; see
+    /// [`crate::secrets::allocator::generate_credential_value_typed`].
+    pub slot_credential_types: std::collections::BTreeMap<String, String>,
 }
 
 impl ResolveReport {
+    /// Structurally-captured credential type for `slot`, if this report
+    /// produced it.
+    pub fn credential_type_for(&self, slot: &str) -> Option<&str> {
+        self.slot_credential_types.get(slot).map(String::as_str)
+    }
+
     pub fn needs_allocation(&self) -> Vec<&ResolveResult> {
         self.results
             .iter()
@@ -176,6 +206,31 @@ fn encode_component(c: &SlotComponent<'_>) -> String {
 /// array, and a literal object key spelled `[0]` escapes its bracket to
 /// `~20]`. `detect_slot_collisions` is the backstop if that ever stops
 /// holding.
+///
+/// # Hazard: entry position IS the slot identity
+///
+/// Nothing about an entry's *content* participates in its slot name — only its
+/// index does. So for a multi-entry credential array, deleting or reordering
+/// entries silently re-owns stored values:
+///
+/// ```text
+/// before:  keyauth: [{key: A}, {key: B}]
+///          A -> <ns>/<id>/keyauth/key        (elided index 0)
+///          B -> <ns>/<id>/keyauth/[1]/key
+///
+/// delete the first entry:
+/// after:   keyauth: [{key: B}]
+///          B -> <ns>/<id>/keyauth/key        <-- now resolves to A's value
+/// ```
+///
+/// The credential the operator meant to retire is still live, now issued to
+/// the surviving entry, and `[1]` is orphaned in the bundle where a later
+/// re-grow would resurrect it. A retroactive content-addressed rename is not
+/// possible without orphaning every slot already allocated by earlier
+/// releases, so the resolver instead *detects* both shapes and reports them
+/// through [`ResolveReport::warnings`] (see `check_array_slot_identity`). The
+/// safe operation is `gitforgeops rotate --credential …/[N]/…`, which replaces
+/// the value in place rather than moving entries around.
 fn is_elided(c: &SlotComponent<'_>) -> bool {
     matches!(c, SlotComponent::ArrayIndex(0))
 }
@@ -362,11 +417,50 @@ pub fn report_secrets(
     report_secrets_with_mode(cfg, bundle, current_gateway_mode())
 }
 
+/// [`report_secrets`] that never fails on a *generation constraint*.
+///
+/// Same signature and return type as [`report_secrets`]; the only difference
+/// is that placeholders the broker provably cannot generate
+/// ([`check_generation_constraints`]) are reported as ordinary statuses rather
+/// than returned as an `Err`.
+///
+/// This exists for the `rotate` preflight. `rotate` targets one specific slot,
+/// but the preflight walks the *whole* assembled config to find it — so an
+/// unrelated consumer holding, say, a `len=16` `jwt` generate placeholder
+/// would abort a rotation that has nothing to do with it. Structural errors
+/// (malformed placeholders, `[REDACTED]` bundle values, slot collisions) are
+/// still hard failures in both variants, because those make the report itself
+/// untrustworthy.
+///
+/// `plan`/`diff`/`apply` keep using strict [`report_secrets`]: there the
+/// constraint really is fatal, since apply would otherwise write a GitHub
+/// Environment Secret holding a value the gateway rejects.
+pub fn report_secrets_lenient(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+) -> crate::error::Result<ResolveReport> {
+    report_secrets_with_mode_inner(
+        cfg,
+        bundle,
+        current_gateway_mode(),
+        ConstraintMode::ReportOnly,
+    )
+}
+
 /// [`report_secrets`] with the gateway mode supplied explicitly.
 pub fn report_secrets_with_mode(
     cfg: &crate::config::GatewayConfig,
     bundle: &CredentialBundle,
     mode: GatewayMode,
+) -> crate::error::Result<ResolveReport> {
+    report_secrets_with_mode_inner(cfg, bundle, mode, ConstraintMode::Enforce)
+}
+
+fn report_secrets_with_mode_inner(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
+    constraints: ConstraintMode,
 ) -> crate::error::Result<ResolveReport> {
     let mut report = ResolveReport::default();
     for consumer in &cfg.consumers {
@@ -378,7 +472,7 @@ pub fn report_secrets_with_mode(
                 SlotComponent::Literal(consumer_id.as_str()),
                 SlotComponent::Literal(cred_key.as_str()),
             ];
-            walk_and_report(value, &components, bundle, &mode, &mut report)?;
+            walk_and_report(value, &components, bundle, &mode, constraints, &mut report)?;
         }
     }
     // Defense-in-depth: detect any duplicate slot strings. With the escape
@@ -479,7 +573,11 @@ fn check_generation_constraints(
     placeholder: &SecretPlaceholder,
     status: &SlotStatus,
     mode: &GatewayMode,
+    constraints: ConstraintMode,
 ) -> crate::error::Result<()> {
+    if matches!(constraints, ConstraintMode::ReportOnly) {
+        return Ok(());
+    }
     if !matches!(status, SlotStatus::NeedsAllocation) {
         return Ok(());
     }
@@ -514,20 +612,150 @@ fn check_generation_constraints(
         }
     }
 
-    if MIN32_CREDENTIAL_TYPES.contains(&cred_type)
-        && placeholder.length_bytes < MIN_ENTROPY_BYTES_FOR_32_CHARS
+    check_min_entropy(&slot, cred_type, placeholder.length_bytes)?;
+
+    Ok(())
+}
+
+/// The one implementation of ferrum-edge's ≥32-character secret floor for
+/// `jwt` / `hmac_auth`.
+///
+/// Both the plan-time resolver check ([`check_generation_constraints`]) and
+/// the generate-time allocator check
+/// ([`crate::secrets::allocator::generate_credential_value_typed`]) call this,
+/// so the rule and its wording live in exactly one place. Pure: no I/O, no
+/// randomness — it only decides whether `length_bytes` entropy bytes can
+/// base64url-encode to at least 32 characters for this credential type.
+pub(crate) fn check_min_entropy(
+    slot: &str,
+    cred_type: &str,
+    length_bytes: usize,
+) -> crate::error::Result<()> {
+    if MIN32_CREDENTIAL_TYPES.contains(&cred_type) && length_bytes < MIN_ENTROPY_BYTES_FOR_32_CHARS
     {
         return Err(crate::error::Error::Config(format!(
             "credential slot '{slot}': {cred_type} secrets must be at least 32 characters, but \
-             'len={}' generates only {} base64url characters. Use 'len={}' or higher (the default \
-             len=32 yields 43 characters).",
-            placeholder.length_bytes,
-            base64_chars(placeholder.length_bytes),
-            MIN_ENTROPY_BYTES_FOR_32_CHARS
+             'len={length_bytes}' generates only {} base64url characters. Use \
+             'len={MIN_ENTROPY_BYTES_FOR_32_CHARS}' or higher (the default len=32 yields 43 \
+             characters).",
+            base64_chars(length_bytes),
         )));
     }
-
     Ok(())
+}
+
+/// Does this credential subtree contain at least one `${gh-env-secret:…}`
+/// placeholder? Used to decide whether array-slot advisories are relevant —
+/// an array of literal credentials has no brokered slots to shift.
+///
+/// A malformed placeholder counts as present; the walker reports the parse
+/// error on its own pass.
+fn contains_placeholder(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => parse_placeholder(s).is_some(),
+        serde_json::Value::Object(map) => map.values().any(contains_placeholder),
+        serde_json::Value::Array(items) => items.iter().any(contains_placeholder),
+        _ => false,
+    }
+}
+
+/// G3 advisories for one credential **array** node.
+///
+/// Slot identity is positional (see [`is_elided`]): entry 0 owns the elided
+/// slot, entry 1 owns `[1]`, and so on. Nothing in the entry's own content
+/// participates in the slot name, so:
+///
+/// * **Reorder/delete hazard** — deleting the first of two `keyauth` entries
+///   shifts the survivor into index 0 and hands it the deleted entry's stored
+///   value. The credential the operator meant to retire stays live under a new
+///   owner. Warn whenever a brokered array has more than one entry.
+/// * **Orphaned slot** — the bundle still holds a slot for an index the array
+///   no longer has (the array shrank). That value is now unreferenced, and
+///   re-growing the array would silently resurrect it for the new entry.
+///
+/// Both are warnings, not errors: the bundle is not corrupt, and failing an
+/// apply over a shape that is merely dangerous would block legitimate
+/// shrink-then-rotate workflows.
+fn check_array_slot_identity(
+    components: &[SlotComponent<'_>],
+    items: &[serde_json::Value],
+    bundle: &CredentialBundle,
+    report: &mut ResolveReport,
+) {
+    let prefix = join_slot_components(components);
+    let brokered = items.iter().any(contains_placeholder);
+
+    if brokered && items.len() > 1 {
+        push_warning(
+            report,
+            format!(
+                "credential array '{prefix}' has {} entries and entry ORDER is the slot identity \
+                 (entry 0 uses the unindexed slot, later entries use '[1]', '[2]', …). Removing or \
+                 reordering an entry reassigns the retired slot's value to whichever entry shifts \
+                 into its index. Rotate with 'gitforgeops rotate --credential' instead of deleting \
+                 entries.",
+                items.len()
+            ),
+        );
+    }
+
+    // Orphan scan: a bundle slot under this array whose entry index is beyond
+    // the array's current length. Runs regardless of `brokered`, because an
+    // array that lost its last placeholder is exactly the shrink case.
+    let scan_prefix = format!("{prefix}/");
+    for slot in bundle.keys() {
+        let Some(rest) = slot.strip_prefix(&scan_prefix) else {
+            continue;
+        };
+        let index = entry_index_of_suffix(rest);
+        if index >= items.len() {
+            push_warning(
+                report,
+                format!(
+                    "credential slot '{slot}' is orphaned: the credential bundle still holds it, \
+                     but array '{prefix}' now has {} entr{} (entry index {index} no longer \
+                     exists). Slot identity is positional, so re-adding an entry at that index \
+                     would resurrect the stale value — rotate the slot instead of relying on the \
+                     array length.",
+                    items.len(),
+                    if items.len() == 1 { "y" } else { "ies" }
+                ),
+            );
+        }
+    }
+}
+
+/// Entry index a bundle-slot suffix belongs to: `"[2]/key"` → 2, and anything
+/// else → 0, since index 0 renders without its bracket (see [`is_elided`]).
+fn entry_index_of_suffix(rest: &str) -> usize {
+    rest.split('/')
+        .next()
+        .and_then(parse_index_segment)
+        .unwrap_or(0)
+}
+
+/// Record a warning once per report and echo it to stderr the first time this
+/// process sees that exact text, so a `plan` that resolves the same config
+/// several times doesn't repeat itself.
+fn push_warning(report: &mut ResolveReport, message: String) {
+    if report.warnings.contains(&message) {
+        return;
+    }
+    if warn_once(&message) {
+        eprintln!("Warning: {message}");
+    }
+    report.warnings.push(message);
+}
+
+fn warn_once(message: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    match SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+        Ok(mut seen) => seen.insert(message.to_string()),
+        // A poisoned mutex only costs us deduplication.
+        Err(_) => true,
+    }
 }
 
 /// Character count of `n` bytes encoded as base64url without padding.
@@ -573,6 +801,7 @@ fn walk_and_report(
     components: &[SlotComponent<'_>],
     bundle: &CredentialBundle,
     mode: &GatewayMode,
+    constraints: ConstraintMode,
     report: &mut ResolveReport,
 ) -> crate::error::Result<()> {
     match value {
@@ -582,8 +811,9 @@ fn walk_and_report(
                 let slot = join_slot_components(components);
                 let existing = lookup_slot_value(components, &slot, bundle)?;
                 let status = classify_status(&placeholder, existing);
-                check_generation_constraints(components, &placeholder, &status, mode)?;
+                check_generation_constraints(components, &placeholder, &status, mode, constraints)?;
                 let (namespace, consumer_id, cred_key) = decompose_components(components);
+                record_credential_type(report, &slot, components);
                 report.results.push(ResolveResult {
                     consumer_id,
                     namespace,
@@ -598,19 +828,42 @@ fn walk_and_report(
             for (child_key, child_val) in map {
                 let mut child_components = components.to_vec();
                 child_components.push(SlotComponent::Literal(child_key.as_str()));
-                walk_and_report(child_val, &child_components, bundle, mode, report)?;
+                walk_and_report(
+                    child_val,
+                    &child_components,
+                    bundle,
+                    mode,
+                    constraints,
+                    report,
+                )?;
             }
         }
         serde_json::Value::Array(items) => {
+            check_array_slot_identity(components, items, bundle, report);
             for (i, item) in items.iter().enumerate() {
                 let mut child_components = components.to_vec();
                 child_components.push(SlotComponent::ArrayIndex(i));
-                walk_and_report(item, &child_components, bundle, mode, report)?;
+                walk_and_report(item, &child_components, bundle, mode, constraints, report)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Capture the credential type (third slot component) structurally, before it
+/// is flattened into the slot string. See
+/// [`ResolveReport::slot_credential_types`].
+fn record_credential_type(
+    report: &mut ResolveReport,
+    slot: &str,
+    components: &[SlotComponent<'_>],
+) {
+    if let Some(SlotComponent::Literal(cred_type)) = components.get(2) {
+        report
+            .slot_credential_types
+            .insert(slot.to_string(), (*cred_type).to_string());
+    }
 }
 
 fn walk_report_and_replace<'a>(
@@ -627,9 +880,16 @@ fn walk_report_and_replace<'a>(
                 let slot = join_slot_components(components);
                 let existing = lookup_slot_value(components, &slot, bundle)?;
                 let status = classify_status(&placeholder, existing);
-                check_generation_constraints(components, &placeholder, &status, mode)?;
+                check_generation_constraints(
+                    components,
+                    &placeholder,
+                    &status,
+                    mode,
+                    ConstraintMode::Enforce,
+                )?;
                 let (namespace, consumer_id, cred_key) = decompose_components(components);
                 let replacement = existing.cloned();
+                record_credential_type(report, &slot, components);
                 report_push(
                     report,
                     placeholder,
@@ -652,6 +912,7 @@ fn walk_report_and_replace<'a>(
             }
         }
         serde_json::Value::Array(items) => {
+            check_array_slot_identity(components, items, bundle, report);
             for (i, item) in items.iter_mut().enumerate() {
                 components.push(SlotComponent::ArrayIndex(i));
                 walk_report_and_replace(item, components, bundle, mode, report)?;

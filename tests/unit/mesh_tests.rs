@@ -168,6 +168,147 @@ fn fragments_merge_across_namespaces_into_one_document() {
     assert_eq!(mesh.service_entries.len(), 1);
 }
 
+/// A workload's SPIFFE ID is the mesh's primary key for it: policies, waypoint
+/// bindings and authorization rules all refer to a workload by that string. Two
+/// fragments defining it differently is an authoring conflict with no
+/// defensible winner — merging would pick whichever the directory walk reached
+/// last.
+#[test]
+fn conflicting_duplicate_workload_identity_is_an_error_naming_both_fragments() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            ("ferrum/mesh/a.yaml", CORE_FRAGMENT),
+            (
+                "ferrum/mesh/b.yaml",
+                r#"
+kind: MeshConfig
+spec:
+  workloads:
+    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+      service_name: api
+      namespace: ferrum
+      trust_domain: cluster.local
+      addresses: ["10.0.0.99"]
+"#,
+            ),
+        ],
+    );
+
+    let resources = load_resources(tmp.path()).unwrap();
+    let err = assemble(resources).expect_err("conflicting workload identity must fail");
+    let message = err.to_string();
+
+    assert!(message.contains("workloads"), "{message}");
+    assert!(
+        message.contains("spiffe://cluster.local/ns/ferrum/sa/api"),
+        "{message}"
+    );
+    assert!(message.contains("ferrum/mesh/a"), "{message}");
+    assert!(message.contains("ferrum/mesh/b"), "{message}");
+}
+
+/// Services are keyed by `(name, namespace)` — the same identity overlays merge
+/// on. Name alone is not enough, so the conflict must be reported per
+/// namespace.
+#[test]
+fn conflicting_duplicate_service_identity_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            ("ferrum/mesh/a.yaml", CORE_FRAGMENT),
+            (
+                "ferrum/mesh/b.yaml",
+                "kind: MeshConfig\nspec:\n  services:\n    - name: api\n      namespace: ferrum\n      ports:\n        - port: 8443\n          protocol: https\n",
+            ),
+        ],
+    );
+
+    let resources = load_resources(tmp.path()).unwrap();
+    let err = assemble(resources).expect_err("conflicting service identity must fail");
+    let message = err.to_string();
+
+    assert!(message.contains("services"), "{message}");
+    assert!(message.contains("ferrum/api"), "{message}");
+    assert!(message.contains("(name, namespace)"), "{message}");
+}
+
+/// Two fragments repeating the *same* entry agree with each other. Shared
+/// boilerplate copied into two files is harmless; emitting the entry twice
+/// would hand the mesh node a document it then has to reconcile.
+#[test]
+fn deep_equal_duplicate_entries_are_deduplicated_silently() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            ("ferrum/mesh/a.yaml", CORE_FRAGMENT),
+            ("ferrum/mesh/b.yaml", CORE_FRAGMENT),
+        ],
+    );
+
+    let mesh = mesh_from(tmp.path()).expect("mesh document");
+
+    assert_eq!(mesh.workloads.len(), 1, "identical workload deduplicated");
+    assert_eq!(mesh.services.len(), 1, "identical service deduplicated");
+    // Collections without a mesh-wide identity still concatenate: two
+    // similar-looking policy entries are two policies and both apply.
+    assert_eq!(mesh.peer_authentications.len(), 2);
+}
+
+/// The identity check must not collapse a service that legitimately exists in
+/// two mesh namespaces, nor two distinct workloads.
+#[test]
+fn distinct_identities_across_fragments_all_survive() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            ("ferrum/mesh/core.yaml", CORE_FRAGMENT),
+            ("ferrum/mesh/extra.yaml", EXTRA_FRAGMENT),
+            (
+                "ferrum/mesh/other-ns.yaml",
+                "kind: MeshConfig\nspec:\n  services:\n    - name: api\n      namespace: platform\n      ports:\n        - port: 80\n          protocol: http\n",
+            ),
+        ],
+    );
+
+    let mesh = mesh_from(tmp.path()).expect("mesh document");
+
+    assert_eq!(mesh.workloads.len(), 2, "two distinct spiffe ids");
+    assert_eq!(
+        mesh.services.len(),
+        2,
+        "same service name in two namespaces is two services"
+    );
+}
+
+/// An entry the identity rules cannot read (no `spiffe_id`) is passed through
+/// unchecked — `ferrum-edge validate -m mesh` owns required-field reporting and
+/// says it far better than a merge-time guess could.
+#[test]
+fn entries_without_a_readable_identity_are_passed_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            (
+                "ferrum/mesh/a.yaml",
+                "kind: MeshConfig\nspec:\n  workloads:\n    - service_name: api\n",
+            ),
+            (
+                "ferrum/mesh/b.yaml",
+                "kind: MeshConfig\nspec:\n  workloads:\n    - service_name: web\n",
+            ),
+        ],
+    );
+
+    let mesh = mesh_from(tmp.path()).expect("mesh document");
+    assert_eq!(mesh.workloads.len(), 2);
+}
+
 #[test]
 fn conflicting_singleton_fields_are_an_error_naming_both_fragments() {
     let tmp = tempfile::tempdir().unwrap();

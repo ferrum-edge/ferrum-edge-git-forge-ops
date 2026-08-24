@@ -24,8 +24,13 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
 pub const BATCH_MAX_BODY_BYTES: usize = 1024 * 1024;
 const BATCH_ENVELOPE_OVERHEAD: usize = 512;
 
-/// Exact read-only refusal body the admin API returns for config mutations.
-const READ_ONLY_MESSAGE: &str = "Admin API is in read-only mode";
+/// Marker substring of the read-only refusal body the admin API returns for
+/// config mutations. The canonical wording is
+/// `"Admin API is in read-only mode"`, but the phrase reaches us wrapped in
+/// several ways — prefixed by a middlebox, re-cased, or embedded in a longer
+/// sentence by a newer build — so the classifier matches the distinctive part
+/// case-insensitively rather than demanding the exact string.
+const READ_ONLY_MARKER: &str = "read-only mode";
 
 /// Gateway modes in which the admin API refuses config writes unconditionally,
 /// regardless of `FERRUM_ADMIN_READ_ONLY`.
@@ -238,6 +243,41 @@ impl AdminClient {
         Err(map_api_error(resp.status, &resp.body, kind))
     }
 
+    /// [`AdminClient::check`] for config mutations, with one extra step: an
+    /// unclassified 403 is re-checked against `GET /health`.
+    ///
+    /// A read-only admin plane usually says so in the body, but not every
+    /// deployment does — a proxy can rewrite the body, and some builds answer a
+    /// bare 403. Consulting the authenticated health projection turns that into
+    /// the same run-stopping [`crate::error::Error::GatewayReadOnly`] the
+    /// explicit body produces, so the run reports "the plane refuses writes"
+    /// once instead of N identical permission errors.
+    ///
+    /// Strictly best-effort: a `/health` that cannot be reached or that reports
+    /// writes as enabled leaves the original 403 exactly as it was.
+    async fn check_mutation(&self, resp: &RawResponse) -> crate::error::Result<()> {
+        match self.check(resp, RequestKind::Mutation) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.refine_mutation_error(e).await),
+        }
+    }
+
+    async fn refine_mutation_error(&self, error: crate::error::Error) -> crate::error::Error {
+        if !matches!(error, crate::error::Error::ApiError { status: 403, .. }) {
+            return error;
+        }
+        match self.get_health().await {
+            Ok(health) => match write_block_reason(&health) {
+                Some(reason) => crate::error::Error::GatewayReadOnly(format!(
+                    "the gateway answered 403 to a config mutation and GET /health confirms it \
+                     will not accept writes: {reason} No further resources were attempted."
+                )),
+                None => error,
+            },
+            Err(_) => error,
+        }
+    }
+
     /// Authenticated `GET /health`. Carries `mode`, `ready` and
     /// `admin_writes_enabled` — the ahead-of-time signal for read-only mode.
     pub async fn get_health(&self) -> crate::error::Result<HealthStatus> {
@@ -336,7 +376,7 @@ impl AdminClient {
             accumulated += received;
             pages.push(page.data);
 
-            match next_page_offset(offset, received, total, accumulated) {
+            match next_page_offset(offset, received, LIST_PAGE_LIMIT, total, accumulated) {
                 Some(next) => offset = next,
                 None => break,
             }
@@ -403,7 +443,7 @@ impl AdminClient {
         if resp.status == 501 {
             return Ok(None);
         }
-        self.check(&resp, RequestKind::Mutation)?;
+        self.check_mutation(&resp).await?;
 
         // 201 `{"created": {...}}`. A gateway that answers 200 with no body is
         // still a success — fall back to the counts we sent.
@@ -424,7 +464,7 @@ impl AdminClient {
                     .json(proxy)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
     pub async fn update_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
@@ -440,7 +480,7 @@ impl AdminClient {
                     .json(proxy)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
     /// Delete a proxy without the server-side orphan cleanup.
@@ -451,7 +491,11 @@ impl AdminClient {
     /// answer 404 and wedges the run. gitforgeops owns the upstream lifecycle
     /// through its own diff, so it opts out and issues the upstream delete
     /// itself.
-    pub async fn delete_proxy(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
+    pub async fn delete_proxy(
+        &self,
+        id: &str,
+        namespace: &str,
+    ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/proxies/{id}?cleanup_orphaned_upstream=false");
         self.delete(&path, namespace).await
@@ -472,7 +516,7 @@ impl AdminClient {
                     .json(consumer)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
     pub async fn update_consumer(
@@ -492,10 +536,14 @@ impl AdminClient {
                     .json(consumer)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
-    pub async fn delete_consumer(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
+    pub async fn delete_consumer(
+        &self,
+        id: &str,
+        namespace: &str,
+    ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/consumers/{id}");
         self.delete(&path, namespace).await
@@ -516,7 +564,7 @@ impl AdminClient {
                     .json(upstream)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
     pub async fn update_upstream(
@@ -536,10 +584,14 @@ impl AdminClient {
                     .json(upstream)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
-    pub async fn delete_upstream(&self, id: &str, namespace: &str) -> crate::error::Result<()> {
+    pub async fn delete_upstream(
+        &self,
+        id: &str,
+        namespace: &str,
+    ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/upstreams/{id}");
         self.delete(&path, namespace).await
@@ -560,7 +612,7 @@ impl AdminClient {
                     .json(pc)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
     pub async fn update_plugin_config(
@@ -580,21 +632,26 @@ impl AdminClient {
                     .json(pc)
             })
             .await?;
-        self.check(&resp, RequestKind::Mutation)
+        self.check_mutation(&resp).await
     }
 
     pub async fn delete_plugin_config(
         &self,
         id: &str,
         namespace: &str,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/plugins/config/{id}");
         self.delete(&path, namespace).await
     }
 
     /// Shared DELETE path with 404 tolerance — see [`delete_succeeded`].
-    async fn delete(&self, path: &str, namespace: &str) -> crate::error::Result<()> {
+    ///
+    /// The 404 is reported (as [`DeleteOutcome::NotFound`]) rather than
+    /// flattened into `Ok(())`: individually a 404 is benign, but a namespace
+    /// where *every* delete 404s is the signature of a misrouted run, and the
+    /// caller can only say that if it can count them.
+    async fn delete(&self, path: &str, namespace: &str) -> crate::error::Result<DeleteOutcome> {
         let token = self.token()?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
@@ -604,15 +661,28 @@ impl AdminClient {
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
-        if delete_succeeded(resp.status) {
-            return Ok(());
+        if resp.status == 404 {
+            return Ok(DeleteOutcome::NotFound);
         }
-        Err(map_api_error(
-            resp.status,
-            &resp.body,
-            RequestKind::Mutation,
-        ))
+        if delete_succeeded(resp.status) {
+            return Ok(DeleteOutcome::Deleted);
+        }
+        Err(self
+            .refine_mutation_error(map_api_error(
+                resp.status,
+                &resp.body,
+                RequestKind::Mutation,
+            ))
+            .await)
     }
+}
+
+/// Whether a tolerated DELETE actually removed something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// The gateway answered 404 — the resource was already gone.
+    NotFound,
 }
 
 // --- Response plumbing -------------------------------------------------------
@@ -679,9 +749,14 @@ pub enum RetryDecision {
 
 /// Decide whether a failed request may be re-sent.
 ///
-/// Retryable statuses are connect failures (handled by the caller), 408, 429,
-/// 500, 502, 503 and 504. **501 is never retried** — a standalone-MongoDB
-/// gateway will answer it forever. Body markers override the status:
+/// Retryable statuses are connect failures (handled by the caller), 408, 429
+/// and *every* 5xx except 501. The whole 5xx range is taken rather than an
+/// allow-list of the four the gateway itself emits: a CDN or load balancer in
+/// front of the admin API answers with its own vendor codes (520–527, 529,
+/// 530, 561, 598, 599) which are transient by definition, and an allow-list
+/// silently turns those into hard failures. **501 is never retried** — a
+/// standalone-MongoDB gateway will answer it forever. Body markers override
+/// the status:
 ///
 /// - `applied: false` ⇒ the write is durably committed but not live. Retrying
 ///   re-applies it (and a create answers 409 on the second attempt).
@@ -705,7 +780,10 @@ pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> Re
         }
     }
     match status {
-        408 | 429 | 500 | 502 | 503 | 504 => RetryDecision::Retry,
+        // 501 already returned NoRetry above, so the range is safe to take
+        // wholesale.
+        408 | 429 => RetryDecision::Retry,
+        s if (500..=599).contains(&s) => RetryDecision::Retry,
         _ => RetryDecision::NoRetry,
     }
 }
@@ -728,7 +806,7 @@ pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error
     let parsed = ApiErrorBody::parse(body);
     let message = parsed.error.clone().unwrap_or_else(|| body.to_string());
 
-    if status == 403 && message.trim() == READ_ONLY_MESSAGE {
+    if status == 403 && is_read_only_refusal(&message) {
         return crate::error::Error::GatewayReadOnly(
             "the gateway rejected a config mutation with \"Admin API is in read-only mode\" \
              (FERRUM_ADMIN_READ_ONLY, an unavailable config database, or a file/dp/mesh/node_agent \
@@ -794,6 +872,18 @@ pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error
     }
 }
 
+/// Does a 403 body say the admin plane is refusing writes?
+///
+/// Matching the canonical body byte-for-byte was too brittle: the refusal
+/// arrives re-cased, whitespace-padded, or wrapped in a longer sentence
+/// depending on the build and on whatever sits in front of the gateway, and a
+/// missed match downgrades a whole-run stop into N per-resource errors. Keyed
+/// on the distinctive phrase instead. Narrow enough that the other 403s
+/// (namespace-claim and role rejections) never match.
+pub fn is_read_only_refusal(message: &str) -> bool {
+    message.to_ascii_lowercase().contains(READ_ONLY_MARKER)
+}
+
 fn describe_api_specs_at_risk(at_risk: &Option<serde_json::Value>) -> String {
     match at_risk {
         Some(serde_json::Value::Array(items)) => format!("{} spec(s)", items.len()),
@@ -851,29 +941,59 @@ pub struct Page<T> {
     pub pagination: Option<Pagination>,
 }
 
+/// Hard stop on how many rows a single paginated walk will accumulate.
+///
+/// Only reachable on the envelope-less path, where there is no `total` to
+/// bound the walk: a server that ignores `offset` and keeps answering full
+/// pages would otherwise loop forever. Far above any real namespace count.
+const MAX_PAGINATED_ROWS: usize = 100_000;
+
 /// Offset of the next page, or `None` when the listing is complete.
 ///
-/// Terminates on an empty page (a server that ignores `offset` would otherwise
-/// loop forever), on a non-advancing offset, on a missing pagination envelope,
-/// and once the accumulated count covers the reported total.
+/// Terminates on an empty page, on a non-advancing offset, and — when the
+/// gateway sends a pagination envelope — once the accumulated count covers the
+/// reported total.
+///
+/// **Without an envelope** the walk continues while each page comes back
+/// exactly full (`received == limit`). A full page with no `total` to compare
+/// against is indistinguishable from a truncated listing, and stopping there
+/// silently dropped every namespace past the first page whenever a middlebox
+/// stripped the envelope or an older build omitted it. A short page ends the
+/// walk, as does [`MAX_PAGINATED_ROWS`].
 pub fn next_page_offset(
     requested_offset: i64,
     received: usize,
+    limit: i64,
     total: Option<i64>,
     accumulated: usize,
 ) -> Option<i64> {
     if received == 0 {
         return None;
     }
-    let total = total?;
-    if accumulated as i64 >= total {
-        return None;
-    }
     let next = requested_offset.saturating_add(received as i64);
     if next <= requested_offset {
         return None;
     }
-    Some(next)
+    match total {
+        Some(total) => {
+            if accumulated as i64 >= total {
+                return None;
+            }
+            Some(next)
+        }
+        None => {
+            if accumulated >= MAX_PAGINATED_ROWS {
+                return None;
+            }
+            // A short page is the end of the listing; an exactly-full one means
+            // there is probably more behind it.
+            if limit > 0 && received as i64 >= limit {
+                Some(next)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Flatten paged results, dropping duplicates while preserving first-seen
@@ -948,30 +1068,45 @@ impl BackupSnapshot {
     /// permissive `GatewayConfig`; the rest is picked out by key so unknown
     /// future metadata is simply ignored.
     pub fn from_body(body: &str) -> crate::error::Result<Self> {
-        let value: serde_json::Value = serde_json::from_str(body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
-        let config: GatewayConfig = serde_json::from_value(value.clone())
+        let mut value: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
 
-        let take = |key: &str| value.get(key).cloned();
-        let text = |key: &str| {
-            value
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
+        // Lift the non-`GatewayConfig` sections *out* of the document rather
+        // than copying them out of it: a production `/backup` is megabytes of
+        // JSON, and cloning the whole tree just to keep two keys doubled peak
+        // memory for every namespace fetched. `GatewayConfig` ignores unknown
+        // keys, so removing them changes nothing about what it deserializes.
+        let mut extras = BackupExtras::default();
+        let mut ferrum_version = None;
+        let mut exported_at = None;
+        let mut source = None;
+        if let Some(map) = value.as_object_mut() {
+            extras.api_specs = map.remove("api_specs");
+            extras.gateway_trust_bundles = map.remove("gateway_trust_bundles");
+            ferrum_version = take_string(map, "ferrum_version");
+            exported_at = take_string(map, "exported_at");
+            source = take_string(map, "source");
+        }
+
+        let config: GatewayConfig = serde_json::from_value(value)
+            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
 
         Ok(Self {
             config,
-            extras: BackupExtras {
-                api_specs: take("api_specs"),
-                gateway_trust_bundles: take("gateway_trust_bundles"),
-            },
+            extras,
             cached: false,
-            ferrum_version: text("ferrum_version"),
-            exported_at: text("exported_at"),
-            source: text("source"),
+            ferrum_version,
+            exported_at,
+            source,
         })
+    }
+}
+
+/// Remove `key` from `map`, keeping it only when it is a JSON string.
+fn take_string(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match map.remove(key) {
+        Some(serde_json::Value::String(s)) => Some(s),
+        _ => None,
     }
 }
 
@@ -1079,31 +1214,36 @@ impl BatchCreate {
 /// A single item larger than the cap is emitted in a chunk of its own — the
 /// gateway will reject it with 413, which is a clearer diagnostic than a
 /// silent drop.
-pub fn split_batch(
-    batch: &BatchCreate,
-    max_bytes: usize,
-) -> crate::error::Result<Vec<BatchCreate>> {
+///
+/// Takes the batch **by value**: every resource ends up in exactly one chunk,
+/// so moving them through costs nothing where borrowing forced a clone of the
+/// entire payload (on top of the caller's clone out of `desired`).
+pub fn split_batch(batch: BatchCreate, max_bytes: usize) -> crate::error::Result<Vec<BatchCreate>> {
     let budget = max_bytes.saturating_sub(BATCH_ENVELOPE_OVERHEAD).max(1);
 
-    enum Item<'a> {
-        Upstream(&'a Upstream),
-        Consumer(&'a Consumer),
-        Proxy(&'a Proxy),
-        PluginConfig(&'a PluginConfig),
+    enum Item {
+        Upstream(Upstream),
+        Consumer(Consumer),
+        Proxy(Proxy),
+        PluginConfig(PluginConfig),
     }
 
-    let mut ordered: Vec<(Item<'_>, usize)> = Vec::with_capacity(batch.len());
-    for u in &batch.upstreams {
-        ordered.push((Item::Upstream(u), serde_json::to_vec(u)?.len()));
+    let mut ordered: Vec<(Item, usize)> = Vec::with_capacity(batch.len());
+    for u in batch.upstreams {
+        let size = serde_json::to_vec(&u)?.len();
+        ordered.push((Item::Upstream(u), size));
     }
-    for c in &batch.consumers {
-        ordered.push((Item::Consumer(c), serde_json::to_vec(c)?.len()));
+    for c in batch.consumers {
+        let size = serde_json::to_vec(&c)?.len();
+        ordered.push((Item::Consumer(c), size));
     }
-    for p in &batch.proxies {
-        ordered.push((Item::Proxy(p), serde_json::to_vec(p)?.len()));
+    for p in batch.proxies {
+        let size = serde_json::to_vec(&p)?.len();
+        ordered.push((Item::Proxy(p), size));
     }
-    for pc in &batch.plugin_configs {
-        ordered.push((Item::PluginConfig(pc), serde_json::to_vec(pc)?.len()));
+    for pc in batch.plugin_configs {
+        let size = serde_json::to_vec(&pc)?.len();
+        ordered.push((Item::PluginConfig(pc), size));
     }
 
     let mut chunks: Vec<BatchCreate> = Vec::new();
@@ -1117,10 +1257,10 @@ pub fn split_batch(
             current_bytes = 0;
         }
         match item {
-            Item::Upstream(u) => current.upstreams.push(u.clone()),
-            Item::Consumer(c) => current.consumers.push(c.clone()),
-            Item::Proxy(p) => current.proxies.push(p.clone()),
-            Item::PluginConfig(pc) => current.plugin_configs.push(pc.clone()),
+            Item::Upstream(u) => current.upstreams.push(u),
+            Item::Consumer(c) => current.consumers.push(c),
+            Item::Proxy(p) => current.proxies.push(p),
+            Item::PluginConfig(pc) => current.plugin_configs.push(pc),
         }
         current_bytes += size + 1;
     }
@@ -1360,12 +1500,29 @@ fn oldest_last_sync(status: &ClusterStatus) -> Option<&str> {
 /// Longest resource id the gateway accepts in a path segment.
 const MAX_RESOURCE_ID_LEN: usize = 254;
 
-/// Enforce the server's resource-id grammar before interpolating an id into a
-/// URL path: `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, at most 254 characters.
+/// Characters that would let an id escape its path segment.
+const PATH_UNSAFE_CHARS: [char; 5] = ['/', '\\', '?', '#', '%'];
+
+/// Reject ids that cannot be safely interpolated into a URL path segment.
 ///
-/// Aligned exactly with the gateway rather than merely being stricter, so an id
-/// this tool accepts is one the gateway will accept too — and no id can smuggle
-/// a `/`, `..` or query string into a different endpoint.
+/// This is a **path-safety** check, deliberately *not* a re-implementation of
+/// the server's id grammar (`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`). The two are not
+/// the same job, and conflating them breaks reconciliation: a gateway can
+/// hold resources whose ids predate the current grammar (or were created
+/// through another client), and refusing to build a URL for them means the
+/// repo can never delete or update them — the namespace stops converging, with
+/// no way out short of hand-editing the database. Validating what the gateway
+/// *would accept on create* is the gateway's job; ours is only to guarantee
+/// the id lands in the segment we aimed it at.
+///
+/// So `~`, a leading `-`, `_` or `.`, and anything else the grammar happens to
+/// exclude are all allowed through: the gateway will answer 400 or 404 for an
+/// id it genuinely dislikes, which is the honest outcome. What is refused is
+/// everything that changes *which* endpoint is addressed — the separators in
+/// [`PATH_UNSAFE_CHARS`], the relative segments `.` and `..`, and any
+/// non-printable or non-ASCII byte (which would otherwise be percent-encoded,
+/// silently changing the id, or smuggle a control character into the request
+/// line).
 fn validate_resource_id_for_path(id: &str) -> crate::error::Result<()> {
     if id.is_empty() {
         return Err(crate::error::Error::Config(
@@ -1379,18 +1536,40 @@ fn validate_resource_id_for_path(id: &str) -> crate::error::Result<()> {
         )));
     }
 
-    let mut chars = id.chars();
-    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
-    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-
-    if !first_ok || !rest_ok {
+    if id == "." || id == ".." {
         return Err(crate::error::Error::Config(format!(
             "resource id contains unsafe characters for API path segment: {id} \
-             (must match ^[a-zA-Z0-9][a-zA-Z0-9._-]*$)",
+             (relative path segments would address a different endpoint)",
+        )));
+    }
+
+    // `is_ascii_graphic` is 0x21..=0x7E: excludes control characters, DEL,
+    // space, and every non-ASCII byte.
+    let safe = id
+        .chars()
+        .all(|c| c.is_ascii_graphic() && !PATH_UNSAFE_CHARS.contains(&c));
+
+    if !safe {
+        return Err(crate::error::Error::Config(format!(
+            "resource id contains unsafe characters for API path segment: {id} \
+             (must be printable ASCII with no {})",
+            PATH_UNSAFE_CHARS
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(" ")
         )));
     }
 
     Ok(())
+}
+
+/// Test-visible wrapper for [`validate_resource_id_for_path`].
+///
+/// Exposed so the accept/reject matrix can be exercised without a gateway —
+/// the alternative is a network round-trip per id, which the suite forbids.
+pub fn resource_id_is_path_safe(id: &str) -> crate::error::Result<()> {
+    validate_resource_id_for_path(id)
 }
 
 async fn backoff_sleep(attempt: u32) {

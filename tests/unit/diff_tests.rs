@@ -303,6 +303,69 @@ fn breaking_detects_backend_scheme_change() {
     );
 }
 
+/// A live DB-backed gateway always reports a resolved scheme, so the desired
+/// side (which assembly normalizes the same way) must compare equal. Before
+/// this, a schemeless repo proxy read as `None != Some(https)` and every PR
+/// touching it carried a phantom "backend_scheme changed" banner that no edit
+/// could clear.
+#[test]
+fn schemeless_desired_proxy_is_not_a_breaking_change_against_a_resolved_live_scheme() {
+    let mut actual_proxy = make_proxy("p1", "/api", "localhost");
+    actual_proxy.backend_scheme = Some(BackendScheme::Https); // as returned by /backup
+    let mut desired_proxy = actual_proxy.clone();
+    desired_proxy.backend_scheme = None; // as authored, before normalization
+
+    let desired = GatewayConfig {
+        proxies: vec![desired_proxy],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![actual_proxy],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    let reasons: Vec<String> = detect_breaking_changes(&diffs, &desired, &actual)
+        .into_iter()
+        .map(|bc| bc.reason)
+        .collect();
+
+    assert!(
+        !reasons.iter().any(|r| r.contains("backend_scheme")),
+        "an absent scheme resolves to https, so nothing changed: {reasons:?}"
+    );
+}
+
+/// The end-to-end shape of the same bug: assemble the desired config (which
+/// resolves the scheme) and diff it against what the gateway reports. There
+/// must be no Modify at all — this is the drift that never converged.
+#[test]
+fn assembled_schemeless_proxy_diffs_clean_against_a_resolved_live_gateway() {
+    use gitforgeops::config::assemble;
+
+    let resource: Resource = serde_yaml::from_str(
+        "kind: Proxy\nspec:\n  id: p1\n  listen_path: /api\n  backend_host: localhost\n  backend_port: 8080\n",
+    )
+    .unwrap();
+    let desired = assemble(vec![("ferrum".to_string(), resource)])
+        .expect("assemble")
+        .gateway;
+
+    // What `GET /backup` returns for that proxy: same fields, scheme resolved.
+    let mut live_proxy = desired.proxies[0].clone();
+    live_proxy.backend_scheme = Some(BackendScheme::Https);
+    let actual = GatewayConfig {
+        proxies: vec![live_proxy],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    assert!(
+        diffs.is_empty(),
+        "assembled desired config must converge with the live gateway: {diffs:?}"
+    );
+}
+
 #[test]
 fn breaking_detects_upstream_subset_change() {
     let reasons = breaking_reasons_for_proxy_change(|p| {

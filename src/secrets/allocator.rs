@@ -11,9 +11,8 @@ use super::delivery::{deliver_to_author, DeliveryResult};
 use super::github_api::{fetch_public_key, put_environment_secret};
 use super::placeholder::PlaceholderAlloc;
 use super::resolver::{
-    base64_chars, credential_type_from_slot, ResolveReport, ResolveResult, SlotStatus,
-    MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS,
-    REDACTED_SENTINEL,
+    check_min_entropy, credential_type_from_slot, ResolveReport, ResolveResult, SlotStatus,
+    MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, REDACTED_SENTINEL,
 };
 
 #[derive(Debug, Clone)]
@@ -139,12 +138,19 @@ pub async fn allocate_and_deliver(
 
     for candidate in candidates {
         // Fails before any GitHub write, so a `len=` that violates the
-        // gateway's minimum leaves `shards` untouched.
-        let value = generate_credential_value(&candidate.slot, candidate.placeholder.length_bytes)
-            .map_err(|source| AllocationFailure {
-                source,
-                partial: outcome.clone(),
-            })?;
+        // gateway's minimum leaves `shards` untouched. The credential type
+        // comes from the report, where the resolver captured it as a slot
+        // *component*; parsing it back out of the slot string is only the
+        // fallback.
+        let value = generate_credential_value_typed(
+            &candidate.slot,
+            candidate.placeholder.length_bytes,
+            report.credential_type_for(&candidate.slot),
+        )
+        .map_err(|source| AllocationFailure {
+            source,
+            partial: outcome.clone(),
+        })?;
 
         // Prefer the shard the slot already lives on. If we ran pick_shard
         // after `shard_count` has grown, the hash-based target could differ
@@ -448,7 +454,7 @@ fn random_value(length_bytes: usize) -> String {
 /// Enforced here:
 ///
 /// * `jwt` / `hmac_auth` secrets must be ≥32 characters, so `len=` must be at
-///   least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] (24). `len=16` is rejected with
+///   least [`super::resolver::MIN_ENTROPY_BYTES_FOR_32_CHARS`] (24). `len=16` is rejected with
 ///   an actionable error rather than silently clamped — silently growing a
 ///   credential the operator explicitly sized would be a surprise, and the
 ///   alternative (emitting a 22-character secret) is a credential the gateway
@@ -463,19 +469,45 @@ fn random_value(length_bytes: usize) -> String {
 /// allocator directly (notably `gitforgeops rotate`, whose `--credential`
 /// argument never passes through the resolver's placeholder walk).
 pub fn generate_credential_value(slot: &str, length_bytes: usize) -> crate::error::Result<String> {
-    let cred_type = credential_type_from_slot(slot).unwrap_or_default();
+    generate_credential_value_typed(slot, length_bytes, None)
+}
 
-    if MIN32_CREDENTIAL_TYPES.contains(&cred_type.as_str())
-        && length_bytes < MIN_ENTROPY_BYTES_FOR_32_CHARS
-    {
-        return Err(crate::error::Error::Config(format!(
-            "credential slot '{slot}': {cred_type} secrets must be at least 32 characters, but \
-             'len={length_bytes}' generates only {} base64url characters. Use \
-             'len={MIN_ENTROPY_BYTES_FOR_32_CHARS}' or higher (the default len=32 yields 43 \
-             characters).",
-            base64_chars(length_bytes)
-        )));
-    }
+/// [`generate_credential_value`] with the credential type supplied
+/// structurally.
+///
+/// The type decides whether the ≥32-character `jwt`/`hmac_auth` floor applies,
+/// so getting it wrong silently emits a credential the gateway rejects. The
+/// resolver already knows the type as a slot *component* before the slot
+/// string is joined ([`ResolveReport::slot_credential_types`]), so
+/// `allocate_and_deliver` passes it through instead of parsing it back out.
+///
+/// `cred_type == None` falls back to splitting the slot
+/// ([`credential_type_from_slot`]) — the path `gitforgeops rotate` takes,
+/// where the slot is built from CLI arguments and no report exists. If *that*
+/// also fails to yield a type, this is a hard error: a slot we cannot classify
+/// is a slot whose minimum-length rule we cannot apply, and the previous
+/// `.unwrap_or_default()` turned that into an empty type string that quietly
+/// skipped the floor.
+pub fn generate_credential_value_typed(
+    slot: &str,
+    length_bytes: usize,
+    cred_type: Option<&str>,
+) -> crate::error::Result<String> {
+    let cred_type = match cred_type {
+        Some(t) => t.to_string(),
+        None => credential_type_from_slot(slot).ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "credential slot '{slot}' has no credential-type component, so the \
+                 minimum-length rule for jwt/hmac_auth secrets cannot be applied. Slots are \
+                 '<namespace>/<consumer>/<credential-type>/…' — build the slot with \
+                 secrets::slot_path rather than by hand."
+            ))
+        })?,
+    };
+
+    // One shared implementation of the floor, also used by the resolver's
+    // plan-time check so the two can't drift.
+    check_min_entropy(slot, &cred_type, length_bytes)?;
 
     let value = random_value(length_bytes);
     let chars = value.chars().count();

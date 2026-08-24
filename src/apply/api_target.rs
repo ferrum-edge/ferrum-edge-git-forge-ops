@@ -1,12 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::config::schema::GatewayConfig;
+use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::ApplyStrategy;
 use crate::diff::resource_diff::{
     compute_diff_with_options, DiffAction, DiffOptions, DiffResult, OwnershipScope, ResourceDiff,
     SpecOwnedResource,
 };
-use crate::http_client::{self, AdminClient, BackupExtras, BatchCreate, BATCH_MAX_BODY_BYTES};
+use crate::http_client::{
+    self, AdminClient, BackupExtras, BatchCreate, DeleteOutcome, BATCH_MAX_BODY_BYTES,
+};
 
 /// A single per-resource operation that completed successfully against the
 /// gateway. cmd_apply uses this to update `state.resources` incrementally,
@@ -44,11 +46,28 @@ pub struct ApplyResult {
     pub created: usize,
     pub updated: usize,
     pub deleted: usize,
+    /// Deletes the gateway answered with 404. Tolerated individually (the
+    /// resource is gone either way), but counted so an all-404 namespace can
+    /// be called out — see [`all_deletes_missing_warning`].
+    pub deletes_missing: usize,
     pub unmanaged_skipped: usize,
     /// Live resources owned by an API-spec import that this run deliberately
     /// left alone (see [`spec_owned_skip_messages`]).
     pub spec_owned_skipped: usize,
     pub errors: Vec<String>,
+    /// A failure that stopped the run rather than being recorded and stepped
+    /// over: a read-only admin plane, a stale gateway view, a restore that
+    /// needs manual recovery.
+    ///
+    /// Carried on the result instead of being returned as `Err` so the caller
+    /// still receives everything that *did* land. Returning early threw the
+    /// aggregate away, and with it the per-op records `cmd_apply` writes into
+    /// the state file — so a run that successfully reconciled namespaces 0..N
+    /// before namespace N+1 hit a read-only plane recorded none of it, and the
+    /// next run re-derived those resources as unmanaged. The caller persists
+    /// state from [`ApplyResult::applied_incremental`], then propagates this
+    /// through its deferred-error path so the run still exits non-zero.
+    pub fatal_error: Option<String>,
     /// Per-resource operations that succeeded in `apply_incremental`.
     /// Empty for `apply_full_replace` runs — see `fully_replaced_namespaces`.
     pub applied_incremental: Vec<AppliedOp>,
@@ -60,20 +79,54 @@ pub struct ApplyResult {
 }
 
 impl ApplyResult {
-    pub fn into_result(self) -> crate::error::Result<Self> {
-        if self.errors.is_empty() {
-            return Ok(self);
-        }
+    pub fn into_result(mut self) -> crate::error::Result<Self> {
+        let fatal = self.fatal_error.take();
+        let counts = format!(
+            "{} created, {} updated, {} deleted",
+            self.created, self.updated, self.deleted
+        );
 
-        Err(crate::error::Error::Config(format!(
-            "Apply failed after partial success: {} created, {} updated, {} deleted, {} failed\n{}",
-            self.created,
-            self.updated,
-            self.deleted,
-            self.errors.len(),
-            self.errors.join("\n")
-        )))
+        match (fatal, self.errors.is_empty()) {
+            (None, true) => Ok(self),
+            (None, false) => Err(crate::error::Error::Config(format!(
+                "Apply failed after partial success: {counts}, {} failed\n{}",
+                self.errors.len(),
+                self.errors.join("\n")
+            ))),
+            (Some(fatal), true) => Err(crate::error::Error::Config(format!(
+                "Apply stopped: {fatal}\nCompleted before stopping: {counts}."
+            ))),
+            (Some(fatal), false) => Err(crate::error::Error::Config(format!(
+                "Apply stopped: {fatal}\nCompleted before stopping: {counts}, {} failed\n{}",
+                self.errors.len(),
+                self.errors.join("\n")
+            ))),
+        }
     }
+}
+
+/// Warn when a namespace's deletes *all* came back 404.
+///
+/// One 404 is routine — the gateway cascades deletes server-side, so a
+/// diff-driven follow-up legitimately finds nothing. Every delete 404ing is a
+/// different story: it is what a run pointed at the wrong gateway, or sending
+/// the wrong `X-Ferrum-Namespace`, looks like. The state entries are removed
+/// either way (the resources are absent from the view we were given), so the
+/// next run will not retry them — which makes this the only moment the
+/// operator can catch it.
+pub fn all_deletes_missing_warning(
+    namespace: &str,
+    deleted: usize,
+    deletes_missing: usize,
+) -> Option<String> {
+    if deleted == 0 || deletes_missing < deleted {
+        return None;
+    }
+    Some(format!(
+        "[{namespace}] all {deleted} delete(s) returned 404 — the resources were already absent. \
+         Verify FERRUM_GATEWAY_URL and the namespace routing for this environment; state entries \
+         were still removed."
+    ))
 }
 
 /// Order in which a diff entry must be issued against the admin API.
@@ -158,12 +211,19 @@ pub fn order_diffs(mut diffs: Vec<ResourceDiff>) -> Vec<ResourceDiff> {
 /// enumerates every namespace that failed (and implicitly, every one that
 /// succeeded). Operators running cross-namespace full_replace should
 /// understand this: partial restores need manual remediation.
+///
+/// **Fatal errors** (see [`is_fatal`]) stop the loop but do *not* discard the
+/// aggregate: they are recorded in [`ApplyResult::fatal_error`] and returned as
+/// `Ok`, so the caller can persist state for everything that already landed
+/// before propagating the failure. `into_result()` still turns it into an
+/// `Err`, so the run exits non-zero either way.
 pub async fn apply_api(
     desired: &GatewayConfig,
     client: &AdminClient,
     namespaces: &[String],
     ownership_scope: OwnershipScope<'_>,
     actual_by_namespace: Option<&BTreeMap<String, GatewayConfig>>,
+    extras_by_namespace: Option<&BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
 ) -> crate::error::Result<ApplyResult> {
     preflight_writes(client).await?;
@@ -181,9 +241,15 @@ pub async fn apply_api(
                 // the worst case is that namespaces 0..N restored and
                 // namespace N failed, which operators see in the aggregate
                 // error listing.
-                match apply_full_replace(&desired_namespace, client, namespace, options).await {
+                let extras = extras_by_namespace.and_then(|extras| extras.get(namespace));
+                match apply_full_replace(&desired_namespace, client, namespace, extras, options)
+                    .await
+                {
                     Ok(r) => r,
-                    Err(e) if is_fatal(&e) => return Err(e),
+                    Err(e) if is_fatal(&e) => {
+                        aggregate.fatal_error = Some(format!("[{namespace}] {e}"));
+                        break;
+                    }
                     Err(e) => {
                         aggregate.errors.push(format!("[{namespace}] {e}"));
                         continue;
@@ -203,7 +269,10 @@ pub async fn apply_api(
                 .await
                 {
                     Ok(r) => r,
-                    Err(e) if is_fatal(&e) => return Err(e),
+                    Err(e) if is_fatal(&e) => {
+                        aggregate.fatal_error = Some(format!("[{namespace}] {e}"));
+                        break;
+                    }
                     Err(e) => {
                         aggregate.errors.push(format!("[{namespace}] {e}"));
                         continue;
@@ -212,9 +281,18 @@ pub async fn apply_api(
             }
         };
 
+        if let Some(warning) = all_deletes_missing_warning(
+            namespace,
+            namespace_result.deleted,
+            namespace_result.deletes_missing,
+        ) {
+            eprintln!("Warning: {warning}");
+        }
+
         aggregate.created += namespace_result.created;
         aggregate.updated += namespace_result.updated;
         aggregate.deleted += namespace_result.deleted;
+        aggregate.deletes_missing += namespace_result.deletes_missing;
         aggregate.unmanaged_skipped += namespace_result.unmanaged_skipped;
         aggregate.spec_owned_skipped += namespace_result.spec_owned_skipped;
         aggregate
@@ -229,6 +307,15 @@ pub async fn apply_api(
                 .into_iter()
                 .map(|error| format!("[{namespace}] {error}")),
         );
+
+        // A mid-namespace stop (a read-only plane refusing the Nth resource)
+        // reaches us on the result rather than as an Err. Everything above has
+        // been folded into the aggregate; stop before the next namespace,
+        // which would fail identically.
+        if let Some(fatal) = namespace_result.fatal_error {
+            aggregate.fatal_error = Some(format!("[{namespace}] {fatal}"));
+            break;
+        }
     }
 
     Ok(aggregate)
@@ -270,35 +357,49 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
     }
 }
 
+/// `prefetched` carries the backup-only sections the caller already pulled with
+/// the namespace's live config. Only fetched here when the caller had none —
+/// `cmd_apply` reads `/backup` for its preview and large-prune guard anyway, so
+/// re-reading it per namespace was a second full download of a document we
+/// already had in hand.
 async fn apply_full_replace(
     desired: &GatewayConfig,
     client: &AdminClient,
     namespace: &str,
+    prefetched: Option<&BackupExtras>,
     options: &ApplyOptions,
 ) -> crate::error::Result<ApplyResult> {
     // A bare `GatewayConfig` restore omits `api_specs`, which the gateway
     // reads as "delete every API spec in this namespace" — it answers 409
     // rather than doing it. Read the live sections first and hand them back
     // verbatim so a full replace only replaces what this repo manages.
+    let fetched;
+    let none = BackupExtras::default();
     let extras = if options.confirm_api_spec_deletion {
-        BackupExtras::default()
+        &none
     } else {
-        let snapshot = client.get_backup_snapshot(namespace).await?;
-        if !snapshot.extras.is_empty() {
+        let extras = match prefetched {
+            Some(extras) => extras,
+            None => {
+                fetched = client.get_backup_snapshot(namespace).await?.extras;
+                &fetched
+            }
+        };
+        if !extras.is_empty() {
             eprintln!(
                 "[{namespace}] carrying {} API spec(s) and {} trust-bundle record(s) through the restore unchanged",
-                snapshot.extras.api_spec_count(),
-                snapshot.extras.trust_bundle_count(),
+                extras.api_spec_count(),
+                extras.trust_bundle_count(),
             );
         }
-        snapshot.extras
+        extras
     };
 
     client
         .post_restore(
             desired,
             namespace,
-            &extras,
+            extras,
             options.confirm_api_spec_deletion,
         )
         .await?;
@@ -376,11 +477,13 @@ async fn apply_incremental(
         ..Default::default()
     };
 
+    let index = DesiredIndex::build(desired);
+
     // Pure-Add namespaces take the transactional bulk path. `POST /batch` is
     // create-only and all-or-nothing (never 207), so any Modify or Delete in
     // the set disqualifies it.
     if !diffs.is_empty() && diffs.iter().all(|d| matches!(d.action, DiffAction::Add)) {
-        match try_batch_create(&diffs, desired, client, namespace).await? {
+        match try_batch_create(&diffs, &index, client, namespace).await? {
             Some(batched) => {
                 return Ok(ApplyResult {
                     unmanaged_skipped: result.unmanaged_skipped,
@@ -398,106 +501,74 @@ async fn apply_incremental(
     }
 
     for diff in &diffs {
+        let key = (diff.namespace.as_str(), diff.id.as_str());
         let outcome = match (&diff.action, diff.kind.as_str()) {
-            (DiffAction::Add, "Proxy") => {
-                let proxy = desired
-                    .proxies
-                    .iter()
-                    .find(|p| p.id == diff.id && p.namespace == diff.namespace);
-                match proxy {
-                    Some(p) => client.create_proxy(p, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Modify, "Proxy") => {
-                let proxy = desired
-                    .proxies
-                    .iter()
-                    .find(|p| p.id == diff.id && p.namespace == diff.namespace);
-                match proxy {
-                    Some(p) => client.update_proxy(p, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Delete, "Proxy") => client.delete_proxy(&diff.id, namespace).await,
+            (DiffAction::Add, "Proxy") => match index.proxies.get(&key) {
+                Some(p) => client.create_proxy(p, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Modify, "Proxy") => match index.proxies.get(&key) {
+                Some(p) => client.update_proxy(p, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Delete, "Proxy") => client
+                .delete_proxy(&diff.id, namespace)
+                .await
+                .map(OpOutcome::from),
 
-            (DiffAction::Add, "Consumer") => {
-                let consumer = desired
-                    .consumers
-                    .iter()
-                    .find(|c| c.id == diff.id && c.namespace == diff.namespace);
-                match consumer {
-                    Some(c) => client.create_consumer(c, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Modify, "Consumer") => {
-                let consumer = desired
-                    .consumers
-                    .iter()
-                    .find(|c| c.id == diff.id && c.namespace == diff.namespace);
-                match consumer {
-                    Some(c) => client.update_consumer(c, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Delete, "Consumer") => client.delete_consumer(&diff.id, namespace).await,
+            (DiffAction::Add, "Consumer") => match index.consumers.get(&key) {
+                Some(c) => client.create_consumer(c, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Modify, "Consumer") => match index.consumers.get(&key) {
+                Some(c) => client.update_consumer(c, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Delete, "Consumer") => client
+                .delete_consumer(&diff.id, namespace)
+                .await
+                .map(OpOutcome::from),
 
-            (DiffAction::Add, "Upstream") => {
-                let upstream = desired
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == diff.id && u.namespace == diff.namespace);
-                match upstream {
-                    Some(u) => client.create_upstream(u, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Modify, "Upstream") => {
-                let upstream = desired
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == diff.id && u.namespace == diff.namespace);
-                match upstream {
-                    Some(u) => client.update_upstream(u, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Delete, "Upstream") => client.delete_upstream(&diff.id, namespace).await,
+            (DiffAction::Add, "Upstream") => match index.upstreams.get(&key) {
+                Some(u) => client.create_upstream(u, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Modify, "Upstream") => match index.upstreams.get(&key) {
+                Some(u) => client.update_upstream(u, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Delete, "Upstream") => client
+                .delete_upstream(&diff.id, namespace)
+                .await
+                .map(OpOutcome::from),
 
-            (DiffAction::Add, "PluginConfig") => {
-                let pc = desired
-                    .plugin_configs
-                    .iter()
-                    .find(|p| p.id == diff.id && p.namespace == diff.namespace);
-                match pc {
-                    Some(p) => client.create_plugin_config(p, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Modify, "PluginConfig") => {
-                let pc = desired
-                    .plugin_configs
-                    .iter()
-                    .find(|p| p.id == diff.id && p.namespace == diff.namespace);
-                match pc {
-                    Some(p) => client.update_plugin_config(p, namespace).await,
-                    None => continue,
-                }
-            }
-            (DiffAction::Delete, "PluginConfig") => {
-                client.delete_plugin_config(&diff.id, namespace).await
-            }
+            (DiffAction::Add, "PluginConfig") => match index.plugin_configs.get(&key) {
+                Some(p) => client.create_plugin_config(p, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Modify, "PluginConfig") => match index.plugin_configs.get(&key) {
+                Some(p) => client.update_plugin_config(p, namespace).await.map(applied),
+                None => continue,
+            },
+            (DiffAction::Delete, "PluginConfig") => client
+                .delete_plugin_config(&diff.id, namespace)
+                .await
+                .map(OpOutcome::from),
 
             _ => continue,
         };
 
         match outcome {
-            Ok(()) => {
+            Ok(op) => {
                 match diff.action {
                     DiffAction::Add => result.created += 1,
                     DiffAction::Modify => result.updated += 1,
-                    DiffAction::Delete => result.deleted += 1,
+                    DiffAction::Delete => {
+                        result.deleted += 1;
+                        if op == OpOutcome::AlreadyGone {
+                            result.deletes_missing += 1;
+                        }
+                    }
                 }
                 // Track per-op success so cmd_apply updates state.resources
                 // only for ops that actually landed. Failed ops leave their
@@ -512,10 +583,14 @@ async fn apply_incremental(
                 });
             }
             // The whole admin plane refuses writes — every remaining resource
-            // would fail identically. Surface it once and stop, keeping the
-            // partial successes recorded so far.
+            // (in this namespace and every later one) would fail identically.
+            // Record it as the run's fatal stop, keeping the partial successes,
+            // and let apply_api unwind. Pushing it onto `errors` instead made
+            // it indistinguishable from a per-resource failure, so the run
+            // carried on into the next namespace collecting the same 403 over
+            // and over.
             Err(e @ crate::error::Error::GatewayReadOnly(_)) => {
-                result.errors.push(e.to_string());
+                result.fatal_error = Some(e.to_string());
                 return Ok(result);
             }
             Err(e) => {
@@ -535,6 +610,68 @@ async fn apply_incremental(
     }
 
     Ok(result)
+}
+
+/// What a single successful admin call actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpOutcome {
+    Applied,
+    /// A DELETE the gateway answered 404 — tolerated, but counted.
+    AlreadyGone,
+}
+
+impl From<DeleteOutcome> for OpOutcome {
+    fn from(outcome: DeleteOutcome) -> Self {
+        match outcome {
+            DeleteOutcome::Deleted => OpOutcome::Applied,
+            DeleteOutcome::NotFound => OpOutcome::AlreadyGone,
+        }
+    }
+}
+
+/// `map` adaptor for the create/update calls, which return `()` on success.
+fn applied(_: ()) -> OpOutcome {
+    OpOutcome::Applied
+}
+
+/// `(namespace, id)`-keyed view over the desired config.
+///
+/// The diff and the desired document are both O(n); pairing them by scanning
+/// the relevant `Vec` per diff entry made the apply loop O(n²), which shows up
+/// as real time on namespaces with a few thousand resources. Built once per
+/// namespace and shared by the per-resource path and the batch collector.
+struct DesiredIndex<'a> {
+    proxies: HashMap<(&'a str, &'a str), &'a Proxy>,
+    consumers: HashMap<(&'a str, &'a str), &'a Consumer>,
+    upstreams: HashMap<(&'a str, &'a str), &'a Upstream>,
+    plugin_configs: HashMap<(&'a str, &'a str), &'a PluginConfig>,
+}
+
+impl<'a> DesiredIndex<'a> {
+    fn build(desired: &'a GatewayConfig) -> Self {
+        Self {
+            proxies: desired
+                .proxies
+                .iter()
+                .map(|p| ((p.namespace.as_str(), p.id.as_str()), p))
+                .collect(),
+            consumers: desired
+                .consumers
+                .iter()
+                .map(|c| ((c.namespace.as_str(), c.id.as_str()), c))
+                .collect(),
+            upstreams: desired
+                .upstreams
+                .iter()
+                .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
+                .collect(),
+            plugin_configs: desired
+                .plugin_configs
+                .iter()
+                .map(|p| ((p.namespace.as_str(), p.id.as_str()), p))
+                .collect(),
+        }
+    }
 }
 
 /// One operator-facing line per spec-owned live resource the run touched.
@@ -598,176 +735,212 @@ pub fn stale_view_block(
     ))
 }
 
-/// Collect a pure-Add diff into a `POST /batch` payload.
+/// Collect a pure-Add diff into a `POST /batch` payload and send it.
 ///
-/// Returns `Ok(None)` when the gateway answered 501 (standalone MongoDB has no
-/// multi-document transaction), signalling the caller to fall back to
-/// per-resource creates.
+/// Returns `Ok(None)` when the gateway answered 501 on the *first* chunk
+/// (standalone MongoDB has no multi-document transaction and nothing landed),
+/// signalling the caller to fall back to per-resource creates for the whole
+/// namespace.
+///
+/// Any other chunk failure — a 501 partway through, a validation 400, a 409 on
+/// one resource — is **not** the end of the run. `/batch` is all-or-nothing per
+/// chunk, so a rejected chunk left nothing behind, and the single aggregate
+/// `POST /batch: {e}` this used to return told the operator nothing about
+/// *which* resource the gateway objected to while silently abandoning every
+/// chunk behind it. The failing chunk and all remaining ones are replayed as
+/// per-resource creates instead: each failure is then named individually, and
+/// the resources the gateway is happy with still land.
 async fn try_batch_create(
     diffs: &[ResourceDiff],
-    desired: &GatewayConfig,
+    index: &DesiredIndex<'_>,
     client: &AdminClient,
     namespace: &str,
 ) -> crate::error::Result<Option<ApplyResult>> {
-    let mut batch = BatchCreate::default();
-    let mut ops: Vec<AppliedOp> = Vec::new();
-
-    for diff in diffs {
-        let matched = match diff.kind.as_str() {
-            "Upstream" => {
-                match desired
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == diff.id && u.namespace == diff.namespace)
-                {
-                    Some(u) => {
-                        batch.upstreams.push(u.clone());
-                        true
-                    }
-                    None => false,
-                }
-            }
-            "Consumer" => {
-                match desired
-                    .consumers
-                    .iter()
-                    .find(|c| c.id == diff.id && c.namespace == diff.namespace)
-                {
-                    Some(c) => {
-                        batch.consumers.push(c.clone());
-                        true
-                    }
-                    None => false,
-                }
-            }
-            "Proxy" => {
-                match desired
-                    .proxies
-                    .iter()
-                    .find(|p| p.id == diff.id && p.namespace == diff.namespace)
-                {
-                    Some(p) => {
-                        batch.proxies.push(p.clone());
-                        true
-                    }
-                    None => false,
-                }
-            }
-            "PluginConfig" => {
-                match desired
-                    .plugin_configs
-                    .iter()
-                    .find(|p| p.id == diff.id && p.namespace == diff.namespace)
-                {
-                    Some(p) => {
-                        batch.plugin_configs.push(p.clone());
-                        true
-                    }
-                    None => false,
-                }
-            }
-            _ => false,
-        };
-        if matched {
-            ops.push(AppliedOp {
-                kind: diff.kind.clone(),
-                namespace: diff.namespace.clone(),
-                id: diff.id.clone(),
-                action: DiffAction::Add,
-            });
-        }
-    }
-
+    let batch = collect_batch(diffs, index);
     if batch.is_empty() {
         return Ok(Some(ApplyResult::default()));
     }
 
-    // `split_batch` packs in dependency order, and `ops` was collected in the
-    // same order the batch arrays were filled, so per-chunk slices of `ops`
-    // line up with the resources each chunk carries only if `ops` is
-    // re-sorted the same way. Rebuild it from the chunk contents instead of
-    // assuming.
-    let chunks = http_client::split_batch(&batch, BATCH_MAX_BODY_BYTES)?;
-    let by_key: BTreeMap<(String, String), AppliedOp> = ops
-        .into_iter()
-        .map(|op| ((op.kind.clone(), op.id.clone()), op))
-        .collect();
+    let total = batch.len();
+    let chunks = http_client::split_batch(batch, BATCH_MAX_BODY_BYTES)?;
+    let mut result = ApplyResult::default();
+    let mut replay_from: Option<usize> = None;
 
-    let mut created = 0usize;
-    let mut applied: Vec<AppliedOp> = Vec::new();
-
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (position, chunk) in chunks.iter().enumerate() {
         match client.post_batch(chunk, namespace).await {
             Ok(Some(_counts)) => {
                 // `/batch` is all-or-nothing and never answers 207, so a
                 // non-error response means the whole chunk landed.
-                created += chunk.len();
-                applied.extend(chunk_ops(chunk, &by_key));
+                result.created += chunk.len();
+                result
+                    .applied_incremental
+                    .extend(chunk_ops(chunk, namespace));
             }
-            // 501 on the first chunk: nothing landed, so the caller can retry
-            // the whole namespace per-resource. On a later chunk the earlier
-            // ones are already committed — report progress instead.
-            Ok(None) if index == 0 => return Ok(None),
+            // 501 on the first chunk: nothing landed anywhere, so the caller
+            // can take the whole namespace down the per-resource path.
+            Ok(None) if position == 0 => return Ok(None),
             Ok(None) => {
-                return Ok(Some(ApplyResult {
-                    created,
-                    applied_incremental: applied,
-                    errors: vec![format!(
-                        "POST /batch stopped after {created} resource(s): gateway returned 501 \
-                         mid-run. Re-run apply to create the remaining {} resource(s) via \
-                         per-resource calls.",
-                        batch.len().saturating_sub(created)
-                    )],
-                    ..Default::default()
-                }));
+                eprintln!(
+                    "[{namespace}] gateway returned 501 for POST /batch after {} resource(s); \
+                     creating the remaining {} resource(s) individually.",
+                    result.created,
+                    total.saturating_sub(result.created),
+                );
+                replay_from = Some(position);
+                break;
             }
-            Err(e) if index == 0 && matches!(e, crate::error::Error::GatewayReadOnly(_)) => {
-                return Err(e)
+            // A read-only admin plane refuses every chunk and every
+            // per-resource create identically; replaying would just collect
+            // the same 403 N times.
+            Err(e @ crate::error::Error::GatewayReadOnly(_)) => {
+                result.fatal_error = Some(e.to_string());
+                return Ok(Some(result));
             }
             Err(e) => {
-                return Ok(Some(ApplyResult {
-                    created,
-                    applied_incremental: applied,
-                    errors: vec![format!("POST /batch: {e}")],
-                    ..Default::default()
-                }));
+                eprintln!(
+                    "[{namespace}] POST /batch chunk {} failed ({e}); creating the remaining {} \
+                     resource(s) individually so each failure is reported on its own.",
+                    position + 1,
+                    total.saturating_sub(result.created),
+                );
+                replay_from = Some(position);
+                break;
             }
         }
     }
 
-    Ok(Some(ApplyResult {
-        created,
-        applied_incremental: applied,
-        ..Default::default()
-    }))
+    if let Some(start) = replay_from {
+        create_individually(&chunks[start..], client, namespace, &mut result).await;
+    }
+
+    Ok(Some(result))
 }
 
-/// Recover the `AppliedOp` records for the resources a chunk actually carries.
-fn chunk_ops(
-    chunk: &BatchCreate,
-    by_key: &BTreeMap<(String, String), AppliedOp>,
-) -> Vec<AppliedOp> {
-    let keys = chunk
+/// Gather the desired resources a pure-Add diff names into a batch payload,
+/// in dependency order.
+fn collect_batch(diffs: &[ResourceDiff], index: &DesiredIndex<'_>) -> BatchCreate {
+    let mut batch = BatchCreate::default();
+    for diff in diffs {
+        let key = (diff.namespace.as_str(), diff.id.as_str());
+        match diff.kind.as_str() {
+            "Upstream" => {
+                if let Some(u) = index.upstreams.get(&key) {
+                    batch.upstreams.push((*u).clone());
+                }
+            }
+            "Consumer" => {
+                if let Some(c) = index.consumers.get(&key) {
+                    batch.consumers.push((*c).clone());
+                }
+            }
+            "Proxy" => {
+                if let Some(p) = index.proxies.get(&key) {
+                    batch.proxies.push((*p).clone());
+                }
+            }
+            "PluginConfig" => {
+                if let Some(p) = index.plugin_configs.get(&key) {
+                    batch.plugin_configs.push((*p).clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    batch
+}
+
+/// Replay chunks as per-resource `POST`s, in the same dependency order the
+/// batch packer used (upstreams and consumers, then proxies, then plugin
+/// configs), so a proxy never precedes the upstream it references.
+///
+/// Stops early on a read-only plane; every other failure is recorded against
+/// the individual resource and the walk continues.
+async fn create_individually(
+    chunks: &[BatchCreate],
+    client: &AdminClient,
+    namespace: &str,
+    result: &mut ApplyResult,
+) {
+    for chunk in chunks {
+        for u in &chunk.upstreams {
+            let outcome = client.create_upstream(u, namespace).await;
+            record_create(result, outcome, "Upstream", &u.id, namespace);
+            if result.fatal_error.is_some() {
+                return;
+            }
+        }
+        for c in &chunk.consumers {
+            let outcome = client.create_consumer(c, namespace).await;
+            record_create(result, outcome, "Consumer", &c.id, namespace);
+            if result.fatal_error.is_some() {
+                return;
+            }
+        }
+        for p in &chunk.proxies {
+            let outcome = client.create_proxy(p, namespace).await;
+            record_create(result, outcome, "Proxy", &p.id, namespace);
+            if result.fatal_error.is_some() {
+                return;
+            }
+        }
+        for pc in &chunk.plugin_configs {
+            let outcome = client.create_plugin_config(pc, namespace).await;
+            record_create(result, outcome, "PluginConfig", &pc.id, namespace);
+            if result.fatal_error.is_some() {
+                return;
+            }
+        }
+    }
+}
+
+fn record_create(
+    result: &mut ApplyResult,
+    outcome: crate::error::Result<()>,
+    kind: &str,
+    id: &str,
+    namespace: &str,
+) {
+    match outcome {
+        Ok(()) => {
+            result.created += 1;
+            result.applied_incremental.push(AppliedOp {
+                kind: kind.to_string(),
+                namespace: namespace.to_string(),
+                id: id.to_string(),
+                action: DiffAction::Add,
+            });
+        }
+        Err(e @ crate::error::Error::GatewayReadOnly(_)) => {
+            result.fatal_error = Some(e.to_string());
+        }
+        Err(e) => result.errors.push(format!("{kind} {id} create: {e}")),
+    }
+}
+
+/// The `AppliedOp` records for the resources a landed chunk carried.
+///
+/// Built straight from the chunk: every entry in it is an Add that just
+/// succeeded in `namespace`, so the id and kind are all the chunk needs to
+/// carry — the earlier round-trip through a keyed map of pre-built ops was
+/// re-deriving facts already present.
+fn chunk_ops(chunk: &BatchCreate, namespace: &str) -> Vec<AppliedOp> {
+    let op = |kind: &str, id: &str| AppliedOp {
+        kind: kind.to_string(),
+        namespace: namespace.to_string(),
+        id: id.to_string(),
+        action: DiffAction::Add,
+    };
+    chunk
         .upstreams
         .iter()
-        .map(|u| ("Upstream".to_string(), u.id.clone()))
-        .chain(
-            chunk
-                .consumers
-                .iter()
-                .map(|c| ("Consumer".to_string(), c.id.clone())),
-        )
-        .chain(
-            chunk
-                .proxies
-                .iter()
-                .map(|p| ("Proxy".to_string(), p.id.clone())),
-        )
+        .map(|u| op("Upstream", &u.id))
+        .chain(chunk.consumers.iter().map(|c| op("Consumer", &c.id)))
+        .chain(chunk.proxies.iter().map(|p| op("Proxy", &p.id)))
         .chain(
             chunk
                 .plugin_configs
                 .iter()
-                .map(|p| ("PluginConfig".to_string(), p.id.clone())),
-        );
-    keys.filter_map(|key| by_key.get(&key).cloned()).collect()
+                .map(|p| op("PluginConfig", &p.id)),
+        )
+        .collect()
 }

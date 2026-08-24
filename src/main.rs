@@ -570,8 +570,22 @@ async fn allocate_if_needed(
     Ok(Some(outcome))
 }
 
-/// Load per-namespace (desired, actual) pairs from the gateway for the given
-/// namespace list.
+/// One namespace's desired/live pair, plus the backup-only sections that came
+/// down with the live fetch.
+///
+/// `extras` (`api_specs`, `gateway_trust_bundles`) rides along because
+/// `full_replace` has to hand them straight back to `/restore` — carrying them
+/// from the fetch the caller already performed saves a second full `/backup`
+/// download per namespace inside `apply_api`.
+struct NamespaceSnapshot {
+    namespace: String,
+    desired: GatewayConfig,
+    actual: GatewayConfig,
+    extras: gitforgeops::http_client::BackupExtras,
+}
+
+/// Load per-namespace (desired, actual) snapshots from the gateway for the
+/// given namespace list.
 ///
 /// Iterates an explicit namespace list so exclusive-mode apply can reconcile
 /// namespaces that the repo has emptied (still need to fetch gateway state to
@@ -581,19 +595,31 @@ async fn load_namespace_pairs_for(
     client: &AdminClient,
     desired: &GatewayConfig,
     namespaces: &[String],
-) -> gitforgeops::error::Result<Vec<(String, GatewayConfig, GatewayConfig)>> {
+) -> gitforgeops::error::Result<Vec<NamespaceSnapshot>> {
     let mut pairs = Vec::new();
     for namespace in namespaces {
         let desired_namespace = config::filter_config_by_namespace(desired, namespace);
-        let actual_namespace = client.get_backup(namespace).await?;
-        pairs.push((namespace.clone(), desired_namespace, actual_namespace));
+        let snapshot = client.get_backup_snapshot(namespace).await?;
+        pairs.push(NamespaceSnapshot {
+            namespace: namespace.clone(),
+            desired: desired_namespace,
+            actual: snapshot.config,
+            extras: snapshot.extras,
+        });
     }
     Ok(pairs)
 }
 
+/// `options` mirrors the apply-time decisions that change which entries the
+/// diff materializes. Preview-only commands (`diff`, `plan`, `review`) pass the
+/// default; `apply` passes its own `--confirm-api-spec-deletion` so the preview
+/// it prints and the large-prune guard it evaluates describe the run that is
+/// about to happen. Computing the preview with the default while applying with
+/// the flag hid spec-owned deletions from both.
 fn compute_namespace_diffs(
-    namespace_pairs: &[(String, GatewayConfig, GatewayConfig)],
+    namespace_pairs: &[NamespaceSnapshot],
     previously_managed: Option<&HashSet<String>>,
+    options: diff::DiffOptions,
 ) -> (
     Vec<diff::ResourceDiff>,
     Vec<diff::BreakingChange>,
@@ -610,14 +636,11 @@ fn compute_namespace_diffs(
         None => diff::OwnershipScope::Exclusive,
     };
 
-    for (_, desired_namespace, actual_namespace) in namespace_pairs {
-        // Preview paths never prune spec-owned resources: `--confirm-api-spec-
-        // deletion` is an apply-time decision, and showing the deletion here
-        // would imply diff/plan had already made it.
+    for pair in namespace_pairs {
         let result =
-            diff::compute_diff_with_scope(desired_namespace, actual_namespace, ownership_scope);
+            diff::compute_diff_with_options(&pair.desired, &pair.actual, ownership_scope, options);
         let namespace_breaking =
-            diff::detect_breaking_changes(&result.diffs, desired_namespace, actual_namespace);
+            diff::detect_breaking_changes(&result.diffs, &pair.desired, &pair.actual);
 
         diffs.extend(result.diffs);
         unmanaged.extend(result.unmanaged);
@@ -626,6 +649,19 @@ fn compute_namespace_diffs(
     }
 
     (diffs, breaking, unmanaged, spec_owned)
+}
+
+/// True when the spec-owned bucket holds something an operator must resolve
+/// before the repo and the gateway can agree.
+///
+/// A plain spec-owned row is *informational*: the resource has a third owner
+/// and this run stays off it, which is a stable, correct steady state. Treating
+/// the bucket's mere non-emptiness as drift meant any gateway that ingests API
+/// specs could never report "in sync" and interactive `apply` prompted on every
+/// no-op run. Only a conflict — the repo declaring a row the spec importer owns
+/// — actually needs a human.
+fn spec_owned_blocks_sync(spec_owned: &[diff::SpecOwnedResource]) -> bool {
+    spec_owned.iter().any(|s| s.is_conflict())
 }
 
 /// Render the spec-owned bucket for `diff` / `plan` stdout.
@@ -639,10 +675,25 @@ fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
         return;
     }
     println!("=== Spec-owned Resources ===");
-    println!("(carry an `api_spec_id`; provisioned by an OpenAPI spec import, never touched here)");
+    // With `--confirm-api-spec-deletion` these are not "never touched" — the
+    // run is about to delete the non-conflicting ones, and they appear as
+    // DELETE entries in the change list above. Saying otherwise while deleting
+    // them is the worst of both.
+    if spec_owned.iter().any(|s| s.pruned) {
+        println!(
+            "(carry an `api_spec_id`; --confirm-api-spec-deletion is set, so the ones marked \
+             DELETE below WILL be deleted by this run)"
+        );
+    } else {
+        println!(
+            "(carry an `api_spec_id`; provisioned by an OpenAPI spec import, never touched here)"
+        );
+    }
     for s in spec_owned {
         let note = if s.declared_in_repo {
             "  [CONFLICT: also declared in this repo]"
+        } else if s.pruned {
+            "  [DELETE: --confirm-api-spec-deletion]"
         } else {
             ""
         };
@@ -892,10 +943,17 @@ async fn cmd_diff(
     client.set_namespace_scope(&namespaces);
     let client = client;
     let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
-    let (diffs, _breaking, unmanaged, spec_owned) =
-        compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+    let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
+        &namespace_pairs,
+        managed.as_ref(),
+        diff::DiffOptions::default(),
+    );
 
-    if diffs.is_empty() && unmanaged.is_empty() && spec_owned.is_empty() {
+    if diffs.is_empty() && unmanaged.is_empty() && !spec_owned_blocks_sync(&spec_owned) {
+        // Spec-owned rows are still reported — an operator should know a third
+        // owner is in play — but they do not make the configuration
+        // out-of-sync on their own.
+        print_spec_owned(&spec_owned);
         println!("No differences found. Configuration is in sync.");
         return Ok(());
     }
@@ -1027,7 +1085,11 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let (diffs, breaking, unmanaged, spec_owned, actual_available) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
-                let (d, b, u, s) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                let (d, b, u, s) = compute_namespace_diffs(
+                    &namespace_pairs,
+                    managed.as_ref(),
+                    diff::DiffOptions::default(),
+                );
                 (d, b, u, s, true)
             }
             Err(e) => {
@@ -1299,17 +1361,29 @@ async fn cmd_apply(
             let client = client;
             let managed = previously_managed(&resolved, &state);
 
+            // The preview must be computed with the same options the apply
+            // will run under, or it describes a different run: with
+            // `--confirm-api-spec-deletion` the spec-owned prunes are real
+            // DELETEs, and leaving them out of the preview asked the operator
+            // to approve a change set that understated what would happen.
+            let diff_options = diff::DiffOptions {
+                prune_spec_owned: confirm_api_spec_deletion,
+            };
+
             if !auto_approve {
                 let namespace_pairs =
                     load_namespace_pairs_for(&client, &desired, &namespaces).await?;
                 let (diffs, _, unmanaged, spec_owned) =
-                    compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                    compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
 
                 if diffs.is_empty()
                     && unmanaged.is_empty()
-                    && spec_owned.is_empty()
+                    && !spec_owned_blocks_sync(&spec_owned)
                     && secret_report.needs_allocation().is_empty()
                 {
+                    // Informational spec-owned rows are reported but do not
+                    // manufacture a change to approve.
+                    print_spec_owned(&spec_owned);
                     println!("No changes to apply.");
                     return Ok(());
                 }
@@ -1354,11 +1428,20 @@ async fn cmd_apply(
             // env secrets untouched — otherwise we'd burn a generated value
             // that the gateway never receives.
             let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
-            let (diffs, _, _, _) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+            let (diffs, _, _, _) =
+                compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
             let actual_by_namespace: BTreeMap<String, GatewayConfig> = namespace_pairs
                 .iter()
-                .map(|(namespace, _, actual)| (namespace.clone(), actual.clone()))
+                .map(|pair| (pair.namespace.clone(), pair.actual.clone()))
                 .collect();
+            // `/backup` was just read for every namespace in scope; hand the
+            // backup-only sections to apply_api so a full_replace does not
+            // download the same document a second time.
+            let extras_by_namespace: BTreeMap<String, gitforgeops::http_client::BackupExtras> =
+                namespace_pairs
+                    .iter()
+                    .map(|pair| (pair.namespace.clone(), pair.extras.clone()))
+                    .collect();
             let delete_count = diffs
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
@@ -1400,11 +1483,11 @@ async fn cmd_apply(
                 }
                 None => namespace_pairs
                     .iter()
-                    .map(|(_, _, actual)| {
-                        actual.proxies.len()
-                            + actual.consumers.len()
-                            + actual.plugin_configs.len()
-                            + actual.upstreams.len()
+                    .map(|pair| {
+                        pair.actual.proxies.len()
+                            + pair.actual.consumers.len()
+                            + pair.actual.plugin_configs.len()
+                            + pair.actual.upstreams.len()
                     })
                     .sum(),
             };
@@ -1480,6 +1563,7 @@ async fn cmd_apply(
                     None => diff::OwnershipScope::Exclusive,
                 },
                 Some(&actual_by_namespace),
+                Some(&extras_by_namespace),
                 &apply::ApplyOptions {
                     strategy: resolved.apply_strategy.clone(),
                     allow_large_prune,
@@ -1505,9 +1589,12 @@ async fn cmd_apply(
             fully_replaced = std::mem::take(&mut raw.fully_replaced_namespaces);
 
             // Defer propagation: record state for the successful portion
-            // first, then surface the partial-failure summary at the end of
-            // cmd_apply. `into_result()` produces the same aggregated error
-            // message it always did.
+            // first, then surface the failure summary at the end of cmd_apply.
+            // This is the *only* path a failure takes now — apply_api reports
+            // even a run-stopping error (a read-only plane, a stale view, a
+            // restore needing recovery) on the result rather than returning
+            // early, precisely so the namespaces that already landed reach the
+            // state file before we exit non-zero.
             deferred_apply_error = raw.into_result().err();
 
             // Convergence is a read-only, advisory postscript: with a CP/DP
@@ -1706,7 +1793,11 @@ async fn cmd_review(
     let (diffs, breaking, unmanaged, spec_owned, comparison_error) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
-                let (d, b, u, s) = compute_namespace_diffs(&namespace_pairs, managed.as_ref());
+                let (d, b, u, s) = compute_namespace_diffs(
+                    &namespace_pairs,
+                    managed.as_ref(),
+                    diff::DiffOptions::default(),
+                );
                 (d, b, u, s, None)
             }
             Err(e) => (
@@ -1894,7 +1985,10 @@ async fn cmd_rotate(
     // otherwise write random bytes into an orphaned Env Secret with no
     // gateway-side reference.
     let empty_bundle = BTreeMap::new();
-    let placeholder_report = secrets::report_secrets(&desired_for_check, &empty_bundle)?;
+    // Lenient: this scan only answers "does a placeholder exist at this slot",
+    // so a generation-constraint complaint about some *other* slot must not
+    // abort a rotation that has nothing to do with it.
+    let placeholder_report = secrets::report_secrets_lenient(&desired_for_check, &empty_bundle)?;
     let target_placeholder = placeholder_report.results.iter().find(|r| r.slot == slot);
     let placeholder_length = match target_placeholder {
         Some(r) => r.placeholder.length_bytes,

@@ -1,13 +1,8 @@
 use crate::config::schema::BackendScheme;
 use crate::config::GatewayConfig;
+use crate::plugin_catalog::effective_scheme;
 use crate::policy::config::BackendSchemeRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
-
-/// Scheme assumed when a proxy leaves `backend_scheme` unset. Mirrors
-/// ferrum-edge's `effective_scheme()`, which normalizes an absent scheme to
-/// `https` (an absent scheme on a stream proxy is rejected by the gateway
-/// outright, so `https` is the only reachable default here).
-const DEFAULT_SCHEME: BackendScheme = BackendScheme::Https;
 
 pub struct BackendSchemeRule {
     config: BackendSchemeRuleConfig,
@@ -16,10 +11,6 @@ pub struct BackendSchemeRule {
 impl BackendSchemeRule {
     pub fn new(config: BackendSchemeRuleConfig) -> Self {
         Self { config }
-    }
-
-    fn scheme_name(scheme: Option<BackendScheme>) -> &'static str {
-        scheme.unwrap_or(DEFAULT_SCHEME).as_str()
     }
 }
 
@@ -49,7 +40,14 @@ impl PolicyCheck for BackendSchemeRule {
         }
 
         for proxy in &cfg.proxies {
-            let actual = Self::scheme_name(proxy.backend_scheme);
+            // Assembly normalizes a schemeless HTTP-family proxy to `https`
+            // before any rule runs, so `backend_scheme` is usually already set.
+            // `effective_scheme` still applies the gateway's own default here —
+            // the rule is also evaluated on configs that did not come through
+            // the assembler (imports, `--from-file`), and a stream proxy's
+            // absent scheme has to resolve to the stream sentinel rather than
+            // to `https`.
+            let actual = effective_scheme(proxy).as_str();
             if !allowed.iter().any(|a| a == actual) {
                 findings.push(PolicyFinding {
                     rule_id: self.rule_id().to_string(),

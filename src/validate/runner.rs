@@ -23,28 +23,6 @@ pub struct ValidationResult {
 /// configuration resolution (mode, settings paths, TLS material, ...).
 const FERRUM_ENV_PREFIX: &str = "FERRUM_";
 
-/// Build the argument vector for `ferrum-edge validate`.
-///
-/// The real CLI is
-/// `ferrum-edge validate [-s|--settings <PATH>] [-c|--spec <PATH>] [-m|--mode <MODE>] [-v...]`.
-/// There is **no `--format` flag**; do not add one.
-///
-/// Two of these arguments are load-bearing for correctness:
-///
-/// * `-m file` — ferrum-edge only parses and validates the *spec* when the
-///   resolved mode is `file`. Mode precedence is CLI `--mode` > env
-///   `FERRUM_MODE` > `ferrum.conf` > file-mode inference, so without an
-///   explicit `-m file` an inherited `FERRUM_MODE` (or a stray `ferrum.conf`
-///   declaring a mode) makes validation a silent fail-open no-op that still
-///   exits 0.
-/// * `-s <path>` — when omitted, ferrum-edge auto-discovers `./ferrum.conf`,
-///   `./config/ferrum.conf` or `/etc/ferrum/ferrum.conf` and validates those
-///   settings too, so an unrelated file in the checkout can fail the run.
-///   Pointing `-s` at an empty settings file pins settings to defaults.
-pub fn build_validate_args(settings_path: &Path, spec_path: &Path) -> Vec<OsString> {
-    build_validate_args_for_mode(GATEWAY_VALIDATE_MODE, settings_path, spec_path)
-}
-
 /// `-m` value that makes ferrum-edge validate a flat gateway document.
 pub const GATEWAY_VALIDATE_MODE: &str = "file";
 
@@ -61,9 +39,27 @@ pub const GATEWAY_VALIDATE_MODE: &str = "file";
 /// than one document with a `mesh:` key.
 pub const MESH_VALIDATE_MODE: &str = "mesh";
 
-/// [`build_validate_args`] with an explicit `-m` value. See
-/// [`GATEWAY_VALIDATE_MODE`] / [`MESH_VALIDATE_MODE`]; the `-m` and `-s`
-/// arguments are load-bearing for both.
+/// Build the argument vector for `ferrum-edge validate` in an explicit mode —
+/// [`GATEWAY_VALIDATE_MODE`] for a flat gateway document, [`MESH_VALIDATE_MODE`]
+/// for a standalone mesh document.
+///
+/// The real CLI is
+/// `ferrum-edge validate [-s|--settings <PATH>] [-c|--spec <PATH>] [-m|--mode <MODE>] [-v...]`.
+/// There is **no `--format` flag**; do not add one.
+///
+/// Two of these arguments are load-bearing for correctness:
+///
+/// * `-m <mode>` — ferrum-edge only parses and validates the *spec* when the
+///   resolved mode matches the document. Mode precedence is CLI `--mode` > env
+///   `FERRUM_MODE` > `ferrum.conf` > file-mode inference, so without an
+///   explicit `-m` an inherited `FERRUM_MODE` (or a stray `ferrum.conf`
+///   declaring a mode) makes validation a silent fail-open no-op that still
+///   exits 0. This is why the mode is always passed explicitly rather than
+///   defaulted by a wrapper.
+/// * `-s <path>` — when omitted, ferrum-edge auto-discovers `./ferrum.conf`,
+///   `./config/ferrum.conf` or `/etc/ferrum/ferrum.conf` and validates those
+///   settings too, so an unrelated file in the checkout can fail the run.
+///   Pointing `-s` at an empty settings file pins settings to defaults.
 pub fn build_validate_args_for_mode(
     mode: &str,
     settings_path: &Path,

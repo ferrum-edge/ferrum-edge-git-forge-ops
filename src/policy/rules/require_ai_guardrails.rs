@@ -1,6 +1,8 @@
 use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
-use crate::plugin_catalog::{cfg_bool, cfg_str, effective_plugins, is_ai_plugin};
+use crate::plugin_catalog::{
+    allows_uninspectable_body, cfg_bool, cfg_str, effective_plugins, is_ai_plugin,
+};
 use crate::policy::config::RequireAiGuardrailsRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
 
@@ -29,7 +31,7 @@ impl RequireAiGuardrailsRule {
         if cfg_str(cfg, &["streaming_response"]).as_deref() == Some("skip") {
             return Some("streaming_response: skip".to_string());
         }
-        if cfg_bool(cfg, &["fail_on_uninspectable_body"]) == Some(false) {
+        if allows_uninspectable_body(cfg) {
             return Some("fail_on_uninspectable_body: false".to_string());
         }
         if cfg_bool(cfg, &["privacy", "log_raw_text"]) == Some(true) {

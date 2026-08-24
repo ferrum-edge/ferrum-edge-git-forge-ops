@@ -657,7 +657,19 @@ pub struct Proxy {
     /// Backend wire scheme. Optional on HTTP-family proxies (the gateway
     /// defaults it to `https`), required on stream proxies. Accepts the legacy
     /// field name `backend_protocol` on read; always emits `backend_scheme`.
-    #[serde(default, alias = "backend_protocol")]
+    ///
+    /// `skip_serializing_if` matters here: a DB-backed gateway never returns
+    /// `null` for this field (the column defaults to `https` and
+    /// `Proxy::resolve_dispatch_kind_fields` canonicalizes `None` → `Some` for
+    /// every non-stream proxy on write). Emitting an explicit `backend_scheme:
+    /// null` would therefore diff against the live value forever. Assembly
+    /// applies the same normalization to the desired config — see
+    /// `assembler::normalize_proxy_backend_schemes`.
+    #[serde(
+        default,
+        alias = "backend_protocol",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub backend_scheme: Option<BackendScheme>,
     /// Optional (empty) when `upstream_id` supplies the dial address.
     #[serde(default)]

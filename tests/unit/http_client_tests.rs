@@ -2,10 +2,10 @@ use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
 use gitforgeops::config::schema::{GatewayConfig, Proxy, Upstream};
 use gitforgeops::http_client::convergence_summary;
 use gitforgeops::http_client::{
-    build_restore_body, classify_retry, delete_succeeded, map_api_error, merge_pages,
-    next_page_offset, split_batch, write_block_reason, AdminClient, ApiErrorBody, BackupExtras,
-    BackupSnapshot, BatchCreate, ClusterStatus, HealthStatus, RequestKind, RetryDecision,
-    BATCH_MAX_BODY_BYTES,
+    build_restore_body, classify_retry, delete_succeeded, is_read_only_refusal, map_api_error,
+    merge_pages, next_page_offset, resource_id_is_path_safe, split_batch, write_block_reason,
+    AdminClient, ApiErrorBody, BackupExtras, BackupSnapshot, BatchCreate, ClusterStatus,
+    DeleteOutcome, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -157,38 +157,67 @@ async fn admin_client_accepts_safe_resource_id_in_paths() {
     env.gateway_url = Some(format!("http://{addr}"));
     let client = AdminClient::new(&env).unwrap();
 
-    client
-        .delete_proxy("proxy-01._A", "team-alpha")
+    let outcome = client
+        .delete_proxy("proxy-01._~A", "team-alpha")
         .await
         .unwrap();
+    assert_eq!(outcome, DeleteOutcome::Deleted);
 
     let request = rx.recv().unwrap();
     // `cleanup_orphaned_upstream=false` opts out of the server-side cascade
     // that would silently delete the proxy's last-referenced upstream and make
     // the diff's own upstream delete 404.
     assert!(
-        request.starts_with("DELETE /proxies/proxy-01._A?cleanup_orphaned_upstream=false HTTP/1.1"),
+        request
+            .starts_with("DELETE /proxies/proxy-01._~A?cleanup_orphaned_upstream=false HTTP/1.1"),
         "unexpected request line: {request}"
     );
 }
 
-// --- Resource-id grammar -----------------------------------------------------
+// --- Resource-id path safety -------------------------------------------------
 
-#[tokio::test]
-async fn admin_client_rejects_ids_outside_the_server_grammar() {
-    let env = base_env();
-    let client = AdminClient::new(&env).unwrap();
-
-    // Aligned exactly with the gateway's `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`:
-    // `~` is URL-safe but not in the server's alphabet, and a leading `-`
-    // or `.` is rejected too.
-    for id in ["proxy~01", "-leading-dash", ".leading-dot", "_leading"] {
-        let err = client.delete_proxy(id, "team-alpha").await;
-        assert!(err.is_err(), "expected {id:?} to be rejected");
+#[test]
+fn resource_ids_are_validated_for_path_safety_not_server_grammar() {
+    // The gateway's *create* grammar is `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, but a
+    // live gateway can hold ids that predate it or came from another client.
+    // Refusing to build a URL for those makes them undeletable and the
+    // namespace can never converge — so anything that stays inside its path
+    // segment is allowed through and the gateway gets to have the last word.
+    for id in [
+        "proxy-01._~A",
+        "proxy~01",
+        "-leading-dash",
+        ".leading-dot",
+        "_leading",
+        "UPPER_case.9",
+        "a",
+        &"a".repeat(254),
+    ] {
         assert!(
-            err.err().unwrap().to_string().contains("unsafe characters"),
-            "expected grammar rejection for {id:?}"
+            resource_id_is_path_safe(id).is_ok(),
+            "{id:?} is path-safe and must be accepted"
         );
+    }
+}
+
+#[test]
+fn resource_ids_that_escape_the_path_segment_are_rejected() {
+    for id in [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a?confirm=true",
+        "a#frag",
+        "a%2f",
+        "has space",
+        "tab\there",
+        "null\0byte",
+        "café",
+    ] {
+        let err = resource_id_is_path_safe(id);
+        assert!(err.is_err(), "expected {id:?} to be rejected");
     }
 }
 
@@ -210,28 +239,55 @@ async fn admin_client_rejects_ids_over_the_length_limit() {
 #[test]
 fn next_page_offset_advances_until_the_total_is_covered() {
     // 250 namespaces, page size 100: offsets 0 → 100 → 200 → done.
-    assert_eq!(next_page_offset(0, 100, Some(250), 100), Some(100));
-    assert_eq!(next_page_offset(100, 100, Some(250), 200), Some(200));
-    assert_eq!(next_page_offset(200, 50, Some(250), 250), None);
+    assert_eq!(next_page_offset(0, 100, 100, Some(250), 100), Some(100));
+    assert_eq!(next_page_offset(100, 100, 100, Some(250), 200), Some(200));
+    assert_eq!(next_page_offset(200, 50, 100, Some(250), 250), None);
 }
 
 #[test]
 fn next_page_offset_stops_on_an_empty_page() {
     // Guards against a server that ignores `offset` and would otherwise loop
     // forever returning the same (or no) rows.
-    assert_eq!(next_page_offset(0, 0, Some(500), 0), None);
+    assert_eq!(next_page_offset(0, 0, 100, Some(500), 0), None);
 }
 
 #[test]
-fn next_page_offset_stops_without_a_pagination_envelope() {
-    // No `pagination` key at all (an older gateway, or a proxy that rewrote
-    // the body) — take the single page rather than guessing.
-    assert_eq!(next_page_offset(0, 12, None, 12), None);
+fn next_page_offset_continues_a_full_page_without_a_pagination_envelope() {
+    // No `pagination` key at all (an older gateway, or a middlebox that
+    // rewrote the body). An exactly-full page is indistinguishable from a
+    // truncated listing, so the walk continues — stopping here silently
+    // dropped every namespace past the first page.
+    assert_eq!(next_page_offset(0, 100, 100, None, 100), Some(100));
+    assert_eq!(next_page_offset(100, 100, 100, None, 200), Some(200));
+}
+
+#[test]
+fn next_page_offset_stops_on_a_short_page_without_an_envelope() {
+    // Fewer rows than the limit means the server had nothing more to give.
+    assert_eq!(next_page_offset(0, 12, 100, None, 12), None);
+    assert_eq!(next_page_offset(100, 99, 100, None, 199), None);
+}
+
+#[test]
+fn next_page_offset_envelope_less_walk_is_bounded() {
+    // A server that ignores `offset` answers full pages forever; the walk must
+    // still terminate rather than spinning until the CI job is killed.
+    assert_eq!(next_page_offset(100_000, 100, 100, None, 100_000), None);
 }
 
 #[test]
 fn next_page_offset_stops_when_accumulated_exceeds_total() {
-    assert_eq!(next_page_offset(0, 100, Some(80), 100), None);
+    assert_eq!(next_page_offset(0, 100, 100, Some(80), 100), None);
+}
+
+#[test]
+fn next_page_offset_stops_on_a_non_advancing_offset() {
+    // saturating_add at i64::MAX cannot move forward; refuse rather than
+    // re-request the same page forever.
+    assert_eq!(
+        next_page_offset(i64::MAX, 100, 100, Some(i64::MAX), 1),
+        None
+    );
 }
 
 #[test]
@@ -267,6 +323,15 @@ fn retry_classification_table() {
         (502, RetryDecision::Retry),
         (503, RetryDecision::Retry),
         (504, RetryDecision::Retry),
+        // Vendor 5xx from whatever sits in front of the admin API (Cloudflare
+        // 520/522/524, 529, 530, nginx-ish 599). All transient by definition —
+        // an allow-list of the gateway's own four codes turned each of these
+        // into a hard apply failure.
+        (520, RetryDecision::Retry),
+        (522, RetryDecision::Retry),
+        (524, RetryDecision::Retry),
+        (529, RetryDecision::Retry),
+        (599, RetryDecision::Retry),
         // 501 is permanent: a standalone-MongoDB gateway has no multi-document
         // transaction and will answer it forever.
         (501, RetryDecision::NoRetry),
@@ -342,7 +407,139 @@ fn api_error_body_tolerates_non_json_bodies() {
     );
 }
 
+// --- Stub gateway ------------------------------------------------------------
+
+/// Serve canned responses on a loopback socket, matched by request line.
+///
+/// Multi-request by design: the 403-then-`/health` re-check needs two calls,
+/// and reqwest may send them down one keep-alive connection or open a second
+/// one. Both are handled. Still network-free in the sense that matters — no
+/// dependency outside the test process.
+fn spawn_stub_gateway(routes: Vec<(&'static str, u16, &'static str)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let routes = routes.clone();
+            std::thread::spawn(move || loop {
+                let mut buf = [0_u8; 8192];
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(needle, _, _)| request.contains(needle))
+                    .map(|(_, status, body)| (*status, *body))
+                    .unwrap_or((404, "{}"));
+                if write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .is_err()
+                {
+                    return;
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn stub_env(url: String) -> EnvConfig {
+    let mut env = base_env();
+    env.gateway_url = Some(url);
+    // Keep the failure paths instant: a retried 5xx would otherwise sleep
+    // through the backoff schedule.
+    env.gateway_max_retries = 0;
+    env
+}
+
 // --- Delete tolerance --------------------------------------------------------
+
+#[tokio::test]
+async fn delete_reports_a_404_as_already_gone() {
+    // Individually benign, but the caller counts them: a namespace where every
+    // delete 404s is what a misrouted apply looks like.
+    let url = spawn_stub_gateway(vec![(
+        "DELETE /upstreams/",
+        404,
+        r#"{"error":"not found"}"#,
+    )]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let outcome = client.delete_upstream("u1", "team-alpha").await.unwrap();
+    assert_eq!(outcome, DeleteOutcome::NotFound);
+}
+
+#[tokio::test]
+async fn unclassified_mutation_403_is_upgraded_via_health() {
+    // Some deployments answer a bare 403 with no read-only marker in the body.
+    // Left as a generic ApiError it repeated once per resource; the health
+    // re-check turns it back into the single run-stopping error.
+    let url = spawn_stub_gateway(vec![
+        ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
+        (
+            "GET /health",
+            200,
+            r#"{"status":"degraded","mode":"database","admin_writes_enabled":false}"#,
+        ),
+    ]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "expected the 403 to be upgraded, got: {err:?}"
+    );
+    assert!(err.to_string().contains("admin_writes_enabled=false"));
+}
+
+#[tokio::test]
+async fn a_403_on_a_writable_gateway_stays_a_plain_api_error() {
+    // A namespace-claim or role rejection is also 403 and must NOT be
+    // mistaken for a read-only plane — that would abandon every other
+    // namespace over one permission problem.
+    let url = spawn_stub_gateway(vec![
+        (
+            "DELETE /proxies/",
+            403,
+            r#"{"error":"Namespace claim does not cover team-alpha"}"#,
+        ),
+        (
+            "GET /health",
+            200,
+            r#"{"status":"ok","mode":"database","admin_writes_enabled":true}"#,
+        ),
+    ]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::ApiError { status: 403, .. }),
+        "expected the 403 to stand, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_health_recheck_is_best_effort() {
+    // An unreachable/erroring /health must leave the original 403 untouched
+    // rather than inventing a verdict either way.
+    let url = spawn_stub_gateway(vec![
+        ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
+        ("GET /health", 500, r#"{"error":"boom"}"#),
+    ]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::ApiError { status: 403, .. }),
+        "expected the original error, got: {err:?}"
+    );
+}
 
 #[test]
 fn delete_treats_404_as_success() {
@@ -372,6 +569,31 @@ fn read_only_403_maps_to_a_dedicated_error() {
         "expected GatewayReadOnly, got: {err:?}"
     );
     assert!(err.to_string().contains("read-only"));
+}
+
+#[test]
+fn read_only_403_match_tolerates_rewording() {
+    // The exact-string match missed every variant a real deployment produces —
+    // a re-cased body, a middlebox prefix, a longer sentence from a newer
+    // build — and each miss downgraded a whole-run stop into N per-resource
+    // 403s that apply then plodded through.
+    for body in [
+        r#"{"error":"Admin API is in read-only mode"}"#,
+        r#"{"error":"  admin api is in READ-ONLY MODE  "}"#,
+        r#"{"error":"request rejected: the Admin API is in read-only mode (config database unavailable)"}"#,
+        "Admin API is in read-only mode",
+    ] {
+        let err = map_api_error(403, body, RequestKind::Mutation);
+        assert!(
+            matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+            "expected GatewayReadOnly for {body:?}, got: {err:?}"
+        );
+    }
+
+    assert!(is_read_only_refusal("Admin API is in READ-Only Mode"));
+    assert!(!is_read_only_refusal(
+        "Namespace claim does not cover team-alpha"
+    ));
 }
 
 #[test]
@@ -568,7 +790,7 @@ fn split_batch_keeps_one_chunk_when_it_fits() {
         proxies: vec![proxy("p1")],
         ..BatchCreate::default()
     };
-    let chunks = split_batch(&batch, BATCH_MAX_BODY_BYTES).unwrap();
+    let chunks = split_batch(batch, BATCH_MAX_BODY_BYTES).unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].len(), 2);
 }
@@ -583,7 +805,7 @@ fn split_batch_preserves_dependency_order_across_chunks() {
         proxies: vec![proxy("p1"), proxy("p2")],
         ..BatchCreate::default()
     };
-    let chunks = split_batch(&batch, 600).unwrap();
+    let chunks = split_batch(batch, 600).unwrap();
     assert!(chunks.len() > 1, "expected the budget to force chunking");
 
     let order: Vec<&str> = chunks
@@ -606,7 +828,7 @@ fn split_batch_preserves_dependency_order_across_chunks() {
 
 #[test]
 fn split_batch_on_empty_input_produces_no_requests() {
-    assert!(split_batch(&BatchCreate::default(), BATCH_MAX_BODY_BYTES)
+    assert!(split_batch(BatchCreate::default(), BATCH_MAX_BODY_BYTES)
         .unwrap()
         .is_empty());
 }

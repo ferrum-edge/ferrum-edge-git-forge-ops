@@ -3,7 +3,7 @@ use std::path::Path;
 
 use walkdir::WalkDir;
 
-use super::schema::{GatewayConfig, MeshConfigSpec, Resource};
+use super::schema::{BackendScheme, GatewayConfig, MeshConfigSpec, Resource};
 
 /// Everything one load+assemble pass produces.
 ///
@@ -30,7 +30,8 @@ pub struct AssembledOutput {
 /// Sets each gateway resource's `namespace` field to the directory-inferred
 /// namespace, unless the spec already has a non-default namespace explicitly
 /// set, then canonicalizes consumer credentials via
-/// [`normalize_consumer_credentials`]. Mesh fragments are merged by
+/// [`normalize_consumer_credentials`] and proxy backend schemes via
+/// [`normalize_proxy_backend_schemes`]. Mesh fragments are merged by
 /// [`merge_mesh_fragments`].
 pub fn assemble(resources: Vec<(String, Resource)>) -> crate::error::Result<AssembledOutput> {
     assemble_with_namespace_filter(resources, None)
@@ -93,6 +94,7 @@ pub fn assemble_with_namespace_filter(
     }
 
     normalize_consumer_credentials(&mut config);
+    normalize_proxy_backend_schemes(&mut config);
 
     Ok(AssembledOutput {
         gateway: config,
@@ -111,6 +113,12 @@ pub fn assemble_with_namespace_filter(
 ///   a mesh document (a service naming a workload's SPIFFE ID, a policy naming
 ///   a service) are resolved against the merged whole, so splitting a mesh
 ///   across files is purely an authoring convenience.
+/// * **`workloads` and `services` additionally check identity.** Both have a
+///   mesh-wide primary key (`spiffe_id`; `(name, namespace)`) — the same keys
+///   overlays merge on — so two fragments defining one key differently is an
+///   authoring conflict, not a longer list, and is rejected naming both
+///   fragments. Byte-identical duplicates are deduplicated instead. See
+///   [`merge_mesh_identified_collection`].
 /// * **Scalar / singleton fields take the one value that is set.** Two
 ///   fragments setting the *same* value agree and are accepted; two fragments
 ///   setting *different* values are a genuine authoring conflict with no
@@ -131,6 +139,9 @@ pub fn merge_mesh_fragments(
     // Remembers which fragment last set each singleton, so a conflict error
     // can name both sides instead of just the loser.
     let mut singleton_origin: HashMap<&'static str, String> = HashMap::new();
+    // Same, for the identified collections (`workloads`, `services`), keyed by
+    // `<field>/<identity>`.
+    let mut entry_origin: HashMap<String, String> = HashMap::new();
 
     for (origin, fragment) in fragments {
         let MeshConfigSpec {
@@ -154,8 +165,25 @@ pub fn merge_mesh_fragments(
             extension_configs,
         } = fragment;
 
-        merged.workloads.extend(workloads);
-        merged.services.extend(services);
+        // `workloads` and `services` have mesh-wide primary keys, so two
+        // fragments defining the same one is an authoring conflict rather than
+        // a longer list — see `merge_mesh_identified_collection`.
+        merge_mesh_identified_collection(
+            "workloads",
+            &mut merged.workloads,
+            workloads,
+            ArrayIdentity::MeshWorkloadSpiffeId,
+            &origin,
+            &mut entry_origin,
+        )?;
+        merge_mesh_identified_collection(
+            "services",
+            &mut merged.services,
+            services,
+            ArrayIdentity::MeshServiceNameNamespace,
+            &origin,
+            &mut entry_origin,
+        )?;
         merged.mesh_policies.extend(mesh_policies);
         merged.ext_authz_providers.extend(ext_authz_providers);
         merged.peer_authentications.extend(peer_authentications);
@@ -204,6 +232,89 @@ pub fn merge_mesh_fragments(
     }
 
     Ok(Some(merged))
+}
+
+/// Concatenate one mesh collection whose entries carry a mesh-wide identity,
+/// rejecting two fragments that define the *same* identity differently.
+///
+/// The identity rules are the overlay rules ([`array_merge_identity`]):
+/// workloads are keyed by `spiffe_id`, services by `(name, namespace)`. Those
+/// are the mesh's own primary keys — a workload's SPIFFE ID is how every
+/// policy, waypoint binding and authorization rule refers to it — so a merged
+/// document holding two different entries under one key has no defensible
+/// reading. Which one wins would depend on directory walk order, exactly the
+/// reason [`merge_mesh_singleton`] refuses conflicting scalars.
+///
+/// Three cases:
+///
+/// * **New identity** — appended, and the fragment is remembered so a later
+///   conflict can name both sides.
+/// * **Same identity, deep-equal entry** — the fragments agree. Deduplicated
+///   silently: shared boilerplate copied into two fragments is harmless, and
+///   emitting the entry twice would be a document the gateway then has to
+///   reconcile.
+/// * **Same identity, different entry** — `Error::Config` naming the identity
+///   and both fragments.
+///
+/// Entries with no readable identity (a workload with no `spiffe_id`, a
+/// service missing `name` or `namespace`) are appended unchecked;
+/// `ferrum-edge validate -m mesh` is the authority on required fields and
+/// reports them far better than a merge-time guess could.
+///
+/// Every other mesh collection stays a plain concatenation: `mesh_policies`,
+/// `peer_authentications`, `service_entries`, `destination_rules`, `sidecars`
+/// and friends are lists of rules, where two entries that look similar are two
+/// rules and both apply.
+fn merge_mesh_identified_collection(
+    field: &'static str,
+    merged: &mut Vec<serde_json::Value>,
+    incoming: Vec<serde_json::Value>,
+    identity: ArrayIdentity,
+    origin: &str,
+    origins: &mut HashMap<String, String>,
+) -> crate::error::Result<()> {
+    for item in incoming {
+        let Some(item_identity) = array_item_identity(&item, identity) else {
+            merged.push(item);
+            continue;
+        };
+
+        let existing = merged.iter().find(|candidate| {
+            array_item_identity(candidate, identity).as_ref() == Some(&item_identity)
+        });
+
+        match existing {
+            Some(existing) if *existing == item => continue,
+            Some(_) => {
+                let previous = origins
+                    .get(&format!("{field}/{item_identity}"))
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                return Err(crate::error::Error::Config(format!(
+                    "conflicting mesh `{field}` entry {item_identity}: fragment {previous} and \
+                     fragment {origin} both define it, with different contents. Mesh {field} are \
+                     keyed by {}, so only one definition can apply — merge them into a single \
+                     fragment, or give the entries distinct identities.",
+                    identity_key_description(identity)
+                )));
+            }
+            None => {
+                origins.insert(format!("{field}/{item_identity}"), origin.to_string());
+                merged.push(item);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Human-readable name of the fields an [`ArrayIdentity`] is built from, for
+/// conflict messages.
+fn identity_key_description(identity: ArrayIdentity) -> &'static str {
+    match identity {
+        ArrayIdentity::MeshWorkloadSpiffeId => "spiffe_id",
+        ArrayIdentity::MeshServiceNameNamespace => "(name, namespace)",
+        ArrayIdentity::Generic => "id / name",
+    }
 }
 
 fn merge_mesh_singleton<T: PartialEq + std::fmt::Debug>(
@@ -284,6 +395,36 @@ pub fn normalize_consumer_credentials(config: &mut GatewayConfig) {
                 let entry = std::mem::replace(value, serde_json::Value::Null);
                 *value = serde_json::Value::Array(vec![entry]);
             }
+        }
+    }
+}
+
+/// Resolve every HTTP-family proxy's `backend_scheme` to the value the gateway
+/// will store for it.
+///
+/// ferrum-edge canonicalizes the field on write:
+/// `Proxy::resolve_dispatch_kind_fields` (`src/config/types.rs`) sets
+/// `backend_scheme = Some(effective_scheme())` for every **non-stream** proxy,
+/// and the DB column defaults to `https` besides. So a proxy that omits the
+/// field in the repo comes back from `GET /backup` as `backend_scheme: https`.
+/// Without normalizing here, `compare_fields` sees desired `null` versus live
+/// `"https"` and reports a Modify on every run, and `breaking.rs` reports
+/// "backend_scheme changed" on every PR that touches such a proxy — drift and a
+/// breaking-change banner that no edit can clear.
+///
+/// **Stream proxies are deliberately left alone.** The gateway does *not*
+/// default a stream proxy's scheme (its `effective_scheme` returns a `tcp`
+/// sentinel that is never dispatched on); it rejects the config in validation
+/// instead. Inventing `tcp` here would convert a clear "stream proxy is missing
+/// backend_scheme" validation error into a silently-wrong `tcp` proxy that may
+/// have meant `tcps` or `udp`. The stream discriminator is `listen_port`, the
+/// same one the gateway uses.
+///
+/// Idempotent: a proxy that already names a scheme keeps it, whatever it is.
+pub fn normalize_proxy_backend_schemes(config: &mut GatewayConfig) {
+    for proxy in config.proxies.iter_mut() {
+        if proxy.backend_scheme.is_none() && !crate::plugin_catalog::is_stream_proxy(proxy) {
+            proxy.backend_scheme = Some(BackendScheme::Https);
         }
     }
 }

@@ -1,5 +1,8 @@
 use crate::config::GatewayConfig;
-use crate::plugin_catalog::{is_builtin, is_reserved, is_retired, RETIRED_PLUGIN_NAMES};
+use crate::plugin_catalog::{
+    is_builtin, is_reserved, is_retired, retired_replacement, RetiredRemediation,
+    RETIRED_PLUGIN_NAMES,
+};
 use crate::policy::config::PluginNameIsKnownRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding, Severity};
 
@@ -50,12 +53,14 @@ impl PolicyCheck for PluginNameIsKnownRule {
                         plugin.namespace,
                         RETIRED_PLUGIN_NAMES.join(", ")
                     ),
-                    remediation: Some(match name {
-                        "oauth2_auth" => {
-                            "Replace with oauth2_introspection or oidc_relying_party".to_string()
+                    remediation: Some(match retired_replacement(name) {
+                        RetiredRemediation::ReplaceWith(successors) => {
+                            format!("Replace with {}", successors.join(" or "))
                         }
-                        "semantic_ai_firewall" => "Rename to ai_semantic_firewall".to_string(),
-                        _ => "Remove this plugin config".to_string(),
+                        RetiredRemediation::RenamedTo(successor) => {
+                            format!("Rename to {successor}")
+                        }
+                        RetiredRemediation::Remove => "Remove this plugin config".to_string(),
                     }),
                     overridden_by: None,
                 });

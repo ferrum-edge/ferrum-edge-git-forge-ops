@@ -370,3 +370,359 @@ fn apply_result_reports_spec_owned_skips() {
     let ok = result.into_result().expect("no errors means Ok");
     assert_eq!(ok.spec_owned_skipped, 2);
 }
+
+// --- Fatal stops -------------------------------------------------------------
+
+#[test]
+fn a_fatal_stop_still_yields_an_error_with_the_partial_counts() {
+    // The fatal error rides on the result instead of being returned as Err, so
+    // cmd_apply can persist state for the ops that landed first. into_result
+    // is what turns it back into a non-zero exit.
+    let result = ApplyResult {
+        created: 4,
+        updated: 1,
+        fatal_error: Some(
+            "[team-b] gateway admin API is read-only, refusing to apply: ...".to_string(),
+        ),
+        ..Default::default()
+    };
+
+    let msg = result.into_result().unwrap_err().to_string();
+    assert!(msg.contains("Apply stopped"), "{msg}");
+    assert!(msg.contains("read-only"), "{msg}");
+    assert!(
+        msg.contains("4 created"),
+        "the operator must see what landed before the stop: {msg}"
+    );
+}
+
+#[test]
+fn a_fatal_stop_alongside_per_resource_failures_reports_both() {
+    let result = ApplyResult {
+        created: 2,
+        errors: vec!["Proxy p9 create: 409 duplicate".to_string()],
+        fatal_error: Some("[team-b] gateway admin API is read-only".to_string()),
+        ..Default::default()
+    };
+
+    let msg = result.into_result().unwrap_err().to_string();
+    assert!(msg.contains("Apply stopped"), "{msg}");
+    assert!(msg.contains("Proxy p9 create"), "{msg}");
+    assert!(msg.contains("1 failed"), "{msg}");
+}
+
+#[test]
+fn a_clean_result_has_no_fatal_error() {
+    let result = ApplyResult {
+        created: 3,
+        ..Default::default()
+    };
+    assert!(result.fatal_error.is_none());
+    assert!(result.into_result().is_ok());
+}
+
+// --- All-404 delete warning --------------------------------------------------
+
+#[test]
+fn every_delete_404ing_is_called_out() {
+    let warning = all_deletes_missing_warning("team-alpha", 3, 3).expect("should warn");
+    assert!(warning.contains("[team-alpha]"), "{warning}");
+    assert!(
+        warning.contains("all 3 delete(s) returned 404"),
+        "{warning}"
+    );
+    assert!(warning.contains("FERRUM_GATEWAY_URL"), "{warning}");
+    assert!(
+        warning.contains("state entries were still removed"),
+        "the operator has to know the next run will not retry them: {warning}"
+    );
+}
+
+#[test]
+fn a_single_tolerated_404_stays_silent() {
+    // The gateway cascades deletes server-side, so one follow-up delete
+    // finding nothing is routine and must not become noise.
+    assert!(all_deletes_missing_warning("team-alpha", 3, 1).is_none());
+    assert!(all_deletes_missing_warning("team-alpha", 2, 0).is_none());
+    // Nothing was deleted at all — there is no signal here either way.
+    assert!(all_deletes_missing_warning("team-alpha", 0, 0).is_none());
+}
+
+// --- apply_api against a stub gateway ----------------------------------------
+
+use gitforgeops::apply::{all_deletes_missing_warning, apply_api, ApplyOptions};
+use gitforgeops::config::env::{EnvConfig, GatewayMode};
+use gitforgeops::config::schema::Upstream;
+use gitforgeops::diff::OwnershipScope;
+use gitforgeops::http_client::AdminClient;
+use std::collections::BTreeMap;
+use std::io::{Read as _, Write as _};
+use std::net::TcpListener;
+
+/// Canned-response gateway on a loopback socket, matched by the first route
+/// whose needle appears anywhere in the request (line, headers, or body).
+///
+/// Reads the full request including its body, so routes can key on a payload —
+/// which is how "fail this one resource, accept the others" is expressed.
+fn spawn_stub_gateway(routes: Vec<(&'static str, u16, &'static str)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let routes = routes.clone();
+            std::thread::spawn(move || loop {
+                let request = match read_request(&mut stream) {
+                    Some(request) => request,
+                    None => return,
+                };
+                let (status, body) = routes
+                    .iter()
+                    .find(|(needle, _, _)| request.contains(needle))
+                    .map(|(_, status, body)| (*status, *body))
+                    .unwrap_or((200, "{}"));
+                if write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .is_err()
+                {
+                    return;
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        let mut buf = [0_u8; 4096];
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => n,
+        };
+        raw.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let Some(header_end) = text.find("\r\n\r\n") else {
+            continue;
+        };
+        let content_length = text
+            .to_ascii_lowercase()
+            .split("\r\n")
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .map(str::trim)
+                    .map(String::from)
+            })
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if raw.len() >= header_end + 4 + content_length {
+            return Some(text);
+        }
+    }
+}
+
+fn stub_client(url: String) -> AdminClient {
+    let env = EnvConfig {
+        gateway_url: Some(url),
+        admin_jwt_secret: Some("test-secret-must-be-32-chars-long".to_string()),
+        gateway_mode: GatewayMode::Api,
+        // No backoff sleeps in the failure paths.
+        gateway_max_retries: 0,
+        ..EnvConfig::default()
+    };
+    AdminClient::new(&env).unwrap()
+}
+
+fn upstream(id: &str, namespace: &str) -> Upstream {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": namespace,
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .expect("upstream fixture")
+}
+
+const HEALTHY: &str = r#"{"status":"ok","mode":"database","admin_writes_enabled":true}"#;
+
+fn empty_actuals(namespaces: &[&str]) -> BTreeMap<String, GatewayConfig> {
+    namespaces
+        .iter()
+        .map(|ns| (ns.to_string(), GatewayConfig::default()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_rejected_batch_chunk_falls_back_to_named_per_resource_creates() {
+    // The old behaviour returned one opaque "POST /batch: {e}" and abandoned
+    // every remaining resource. `/batch` is all-or-nothing per chunk, so
+    // nothing landed — replaying the chunk per resource names the resource the
+    // gateway actually objected to and still creates the rest.
+    let url = spawn_stub_gateway(vec![
+        ("GET /health", 200, HEALTHY),
+        ("POST /batch", 400, r#"{"error":"batch rejected"}"#),
+        (r#""id":"u2""#, 409, r#"{"error":"duplicate id"}"#),
+        ("POST /upstreams", 201, "{}"),
+    ]);
+    let client = stub_client(url);
+
+    let desired = GatewayConfig {
+        upstreams: vec![
+            upstream("u1", "team-alpha"),
+            upstream("u2", "team-alpha"),
+            upstream("u3", "team-alpha"),
+        ],
+        ..Default::default()
+    };
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("a per-resource failure is not fatal");
+
+    assert_eq!(result.created, 2, "the healthy resources still land");
+    assert_eq!(result.errors.len(), 1, "got {:?}", result.errors);
+    assert!(
+        result.errors[0].contains("Upstream u2 create"),
+        "the failing resource must be named: {:?}",
+        result.errors
+    );
+    // Order follows the diff, which is not id-sorted; the *set* is what
+    // matters for the state update.
+    let mut created: Vec<&str> = result
+        .applied_incremental
+        .iter()
+        .map(|op| op.id.as_str())
+        .collect();
+    created.sort_unstable();
+    assert_eq!(created, vec!["u1", "u3"]);
+    assert!(result.fatal_error.is_none());
+}
+
+#[tokio::test]
+async fn a_read_only_plane_stops_the_run_but_keeps_earlier_namespaces_recorded() {
+    // The whole point of F1/F2: namespace ferrum applied cleanly, team-b hit a
+    // read-only admin plane. Returning Err here threw away ferrum's applied
+    // ops, so cmd_apply persisted nothing and the next run re-derived those
+    // resources as unmanaged. The ops survive; the error rides on the result.
+    let url = spawn_stub_gateway(vec![
+        ("GET /health", 200, HEALTHY),
+        // Force the per-resource path so the read-only 403 comes from a
+        // single-resource create, the way it does mid-namespace.
+        ("POST /batch", 501, "{}"),
+        (
+            "x-ferrum-namespace: team-b",
+            403,
+            r#"{"error":"Admin API is in read-only mode"}"#,
+        ),
+        ("POST /upstreams", 201, "{}"),
+    ]);
+    let client = stub_client(url);
+
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum"), upstream("u2", "team-b")],
+        ..Default::default()
+    };
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["ferrum", "team-b"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("a fatal stop is reported on the result, not as Err");
+
+    assert_eq!(result.created, 1);
+    assert_eq!(
+        result
+            .applied_incremental
+            .iter()
+            .map(|op| op.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["u1"],
+        "the namespace that succeeded must still be recordable in state"
+    );
+    let fatal = result.fatal_error.clone().expect("read-only is fatal");
+    assert!(fatal.contains("[team-b]"), "{fatal}");
+    assert!(fatal.contains("read-only"), "{fatal}");
+
+    // ...and it is still a failed run.
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn a_read_only_plane_at_the_first_namespace_stops_immediately() {
+    // Nothing landed, but the run must still stop rather than collecting the
+    // same 403 once per remaining namespace.
+    let url = spawn_stub_gateway(vec![
+        ("GET /health", 200, HEALTHY),
+        ("POST /batch", 501, "{}"),
+        (
+            "POST /upstreams",
+            403,
+            r#"{"error":"Admin API is in read-only mode"}"#,
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum"), upstream("u2", "team-b")],
+        ..Default::default()
+    };
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["ferrum", "team-b"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("reported on the result");
+
+    assert_eq!(result.created, 0);
+    let fatal = result.fatal_error.expect("read-only is fatal");
+    assert!(fatal.contains("[ferrum]"), "stopped at the first: {fatal}");
+}
+
+#[tokio::test]
+async fn a_read_only_preflight_fails_before_any_mutation() {
+    // Unchanged behaviour: the up-front GET /health verdict is a hard Err,
+    // because nothing has been applied and there is no partial state to save.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        200,
+        r#"{"status":"degraded","mode":"database","admin_writes_enabled":false}"#,
+    )]);
+    let client = stub_client(url);
+
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["ferrum"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)));
+}

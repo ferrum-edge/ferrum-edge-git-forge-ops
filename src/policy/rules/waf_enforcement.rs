@@ -1,13 +1,10 @@
 use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
-use crate::plugin_catalog::{cfg_array, cfg_at, cfg_str, cfg_u64};
+use crate::plugin_catalog::{
+    cfg_u64, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body,
+};
 use crate::policy::config::WafEnforcementRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
-
-/// Rule actions that actually reject a matched request. The gateway spells the
-/// enforcing action `enforce`; `block` / `reject` are accepted here so a
-/// config using the response-oriented wording is not misread as monitor-only.
-const ENFORCING_ACTIONS: &[&str] = &["enforce", "block", "reject"];
 
 pub struct WafEnforcementRule {
     config: WafEnforcementRuleConfig,
@@ -16,47 +13,6 @@ pub struct WafEnforcementRule {
 impl WafEnforcementRule {
     pub fn new(config: WafEnforcementRuleConfig) -> Self {
         Self { config }
-    }
-
-    /// Does any rule-level setting promote at least one rule to enforcement?
-    ///
-    /// The built-in rule pack ships every rule at `monitor`, so `mode: enforce`
-    /// on its own blocks nothing. Enforcement arrives through the bulk
-    /// `default_rule_action` switch, a per-rule `rule_modes` entry, a
-    /// `rule_overrides.<id>.action`, or a `custom_rules[].action`.
-    fn has_enforcing_rule(config: &serde_json::Value) -> bool {
-        if cfg_str(config, &["default_rule_action"])
-            .is_some_and(|action| ENFORCING_ACTIONS.contains(&action.as_str()))
-        {
-            return true;
-        }
-
-        if let Some(modes) = cfg_at(config, &["rule_modes"]).and_then(|v| v.as_object()) {
-            if modes.values().any(|v| {
-                v.as_str()
-                    .is_some_and(|s| ENFORCING_ACTIONS.contains(&s.to_ascii_lowercase().as_str()))
-            }) {
-                return true;
-            }
-        }
-
-        if let Some(overrides) = cfg_at(config, &["rule_overrides"]).and_then(|v| v.as_object()) {
-            if overrides.values().any(|v| {
-                cfg_str(v, &["action"]).is_some_and(|a| ENFORCING_ACTIONS.contains(&a.as_str()))
-            }) {
-                return true;
-            }
-        }
-
-        if let Some(custom) = cfg_array(config, &["custom_rules"]) {
-            if custom.iter().any(|v| {
-                cfg_str(v, &["action"]).is_some_and(|a| ENFORCING_ACTIONS.contains(&a.as_str()))
-            }) {
-                return true;
-            }
-        }
-
-        false
     }
 
     fn check_instance(&self, plugin: &PluginConfig, findings: &mut Vec<PolicyFinding>) {
@@ -74,9 +30,9 @@ impl WafEnforcementRule {
         };
 
         // `mode` defaults to `enforce` when absent.
-        let mode = cfg_str(&plugin.config, &["mode"]).unwrap_or_else(|| "enforce".to_string());
+        let mode = waf_mode(&plugin.config);
         match mode.as_str() {
-            "monitor" | "disabled" => {
+            m if waf_mode_is_passive(m) => {
                 push(
                     format!(
                         "waf plugin {} in namespace {} has mode: {mode} — matched requests are recorded but never rejected",
@@ -87,7 +43,7 @@ impl WafEnforcementRule {
                 );
             }
             _ => {
-                if !Self::has_enforcing_rule(&plugin.config) {
+                if !waf_has_enforcing_rule(&plugin.config) {
                     push(
                         format!(
                             "waf plugin {} in namespace {} has mode: enforce but every built-in rule is monitor-only — no rule_modes, rule_overrides, custom_rules or default_rule_action promotes one to enforcement",
@@ -117,7 +73,7 @@ impl WafEnforcementRule {
 
         // `on_body_too_large` defaults to `fail_closed`; `skip` waves through a
         // body the scanner never looked at.
-        if cfg_str(&plugin.config, &["on_body_too_large"]).as_deref() == Some("skip") {
+        if waf_skips_oversized_body(&plugin.config) {
             push(
                 format!(
                     "waf plugin {} in namespace {} has on_body_too_large: skip — oversized bodies bypass inspection entirely",

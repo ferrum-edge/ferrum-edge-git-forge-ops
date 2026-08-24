@@ -1,6 +1,6 @@
 use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
-use crate::plugin_catalog::{cfg_array, cfg_at, cfg_str};
+use crate::plugin_catalog::{cfg_array, cfg_at, cfg_str, has_local_redis_fallback};
 use crate::policy::config::RateLimitCompletenessRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
 
@@ -183,9 +183,7 @@ impl PolicyCheck for RateLimitCompletenessRule {
             // Both limiters can fall back to a per-process counter when Redis
             // is unreachable, which silently multiplies the effective budget by
             // the replica count.
-            if cfg_str(&plugin.config, &["redis_failure_policy"]).as_deref()
-                == Some("local_fallback")
-            {
+            if has_local_redis_fallback(&plugin.config) {
                 findings.push(self.finding(
                     plugin,
                     format!(

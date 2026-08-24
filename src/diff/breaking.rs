@@ -1,4 +1,5 @@
 use crate::config::GatewayConfig;
+use crate::plugin_catalog::effective_scheme;
 use crate::policy::config::is_default_auth_plugin_name;
 
 use super::resource_diff::{DiffAction, ResourceDiff};
@@ -92,7 +93,15 @@ fn check_proxy_breaking_fields(
                 reason: "hosts changed".to_string(),
             });
         }
-        if d.backend_scheme != a.backend_scheme {
+        // Compare the *effective* schemes, not the raw `Option`s. A DB-backed
+        // gateway always reports a resolved scheme (it canonicalizes `None` to
+        // `https` for non-stream proxies on write), so a repo proxy that omits
+        // the field would otherwise read as `None != Some(https)` — a breaking
+        // change on every PR touching that proxy, for an edit that changes
+        // nothing on the wire. Assembly normalizes the desired side for the
+        // same reason; this keeps the comparison correct for configs that did
+        // not come through the assembler.
+        if effective_scheme(d) != effective_scheme(a) {
             breaking.push(BreakingChange {
                 kind: "Proxy".to_string(),
                 id: diff.id.clone(),

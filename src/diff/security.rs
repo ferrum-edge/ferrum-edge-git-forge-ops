@@ -1,8 +1,10 @@
-use crate::config::schema::{BackendScheme, PluginConfig, Proxy};
+use crate::config::schema::{PluginConfig, Proxy};
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::{
-    cfg_array, cfg_at, cfg_bool, cfg_str, effective_plugins, is_auth_plugin, is_builtin,
-    is_retired, RETIRED_PLUGIN_NAMES,
+    allows_uninspectable_body, cfg_array, cfg_bool, cfg_str, effective_plugins, effective_scheme,
+    has_local_redis_fallback, is_auth_plugin, is_builtin, is_retired, retired_replacement,
+    scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body,
+    RetiredRemediation, RETIRED_PLUGIN_NAMES,
 };
 use crate::policy::config::default_auth_plugin_names;
 use crate::policy::PolicyConfig;
@@ -36,29 +38,6 @@ impl SecurityFinding {
             message,
         }
     }
-}
-
-/// The scheme the gateway will actually dial. An absent `backend_scheme` on an
-/// HTTP-family proxy defaults to `https` (`effective_scheme()` upstream), so
-/// `None` must never be read as "plaintext".
-pub fn effective_scheme(proxy: &Proxy) -> BackendScheme {
-    proxy.backend_scheme.unwrap_or(BackendScheme::Https)
-}
-
-/// Does this scheme negotiate TLS on the backend connection? Only these carry
-/// a server certificate, so only these give
-/// `backend_tls_verify_server_cert: false` any meaning — the gateway rejects
-/// the field outright on the plaintext schemes.
-pub fn scheme_is_tls(scheme: BackendScheme) -> bool {
-    matches!(
-        scheme,
-        BackendScheme::Https | BackendScheme::Tcps | BackendScheme::Dtls
-    )
-}
-
-/// Is this an HTTP-family scheme (as opposed to a raw L4 stream)?
-pub fn scheme_is_http_family(scheme: BackendScheme) -> bool {
-    matches!(scheme, BackendScheme::Http | BackendScheme::Https)
 }
 
 /// Audit with the repository's default notion of what counts as authentication.
@@ -221,41 +200,6 @@ fn check_proxy(
     }
 }
 
-/// Rule actions that actually reject a matched request.
-const WAF_ENFORCING_ACTIONS: &[&str] = &["enforce", "block", "reject"];
-
-fn waf_has_enforcing_rule(config: &serde_json::Value) -> bool {
-    let enforcing = |value: Option<String>| {
-        value.is_some_and(|action| WAF_ENFORCING_ACTIONS.contains(&action.as_str()))
-    };
-
-    if enforcing(cfg_str(config, &["default_rule_action"])) {
-        return true;
-    }
-    if let Some(modes) = cfg_at(config, &["rule_modes"]).and_then(|v| v.as_object()) {
-        if modes
-            .values()
-            .any(|v| enforcing(v.as_str().map(|s| s.to_ascii_lowercase())))
-        {
-            return true;
-        }
-    }
-    if let Some(overrides) = cfg_at(config, &["rule_overrides"]).and_then(|v| v.as_object()) {
-        if overrides
-            .values()
-            .any(|v| enforcing(cfg_str(v, &["action"])))
-        {
-            return true;
-        }
-    }
-    if let Some(custom) = cfg_array(config, &["custom_rules"]) {
-        if custom.iter().any(|v| enforcing(cfg_str(v, &["action"]))) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Is this `allowed_origins` entry the any-origin wildcard? CORS origins are
 /// either bare strings or match objects, so `"*"` and `{exact: "*"}` are the
 /// same policy written two ways.
@@ -285,10 +229,12 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
             format!(
                 "plugin {id} in namespace {ns} uses the retired plugin_name: {name} — the gateway refuses to load any config mentioning {}; {}",
                 RETIRED_PLUGIN_NAMES.join(" or "),
-                match name {
-                    "oauth2_auth" => "replace it with oauth2_introspection or oidc_relying_party",
-                    "semantic_ai_firewall" => "rename it to ai_semantic_firewall",
-                    _ => "remove this plugin config",
+                match retired_replacement(name) {
+                    RetiredRemediation::ReplaceWith(successors) =>
+                        format!("replace it with {}", successors.join(" or ")),
+                    RetiredRemediation::RenamedTo(successor) =>
+                        format!("rename it to {successor}"),
+                    RetiredRemediation::Remove => "remove this plugin config".to_string(),
                 }
             ),
         ));
@@ -317,8 +263,8 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
 
     match name {
         "waf" => {
-            let mode = cfg_str(cfg, &["mode"]).unwrap_or_else(|| "enforce".to_string());
-            if mode == "monitor" || mode == "disabled" {
+            let mode = waf_mode(cfg);
+            if waf_mode_is_passive(&mode) {
                 findings.push(SecurityFinding::error(
                     "PluginConfig",
                     id,
@@ -337,7 +283,7 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
                     ),
                 ));
             }
-            if cfg_str(cfg, &["on_body_too_large"]).as_deref() == Some("skip") {
+            if waf_skips_oversized_body(cfg) {
                 findings.push(SecurityFinding::warning(
                     "PluginConfig",
                     id,
@@ -432,7 +378,7 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     }
 
     // Fail-open escape hatches shared across several plugins.
-    if cfg_str(cfg, &["redis_failure_policy"]).as_deref() == Some("local_fallback") {
+    if has_local_redis_fallback(cfg) {
         findings.push(SecurityFinding::warning(
             "PluginConfig",
             id,
@@ -442,7 +388,7 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
             ),
         ));
     }
-    if cfg_bool(cfg, &["fail_on_uninspectable_body"]) == Some(false) {
+    if allows_uninspectable_body(cfg) {
         findings.push(SecurityFinding::warning(
             "PluginConfig",
             id,
