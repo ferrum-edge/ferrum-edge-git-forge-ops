@@ -29,8 +29,14 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
    ```
 
    Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). Both are gated on `write` repo permission, since only users with write access can apply labels. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`.
-6. Open a PR. CI runs the matrix across every declared environment, validates the assembled config, and posts a review comment per env with policy, drift, credential, security, and best-practice findings. Policy errors are enforced by `apply`.
-7. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering).
+6. **Require the `reject-state-edits` check on your default branch.** Neither branch protection nor rulesets are copied when you fork, so a fresh fork has an unprotected `main` and the state guard is advisory only — it goes red, but nothing stops a merge. Add a ruleset (Settings → Rules → Rulesets → New branch ruleset) targeting the default branch with **Require status checks to pass** → `reject-state-edits`.
+
+   Two things to get right, both of which will bite silently otherwise:
+
+   - **Give `apply-on-merge.yml` and `rotate.yml` a bypass.** They push state commits straight to `main` as `gitforgeops[bot]`; required status checks gate direct pushes too, and a bot commit that never had a PR has no checks to satisfy. Add the GitHub Actions app to the ruleset's **Bypass list**. Without it the "Commit state" step fails on every apply and the ledger stops advancing.
+   - **Don't add a path filter to `state-guard.yml`.** It deliberately runs on every PR and decides internally whether `.state/` was touched. A path-filtered workflow reports no status at all on PRs that don't match, and GitHub holds those PRs at "Expected — waiting for status to be reported" indefinitely once the check is required.
+7. Open a PR. CI runs the matrix across every declared environment, validates the assembled config, and posts a review comment per env with policy, drift, credential, security, and best-practice findings. Policy errors are enforced by `apply`.
+8. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering).
 
 ## Repository layout
 
@@ -175,6 +181,7 @@ That trust is enforced at the boundary, not inside the binary:
 - **`state-guard.yml` fails any PR that touches `.state/**`.** A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. Deliberate repairs (restoring a corrupted ledger, adopting an existing gateway) need the `gitforgeops/state-override` label, which only a user with `write` permission can add and which lands in the PR timeline.
 - **`.state/*.json` is tracked in git; locks and temp files are not.** If you fork this repo, keep the `.gitignore` entries as shipped. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
 - **Apply runs post-merge only**, so a poisoned ledger has to survive review and land on `main` before it can act.
+- **The guard is only a merge blocker once it is a required status check.** It is not required by default, and forks inherit neither branch protection nor rulesets — see [Quick start](#quick-start) step 6, including the bypass the bot's state pushes need.
 
 Narrowing what the binary reads out of the ledger is not a substitute for any of this: an attacker who can write `.state/<env>.json` can already forge entries inside a declared namespace, which no amount of namespace scoping catches.
 

@@ -131,7 +131,10 @@ The state file is the trust boundary for both of those, and it is CI-authored:
 `apply-on-merge.yml` / `rotate.yml` commit `.state/<env>.json` back to `main`
 as `gitforgeops[bot]`, `.gitignore` tracks `.state/*.json` (ignoring only locks
 and temp files), and `state-guard.yml` fails any PR touching `.state/**` unless
-a maintainer adds the `gitforgeops/state-override` label. Keep the fence there
+a maintainer adds the `gitforgeops/state-override` label. That workflow runs
+on **every** PR with no `paths:` filter and decides internally whether
+`.state/` was touched — a path-filtered workflow reports no status on
+non-matching PRs, which stalls them forever once the check is required. Keep the fence there
 rather than narrowing what the binary reads out of the ledger — shared mode
 must keep reconciling namespaces the repo no longer declares, or a PR that
 removes a namespace's last resource orphans it on the gateway forever.
