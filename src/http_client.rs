@@ -64,9 +64,11 @@ impl AdminClient {
             .clone()
             .ok_or(crate::error::Error::NoJwtSecret)?;
         if jwt_secret.len() < 32 {
-            return Err(crate::error::Error::Config(
-                "FERRUM_ADMIN_JWT_SECRET must be at least 32 characters".to_string(),
-            ));
+            return Err(crate::error::Error::Config(format!(
+                "FERRUM_ADMIN_JWT_SECRET must be at least 32 characters to match \
+                 ferrum-edge's minimum (got {})",
+                jwt_secret.len()
+            )));
         }
 
         // Timeouts prevent CI from hanging indefinitely when the gateway is

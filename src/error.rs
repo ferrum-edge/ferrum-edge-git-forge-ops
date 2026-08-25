@@ -83,10 +83,10 @@ pub enum Error {
     #[error("JWT error: {0}")]
     JwtError(String),
 
-    #[error("gateway URL not configured (set FERRUM_GATEWAY_URL)")]
+    #[error("gateway URL not configured: set FERRUM_GATEWAY_URL (in CI, add it to the GitHub Environment's secrets for this environment)")]
     NoGatewayUrl,
 
-    #[error("JWT secret not configured (set FERRUM_ADMIN_JWT_SECRET)")]
+    #[error("JWT secret not configured: set FERRUM_ADMIN_JWT_SECRET (in CI, add it to the GitHub Environment's secrets for this environment)")]
     NoJwtSecret,
 
     #[error("HTTP client error: {0}")]

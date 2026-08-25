@@ -99,6 +99,34 @@ fn env_config_treats_blank_jwt_vars_as_unset() {
     clear_env();
 }
 
+/// Every var CI feeds from a `${{ secrets.* }}` expression arrives as an empty
+/// string when the GitHub Environment doesn't define it. Blank must read as
+/// unset so callers get the clear "not configured" errors (NoJwtSecret /
+/// NoGatewayUrl) instead of misleading ones like "secret must be at least 32
+/// characters" for a secret that was never set at all.
+#[test]
+fn env_config_treats_blank_secret_backed_vars_as_unset() {
+    let _guard = env_guard();
+    clear_env();
+
+    std::env::set_var("FERRUM_GATEWAY_URL", "");
+    std::env::set_var("FERRUM_ADMIN_JWT_SECRET", "");
+    std::env::set_var("FERRUM_NAMESPACE", "  ");
+    std::env::set_var("FERRUM_GATEWAY_CA_CERT", "");
+    std::env::set_var("FERRUM_GATEWAY_CLIENT_CERT", "");
+    std::env::set_var("FERRUM_GATEWAY_CLIENT_KEY", "");
+
+    let config = load_env_config();
+    assert!(config.gateway_url.is_none());
+    assert!(config.admin_jwt_secret.is_none());
+    assert!(config.namespace_filter.is_none());
+    assert!(config.ca_cert.is_none());
+    assert!(config.client_cert.is_none());
+    assert!(config.client_key.is_none());
+
+    clear_env();
+}
+
 /// `FERRUM_MESH_FILE_OUTPUT_PATH` follows the same shape as every other
 /// path-valued variable: absent or blank falls back to the documented default,
 /// a real value wins. Blank matters because CI writes these from `secrets` /

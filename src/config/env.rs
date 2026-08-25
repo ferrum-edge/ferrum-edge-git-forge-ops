@@ -196,15 +196,19 @@ impl Default for EnvConfig {
 /// | `FERRUM_GATEWAY_MAX_RETRIES`          | `gateway_max_retries`          | `3`         |
 pub fn load_env_config() -> EnvConfig {
     EnvConfig {
-        gateway_url: env::var("FERRUM_GATEWAY_URL").ok(),
-        admin_jwt_secret: env::var("FERRUM_ADMIN_JWT_SECRET").ok(),
+        // Blank-as-unset matters for every var CI feeds from a `${{ secrets.* }}`
+        // expression: an unconfigured GitHub secret interpolates to "", and
+        // Some("") would produce misleading downstream errors ("secret too
+        // short") instead of the clear "not configured" ones.
+        gateway_url: non_empty_env("FERRUM_GATEWAY_URL"),
+        admin_jwt_secret: non_empty_env("FERRUM_ADMIN_JWT_SECRET"),
         admin_jwt_issuer: non_empty_env("FERRUM_ADMIN_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),
         admin_jwt_role: non_empty_env("FERRUM_ADMIN_JWT_ROLE")
             .unwrap_or_else(|| DEFAULT_JWT_ROLE.to_string()),
         admin_jwt_audience: non_empty_env("FERRUM_ADMIN_JWT_AUDIENCE"),
         admin_jwt_ttl_secs: parse_i64_env("FERRUM_ADMIN_JWT_TTL_SECS", DEFAULT_JWT_TTL_SECS),
-        namespace_filter: env::var("FERRUM_NAMESPACE").ok(),
+        namespace_filter: non_empty_env("FERRUM_NAMESPACE"),
         gateway_mode: match env::var("FERRUM_GATEWAY_MODE")
             .unwrap_or_default()
             .to_lowercase()
@@ -221,13 +225,13 @@ pub fn load_env_config() -> EnvConfig {
             "full_replace" => ApplyStrategy::FullReplace,
             _ => ApplyStrategy::Incremental,
         },
-        overlay: env::var("FERRUM_OVERLAY").ok(),
-        env_name: env::var("FERRUM_ENV").ok(),
-        github_repository: env::var("GITHUB_REPOSITORY").ok(),
-        github_token: env::var("GITHUB_TOKEN").ok(),
-        github_provisioner_token: env::var("FERRUM_GH_PROVISIONER_TOKEN").ok(),
-        creds_bundle_json: env::var("FERRUM_CREDS_JSON").ok(),
-        creds_bundle_json_file: env::var("FERRUM_CREDS_JSON_FILE").ok(),
+        overlay: non_empty_env("FERRUM_OVERLAY"),
+        env_name: non_empty_env("FERRUM_ENV"),
+        github_repository: non_empty_env("GITHUB_REPOSITORY"),
+        github_token: non_empty_env("GITHUB_TOKEN"),
+        github_provisioner_token: non_empty_env("FERRUM_GH_PROVISIONER_TOKEN"),
+        creds_bundle_json: non_empty_env("FERRUM_CREDS_JSON"),
+        creds_bundle_json_file: non_empty_env("FERRUM_CREDS_JSON_FILE"),
         file_output_path: env::var("FERRUM_FILE_OUTPUT_PATH")
             .unwrap_or_else(|_| "./assembled/resources.yaml".to_string()),
         mesh_file_output_path: non_empty_env("FERRUM_MESH_FILE_OUTPUT_PATH")
@@ -237,9 +241,9 @@ pub fn load_env_config() -> EnvConfig {
         tls_no_verify: env::var("FERRUM_TLS_NO_VERIFY")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false),
-        ca_cert: env::var("FERRUM_GATEWAY_CA_CERT").ok(),
-        client_cert: env::var("FERRUM_GATEWAY_CLIENT_CERT").ok(),
-        client_key: env::var("FERRUM_GATEWAY_CLIENT_KEY").ok(),
+        ca_cert: non_empty_env("FERRUM_GATEWAY_CA_CERT"),
+        client_cert: non_empty_env("FERRUM_GATEWAY_CLIENT_CERT"),
+        client_key: non_empty_env("FERRUM_GATEWAY_CLIENT_KEY"),
         gateway_connect_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", 10),
         gateway_request_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", 60),
         github_connect_timeout_secs: parse_timeout_env("FERRUM_GITHUB_CONNECT_TIMEOUT_SECS", 10),
