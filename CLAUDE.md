@@ -127,6 +127,15 @@ Configured per environment in repo config.
 - **`exclusive`**: repo is authoritative for the listed `namespaces`. Unmanaged
   resources get pruned. Required for `full_replace`.
 
+The state file is the trust boundary for both of those, and it is CI-authored:
+`apply-on-merge.yml` / `rotate.yml` commit `.state/<env>.json` back to `main`
+as `gitforgeops[bot]`, `.gitignore` tracks `.state/*.json` (ignoring only locks
+and temp files), and `state-guard.yml` fails any PR touching `.state/**` unless
+a maintainer adds the `gitforgeops/state-override` label. Keep the fence there
+rather than narrowing what the binary reads out of the ledger — shared mode
+must keep reconciling namespaces the repo no longer declares, or a PR that
+removes a namespace's last resource orphans it on the gateway forever.
+
 `diff::compute_diff_with_ownership` takes an optional `previously_managed: &HashSet<String>`
 of `namespace:Kind:id` keys from the state file. `Some(set)` = shared mode,
 `None` = exclusive. Large-prune guard refuses applies that would delete more
@@ -237,6 +246,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (walks namespaces, pulls `/backup`), `from_file.rs`, `mod.rs::split_config` (emits per-resource YAML; reports skipped `api_specs` / trust-bundle sections instead of dropping them silently)
 - `src/state.rs` — `.state/<env>.json` tracks applied hashes, credential metadata, shard count, override history
+- `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/error.rs` — unified `Error` enum via `thiserror`
 

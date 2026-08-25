@@ -132,7 +132,11 @@ jobs:
           git config user.name "gitforgeops[bot]"
           git config user.email "gitforgeops[bot]@users.noreply.github.com"
           mkdir -p .state
-          git add ".state/${INPUT_ENVIRONMENT}.json" 2>/dev/null || true
+          # No `|| true`: a failing `git add` (gitignored path, bad perms)
+          # must fail the job rather than silently commit nothing.
+          if [ -f ".state/${INPUT_ENVIRONMENT}.json" ]; then
+            git add ".state/${INPUT_ENVIRONMENT}.json"
+          fi
           if git diff --cached --quiet; then
             echo "No state changes to commit."
             exit 0

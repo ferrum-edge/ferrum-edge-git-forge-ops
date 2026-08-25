@@ -55,7 +55,7 @@ assembled/                       # file-mode output (gateway doc + mesh doc)
   staging.yaml
   staging-mesh.yaml
 
-.state/                          # auto-committed by CI, per environment
+.state/                          # auto-committed by CI, per environment; never hand-edit
   staging.json
   production.json
 
@@ -63,6 +63,7 @@ assembled/                       # file-mode output (gateway doc + mesh doc)
   validate-pr.yml                # matrix validate + review per env
   apply-on-merge.yml             # matrix apply per env (with env binding)
   drift-check.yml                # scheduled diff per env
+  state-guard.yml                # rejects PR-authored .state/ edits
   rotate.yml                     # workflow_dispatch for credential rotation
   materialize-file.yml           # workflow_dispatch for encrypted flat-file delivery
   release.yml                    # builds multi-arch image on push to main / v* tag
@@ -148,6 +149,23 @@ Choose this for production or regulated environments where git is the single sou
 ### First-apply behavior
 
 In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. The state file is written at the end, so subsequent applies distinguish between bucket 2 and bucket 3 correctly.
+
+### State file trust model
+
+`.state/<env>.json` is the ownership ledger, and it is load-bearing twice over:
+
+- `previously_managed` reads it to decide **what shared mode may delete**. A resource the ledger doesn't list is unmanaged; nothing outside the ledger is ever removed.
+- `resolved_namespaces` unions the namespaces it names with the namespaces the repo currently declares, deciding **what gets reconciled at all**. Without that union, a PR removing the last resource from namespace `foo` would stop `foo` being diffed entirely — the orphaned resource would stay on the gateway forever while its key sat in the ledger, never re-reconciled.
+
+Both of those make sense only because the ledger is **CI-authored**. `apply-on-merge.yml` and `rotate.yml` write it after a successful run and push it to `main` as `gitforgeops[bot]`; nobody edits it by hand.
+
+That trust is enforced at the boundary, not inside the binary:
+
+- **`state-guard.yml` fails any PR that touches `.state/**`.** A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. Deliberate repairs (restoring a corrupted ledger, adopting an existing gateway) need the `gitforgeops/state-override` label, which only a user with `write` permission can add and which lands in the PR timeline.
+- **`.state/*.json` is tracked in git; locks and temp files are not.** If you fork this repo, keep the `.gitignore` entries as shipped. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
+- **Apply runs post-merge only**, so a poisoned ledger has to survive review and land on `main` before it can act.
+
+Narrowing what the binary reads out of the ledger is not a substitute for any of this: an attacker who can write `.state/<env>.json` can already forge entries inside a declared namespace, which no amount of namespace scoping catches.
 
 ### Spec-owned resources (both modes)
 
@@ -794,6 +812,7 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - **Fork PRs cannot see production secrets.** `validate-pr.yml` binds each review job to the matching GitHub Environment so same-repo PRs can include live gateway comparison in review comments, but GitHub withholds environment secrets from forked `pull_request` runs. Fork PRs degrade to static-only review output, and contributors from forks can propose credential slots but cannot cause allocation.
 - **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions).
 - **Credential values are never written back to the repo.** Only hashes and metadata in `.state/`.
+- **The state file is CI-owned.** `state-guard.yml` rejects PRs that modify `.state/**` unless a maintainer adds the `gitforgeops/state-override` label — the ledger decides what shared mode may delete, so a hand-edited one is a privilege escalation. See [State file trust model](#state-file-trust-model).
 - **Policy overrides leave a permanent trail.** PR label event + approver permission + `.state/<env>.json.overrides` record.
 - **The provisioner token is the bootstrap credential.** Rotate periodically; prefer GitHub App installation tokens over PATs (automatic 1-hour expiry, org-scoped).
 - **TLS material stays as GitHub secrets.** The binary only ever sees the base64-decoded PEM in-process.
