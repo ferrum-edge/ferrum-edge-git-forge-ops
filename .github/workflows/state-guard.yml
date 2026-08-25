@@ -1,0 +1,59 @@
+name: GitForgeOps State Guard
+
+# `.state/<env>.json` is the ownership ledger: in shared mode it is the sole
+# authority for which live gateway resources this repo may delete, and it also
+# widens the namespace set that gets reconciled. It is written by CI only —
+# apply-on-merge.yml and rotate.yml commit it back to main as gitforgeops[bot].
+#
+# A PR that hand-edits `.state/` is therefore a privilege escalation, not a
+# config change: forged entries name live resources as "previously managed"
+# and the next post-merge apply deletes them. This job is the fence. Keeping
+# the trust boundary here — rather than narrowing what the binary is willing
+# to read out of the state file — is what lets shared mode keep reconciling
+# namespaces the repo no longer declares, so orphaned resources still get
+# cleaned up (see README "State file trust model").
+#
+# Escape hatch for genuine repairs (restoring a corrupted ledger, seeding an
+# environment adopted from an existing gateway): label the PR
+# `gitforgeops/state-override`. Only users with write access can add labels,
+# and the label event is recorded in the PR timeline.
+
+on:
+  pull_request:
+    paths:
+      - '.state/**'
+
+permissions:
+  contents: read
+
+jobs:
+  reject-state-edits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject PR-authored state changes
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
+        run: |
+          echo "::error::This PR modifies .state/, the CI-owned ownership ledger."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'MSG'
+          ## Blocked: PR modifies `.state/`
+
+          `.state/<env>.json` records which gateway resources this repo has
+          applied. In `shared` ownership mode it is the only thing standing
+          between a live resource and a delete, so a hand-edited state file can
+          cause the next post-merge apply to remove resources the repo never
+          managed.
+
+          It is maintained by CI: `apply-on-merge.yml` and `rotate.yml` commit
+          it as `gitforgeops[bot]` after a successful run. Drop the `.state/`
+          changes from this PR and let the next apply write them.
+
+          If you are deliberately repairing or seeding the ledger, a
+          maintainer with write access can add the
+          `gitforgeops/state-override` label to this PR.
+          MSG
+          exit 1
+
+      - name: Record override
+        if: ${{ contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
+        run: |
+          echo "::warning::.state/ changes accepted via gitforgeops/state-override label."

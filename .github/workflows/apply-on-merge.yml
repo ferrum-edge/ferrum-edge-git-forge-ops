@@ -245,11 +245,20 @@ jobs:
           # Stage only the paths this job owns so we don't accidentally pick up
           # anything else that landed in the workdir.
           mkdir -p .state assembled
-          git add ".state/${{ matrix.environment }}.json" 2>/dev/null || true
-          git add "assembled/${{ matrix.environment }}.yaml" 2>/dev/null || true
-          # Mesh document, written only when the repo declares MeshConfig
-          # fragments. Absent otherwise, hence the same tolerant `git add`.
-          git add "assembled/${{ matrix.environment }}-mesh.yaml" 2>/dev/null || true
+          # Stage only files that exist, and let a real `git add` failure
+          # (e.g. the path being gitignored) fail the job. Swallowing it with
+          # `|| true` is how state silently stopped being committed once
+          # before: the add errored, nothing was staged, and the run reported
+          # "No state changes to commit" on every apply.
+          for path in \
+            ".state/${{ matrix.environment }}.json" \
+            "assembled/${{ matrix.environment }}.yaml" \
+            "assembled/${{ matrix.environment }}-mesh.yaml"; do
+            # The assembled docs exist only in file mode, and the mesh doc only
+            # when the repo declares MeshConfig fragments — absence is normal.
+            [ -f "$path" ] || continue
+            git add "$path"
+          done
 
           if git diff --cached --quiet; then
             echo "No state changes to commit."

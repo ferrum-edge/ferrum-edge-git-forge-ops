@@ -8,6 +8,7 @@ pub mod import;
 pub mod jwt;
 pub mod plugin_catalog;
 pub mod policy;
+pub mod reconcile;
 pub mod review;
 pub mod secrets;
 pub mod state;

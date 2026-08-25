@@ -15,6 +15,7 @@ use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
 use gitforgeops::policy;
+use gitforgeops::reconcile::{previously_managed, resolved_namespaces};
 use gitforgeops::review;
 use gitforgeops::secrets;
 use gitforgeops::state::StateFile;
@@ -208,51 +209,6 @@ fn resolve_credentials(
 ) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
     let (bundle, _) = load_credential_bundles(env_config)?;
     Ok(secrets::resolve_secrets(cfg, &bundle)?)
-}
-
-fn resolved_namespaces(
-    resolved: &ResolvedEnv,
-    desired: &GatewayConfig,
-    state: &StateFile,
-) -> Vec<String> {
-    match resolved.ownership.mode {
-        OwnershipMode::Exclusive => {
-            let owned = resolved.ownership.namespaces.clone().unwrap_or_default();
-            // Honor namespace_filter as an intersection. Without this,
-            // `FERRUM_NAMESPACE=ferrum` on an env with
-            // `ownership.namespaces: [ferrum, platform]` would still iterate
-            // `platform` — but `desired` has been filtered to `ferrum` only,
-            // so `platform` shows up as an all-deletions diff and prunes
-            // resources outside the operator's requested scope.
-            // The mismatched-filter case (namespace_filter not in owned set)
-            // is rejected upstream by `enforce_exclusive_scope`. If we reach
-            // here with a filter set, it's guaranteed to be in the allowed
-            // list.
-            match resolved.namespace_filter.as_deref() {
-                Some(ns) => vec![ns.to_string()],
-                None => owned,
-            }
-        }
-        OwnershipMode::Shared => match resolved.namespace_filter.as_deref() {
-            Some(ns) => vec![ns.to_string()],
-            None => {
-                // Shared mode: iterate every namespace the repo *currently*
-                // declares AND every namespace it has previously managed.
-                // Missing the latter means a PR that removes the last resource
-                // from a namespace silently stops reconciling it — the gateway
-                // keeps the orphan forever.
-                use std::collections::BTreeSet;
-                let mut set: BTreeSet<String> =
-                    config::collect_namespaces(desired).into_iter().collect();
-                for key in state.resources.keys() {
-                    if let Some(ns) = diff::resource_diff::state_key_namespace(key) {
-                        set.insert(ns);
-                    }
-                }
-                set.into_iter().collect()
-            }
-        },
-    }
 }
 
 /// In `exclusive` mode, every resource in `desired` must live in a namespace
@@ -712,13 +668,6 @@ async fn convergence_line(client: &AdminClient) -> String {
     match client.get_cluster().await {
         Ok(status) => gitforgeops::http_client::convergence_summary(&status),
         Err(_) => gitforgeops::http_client::CONVERGENCE_UNAVAILABLE.to_string(),
-    }
-}
-
-fn previously_managed(resolved: &ResolvedEnv, state: &StateFile) -> Option<HashSet<String>> {
-    match resolved.ownership.mode {
-        OwnershipMode::Shared => Some(state.previously_managed_keys()),
-        OwnershipMode::Exclusive => None,
     }
 }
 

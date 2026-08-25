@@ -5,8 +5,12 @@ target/
 *.pdb
 **/mutants.out*/
 
-# GitForgeOps state (local, not committed)
-.state/
+# GitForgeOps state. The per-environment JSON manifests ARE committed —
+# apply-on-merge.yml and rotate.yml push them back to main, and shared-mode
+# ownership tracking is broken without them. Locks and the temp files
+# StateFile::save renames from are local-only.
+.state/*
+!.state/*.json
 
 # Environment files (may contain secrets)
 .env
