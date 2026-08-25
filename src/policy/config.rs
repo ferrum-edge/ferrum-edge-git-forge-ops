@@ -62,40 +62,46 @@ impl Default for RequireAuthPluginRuleConfig {
     }
 }
 
-const DEFAULT_AUTH_PLUGIN_NAMES: &[&str] = &[
+/// Spellings that are not real `plugin_name` values but appear in
+/// hand-written policy files and in this repo's own examples from before the
+/// catalog was pinned down. Tolerated so an upgrade does not suddenly report
+/// every proxy as unauthenticated, but they can never match a live plugin —
+/// `plugin_name_is_known` flags them separately as unknown names.
+const LEGACY_AUTH_PLUGIN_ALIASES: &[&str] = &[
     "jwt",
-    "basic_auth",
+    "oauth2",
+    "oidc",
     "basic-auth",
     "basic auth",
     "basicauth",
-    "key_auth",
     "key-auth",
     "keyauth",
-    "oauth2",
-    "oidc",
-    "ldap_auth",
     "ldap-auth",
     "ldapauth",
-    "hmac_auth",
     "hmac-auth",
     "hmacauth",
-    "mtls_auth",
     "mtls-auth",
     "mtlsauth",
 ];
 
 /// Ferrum Edge built-in auth plugin ids. Matching is case-insensitive against
 /// the plugin's `plugin_name` field.
+///
+/// The canonical eleven come from [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`]
+/// so this list cannot drift from the gateway's registry; the legacy aliases
+/// are appended for backwards compatibility with older policy files.
 pub fn default_auth_plugin_names() -> Vec<String> {
-    DEFAULT_AUTH_PLUGIN_NAMES
+    crate::plugin_catalog::AUTH_PLUGIN_NAMES
         .iter()
+        .chain(LEGACY_AUTH_PLUGIN_ALIASES.iter())
         .map(|name| (*name).to_string())
         .collect()
 }
 
 pub fn is_default_auth_plugin_name(plugin_name: &str) -> bool {
     let plugin_name = plugin_name.to_ascii_lowercase();
-    DEFAULT_AUTH_PLUGIN_NAMES.contains(&plugin_name.as_str())
+    crate::plugin_catalog::AUTH_PLUGIN_NAMES.contains(&plugin_name.as_str())
+        || LEGACY_AUTH_PLUGIN_ALIASES.contains(&plugin_name.as_str())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -126,6 +132,83 @@ pub struct AllowedBackendDomainsRuleConfig {
     pub allowed_domains: Vec<String>,
 }
 
+/// `waf_enforcement` — a WAF that is attached but not blocking.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WafEnforcementRuleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub severity: Severity,
+    /// When set, also require `paranoia_level` to be at least this value
+    /// (the gateway accepts 1-4 and defaults to 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_paranoia_level: Option<u8>,
+}
+
+fn default_ai_guardrail_names() -> Vec<String> {
+    crate::plugin_catalog::AI_GUARDRAIL_PLUGIN_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// `require_ai_guardrails` — AI routes must carry a content guardrail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequireAiGuardrailsRuleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub severity: Severity,
+    /// Plugin names that satisfy the guardrail requirement.
+    #[serde(default = "default_ai_guardrail_names")]
+    pub guardrail_plugin_names: Vec<String>,
+}
+
+impl Default for RequireAiGuardrailsRuleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::default(),
+            guardrail_plugin_names: default_ai_guardrail_names(),
+        }
+    }
+}
+
+/// `rate_limit_completeness` — a rate limiter that declares no usable budget.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RateLimitCompletenessRuleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub severity: Severity,
+}
+
+/// `plugin_name_is_known` — the name must be one the gateway will load.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginNameIsKnownRuleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Severity for a name that is merely unknown (a custom plugin the
+    /// gateway build may or may not carry). Retired and reserved names are
+    /// always reported at `error`: the gateway refuses to load them, so no
+    /// configured severity can make them acceptable.
+    #[serde(default)]
+    pub severity: Severity,
+    /// Custom plugin names compiled into this deployment's gateway build.
+    /// Listing them here stops the rule reporting them as unknown.
+    #[serde(default)]
+    pub allowed_extra_plugin_names: Vec<String>,
+}
+
+/// `priority_override_range` — the gateway accepts 0..=10000.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PriorityOverrideRangeRuleConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub severity: Severity,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PolicyRules {
     #[serde(default)]
@@ -140,6 +223,16 @@ pub struct PolicyRules {
     pub allowed_proxy_plugins: AllowedProxyPluginsRuleConfig,
     #[serde(default)]
     pub allowed_backend_domains: AllowedBackendDomainsRuleConfig,
+    #[serde(default)]
+    pub waf_enforcement: WafEnforcementRuleConfig,
+    #[serde(default)]
+    pub require_ai_guardrails: RequireAiGuardrailsRuleConfig,
+    #[serde(default)]
+    pub rate_limit_completeness: RateLimitCompletenessRuleConfig,
+    #[serde(default)]
+    pub plugin_name_is_known: PluginNameIsKnownRuleConfig,
+    #[serde(default)]
+    pub priority_override_range: PriorityOverrideRangeRuleConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

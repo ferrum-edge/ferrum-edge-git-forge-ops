@@ -1,5 +1,6 @@
-use crate::config::schema::{PluginConfig, PluginScope, Proxy};
+use crate::config::schema::Proxy;
 use crate::config::GatewayConfig;
+use crate::plugin_catalog::{effective_plugins, AUTH_PLUGIN_NAMES};
 use crate::policy::config::RequireAuthPluginRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
 
@@ -13,10 +14,14 @@ impl RequireAuthPluginRule {
     }
 
     fn proxy_has_auth(&self, cfg: &GatewayConfig, proxy: &Proxy) -> bool {
-        // Explicit allowlist matching keeps valid auth plugin ids such as
-        // `jwt` accepted while rejecting unrelated names that merely contain
-        // auth-like substrings. Matching is case-insensitive against the
-        // allowlist entries.
+        // Explicit allowlist matching keeps valid auth plugin ids accepted
+        // while rejecting unrelated names that merely contain auth-like
+        // substrings. Matching is case-insensitive against the allowlist.
+        //
+        // Scope resolution (including the `enabled` guard, without which an
+        // attacker could commit `enabled: false` on an auth plugin and pass
+        // this policy while the proxy accepts unauthenticated traffic) is
+        // delegated to the shared `effective_plugins` merge.
         let allowlist: Vec<String> = self
             .config
             .auth_plugin_names
@@ -24,37 +29,9 @@ impl RequireAuthPluginRule {
             .map(|s| s.to_ascii_lowercase())
             .collect();
 
-        let in_scope = |plugin: &PluginConfig| -> bool {
-            // A disabled auth plugin provides no authentication — the gateway
-            // skips it on every request. Treating it as "satisfies auth"
-            // would let an attacker commit a plugin with enabled=false and
-            // pass this policy while the proxy actually accepts unauthenticated
-            // traffic.
-            if !plugin.enabled {
-                return false;
-            }
-            if !allowlist.contains(&plugin.plugin_name.to_ascii_lowercase()) {
-                return false;
-            }
-            if plugin.namespace != proxy.namespace {
-                return false;
-            }
-            match plugin.scope {
-                PluginScope::Global => true,
-                PluginScope::Proxy => {
-                    plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
-                        && proxy
-                            .plugins
-                            .iter()
-                            .any(|assoc| assoc.plugin_config_id == plugin.id)
-                }
-                PluginScope::ProxyGroup => proxy
-                    .plugins
-                    .iter()
-                    .any(|assoc| assoc.plugin_config_id == plugin.id),
-            }
-        };
-        cfg.plugin_configs.iter().any(in_scope)
+        effective_plugins(cfg, proxy)
+            .into_iter()
+            .any(|plugin| allowlist.contains(&plugin.plugin_name.to_ascii_lowercase()))
     }
 }
 
@@ -77,11 +54,16 @@ impl PolicyCheck for RequireAuthPluginRule {
                     kind: "Proxy".to_string(),
                     id: proxy.id.clone(),
                     namespace: proxy.namespace.clone(),
-                    message: "No authentication plugin attached to this proxy".to_string(),
-                    remediation: Some(
-                        "Attach an auth plugin (jwt, basic-auth, key-auth, etc.) or a global auth plugin in the same namespace"
-                            .to_string(),
+                    message: format!(
+                        "proxy {} in namespace {} has no enabled authentication plugin in its effective plugin list",
+                        proxy.id, proxy.namespace
                     ),
+                    remediation: Some(format!(
+                        "Attach an auth plugin ({}) to proxy {}, or add a global one in namespace {}",
+                        AUTH_PLUGIN_NAMES.join(", "),
+                        proxy.id,
+                        proxy.namespace
+                    )),
                     overridden_by: None,
                 });
             }

@@ -1,11 +1,53 @@
 # Example consumer resource — rename this file (remove leading _) to use it.
 #
+# ferrum-edge recognizes exactly five credential types, and each one is an
+# ARRAY of entries. Write them that way: `GET /backup` always returns the
+# array form, so a bare object (`keyauth: {key: ...}`) shows up as permanent
+# drift in `gitforgeops diff`. (gitforgeops normalizes the object form during
+# assembly, but the array form is what the gateway means.)
+#
+#   keyauth    [{key: "<non-empty, <=4096 chars>"}]
+#   jwt        [{secret: "<>=32 chars>"}]           # `secret` is the only field
+#   hmac_auth  [{secret: "<>=32 chars>"}]           # unique per namespace
+#   mtls_auth  [{identity: "<cert CN/SAN/fingerprint>"}]
+#   basicauth  [{password: "..."}] XOR [{password_hash: "hmac_sha256:<64 hex>"}]
+#
+# Removing a credential: omitting `keyauth`, `jwt`, `hmac_auth` or `mtls_auth`
+# DELETES the stored entries on the next apply. Omitting `basicauth` (or any
+# unrecognized type) PRESERVES what the gateway already has. To actually clear
+# one of the first four, write an explicit empty array: `keyauth: []`.
+#
 # kind: Consumer
 # spec:
 #   id: "consumer-alice"
 #   username: "alice"
 #   credentials:
+#     # Broker-generated: gitforgeops allocates a random value on first apply,
+#     # stores it in the FERRUM_CREDS_BUNDLE environment secret, and delivers
+#     # it age-encrypted to the PR author. Slot: ferrum/consumer-alice/keyauth/key
 #     keyauth:
-#       key: "${ALICE_API_KEY}"    # secret ref — resolved at apply time
+#       - key: "${gh-env-secret:alloc=generate}"
+#
+#     # jwt/hmac_auth secrets must be >=32 characters. The default len=32
+#     # (entropy bytes) yields 43 base64url characters; len must be >=24.
+#     # jwt:
+#     #   - secret: "${gh-env-secret:alloc=generate|len=32}"
+#
+#     # basicauth cannot be brokered in file mode: a file-mode gateway rejects
+#     # a plaintext `password`, and `password_hash` is an HMAC-SHA256 computed
+#     # with the gateway's server-side FERRUM_BASIC_AUTH_HMAC_SECRET, which
+#     # gitforgeops does not have. Set the hash by hand for file mode:
+#     # basicauth:
+#     #   - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
+#     #
+#     # Against an api-mode gateway a plaintext password works — the admin API
+#     # hashes it on write — and can be broker-generated:
+#     # basicauth:
+#     #   - password: "${gh-env-secret:alloc=generate}"
+#
+#     # mtls_auth identities must match a real certificate field, so they are
+#     # never broker-generated:
+#     # mtls_auth:
+#     #   - identity: "CN=alice.clients.example.com"
 #   acl_groups:
 #     - "engineering"

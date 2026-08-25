@@ -1,7 +1,37 @@
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, GatewayMode};
 
 use super::bundle::CredentialBundle;
 use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
+
+/// Credential types whose secret must be at least 32 characters
+/// (`jwt.secret`, `hmac_auth.secret`).
+pub const MIN32_CREDENTIAL_TYPES: [&str; 2] = ["jwt", "hmac_auth"];
+
+/// Minimum `len=` (entropy bytes) that still yields ≥32 characters once
+/// base64url-no-pad encoded: `ceil(24 * 4 / 3) == 32`.
+pub const MIN_ENTROPY_BYTES_FOR_32_CHARS: usize = 24;
+
+/// ferrum-edge rejects any credential string longer than 4096 characters.
+pub const MAX_CREDENTIAL_VALUE_CHARS: usize = 4096;
+
+/// Sentinel ferrum-edge substitutes for `keyauth.key`, `jwt.secret` and
+/// `hmac_auth.secret` on a normal `GET` (only `GET /backup` returns real
+/// values). It is reserved: writing it back is rejected by the gateway, so a
+/// bundle that contains it was seeded from the wrong endpoint.
+pub const REDACTED_SENTINEL: &str = "[REDACTED]";
+
+/// Whether generation constraints ([`check_generation_constraints`]) abort the
+/// walk or are merely reflected in the returned statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintMode {
+    /// Return `Err` for a placeholder the broker provably cannot satisfy.
+    /// Used by `plan`/`diff`/`apply`, where allocation is about to happen.
+    Enforce,
+    /// Never fail on a generation constraint. Used by the `rotate` preflight,
+    /// which walks the whole config to locate one slot and must not be blocked
+    /// by an unrelated consumer's unsatisfiable placeholder.
+    ReportOnly,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotStatus {
@@ -37,9 +67,32 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default)]
 pub struct ResolveReport {
     pub results: Vec<ResolveResult>,
+    /// Non-fatal advisories raised while walking the credential tree.
+    ///
+    /// Currently these are the array-slot-identity hazards described on
+    /// [`is_elided`]: entry *position* is the slot identity, so removing or
+    /// reordering entries of a multi-entry credential array silently hands a
+    /// retired slot's value to whichever entry shifted into its index. Each
+    /// message is also echoed to stderr by the entrypoints so it shows up in
+    /// CI logs even when the caller ignores this field.
+    pub warnings: Vec<String>,
+    /// `slot → credential type` for every slot in `results`, captured
+    /// structurally while walking (the type is the third path component, known
+    /// before the slot string is ever joined).
+    ///
+    /// The allocator consumes this so it does not have to recover the type by
+    /// string-splitting the slot back apart; see
+    /// [`crate::secrets::allocator::generate_credential_value_typed`].
+    pub slot_credential_types: std::collections::BTreeMap<String, String>,
 }
 
 impl ResolveReport {
+    /// Structurally-captured credential type for `slot`, if this report
+    /// produced it.
+    pub fn credential_type_for(&self, slot: &str) -> Option<&str> {
+        self.slot_credential_types.get(slot).map(String::as_str)
+    }
+
     pub fn needs_allocation(&self) -> Vec<&ResolveResult> {
         self.results
             .iter()
@@ -88,6 +141,39 @@ fn escape_slot_component(s: &str) -> String {
     out
 }
 
+/// Inverse of [`escape_slot_component`]. A trailing lone `~` (impossible in
+/// output of the escaper) is passed through verbatim rather than dropped.
+fn unescape_slot_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '~' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('0') => out.push('~'),
+            Some('1') => out.push('/'),
+            Some('2') => out.push('['),
+            Some(other) => {
+                out.push('~');
+                out.push(other);
+            }
+            None => out.push('~'),
+        }
+    }
+    out
+}
+
+/// The credential type (`keyauth`, `basicauth`, …) encoded in a slot string.
+///
+/// Slot components are `/`-joined with real `/` escaped to `~1`, so a plain
+/// `split('/')` is unambiguous: index 0 is the namespace, 1 the consumer id,
+/// and 2 the top-level credential key.
+pub(crate) fn credential_type_from_slot(slot: &str) -> Option<String> {
+    slot.split('/').nth(2).map(unescape_slot_component)
+}
+
 fn encode_component(c: &SlotComponent<'_>) -> String {
     match c {
         SlotComponent::Literal(s) => escape_slot_component(s),
@@ -95,7 +181,73 @@ fn encode_component(c: &SlotComponent<'_>) -> String {
     }
 }
 
+/// `ArrayIndex(0)` is elided from the canonical slot path.
+///
+/// ferrum-edge stores every consumer credential as an **array** of entries
+/// (`keyauth: [{key: "…"}]`), and `gitforgeops` now normalizes the bare-object
+/// form (`keyauth: {key: "…"}`) into that array during assembly. Without this
+/// elision the normalization would silently rename every existing slot from
+/// `<ns>/<id>/keyauth/key` to `<ns>/<id>/keyauth/[0]/key`, orphaning every
+/// value already allocated in `FERRUM_CREDS_BUNDLE*` and re-generating (and
+/// re-delivering) credentials that consumers are actively using.
+///
+/// So index `0` — the only index a normalized single-entry credential can
+/// have — renders as the legacy unindexed name, and only index ≥ 1 appends
+/// `[N]`:
+///
+/// ```text
+/// keyauth: [{key: K}]            -> <ns>/<id>/keyauth/key
+/// keyauth: {key: K}   (legacy)   -> <ns>/<id>/keyauth/key      (same slot)
+/// keyauth: [{key: K}, {key: K2}] -> <ns>/<id>/keyauth/key
+///                                   <ns>/<id>/keyauth/[1]/key
+/// ```
+///
+/// Injectivity is preserved because index 0 is unique within its parent
+/// array, and a literal object key spelled `[0]` escapes its bracket to
+/// `~20]`. `detect_slot_collisions` is the backstop if that ever stops
+/// holding.
+///
+/// # Hazard: entry position IS the slot identity
+///
+/// Nothing about an entry's *content* participates in its slot name — only its
+/// index does. So for a multi-entry credential array, deleting or reordering
+/// entries silently re-owns stored values:
+///
+/// ```text
+/// before:  keyauth: [{key: A}, {key: B}]
+///          A -> <ns>/<id>/keyauth/key        (elided index 0)
+///          B -> <ns>/<id>/keyauth/[1]/key
+///
+/// delete the first entry:
+/// after:   keyauth: [{key: B}]
+///          B -> <ns>/<id>/keyauth/key        <-- now resolves to A's value
+/// ```
+///
+/// The credential the operator meant to retire is still live, now issued to
+/// the surviving entry, and `[1]` is orphaned in the bundle where a later
+/// re-grow would resurrect it. A retroactive content-addressed rename is not
+/// possible without orphaning every slot already allocated by earlier
+/// releases, so the resolver instead *detects* both shapes and reports them
+/// through [`ResolveReport::warnings`] (see `check_array_slot_identity`). The
+/// safe operation is `gitforgeops rotate --credential …/[N]/…`, which replaces
+/// the value in place rather than moving entries around.
+fn is_elided(c: &SlotComponent<'_>) -> bool {
+    matches!(c, SlotComponent::ArrayIndex(0))
+}
+
 fn join_slot_components(components: &[SlotComponent<'_>]) -> String {
+    components
+        .iter()
+        .filter(|c| !is_elided(c))
+        .map(encode_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Verbatim join that keeps `[0]`. This is the shape emitted by gitforgeops
+/// releases between the array-walker landing and index-0 elision; kept as a
+/// read-only lookup candidate so those bundles still resolve.
+fn join_slot_components_verbatim(components: &[SlotComponent<'_>]) -> String {
     components
         .iter()
         .map(encode_component)
@@ -103,7 +255,10 @@ fn join_slot_components(components: &[SlotComponent<'_>]) -> String {
         .join("/")
 }
 
-fn legacy_slot_from_components(components: &[SlotComponent<'_>]) -> Option<String> {
+fn legacy_slot_from_components(
+    components: &[SlotComponent<'_>],
+    keep_index_zero: bool,
+) -> Option<String> {
     if components.len() <= 3 {
         return None;
     }
@@ -132,10 +287,33 @@ fn legacy_slot_from_components(components: &[SlotComponent<'_>]) -> Option<Strin
                 path.push('.');
                 path.push_str(s);
             }
+            SlotComponent::ArrayIndex(0) if !keep_index_zero => {}
             SlotComponent::ArrayIndex(i) => path.push_str(&format!("[{i}]")),
         }
     }
     Some(format!("{namespace}/{consumer_id}/{path}"))
+}
+
+/// Read-only lookup order for a credential slot, newest encoding first.
+///
+/// Only `join_slot_components` (index-0 elided) is ever **written**; the rest
+/// exist so a bundle allocated by an older gitforgeops still resolves after
+/// an upgrade instead of orphaning and re-allocating.
+fn slot_lookup_candidates(components: &[SlotComponent<'_>]) -> Vec<String> {
+    let mut candidates = vec![join_slot_components(components)];
+    let mut push = |s: String| {
+        if !candidates.contains(&s) {
+            candidates.push(s);
+        }
+    };
+    push(join_slot_components_verbatim(components));
+    if let Some(s) = legacy_slot_from_components(components, false) {
+        push(s);
+    }
+    if let Some(s) = legacy_slot_from_components(components, true) {
+        push(s);
+    }
+    candidates
 }
 
 fn lookup_slot_value<'a>(
@@ -143,12 +321,25 @@ fn lookup_slot_value<'a>(
     slot: &str,
     bundle: &'a CredentialBundle,
 ) -> crate::error::Result<Option<&'a String>> {
-    let current = bundle.get(slot);
-    if current.is_some() {
-        return Ok(current);
-    }
-    if let Some(legacy_slot) = legacy_slot_from_components(components) {
-        return Ok(bundle.get(&legacy_slot));
+    let found = slot_lookup_candidates(components)
+        .into_iter()
+        .find_map(|candidate| bundle.get(&candidate));
+
+    if let Some(value) = found {
+        // `[REDACTED]` is what a plain `GET /consumers/...` returns for
+        // `keyauth.key`, `jwt.secret` and `hmac_auth.secret`. If it made it
+        // into a bundle, the bundle was seeded from the wrong endpoint (only
+        // `GET /backup` returns real values) and pushing it back would be
+        // rejected by the gateway — or, worse, quietly install the literal
+        // string as the credential.
+        if value == REDACTED_SENTINEL {
+            return Err(crate::error::Error::Config(format!(
+                "credential slot '{slot}' holds the reserved sentinel '{REDACTED_SENTINEL}'. \
+                 ferrum-edge redacts keyauth/jwt/hmac_auth secrets on normal GETs; re-seed the \
+                 bundle from 'GET /backup' or rotate the slot with 'gitforgeops rotate'."
+            )));
+        }
+        return Ok(Some(value));
     }
     Ok(None)
 }
@@ -156,29 +347,61 @@ fn lookup_slot_value<'a>(
 /// Build a slot path from the CLI `--credential` argument.
 ///
 /// `cred_key` is interpreted as a `/`-separated path matching the walker's
-/// nested-object emission: a top-level string credential maps to a single
-/// component (`api_key` → `<ns>/<id>/api_key`), and a placeholder reached
-/// by object traversal uses `/` as the path separator (`basic_auth.password`
-/// → `<ns>/<id>/basic_auth/password`). Each segment is run through
-/// `escape_slot_component`, so `~` in a segment escapes to `~0` and matches
-/// the walker for top-level keys containing `~`.
+/// emission for ferrum-edge's real credential shapes. Credentials are arrays
+/// of entries, and index 0 is elided (see [`is_elided`]), so the first entry
+/// of each type is addressed without an index:
 ///
-/// Limitation: a literal `/` inside a single credential key (e.g. a flat
-/// top-level key spelled `foo/bar`) cannot be addressed from the CLI — the
-/// walker emits `<ns>/<id>/foo~1bar` for that, but this function will always
-/// interpret `/` as a path separator. There is no CLI escape syntax because
-/// routing a user-typed `~1` through `escape_slot_component` would
-/// double-escape the `~` to `~01`. Such keys are vanishingly rare in
-/// practice; if you hit this, rename the key to avoid `/`.
+/// ```text
+/// --credential keyauth/key        -> <ns>/<id>/keyauth/key
+/// --credential jwt/secret         -> <ns>/<id>/jwt/secret
+/// --credential hmac_auth/secret   -> <ns>/<id>/hmac_auth/secret
+/// --credential mtls_auth/identity -> <ns>/<id>/mtls_auth/identity
+/// --credential basicauth/password -> <ns>/<id>/basicauth/password
+/// ```
+///
+/// A segment spelled exactly `[N]` is an array index, so the second and later
+/// entries of a type stay addressable: `--credential keyauth/[1]/key`.
+/// `[0]` is accepted and normalizes to the elided form, so
+/// `keyauth/[0]/key` and `keyauth/key` name the same slot.
+///
+/// Limitations, both from `/` being the unescapable separator: a literal `/`
+/// inside a single credential key (`foo/bar`, which the walker emits as
+/// `<ns>/<id>/foo~1bar`) and a literal object key spelled exactly `[1]` can't
+/// be addressed from the CLI. There is no CLI escape syntax because routing a
+/// user-typed `~1` through `escape_slot_component` would double-escape the
+/// `~` to `~01`. Neither shape occurs in ferrum-edge's credential schema; if
+/// you hit it in a custom credential type, rename the key.
 pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
     let mut components: Vec<SlotComponent<'_>> = vec![
         SlotComponent::Literal(namespace),
         SlotComponent::Literal(consumer_id),
     ];
     for piece in cred_key.split('/') {
-        components.push(SlotComponent::Literal(piece));
+        match parse_index_segment(piece) {
+            Some(i) => components.push(SlotComponent::ArrayIndex(i)),
+            None => components.push(SlotComponent::Literal(piece)),
+        }
     }
     join_slot_components(&components)
+}
+
+/// `"[12]"` → `Some(12)`; anything else → `None`.
+fn parse_index_segment(piece: &str) -> Option<usize> {
+    piece
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse::<usize>().ok())
+}
+
+/// Gateway mode for the current process, read from `FERRUM_GATEWAY_MODE`.
+///
+/// The mode-taking `*_with_mode` variants exist so tests (and any caller that
+/// already has an `EnvConfig` in hand) don't have to go through the process
+/// environment. `main.rs` calls the two-argument forms, whose signatures stay
+/// stable.
+fn current_gateway_mode() -> GatewayMode {
+    crate::config::load_env_config().gateway_mode
 }
 
 /// Walk consumers and produce a [`ResolveReport`] **without mutating** `cfg`.
@@ -191,6 +414,54 @@ pub fn report_secrets(
     cfg: &crate::config::GatewayConfig,
     bundle: &CredentialBundle,
 ) -> crate::error::Result<ResolveReport> {
+    report_secrets_with_mode(cfg, bundle, current_gateway_mode())
+}
+
+/// [`report_secrets`] that never fails on a *generation constraint*.
+///
+/// Same signature and return type as [`report_secrets`]; the only difference
+/// is that placeholders the broker provably cannot generate
+/// ([`check_generation_constraints`]) are reported as ordinary statuses rather
+/// than returned as an `Err`.
+///
+/// This exists for the `rotate` preflight. `rotate` targets one specific slot,
+/// but the preflight walks the *whole* assembled config to find it — so an
+/// unrelated consumer holding, say, a `len=16` `jwt` generate placeholder
+/// would abort a rotation that has nothing to do with it. Structural errors
+/// (malformed placeholders, `[REDACTED]` bundle values, slot collisions) are
+/// still hard failures in both variants, because those make the report itself
+/// untrustworthy.
+///
+/// `plan`/`diff`/`apply` keep using strict [`report_secrets`]: there the
+/// constraint really is fatal, since apply would otherwise write a GitHub
+/// Environment Secret holding a value the gateway rejects.
+pub fn report_secrets_lenient(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+) -> crate::error::Result<ResolveReport> {
+    report_secrets_with_mode_inner(
+        cfg,
+        bundle,
+        current_gateway_mode(),
+        ConstraintMode::ReportOnly,
+    )
+}
+
+/// [`report_secrets`] with the gateway mode supplied explicitly.
+pub fn report_secrets_with_mode(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
+) -> crate::error::Result<ResolveReport> {
+    report_secrets_with_mode_inner(cfg, bundle, mode, ConstraintMode::Enforce)
+}
+
+fn report_secrets_with_mode_inner(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
+    constraints: ConstraintMode,
+) -> crate::error::Result<ResolveReport> {
     let mut report = ResolveReport::default();
     for consumer in &cfg.consumers {
         let namespace = &consumer.namespace;
@@ -201,7 +472,7 @@ pub fn report_secrets(
                 SlotComponent::Literal(consumer_id.as_str()),
                 SlotComponent::Literal(cred_key.as_str()),
             ];
-            walk_and_report(value, &components, bundle, &mut report)?;
+            walk_and_report(value, &components, bundle, &mode, constraints, &mut report)?;
         }
     }
     // Defense-in-depth: detect any duplicate slot strings. With the escape
@@ -227,9 +498,30 @@ pub fn report_secrets(
 ///     redeliver every persistent rotate slot to that PR's author, even
 ///     when the credential belonged to an unrelated consumer.
 ///   - Missing slot: placeholder stays; the report tells the caller why.
+///
+/// # Read-modify-write hazard
+///
+/// ferrum-edge treats an omitted credential type asymmetrically on write:
+/// omitting `keyauth`, `jwt`, `hmac_auth` or `mtls_auth` **deletes** the
+/// stored entries, while omitting `basicauth` or any unrecognized type
+/// **preserves** them. So a repo YAML that drops a `keyauth` block silently
+/// revokes those API keys on the next apply, but dropping a `basicauth` block
+/// leaves the password in place and gitforgeops will report it as unmanaged
+/// drift forever. Removing a credential you actually want gone therefore
+/// needs an explicit empty array (`keyauth: []`) for the delete-on-omit
+/// types, and a gateway-side removal for `basicauth`.
 pub fn resolve_secrets(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
+) -> crate::error::Result<ResolveReport> {
+    resolve_secrets_with_mode(cfg, bundle, current_gateway_mode())
+}
+
+/// [`resolve_secrets`] with the gateway mode supplied explicitly.
+pub fn resolve_secrets_with_mode(
+    cfg: &mut GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
 ) -> crate::error::Result<ResolveReport> {
     let mut report = ResolveReport::default();
 
@@ -242,12 +534,233 @@ pub fn resolve_secrets(
                 SlotComponent::Literal(consumer_id.as_str()),
                 SlotComponent::Literal(cred_key.as_str()),
             ];
-            walk_report_and_replace(value, &mut components, bundle, &mut report)?;
+            walk_report_and_replace(value, &mut components, bundle, &mode, &mut report)?;
         }
     }
 
     detect_slot_collisions(&report)?;
     Ok(report)
+}
+
+/// Reject `alloc=generate` / `alloc=rotate` placeholders the broker provably
+/// cannot satisfy, at resolve time — so `plan`/`diff` surface the problem
+/// before `apply` writes a GitHub Environment Secret holding a value the
+/// gateway will refuse.
+///
+/// Only fires for slots that would actually be allocated
+/// ([`SlotStatus::NeedsAllocation`]); an already-allocated slot keeps
+/// resolving from the bundle whatever its shape.
+///
+/// Constraints, all from ferrum-edge's `Consumer::validate_fields()`:
+///
+/// * `basicauth` + **file mode** — a file-mode gateway hard-rejects a
+///   plaintext `password`, and only the admin API hashes one on write.
+/// * `basicauth/…/password_hash` — the hash is
+///   `hmac_sha256:<64 lowercase hex>` computed under the gateway's
+///   server-wide `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not
+///   have. Random bytes can never be a valid hash, in either mode.
+/// * `jwt` / `hmac_auth` — secrets must be ≥32 characters, so `len=` must be
+///   at least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] entropy bytes.
+///
+/// `mtls_auth.identity` is *also* not brokerable (it has to match a real
+/// certificate's CN/SAN/fingerprint), but it is left as a documented footgun
+/// rather than a hard error: unlike basicauth there is no mode in which a
+/// generated value is correct, so anyone writing `alloc=generate` there has
+/// already gone out of their way, and failing existing configs closed on
+/// upgrade would be worse than the gateway's own rejection message.
+fn check_generation_constraints(
+    components: &[SlotComponent<'_>],
+    placeholder: &SecretPlaceholder,
+    status: &SlotStatus,
+    mode: &GatewayMode,
+    constraints: ConstraintMode,
+) -> crate::error::Result<()> {
+    if matches!(constraints, ConstraintMode::ReportOnly) {
+        return Ok(());
+    }
+    if !matches!(status, SlotStatus::NeedsAllocation) {
+        return Ok(());
+    }
+    let slot = join_slot_components(components);
+    let cred_type = match components.get(2) {
+        Some(SlotComponent::Literal(s)) => *s,
+        _ => return Ok(()),
+    };
+    let leaf = match components.last() {
+        Some(SlotComponent::Literal(s)) => *s,
+        _ => "",
+    };
+
+    if cred_type == "basicauth" {
+        if leaf == "password_hash" {
+            return Err(crate::error::Error::Config(format!(
+                "credential slot '{slot}': the broker cannot generate a basicauth password_hash. \
+                 ferrum-edge expects 'hmac_sha256:<64 lowercase hex>' computed with the gateway's \
+                 FERRUM_BASIC_AUTH_HMAC_SECRET, which gitforgeops does not have. Set the hash \
+                 manually, or use a plaintext 'password' against an api-mode gateway and let the \
+                 gateway hash it."
+            )));
+        }
+        if matches!(mode, GatewayMode::File) {
+            return Err(crate::error::Error::Config(format!(
+                "credential slot '{slot}': file-mode gateways require password_hash; the broker \
+                 cannot compute hmac_sha256 hashes without the gateway's \
+                 FERRUM_BASIC_AUTH_HMAC_SECRET — set the hash manually or use api mode \
+                 (FERRUM_GATEWAY_MODE=api), where the admin API hashes a plaintext password on \
+                 write."
+            )));
+        }
+    }
+
+    check_min_entropy(&slot, cred_type, placeholder.length_bytes)?;
+
+    Ok(())
+}
+
+/// The one implementation of ferrum-edge's ≥32-character secret floor for
+/// `jwt` / `hmac_auth`.
+///
+/// Both the plan-time resolver check ([`check_generation_constraints`]) and
+/// the generate-time allocator check
+/// ([`crate::secrets::allocator::generate_credential_value_typed`]) call this,
+/// so the rule and its wording live in exactly one place. Pure: no I/O, no
+/// randomness — it only decides whether `length_bytes` entropy bytes can
+/// base64url-encode to at least 32 characters for this credential type.
+pub(crate) fn check_min_entropy(
+    slot: &str,
+    cred_type: &str,
+    length_bytes: usize,
+) -> crate::error::Result<()> {
+    if MIN32_CREDENTIAL_TYPES.contains(&cred_type) && length_bytes < MIN_ENTROPY_BYTES_FOR_32_CHARS
+    {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': {cred_type} secrets must be at least 32 characters, but \
+             'len={length_bytes}' generates only {} base64url characters. Use \
+             'len={MIN_ENTROPY_BYTES_FOR_32_CHARS}' or higher (the default len=32 yields 43 \
+             characters).",
+            base64_chars(length_bytes),
+        )));
+    }
+    Ok(())
+}
+
+/// Does this credential subtree contain at least one `${gh-env-secret:…}`
+/// placeholder? Used to decide whether array-slot advisories are relevant —
+/// an array of literal credentials has no brokered slots to shift.
+///
+/// A malformed placeholder counts as present; the walker reports the parse
+/// error on its own pass.
+fn contains_placeholder(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => parse_placeholder(s).is_some(),
+        serde_json::Value::Object(map) => map.values().any(contains_placeholder),
+        serde_json::Value::Array(items) => items.iter().any(contains_placeholder),
+        _ => false,
+    }
+}
+
+/// G3 advisories for one credential **array** node.
+///
+/// Slot identity is positional (see [`is_elided`]): entry 0 owns the elided
+/// slot, entry 1 owns `[1]`, and so on. Nothing in the entry's own content
+/// participates in the slot name, so:
+///
+/// * **Reorder/delete hazard** — deleting the first of two `keyauth` entries
+///   shifts the survivor into index 0 and hands it the deleted entry's stored
+///   value. The credential the operator meant to retire stays live under a new
+///   owner. Warn whenever a brokered array has more than one entry.
+/// * **Orphaned slot** — the bundle still holds a slot for an index the array
+///   no longer has (the array shrank). That value is now unreferenced, and
+///   re-growing the array would silently resurrect it for the new entry.
+///
+/// Both are warnings, not errors: the bundle is not corrupt, and failing an
+/// apply over a shape that is merely dangerous would block legitimate
+/// shrink-then-rotate workflows.
+fn check_array_slot_identity(
+    components: &[SlotComponent<'_>],
+    items: &[serde_json::Value],
+    bundle: &CredentialBundle,
+    report: &mut ResolveReport,
+) {
+    let prefix = join_slot_components(components);
+    let brokered = items.iter().any(contains_placeholder);
+
+    if brokered && items.len() > 1 {
+        push_warning(
+            report,
+            format!(
+                "credential array '{prefix}' has {} entries and entry ORDER is the slot identity \
+                 (entry 0 uses the unindexed slot, later entries use '[1]', '[2]', …). Removing or \
+                 reordering an entry reassigns the retired slot's value to whichever entry shifts \
+                 into its index. Rotate with 'gitforgeops rotate --credential' instead of deleting \
+                 entries.",
+                items.len()
+            ),
+        );
+    }
+
+    // Orphan scan: a bundle slot under this array whose entry index is beyond
+    // the array's current length. Runs regardless of `brokered`, because an
+    // array that lost its last placeholder is exactly the shrink case.
+    let scan_prefix = format!("{prefix}/");
+    for slot in bundle.keys() {
+        let Some(rest) = slot.strip_prefix(&scan_prefix) else {
+            continue;
+        };
+        let index = entry_index_of_suffix(rest);
+        if index >= items.len() {
+            push_warning(
+                report,
+                format!(
+                    "credential slot '{slot}' is orphaned: the credential bundle still holds it, \
+                     but array '{prefix}' now has {} entr{} (entry index {index} no longer \
+                     exists). Slot identity is positional, so re-adding an entry at that index \
+                     would resurrect the stale value — rotate the slot instead of relying on the \
+                     array length.",
+                    items.len(),
+                    if items.len() == 1 { "y" } else { "ies" }
+                ),
+            );
+        }
+    }
+}
+
+/// Entry index a bundle-slot suffix belongs to: `"[2]/key"` → 2, and anything
+/// else → 0, since index 0 renders without its bracket (see [`is_elided`]).
+fn entry_index_of_suffix(rest: &str) -> usize {
+    rest.split('/')
+        .next()
+        .and_then(parse_index_segment)
+        .unwrap_or(0)
+}
+
+/// Record a warning once per report and echo it to stderr the first time this
+/// process sees that exact text, so a `plan` that resolves the same config
+/// several times doesn't repeat itself.
+fn push_warning(report: &mut ResolveReport, message: String) {
+    if report.warnings.contains(&message) {
+        return;
+    }
+    if warn_once(&message) {
+        eprintln!("Warning: {message}");
+    }
+    report.warnings.push(message);
+}
+
+fn warn_once(message: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    match SEEN.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+        Ok(mut seen) => seen.insert(message.to_string()),
+        // A poisoned mutex only costs us deduplication.
+        Err(_) => true,
+    }
+}
+
+/// Character count of `n` bytes encoded as base64url without padding.
+pub(crate) fn base64_chars(n: usize) -> usize {
+    n.div_ceil(3) * 4 - (3 - n % 3) % 3
 }
 
 /// Detect duplicate slot strings within a single resolve report. Each report
@@ -287,6 +800,8 @@ fn walk_and_report(
     value: &serde_json::Value,
     components: &[SlotComponent<'_>],
     bundle: &CredentialBundle,
+    mode: &GatewayMode,
+    constraints: ConstraintMode,
     report: &mut ResolveReport,
 ) -> crate::error::Result<()> {
     match value {
@@ -296,7 +811,9 @@ fn walk_and_report(
                 let slot = join_slot_components(components);
                 let existing = lookup_slot_value(components, &slot, bundle)?;
                 let status = classify_status(&placeholder, existing);
+                check_generation_constraints(components, &placeholder, &status, mode, constraints)?;
                 let (namespace, consumer_id, cred_key) = decompose_components(components);
+                record_credential_type(report, &slot, components);
                 report.results.push(ResolveResult {
                     consumer_id,
                     namespace,
@@ -311,14 +828,22 @@ fn walk_and_report(
             for (child_key, child_val) in map {
                 let mut child_components = components.to_vec();
                 child_components.push(SlotComponent::Literal(child_key.as_str()));
-                walk_and_report(child_val, &child_components, bundle, report)?;
+                walk_and_report(
+                    child_val,
+                    &child_components,
+                    bundle,
+                    mode,
+                    constraints,
+                    report,
+                )?;
             }
         }
         serde_json::Value::Array(items) => {
+            check_array_slot_identity(components, items, bundle, report);
             for (i, item) in items.iter().enumerate() {
                 let mut child_components = components.to_vec();
                 child_components.push(SlotComponent::ArrayIndex(i));
-                walk_and_report(item, &child_components, bundle, report)?;
+                walk_and_report(item, &child_components, bundle, mode, constraints, report)?;
             }
         }
         _ => {}
@@ -326,10 +851,26 @@ fn walk_and_report(
     Ok(())
 }
 
+/// Capture the credential type (third slot component) structurally, before it
+/// is flattened into the slot string. See
+/// [`ResolveReport::slot_credential_types`].
+fn record_credential_type(
+    report: &mut ResolveReport,
+    slot: &str,
+    components: &[SlotComponent<'_>],
+) {
+    if let Some(SlotComponent::Literal(cred_type)) = components.get(2) {
+        report
+            .slot_credential_types
+            .insert(slot.to_string(), (*cred_type).to_string());
+    }
+}
+
 fn walk_report_and_replace<'a>(
     value: &'a mut serde_json::Value,
     components: &mut Vec<SlotComponent<'a>>,
     bundle: &CredentialBundle,
+    mode: &GatewayMode,
     report: &mut ResolveReport,
 ) -> crate::error::Result<()> {
     match value {
@@ -339,8 +880,16 @@ fn walk_report_and_replace<'a>(
                 let slot = join_slot_components(components);
                 let existing = lookup_slot_value(components, &slot, bundle)?;
                 let status = classify_status(&placeholder, existing);
+                check_generation_constraints(
+                    components,
+                    &placeholder,
+                    &status,
+                    mode,
+                    ConstraintMode::Enforce,
+                )?;
                 let (namespace, consumer_id, cred_key) = decompose_components(components);
                 let replacement = existing.cloned();
+                record_credential_type(report, &slot, components);
                 report_push(
                     report,
                     placeholder,
@@ -358,14 +907,15 @@ fn walk_report_and_replace<'a>(
         serde_json::Value::Object(map) => {
             for (child_key, child_val) in map.iter_mut() {
                 components.push(SlotComponent::Literal(child_key.as_str()));
-                walk_report_and_replace(child_val, components, bundle, report)?;
+                walk_report_and_replace(child_val, components, bundle, mode, report)?;
                 components.pop();
             }
         }
         serde_json::Value::Array(items) => {
+            check_array_slot_identity(components, items, bundle, report);
             for (i, item) in items.iter_mut().enumerate() {
                 components.push(SlotComponent::ArrayIndex(i));
-                walk_report_and_replace(item, components, bundle, report)?;
+                walk_report_and_replace(item, components, bundle, mode, report)?;
                 components.pop();
             }
         }
@@ -397,7 +947,9 @@ fn report_push(
 /// for the `ResolveResult` record. The first two components are always
 /// literal (namespace, consumer_id); the remainder joined by `/` gives a
 /// human-readable cred-key path that matches the slot-path encoding for
-/// top-level or nested access.
+/// top-level or nested access — including the index-0 elision, so a
+/// `keyauth: [{key: …}]` credential reports `cred_key: "keyauth/key"` and can
+/// be pasted straight into `gitforgeops rotate --credential`.
 fn decompose_components(components: &[SlotComponent<'_>]) -> (String, String, String) {
     let namespace = match components.first() {
         Some(SlotComponent::Literal(s)) => (*s).to_string(),
@@ -407,13 +959,7 @@ fn decompose_components(components: &[SlotComponent<'_>]) -> (String, String, St
         Some(SlotComponent::Literal(s)) => (*s).to_string(),
         _ => String::new(),
     };
-    let cred_key = components
-        .get(2..)
-        .unwrap_or(&[])
-        .iter()
-        .map(encode_component)
-        .collect::<Vec<_>>()
-        .join("/");
+    let cred_key = join_slot_components(components.get(2..).unwrap_or(&[]));
     (namespace, consumer_id, cred_key)
 }
 

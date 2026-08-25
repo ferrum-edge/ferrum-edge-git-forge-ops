@@ -6,6 +6,7 @@ pub mod error;
 pub mod http_client;
 pub mod import;
 pub mod jwt;
+pub mod plugin_catalog;
 pub mod policy;
 pub mod review;
 pub mod secrets;

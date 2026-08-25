@@ -32,10 +32,54 @@ pub struct UnmanagedResource {
     pub namespace: String,
 }
 
+/// A live resource the gateway's OpenAPI-spec ingestion owns (`api_spec_id`
+/// is set).
+///
+/// These have a third owner — neither this repo nor a human admin, but the
+/// `/api-specs` importer, which re-provisions them atomically from the spec
+/// document. gitforgeops reports them and stays off them: a Modify would be
+/// reverted on the next spec import, and a Delete would silently break the
+/// spec's contract.
+#[derive(Debug, Clone)]
+pub struct SpecOwnedResource {
+    pub kind: String,
+    pub id: String,
+    pub namespace: String,
+    /// `api_spec_id` as reported by the live resource.
+    pub api_spec_id: String,
+    /// The repo *also* declares this `(namespace, kind, id)`. Two owners are
+    /// writing the same row — the repo is fighting the spec importer, and the
+    /// Modify that would normally be emitted is suppressed.
+    pub declared_in_repo: bool,
+    /// The resource is scheduled for deletion anyway, because the run carries
+    /// the explicit `--confirm-api-spec-deletion` opt-in.
+    pub pruned: bool,
+}
+
+impl SpecOwnedResource {
+    /// True when this entry is a repo-vs-spec ownership conflict rather than a
+    /// resource we are merely staying off.
+    pub fn is_conflict(&self) -> bool {
+        self.declared_in_repo
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DiffResult {
     pub diffs: Vec<ResourceDiff>,
     pub unmanaged: Vec<UnmanagedResource>,
+    /// Live resources tagged with an `api_spec_id`. Reported in their own
+    /// bucket rather than folded into `unmanaged`: the classification applies
+    /// in *both* ownership modes, and it carries the conflict signal.
+    pub spec_owned: Vec<SpecOwnedResource>,
+}
+
+impl DiffResult {
+    /// Spec-owned resources the repo also declares — the ones an operator has
+    /// to resolve by hand (drop the file, or stop managing the spec).
+    pub fn spec_conflicts(&self) -> impl Iterator<Item = &SpecOwnedResource> {
+        self.spec_owned.iter().filter(|s| s.is_conflict())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +88,18 @@ pub enum OwnershipScope<'a> {
         previously_managed: &'a HashSet<String>,
     },
     Exclusive,
+}
+
+/// Knobs that change which diff entries are *materialized* (as opposed to
+/// which ownership fence applies).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiffOptions {
+    /// Mirrors `apply --confirm-api-spec-deletion`. Off (the default),
+    /// spec-owned live resources are never emitted as deletions. On, exclusive
+    /// mode prunes them like anything else — the operator has said so
+    /// explicitly. Shared mode ignores this: the state file is the fence there
+    /// and a spec-owned resource was never in it.
+    pub prune_spec_owned: bool,
 }
 
 pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<ResourceDiff> {
@@ -76,7 +132,20 @@ pub fn compute_diff_with_scope(
     actual: &GatewayConfig,
     ownership_scope: OwnershipScope<'_>,
 ) -> DiffResult {
+    compute_diff_with_options(desired, actual, ownership_scope, DiffOptions::default())
+}
+
+pub fn compute_diff_with_options(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    ownership_scope: OwnershipScope<'_>,
+    options: DiffOptions,
+) -> DiffResult {
     let mut result = DiffResult::default();
+    let ctx = CollectionContext {
+        ownership_scope,
+        options,
+    };
 
     diff_collection(
         &desired.proxies,
@@ -84,7 +153,8 @@ pub fn compute_diff_with_scope(
         "Proxy",
         |p| p.id.clone(),
         |p| p.namespace.clone(),
-        ownership_scope,
+        |p| p.api_spec_id.clone(),
+        ctx,
         &mut result,
     );
     diff_collection(
@@ -93,7 +163,10 @@ pub fn compute_diff_with_scope(
         "Consumer",
         |c| c.id.clone(),
         |c| c.namespace.clone(),
-        ownership_scope,
+        // Consumers are never provisioned by spec ingestion — the admin API's
+        // `api_spec_id` tag exists on proxies, upstreams and plugin configs only.
+        |_| None,
+        ctx,
         &mut result,
     );
     diff_collection(
@@ -102,7 +175,8 @@ pub fn compute_diff_with_scope(
         "Upstream",
         |u| u.id.clone(),
         |u| u.namespace.clone(),
-        ownership_scope,
+        |u| u.api_spec_id.clone(),
+        ctx,
         &mut result,
     );
     diff_collection(
@@ -111,9 +185,18 @@ pub fn compute_diff_with_scope(
         "PluginConfig",
         |p| p.id.clone(),
         |p| p.namespace.clone(),
-        ownership_scope,
+        |p| p.api_spec_id.clone(),
+        ctx,
         &mut result,
     );
+
+    // `actual` is walked through a HashMap, so the spec-owned bucket comes out
+    // in arbitrary order. It is rendered verbatim into PR comments and plan
+    // output — sort it so re-runs of an unchanged config produce an unchanged
+    // report.
+    result
+        .spec_owned
+        .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));
 
     result
 }
@@ -186,6 +269,14 @@ fn decode_state_key_component(value: &str) -> String {
     out
 }
 
+/// The per-run knobs `diff_collection` needs, bundled so the argument list
+/// stays readable.
+#[derive(Debug, Clone, Copy)]
+struct CollectionContext<'a> {
+    ownership_scope: OwnershipScope<'a>,
+    options: DiffOptions,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn diff_collection<T: serde::Serialize>(
     desired: &[T],
@@ -193,7 +284,8 @@ fn diff_collection<T: serde::Serialize>(
     kind: &str,
     id_fn: impl Fn(&T) -> String,
     ns_fn: impl Fn(&T) -> String,
-    ownership_scope: OwnershipScope<'_>,
+    spec_fn: impl Fn(&T) -> Option<String>,
+    ctx: CollectionContext<'_>,
     result: &mut DiffResult,
 ) {
     let desired_map: std::collections::HashMap<(String, String), &T> =
@@ -204,6 +296,22 @@ fn diff_collection<T: serde::Serialize>(
     for ((namespace, id), desired_res) in &desired_map {
         match actual_map.get(&(namespace.clone(), id.clone())) {
             Some(actual_res) => {
+                // The live row belongs to a spec import. Modifying it would be
+                // reverted on the next `PUT /api-specs`, so record the
+                // ownership conflict and emit no Modify. Reported even when
+                // the fields happen to agree today: two owners writing one row
+                // is the finding, not the current field delta.
+                if let Some(api_spec_id) = spec_fn(actual_res) {
+                    result.spec_owned.push(SpecOwnedResource {
+                        kind: kind.to_string(),
+                        id: id.clone(),
+                        namespace: namespace.clone(),
+                        api_spec_id,
+                        declared_in_repo: true,
+                        pruned: false,
+                    });
+                    continue;
+                }
                 let details = compare_fields(desired_res, actual_res);
                 if !details.is_empty() {
                     result.diffs.push(ResourceDiff {
@@ -227,12 +335,39 @@ fn diff_collection<T: serde::Serialize>(
         }
     }
 
-    for (namespace, id) in actual_map.keys() {
+    for ((namespace, id), actual_res) in &actual_map {
         if desired_map.contains_key(&(namespace.clone(), id.clone())) {
             continue;
         }
 
-        match ownership_scope {
+        // Spec-owned rows are off-limits to the repo's prune in both modes.
+        // Exclusive mode can still be told to take them, but only through the
+        // explicit `--confirm-api-spec-deletion` opt-in.
+        if let Some(api_spec_id) = spec_fn(actual_res) {
+            let prune = matches!(ctx.ownership_scope, OwnershipScope::Exclusive)
+                && ctx.options.prune_spec_owned;
+            result.spec_owned.push(SpecOwnedResource {
+                kind: kind.to_string(),
+                id: id.clone(),
+                namespace: namespace.clone(),
+                api_spec_id,
+                declared_in_repo: false,
+                pruned: prune,
+            });
+            if !prune {
+                continue;
+            }
+            result.diffs.push(ResourceDiff {
+                action: DiffAction::Delete,
+                kind: kind.to_string(),
+                id: id.clone(),
+                namespace: namespace.clone(),
+                details: Vec::new(),
+            });
+            continue;
+        }
+
+        match ctx.ownership_scope {
             OwnershipScope::Shared { previously_managed } => {
                 let was_managed = previously_managed.contains(&state_key(namespace, kind, id));
                 if was_managed {

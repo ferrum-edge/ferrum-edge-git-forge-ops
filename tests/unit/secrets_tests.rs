@@ -599,19 +599,30 @@ fn object_key_with_bracket_distinct_from_array_index() {
         "literal".to_string(),
         serde_json::Value::Object(bracket_obj),
     );
-    // Actual array with a placeholder element.
+    // Object with a literal "[1]" key.
+    let mut bracket_obj_one = serde_json::Map::new();
+    bracket_obj_one.insert(
+        "[1]".to_string(),
+        serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+    );
+    consumer.credentials.insert(
+        "literal_one".to_string(),
+        serde_json::Value::Object(bracket_obj_one),
+    );
+    // Actual array with placeholder elements at index 0 and index 1.
     consumer.credentials.insert(
         "arr".to_string(),
-        serde_json::Value::Array(vec![serde_json::Value::String(
-            "${gh-env-secret:alloc=generate}".to_string(),
-        )]),
+        serde_json::Value::Array(vec![
+            serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+            serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
+        ]),
     );
     cfg.consumers.push(consumer);
 
     let bundle = BTreeMap::new();
     let report = resolve_secrets(&mut cfg, &bundle).unwrap();
     let slots: Vec<_> = report.results.iter().map(|r| r.slot.as_str()).collect();
-    assert_eq!(slots.len(), 2);
+    assert_eq!(slots.len(), 4);
     // `[` in object key escapes to `~2`; `]` is kept literal. Array index
     // emits `[N]` via the SlotComponent::ArrayIndex path without escape,
     // so the two forms remain distinct.
@@ -620,8 +631,17 @@ fn object_key_with_bracket_distinct_from_array_index() {
         "literal [0] key should escape bracket: {slots:?}"
     );
     assert!(
-        slots.contains(&"ferrum/app/arr/[0]"),
-        "array index should emit literal [0]: {slots:?}"
+        slots.contains(&"ferrum/app/literal_one/~21]"),
+        "literal [1] key should escape bracket: {slots:?}"
+    );
+    // Index 0 is elided (legacy-compatible name); index 1 keeps its bracket.
+    assert!(
+        slots.contains(&"ferrum/app/arr"),
+        "array index 0 should be elided: {slots:?}"
+    );
+    assert!(
+        slots.contains(&"ferrum/app/arr/[1]"),
+        "array index 1 should emit literal [1]: {slots:?}"
     );
 }
 
@@ -767,5 +787,692 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
             "staging must reject some candidates once shard 0 fills"
         );
         assert!(rejected > 0, "at least one candidate must be rejected");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical array-form credentials
+//
+// ferrum-edge stores every consumer credential type as an ARRAY of entries
+// (`keyauth: [{key: "..."}]`). gitforgeops normalizes the bare-object form in
+// the assembler, and the slot encoding elides array index 0 so that
+// normalization does not rename — and thereby orphan — slots that were
+// allocated back when the object form was what the examples shipped.
+// ---------------------------------------------------------------------------
+
+fn consumer_with(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
+    let mut cfg = GatewayConfig::default();
+    let mut consumer = Consumer {
+        id: "app".to_string(),
+        username: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: vec![],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    consumer.credentials.insert(cred_key.to_string(), value);
+    cfg.consumers.push(consumer);
+    cfg
+}
+
+fn entry(field: &str, value: &str) -> serde_json::Value {
+    serde_json::json!({ field: value })
+}
+
+const GENERATE: &str = "${gh-env-secret:alloc=generate}";
+const REQUIRE: &str = "${gh-env-secret:alloc=require}";
+
+#[test]
+fn object_and_array_credential_forms_derive_the_same_slot() {
+    // THE upgrade-safety invariant. A repo that shipped
+    // `keyauth: {key: "${...}"}` allocated `ferrum/app/keyauth/key`. After
+    // assembler normalization the same credential is
+    // `keyauth: [{key: "${...}"}]` — and must still derive
+    // `ferrum/app/keyauth/key`, or every existing consumer's API key gets
+    // regenerated and redelivered on the next apply.
+    use gitforgeops::secrets::report_secrets;
+
+    let object_form = consumer_with("keyauth", entry("key", REQUIRE));
+    let array_form = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE)]),
+    );
+
+    let slot_of = |cfg: &GatewayConfig| {
+        report_secrets(cfg, &BTreeMap::new())
+            .unwrap()
+            .results
+            .into_iter()
+            .next()
+            .unwrap()
+            .slot
+    };
+
+    assert_eq!(slot_of(&object_form), "ferrum/app/keyauth/key");
+    assert_eq!(
+        slot_of(&array_form),
+        slot_of(&object_form),
+        "array index 0 must render as the legacy unindexed slot name"
+    );
+}
+
+#[test]
+fn second_array_entry_gets_an_indexed_slot() {
+    // Index >= 1 appends `[N]`, so a consumer with two keyauth entries gets
+    // two distinct slots rather than colliding on one.
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE), entry("key", REQUIRE)]),
+    );
+
+    let report = report_secrets(&cfg, &BTreeMap::new()).unwrap();
+    let mut slots: Vec<_> = report.results.iter().map(|r| r.slot.clone()).collect();
+    slots.sort();
+    assert_eq!(
+        slots,
+        vec![
+            "ferrum/app/keyauth/[1]/key".to_string(),
+            "ferrum/app/keyauth/key".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn slot_path_addresses_array_entries_from_the_cli() {
+    use gitforgeops::secrets::slot_path;
+
+    // Index 0 is elided, and an explicit `[0]` normalizes to the same slot.
+    assert_eq!(
+        slot_path("ferrum", "app", "keyauth/key"),
+        "ferrum/app/keyauth/key"
+    );
+    assert_eq!(
+        slot_path("ferrum", "app", "keyauth/[0]/key"),
+        "ferrum/app/keyauth/key"
+    );
+    // Index >= 1 stays addressable — otherwise `gitforgeops rotate` could
+    // never reach a consumer's second credential.
+    assert_eq!(
+        slot_path("ferrum", "app", "keyauth/[1]/key"),
+        "ferrum/app/keyauth/[1]/key"
+    );
+    // Real credential types round-trip.
+    for (cred, field) in [
+        ("keyauth", "key"),
+        ("jwt", "secret"),
+        ("hmac_auth", "secret"),
+        ("mtls_auth", "identity"),
+        ("basicauth", "password"),
+    ] {
+        assert_eq!(
+            slot_path("ferrum", "app", &format!("{cred}/{field}")),
+            format!("ferrum/app/{cred}/{field}")
+        );
+    }
+}
+
+#[test]
+fn slot_path_matches_walker_for_array_form_credentials() {
+    // `gitforgeops rotate --credential keyauth/key` must find the slot the
+    // walker emits for the canonical array form.
+    use gitforgeops::secrets::{report_secrets, slot_path};
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE), entry("key", REQUIRE)]),
+    );
+    let report = report_secrets(&cfg, &BTreeMap::new()).unwrap();
+    let slots: Vec<_> = report.results.iter().map(|r| r.slot.clone()).collect();
+
+    assert!(slots.contains(&slot_path("ferrum", "app", "keyauth/key")));
+    assert!(slots.contains(&slot_path("ferrum", "app", "keyauth/[1]/key")));
+}
+
+#[test]
+fn placeholder_inside_array_resolves_from_bundle_end_to_end() {
+    // The full path the assembler now produces: placeholder nested inside a
+    // one-element array, resolved in place from a bundle keyed on the
+    // index-elided slot name.
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE)]),
+    );
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "real-api-key".to_string(),
+    );
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(report.results[0].cred_key, "keyauth/key");
+    assert_eq!(
+        cfg.consumers[0].credentials.get("keyauth").unwrap(),
+        &serde_json::Value::Array(vec![entry("key", "real-api-key")]),
+        "placeholder must be replaced in place, preserving the array shape"
+    );
+}
+
+#[test]
+fn explicit_index_zero_slot_from_an_older_bundle_still_resolves() {
+    // A gitforgeops release between "walker handles arrays" and "index 0 is
+    // elided" wrote `ferrum/app/keyauth/[0]/key`. That bundle must keep
+    // resolving after the upgrade rather than orphaning and re-allocating.
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE)]),
+    );
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/keyauth/[0]/key".to_string(),
+        "older-encoding-value".to_string(),
+    );
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(
+        cfg.consumers[0].credentials.get("keyauth").unwrap(),
+        &serde_json::Value::Array(vec![entry("key", "older-encoding-value")])
+    );
+}
+
+#[test]
+fn legacy_dotted_slot_with_array_index_still_resolves() {
+    // The oldest encoding: dotted path with a bracketed index.
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE)]),
+    );
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/keyauth[0].key".to_string(),
+        "oldest-encoding-value".to_string(),
+    );
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+}
+
+// ---------------------------------------------------------------------------
+// Value constraints
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redacted_sentinel_in_bundle_is_refused() {
+    // `[REDACTED]` is what a normal GET returns for keyauth/jwt/hmac_auth
+    // secrets — only GET /backup returns real values. A bundle holding it was
+    // seeded wrong, and pushing it would install the literal string.
+    use gitforgeops::secrets::REDACTED_SENTINEL;
+
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE)]),
+    );
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        REDACTED_SENTINEL.to_string(),
+    );
+
+    let err = resolve_secrets(&mut cfg, &bundle).unwrap_err().to_string();
+    assert!(
+        err.contains("[REDACTED]") && err.contains("/backup"),
+        "expected reserved-sentinel error, got: {err}"
+    );
+}
+
+#[test]
+fn jwt_generate_with_undersized_len_is_rejected_at_resolve_time() {
+    // jwt/hmac_auth secrets must be >= 32 chars. len=16 yields 22 base64url
+    // characters, so it must fail at plan time — before any GitHub write.
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    for cred_type in ["jwt", "hmac_auth"] {
+        let mut cfg = consumer_with(
+            cred_type,
+            serde_json::Value::Array(vec![entry(
+                "secret",
+                "${gh-env-secret:alloc=generate|len=16}",
+            )]),
+        );
+        let err = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("at least 32 characters") && err.contains("len=24"),
+            "expected {cred_type} minimum-length error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn jwt_generate_with_default_len_is_accepted() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    let mut cfg = consumer_with(
+        "jwt",
+        serde_json::Value::Array(vec![entry("secret", GENERATE)]),
+    );
+    let report = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api).unwrap();
+    assert_eq!(report.needs_allocation().len(), 1);
+}
+
+#[test]
+fn keyauth_generate_with_small_len_is_still_allowed() {
+    // The >= 32 char floor is jwt/hmac_auth only; keyauth just needs
+    // non-empty and <= 4096.
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", "${gh-env-secret:alloc=generate|len=16}")]),
+    );
+    let report = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api).unwrap();
+    assert_eq!(report.needs_allocation().len(), 1);
+}
+
+#[test]
+fn already_allocated_undersized_jwt_slot_is_not_re_validated() {
+    // The length check gates GENERATION. A slot that already has a value
+    // resolves normally — we neither regenerate it nor block the apply on a
+    // `len=` that is no longer used.
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    let mut cfg = consumer_with(
+        "jwt",
+        serde_json::Value::Array(vec![entry(
+            "secret",
+            "${gh-env-secret:alloc=generate|len=16}",
+        )]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/jwt/secret".to_string(),
+        "a-previously-allocated-secret-of-sufficient-length".to_string(),
+    );
+
+    let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::Api).unwrap();
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+}
+
+#[test]
+fn generate_credential_value_enforces_the_jwt_minimum() {
+    // Allocator-side enforcement — the last line of defense for
+    // `gitforgeops rotate`, whose --credential never passes through the
+    // resolver's placeholder walk.
+    use gitforgeops::secrets::generate_credential_value;
+
+    let err = generate_credential_value("ferrum/app/jwt/secret", 16)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("at least 32 characters"),
+        "expected minimum-length error, got: {err}"
+    );
+
+    let err = generate_credential_value("ferrum/app/hmac_auth/secret", 23)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("at least 32 characters"), "got: {err}");
+
+    // 24 entropy bytes is the floor: exactly 32 base64url characters.
+    let ok = generate_credential_value("ferrum/app/jwt/secret", 24).unwrap();
+    assert_eq!(ok.chars().count(), 32);
+
+    // Indexed slots resolve to the same credential type.
+    assert!(generate_credential_value("ferrum/app/jwt/[1]/secret", 16).is_err());
+}
+
+#[test]
+fn generate_credential_value_respects_the_value_cap_and_sentinel() {
+    use gitforgeops::secrets::{generate_credential_value, MAX_CREDENTIAL_VALUE_CHARS};
+
+    // The placeholder parser caps len= at 256 bytes -> 342 characters, well
+    // under the gateway's 4096-character limit. Assert the invariant holds at
+    // the top of the range.
+    let value = generate_credential_value("ferrum/app/keyauth/key", 256).unwrap();
+    assert!(value.chars().count() <= MAX_CREDENTIAL_VALUE_CHARS);
+    assert_ne!(value, "[REDACTED]");
+    // base64url has no `[`, so the sentinel is structurally unreachable.
+    assert!(!value.contains('['));
+}
+
+// ---------------------------------------------------------------------------
+// basicauth mode-awareness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn basicauth_generate_is_rejected_in_file_mode() {
+    // A file-mode ferrum-edge hard-rejects a plaintext password; only the
+    // admin API hashes one on write.
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    let mut cfg = consumer_with(
+        "basicauth",
+        serde_json::Value::Array(vec![entry("password", GENERATE)]),
+    );
+
+    let err = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::File)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("file-mode gateways require password_hash")
+            && err.contains("FERRUM_BASIC_AUTH_HMAC_SECRET"),
+        "expected actionable file-mode basicauth error, got: {err}"
+    );
+}
+
+#[test]
+fn basicauth_generate_is_allowed_in_api_mode() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    let mut cfg = consumer_with(
+        "basicauth",
+        serde_json::Value::Array(vec![entry("password", GENERATE)]),
+    );
+
+    let report = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api).unwrap();
+    assert_eq!(report.needs_allocation().len(), 1);
+    assert_eq!(report.results[0].slot, "ferrum/app/basicauth/password");
+}
+
+#[test]
+fn basicauth_password_hash_generate_is_rejected_in_every_mode() {
+    // `hmac_sha256:<64 hex>` is computed with the gateway's server-side
+    // secret. Random bytes are never a valid hash, api mode included.
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    for mode in [GatewayMode::Api, GatewayMode::File] {
+        let mut cfg = consumer_with(
+            "basicauth",
+            serde_json::Value::Array(vec![entry("password_hash", GENERATE)]),
+        );
+        let err = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), mode)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot generate a basicauth password_hash"),
+            "expected password_hash rejection, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn basicauth_already_allocated_resolves_in_file_mode() {
+    // The mode check only gates allocation. A file-mode repo that set its own
+    // password_hash (or resolved a previously allocated password) is fine.
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    let mut cfg = consumer_with(
+        "basicauth",
+        serde_json::Value::Array(vec![entry("password_hash", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/basicauth/password_hash".to_string(),
+        format!("hmac_sha256:{}", "a".repeat(64)),
+    );
+
+    let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::File).unwrap();
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+}
+
+// --- Rotate preflight: strict vs lenient reporting (G4) ---------------------
+
+/// `rotate` targets one slot but the preflight walks the whole assembled
+/// config to find it. A generation constraint on an *unrelated* consumer must
+/// not abort a rotation that has nothing to do with it — the lenient variant
+/// reports it as a status instead of an error.
+#[test]
+fn lenient_report_does_not_fail_on_generation_constraints() {
+    use gitforgeops::secrets::{report_secrets, report_secrets_lenient};
+
+    let cfg = consumer_with(
+        "jwt",
+        serde_json::Value::Array(vec![entry(
+            "secret",
+            "${gh-env-secret:alloc=generate|len=16}",
+        )]),
+    );
+
+    let strict = report_secrets(&cfg, &BTreeMap::new());
+    let err = strict
+        .expect_err("strict reporting must still reject an unsatisfiable len=")
+        .to_string();
+    assert!(err.contains("at least 32 characters"), "{err}");
+
+    let lenient = report_secrets_lenient(&cfg, &BTreeMap::new())
+        .expect("lenient reporting must not fail on a generation constraint");
+    assert_eq!(lenient.results.len(), 1, "the slot is still reported");
+    assert_eq!(lenient.results[0].status, SlotStatus::NeedsAllocation);
+    assert_eq!(lenient.results[0].slot, "ferrum/app/jwt/secret");
+}
+
+/// Lenient only relaxes *generation constraints*. A structural problem makes
+/// the report itself untrustworthy, so it stays fatal in both variants.
+#[test]
+fn lenient_report_still_fails_on_structural_errors() {
+    use gitforgeops::secrets::{report_secrets_lenient, REDACTED_SENTINEL};
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        REDACTED_SENTINEL.to_string(),
+    );
+
+    let err = report_secrets_lenient(&cfg, &bundle)
+        .expect_err("a [REDACTED] bundle value is still fatal")
+        .to_string();
+    assert!(err.contains(REDACTED_SENTINEL), "{err}");
+}
+
+#[test]
+fn lenient_and_strict_agree_when_no_constraint_is_violated() {
+    use gitforgeops::secrets::{report_secrets, report_secrets_lenient};
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE)]),
+    );
+
+    let strict = report_secrets(&cfg, &BTreeMap::new()).unwrap();
+    let lenient = report_secrets_lenient(&cfg, &BTreeMap::new()).unwrap();
+
+    assert_eq!(strict.results.len(), lenient.results.len());
+    assert_eq!(strict.results[0].slot, lenient.results[0].slot);
+    assert_eq!(strict.results[0].status, lenient.results[0].status);
+}
+
+// --- Array slot-identity hazards (G3) ---------------------------------------
+
+/// Entry *position* is the slot identity, so a multi-entry credential array
+/// cannot be reordered or shortened safely. The resolver cannot rename slots
+/// retroactively without orphaning every existing allocation, so it warns.
+#[test]
+fn multi_entry_credential_array_warns_that_order_is_identity() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE), entry("key", GENERATE)]),
+    );
+
+    let report = report_secrets(&cfg, &BTreeMap::new()).unwrap();
+
+    assert_eq!(report.results.len(), 2);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("ferrum/app/keyauth") && w.contains("slot identity")),
+        "expected an order-is-identity warning, got {:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings.iter().any(|w| w.contains("rotate")),
+        "the warning must point at the safe operation: {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn single_entry_credential_array_raises_no_warning() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE)]),
+    );
+
+    let report = report_secrets(&cfg, &BTreeMap::new()).unwrap();
+    assert!(
+        report.warnings.is_empty(),
+        "a single-entry array has no ordering hazard: {:?}",
+        report.warnings
+    );
+}
+
+/// The array shrank: the bundle still holds `[1]`, but there is no entry 1 any
+/// more. That value is unreferenced, and re-growing the array would hand it to
+/// whatever entry lands at index 1 next.
+#[test]
+fn shrunk_credential_array_warns_about_the_orphaned_slot() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/[1]/key".to_string(),
+        "retired-but-still-stored".to_string(),
+    );
+
+    let report = report_secrets(&cfg, &bundle).unwrap();
+
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("ferrum/app/keyauth/[1]/key") && w.contains("orphaned")),
+        "expected an orphaned-slot warning naming the slot, got {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn matching_bundle_slots_raise_no_orphan_warning() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE), entry("key", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), "a".to_string());
+    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "b".to_string());
+
+    let report = report_secrets(&cfg, &bundle).unwrap();
+
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("orphaned")),
+        "every stored slot still has an entry: {:?}",
+        report.warnings
+    );
+}
+
+// --- Structured credential type plumbing (G7) -------------------------------
+
+/// The report captures the credential type as a slot *component*, so the
+/// allocator never has to recover it by splitting the slot string apart.
+#[test]
+fn report_records_the_credential_type_structurally() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "hmac_auth",
+        serde_json::Value::Array(vec![entry("secret", GENERATE)]),
+    );
+
+    let report = report_secrets(&cfg, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        report.credential_type_for("ferrum/app/hmac_auth/secret"),
+        Some("hmac_auth")
+    );
+}
+
+#[test]
+fn explicit_credential_type_drives_the_minimum_length_rule() {
+    use gitforgeops::secrets::generate_credential_value_typed;
+
+    // The slot string alone would say `keyauth`; the structured type wins.
+    let err = generate_credential_value_typed("ferrum/app/keyauth/key", 16, Some("jwt"))
+        .expect_err("the supplied type must decide the floor")
+        .to_string();
+    assert!(err.contains("at least 32 characters"), "{err}");
+
+    let ok = generate_credential_value_typed("ferrum/app/jwt/secret", 24, Some("jwt")).unwrap();
+    assert!(ok.chars().count() >= 32);
+}
+
+/// A slot with no credential-type component used to parse back as `""`, which
+/// silently skipped the jwt/hmac_auth floor. It is now a hard error: a slot we
+/// cannot classify is one whose minimum we cannot apply.
+#[test]
+fn unclassifiable_slot_is_a_hard_error_not_a_silent_skip() {
+    use gitforgeops::secrets::generate_credential_value;
+
+    let err = generate_credential_value("ferrum/app", 16)
+        .expect_err("a slot with no credential-type component must not generate")
+        .to_string();
+    assert!(err.contains("no credential-type component"), "{err}");
+    assert!(err.contains("slot_path"), "{err}");
+}
+
+/// The resolver's plan-time check and the allocator's generate-time check are
+/// the same function, so they cannot disagree about where the floor sits.
+#[test]
+fn plan_time_and_generate_time_minimum_checks_agree() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{generate_credential_value, resolve_secrets_with_mode};
+
+    for len in [16usize, 23, 24, 32] {
+        let mut cfg = consumer_with(
+            "jwt",
+            serde_json::Value::Array(vec![entry(
+                "secret",
+                &format!("${{gh-env-secret:alloc=generate|len={len}}}"),
+            )]),
+        );
+        let plan_ok =
+            resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api).is_ok();
+        let generate_ok = generate_credential_value("ferrum/app/jwt/secret", len).is_ok();
+        assert_eq!(
+            plan_ok, generate_ok,
+            "plan-time and generate-time verdicts must match for len={len}"
+        );
     }
 }

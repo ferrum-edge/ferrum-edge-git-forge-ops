@@ -1,5 +1,12 @@
 use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
-use gitforgeops::http_client::AdminClient;
+use gitforgeops::config::schema::{GatewayConfig, Proxy, Upstream};
+use gitforgeops::http_client::convergence_summary;
+use gitforgeops::http_client::{
+    build_restore_body, classify_retry, delete_succeeded, is_read_only_refusal, map_api_error,
+    merge_pages, next_page_offset, resource_id_is_path_safe, split_batch, write_block_reason,
+    AdminClient, ApiErrorBody, BackupExtras, BackupSnapshot, BatchCreate, ClusterStatus,
+    DeleteOutcome, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
+};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -8,27 +15,9 @@ fn base_env() -> EnvConfig {
     EnvConfig {
         gateway_url: Some("https://gateway.example:9000".to_string()),
         admin_jwt_secret: Some("test-secret-must-be-32-chars-long".to_string()),
-        namespace_filter: None,
         gateway_mode: GatewayMode::Api,
         apply_strategy: ApplyStrategy::Incremental,
-        overlay: None,
-        env_name: None,
-        github_repository: None,
-        github_token: None,
-        github_provisioner_token: None,
-        creds_bundle_json: None,
-        creds_bundle_json_file: None,
-        file_output_path: "./assembled/resources.yaml".to_string(),
-        edge_binary_path: "ferrum-edge".to_string(),
-        tls_no_verify: false,
-        ca_cert: None,
-        client_cert: None,
-        client_key: None,
-        gateway_connect_timeout_secs: 10,
-        gateway_request_timeout_secs: 60,
-        github_connect_timeout_secs: 10,
-        github_request_timeout_secs: 30,
-        gateway_max_retries: 3,
+        ..EnvConfig::default()
     }
 }
 
@@ -168,11 +157,899 @@ async fn admin_client_accepts_safe_resource_id_in_paths() {
     env.gateway_url = Some(format!("http://{addr}"));
     let client = AdminClient::new(&env).unwrap();
 
-    client
+    let outcome = client
         .delete_proxy("proxy-01._~A", "team-alpha")
         .await
         .unwrap();
+    assert_eq!(outcome, DeleteOutcome::Deleted);
 
     let request = rx.recv().unwrap();
-    assert!(request.starts_with("DELETE /proxies/proxy-01._~A HTTP/1.1"));
+    // `cleanup_orphaned_upstream=false` opts out of the server-side cascade
+    // that would silently delete the proxy's last-referenced upstream and make
+    // the diff's own upstream delete 404.
+    assert!(
+        request
+            .starts_with("DELETE /proxies/proxy-01._~A?cleanup_orphaned_upstream=false HTTP/1.1"),
+        "unexpected request line: {request}"
+    );
+}
+
+// --- Resource-id path safety -------------------------------------------------
+
+#[test]
+fn resource_ids_are_validated_for_path_safety_not_server_grammar() {
+    // The gateway's *create* grammar is `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, but a
+    // live gateway can hold ids that predate it or came from another client.
+    // Refusing to build a URL for those makes them undeletable and the
+    // namespace can never converge — so anything that stays inside its path
+    // segment is allowed through and the gateway gets to have the last word.
+    for id in [
+        "proxy-01._~A",
+        "proxy~01",
+        "-leading-dash",
+        ".leading-dot",
+        "_leading",
+        "UPPER_case.9",
+        "a",
+        &"a".repeat(254),
+    ] {
+        assert!(
+            resource_id_is_path_safe(id).is_ok(),
+            "{id:?} is path-safe and must be accepted"
+        );
+    }
+}
+
+#[test]
+fn resource_ids_that_escape_the_path_segment_are_rejected() {
+    for id in [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a?confirm=true",
+        "a#frag",
+        "a%2f",
+        "has space",
+        "tab\there",
+        "null\0byte",
+        "café",
+    ] {
+        let err = resource_id_is_path_safe(id);
+        assert!(err.is_err(), "expected {id:?} to be rejected");
+    }
+}
+
+#[tokio::test]
+async fn admin_client_rejects_ids_over_the_length_limit() {
+    let env = base_env();
+    let client = AdminClient::new(&env).unwrap();
+
+    let too_long = "a".repeat(255);
+    let err = client.delete_proxy(&too_long, "team-alpha").await;
+    assert!(
+        err.err().unwrap().to_string().contains("254"),
+        "expected the 254-character limit to be named"
+    );
+}
+
+// --- Pagination --------------------------------------------------------------
+
+#[test]
+fn next_page_offset_advances_until_the_total_is_covered() {
+    // 250 namespaces, page size 100: offsets 0 → 100 → 200 → done.
+    assert_eq!(next_page_offset(0, 100, 100, Some(250), 100), Some(100));
+    assert_eq!(next_page_offset(100, 100, 100, Some(250), 200), Some(200));
+    assert_eq!(next_page_offset(200, 50, 100, Some(250), 250), None);
+}
+
+#[test]
+fn next_page_offset_stops_on_an_empty_page() {
+    // Guards against a server that ignores `offset` and would otherwise loop
+    // forever returning the same (or no) rows.
+    assert_eq!(next_page_offset(0, 0, 100, Some(500), 0), None);
+}
+
+#[test]
+fn next_page_offset_continues_a_full_page_without_a_pagination_envelope() {
+    // No `pagination` key at all (an older gateway, or a middlebox that
+    // rewrote the body). An exactly-full page is indistinguishable from a
+    // truncated listing, so the walk continues — stopping here silently
+    // dropped every namespace past the first page.
+    assert_eq!(next_page_offset(0, 100, 100, None, 100), Some(100));
+    assert_eq!(next_page_offset(100, 100, 100, None, 200), Some(200));
+}
+
+#[test]
+fn next_page_offset_stops_on_a_short_page_without_an_envelope() {
+    // Fewer rows than the limit means the server had nothing more to give.
+    assert_eq!(next_page_offset(0, 12, 100, None, 12), None);
+    assert_eq!(next_page_offset(100, 99, 100, None, 199), None);
+}
+
+#[test]
+fn next_page_offset_envelope_less_walk_is_bounded() {
+    // A server that ignores `offset` answers full pages forever; the walk must
+    // still terminate rather than spinning until the CI job is killed.
+    assert_eq!(next_page_offset(100_000, 100, 100, None, 100_000), None);
+}
+
+#[test]
+fn next_page_offset_stops_when_accumulated_exceeds_total() {
+    assert_eq!(next_page_offset(0, 100, 100, Some(80), 100), None);
+}
+
+#[test]
+fn next_page_offset_stops_on_a_non_advancing_offset() {
+    // saturating_add at i64::MAX cannot move forward; refuse rather than
+    // re-request the same page forever.
+    assert_eq!(
+        next_page_offset(i64::MAX, 100, 100, Some(i64::MAX), 1),
+        None
+    );
+}
+
+#[test]
+fn merge_pages_flattens_and_dedups_preserving_order() {
+    let merged = merge_pages(vec![
+        vec!["ferrum".to_string(), "team-a".to_string()],
+        // `team-a` can legitimately reappear across a page boundary: the
+        // listing is a union of registry rows and derived namespaces and can
+        // shift mid-walk.
+        vec!["team-a".to_string(), "team-b".to_string()],
+    ]);
+    assert_eq!(merged, vec!["ferrum", "team-a", "team-b"]);
+}
+
+#[test]
+fn merge_pages_on_no_pages_is_empty() {
+    assert!(merge_pages(Vec::new()).is_empty());
+}
+
+// --- Retry classification ----------------------------------------------------
+
+fn body(json: &str) -> ApiErrorBody {
+    ApiErrorBody::parse(json)
+}
+
+#[test]
+fn retry_classification_table() {
+    let empty = ApiErrorBody::default();
+    let cases: &[(u16, RetryDecision)] = &[
+        (408, RetryDecision::Retry),
+        (429, RetryDecision::Retry),
+        (500, RetryDecision::Retry),
+        (502, RetryDecision::Retry),
+        (503, RetryDecision::Retry),
+        (504, RetryDecision::Retry),
+        // Vendor 5xx from whatever sits in front of the admin API (Cloudflare
+        // 520/522/524, 529, 530, nginx-ish 599). All transient by definition —
+        // an allow-list of the gateway's own four codes turned each of these
+        // into a hard apply failure.
+        (520, RetryDecision::Retry),
+        (522, RetryDecision::Retry),
+        (524, RetryDecision::Retry),
+        (529, RetryDecision::Retry),
+        (599, RetryDecision::Retry),
+        // 501 is permanent: a standalone-MongoDB gateway has no multi-document
+        // transaction and will answer it forever.
+        (501, RetryDecision::NoRetry),
+        (400, RetryDecision::NoRetry),
+        (401, RetryDecision::NoRetry),
+        (403, RetryDecision::NoRetry),
+        (404, RetryDecision::NoRetry),
+        (409, RetryDecision::NoRetry),
+        (413, RetryDecision::NoRetry),
+    ];
+    for (status, expected) in cases {
+        assert_eq!(
+            classify_retry(*status, &empty, RequestKind::Mutation),
+            *expected,
+            "status {status} classified wrong"
+        );
+    }
+}
+
+#[test]
+fn applied_false_is_never_retried() {
+    // Durable but not live: the write is committed, so a retry re-applies it
+    // (and a create answers 409 the second time round).
+    let b = body(r#"{"error":"reload timed out","applied":false,"reason":"reload_timeout"}"#);
+    assert_eq!(b.applied, Some(false));
+    assert_eq!(b.reason.as_deref(), Some("reload_timeout"));
+    assert_eq!(
+        classify_retry(503, &b, RequestKind::Mutation),
+        RetryDecision::NoRetry
+    );
+}
+
+#[test]
+fn restore_500_with_dirty_rollback_is_never_retried() {
+    for rollback in ["incomplete", "unknown_outcome"] {
+        let b = body(&format!(
+            r#"{{"error":"restore failed","rollback":"{rollback}","failure_class":"data_integrity"}}"#
+        ));
+        assert_eq!(
+            classify_retry(500, &b, RequestKind::Restore),
+            RetryDecision::NoRetry,
+            "rollback={rollback} must not be retried — a retry re-runs a destructive replace"
+        );
+    }
+
+    // A clean rollback means nothing was left behind; the generic 500 rule
+    // applies again.
+    let clean = body(r#"{"error":"restore failed","rollback":"completed"}"#);
+    assert_eq!(
+        classify_retry(500, &clean, RequestKind::Restore),
+        RetryDecision::Retry
+    );
+}
+
+#[test]
+fn restore_503_connectivity_is_retryable() {
+    let b = body(r#"{"error":"datastore unavailable","failure_class":"connectivity"}"#);
+    assert_eq!(
+        classify_retry(503, &b, RequestKind::Restore),
+        RetryDecision::Retry
+    );
+}
+
+#[test]
+fn api_error_body_tolerates_non_json_bodies() {
+    // Load balancers and proxies emit HTML error pages; the classifier must
+    // degrade to the status-only decision rather than blowing up.
+    let b = ApiErrorBody::parse("<html>502 Bad Gateway</html>");
+    assert!(b.error.is_none());
+    assert_eq!(
+        classify_retry(502, &b, RequestKind::Mutation),
+        RetryDecision::Retry
+    );
+}
+
+// --- Stub gateway ------------------------------------------------------------
+
+/// Serve canned responses on a loopback socket, matched by request line.
+///
+/// Multi-request by design: the 403-then-`/health` re-check needs two calls,
+/// and reqwest may send them down one keep-alive connection or open a second
+/// one. Both are handled. Still network-free in the sense that matters — no
+/// dependency outside the test process.
+fn spawn_stub_gateway(routes: Vec<(&'static str, u16, &'static str)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let routes = routes.clone();
+            std::thread::spawn(move || loop {
+                let mut buf = [0_u8; 8192];
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(needle, _, _)| request.contains(needle))
+                    .map(|(_, status, body)| (*status, *body))
+                    .unwrap_or((404, "{}"));
+                if write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .is_err()
+                {
+                    return;
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn stub_env(url: String) -> EnvConfig {
+    let mut env = base_env();
+    env.gateway_url = Some(url);
+    // Keep the failure paths instant: a retried 5xx would otherwise sleep
+    // through the backoff schedule.
+    env.gateway_max_retries = 0;
+    env
+}
+
+// --- Delete tolerance --------------------------------------------------------
+
+#[tokio::test]
+async fn delete_reports_a_404_as_already_gone() {
+    // Individually benign, but the caller counts them: a namespace where every
+    // delete 404s is what a misrouted apply looks like.
+    let url = spawn_stub_gateway(vec![(
+        "DELETE /upstreams/",
+        404,
+        r#"{"error":"not found"}"#,
+    )]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let outcome = client.delete_upstream("u1", "team-alpha").await.unwrap();
+    assert_eq!(outcome, DeleteOutcome::NotFound);
+}
+
+#[tokio::test]
+async fn unclassified_mutation_403_is_upgraded_via_health() {
+    // Some deployments answer a bare 403 with no read-only marker in the body.
+    // Left as a generic ApiError it repeated once per resource; the health
+    // re-check turns it back into the single run-stopping error.
+    let url = spawn_stub_gateway(vec![
+        ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
+        (
+            "GET /health",
+            200,
+            r#"{"status":"degraded","mode":"database","admin_writes_enabled":false}"#,
+        ),
+    ]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "expected the 403 to be upgraded, got: {err:?}"
+    );
+    assert!(err.to_string().contains("admin_writes_enabled=false"));
+}
+
+#[tokio::test]
+async fn a_403_on_a_writable_gateway_stays_a_plain_api_error() {
+    // A namespace-claim or role rejection is also 403 and must NOT be
+    // mistaken for a read-only plane — that would abandon every other
+    // namespace over one permission problem.
+    let url = spawn_stub_gateway(vec![
+        (
+            "DELETE /proxies/",
+            403,
+            r#"{"error":"Namespace claim does not cover team-alpha"}"#,
+        ),
+        (
+            "GET /health",
+            200,
+            r#"{"status":"ok","mode":"database","admin_writes_enabled":true}"#,
+        ),
+    ]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::ApiError { status: 403, .. }),
+        "expected the 403 to stand, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_health_recheck_is_best_effort() {
+    // An unreachable/erroring /health must leave the original 403 untouched
+    // rather than inventing a verdict either way.
+    let url = spawn_stub_gateway(vec![
+        ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
+        ("GET /health", 500, r#"{"error":"boom"}"#),
+    ]);
+    let client = AdminClient::new(&stub_env(url)).unwrap();
+
+    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::ApiError { status: 403, .. }),
+        "expected the original error, got: {err:?}"
+    );
+}
+
+#[test]
+fn delete_treats_404_as_success() {
+    // Proxy deletes cascade server-side to scoped plugin configs, so the
+    // diff's own follow-up delete legitimately finds nothing. Recording that
+    // as an error left the state entry behind and wedged every later run.
+    assert!(delete_succeeded(200));
+    assert!(delete_succeeded(204));
+    assert!(delete_succeeded(404));
+
+    assert!(!delete_succeeded(403));
+    assert!(!delete_succeeded(409));
+    assert!(!delete_succeeded(500));
+}
+
+// --- Error mapping -----------------------------------------------------------
+
+#[test]
+fn read_only_403_maps_to_a_dedicated_error() {
+    let err = map_api_error(
+        403,
+        r#"{"error":"Admin API is in read-only mode"}"#,
+        RequestKind::Mutation,
+    );
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "expected GatewayReadOnly, got: {err:?}"
+    );
+    assert!(err.to_string().contains("read-only"));
+}
+
+#[test]
+fn read_only_403_match_tolerates_rewording() {
+    // The exact-string match missed every variant a real deployment produces —
+    // a re-cased body, a middlebox prefix, a longer sentence from a newer
+    // build — and each miss downgraded a whole-run stop into N per-resource
+    // 403s that apply then plodded through.
+    for body in [
+        r#"{"error":"Admin API is in read-only mode"}"#,
+        r#"{"error":"  admin api is in READ-ONLY MODE  "}"#,
+        r#"{"error":"request rejected: the Admin API is in read-only mode (config database unavailable)"}"#,
+        "Admin API is in read-only mode",
+    ] {
+        let err = map_api_error(403, body, RequestKind::Mutation);
+        assert!(
+            matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+            "expected GatewayReadOnly for {body:?}, got: {err:?}"
+        );
+    }
+
+    assert!(is_read_only_refusal("Admin API is in READ-Only Mode"));
+    assert!(!is_read_only_refusal(
+        "Namespace claim does not cover team-alpha"
+    ));
+}
+
+#[test]
+fn other_403s_stay_generic_api_errors() {
+    // Role/namespace-claim rejections are also 403 but are a different
+    // problem, and must not short-circuit the apply as read-only.
+    let err = map_api_error(
+        403,
+        r#"{"error":"Namespace claim does not cover team-alpha"}"#,
+        RequestKind::Mutation,
+    );
+    assert!(matches!(
+        err,
+        gitforgeops::error::Error::ApiError { status: 403, .. }
+    ));
+}
+
+#[test]
+fn api_specs_409_is_actionable() {
+    let err = map_api_error(
+        409,
+        r#"{"error":"restore would delete API specs","api_specs_at_risk":["spec-a","spec-b"],"confirmation_required":"confirm_api_spec_deletion=true"}"#,
+        RequestKind::Restore,
+    );
+    assert!(matches!(err, gitforgeops::error::Error::ApiSpecsAtRisk(_)));
+    let msg = err.to_string();
+    assert!(msg.contains("2 spec(s)"), "should count the specs: {msg}");
+    assert!(
+        msg.contains("--confirm-api-spec-deletion"),
+        "should name the opt-in flag: {msg}"
+    );
+}
+
+#[test]
+fn restore_rollback_failure_demands_manual_recovery() {
+    let err = map_api_error(
+        500,
+        r#"{"error":"import failed","rollback":"incomplete","restore_errors":["proxy-a"]}"#,
+        RequestKind::Restore,
+    );
+    assert!(matches!(
+        err,
+        gitforgeops::error::Error::RestoreNeedsManualRecovery(_)
+    ));
+    let msg = err.to_string();
+    assert!(msg.contains("Do NOT re-run apply"), "got: {msg}");
+    assert!(
+        msg.contains("proxy-a"),
+        "should surface restore_errors: {msg}"
+    );
+}
+
+#[test]
+fn applied_false_maps_to_committed_not_live() {
+    let err = map_api_error(
+        503,
+        r#"{"error":"reload timed out","applied":false,"reason":"reload_timeout"}"#,
+        RequestKind::Mutation,
+    );
+    match err {
+        gitforgeops::error::Error::CommittedNotLive { reason, .. } => {
+            assert_eq!(reason, "reload_timeout");
+        }
+        other => panic!("expected CommittedNotLive, got {other:?}"),
+    }
+}
+
+#[test]
+fn payload_too_large_names_the_limit_knob() {
+    let err = map_api_error(413, r#"{"error":"body too large"}"#, RequestKind::Restore);
+    assert!(err
+        .to_string()
+        .contains("FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB"));
+}
+
+// --- Restore body ------------------------------------------------------------
+
+fn backup_extras() -> BackupExtras {
+    BackupExtras {
+        api_specs: Some(serde_json::json!({
+            "section_version": "2",
+            "items": [{"id": "spec-a"}, {"id": "spec-b"}],
+        })),
+        gateway_trust_bundles: Some(serde_json::json!([{ "revision": 7 }])),
+    }
+}
+
+#[test]
+fn restore_body_carries_opaque_api_specs_and_trust_bundles() {
+    let extras = backup_extras();
+    let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
+
+    // Carried through byte-for-byte: gitforgeops does not model (or version)
+    // these sections, it just refuses to destroy them.
+    assert_eq!(body["api_specs"], extras.api_specs.clone().unwrap());
+    assert_eq!(
+        body["gateway_trust_bundles"],
+        extras.gateway_trust_bundles.clone().unwrap()
+    );
+    // The managed sections are still present alongside them.
+    assert_eq!(body["version"], "1");
+    assert!(body.get("proxies").is_some());
+}
+
+#[test]
+fn restore_body_drops_api_specs_on_explicit_confirmation() {
+    let body = build_restore_body(&GatewayConfig::default(), &backup_extras(), true).unwrap();
+    assert!(
+        body.get("api_specs").is_none(),
+        "the destructive opt-in must omit the section so /restore deletes it"
+    );
+    assert!(body.get("gateway_trust_bundles").is_none());
+}
+
+#[test]
+fn restore_body_omits_absent_sections_entirely() {
+    // Three-valued trust-bundle contract: absent = no-op, present-empty =
+    // revoke. A backup that omitted the section must restore as a no-op, so we
+    // must not synthesize an empty array.
+    let body =
+        build_restore_body(&GatewayConfig::default(), &BackupExtras::default(), false).unwrap();
+    assert!(body.get("api_specs").is_none());
+    assert!(body.get("gateway_trust_bundles").is_none());
+}
+
+#[test]
+fn backup_extras_counts_report_what_was_carried() {
+    let extras = backup_extras();
+    assert_eq!(extras.api_spec_count(), 2);
+    assert_eq!(extras.trust_bundle_count(), 1);
+    assert!(!extras.is_empty());
+
+    let none = BackupExtras::default();
+    assert_eq!(none.api_spec_count(), 0);
+    assert_eq!(none.trust_bundle_count(), 0);
+    assert!(none.is_empty());
+}
+
+#[test]
+fn backup_snapshot_parses_the_full_envelope() {
+    let snapshot = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "ferrum_version": "2.4.0",
+            "exported_at": "2026-08-24T00:00:00Z",
+            "source": "database",
+            "counts": {"proxies": 0},
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": [],
+            "api_specs": {"section_version": "2", "items": [{"id": "spec-a"}]},
+            "gateway_trust_bundles": []
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(snapshot.ferrum_version.as_deref(), Some("2.4.0"));
+    assert_eq!(snapshot.source.as_deref(), Some("database"));
+    assert_eq!(snapshot.extras.api_spec_count(), 1);
+    // Present-but-empty is distinct from absent and must survive the round trip.
+    assert_eq!(
+        snapshot.extras.gateway_trust_bundles,
+        Some(serde_json::json!([]))
+    );
+    assert!(snapshot.config.proxies.is_empty());
+}
+
+// --- Batch -------------------------------------------------------------------
+
+/// Build resources through serde so these tests stay decoupled from the
+/// (permissive, frequently extended) schema struct's field list.
+fn upstream(id: &str) -> Upstream {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": "team-alpha",
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .expect("upstream fixture")
+}
+
+fn proxy(id: &str) -> Proxy {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": "team-alpha",
+        "listen_path": format!("/{id}"),
+        "backend_host": "localhost",
+        "backend_port": 8080,
+    }))
+    .expect("proxy fixture")
+}
+
+#[test]
+fn split_batch_keeps_one_chunk_when_it_fits() {
+    let batch = BatchCreate {
+        upstreams: vec![upstream("u1")],
+        proxies: vec![proxy("p1")],
+        ..BatchCreate::default()
+    };
+    let chunks = split_batch(batch, BATCH_MAX_BODY_BYTES).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].len(), 2);
+}
+
+#[test]
+fn split_batch_preserves_dependency_order_across_chunks() {
+    // A tiny budget forces one resource per chunk. Upstreams must all land
+    // before the proxies that reference them, or the gateway rejects the
+    // proxy with "upstream_id '…' does not exist".
+    let batch = BatchCreate {
+        upstreams: vec![upstream("u1"), upstream("u2")],
+        proxies: vec![proxy("p1"), proxy("p2")],
+        ..BatchCreate::default()
+    };
+    let chunks = split_batch(batch, 600).unwrap();
+    assert!(chunks.len() > 1, "expected the budget to force chunking");
+
+    let order: Vec<&str> = chunks
+        .iter()
+        .flat_map(|c| {
+            c.upstreams
+                .iter()
+                .map(|_| "upstream")
+                .chain(c.proxies.iter().map(|_| "proxy"))
+        })
+        .collect();
+    let first_proxy = order.iter().position(|k| *k == "proxy").unwrap();
+    let last_upstream = order.iter().rposition(|k| *k == "upstream").unwrap();
+    assert!(
+        last_upstream < first_proxy,
+        "upstreams must precede proxies across chunk boundaries: {order:?}"
+    );
+    assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 4);
+}
+
+#[test]
+fn split_batch_on_empty_input_produces_no_requests() {
+    assert!(split_batch(BatchCreate::default(), BATCH_MAX_BODY_BYTES)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn batch_counts_mirror_the_payload() {
+    let batch = BatchCreate {
+        upstreams: vec![upstream("u1"), upstream("u2")],
+        proxies: vec![proxy("p1")],
+        ..BatchCreate::default()
+    };
+    let counts = batch.counts();
+    assert_eq!(counts.upstreams, 2);
+    assert_eq!(counts.proxies, 1);
+    assert_eq!(counts.total(), 3);
+}
+
+#[test]
+fn batch_payload_omits_empty_sections() {
+    // `BatchCreateRequest` is `additionalProperties: false` and create-only;
+    // sending `version` or empty arrays is needless surface.
+    let batch = BatchCreate {
+        upstreams: vec![upstream("u1")],
+        ..BatchCreate::default()
+    };
+    let json = serde_json::to_value(&batch).unwrap();
+    assert!(json.get("upstreams").is_some());
+    assert!(json.get("proxies").is_none());
+    assert!(json.get("version").is_none());
+}
+
+// --- Health preflight --------------------------------------------------------
+
+#[test]
+fn write_block_reason_passes_a_writable_gateway() {
+    let health = serde_json::from_str::<HealthStatus>(
+        r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+    )
+    .unwrap();
+    assert!(write_block_reason(&health).is_none());
+}
+
+#[test]
+fn write_block_reason_flags_read_only_mode() {
+    let health = serde_json::from_str::<HealthStatus>(
+        r#"{"status":"degraded","ready":true,"mode":"database","admin_writes_enabled":false}"#,
+    )
+    .unwrap();
+    let reason = write_block_reason(&health).expect("should block");
+    assert!(reason.contains("admin_writes_enabled=false"), "{reason}");
+}
+
+#[test]
+fn write_block_reason_flags_modes_that_never_accept_writes() {
+    for mode in ["file", "dp", "mesh", "node_agent", "FILE"] {
+        let health = serde_json::from_str::<HealthStatus>(&format!(
+            r#"{{"status":"ok","ready":true,"mode":"{mode}"}}"#
+        ))
+        .unwrap();
+        assert!(
+            write_block_reason(&health).is_some(),
+            "{mode} mode is read-only unconditionally"
+        );
+    }
+}
+
+#[test]
+fn write_block_reason_tolerates_a_sparse_health_body() {
+    // Older builds (or an unauthenticated projection) report only status/ready.
+    // Absence of the flag is not evidence of read-only mode.
+    let health = serde_json::from_str::<HealthStatus>(r#"{"status":"ok","ready":true}"#).unwrap();
+    assert!(write_block_reason(&health).is_none());
+}
+
+// --- GET /cluster + convergence summary --------------------------------------
+
+#[test]
+fn cluster_status_parses_cp_shape() {
+    let body = r#"{
+      "mode": "cp",
+      "connected_data_planes": 2,
+      "data_planes": [
+        {"node_id":"abc-123","version":"0.9.0","namespace":"ferrum","status":"online",
+         "connected_at":"2025-01-15T10:30:00Z","last_sync_at":"2025-01-15T10:35:00Z"},
+        {"node_id":"def-456","version":"0.9.0","namespace":"staging","status":"online",
+         "connected_at":"2025-01-15T10:31:00Z","last_sync_at":"2025-01-15T10:32:00Z"}
+      ],
+      "connected_mesh_nodes": 1,
+      "mesh_nodes": [
+        {"node_id":"mesh-789","version":"0.9.0","namespace":"ferrum","status":"online",
+         "connected_at":"2025-01-15T10:32:00Z","last_sync_at":"2025-01-15T10:40:00Z"}
+      ]
+    }"#;
+
+    let status: ClusterStatus = serde_json::from_str(body).expect("cp shape parses");
+    assert_eq!(status.mode.as_deref(), Some("cp"));
+    assert_eq!(status.data_planes.len(), 2);
+    assert_eq!(status.mesh_nodes.len(), 1);
+
+    let summary = convergence_summary(&status);
+    assert!(summary.contains("2 data-plane node(s)"), "{summary}");
+    assert!(summary.contains("1 mesh node(s)"), "{summary}");
+    // Oldest across BOTH node lists, not just the first one.
+    assert!(
+        summary.contains("oldest last_sync_at 2025-01-15T10:32:00Z"),
+        "{summary}"
+    );
+    assert!(!summary.contains("WARNING"), "{summary}");
+}
+
+#[test]
+fn cluster_status_parses_dp_shape_and_warns_on_divergence() {
+    let body = r#"{
+      "mode": "dp",
+      "control_plane": {
+        "url": "http://cp-host:50051",
+        "status": "online",
+        "is_primary": true,
+        "connected_since": "2025-01-15T10:30:00Z",
+        "last_config_received_at": "2025-01-15T10:35:00Z",
+        "config_diverged": true,
+        "config_diverged_since": "2025-01-15T10:36:00Z",
+        "config_divergence_recoveries_total": 3
+      }
+    }"#;
+
+    let status: ClusterStatus = serde_json::from_str(body).expect("dp shape parses");
+    let summary = convergence_summary(&status);
+    assert!(summary.contains("http://cp-host:50051"), "{summary}");
+    assert!(summary.contains("online"), "{summary}");
+    assert!(
+        summary.contains("last config received 2025-01-15T10:35:00Z"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("WARNING: config_diverged since 2025-01-15T10:36:00Z"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn cluster_status_parses_informational_shape() {
+    let body =
+        r#"{"mode":"database","message":"cluster status is only meaningful in CP/DP modes"}"#;
+
+    let status: ClusterStatus = serde_json::from_str(body).expect("informational shape parses");
+    let summary = convergence_summary(&status);
+    assert!(summary.contains("mode=database"), "{summary}");
+    assert!(summary.contains("only meaningful in CP/DP"), "{summary}");
+    assert!(!summary.contains("WARNING"), "{summary}");
+}
+
+#[test]
+fn cluster_status_tolerates_missing_fields() {
+    // Every field optional: an empty object, a node with no timestamps, and an
+    // unknown extra key must all survive. The endpoint is advisory; a shape
+    // this build has not seen must not become an error.
+    let empty: ClusterStatus = serde_json::from_str("{}").expect("empty object parses");
+    assert!(empty.mode.is_none());
+    let summary = convergence_summary(&empty);
+    assert!(summary.contains("mode=unknown"), "{summary}");
+
+    let partial: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","data_planes":[{"node_id":"a"}],"future_field":{"nested":1}}"#,
+    )
+    .expect("partial + unknown fields parse");
+    assert_eq!(partial.data_planes.len(), 1);
+    assert!(partial.data_planes[0].last_sync_at.is_none());
+    let summary = convergence_summary(&partial);
+    assert!(summary.contains("1 data-plane node(s)"), "{summary}");
+    assert!(summary.contains("no last_sync_at reported"), "{summary}");
+}
+
+#[test]
+fn convergence_summary_warns_on_per_node_divergence() {
+    let status: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","connected_data_planes":1,
+            "data_planes":[{"node_id":"a","last_sync_at":"2025-01-15T10:35:00Z",
+                            "config_diverged":true}]}"#,
+    )
+    .expect("parses");
+
+    let summary = convergence_summary(&status);
+    assert!(
+        summary.contains("WARNING: at least one node reports config_diverged"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn convergence_summary_ignores_unparsable_timestamps() {
+    // A garbage stamp must not become the headline "oldest" value.
+    let status: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","connected_data_planes":2,
+            "data_planes":[{"node_id":"a","last_sync_at":"not-a-timestamp"},
+                           {"node_id":"b","last_sync_at":"2025-01-15T10:35:00Z"}]}"#,
+    )
+    .expect("parses");
+
+    let summary = convergence_summary(&status);
+    assert!(
+        summary.contains("oldest last_sync_at 2025-01-15T10:35:00Z"),
+        "{summary}"
+    );
+    assert!(!summary.contains("not-a-timestamp"), "{summary}");
+}
+
+#[test]
+fn convergence_summary_orders_by_instant_not_string() {
+    // 09:00-01:00 is 10:00Z, which is LATER than 09:30Z despite sorting
+    // earlier lexicographically.
+    let status: ClusterStatus = serde_json::from_str(
+        r#"{"mode":"cp","connected_data_planes":2,
+            "data_planes":[{"node_id":"a","last_sync_at":"2025-01-15T09:00:00-01:00"},
+                           {"node_id":"b","last_sync_at":"2025-01-15T09:30:00Z"}]}"#,
+    )
+    .expect("parses");
+
+    let summary = convergence_summary(&status);
+    assert!(
+        summary.contains("oldest last_sync_at 2025-01-15T09:30:00Z"),
+        "{summary}"
+    );
 }
