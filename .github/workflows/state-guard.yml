@@ -20,6 +20,14 @@ name: GitForgeOps State Guard
 
 on:
   pull_request:
+    # `labeled`/`unlabeled` are not in the default activity type set
+    # (opened, synchronize, reopened). Without them, adding the override
+    # label does nothing until someone pushes another commit — the check
+    # stays red on a PR that has already been authorized, and the only way
+    # out is an empty commit. Re-evaluate on the label events themselves so
+    # the escape hatch takes effect when it is used, and so removing the
+    # label puts the fence straight back up.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - '.state/**'
 
