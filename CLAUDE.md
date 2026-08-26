@@ -134,7 +134,11 @@ and temp files), and `state-guard.yml` fails any PR touching `.state/**` unless
 a maintainer adds the `gitforgeops/state-override` label. That workflow runs
 on **every** PR with no `paths:` filter and decides internally whether
 `.state/` was touched — a path-filtered workflow reports no status on
-non-matching PRs, which stalls them forever once the check is required. Keep the fence there
+non-matching PRs, which stalls them forever once the check is required.
+Requiring it is a deliberate opt-in with a cost: a ruleset that requires the
+check also rejects `github-actions[bot]`'s direct push of the ledger
+(`GH013`), and GitHub Actions cannot hold a ruleset bypass, so the
+state-commit steps would first need a PAT or App token. Advisory by default. Keep the fence there
 rather than narrowing what the binary reads out of the ledger — shared mode
 must keep reconciling namespaces the repo no longer declares, or a PR that
 removes a namespace's last resource orphans it on the gateway forever.
