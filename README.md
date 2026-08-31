@@ -30,7 +30,7 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
 
    Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each resolves the effective label event and requires the actor's current permission to be `write`, `maintain`, or `admin`. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
 6. **Configure the mandatory GitHub launch controls.** Create the contents-only state-writer App, require the state guard and CI checks in an active `main` ruleset, protect release tags and every deployment environment, restrict Actions, and configure the scheduled settings audit. Follow [GitHub launch controls](docs/github-launch-controls.md) before adding production credentials. Forks do not inherit any of these settings.
-7. **Pin the validator release identity.** Select an allowed `FERRUM_EDGE_VERSION`. Every allowed release and digest lives in reviewed `.github/ferrum-edge-checksums.txt`; the checked-in fallback is the content-pinned 2026-08-27 `latest` snapshot. A moved tag or an unreviewed version fails before execution.
+7. **Pin the validator release identity.** Select an allowed `FERRUM_EDGE_VERSION`. Every allowed release and digest lives in reviewed `.github/ferrum-edge-checksums.txt`; the checked-in fallback is the content-pinned 2026-08-31 `latest` snapshot. A moved tag or an unreviewed version fails before execution.
 8. Open a PR. The PR-built binary runs static validation without an environment or gateway secrets. A default-branch `workflow_run` then sanitizes only declarative YAML, builds and hashes the protected-branch binary once, waits for environment approval, and posts the live policy/drift/security review for same-repository PRs. Each live job is intersected with the environment's protected namespace scope and fails if comparison is unavailable. Fork PRs remain static-only.
 9. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering) and uses the short-lived state-writer App token for its protected ledger commit.
 
@@ -929,7 +929,7 @@ must appear beside the SHA-256 of `ferrum-edge-linux-x86_64` in
 through normal CODEOWNER review. The installer downloads the binary and its
 publisher `.sha256` asset, verifies they agree, then verifies the computed
 bytes against the checked-in digest before making the file executable. If
-unset, the fallback selects the content-pinned 2026-08-27 `latest` snapshot;
+unset, the fallback selects the content-pinned 2026-08-31 `latest` snapshot;
 if that tag moves, CI stops until the lock file is deliberately updated.
 
 ## License
