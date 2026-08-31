@@ -28,14 +28,14 @@ on:
     # out is an empty commit. Re-evaluate on the label events themselves so
     # the escape hatch takes effect when it is used, and so removing the
     # label puts the fence straight back up.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
     # Deliberately NO `paths:` filter. This job is meant to be a required
-    # status check, and a path-filtered workflow never reports a status on
-    # PRs that don't match — GitHub then holds every such PR at "Expected —
+    # status check for `main`, and a path-filtered workflow never reports a status on
+    # matching-base PRs that don't match — GitHub then holds every such PR at "Expected —
     # waiting for status to be reported" forever. Running always and deciding
     # inside the job is what makes the check safe to require: it reports on
-    # every PR, and passes in three seconds when `.state/` is untouched.
-    branches: ['**']
+    # every PR to `main`, and passes in three seconds when `.state/` is untouched.
+    branches: [main]
 
 concurrency:
   group: state-guard-${{ github.event.pull_request.number }}
@@ -55,7 +55,7 @@ jobs:
       - name: Check out trusted guard logic
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: trusted-guard
           persist-credentials: false
 
@@ -65,6 +65,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # Inspect both current and previous names. Looking only at
@@ -72,11 +74,42 @@ jobs:
           # evade the ownership-ledger guard.
           pages_file=$(mktemp)
           trap 'rm -f "$pages_file"' EXIT
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --paginate --slurp > "$pages_file"
-          current_changed=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files')
-          [[ "$current_changed" =~ ^[0-9]+$ ]] || {
-            echo "::error::GitHub returned an invalid current changed-file count."
+          stable=false
+          for attempt in 1 2 3; do
+            before=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            before_head=$(jq -r '.head.sha' <<< "$before")
+            before_base=$(jq -r '.base.sha' <<< "$before")
+            before_ref=$(jq -r '.base.ref' <<< "$before")
+            before_count=$(jq -r '.changed_files' <<< "$before")
+            [[ "$before_head" =~ ^[0-9a-f]{40}$ && "$before_base" =~ ^[0-9a-f]{40}$ && "$before_count" =~ ^[0-9]+$ ]] || {
+              echo "::error::GitHub returned invalid PR file metadata."
+              exit 1
+            }
+            [ "$before_head" = "$EXPECTED_HEAD_SHA" ] || {
+              echo "::error::PR head changed while the state guard was running; wait for the new run."
+              exit 1
+            }
+            [ "$before_ref" = "$DEFAULT_BRANCH" ] || {
+              echo "::error::State guard only trusts PRs targeting the protected default branch."
+              exit 1
+            }
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+              --paginate --slurp > "$pages_file"
+            after=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            after_head=$(jq -r '.head.sha' <<< "$after")
+            after_base=$(jq -r '.base.sha' <<< "$after")
+            after_ref=$(jq -r '.base.ref' <<< "$after")
+            after_count=$(jq -r '.changed_files' <<< "$after")
+            if [ "$before_head" = "$after_head" ] && [ "$before_base" = "$after_base" ] && \
+               [ "$before_ref" = "$after_ref" ] && [ "$before_count" = "$after_count" ]; then
+              current_changed=$after_count
+              stable=true
+              break
+            fi
+            echo "::warning::PR file metadata changed during attempt ${attempt}; retrying a stable snapshot."
+          done
+          [ "$stable" = true ] || {
+            echo "::error::Could not obtain a stable PR file snapshot; state guard fails closed."
             exit 1
           }
           helper=trusted-guard/.github/scripts/changed_files.py

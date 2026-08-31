@@ -32,6 +32,7 @@ environments:
 
   sandbox:
     overlay: sandbox
+    live_review: false          # file-mode env: skip Admin API PR comparison
     apply_strategy: incremental
     ownership:
       mode: shared

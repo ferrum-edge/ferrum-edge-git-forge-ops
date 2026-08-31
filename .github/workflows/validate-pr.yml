@@ -2,6 +2,8 @@ name: GitForgeOps PR Static Validation
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
 
 # This workflow executes code from the pull request, including Cargo build
 # scripts. It therefore receives no GitHub Environment, gateway credential,
@@ -9,6 +11,7 @@ on:
 # review consumes only a sanitized declarative artifact with a trusted binary.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   scope:
@@ -23,7 +26,7 @@ jobs:
       - name: Check out trusted path classifier
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: trusted-scope
           persist-credentials: false
 
@@ -33,19 +36,38 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           pages_file=$(mktemp)
           trap 'rm -f "$pages_file"' EXIT
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --paginate --slurp > "$pages_file"
-          current_changed=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files')
-          [[ "$current_changed" =~ ^[0-9]+$ ]] || {
-            echo "::warning::GitHub returned an invalid current changed-file count; validating fail-safe."
-            current_changed=-1
-          }
+          stable=false
+          for attempt in 1 2 3; do
+            before=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            before_head=$(jq -r '.head.sha' <<< "$before")
+            before_base=$(jq -r '.base.sha' <<< "$before")
+            before_ref=$(jq -r '.base.ref' <<< "$before")
+            before_count=$(jq -r '.changed_files' <<< "$before")
+            [[ "$before_head" =~ ^[0-9a-f]{40}$ && "$before_base" =~ ^[0-9a-f]{40}$ && "$before_count" =~ ^[0-9]+$ ]] || exit 1
+            [ "$before_head" = "$EXPECTED_HEAD_SHA" ] && [ "$before_ref" = "$DEFAULT_BRANCH" ] || exit 1
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" --paginate --slurp > "$pages_file"
+            after=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            after_head=$(jq -r '.head.sha' <<< "$after")
+            after_base=$(jq -r '.base.sha' <<< "$after")
+            after_ref=$(jq -r '.base.ref' <<< "$after")
+            after_count=$(jq -r '.changed_files' <<< "$after")
+            if [ "$before_head" = "$after_head" ] && [ "$before_base" = "$after_base" ] && \
+               [ "$before_ref" = "$after_ref" ] && [ "$before_count" = "$after_count" ]; then
+              current_changed=$after_count
+              stable=true
+              break
+            fi
+            echo "::warning::PR file metadata changed during attempt ${attempt}; retrying."
+          done
+          [ "$stable" = true ] || exit 1
           helper=trusted-scope/.github/scripts/changed_files.py
-          if [ -f "$helper" ] && [ "$current_changed" -ge 0 ]; then
+          if [ -f "$helper" ]; then
             result=$(python3 trusted-scope/.github/scripts/changed_files.py \
               "$pages_file" "$current_changed" declarative)
           else

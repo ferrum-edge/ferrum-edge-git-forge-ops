@@ -144,10 +144,20 @@ class PrInputTests(unittest.TestCase):
                 root,
                 json.dumps(
                     [
-                        {"environment": "staging", "namespaces": None},
+                        {
+                            "environment": "staging",
+                            "live_review": True,
+                            "namespaces": None,
+                        },
                         {
                             "environment": "production",
+                            "live_review": True,
                             "namespaces": ["team-a"],
+                        },
+                        {
+                            "environment": "file-output",
+                            "live_review": False,
+                            "namespaces": None,
                         },
                     ]
                 ),
@@ -178,16 +188,17 @@ class PrInputTests(unittest.TestCase):
                 with self.assertRaisesRegex(pr_input.InputError, expected):
                     pr_input.trusted_targets(
                         root,
-                        '[{"environment":"production","namespaces":null}]',
+                        '[{"environment":"production","live_review":true,"namespaces":null}]',
                     )
 
     def test_trusted_targets_reject_malformed_or_duplicate_scope(self):
         cases = [
             '["production"]',
-            '[{"environment":"production","namespaces":["unsafe namespace"]}]',
-            '[{"environment":"production","namespaces":null},'
-            '{"environment":"production","namespaces":null}]',
-            '[{"environment":"production","namespaces":null,"extra":true}]',
+            '[{"environment":"production","live_review":true,"namespaces":["unsafe namespace"]}]',
+            '[{"environment":"production","live_review":true,"namespaces":null},'
+            '{"environment":"production","live_review":true,"namespaces":null}]',
+            '[{"environment":"production","live_review":true,"namespaces":null,"extra":true}]',
+            '[{"environment":"production","live_review":"yes","namespaces":null}]',
         ]
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

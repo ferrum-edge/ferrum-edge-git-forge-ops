@@ -121,6 +121,13 @@ environments:
       mode: shared               # safer; repo only manages what it declared
       drift_report: true
 
+  file-output:
+    overlay: production
+    live_review: false           # no Admin API; skip Environment-bound review
+    apply_strategy: incremental
+    ownership:
+      mode: shared
+
   production:
     overlay: production
     apply_strategy: full_replace
@@ -132,7 +139,7 @@ environments:
 default_environment: staging
 ```
 
-The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
+The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Set `live_review: false` on file-mode environments (or any environment without a live Admin API); the protected matrix excludes them before a GitHub Environment approval is requested. Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
 
 ## Ownership modes
 

@@ -57,7 +57,8 @@ overlay YAML, copies environment/policy routing from the protected branch, and
 runs a trusted binary with `FERRUM_NAMESPACE` set to one protected-branch
 resource namespace per job, intersected with the environment's protected
 namespace scope. `review --require-live` fails that job when comparison is
-unavailable. Fork PRs and new/remapped namespaces never enter the privileged
+unavailable. Environments with `live_review: false` are removed before the
+Environment-bound matrix, which is required for file mode. Fork PRs and new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in
 `rust-toolchain.toml`; external Actions use full commit SHAs.
 
@@ -116,7 +117,8 @@ A `GET /health` preflight runs before the first mutation so a read-only plane fa
 ### Multi-Environment (repo config)
 
 `.gitforgeops/config.yaml` declares logical environments. Each entry picks an
-overlay, apply strategy, and ownership mode. **No gateway URL, no JWT, no
+overlay, apply strategy, ownership mode, and whether live PR review is enabled.
+Set `live_review: false` for file-mode environments. **No gateway URL, no JWT, no
 secret names** live in this file — those come from GitHub Environment Secrets
 of the same name as the entry (e.g. `production` entry → GitHub Environment
 `production`'s secrets are injected by the workflow). See

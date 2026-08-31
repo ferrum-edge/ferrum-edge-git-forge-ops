@@ -21,6 +21,9 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       targets: ${{ steps.targets.outputs.targets }}
       head_sha: ${{ steps.metadata.outputs.head_sha }}
@@ -82,6 +85,8 @@ jobs:
           current_sha=$(jq -r '.head.sha' <<< "$current")
           current_repo=$(jq -r '.head.repo.full_name' <<< "$current")
           current_base=$(jq -r '.base.ref' <<< "$current")
+          current_base_sha=$(jq -r '.base.sha' <<< "$current")
+          declared_changed=$(jq -r '.changed_files' <<< "$current")
           [ "$current_sha" = "$EVENT_HEAD_SHA" ] || { echo "PR head changed after static validation; wait for the new run." >&2; exit 1; }
           [ "$current_repo" = "$EVENT_HEAD_REPO" ] || { echo "PR source repository changed." >&2; exit 1; }
           [ "$current_base" = "$DEFAULT_BRANCH" ] || { echo "PR no longer targets the protected default branch." >&2; exit 1; }
@@ -90,8 +95,15 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${event_pr}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
-          declared_changed=$(jq -r '.changed_files' <<< "$current")
           [[ "$declared_changed" =~ ^[0-9]+$ ]] || { echo "Invalid changed-file count" >&2; exit 1; }
+          current_after=$(gh api "repos/${REPO}/pulls/${event_pr}")
+          [ "$(jq -r '.head.sha' <<< "$current_after")" = "$current_sha" ] && \
+          [ "$(jq -r '.base.sha' <<< "$current_after")" = "$current_base_sha" ] && \
+          [ "$(jq -r '.base.ref' <<< "$current_after")" = "$current_base" ] && \
+          [ "$(jq -r '.changed_files' <<< "$current_after")" = "$declared_changed" ] || {
+            echo "PR file metadata changed during trusted classification; wait for the new run." >&2
+            exit 1
+          }
           classification=$(python3 trusted/.github/scripts/changed_files.py \
             "$pages_file" "$declared_changed" declarative)
           [ "$(jq -r '.complete' <<< "$classification")" = true ] || {

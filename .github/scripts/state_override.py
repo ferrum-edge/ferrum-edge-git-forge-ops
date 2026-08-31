@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 
 MAX_EVENTS = 10_000
 SUFFICIENT_PERMISSIONS = {"write", "maintain", "admin"}
+LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,33}\[bot\])$")
 
 
 class OverrideError(RuntimeError):
@@ -53,7 +55,7 @@ def resolve_effective_event(pages: Any, label: str) -> dict[str, Any]:
 
     actor = effective.get("actor")
     login = actor.get("login") if isinstance(actor, dict) else None
-    if not isinstance(login, str) or not login:
+    if not isinstance(login, str) or not LOGIN_RE.fullmatch(login):
         raise OverrideError("effective label event has a missing/deleted actor")
     return {
         "actor": login,

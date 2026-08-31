@@ -12,9 +12,30 @@ SPEC.loader.exec_module(check_supply_chain)
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
+    def test_pr_trigger_must_rerun_on_retarget_and_target_main(self):
+        secure = """on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+"""
+        self.assertEqual(
+            check_supply_chain.pull_request_trigger_violations("secure.yml", secure),
+            [],
+        )
+        insecure = """on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: ['**']
+"""
+        violations = check_supply_chain.pull_request_trigger_violations(
+            "insecure.yml", insecure
+        )
+        self.assertTrue(any("base-retarget" in item for item in violations))
+        self.assertTrue(any("protected main" in item for item in violations))
+
     def test_candidate_branch_classifier_fails_even_when_trusted_text_remains(self):
         text = """
-ref: ${{ github.event.pull_request.base.sha }}
+ref: ${{ github.event.repository.default_branch }}
 result=$(python3 trusted-scope/.github/scripts/changed_files.py
 result=$(python3 .github/scripts/changed_files.py
 """
@@ -26,18 +47,33 @@ result=$(python3 .github/scripts/changed_files.py
         )
         self.assertTrue(any("candidate-branch" in item for item in violations))
 
-    def test_missing_base_sha_checkout_fails(self):
+    def test_missing_default_branch_checkout_fails(self):
         violations = check_supply_chain.trusted_classifier_violations(
             "validate-pr.yml",
             "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
             "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
             1,
         )
-        self.assertTrue(any("base SHA" in item for item in violations))
+        self.assertTrue(any("default branch" in item for item in violations))
+
+    def test_unprotected_pr_base_cannot_supply_trusted_classifier(self):
+        text = """
+ref: ${{ github.event.repository.default_branch }}
+ref: ${{ github.event.pull_request.base.sha }}
+result=$(python3 trusted-scope/.github/scripts/changed_files.py
+result='{"complete":false,"matches":true}'
+"""
+        violations = check_supply_chain.trusted_classifier_violations(
+            "validate-pr.yml",
+            text,
+            "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
+            1,
+        )
+        self.assertTrue(any("unprotected PR base" in item for item in violations))
 
     def test_missing_trusted_helper_must_run_the_gate_fail_safe(self):
         text = """
-ref: ${{ github.event.pull_request.base.sha }}
+ref: ${{ github.event.repository.default_branch }}
 result=$(python3 trusted-scope/.github/scripts/changed_files.py
 """
         violations = check_supply_chain.trusted_classifier_violations(
