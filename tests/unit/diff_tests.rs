@@ -1,7 +1,7 @@
 use gitforgeops::config::schema::*;
 use gitforgeops::diff::{
     best_practice::check_best_practices, breaking::detect_breaking_changes,
-    mask_indeterminate_consumer_credentials, resource_diff::compute_diff,
+    is_sensitive_diff_field, mask_indeterminate_secret_values, resource_diff::compute_diff,
     resource_diff::compute_diff_with_scope, resource_diff::state_key, resource_diff::DiffAction,
     resource_diff::OwnershipScope, security::audit_security,
 };
@@ -101,7 +101,7 @@ fn credential_indeterminate_review_masks_only_matching_consumer_values() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_consumer_credentials(&desired, &mut actual);
+    mask_indeterminate_secret_values(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert_eq!(diffs[0].kind, "Consumer");
@@ -145,7 +145,7 @@ fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_consumer_credentials(&desired, &mut actual);
+    mask_indeterminate_secret_values(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert!(
@@ -156,6 +156,79 @@ fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
         "{:?}",
         diffs[0].details
     );
+}
+
+#[test]
+fn credential_indeterminate_review_masks_only_placeholder_leaves() {
+    let mut desired_consumer = make_consumer("app", "app");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([
+            {"key": "${gh-env-secret:alloc=require}", "label": "desired-label"}
+        ]),
+    );
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "app");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([
+            {"key": "live-secret", "label": "changed-label"},
+            {"key": "unexpected-extra-live-secret"}
+        ]),
+    );
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .any(|change| change.field == "credentials"),
+        "literal and extra live credential data must remain comparable: {:?}",
+        diffs[0].details
+    );
+}
+
+#[test]
+fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
+    let mut desired_plugin =
+        make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    desired_plugin.config = serde_json::json!({
+        "authorization": "${gh-env-secret:alloc=require}",
+        "protocol": "grpc"
+    });
+    let desired = GatewayConfig {
+        plugin_configs: vec![desired_plugin],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    live_plugin.config = serde_json::json!({
+        "authorization": "Bearer live-secret",
+        "protocol": "http/protobuf"
+    });
+    let mut actual = GatewayConfig {
+        plugin_configs: vec![live_plugin],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert_eq!(diffs[0].details.len(), 1, "{:?}", diffs[0].details);
+    assert_eq!(diffs[0].details[0].field, "config");
+    assert!(is_sensitive_diff_field("PluginConfig", "config"));
+    assert!(is_sensitive_diff_field("Consumer", "credentials"));
+    assert!(!is_sensitive_diff_field("PluginConfig", "plugin_name"));
 }
 
 fn make_plugin_config(

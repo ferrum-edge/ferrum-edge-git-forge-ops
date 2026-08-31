@@ -2,42 +2,68 @@ use std::collections::HashSet;
 
 use crate::config::GatewayConfig;
 
-/// Exclude credential values from a live comparison when the caller has no
-/// credential bundle and therefore cannot materialize the desired slots.
+/// Exclude only unresolved broker-controlled leaves from a live comparison
+/// when the caller has no secret bundle and cannot materialize desired slots.
 ///
-/// Only matching Consumers are aligned. Adds/deletes and every non-credential
-/// Consumer field remain visible, so the review loses no actionable drift
-/// signal beyond the values it cannot authoritatively know.
-pub fn mask_indeterminate_consumer_credentials(
-    desired: &GatewayConfig,
-    actual: &mut GatewayConfig,
-) {
+/// Matching Consumer credentials and PluginConfig config values are aligned
+/// leaf-by-leaf. Literal siblings, extra live entries, shape differences,
+/// adds/deletes, and every nonsecret field remain visible, so review loses no
+/// actionable drift signal beyond exact values it cannot authoritatively know.
+pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut GatewayConfig) {
     for live in &mut actual.consumers {
         if let Some(expected) = desired
             .consumers
             .iter()
             .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
-            .filter(|candidate| {
-                candidate
-                    .credentials
-                    .values()
-                    .any(value_contains_placeholder)
-            })
         {
-            live.credentials = expected.credentials.clone();
+            for (credential_type, desired_value) in &expected.credentials {
+                if let Some(live_value) = live.credentials.get_mut(credential_type) {
+                    mask_placeholder_leaves(desired_value, live_value);
+                }
+            }
+        }
+    }
+
+    for live in &mut actual.plugin_configs {
+        if let Some(expected) = desired
+            .plugin_configs
+            .iter()
+            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+        {
+            mask_placeholder_leaves(&expected.config, &mut live.config);
         }
     }
 }
 
-fn value_contains_placeholder(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(value) => {
-            matches!(crate::secrets::parse_placeholder(value), Some(Ok(_)))
+fn mask_placeholder_leaves(desired: &serde_json::Value, live: &mut serde_json::Value) {
+    match (desired, live) {
+        (serde_json::Value::String(expected), serde_json::Value::String(actual))
+            if matches!(crate::secrets::parse_placeholder(expected), Some(Ok(_))) =>
+        {
+            *actual = expected.clone();
         }
-        serde_json::Value::Array(items) => items.iter().any(value_contains_placeholder),
-        serde_json::Value::Object(map) => map.values().any(value_contains_placeholder),
-        _ => false,
+        (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+            for (key, expected_child) in expected {
+                if let Some(actual_child) = actual.get_mut(key) {
+                    mask_placeholder_leaves(expected_child, actual_child);
+                }
+            }
+        }
+        (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+            for (expected_child, actual_child) in expected.iter().zip(actual.iter_mut()) {
+                mask_placeholder_leaves(expected_child, actual_child);
+            }
+        }
+        _ => {}
     }
+}
+
+/// Diff fields whose values must never be rendered verbatim to stdout/logs.
+pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
+    matches!(
+        (kind, field),
+        ("Consumer", "credentials") | ("PluginConfig", "config")
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

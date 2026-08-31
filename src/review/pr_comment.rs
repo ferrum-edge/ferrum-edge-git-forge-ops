@@ -381,7 +381,7 @@ pub fn build_review_comment_v2(
     }
 
     if !secrets.results.is_empty() {
-        md.push_str("### Credential Slots\n\n");
+        md.push_str("### Secret Broker Slots\n\n");
         if !bundle_loaded {
             // PR review on a fork (or any context without environment-secret
             // access) sees no bundle, so every placeholder looks unresolved.
@@ -392,8 +392,10 @@ pub fn build_review_comment_v2(
                  (typical for PRs from forks or runs without an environment \
                  binding). The table below shows which placeholders are \
                  declared; **actual allocation status is determined at apply \
-                 time**, not here. Credential values are excluded from the live \
-                 Consumer diff; all non-credential fields are still compared._\n\n",
+                 time**, not here. Only unresolved broker-controlled leaves in \
+                 Consumer credentials and plugin config are excluded from the \
+                 live diff; literal siblings, extra entries, shape changes, and \
+                 nonsecret fields are still compared._\n\n",
             );
         }
         md.push_str("| Slot | Declared as |\n|------|-------------|\n");
@@ -417,7 +419,7 @@ pub fn build_review_comment_v2(
                 bounded_inline(&label)
             ));
         }
-        append_omitted_table_row(&mut md, secrets.results.len(), "credential slot");
+        append_omitted_table_row(&mut md, secrets.results.len(), "secret broker slot");
         md.push('\n');
     }
 

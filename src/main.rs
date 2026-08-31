@@ -346,16 +346,6 @@ fn build_github_api_client(
         .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))
 }
 
-/// Field names whose diff values must never be printed verbatim. These
-/// carry secret material — consumer credentials hold API keys, JWT
-/// signing keys, HMAC secrets, etc. Once resolved from the bundle, the
-/// values ARE the secret. `cmd_diff` echoes to stdout which is captured
-/// in CI logs (especially drift-check.yml), so printing them would
-/// exfiltrate secrets through a side channel.
-fn is_sensitive_field(kind: &str, field: &str) -> bool {
-    matches!((kind, field), ("Consumer", "credentials"))
-}
-
 /// Append `comment` to `$GITHUB_STEP_SUMMARY` when running under GitHub
 /// Actions. The step summary is always writable, so this is a reliable
 /// fallback when PR comment posting is blocked (fork PRs, read-only
@@ -697,7 +687,7 @@ fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) 
     if report.results.is_empty() {
         return None;
     }
-    let mut lines = vec![format!("Credential slots (env {}):", resolved.name)];
+    let mut lines = vec![format!("Secret broker slots (env {}):", resolved.name)];
     for r in &report.results {
         let status = match r.status {
             secrets::SlotStatus::Resolved => "resolved",
@@ -973,12 +963,10 @@ async fn cmd_diff(
             };
             println!("  {} {} {} ({})", action, d.kind, d.id, d.namespace);
             for change in &d.details {
-                if is_sensitive_field(&d.kind, &change.field) {
-                    // Credentials carry actual secret material (rotated
-                    // values, generated keys). Printing them here would
-                    // leak to CI logs — drift-check.yml echoes stdout
-                    // into the workflow log, which is viewable by anyone
-                    // with read access to the run.
+                if diff::is_sensitive_diff_field(&d.kind, &change.field) {
+                    // Consumer credentials and plugin config can carry actual
+                    // secret material. Printing them here would leak to CI
+                    // logs, which are visible to anyone with run access.
                     println!("    {}: [REDACTED] -> [REDACTED]", change.field);
                 } else {
                     println!(
@@ -1092,7 +1080,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
         println!("{}\n", note);
         if !bundle_loaded {
             println!(
-                "Credential values are excluded from the live Consumer diff because no credential bundle is available; non-credential Consumer fields are still compared.\n"
+                "Unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from the live diff because no secret bundle is available; literal siblings, extra entries, shape changes, and nonsecret fields are still compared.\n"
             );
         }
     }
@@ -1109,10 +1097,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
                 if cached.is_empty() {
                     if !bundle_loaded {
                         for pair in &mut namespace_pairs {
-                            diff::mask_indeterminate_consumer_credentials(
-                                &desired,
-                                &mut pair.actual,
-                            );
+                            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
                         }
                     }
                     let (d, b, u, s) = compute_namespace_diffs(
@@ -1919,7 +1904,7 @@ async fn cmd_import(
     );
     if let Some(path) = credential_bundle_path {
         println!(
-            "Credential migration bundle: {} (private mode 0600; seed the listed FERRUM_CREDS_BUNDLE* environment secrets, then securely delete the local file)",
+            "Secret migration bundle: {} (private mode 0600; seed the listed FERRUM_CREDS_BUNDLE* environment secrets, then securely delete the local file)",
             path.display()
         );
     }
@@ -1978,10 +1963,7 @@ async fn cmd_review(
                 if cached.is_empty() {
                     if !bundle_loaded {
                         for pair in &mut namespace_pairs {
-                            diff::mask_indeterminate_consumer_credentials(
-                                &desired,
-                                &mut pair.actual,
-                            );
+                            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
                         }
                     }
                     let (d, b, u, s) = compute_namespace_diffs(
