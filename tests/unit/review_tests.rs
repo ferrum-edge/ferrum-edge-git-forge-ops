@@ -5,7 +5,7 @@ use gitforgeops::diff::{
 use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::review::pr_comment::{
-    build_review_comment, build_review_comment_v2, render_spec_owned,
+    build_review_comment, build_review_comment_v2, render_environment_note, render_spec_owned,
 };
 use gitforgeops::secrets::ResolveReport;
 
@@ -282,6 +282,7 @@ fn review_comment_sanitizes_every_resource_section() {
         declared_in_repo: false,
         pruned: false,
     }];
+    let environment_note = render_environment_note(forged, forged, forged);
 
     let comment = build_review_comment_v2(
         true,
@@ -296,7 +297,7 @@ fn review_comment_sanitizes_every_resource_section() {
         None,
         None,
         None,
-        Some(forged),
+        Some(&environment_note),
         &ResolveReport::default(),
         true,
     );
@@ -304,7 +305,45 @@ fn review_comment_sanitizes_every_resource_section() {
     assert!(!comment.lines().any(|line| line == "### Forged Result"));
     assert!(!comment.lines().any(|line| line.starts_with("<!-- hidden")));
     assert!(comment.contains("&lt;!-- hidden"));
-    assert!(comment.contains("&#124;"));
+    assert!(comment.contains("\\|"));
+}
+
+#[test]
+fn review_comment_preserves_trusted_markup_and_names_empty_code_spans() {
+    let policy = vec![PolicyFinding {
+        rule_id: "backend_scheme".to_string(),
+        severity: Severity::Error,
+        kind: "Proxy".to_string(),
+        id: String::new(),
+        namespace: String::new(),
+        message: "missing identity".to_string(),
+        remediation: None,
+        overridden_by: None,
+    }];
+    let note = render_environment_note("production", "Shared", "Incremental");
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &policy,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some(&note),
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(comment.starts_with(
+        "Environment: `production` · Ownership: `Shared` · Strategy: `Incremental`\n\n"
+    ));
+    assert!(comment.contains("**Proxy `(unnamed)`** (`(unnamed)`): missing identity"));
+    assert!(!comment.contains("``"));
 }
 
 #[test]
@@ -388,6 +427,26 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     );
     assert!(!with_bundle.contains("actual allocation status is determined at apply time"));
     assert!(with_bundle.contains("needs allocation (generated on apply)"));
+
+    report.results[0].status = SlotStatus::MissingRequired;
+    let missing_required = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &report,
+        true,
+    );
+    assert!(missing_required.contains("**MISSING (required)**"));
 }
 
 // --- Spec-owned section ------------------------------------------------------

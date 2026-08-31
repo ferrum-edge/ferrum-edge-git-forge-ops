@@ -1790,9 +1790,10 @@ async fn cmd_review(
         None => (Vec::new(), None, None),
     };
 
-    let ownership_note = format!(
-        "Environment: `{}` · Ownership: `{:?}` · Strategy: `{:?}`",
-        resolved.name, resolved.ownership.mode, resolved.apply_strategy
+    let ownership_note = review::render_environment_note(
+        &resolved.name,
+        &format!("{:?}", resolved.ownership.mode),
+        &format!("{:?}", resolved.apply_strategy),
     );
 
     let bundle_loaded = env_config

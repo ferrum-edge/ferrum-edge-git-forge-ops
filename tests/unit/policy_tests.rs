@@ -717,6 +717,8 @@ fn allowed_backend_domains_rejects_url_syntax_inside_bare_hosts() {
         "evil.example#.svc.cluster.local",
         "evil.example?.svc.cluster.local",
         "user@api.svc.cluster.local",
+        "evil.example.com:8080.svc.cluster.local",
+        "a:b.svc.cluster.local",
     ] {
         let mut p = proxy("malformed-host", BackendScheme::Https, 30_000, true);
         p.backend_host = host.to_string();
@@ -819,6 +821,61 @@ fn allowed_backend_domains_rejects_empty_suffix_wildcard_as_configuration() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].kind, "PolicyConfig");
     assert!(findings[0].severity.blocks_apply());
+}
+
+#[test]
+fn allowed_backend_domains_reports_malformed_entries_in_a_mixed_allowlist() {
+    let mut p = proxy("valid-host", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.internal.example.com".to_string();
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.".to_string(), "api.internal.example.com".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, "PolicyConfig");
+    assert!(findings[0].message.contains("'*.'"));
+}
+
+#[test]
+fn allowed_backend_domains_accepts_an_exact_non_bare_dns_override() {
+    let mut p = proxy("resolver-list", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("10.0.0.1,10.0.0.2".to_string());
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec![
+                    "*.svc.cluster.local".to_string(),
+                    "10.0.0.1,10.0.0.2".to_string(),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(evaluate_policies(&cfg, &policies).is_empty());
 }
 
 #[test]

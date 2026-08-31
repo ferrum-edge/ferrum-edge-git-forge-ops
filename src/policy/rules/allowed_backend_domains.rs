@@ -37,17 +37,29 @@ impl AllowedBackendDomainsRule {
     }
 
     fn is_bare_destination(host: &str) -> bool {
+        if host.contains(':') || host.contains('[') || host.contains(']') {
+            let address = host
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host);
+            return address.parse::<IpAddr>().is_ok();
+        }
         !host.is_empty()
             && !host.starts_with('.')
             && !host.contains("..")
             && host.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '.' | '-' | '_' | ':' | '[' | ']')
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
             })
     }
 
     fn is_allowed(host: &str, allowed_domains: &[String]) -> bool {
         let host = Self::normalize_domain(host);
+        if allowed_domains
+            .iter()
+            .any(|pattern| pattern != "*" && !pattern.starts_with("*.") && pattern == &host)
+        {
+            return true;
+        }
         if !Self::is_bare_destination(&host) {
             return false;
         }
@@ -68,20 +80,17 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             return findings;
         }
 
-        let allowed_domains: Vec<String> = self
-            .config
-            .allowed_domains
-            .iter()
-            .filter_map(|domain| {
-                let trimmed = domain.trim();
-                let normalized = Self::normalize_domain(trimmed);
-                if normalized.is_empty() || (normalized == "*" && trimmed != "*") {
-                    None
-                } else {
-                    Some(normalized)
-                }
-            })
-            .collect();
+        let mut invalid_domains = Vec::new();
+        let mut allowed_domains = Vec::new();
+        for domain in &self.config.allowed_domains {
+            let trimmed = domain.trim();
+            let normalized = Self::normalize_domain(trimmed);
+            if normalized.is_empty() || (normalized == "*" && trimmed != "*") {
+                invalid_domains.push(domain.clone());
+            } else {
+                allowed_domains.push(normalized);
+            }
+        }
         if allowed_domains.is_empty() {
             findings.push(PolicyFinding {
                 rule_id: self.rule_id().to_string(),
@@ -97,6 +106,28 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 overridden_by: None,
             });
             return findings;
+        }
+        if !invalid_domains.is_empty() {
+            findings.push(PolicyFinding {
+                rule_id: self.rule_id().to_string(),
+                severity: self.config.severity,
+                kind: "PolicyConfig".to_string(),
+                id: self.rule_id().to_string(),
+                namespace: "global".to_string(),
+                message: format!(
+                    "invalid allowed_domains entries were ignored: {}",
+                    invalid_domains
+                        .iter()
+                        .map(|domain| format!("'{domain}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                remediation: Some(
+                    "Remove malformed entries or replace them with exact hosts, nonempty '*.suffix' entries, or the literal '*' catch-all"
+                        .to_string(),
+                ),
+                overridden_by: None,
+            });
         }
         let allowed = allowed_domains.join(", ");
         let allow_all = allowed_domains.iter().any(|domain| domain == "*");

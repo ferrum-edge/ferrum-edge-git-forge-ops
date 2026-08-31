@@ -49,11 +49,36 @@ fn sanitize_code_span(value: &str) -> String {
         pending_space = false;
         match character {
             '`' => sanitized.push('\''),
-            '|' => sanitized.push_str("&#124;"),
+            '|' => sanitized.push_str("\\|"),
             _ => sanitized.push(character),
         }
     }
-    sanitized
+    if sanitized.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        sanitized
+    }
+}
+
+pub struct EnvironmentNote(String);
+
+impl EnvironmentNote {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn render_environment_note(
+    environment: &str,
+    ownership: &str,
+    strategy: &str,
+) -> EnvironmentNote {
+    EnvironmentNote(format!(
+        "Environment: `{}` · Ownership: `{}` · Strategy: `{}`",
+        sanitize_code_span(environment),
+        sanitize_code_span(ownership),
+        sanitize_code_span(strategy)
+    ))
 }
 
 fn fenced_code(value: &str) -> String {
@@ -246,7 +271,7 @@ pub fn build_review_comment_v2(
     override_reason: Option<&str>,
     override_cfg: Option<&OverrideConfig>,
     comparison_error: Option<&str>,
-    environment_note: Option<&str>,
+    environment_note: Option<&EnvironmentNote>,
     secrets: &ResolveReport,
     bundle_loaded: bool,
 ) -> String {
@@ -261,7 +286,9 @@ pub fn build_review_comment_v2(
     );
 
     if let Some(note) = environment_note {
-        md.insert_str(0, &format!("{}\n\n", sanitize_markdown_inline(note)));
+        // Callers construct this with `render_environment_note`, which escapes
+        // each dynamic value while preserving the intentional code-span markup.
+        md.insert_str(0, &format!("{}\n\n", note.as_str()));
     }
 
     if !unmanaged.is_empty() {
@@ -365,7 +392,7 @@ pub fn build_review_comment_v2(
             md.push_str(&format!(
                 "| `{}` | {} |\n",
                 sanitize_code_span(&r.slot),
-                sanitize_markdown_inline(&label)
+                label
             ));
         }
         md.push('\n');
