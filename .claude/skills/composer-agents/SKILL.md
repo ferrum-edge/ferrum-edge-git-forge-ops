@@ -51,6 +51,10 @@ Non-negotiables:
   where `ps` would expose it) or the CLI's own stored login (`cursor-agent status`). Never print
   the key or put it in prompts, files, arguments, or logs, and do not ask the worker to log in
   interactively.
+- The launcher clears every other inherited `CURSOR_*` override and runs Cursor against a private
+  empty control workspace with `--sandbox disabled`; the prompt must name the locked target
+  worktree, and the worker changes to it before inspecting or editing. This keeps candidate
+  `.cursor` config, `AGENTS.md`, and `CLAUDE.md` out of Cursor's automatic project-rule channel.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.
 

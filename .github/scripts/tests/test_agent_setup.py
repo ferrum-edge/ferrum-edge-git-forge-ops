@@ -37,7 +37,7 @@ def valid_launcher(name: str) -> str:
     ]
     if name in check_agent_setup.CLAUDE_LAUNCHER_FLOOR:
         lines.append("resolve_agent_bin claude")
-        lines.extend(f"unset {variable}" for variable in check_agent_setup.CLAUDE_ENV_OVERRIDES)
+        lines.append(check_agent_setup.CLAUDE_ISOLATION_CALL)
         lines.append("--setting-sources ''")
     return "\n".join(lines) + "\n"
 
@@ -77,7 +77,10 @@ def write_valid_setup(
         "require_linked_worktree() { :; }\n"
         "acquire_worktree_dispatch_lock() { :; }\n"
         "isolate_codex_provider() { :; }\n"
-        "isolate_opencode_provider() { :; }\n",
+        "isolate_opencode_provider() { :; }\n"
+        "isolate_claude_provider() { :; }\n"
+        "isolate_cursor_provider() { :; }\n"
+        "prepare_cursor_control_workspace() { :; }\n",
         encoding="utf-8",
     )
     (root / ".claude" / "rules").mkdir(parents=True, exist_ok=True)
@@ -98,7 +101,10 @@ def write_valid_setup(
         "validator=.agent-setup-base/.github/scripts/check_agent_setup.py\n"
         '[[ -f "$validator" ]]\n'
         "else\n"
-        "validator=.github/scripts/check_agent_setup.py\n",
+        "validator=.github/scripts/check_agent_setup.py\n"
+        'python3 "$validator" --root "$GITHUB_WORKSPACE"\n'
+        "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'\n"
+        "shellcheck --external-sources --source-path=SCRIPTDIR\n",
         encoding="utf-8",
     )
     policy = root / ".github" / "workflows" / "agent-setup-policy.yml"
@@ -128,6 +134,8 @@ def write_valid_setup(
                 "/.github/workflows/agent-setup-policy.yml",
                 "/.github/scripts/check_agent_setup.py",
                 "/.github/scripts/tests/test_agent_setup.py",
+                "/.agents/skills/",
+                "/.claude/",
             )
         )
         + "\n",
@@ -243,6 +251,19 @@ class AgentSetupTests(unittest.TestCase):
             violations = check_agent_setup.collect_violations(root)
         self.assertTrue(any("agent skill root must not be a symlink" in item for item in violations))
 
+    def test_rejects_symlinked_shared_library_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            shared_dir = root / ".agents" / "skills" / "_lib"
+            real_shared_dir = root / ".agents" / "real-lib"
+            shared_dir.rename(real_shared_dir)
+            shared_dir.symlink_to(real_shared_dir, target_is_directory=True)
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn("shared library directory must not be a symlink", joined)
+        self.assertIn("missing dispatch isolation helpers", joined)
+
     def test_requires_claude_mirror_except_for_claude_native_launchers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -267,20 +288,20 @@ class AgentSetupTests(unittest.TestCase):
             violations = check_agent_setup.collect_violations(root)
         self.assertTrue(any("unexpected Claude mirror" in item for item in violations))
 
-    def test_claude_launchers_must_clear_every_override_and_settings_source(self):
+    def test_claude_launchers_must_isolate_every_override_and_settings_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent = write_valid_setup(root, "opus-agents", claude_mirror=False)
             launcher = agent / "scripts" / "dispatch-agent.sh"
             launcher.write_text(
                 valid_launcher("opus-agents")
-                .replace("unset CLAUDE_CODE_USE_VERTEX\n", "")
+                .replace(f"{check_agent_setup.CLAUDE_ISOLATION_CALL}\n", "")
                 .replace("--setting-sources ''\n", ""),
                 encoding="utf-8",
             )
             violations = check_agent_setup.collect_violations(root)
         joined = "\n".join(violations)
-        self.assertIn("inherited CLAUDE_CODE_USE_VERTEX is not cleared", joined)
+        self.assertIn("inherited Claude provider variables are not isolated", joined)
         self.assertIn("user/project/local settings are not disabled", joined)
 
     def test_behavioral_launcher_detection_covers_new_provider_wrappers(self):
@@ -295,10 +316,10 @@ class AgentSetupTests(unittest.TestCase):
                 encoding="utf-8",
             )
             violations = check_agent_setup.collect_violations(root)
-        self.assertTrue(any("inherited ANTHROPIC_API_KEY" in item for item in violations))
+        self.assertTrue(any("Claude provider variables" in item for item in violations))
 
-    def test_codex_and_opencode_launchers_require_provider_isolation(self):
-        for provider in ("codex", "opencode"):
+    def test_codex_opencode_and_cursor_launchers_require_provider_isolation(self):
+        for provider in ("codex", "opencode", "cursor-agent"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 agent = write_valid_setup(root)
@@ -309,7 +330,15 @@ class AgentSetupTests(unittest.TestCase):
                 )
                 violations = check_agent_setup.collect_violations(root)
             self.assertTrue(
-                any(f"missing {provider if provider == 'opencode' else 'Codex'} provider isolation" in item for item in violations)
+                any(
+                    (
+                        "missing Cursor provider/project isolation"
+                        if provider == "cursor-agent"
+                        else f"missing {provider if provider == 'opencode' else 'Codex'} provider isolation"
+                    )
+                    in item
+                    for item in violations
+                )
             )
 
     def test_briefs_require_untrusted_guidance_and_repository_invariants(self):
@@ -382,6 +411,27 @@ class AgentSetupTests(unittest.TestCase):
         joined = "\n".join(violations)
         self.assertIn("github.event.pull_request.base.sha", joined)
         self.assertIn("candidate validator for bootstrap", joined)
+
+    def test_ci_workflow_cannot_keep_markers_but_drop_validation_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            workflow = root / ".github" / "workflows" / "agent-setup-ci.yml"
+            workflow.write_text(
+                workflow.read_text(encoding="utf-8")
+                .replace('python3 "$validator" --root "$GITHUB_WORKSPACE"\n', "")
+                .replace(
+                    "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'\n",
+                    "",
+                )
+                .replace("shellcheck --external-sources --source-path=SCRIPTDIR\n", ""),
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn('python3 "$validator" --root "$GITHUB_WORKSPACE"', joined)
+        self.assertIn("unittest discover", joined)
+        self.assertIn("shellcheck --external-sources", joined)
 
     def test_workflow_requires_policy_file_and_rejects_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -503,6 +553,210 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("controller checkout", controller.stderr)
         self.assertNotEqual(duplicate.returncode, 0)
         self.assertIn("concurrent dispatch", duplicate.stderr)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_worktree_lock_recovers_stale_and_malformed_owners_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            linked = Path(directory) / "linked"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Test",
+                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                    "GIT_COMMITTER_NAME": "Test",
+                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+                },
+                stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
+                check=True,
+            )
+            helper = str(
+                check_agent_setup.ROOT
+                / ".agents/skills/_lib/resolve-agent-bin.sh"
+            )
+            acquire = (
+                'set -e; source "$1"; acquire_worktree_dispatch_lock "$2"; '
+                'printf "acquired\\n"; sleep 30'
+            )
+            holder = subprocess.Popen(
+                ["bash", "-c", acquire, "bash", helper, str(linked)],
+                cwd=directory,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            self.assertEqual(holder.stdout.readline(), "acquired\n")
+            os.killpg(holder.pid, signal.SIGKILL)
+            holder.wait(timeout=5)
+            holder.stdout.close()
+            holder.stderr.close()
+
+            recovered = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    acquire.replace('; printf "acquired\\n"; sleep 30', ""),
+                    "bash",
+                    helper,
+                    str(linked),
+                ],
+                cwd=directory,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+            git_dir = Path(
+                subprocess.check_output(
+                    ["git", "-C", str(linked), "rev-parse", "--git-dir"],
+                    text=True,
+                ).strip()
+            )
+            if not git_dir.is_absolute():
+                git_dir = linked / git_dir
+            lock = git_dir / "gitforgeops-agent-dispatch.lock"
+            lock.write_text("not-a-pid\n", encoding="utf-8")
+            contenders = [
+                subprocess.Popen(
+                    ["bash", "-c", acquire, "bash", helper, str(linked)],
+                    cwd=directory,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                for _ in range(2)
+            ]
+            outputs = [process.stdout.readline() for process in contenders]
+            acquired = [index for index, output in enumerate(outputs) if output == "acquired\n"]
+            self.assertEqual(len(acquired), 1, outputs)
+            for index, process in enumerate(contenders):
+                if index in acquired:
+                    os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=5)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_cursor_launcher_uses_clean_control_workspace_and_scrubs_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            root = temp / "repo"
+            linked = temp / "linked"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Test",
+                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                    "GIT_COMMITTER_NAME": "Test",
+                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+                },
+                stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
+                check=True,
+            )
+            fake_cursor = temp / "cursor-agent"
+            fake_cursor.write_text(
+                "#!/usr/bin/env bash\n"
+                "{\n"
+                "  printf 'cwd=%s\\n' \"$PWD\"\n"
+                "  printf 'arg=%s\\n' \"$@\"\n"
+                "  printf 'api-key=%s\\n' \"${CURSOR_API_KEY:+present}\"\n"
+                "  printf 'endpoint=%s\\n' \"${CURSOR_API_ENDPOINT-unset}\"\n"
+                "  printf 'config=%s\\n' \"${CURSOR_CONFIG_DIR-unset}\"\n"
+                "  printf 'credential-store=%s\\n' \"${AGENT_CLI_CREDENTIAL_STORE-unset}\"\n"
+                "} > \"$FAKE_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            fake_cursor.chmod(0o755)
+            prompt = temp / "prompt.md"
+            prompt.write_text("Review only.\n", encoding="utf-8")
+            capture = temp / "capture.txt"
+            temp_root = temp / "tmp"
+            temp_root.mkdir()
+            launcher = (
+                check_agent_setup.ROOT
+                / ".agents/skills/composer-agents/scripts/dispatch-agent.sh"
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "--worktree",
+                    str(linked),
+                    "--prompt-file",
+                    str(prompt),
+                    "--effort",
+                    "high",
+                ],
+                cwd=temp,
+                env={
+                    **os.environ,
+                    "CURSOR_AGENT_BIN": str(fake_cursor),
+                    "CURSOR_API_KEY": "not-printed",
+                    "CURSOR_API_ENDPOINT": "https://attacker.invalid",
+                    "CURSOR_CONFIG_DIR": str(temp / "attacker-config"),
+                    "FAKE_CAPTURE": str(capture),
+                    "TMPDIR": str(temp_root),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = capture.read_text(encoding="utf-8")
+            cwd = next(
+                line.removeprefix("cwd=")
+                for line in captured.splitlines()
+                if line.startswith("cwd=")
+            )
+            self.assertNotEqual(cwd, str(linked))
+            self.assertTrue(cwd.startswith(str(temp_root)))
+            self.assertFalse(Path(cwd).exists(), "control workspace must be removed")
+            self.assertIn("arg=--sandbox", captured)
+            self.assertIn("arg=disabled", captured)
+            self.assertIn(f"arg={cwd}", captured)
+            self.assertIn("api-key=present", captured)
+            self.assertIn("endpoint=unset", captured)
+            self.assertIn("config=unset", captured)
+            self.assertIn("credential-store=memory", captured)
+            self.assertNotIn("not-printed", captured)
+
+    def test_claude_provider_scrubber_covers_future_and_foundry_overrides(self):
+        helper = str(
+            check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
+        )
+        command = (
+            'source "$1"; '
+            "export ANTHROPIC_DEFAULT_FABLE_MODEL=attacker "
+            "ANTHROPIC_FOUNDRY_BASE_URL=https://attacker.invalid "
+            "CLAUDE_CODE_USE_FOUNDRY=1 CLAUDE_CONFIG_DIR=/tmp/attacker "
+            "MAX_THINKING_TOKENS=1; "
+            "isolate_claude_provider; "
+            '[[ -z "${ANTHROPIC_DEFAULT_FABLE_MODEL-}" && '
+            '-z "${ANTHROPIC_FOUNDRY_BASE_URL-}" && '
+            '-z "${CLAUDE_CODE_USE_FOUNDRY-}" && '
+            '-z "${CLAUDE_CONFIG_DIR-}" && '
+            '-z "${MAX_THINKING_TOKENS-}" ]]'
+        )
+        result = subprocess.run(
+            ["bash", "-c", command, "bash", helper],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_expands_every_braced_rule_path(self):
         self.assertEqual(

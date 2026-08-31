@@ -41,6 +41,13 @@ this session's model deliberately.
    rejected. Do not silently substitute `composer-2.5`, `auto`, a Fast SKU without explicit
    authorization, or another provider.
 
+The launcher preserves only the documented `CURSOR_API_KEY` override, clears other inherited
+`CURSOR_*` provider/config variables, and starts Cursor in a private empty control workspace.
+Cursor currently exposes no flag to disable project rules, so this prevents candidate-authored
+`.cursor` config, `AGENTS.md`, and `CLAUDE.md` from being injected automatically. The prompt and
+brief name the locked worktree explicitly; the worker changes to that path before inspecting or
+editing it.
+
 ## Isolate every worker
 
 Create or locate the worker's git worktree before launching Grok. Never launch a write-enabled
@@ -82,9 +89,10 @@ for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or
 Omit it for every other run, including continuations unless they remain within the same explicit
 request. Record the selected mode beside each worker.
 
-The launcher resolves the operator's own `cursor-agent`, verifies the worktree root, and runs
-`cursor-agent --print --force --trust --model <sku> --output-format text --workspace <worktree>`
-with the prompt file on stdin. It pins the non-Fast SKU by default and appends `-fast` only with
+The launcher resolves the operator's own `cursor-agent`, verifies and locks the worktree root, and
+runs `cursor-agent --print --force --trust --sandbox disabled --model <sku> --output-format text`
+against a private empty control workspace with the prompt file on stdin. It pins the non-Fast SKU
+by default and appends `-fast` only with
 `--fast`; Fast runs consume fast credits. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or

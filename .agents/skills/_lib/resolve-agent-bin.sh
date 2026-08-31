@@ -15,6 +15,16 @@
 # Any candidate whose path lives under com.conductor.app is refused at every
 # step, so a stale bundle produces a hard error instead of a silent downgrade.
 
+absolute_git_path() {
+  local worktree_root=$1 selector=$2 path
+
+  path=$(git -C "$worktree_root" rev-parse "$selector") || return 2
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *) (CDPATH='' cd -- "$worktree_root/$path" && pwd -P) ;;
+  esac
+}
+
 agent_bin_is_conductor_owned() {
   case "$1" in
     *com.conductor.app*) return 0 ;;
@@ -32,8 +42,8 @@ require_linked_worktree() {
 
   worktree_root=$(cd "$worktree_root" && pwd -P) || return 2
 
-  git_dir=$(git -C "$worktree_root" rev-parse --path-format=absolute --git-dir) || return 2
-  common_dir=$(git -C "$worktree_root" rev-parse --path-format=absolute --git-common-dir) || return 2
+  git_dir=$(absolute_git_path "$worktree_root" --git-dir) || return 2
+  common_dir=$(absolute_git_path "$worktree_root" --git-common-dir) || return 2
   if [[ "$git_dir" == "$common_dir" ]]; then
     printf 'Refusing the primary checkout: dispatch requires a dedicated linked git worktree: %s\n' \
       "$worktree_root" >&2
@@ -50,13 +60,63 @@ require_linked_worktree() {
   fi
 }
 
-dispatch_lock_dir=''
+dispatch_lock_path=''
+dispatch_lock_backend=''
+dispatch_lock_holder=''
+dispatch_lock_ready_dir=''
+cursor_control_workspace=''
 
 release_worktree_dispatch_lock() {
-  if [[ -n "$dispatch_lock_dir" ]]; then
-    rm -f -- "$dispatch_lock_dir/pid"
-    rmdir -- "$dispatch_lock_dir" 2>/dev/null || true
-    dispatch_lock_dir=''
+  if [[ -n "$cursor_control_workspace" ]]; then
+    case "$cursor_control_workspace" in
+      "${TMPDIR:-/tmp}"/gitforgeops-cursor-control.*)
+        rm -rf -- "$cursor_control_workspace"
+        ;;
+      *)
+        printf 'Refusing to remove unexpected Cursor control workspace: %s\n' \
+          "$cursor_control_workspace" >&2
+        ;;
+    esac
+    cursor_control_workspace=''
+  fi
+
+  case "$dispatch_lock_backend" in
+    lockf)
+      if [[ -n "$dispatch_lock_holder" ]] && kill -0 "$dispatch_lock_holder" 2>/dev/null; then
+        kill "$dispatch_lock_holder" 2>/dev/null || true
+        wait "$dispatch_lock_holder" 2>/dev/null || true
+      fi
+      ;;
+    flock)
+      flock -u 9 2>/dev/null || true
+      exec 9>&-
+      ;;
+  esac
+  if [[ -n "$dispatch_lock_ready_dir" ]]; then
+    rm -f -- "$dispatch_lock_ready_dir/ready"
+    rmdir -- "$dispatch_lock_ready_dir" 2>/dev/null || true
+  fi
+  dispatch_lock_path=''
+  dispatch_lock_backend=''
+  dispatch_lock_holder=''
+  dispatch_lock_ready_dir=''
+}
+
+arm_dispatch_cleanup() {
+  trap release_worktree_dispatch_lock EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+prepare_cursor_control_workspace() {
+  cursor_control_workspace=$(mktemp -d \
+    "${TMPDIR:-/tmp}/gitforgeops-cursor-control.XXXXXX") || return 2
+  chmod 0700 "$cursor_control_workspace" || return 2
+  if [[ -L "$cursor_control_workspace" || ! -d "$cursor_control_workspace" ]]; then
+    printf 'Cursor control workspace is not a real directory: %s\n' \
+      "$cursor_control_workspace" >&2
+    return 2
   fi
 }
 
@@ -65,37 +125,71 @@ release_worktree_dispatch_lock() {
 # prevents two workers from being dispatched into the same linked worktree.
 acquire_worktree_dispatch_lock() {
   local worktree_root=$1
-  local git_dir owner_pid='' acquired='false'
+  local git_dir owner_pid='' attempt=0 ready_file='' owner_file=''
 
   worktree_root=$(cd "$worktree_root" && pwd -P) || return 2
 
-  git_dir=$(git -C "$worktree_root" rev-parse --path-format=absolute --git-dir) || return 2
-  dispatch_lock_dir="$git_dir/gitforgeops-agent-dispatch.lock"
+  git_dir=$(absolute_git_path "$worktree_root" --git-dir) || return 2
+  dispatch_lock_path="$git_dir/gitforgeops-agent-dispatch.lock"
 
-  if mkdir -- "$dispatch_lock_dir" 2>/dev/null; then
-    acquired='true'
-  else
-    if [[ -f "$dispatch_lock_dir/pid" ]]; then
-      IFS= read -r owner_pid < "$dispatch_lock_dir/pid" || true
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>> "$dispatch_lock_path"
+    if ! flock -n 9; then
+      IFS= read -r owner_pid < "$dispatch_lock_path" || true
+      printf 'Refusing concurrent dispatch into worktree %s (lock: %s, owner pid: %s)\n' \
+        "$worktree_root" "$dispatch_lock_path" "${owner_pid:-unknown}" >&2
+      exec 9>&-
+      dispatch_lock_path=''
+      return 2
     fi
-    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-      rm -f -- "$dispatch_lock_dir/pid"
-      rmdir -- "$dispatch_lock_dir" 2>/dev/null || true
-      if mkdir -- "$dispatch_lock_dir" 2>/dev/null; then
-        acquired='true'
+    printf '%s\n' "$$" > "$dispatch_lock_path"
+    dispatch_lock_backend='flock'
+  elif command -v lockf >/dev/null 2>&1; then
+    dispatch_lock_ready_dir=$(mktemp -d \
+      "$git_dir/gitforgeops-agent-dispatch.ready.XXXXXX") || return 2
+    chmod 0700 "$dispatch_lock_ready_dir" || return 2
+    ready_file="$dispatch_lock_ready_dir/ready"
+    owner_file="$dispatch_lock_path.owner"
+    # The embedded script is intentionally single-quoted; its positional
+    # parameters are expanded by the lock-holder shell, not this launcher.
+    # shellcheck disable=SC2016
+    lockf -t 0 "$dispatch_lock_path" sh -c '
+      parent_pid=$1
+      owner_path=$2
+      ready_path=$3
+      printf "%s\n" "$parent_pid" > "$owner_path"
+      printf "ready\n" > "$ready_path"
+      while kill -0 "$parent_pid" 2>/dev/null; do
+        parent_state=$(ps -o stat= -p "$parent_pid" 2>/dev/null) || break
+        case "$parent_state" in *Z*) break ;; esac
+        sleep 1
+      done
+    ' sh "$$" "$owner_file" "$ready_file" \
+      </dev/null >/dev/null 2>&1 &
+    dispatch_lock_holder=$!
+    dispatch_lock_backend='lockf'
+    while [[ ! -f "$ready_file" ]] && kill -0 "$dispatch_lock_holder" 2>/dev/null; do
+      attempt=$((attempt + 1))
+      if ((attempt >= 500)); then
+        break
       fi
+      sleep 0.01
+    done
+    if [[ ! -f "$ready_file" ]]; then
+      if [[ -f "$owner_file" ]]; then
+        IFS= read -r owner_pid < "$owner_file" || true
+      fi
+      printf 'Refusing concurrent dispatch into worktree %s (lock: %s, owner pid: %s)\n' \
+        "$worktree_root" "$dispatch_lock_path" "${owner_pid:-unknown}" >&2
+      release_worktree_dispatch_lock
+      return 2
     fi
-  fi
-
-  if [[ "$acquired" != 'true' ]]; then
-    printf 'Refusing concurrent dispatch into worktree %s (lock: %s, owner pid: %s)\n' \
-      "$worktree_root" "$dispatch_lock_dir" "${owner_pid:-unknown}" >&2
-    dispatch_lock_dir=''
+  else
+    printf 'Dispatch locking requires flock or lockf; neither command is available.\n' >&2
+    dispatch_lock_path=''
     return 2
   fi
-
-  printf '%s\n' "$$" > "$dispatch_lock_dir/pid"
-  trap release_worktree_dispatch_lock EXIT
+  arm_dispatch_cleanup
 }
 
 # Keep candidate worktrees and inherited provider variables from replacing the
@@ -115,6 +209,26 @@ isolate_opencode_provider() {
   unset OPENCODE_CONFIG_DIR
   unset OPENCODE_CONFIG_CONTENT
   export OPENCODE_DISABLE_PROJECT_CONFIG=1
+}
+
+isolate_claude_provider() {
+  local variable
+  while IFS= read -r variable; do
+    case "$variable" in
+      ANTHROPIC_*|CLAUDE_*) unset "$variable" ;;
+    esac
+  done < <(compgen -v)
+  unset MAX_THINKING_TOKENS
+}
+
+isolate_cursor_provider() {
+  local variable
+  while IFS= read -r variable; do
+    case "$variable" in
+      CURSOR_API_KEY) ;;
+      CURSOR_*) unset "$variable" ;;
+    esac
+  done < <(compgen -v)
 }
 
 # resolve_agent_bin <command-name> <env-var-name> [candidate-abs-path...]

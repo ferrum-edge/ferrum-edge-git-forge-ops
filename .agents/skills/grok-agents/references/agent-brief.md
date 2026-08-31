@@ -18,9 +18,11 @@ is stale or unavailable, ignore it and continue with this brief and the dispatch
 
 ## Verify isolation first
 
-Before reading broadly or editing:
+Cursor starts in a private empty control workspace so candidate-authored project rules are not
+automatically injected. Before reading broadly or editing:
 
-1. Run `pwd`, `git rev-parse --show-toplevel`, `git status --short --branch`, and
+1. Change directory to the exact absolute worktree from the dispatch prompt. Then run `pwd`,
+   `git rev-parse --show-toplevel`, `git status --short --branch`, and
    `git log --oneline -5`.
 2. Confirm that the top level, branch, base, and head match the dispatch prompt.
 3. Refuse to edit if this is the orchestrator's checkout, another worker's worktree, the wrong

@@ -5,3 +5,5 @@
 /.github/workflows/agent-setup-policy.yml @jeremyjpj0916
 /.github/scripts/check_agent_setup.py @jeremyjpj0916
 /.github/scripts/tests/test_agent_setup.py @jeremyjpj0916
+/.agents/skills/ @jeremyjpj0916
+/.claude/ @jeremyjpj0916

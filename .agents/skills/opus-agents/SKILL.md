@@ -46,8 +46,10 @@ effort. This skill is only for sessions where the USER asked Codex to delegate t
 This launcher requires Claude subscription authentication from the standalone CLI. It deliberately
 clears API-key, token, custom-base-URL, Bedrock, and Vertex overrides and ignores user, project, and
 local settings, so those sources cannot silently replace the pinned Anthropic model contract.
-Ignoring those settings also disables their hooks and guardrails for the dispatched process; the
-checked-in brief, worktree isolation, and controller review are the applicable safeguards.
+Ignoring those settings also stops automatic loading of project instructions (`AGENTS.md` and
+`CLAUDE.md`), `.claude/rules`, hooks, and guardrails for the dispatched process. The checked-in
+brief compensates by requiring the worker to verify the target first and then read those repository
+instructions explicitly; worktree isolation and controller review remain the outer safeguards.
 
 ## Isolate every worker
 

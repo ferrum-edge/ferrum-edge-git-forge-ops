@@ -136,8 +136,10 @@ if [[ -n "${CURSOR_API_KEY:-}" ]]; then
 else
   auth_source='cursor-agent login'
 fi
+isolate_cursor_provider
+prepare_cursor_control_workspace
 
-cd "$physical_worktree"
+cd "$cursor_control_workspace"
 
 printf '[composer-agents] dispatch model=%s fast=%s worktree=%s bin=%s auth=%s%s\n' \
   "$MODEL" "$fast" "$physical_worktree" "$cursor_bin" "$auth_source" \
@@ -147,11 +149,15 @@ printf '[composer-agents] dispatch model=%s fast=%s worktree=%s bin=%s auth=%s%s
 # --force:  no per-command approval prompts; worktree isolation is the boundary.
 # --trust:  accept the freshly created worktree as a trusted directory, which the
 #           trust gate otherwise blocks on in a non-TTY.
+# --sandbox disabled: the empty control workspace prevents automatic project
+#           rule/config loading; the worker reaches the already-locked target
+#           worktree by its exact absolute path from the dispatch prompt.
 "$cursor_bin" \
   --print \
   --force \
   --trust \
+  --sandbox disabled \
   --model "$MODEL" \
   --output-format text \
-  --workspace "$physical_worktree" \
+  --workspace "$cursor_control_workspace" \
   < "$prompt_file"

@@ -57,21 +57,7 @@ STALE_MARKERS = (
     "proxy-core",
 )
 TEXT_SUFFIXES = {".json", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
-CLAUDE_ENV_OVERRIDES = (
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-)
+CLAUDE_ISOLATION_CALL = "isolate_claude_provider"
 CLAUDE_LAUNCHER_FLOOR = {"fable-agents", "opus-agents"}
 CLAUDE_MIRROR_EXCEPTIONS = CLAUDE_LAUNCHER_FLOOR
 UNTRUSTED_DATA_GUARD = (
@@ -91,6 +77,9 @@ AGENT_CI_SCRIPT_MARKERS = (
     "validator=.agent-setup-base/.github/scripts/check_agent_setup.py",
     '[[ -f "$validator" ]]',
     "validator=.github/scripts/check_agent_setup.py",
+    'python3 "$validator" --root "$GITHUB_WORKSPACE"',
+    "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'",
+    "shellcheck --external-sources --source-path=SCRIPTDIR",
 )
 AGENT_POLICY_SCRIPT_MARKERS = (
     "repository: ${{ github.event.pull_request.head.repo.full_name }}",
@@ -186,6 +175,10 @@ def skill_directories(root: Path, parent: Path, label: str) -> tuple[list[Path],
     violations: list[str] = []
     for candidate in sorted(parent.iterdir()):
         if candidate.name == "_lib":
+            if candidate.is_symlink():
+                violations.append(
+                    f"{candidate.relative_to(root)}: shared library directory must not be a symlink"
+                )
             continue
         candidate_relative = candidate.relative_to(root)
         if candidate.is_symlink():
@@ -350,6 +343,8 @@ def validate_agent_workflows(root: Path) -> list[str]:
             "/.github/workflows/agent-setup-policy.yml",
             "/.github/scripts/check_agent_setup.py",
             "/.github/scripts/tests/test_agent_setup.py",
+            "/.agents/skills/",
+            "/.claude/",
         ):
             if CODEOWNER not in owners_by_path.get(protected, set()):
                 violations.append(
@@ -504,11 +499,10 @@ def collect_violations(root: Path) -> list[str]:
         if launcher.is_symlink() or not launcher.is_file():
             continue
         launcher_text = read_text(launcher)
-        for variable in CLAUDE_ENV_OVERRIDES:
-            if f"unset {variable}" not in launcher_text:
-                violations.append(
-                    f"{launcher.relative_to(root)}: inherited {variable} is not cleared"
-                )
+        if CLAUDE_ISOLATION_CALL not in launcher_text:
+            violations.append(
+                f"{launcher.relative_to(root)}: inherited Claude provider variables are not isolated"
+            )
         if "--setting-sources ''" not in launcher_text:
             violations.append(
                 f"{launcher.relative_to(root)}: user/project/local settings are not disabled"
@@ -535,6 +529,17 @@ def collect_violations(root: Path) -> list[str]:
                     violations.append(
                         f"{launcher.relative_to(root)}: missing opencode provider isolation {marker!r}"
                     )
+        if "resolve_agent_bin cursor-agent" in launcher_text:
+            for marker in (
+                "isolate_cursor_provider",
+                "prepare_cursor_control_workspace",
+                "--sandbox disabled",
+                '--workspace "$cursor_control_workspace"',
+            ):
+                if marker not in launcher_text:
+                    violations.append(
+                        f"{launcher.relative_to(root)}: missing Cursor provider/project isolation {marker!r}"
+                    )
 
     # Main's trusted bootstrap validator predates the canonical references/
     # layout and requires these Claude-side paths. Keep them as exact mirrors,
@@ -557,13 +562,21 @@ def collect_violations(root: Path) -> list[str]:
                 )
 
     shared_library = agent_skills / "_lib" / "resolve-agent-bin.sh"
-    if not shared_library.is_file() or any(
-        marker not in read_text(shared_library)
-        for marker in (
-            "require_linked_worktree()",
-            "acquire_worktree_dispatch_lock()",
-            "isolate_codex_provider()",
-            "isolate_opencode_provider()",
+    if (
+        shared_library.parent.is_symlink()
+        or shared_library.is_symlink()
+        or not shared_library.is_file()
+        or any(
+            marker not in read_text(shared_library)
+            for marker in (
+                "require_linked_worktree()",
+                "acquire_worktree_dispatch_lock()",
+                "isolate_codex_provider()",
+                "isolate_opencode_provider()",
+                "isolate_claude_provider()",
+                "isolate_cursor_provider()",
+                "prepare_cursor_control_workspace()",
+            )
         )
     ):
         violations.append(

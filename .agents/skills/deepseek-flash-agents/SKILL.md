@@ -50,15 +50,16 @@ worker. The orchestrator selected this session's model deliberately.
    DeepSeek variant and no rolling alias is dispatchable from this skill. Do not substitute
    a different provider or model.
 
-The launcher disables candidate-worktree configuration and external plugins and clears inherited
-custom-config paths. It retains the operator's normal global provider definition plus only the
-documented Alibaba credential, preventing an untrusted PR from replacing the endpoint or loading
-candidate plugins.
 6. The pin is the **dated snapshot**, not the rolling `deepseek-v4-flash` alias. On the Singapore
    token plan the rolling alias returns `Access to model denied` on every attempt while
    `-0731` serves normally, so the snapshot is the only working flash tier today. If the rolling
    alias is later entitled, re-pin here and in `scripts/dispatch-agent.sh` together and re-validate
    before claiming it works.
+
+The launcher disables candidate-worktree configuration and external plugins and clears inherited
+custom-config paths. It retains the operator's normal global provider definition plus only the
+documented Alibaba credential, preventing an untrusted PR from replacing the endpoint or loading
+candidate plugins.
 
 ## Isolate every worker
 

@@ -119,24 +119,7 @@ require_linked_worktree "$physical_root"
 acquire_worktree_dispatch_lock "$physical_root"
 
 cd "$physical_worktree"
-
-unset CLAUDE_CODE_EFFORT_LEVEL
-unset CLAUDE_CODE_DISABLE_1M_CONTEXT
-unset CLAUDE_CODE_DISABLE_THINKING
-unset MAX_THINKING_TOKENS
-unset ANTHROPIC_MODEL
-unset ANTHROPIC_SMALL_FAST_MODEL
-unset ANTHROPIC_DEFAULT_OPUS_MODEL
-unset ANTHROPIC_DEFAULT_SONNET_MODEL
-unset ANTHROPIC_DEFAULT_HAIKU_MODEL
-unset CLAUDE_CODE_SUBAGENT_MODEL
-unset ANTHROPIC_BASE_URL
-unset ANTHROPIC_BEDROCK_BASE_URL
-unset ANTHROPIC_VERTEX_BASE_URL
-unset ANTHROPIC_AUTH_TOKEN
-unset ANTHROPIC_API_KEY
-unset CLAUDE_CODE_USE_BEDROCK
-unset CLAUDE_CODE_USE_VERTEX
+isolate_claude_provider
 
 fast_settings='{"fastMode":false}'
 if [[ "$fast" == 'true' ]]; then
