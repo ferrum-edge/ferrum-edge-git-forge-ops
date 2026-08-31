@@ -141,6 +141,12 @@ pub struct AllowedBackendDomainsRuleConfig {
     /// identity so acknowledging one upstream cannot weaken the whole rule.
     #[serde(default)]
     pub allowed_service_discovery_upstreams: Vec<ServiceDiscoveryUpstreamAllowance>,
+    /// Upstreams that intentionally live outside this repository's desired
+    /// document, such as shared-mode or OpenAPI-spec-owned resources. Entries
+    /// match exact resource identity; their runtime destinations must be
+    /// constrained by an equivalent external egress control.
+    #[serde(default)]
+    pub allowed_external_upstreams: Vec<ServiceDiscoveryUpstreamAllowance>,
 }
 
 /// `waf_enforcement` — a WAF that is attached but not blocking.

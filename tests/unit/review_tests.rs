@@ -43,7 +43,7 @@ fn review_comment_includes_breaking_changes() {
         reason: "listen_path changed".to_string(),
     }];
     let comment = build_review_comment(true, "", &[], &breaking, &[], &[], None);
-    assert!(comment.contains("listen_path changed"));
+    assert!(comment.contains("listen&#95;path changed"));
     assert!(comment.contains("Breaking"));
 }
 
@@ -192,6 +192,10 @@ fn review_comment_sanitizes_policy_text_as_single_line_markdown() {
         overridden_by: None,
     }];
 
+    let override_cfg = OverrideConfig {
+        require_label: "x`\n\n_No blocking violations._".to_string(),
+        required_permission: "write`\n### Forged Permission".to_string(),
+    };
     let comment = build_review_comment_v2(
         true,
         "",
@@ -202,8 +206,8 @@ fn review_comment_sanitizes_policy_text_as_single_line_markdown() {
         &policy,
         &[],
         &[],
-        None,
-        None,
+        Some("missing _override_\n\n_No blocking violations._"),
+        Some(&override_cfg),
         None,
         None,
         &ResolveReport::default(),
@@ -218,10 +222,104 @@ fn review_comment_sanitizes_policy_text_as_single_line_markdown() {
         1
     );
     assert!(!comment.contains("\n### Forged Result"));
-    assert!(!comment.contains("<!-- hidden"));
+    assert!(!comment.lines().any(|line| line.starts_with("<!-- hidden")));
     assert!(comment.contains("&lt;!-- hidden"));
     assert!(comment.contains("`api' ### Forged Result`"));
     assert!(!comment.contains("\r"));
+    assert_eq!(
+        comment
+            .lines()
+            .filter(|line| *line == "_No blocking violations._")
+            .count(),
+        0
+    );
+    assert!(!comment.contains("\n### Forged Permission"));
+}
+
+#[test]
+fn review_comment_sanitizes_every_resource_section() {
+    let forged = "value`|\n\n### Forged Result\n<!-- hidden";
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Modify,
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![FieldChange {
+            field: forged.to_string(),
+            old_value: String::new(),
+            new_value: String::new(),
+        }],
+    }];
+    let breaking = vec![BreakingChange {
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        reason: forged.to_string(),
+    }];
+    let security = vec![SecurityFinding {
+        severity: "error".to_string(),
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+        message: forged.to_string(),
+    }];
+    let best_practices = vec![BestPractice {
+        severity: forged.to_string(),
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+        message: forged.to_string(),
+    }];
+    let unmanaged = vec![UnmanagedResource {
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+    }];
+    let spec_owned = vec![SpecOwnedResource {
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+        api_spec_id: forged.to_string(),
+        declared_in_repo: false,
+        pruned: false,
+    }];
+
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &diffs,
+        &breaking,
+        &security,
+        &best_practices,
+        &[],
+        &unmanaged,
+        &spec_owned,
+        None,
+        None,
+        None,
+        Some(forged),
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(!comment.lines().any(|line| line == "### Forged Result"));
+    assert!(!comment.lines().any(|line| line.starts_with("<!-- hidden")));
+    assert!(comment.contains("&lt;!-- hidden"));
+    assert!(comment.contains("&#124;"));
+}
+
+#[test]
+fn review_comment_uses_a_safe_fence_for_validation_output() {
+    let comment = build_review_comment(
+        false,
+        "failed\n```\n### Forged Result",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("````\nfailed\n```\n### Forged Result\n````"));
 }
 
 #[test]

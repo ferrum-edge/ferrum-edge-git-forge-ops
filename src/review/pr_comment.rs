@@ -47,9 +47,29 @@ fn sanitize_code_span(value: &str) -> String {
             sanitized.push(' ');
         }
         pending_space = false;
-        sanitized.push(if character == '`' { '\'' } else { character });
+        match character {
+            '`' => sanitized.push('\''),
+            '|' => sanitized.push_str("&#124;"),
+            _ => sanitized.push(character),
+        }
     }
     sanitized
+}
+
+fn fenced_code(value: &str) -> String {
+    let mut longest_run = 0usize;
+    let mut current_run = 0usize;
+    for character in value.chars() {
+        if character == '`' {
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    let fence = "`".repeat(longest_run.saturating_add(1).max(3));
+    let separator = if value.ends_with('\n') { "" } else { "\n" };
+    format!("{fence}\n{value}{separator}{fence}\n\n")
 }
 
 pub fn build_review_comment(
@@ -69,17 +89,12 @@ pub fn build_review_comment(
         md.push_str("### Validation: PASSED\n\n");
     } else {
         md.push_str("### Validation: FAILED\n\n");
-        md.push_str("```\n");
-        md.push_str(validation_output);
-        if !validation_output.ends_with('\n') {
-            md.push('\n');
-        }
-        md.push_str("```\n\n");
+        md.push_str(&fenced_code(validation_output));
     }
 
     if let Some(reason) = comparison_error {
         md.push_str("### Changes: Skipped\n\n");
-        md.push_str(reason);
+        md.push_str(&sanitize_markdown_inline(reason));
         md.push_str("\n\n");
     } else if !diffs.is_empty() {
         md.push_str("### Changes\n\n");
@@ -102,7 +117,10 @@ pub fn build_review_comment(
             };
             md.push_str(&format!(
                 "| {} | {} | `{}` | {} |\n",
-                action, diff.kind, diff.id, details
+                action,
+                sanitize_markdown_inline(&diff.kind),
+                sanitize_code_span(&diff.id),
+                sanitize_markdown_inline(&details)
             ));
         }
         md.push('\n');
@@ -112,12 +130,17 @@ pub fn build_review_comment(
 
     if let Some(reason) = comparison_error {
         md.push_str("### Breaking Changes: Skipped\n\n");
-        md.push_str(reason);
+        md.push_str(&sanitize_markdown_inline(reason));
         md.push_str("\n\n");
     } else if !breaking.is_empty() {
         md.push_str("### Breaking Changes\n\n");
         for bc in breaking {
-            md.push_str(&format!("- **{} `{}`**: {}\n", bc.kind, bc.id, bc.reason));
+            md.push_str(&format!(
+                "- **{} `{}`**: {}\n",
+                sanitize_markdown_inline(&bc.kind),
+                sanitize_code_span(&bc.id),
+                sanitize_markdown_inline(&bc.reason)
+            ));
         }
         md.push('\n');
     }
@@ -132,7 +155,11 @@ pub fn build_review_comment(
             };
             md.push_str(&format!(
                 "- [{}] **{} `{}`** (`{}`): {}\n",
-                icon, sf.kind, sf.id, sf.namespace, sf.message
+                icon,
+                sanitize_markdown_inline(&sf.kind),
+                sanitize_code_span(&sf.id),
+                sanitize_code_span(&sf.namespace),
+                sanitize_markdown_inline(&sf.message)
             ));
         }
         md.push('\n');
@@ -143,7 +170,11 @@ pub fn build_review_comment(
         for bp in best_practices {
             md.push_str(&format!(
                 "- [{}] **{} `{}`** (`{}`): {}\n",
-                bp.severity, bp.kind, bp.id, bp.namespace, bp.message
+                sanitize_markdown_inline(&bp.severity),
+                sanitize_markdown_inline(&bp.kind),
+                sanitize_code_span(&bp.id),
+                sanitize_code_span(&bp.namespace),
+                sanitize_markdown_inline(&bp.message)
             ));
         }
         md.push('\n');
@@ -180,7 +211,11 @@ pub fn render_spec_owned(spec_owned: &[SpecOwnedResource]) -> String {
         };
         md.push_str(&format!(
             "- **{} `{}`** (`{}`) owned by spec `{}`{}\n",
-            s.kind, s.id, s.namespace, s.api_spec_id, note
+            sanitize_markdown_inline(&s.kind),
+            sanitize_code_span(&s.id),
+            sanitize_code_span(&s.namespace),
+            sanitize_code_span(&s.api_spec_id),
+            note
         ));
     }
     md.push('\n');
@@ -226,7 +261,7 @@ pub fn build_review_comment_v2(
     );
 
     if let Some(note) = environment_note {
-        md.insert_str(0, &format!("{note}\n\n"));
+        md.insert_str(0, &format!("{}\n\n", sanitize_markdown_inline(note)));
     }
 
     if !unmanaged.is_empty() {
@@ -237,7 +272,9 @@ pub fn build_review_comment_v2(
         for u in unmanaged {
             md.push_str(&format!(
                 "- **{} `{}`** (`{}`)\n",
-                u.kind, u.id, u.namespace
+                sanitize_markdown_inline(&u.kind),
+                sanitize_code_span(&u.id),
+                sanitize_code_span(&u.namespace)
             ));
         }
         md.push('\n');
@@ -282,11 +319,16 @@ pub fn build_review_comment_v2(
                 None => (&default_label, &default_perm),
             };
             md.push_str(&format!(
-                "> **Apply is blocked** until the listed violations are resolved. To override, add the `{label}` label (requires `{perm}` permission on this repo).\n\n",
+                "> **Apply is blocked** until the listed violations are resolved. To override, add the `{}` label (requires `{}` permission on this repo).\n\n",
+                sanitize_code_span(label),
+                sanitize_code_span(perm),
             ));
         }
         if let Some(reason) = override_reason {
-            md.push_str(&format!("_Override status: {reason}_\n\n"));
+            md.push_str(&format!(
+                "_Override status: {}_\n\n",
+                sanitize_markdown_inline(reason)
+            ));
         }
     }
 
@@ -320,7 +362,11 @@ pub fn build_review_comment_v2(
                 // mode. Show that rather than bundle-dependent status.
                 format!("{:?}", r.placeholder.alloc)
             };
-            md.push_str(&format!("| `{}` | {} |\n", r.slot, label));
+            md.push_str(&format!(
+                "| `{}` | {} |\n",
+                sanitize_code_span(&r.slot),
+                sanitize_markdown_inline(&label)
+            ));
         }
         md.push('\n');
     }

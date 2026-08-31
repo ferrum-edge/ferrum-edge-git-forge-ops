@@ -2,6 +2,7 @@ use crate::config::GatewayConfig;
 use crate::policy::config::AllowedBackendDomainsRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 pub struct AllowedBackendDomainsRule {
     config: AllowedBackendDomainsRuleConfig,
@@ -24,6 +25,9 @@ impl AllowedBackendDomainsRule {
             return true;
         }
         if let Some(suffix) = pattern.strip_prefix("*.") {
+            if host.parse::<IpAddr>().is_ok() {
+                return false;
+            }
             return host
                 .strip_suffix(suffix)
                 .map(|prefix| prefix.ends_with('.'))
@@ -34,6 +38,8 @@ impl AllowedBackendDomainsRule {
 
     fn is_bare_destination(host: &str) -> bool {
         !host.is_empty()
+            && !host.starts_with('.')
+            && !host.contains("..")
             && host.chars().all(|character| {
                 character.is_ascii_alphanumeric()
                     || matches!(character, '.' | '-' | '_' | ':' | '[' | ']')
@@ -58,7 +64,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
 
     fn evaluate(&self, cfg: &GatewayConfig) -> Vec<PolicyFinding> {
         let mut findings = Vec::new();
-        if !self.config.enabled || self.config.allowed_domains.is_empty() {
+        if !self.config.enabled {
             return findings;
         }
 
@@ -66,13 +72,34 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             .config
             .allowed_domains
             .iter()
-            .map(|domain| Self::normalize_domain(domain))
-            .filter(|domain| !domain.is_empty())
+            .filter_map(|domain| {
+                let trimmed = domain.trim();
+                let normalized = Self::normalize_domain(trimmed);
+                if normalized.is_empty() || (normalized == "*" && trimmed != "*") {
+                    None
+                } else {
+                    Some(normalized)
+                }
+            })
             .collect();
         if allowed_domains.is_empty() {
+            findings.push(PolicyFinding {
+                rule_id: self.rule_id().to_string(),
+                severity: self.config.severity,
+                kind: "PolicyConfig".to_string(),
+                id: self.rule_id().to_string(),
+                namespace: "global".to_string(),
+                message: "enabled policy has no valid allowed_domains entries".to_string(),
+                remediation: Some(
+                    "Add at least one exact host, a nonempty '*.suffix' entry, or the literal '*' catch-all"
+                        .to_string(),
+                ),
+                overridden_by: None,
+            });
             return findings;
         }
         let allowed = allowed_domains.join(", ");
+        let allow_all = allowed_domains.iter().any(|domain| domain == "*");
 
         let declared_upstreams: HashMap<(&str, &str), _> = cfg
             .upstreams
@@ -87,6 +114,12 @@ impl PolicyCheck for AllowedBackendDomainsRule {
         let allowed_service_discovery_upstreams: HashSet<(&str, &str)> = self
             .config
             .allowed_service_discovery_upstreams
+            .iter()
+            .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
+            .collect();
+        let allowed_external_upstreams: HashSet<(&str, &str)> = self
+            .config
+            .allowed_external_upstreams
             .iter()
             .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
             .collect();
@@ -105,13 +138,21 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             let uses_routable_upstream = resolved_upstream.is_some_and(|upstream| {
                 !upstream.targets.is_empty() || upstream.service_discovery.is_some()
             });
+            let uses_allowed_external_upstream = upstream_id.is_some_and(|upstream_id| {
+                !upstream_id.trim().is_empty()
+                    && resolved_upstream.is_none()
+                    && allowed_external_upstreams.contains(&(proxy.namespace.as_str(), upstream_id))
+            });
 
             // When a proxy delegates to a declared upstream in the same
             // namespace, backend_host is schema filler rather than the routed
             // backend. Authored targets are checked below, and dynamic service
             // discovery is rejected because its runtime targets cannot be
             // proven against this static allowlist.
-            if !uses_routable_upstream && !Self::is_allowed(&proxy.backend_host, &allowed_domains) {
+            if !uses_routable_upstream
+                && !uses_allowed_external_upstream
+                && !Self::is_allowed(&proxy.backend_host, &allowed_domains)
+            {
                 let (message, remediation) = if let Some(upstream_id) = upstream_id {
                     if resolved_upstream.is_some() {
                         (
@@ -183,6 +224,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
 
         for upstream in &cfg.upstreams {
             if upstream.service_discovery.is_some()
+                && !allow_all
                 && !allowed_service_discovery_upstreams
                     .contains(&(upstream.namespace.as_str(), upstream.id.as_str()))
             {

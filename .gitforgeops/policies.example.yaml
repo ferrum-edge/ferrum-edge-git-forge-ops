@@ -68,7 +68,8 @@ policies:
   # resolves in the same namespace. Dynamic service-discovery targets cannot
   # be proven from the static document and therefore produce a finding unless
   # the exact upstream is acknowledged below after equivalent runtime egress
-  # controls are in place.
+  # controls are in place. Shared-mode or spec-owned upstreams outside this
+  # repo need a separate exact acknowledgment for the same reason.
   # Exact FQDNs match one host; wildcard entries like `*.svc.cluster.local`
   # match any subdomain depth under that suffix.
   # IP literals must be listed exactly; suffix wildcards only apply to DNS names.
@@ -83,6 +84,9 @@ policies:
     allowed_service_discovery_upstreams: []
     # - namespace: platform
     #   id: kubernetes-services
+    allowed_external_upstreams: []
+    # - namespace: platform
+    #   id: spec-owned-services
 
   # A `waf` plugin that is attached but not blocking. The built-in rule pack
   # ships every rule at `monitor`, so `mode: enforce` on its own rejects
