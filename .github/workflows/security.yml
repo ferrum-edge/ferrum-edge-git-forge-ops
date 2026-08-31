@@ -48,6 +48,17 @@ jobs:
           path: trusted-supply-chain
           persist-credentials: false
 
+      - name: Check out immutable policy bootstrap
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # PR #87 adds the checker itself, so its protected base cannot supply
+          # it. This already-reviewed commit is a one-time immutable fallback;
+          # after merge the default-branch copy always wins.
+          ref: a41c811cd39e3a7b9def9dac5fa8022587f1024e
+          path: bootstrap-supply-chain
+          persist-credentials: false
+
       - name: Check immutable workflow and container references
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -58,6 +69,9 @@ jobs:
             # pointing it at the candidate tree. The global assignments keep
             # the first bootstrap compatible with the pre-`--root` checker.
             CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py
+            if [ ! -f "$CHECKER" ]; then
+              CHECKER=bootstrap-supply-chain/.github/scripts/check_supply_chain.py
+            fi
             [ -f "$CHECKER" ] || { echo "Trusted supply-chain checker is unavailable." >&2; exit 1; }
             python3 - "$CHECKER" "$GITHUB_WORKSPACE" <<'PY'
           import importlib.util
