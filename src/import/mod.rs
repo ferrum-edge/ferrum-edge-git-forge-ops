@@ -860,5 +860,10 @@ fn safe_path_component<'a>(value: &'a str, field: &str) -> crate::error::Result<
 
 fn resource_filename(id: &str, field: &str) -> crate::error::Result<String> {
     let safe = safe_path_component(id, field)?;
+    if safe.starts_with('_') {
+        return Err(crate::error::Error::Config(format!(
+            "unsafe {field} {safe:?} — imported resource filenames cannot start with '_' because the loader treats that prefix as intentionally disabled"
+        )));
+    }
     Ok(format!("{safe}.yaml"))
 }

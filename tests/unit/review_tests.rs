@@ -115,6 +115,25 @@ fn review_comment_escapes_untrusted_fields_outside_validator_output() {
 }
 
 #[test]
+fn review_comment_preserves_table_cell_escape_after_an_input_backslash() {
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Proxy".to_string(),
+        id: r"left\|forged-cell".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![],
+    }];
+
+    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    assert!(comment.contains(r"left\\\|forged-cell"), "{comment}");
+    let change_row = comment
+        .lines()
+        .find(|line| line.contains("forged-cell"))
+        .expect("change row");
+    assert_eq!(change_row.matches('|').count(), 6, "{change_row}");
+}
+
+#[test]
 fn review_comment_includes_breaking_changes() {
     let breaking = vec![BreakingChange {
         kind: "Proxy".to_string(),

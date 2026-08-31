@@ -274,6 +274,10 @@ fn inline_code(value: &str) -> String {
     let value = value
         .replace("\r\n", " ")
         .replace(['\r', '\n'], " ")
+        // GFM's table parser processes backslash escapes before deciding
+        // whether a pipe ends the cell. Escape caller-supplied backslashes
+        // first so an input `\|` cannot consume the escape we add for `|`.
+        .replace('\\', "\\\\")
         .replace('|', "\\|");
     let longest_run = value
         .split(|character| character != '`')

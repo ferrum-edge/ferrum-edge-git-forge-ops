@@ -690,6 +690,18 @@ fn import_rejects_an_empty_resource_id() {
 }
 
 #[test]
+fn import_rejects_ids_that_would_create_disabled_resource_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.proxies[0].id = "_disabled-by-loader".to_string();
+
+    let error = split_config(&config, tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("cannot start with '_'"), "{error}");
+    assert!(error.contains("intentionally disabled"), "{error}");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn import_reports_backup_sections_it_cannot_represent() {
     // `Resource` models four kinds. API specs and gateway trust bundles are
     // admin-API-managed and must not be written as resource files that
