@@ -140,8 +140,8 @@ actionable work appears. Do not add a review trigger unless the controller expli
 4. For an explicitly assigned review, fix-round, or shepherd task, fetch all review threads;
    findings may not appear in the top-level review body. Verify the active review bot before
    posting a trigger that the prompt specifically requests.
-5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only demonstrated
-   infrastructure failures or repository-known flakes, and dispatch bounded repair work for
+5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only external
+   infrastructure outages proven by the failing job's logs, and dispatch bounded repair work for
    deterministic failures.
 6. If a worker dies, inspect its worktree, local commits, upstream, and remote branch before
    relaunching. Preserve useful work and launch a continuation round.

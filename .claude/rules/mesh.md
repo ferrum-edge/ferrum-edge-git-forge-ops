@@ -4,7 +4,7 @@ paths:
   - "src/apply/file_target.rs"
   - "src/validate/**"
   - "resources/*/mesh/**"
-  - "overlays/*/mesh/**"
+  - "overlays/**"
   - "tests/unit/mesh_tests.rs"
 ---
 

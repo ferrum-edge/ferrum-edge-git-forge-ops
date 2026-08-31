@@ -2,12 +2,6 @@ name: Agent Setup CI
 
 on:
   pull_request:
-    paths:
-      - '.agents/**'
-      - '.claude/**'
-      - '.github/scripts/check_agent_setup.py'
-      - '.github/scripts/tests/test_agent_setup.py'
-      - '.github/workflows/agent-setup-ci.yml'
   push:
     branches: [main]
     paths:
@@ -28,8 +22,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out trusted base validator
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .agent-setup-base
+          persist-credentials: false
+
       - name: Validate agent setup
-        run: python3 .github/scripts/check_agent_setup.py
+        run: |
+          set -euo pipefail
+          validator=.github/scripts/check_agent_setup.py
+          if [[ "${{ github.event_name }}" == pull_request ]] && \
+             [[ -f .agent-setup-base/.github/scripts/check_agent_setup.py ]]; then
+            validator=.agent-setup-base/.github/scripts/check_agent_setup.py
+          else
+            echo "Trusted base validator is unavailable; using the candidate validator for bootstrap."
+          fi
+          python3 "$validator" --root "$GITHUB_WORKSPACE"
 
       - name: Test agent setup validator
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'
@@ -39,10 +50,10 @@ jobs:
           set -euo pipefail
           while IFS= read -r -d '' script; do
             bash -n "$script"
-          done < <(find .agents/skills -type f -name '*.sh' -print0)
+          done < <(find .agents/skills \( -type f -o -type l \) -name '*.sh' -print0)
 
       - name: Lint shell dispatchers
         run: |
           set -euo pipefail
-          mapfile -d '' scripts < <(find .agents/skills -type f -name '*.sh' -print0)
+          mapfile -d '' scripts < <(find .agents/skills \( -type f -o -type l \) -name '*.sh' -print0)
           shellcheck --external-sources --source-path=SCRIPTDIR "${scripts[@]}"

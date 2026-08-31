@@ -5,7 +5,7 @@ paths:
   - "src/plugin_catalog.rs"
   - "tests/unit/{analysis,diff,schema}_tests.rs"
   - "resources/*/{proxies,upstreams}/**"
-  - "overlays/*/{proxies,upstreams}/**"
+  - "overlays/**"
 ---
 
 # Proxy and upstream configuration rules

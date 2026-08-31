@@ -79,9 +79,10 @@ the prompt file to the bundled launcher from one long-lived execution session:
   --effort <medium|high>
 ```
 
-The launcher pins `claude-fable-5`, clears environment variables that can override model, effort,
-or thinking, omits the ordinary Claude Code fallback-model option, enables verbose text output,
-and closes stdin at the prompt file's EOF. Delete the temporary prompt after the worker finishes.
+The launcher pins `claude-fable-5`, clears environment variables that can override the provider,
+authentication, model, effort, or thinking, omits the ordinary Claude Code fallback-model option,
+enables verbose text output, and closes stdin at the prompt file's EOF. Delete the temporary prompt
+after the worker finishes.
 
 Start every worker in its own long-lived execution session and retain the exact session handle or
 PID and full stdout/stderr. Prefer one tool call per worker so completions and failures remain
@@ -169,9 +170,9 @@ them guardrail rejections.
 4. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's
    worktree. Use a three-dot diff. Review ownership and secret fail-closed behavior, namespace
    scoping, schema/documentation parity, production panics, tests, and scope creep.
-5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only demonstrated
-   infrastructure failures or known flakes, and dispatch bounded repair work for deterministic
-   failures.
+5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only external
+   infrastructure outages proven by the failing job's logs, and dispatch bounded repair work for
+   deterministic failures.
 6. If a worker dies, inspect its worktree and remote branch before relaunching. Preserve valid
    commits or intentional WIP, write a compact state snapshot, and launch a continuation round at
    the same effort unless the evidence justifies escalation from `medium` to `high`.

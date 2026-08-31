@@ -16,7 +16,7 @@ class AgentSetupTests(unittest.TestCase):
     def test_repository_setup_is_consistent(self):
         self.assertEqual(check_agent_setup.collect_violations(check_agent_setup.ROOT), [])
 
-    def test_detects_mismatched_name_missing_rule_scope_and_bad_reference(self):
+    def test_detects_drift_across_skills_rules_and_continuations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent = root / ".agents" / "skills" / "sample"
@@ -36,6 +36,9 @@ class AgentSetupTests(unittest.TestCase):
             (agent / "references" / "agent-brief.md").write_text(
                 "\n".join(check_agent_setup.MANDATORY_COMMANDS), encoding="utf-8"
             )
+            (agent / "references" / "continuation-brief.md").write_text(
+                "Rerun known flakes.\n", encoding="utf-8"
+            )
             (claude / "SKILL.md").write_text(
                 "---\nname: sample\n---\ndispatched worker\n"
                 ".agents/skills/missing/scripts/dispatch-agent.sh\n"
@@ -45,6 +48,10 @@ class AgentSetupTests(unittest.TestCase):
             (rules / "testing.md").write_text(
                 "---\nname: wrong-kind\n---\n", encoding="utf-8"
             )
+            (rules / "dangling.md").write_text(
+                '---\npaths:\n  - "src/does_not_exist.rs"\n---\n', encoding="utf-8"
+            )
+            (claude / "linked.sh").symlink_to(agent / "scripts" / "dispatch-agent.sh")
 
             violations = check_agent_setup.collect_violations(root)
 
@@ -53,8 +60,27 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("frontmatter is missing paths", joined)
         self.assertIn("referenced path does not exist", joined)
         self.assertIn("dispatcher is not executable", joined)
-        self.assertIn("merge rule lacks explicit user authorization", joined)
+        self.assertIn("missing explicit user authorization for merging", joined)
+        self.assertIn("path scope matches nothing", joined)
+        self.assertIn("stale companion-repository marker 'known flakes'", joined)
+        self.assertIn("setup content must not be a symlink", joined)
         self.assertIn("project branding is not adapted", joined)
+
+    def test_allows_the_companion_gateway_name(self):
+        self.assertIsNone(
+            check_agent_setup.STALE_BRANDING.search("Companion to the Ferrum Edge gateway.")
+        )
+
+    def test_expands_every_braced_rule_path(self):
+        self.assertEqual(
+            check_agent_setup.expand_braces("tests/{unit,integration}/{a,b}.rs"),
+            [
+                "tests/unit/a.rs",
+                "tests/unit/b.rs",
+                "tests/integration/a.rs",
+                "tests/integration/b.rs",
+            ],
+        )
 
 
 if __name__ == "__main__":
