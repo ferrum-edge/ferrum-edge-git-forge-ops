@@ -12,18 +12,21 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKFLOWS = ROOT / ".github" / "workflows"
-ACTION_FILES = sorted(
-    {
-        *WORKFLOWS.glob("*.yml"),
-        *WORKFLOWS.glob("*.yaml"),
-        *(ROOT / ".github" / "actions").glob("**/action.yml"),
-        *(ROOT / ".github" / "actions").glob("**/action.yaml"),
-    }
-)
 ACTION_SHA = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$")
 USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
+
+
+def action_files(root: Path) -> list[Path]:
+    workflows = root / ".github" / "workflows"
+    return sorted(
+        {
+            *workflows.glob("*.yml"),
+            *workflows.glob("*.yaml"),
+            *(root / ".github" / "actions").glob("**/action.yml"),
+            *(root / ".github" / "actions").glob("**/action.yaml"),
+        }
+    )
 
 
 def trusted_classifier_violations(
@@ -76,6 +79,36 @@ def pull_request_trigger_violations(workflow: str, text: str) -> list[str]:
     return violations
 
 
+def trusted_supply_chain_policy_violations(text: str) -> list[str]:
+    required = (
+        "if: github.event_name == 'pull_request'",
+        "ref: ${{ github.event.repository.default_branch }}",
+        "path: trusted-supply-chain",
+        "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
+        "module.ROOT = candidate",
+        'module.WORKFLOWS = candidate / ".github" / "workflows"',
+        "module.ACTION_FILES = sorted(",
+        "sys.argv = [str(checker)]",
+        "raise SystemExit(module.main())",
+    )
+    violations = [
+        f"security.yml: trusted supply-chain policy runner is missing {item!r}"
+        for item in required
+        if item not in text
+    ]
+    if text.count("CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py") != 1:
+        violations.append(
+            "security.yml: the protected default-branch policy checker must be selected exactly once"
+        )
+    if "path: trusted-supply-chain" in text and (
+        "ref: ${{ github.event.pull_request.base.sha }}" in text
+    ):
+        violations.append(
+            "security.yml: an unprotected PR base SHA must not supply the policy checker"
+        )
+    return violations
+
+
 def state_writer_token_violations(
     workflow: str, text: str, commit_step: str
 ) -> list[str]:
@@ -103,45 +136,54 @@ def state_writer_token_violations(
     return violations
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=ROOT,
+        help="repository root to inspect (checker code may live in a trusted checkout)",
+    )
     parser.add_argument(
         "--write-manifest",
         type=Path,
         help="write the exact reviewed build inputs after policy validation",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    root = args.root.resolve()
+    workflows = root / ".github" / "workflows"
+    checked_action_files = action_files(root)
     violations: list[str] = []
     action_pins: dict[str, list[str]] = {}
-    for workflow in ACTION_FILES:
+    for workflow in checked_action_files:
         text = workflow.read_text(encoding="utf-8")
         references = [reference.strip("'\"") for reference in USES.findall(text)]
-        action_pins[str(workflow.relative_to(ROOT))] = references
+        action_pins[str(workflow.relative_to(root))] = references
         for reference in references:
             if reference.startswith("./"):
                 continue
             if not ACTION_SHA.fullmatch(reference):
                 violations.append(
-                    f"{workflow.relative_to(ROOT)}: action is not pinned to a 40-hex commit: {reference}"
+                    f"{workflow.relative_to(root)}: action is not pinned to a 40-hex commit: {reference}"
                 )
         if "ubuntu-latest" in text:
             violations.append(
-                f"{workflow.relative_to(ROOT)}: runner image must use an explicit Ubuntu release"
+                f"{workflow.relative_to(root)}: runner image must use an explicit Ubuntu release"
             )
         if "dtolnay/rust-toolchain" in text and "toolchain: 1.98.0" not in text:
             violations.append(
-                f"{workflow.relative_to(ROOT)}: Rust action must select exact toolchain 1.98.0"
+                f"{workflow.relative_to(root)}: Rust action must select exact toolchain 1.98.0"
             )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
-                f"{workflow.relative_to(ROOT)}: download must go through install-ferrum-edge.sh"
+                f"{workflow.relative_to(root)}: download must go through install-ferrum-edge.sh"
             )
 
-    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
     for image in FROM.findall(dockerfile):
         if "@sha256:" not in image:
             violations.append(f"Dockerfile: base image is not digest-pinned: {image}")
-    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    dockerignore = (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
     if ".git" not in dockerignore:
         violations.append(".dockerignore must exclude .git from untrusted Docker builds")
     docker_instructions = "\n".join(
@@ -154,11 +196,11 @@ def main() -> int:
     if "cargo build --release --locked" not in docker_instructions:
         violations.append("Dockerfile: Cargo release build must enforce Cargo.lock")
 
-    rust_ci = (WORKFLOWS / "rust-ci.yml").read_text(encoding="utf-8")
+    rust_ci = (workflows / "rust-ci.yml").read_text(encoding="utf-8")
     if "tool: cargo-llvm-cov@0.9.0" not in rust_ci:
         violations.append("rust-ci.yml: cargo-llvm-cov must use exact version 0.9.0")
 
-    release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+    release = (workflows / "release.yml").read_text(encoding="utf-8")
     if "provenance: mode=max" not in release or "sbom: true" not in release:
         violations.append("release.yml: image provenance and SBOM must both be enabled")
     if "actions/attest-build-provenance@" not in release:
@@ -175,7 +217,7 @@ def main() -> int:
                 f"release.yml: missing checked-merge publication gate {required!r}"
             )
 
-    apply_workflow = (WORKFLOWS / "apply-on-merge.yml").read_text(encoding="utf-8")
+    apply_workflow = (workflows / "apply-on-merge.yml").read_text(encoding="utf-8")
     if "vars.FERRUM_GATEWAY_MODE != 'file'" in apply_workflow:
         violations.append("apply-on-merge.yml: inequality routing can send unknown modes to API")
     for required in (
@@ -195,7 +237,7 @@ def main() -> int:
         "materialize-file.yml",
         "rotate.yml",
     ):
-        text = (WORKFLOWS / privileged_workflow).read_text(encoding="utf-8")
+        text = (workflows / privileged_workflow).read_text(encoding="utf-8")
         if ".github/scripts/credential_bundles.py" not in text:
             violations.append(
                 f"{privileged_workflow}: credential bundles must use the fail-closed loader"
@@ -222,7 +264,7 @@ def main() -> int:
             1,
         ),
     ):
-        text = (WORKFLOWS / rename_sensitive_workflow).read_text(encoding="utf-8")
+        text = (workflows / rename_sensitive_workflow).read_text(encoding="utf-8")
         violations.extend(
             trusted_classifier_violations(
                 rename_sensitive_workflow,
@@ -238,9 +280,14 @@ def main() -> int:
         "state-guard.yml",
         "validate-pr.yml",
     ):
-        text = (WORKFLOWS / pr_workflow).read_text(encoding="utf-8")
+        text = (workflows / pr_workflow).read_text(encoding="utf-8")
         violations.extend(pull_request_trigger_violations(pr_workflow, text))
-    state_guard = (WORKFLOWS / "state-guard.yml").read_text(encoding="utf-8")
+    violations.extend(
+        trusted_supply_chain_policy_violations(
+            (workflows / "security.yml").read_text(encoding="utf-8")
+        )
+    )
+    state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     if 'result=$(python3 "$helper"' not in state_guard:
         violations.append(
             "state-guard.yml: classifier execution must use the trusted helper variable"
@@ -250,12 +297,12 @@ def main() -> int:
         ("apply-on-merge.yml", "- name: Commit state + assembled (if changed)"),
         ("rotate.yml", "- name: Commit state update"),
     ):
-        text = (WORKFLOWS / state_workflow).read_text(encoding="utf-8")
+        text = (workflows / state_workflow).read_text(encoding="utf-8")
         violations.extend(
             state_writer_token_violations(state_workflow, text, commit_step)
         )
 
-    static_review = (WORKFLOWS / "validate-pr.yml").read_text(encoding="utf-8")
+    static_review = (workflows / "validate-pr.yml").read_text(encoding="utf-8")
     if re.search(r"^ {4}environment\s*:", static_review, re.MULTILINE):
         violations.append("validate-pr.yml: PR-built code must not bind an Environment")
     if re.search(r"\$\{\{[^}]*\bsecrets(?:\.|\[)", static_review):
@@ -279,7 +326,7 @@ def main() -> int:
             "validate-pr.yml: Pull Requests API access requires pull-requests: read"
         )
 
-    trusted_review = (WORKFLOWS / "trusted-pr-review.yml").read_text(
+    trusted_review = (workflows / "trusted-pr-review.yml").read_text(
         encoding="utf-8"
     )
     prepare_permissions = """  prepare:
@@ -314,7 +361,7 @@ def main() -> int:
                 f"trusted-pr-review.yml: missing privileged-boundary guard {required!r}"
             )
 
-    codeowners = (ROOT / ".github" / "CODEOWNERS").read_text(
+    codeowners = (root / ".github" / "CODEOWNERS").read_text(
         encoding="utf-8"
     )
     owned_patterns = {
@@ -340,7 +387,7 @@ def main() -> int:
             )
 
     for manual_workflow in ("materialize-file.yml", "rotate.yml"):
-        text = (WORKFLOWS / manual_workflow).read_text(encoding="utf-8")
+        text = (workflows / manual_workflow).read_text(encoding="utf-8")
         for required in (
             "Require protected default branch",
             "SOURCE_REF",
@@ -353,11 +400,11 @@ def main() -> int:
                     f"{manual_workflow}: missing manual-dispatch guard {required!r}"
                 )
 
-    toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    toolchain = (root / "rust-toolchain.toml").read_text(encoding="utf-8")
     if 'channel = "1.98.0"' not in toolchain:
         violations.append("rust-toolchain.toml: channel must be pinned to 1.98.0")
 
-    installer = (ROOT / ".github" / "scripts" / "install-ferrum-edge.sh").read_text(
+    installer = (root / ".github" / "scripts" / "install-ferrum-edge.sh").read_text(
         encoding="utf-8"
     )
     for required in (
@@ -371,13 +418,13 @@ def main() -> int:
                 f"install-ferrum-edge.sh: missing {required} checksum comparison"
             )
     if "FERRUM_EDGE_SHA256" in "\n".join(
-        workflow.read_text(encoding="utf-8") for workflow in ACTION_FILES
+        workflow.read_text(encoding="utf-8") for workflow in checked_action_files
     ):
         violations.append(
             "workflows must not replace the checked-in validator digest with a mutable variable"
         )
 
-    checksum_policy = ROOT / ".github" / "ferrum-edge-checksums.txt"
+    checksum_policy = root / ".github" / "ferrum-edge-checksums.txt"
     pins = [
         line.split()
         for line in checksum_policy.read_text(encoding="utf-8").splitlines()

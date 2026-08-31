@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +13,44 @@ SPEC.loader.exec_module(check_supply_chain)
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
+    def test_root_override_checks_the_selected_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(check_supply_chain.action_files(root), [])
+            nested = root / ".github" / "workflows"
+            nested.mkdir(parents=True)
+            action = nested / "sample.yml"
+            action.write_text("name: sample\n", encoding="utf-8")
+            self.assertEqual(check_supply_chain.action_files(root), [action])
+
+    def test_security_policy_must_execute_the_default_branch_checker(self):
+        secure = "\n".join(
+            [
+                "if: github.event_name == 'pull_request'",
+                "ref: ${{ github.event.repository.default_branch }}",
+                "path: trusted-supply-chain",
+                "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
+                "module.ROOT = candidate",
+                'module.WORKFLOWS = candidate / ".github" / "workflows"',
+                "module.ACTION_FILES = sorted(",
+                "sys.argv = [str(checker)]",
+                "raise SystemExit(module.main())",
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.trusted_supply_chain_policy_violations(secure), []
+        )
+
+        insecure = secure.replace(
+            "ref: ${{ github.event.repository.default_branch }}",
+            "ref: ${{ github.event.pull_request.base.sha }}",
+        )
+        violations = check_supply_chain.trusted_supply_chain_policy_violations(
+            insecure
+        )
+        self.assertTrue(any("missing" in item for item in violations))
+        self.assertTrue(any("unprotected PR base" in item for item in violations))
+
     def test_pr_trigger_must_rerun_on_retarget_and_target_main(self):
         secure = """on:
   pull_request:
