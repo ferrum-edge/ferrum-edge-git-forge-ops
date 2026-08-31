@@ -52,8 +52,15 @@ pub enum Commands {
         auto_approve: bool,
         /// Allow apply even when the plan would delete more than
         /// `ownership.large_prune_threshold_percent` of managed resources.
+        /// Also acknowledges pruning from a stale (cached) gateway view.
         #[arg(long)]
         allow_large_prune: bool,
+        /// `full_replace` only: delete the namespace's API specs instead of
+        /// carrying them through the restore untouched. Destructive — API
+        /// specs are managed via the admin API and have no representation in
+        /// this repo, so without this flag `apply` preserves them.
+        #[arg(long)]
+        confirm_api_spec_deletion: bool,
     },
     Import {
         #[arg(long, conflicts_with = "from_file")]
@@ -66,11 +73,19 @@ pub enum Commands {
     Review {
         #[arg(long)]
         pr: Option<u64>,
+        /// Fail when the live gateway comparison cannot be completed.
+        /// Intended for the trusted, credentialed PR-review workflow.
+        #[arg(long)]
+        require_live: bool,
     },
     /// Emit JSON listing environments declared in repo config (used by CI matrix).
     Envs {
         #[arg(long, value_enum, default_value_t = EnvsFormat::Json)]
         format: EnvsFormat,
+        /// Include each environment's configured namespace scope in JSON.
+        /// Used to bound trusted PR live-review matrix entries.
+        #[arg(long)]
+        include_scopes: bool,
     },
     /// Rotate a specific credential slot. Requires provisioner token.
     Rotate {

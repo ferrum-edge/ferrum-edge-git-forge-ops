@@ -98,6 +98,39 @@ environments:
 }
 
 #[test]
+fn repo_config_emits_live_review_namespace_scopes() {
+    let yaml = r#"
+environments:
+  all-shared:
+    ownership:
+      mode: shared
+  filtered:
+    namespace_filter: team-a
+    ownership:
+      mode: shared
+  production:
+    ownership:
+      mode: exclusive
+      namespaces: [team-b, team-a, team-b]
+"#;
+    let file = write_repo_config(yaml);
+    let config = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+
+    let scopes = config.environment_scopes();
+
+    assert_eq!(scopes[0].environment, "all-shared");
+    assert_eq!(scopes[0].namespaces, None);
+    assert_eq!(
+        scopes[1].namespaces.as_deref(),
+        Some(&["team-a".to_string()][..])
+    );
+    assert_eq!(
+        scopes[2].namespaces.as_deref(),
+        Some(&["team-a".to_string(), "team-b".to_string()][..])
+    );
+}
+
+#[test]
 fn repo_config_rejects_prune_threshold_above_100() {
     // delete_pct in cmd_apply is 0..=100. A YAML value > 100 would make the
     // guard `delete_pct > threshold` never fire — mass deletions would
@@ -263,6 +296,10 @@ fn synthetic_default_honors_explicit_env_over_ferrum_env_var() {
         EnvConfig {
             gateway_url: None,
             admin_jwt_secret: None,
+            admin_jwt_issuer: "ferrum-edge".to_string(),
+            admin_jwt_role: "admin".to_string(),
+            admin_jwt_audience: None,
+            admin_jwt_ttl_secs: 3600,
             namespace_filter: None,
             gateway_mode: GatewayMode::Api,
             apply_strategy: ApplyStrategy::Incremental,
@@ -274,6 +311,7 @@ fn synthetic_default_honors_explicit_env_over_ferrum_env_var() {
             creds_bundle_json: None,
             creds_bundle_json_file: None,
             file_output_path: "./assembled/resources.yaml".to_string(),
+            mesh_file_output_path: "./assembled/mesh.yaml".to_string(),
             edge_binary_path: "ferrum-edge".to_string(),
             tls_no_verify: false,
             ca_cert: None,
@@ -322,6 +360,10 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
     let env_config = EnvConfig {
         gateway_url: None,
         admin_jwt_secret: None,
+        admin_jwt_issuer: "ferrum-edge".to_string(),
+        admin_jwt_role: "admin".to_string(),
+        admin_jwt_audience: None,
+        admin_jwt_ttl_secs: 3600,
         namespace_filter: None,
         gateway_mode: GatewayMode::Api,
         apply_strategy: ApplyStrategy::FullReplace,
@@ -333,6 +375,7 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
         creds_bundle_json: None,
         creds_bundle_json_file: None,
         file_output_path: "./assembled/resources.yaml".to_string(),
+        mesh_file_output_path: "./assembled/mesh.yaml".to_string(),
         edge_binary_path: "ferrum-edge".to_string(),
         tls_no_verify: false,
         ca_cert: None,

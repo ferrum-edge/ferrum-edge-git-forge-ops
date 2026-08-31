@@ -50,13 +50,43 @@ pub enum Error {
     #[error("API request failed ({status}): {message}")]
     ApiError { status: u16, message: String },
 
+    /// The admin plane refuses config mutations: either `FERRUM_ADMIN_READ_ONLY`
+    /// is set, the config database is unavailable, or the gateway runs in a mode
+    /// (`file`, `dp`, `mesh`, `node_agent`) where writes are unconditionally off.
+    /// Raised as a single whole-run error rather than once per resource.
+    #[error("gateway admin API is read-only, refusing to apply: {0}")]
+    GatewayReadOnly(String),
+
+    /// `POST /restore` refused because the namespace holds API specs the
+    /// payload would delete. Carries the actionable remediation.
+    #[error("{0}")]
+    ApiSpecsAtRisk(String),
+
+    /// A `/restore` failed with an incomplete or unknown-outcome rollback. The
+    /// namespace may be in a partially-restored state; retrying would re-run a
+    /// destructive replace against unknown content.
+    #[error(
+        "restore failed and rollback did not complete cleanly — manual recovery required: {0}"
+    )]
+    RestoreNeedsManualRecovery(String),
+
+    /// A write was durably committed but is not live yet (`applied: false`).
+    /// Retrying would re-apply it; the caller must reconcile instead.
+    #[error("write committed, awaiting reload ({reason}): {message}")]
+    CommittedNotLive { reason: String, message: String },
+
+    /// `GET /backup` served the in-memory snapshot instead of the database, so
+    /// the live view may be stale and prune computation unsafe.
+    #[error("{0}")]
+    StaleGatewayView(String),
+
     #[error("JWT error: {0}")]
     JwtError(String),
 
-    #[error("gateway URL not configured (set FERRUM_GATEWAY_URL)")]
+    #[error("gateway URL not configured: set FERRUM_GATEWAY_URL (in CI, add it to the GitHub Environment's secrets for this environment)")]
     NoGatewayUrl,
 
-    #[error("JWT secret not configured (set FERRUM_ADMIN_JWT_SECRET)")]
+    #[error("JWT secret not configured: set FERRUM_ADMIN_JWT_SECRET (in CI, add it to the GitHub Environment's secrets for this environment)")]
     NoJwtSecret,
 
     #[error("HTTP client error: {0}")]

@@ -1,23 +1,26 @@
 name: Security
 
 on:
+  # Report required security contexts on every PR. Path filtering a required
+  # workflow leaves non-matching PRs stuck waiting for a status that never ran.
   pull_request:
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Dockerfile'
-      - '.github/workflows/security.yml'
   push:
     branches: [main]
     paths:
       - 'src/**'
       - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+      - 'benches/**'
+      - 'examples/**'
+      - '.cargo/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - 'rust-toolchain'
       - 'Dockerfile'
-      - '.github/workflows/security.yml'
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+      - '.github/dependabot.yml'
   schedule:
     - cron: '17 9 * * 1'
 
@@ -25,22 +28,39 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain-policy:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check immutable workflow and container references
+        run: python3 .github/scripts/check_supply_chain.py
+
+      - name: Test privileged-input boundary
+        run: python3 -m unittest discover -s .github/scripts/tests -v
+
   cargo-audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     env:
       CARGO_AUDIT_VERSION: 0.22.1
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
+        with:
+          toolchain: 1.98.0
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -66,40 +86,51 @@ jobs:
           cargo audit --ignore RUSTSEC-2023-0071
 
   codeql:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         with:
           languages: rust
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
 
   trivy-image:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Build image for scan
         run: docker build -t gitforgeops:scan .
+
+      - name: Smoke-test minimal runtime
+        run: |
+          docker run --rm gitforgeops:scan --help >/dev/null
+          docker run --rm --entrypoint ferrum-edge gitforgeops:scan --help >/dev/null
+          for package in apt libapt-pkg7.0 libssl3t64 openssl-provider-legacy; do
+            status=$(docker run --rm --entrypoint dpkg-query gitforgeops:scan \
+              -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)
+            if [[ "$status" == ii* ]]; then
+              echo "Purged runtime package remains installed: $package" >&2
+              exit 1
+            fi
+          done
 
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -112,7 +143,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload Trivy SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
+        if: ${{ always() && hashFiles('trivy-results.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         with:
           sarif_file: trivy-results.sarif

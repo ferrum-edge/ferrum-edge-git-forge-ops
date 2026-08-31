@@ -1,2 +1,10 @@
 .git
-.git/**
+.github
+.state
+assembled
+target
+*.age
+*.pem
+*.key
+.env
+.env.*

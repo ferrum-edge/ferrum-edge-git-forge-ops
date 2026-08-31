@@ -6,19 +6,33 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
 
 - **Multi-environment from one repo** — declare staging/production/sandbox/etc. in `.gitforgeops/config.yaml`, deploy each to its own gateway via GitHub Environments. No per-env branches, no per-env repos.
 - **Ownership modes** — `shared` (default): repo only touches what it has previously applied; admin-added resources are left alone. `exclusive`: repo is authoritative for a namespace set.
-- **Extensible policy framework** — opt-in rules (timeout bands, HTTPS-only backends, required auth, …) surface in PR review and block `apply` when severity is `error`. Override via labeled PR from a write-permission user.
+- **Extensible policy framework** — opt-in rules (timeout bands, TLS-only backends, required auth, WAF enforcement, AI guardrails, …) surface in PR review and block `apply` when severity is `error`. Override via labeled PR from a write-permission user.
 - **In-GitHub credential broker** — consumer secrets never live in the repo. Placeholders (`${gh-env-secret:alloc=generate}`) are resolved from GitHub Environment Secrets at apply time. New values are generated, libsodium-sealed, written to env secrets via the REST API, and age-encrypted to the PR author's SSH key for one-time delivery.
+- **Mesh configuration as fragments** — `kind: MeshConfig` files under `resources/<ns>/mesh/` merge into one standalone `{version, mesh}` document for file-protocol mesh nodes, validated with `ferrum-edge validate -m mesh`.
 - **Drift detection with awareness of ownership** — scheduled comparisons surface changes on both sides, filtering the noise based on the env's configured mode.
 - **Free-tier only** — GitHub Secrets, GitHub Environments, GitHub Actions, GitHub API. No Vault, no AWS, no 1Password required.
 
 ## Quick start
 
 1. Fork this repo.
-2. **Create a GitHub Environment per deployment target** (Settings → Environments → New). Name it whatever you want to call the environment — e.g. `staging`, `production`. Add its scoped secrets: `FERRUM_GATEWAY_URL`, `FERRUM_ADMIN_JWT_SECRET`, and any TLS material. Optionally set protection rules (required reviewers, wait timers).
+2. **Create a GitHub Environment per deployment target** (Settings → Environments → New). Name it whatever you want to call the environment — e.g. `staging`, `production`. Add its scoped secrets: `FERRUM_GATEWAY_URL`, `FERRUM_ADMIN_JWT_SECRET`, and any TLS material. Before launch, required reviewers, self-review prevention, and a protected-`main` deployment policy are mandatory; see step 6.
 3. **Declare those environments in `.gitforgeops/config.yaml`** — see `.gitforgeops/config.example.yaml`. The file carries overlay names and ownership modes; it does *not* carry any secret or URL.
-4. Add resources under `resources/<namespace>/{proxies,consumers,upstreams,plugins}/*.yaml`.
-5. Open a PR. CI runs the matrix across every declared environment, validates the assembled config, and posts a review comment per env with policy, drift, credential, security, and best-practice findings. Policy errors are enforced by `apply`.
-6. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering).
+4. Add resources under `resources/<namespace>/{proxies,consumers,upstreams,plugins}/*.yaml` (and, for a service mesh, `resources/<namespace>/mesh/*.yaml`).
+5. **Create the two override labels** — they do not exist by default, and labels are not copied when you fork:
+
+   ```bash
+   gh label create gitforgeops/policy-override --color B60205 --description "Bypass blocking policy violations on this PR (requires write permission)"
+   ```
+
+   ```bash
+   gh label create gitforgeops/state-override --color B60205 --description "Allow this PR to modify the CI-owned .state/ ledger"
+   ```
+
+   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each resolves the effective label event and requires the actor's current permission to be `write`, `maintain`, or `admin`. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
+6. **Configure the mandatory GitHub launch controls.** Create the contents-only state-writer App, require the state guard and CI checks in an active `main` ruleset, protect release tags and every deployment environment, restrict Actions, and configure the scheduled settings audit. Follow [GitHub launch controls](docs/github-launch-controls.md) before adding production credentials. Forks do not inherit any of these settings.
+7. **Pin the validator release identity.** Select an allowed `FERRUM_EDGE_VERSION`. Every allowed release and digest lives in reviewed `.github/ferrum-edge-checksums.txt`; the checked-in fallback is the content-pinned 2026-08-31 `latest` snapshot. A moved tag or an unreviewed version fails before execution.
+8. Open a PR. The PR-built binary runs static validation without an environment or gateway secrets. A default-branch `workflow_run` then sanitizes only declarative YAML, builds and hashes the protected-branch binary once, waits for environment approval, and posts the live policy/drift/security review for same-repository PRs. Each live job is intersected with the environment's protected namespace scope and fails if comparison is unavailable. Fork PRs remain static-only.
+9. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering) and uses the short-lived state-writer App token for its protected ledger commit.
 
 ## Repository layout
 
@@ -37,6 +51,8 @@ resources/
       api-cluster.yaml           # kind: Upstream
     plugins/
       rate-limit.yaml            # kind: PluginConfig
+    mesh/
+      core.yaml                  # kind: MeshConfig (fragment, not a gateway resource)
   team-alpha/                    # namespace: team-alpha
     proxies/
       alpha-service.yaml
@@ -44,17 +60,25 @@ resources/
 overlays/                        # environment-specific deep-merge fragments
   staging/
     ferrum/proxies/my-api.yaml   # overrides backend_host, timeouts, etc.
+    ferrum/mesh/core.yaml        # matches the mesh fragment by file name
   production/
     ferrum/proxies/my-api.yaml
 
-.state/                          # auto-committed by CI, per environment
+assembled/                       # file-mode output (gateway doc + mesh doc)
+  staging.yaml
+  staging-mesh.yaml
+
+.state/                          # auto-committed by CI, per environment; never hand-edit
   staging.json
   production.json
 
 .github/workflows/
-  validate-pr.yml                # matrix validate + review per env
+  validate-pr.yml                # secretless PR-built static validation
+  trusted-pr-review.yml          # trusted binary + sanitized-data live review
   apply-on-merge.yml             # matrix apply per env (with env binding)
   drift-check.yml                # scheduled diff per env
+  state-guard.yml                # rejects PR-authored .state/ edits
+  settings-audit.yml             # detects GitHub protection drift
   rotate.yml                     # workflow_dispatch for credential rotation
   materialize-file.yml           # workflow_dispatch for encrypted flat-file delivery
   release.yml                    # builds multi-arch image on push to main / v* tag
@@ -63,11 +87,22 @@ overlays/                        # environment-specific deep-merge fragments
 Overlay object fields deep-merge. Arrays replace by default so environment
 overlays can narrow lists such as `allowed_methods`, `hosts`,
 `allowed_ws_origins`, and `acl_groups`; `spec.plugins` and `spec.targets` are
-additive and merge by item identity.
+additive and merge by item identity, as are a mesh fragment's `spec.workloads`
+(by `spiffe_id`) and `spec.services` (by `name` + `namespace`).
+
+### Proxy backend scheme
+
+A proxy declares its backend wire scheme with `backend_scheme`, one of six values: `http`, `https`, `tcp`, `tcps`, `udp`, `dtls`. WebSocket and gRPC are detected per request rather than declared, and HTTP/3 is negotiated per backend, so the older wider variant set is gone.
+
+Existing trees keep loading. The legacy field name `backend_protocol` is accepted as an alias, and legacy values are folded onto the canonical set: `ws`/`grpc` → `http`, `wss`/`grpcs`/`h3` → `https`, `tcp_tls` → `tcps`. Serialization always emits a canonical value and the canonical field name, so a load/export cycle upgrades a legacy tree in place.
+
+**Omitting the field is resolved at assembly time, not left as `null`.** The gateway canonicalizes a proxy's scheme on write — a non-stream proxy stored without one comes back from `GET /backup` as `backend_scheme: https` — so gitforgeops applies the same rule to the desired config: any proxy with no `backend_scheme` and no `listen_port` is assembled as `https`. Without that, a schemeless proxy would diff as modified against the live gateway on every run and be reported as a breaking `backend_scheme changed` on every PR, forever, with no edit that clears it.
+
+Stream proxies (`listen_port` set) are deliberately **not** defaulted. The gateway does not default them either — it rejects a stream proxy with no scheme during validation — and guessing `tcp` for a proxy that meant `tcps` or `udp` would replace a clear validation error with a silently wrong one.
 
 ### What a single PR can change
 
-One PR can include any number of new, modified, or deleted resources across any number of namespaces, in any mix of kinds (proxies, consumers, upstreams, plugin configs). The loader walks every `resources/<namespace>/{proxies,consumers,upstreams,plugins}/` directory, the assembler flattens into a single `GatewayConfig`, and apply groups by namespace on the way out. Each namespace gets its own `X-Ferrum-Namespace` header; incremental mode diffs that namespace against live `/backup`, and full-replace mode restores that namespace independently. Namespaces are isolated: a failure applying to `team-alpha` doesn't block `team-beta`.
+One PR can include any number of new, modified, or deleted resources across any number of namespaces, in any mix of kinds (proxies, consumers, upstreams, plugin configs, mesh fragments). The loader walks every `resources/<namespace>/{proxies,consumers,upstreams,plugins,mesh}/` directory, the assembler flattens the four gateway kinds into a single `GatewayConfig` (mesh fragments merge into their own separate document), and apply groups by namespace on the way out. Each namespace gets its own `X-Ferrum-Namespace` header; incremental mode diffs that namespace against live `/backup`, and full-replace mode restores that namespace independently. Namespaces are isolated: a failure applying to `team-alpha` doesn't block `team-beta`.
 
 ## Repo configuration: `.gitforgeops/config.yaml`
 
@@ -97,7 +132,7 @@ environments:
 default_environment: staging
 ```
 
-The environment names here must match the GitHub Environments you've set up in repo settings. The review, apply, drift, rotate, and materialize workflows bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can inject that environment's scoped secrets automatically. Fork PRs still receive empty secrets under GitHub's `pull_request` secret rules, so review falls back to static-only output there.
+The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
 
 ## Ownership modes
 
@@ -106,6 +141,7 @@ The environment names here must match the GitHub Environments you've set up in r
 1. **Declared** — in the repo's desired config right now.
 2. **Previously managed** — repo applied it before, not declared now (intentional removal).
 3. **Unmanaged** — exists on the gateway, repo never put it there.
+4. **Spec-owned** — exists on the gateway carrying an `api_spec_id`, i.e. provisioned by the gateway's own OpenAPI spec ingestion (`/api-specs`).
 
 ### `shared` (default, safer)
 
@@ -129,6 +165,34 @@ Choose this for production or regulated environments where git is the single sou
 
 In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. The state file is written at the end, so subsequent applies distinguish between bucket 2 and bucket 3 correctly.
 
+### State file trust model
+
+`.state/<env>.json` is the ownership ledger, and it is load-bearing twice over:
+
+- `previously_managed` reads it to decide **what shared mode may delete**. A resource the ledger doesn't list is unmanaged; nothing outside the ledger is ever removed.
+- `resolved_namespaces` unions the namespaces it names with the namespaces the repo currently declares, deciding **what gets reconciled at all**. Without that union, a PR removing the last resource from namespace `foo` would stop `foo` being diffed entirely — the orphaned resource would stay on the gateway forever while its key sat in the ledger, never re-reconciled.
+
+Both of those make sense only because the ledger is **CI-authored**. `apply-on-merge.yml` and `rotate.yml` write it after a successful run and push it to `main` as `gitforgeops[bot]`; nobody edits it by hand.
+
+That trust is enforced at the boundary, not inside the binary:
+
+- **`state-guard.yml` fails any PR that touches or renames a path from `.state/**`.** A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. Deliberate repairs need the exact `gitforgeops/state-override` label. The guard replays paginated label/unlabel events, attributes the latest effective label, queries that actor's current permission, rejects triage/read/deleted/unknown actors and API ambiguity, and records actor, permission, event ID, and timestamp in the job summary. Label and unlabel events rerun the check under per-PR concurrency so a removed authorization cannot leave an older successful run authoritative.
+- **`.state/*.json` is tracked in git; locks and temp files are not.** If you fork this repo, keep the `.gitignore` entries as shipped. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
+- **Apply runs post-merge only**, so a poisoned ledger has to survive review and land on `main` before it can act.
+- **The guard must be a required status check before launch.** The state-writer GitHub App is the sole ruleset bypass and receives only short-lived `Contents: write` installation tokens. See [GitHub launch controls](docs/github-launch-controls.md).
+
+Narrowing what the binary reads out of the ledger is not a substitute for any of this: an attacker who can write `.state/<env>.json` can already forge entries inside a declared namespace, which no amount of namespace scoping catches.
+
+### Spec-owned resources (both modes)
+
+A live proxy, upstream, or plugin config with `api_spec_id` set was provisioned by the gateway's OpenAPI spec importer, which re-provisions it authoritatively on every spec re-import. gitforgeops stays off those rows in **both** ownership modes, regardless of what the state file says:
+
+- Never modified. If the repo also declares the same `(namespace, kind, id)`, the run reports a **conflict** — two owners writing one row, and the spec importer wins on its next import.
+- Never deleted, except in `exclusive` mode with `gitforgeops apply --confirm-api-spec-deletion`. Otherwise apply prints one line per skipped row and counts them.
+- Rendered in `plan` / `diff` output and in the PR comment's "Spec-owned Resources" section. Unlike the unmanaged block this is not gated on `ownership.drift_report` — a repo fighting the spec importer is a correctness problem, not drift noise.
+
+The same flag governs `full_replace`: by default a restore carries the namespace's live `api_specs` and `gateway_trust_bundles` sections through untouched (a bare restore would read as "delete every API spec here" and the gateway answers 409). `--confirm-api-spec-deletion` opts into dropping them.
+
 ## Policy framework: `.gitforgeops/policies.yaml`
 
 Enforce organization standards across every PR. All rules default off (opt-in).
@@ -147,12 +211,12 @@ policies:
   backend_scheme:
     enabled: true
     severity: error
-    allowed_protocols: [https, wss, grpcs]
+    allowed_protocols: [https, tcps, dtls]
 
   require_auth_plugin:
     enabled: false
     severity: error
-    auth_plugin_names: [jwt, key_auth, basic_auth, oauth2, oidc]
+    auth_plugin_names: [jwt_auth, jwks_auth, key_auth, basic_auth, oauth2_introspection, oidc_relying_party]
 
   forbid_tls_verify_disabled:
     enabled: false
@@ -161,7 +225,7 @@ policies:
   allowed_proxy_plugins:
     enabled: false
     severity: error
-    allowed_plugin_names: [jwt, key_auth, rate_limiting]
+    allowed_plugin_names: [jwt_auth, key_auth, rate_limiting]
 
   allowed_backend_domains:
     enabled: false
@@ -170,6 +234,29 @@ policies:
       - api.internal.example.com
       - "*.svc.cluster.local"
       - "*.corp.example.com"
+
+  waf_enforcement:
+    enabled: false
+    severity: error
+    # min_paranoia_level: 2
+
+  require_ai_guardrails:
+    enabled: false
+    severity: error
+    guardrail_plugin_names: [ai_prompt_shield, ai_semantic_firewall]
+
+  rate_limit_completeness:
+    enabled: false
+    severity: error
+
+  plugin_name_is_known:
+    enabled: false
+    severity: warning
+    allowed_extra_plugin_names: []
+
+  priority_override_range:
+    enabled: false
+    severity: error
 
 overrides:
   require_label: gitforgeops/policy-override
@@ -183,6 +270,13 @@ overrides:
 - Each violation includes the rule id, the resource, the current value, and a remediation hint in the PR comment.
 - `allowed_backend_domains` checks direct proxy `backend_host` values when no `upstream_id` is set, and always checks upstream `targets[*].host` values. `*.example.com` matches subdomains like `api.example.com` and `deep.api.example.com`; list `example.com` separately if the root domain is allowed too. IP literals must be listed exactly; wildcard entries only apply to DNS names.
 - `allowed_proxy_plugins` checks plugin configs explicitly referenced from a proxy's `plugins:` list, matching `plugin_name` case-insensitively.
+- `backend_scheme` compares against the six canonical schemes (`http`, `https`, `tcp`, `tcps`, `udp`, `dtls`). A proxy that leaves `backend_scheme` unset is evaluated as `https`, matching the gateway's own default. Legacy entries in `allowed_protocols` (`wss`, `grpcs`, `tcp_tls`, …) are normalized before comparison, so an older policy file keeps meaning the same thing.
+- `require_auth_plugin` evaluates each proxy's *effective* plugin list — scoped plugin configs merged over global ones of the same `plugin_name`, with disabled instances discarded. Omit `auth_plugin_names` to accept all eleven built-in authenticators: `spiffe_identity`, `mtls_auth`, `jwks_auth`, `oauth2_introspection`, `oidc_relying_party`, `jwt_auth`, `key_auth`, `ldap_auth`, `basic_auth`, `hmac_auth`, `soap_ws_security`.
+- `waf_enforcement` catches a `waf` plugin that is attached but not blocking: `mode` other than `enforce`, a rule pack left entirely at `monitor`, or `on_body_too_large: skip`. Optional `min_paranoia_level` (gateway accepts 1–4, defaults to 1).
+- `require_ai_guardrails` requires a proxy carrying AI traffic (any `ai_*` plugin, `mcp_gateway`, or `a2a_gateway`) to also carry an *enforcing* content guardrail — not a dry-run or warn-only one.
+- `rate_limit_completeness` catches rate limiters with no usable budget: `rate_limiting` with missing/empty `limits`, no `scope: default` entry, or an entry with neither a window+`max_requests` nor `requests_per_*`; `ai_rate_limiter` with no `token_limit`; `redis_failure_policy: local_fallback` on either. It also flags the removed top-level budget fields, which the current gateway rejects outright.
+- `plugin_name_is_known` checks `plugin_name` against the gateway's 82 built-ins plus `allowed_extra_plugin_names`. Retired names (`oauth2_auth`, `semantic_ai_firewall`) and the reserved `__mesh_bpf_metrics` always report at `error` regardless of configured severity — the gateway refuses to load a config that mentions them. Note that `jwt`, `oauth2`, and `oidc` are *not* plugin names; `jwt_auth`, `oauth2_introspection`, and `oidc_relying_party` are.
+- `priority_override_range` checks `priority_override` against the gateway's accepted `0..=10000`.
 
 ### Override flow (B2: label + permission)
 
@@ -213,12 +307,37 @@ spec:
   id: app-mobile
   namespace: ferrum
   credentials:
-    api_key:
-      key: "${gh-env-secret:alloc=generate}"
-    basic_auth:
-      username: app-mobile
-      password: "${gh-env-secret:alloc=generate|len=48}"
+    keyauth:
+      - key: "${gh-env-secret:alloc=generate}"
+    jwt:
+      - secret: "${gh-env-secret:alloc=generate|len=32}"
 ```
+
+### Credential shapes
+
+ferrum-edge recognizes exactly five credential types, and each one is an **array** of entries:
+
+| Type | Entry field | Notes |
+|---|---|---|
+| `keyauth` | `key` | non-empty, ≤4096 chars |
+| `jwt` | `secret` | ≥32 characters |
+| `hmac_auth` | `secret` | ≥32 characters, unique per namespace |
+| `mtls_auth` | `identity` | cert CN / SAN / fingerprint — never broker-generated |
+| `basicauth` | `password` **xor** `password_hash` | `hmac_sha256:<64 hex>` for the hash form |
+
+Write the array form. `GET /backup` always returns arrays, so a bare object (`keyauth: {key: …}`) reads as permanent drift in `gitforgeops diff`. gitforgeops normalizes the object form during assembly so existing trees keep working, but the array form is what the gateway means.
+
+Removal is asymmetric on the gateway side: omitting `keyauth`, `jwt`, `hmac_auth`, or `mtls_auth` **deletes** the stored entries on the next apply, while omitting `basicauth` (or an unrecognized type) **preserves** whatever the gateway already has. To actually clear one of the first four, write an explicit empty array (`keyauth: []`).
+
+### What the broker will and won't generate
+
+Generation constraints are checked at resolve time, so `plan` fails before `apply` writes a value the gateway would reject:
+
+- `jwt` / `hmac_auth` need ≥32-character secrets, so `len=` must be at least 24 entropy bytes. The default `len=32` yields 43 base64url characters.
+- `basicauth` in **file mode** is refused: a file-mode gateway requires `password_hash`, and that hash is an HMAC-SHA256 under the gateway's own `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not have. Set the hash by hand, or use api mode where the admin API hashes a plaintext password on write.
+- `basicauth/…/password_hash` is refused in either mode, for the same reason.
+- A bundle value of `[REDACTED]` is refused — that is what a plain `GET /consumers/…` returns for `keyauth`/`jwt`/`hmac_auth` secrets, so a bundle holding it was seeded from the wrong endpoint. Re-seed from `GET /backup` or rotate the slot.
+- `mtls_auth.identity` has to match a real certificate field. Nothing stops you writing `alloc=generate` there, but the gateway will reject the result.
 
 ### Placeholder syntax
 
@@ -231,7 +350,40 @@ ${gh-env-secret:alloc=<mode>|len=<bytes>}
 - `alloc=rotate` — marker for "this slot is eligible for rotation." Behaves identically to `generate` at apply time: first apply allocates, subsequent applies reuse the stored value. **Re-rotation is explicit** — trigger the `rotate.yml` workflow (see below) with a specific slot and recipient.
 - `len=<16..=256>` — bytes of entropy for generated values. Default 32.
 
+### Slot names
+
 Slot names are derived automatically from `(namespace, consumer_id, cred_key)` — you don't write them anywhere. Renaming a consumer gets a new slot (and the ability to intentionally retire the old one).
+
+`cred_key` is the `/`-joined path from the credential type down to the placeholder string. Because credentials are arrays and **index 0 is elided**, the first entry of each type is addressed without an index:
+
+```text
+keyauth: [{key: K}]              ->  ferrum/app-mobile/keyauth/key
+keyauth: [{key: K}, {key: K2}]   ->  ferrum/app-mobile/keyauth/key
+                                     ferrum/app-mobile/keyauth/[1]/key
+jwt:     [{secret: S}]           ->  ferrum/app-mobile/jwt/secret
+```
+
+The elision is what keeps the object→array normalization from orphaning every value already allocated in `FERRUM_CREDS_BUNDLE*`. Lookups also fall back to older encodings (verbatim `[0]`, and the legacy dotted form) so a bundle written by an earlier gitforgeops still resolves after an upgrade; only the elided form is ever written.
+
+The same path syntax is what `gitforgeops rotate --credential` takes: `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `mtls_auth/identity`, `basicauth/password`, or `keyauth/[1]/key` for a second entry.
+
+#### Hazard: entry position is the slot identity
+
+Nothing about an entry's *contents* goes into its slot name — only its index does. For a credential type with **more than one entry**, that makes list order load-bearing:
+
+```text
+before:  keyauth: [{key: A}, {key: B}]      A -> ferrum/app/keyauth/key
+                                            B -> ferrum/app/keyauth/[1]/key
+
+you delete the first entry:
+after:   keyauth: [{key: B}]                B -> ferrum/app/keyauth/key   <-- now A's stored value
+```
+
+The credential you meant to retire is still live, now issued to the entry that shifted into index 0, and `[1]` is orphaned in the bundle where re-growing the list would resurrect it.
+
+So: **rotate, don't delete or reorder.** `gitforgeops rotate --consumer app --credential keyauth/[1]/key` replaces a value in place and leaves every other slot alone. Deleting the *last* entry of a list is safe; deleting or reordering anything else is not.
+
+`plan`, `diff` and `apply` detect both shapes and print a warning: one when a brokered credential array has more than one entry (order is identity), and one naming any bundle slot whose index is past the end of the current array (orphaned by a shrink). Neither blocks the run — the bundle is not corrupt — but an orphaned slot should be rotated rather than left to be re-inherited.
 
 ### Storage: bundled environment secrets
 
@@ -242,13 +394,13 @@ Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `
 - Auto-sharded by deterministic hash when any bundle approaches 40 KB.
 - GitHub's 100-secrets-per-env limit × ~440 slots/bundle = **~44,000 credentials per environment** before you hit any ceiling.
 
-The bundled workflows read all matching secrets via `${{ toJSON(secrets) }}`, filter `FERRUM_CREDS_BUNDLE*`, write that JSON to a temporary file, and pass the path as `FERRUM_CREDS_JSON_FILE`. The binary still supports inline `FERRUM_CREDS_JSON` for local testing, but the file form is preferred because large multi-shard bundles can exceed OS environment-block limits.
+The bundled workflows read all matching secrets via `${{ toJSON(secrets) }}` and pass them through a fail-closed loader: the outer inventory, exact `FERRUM_CREDS_BUNDLE[_N]` names, each inner JSON object, and every string slot/value are validated before a new mode-0600 runner file is published as `FERRUM_CREDS_JSON_FILE`. Malformed inventories never degrade to an empty bundle (which could otherwise trigger duplicate allocation/rotation). The binary still supports inline `FERRUM_CREDS_JSON` for local testing, but the file form is preferred because large multi-shard bundles can exceed OS environment-block limits.
 
 ### Allocation, writing, and delivery
 
 On apply, for each `alloc=generate` or first-apply `alloc=rotate` placeholder with no existing value:
 
-1. Generate a 32-byte (or `len=`) random value with `OsRng`.
+1. Generate a 32-byte (or `len=`) random value from the OS CSPRNG, encoded base64url-no-pad (so 32 bytes → 43 characters).
 2. Fetch the env's libsodium public key from `GET /repos/.../environments/<env>/secrets/public-key`.
 3. Encrypt the updated bundle with `crypto_box_seal` and `PUT` to `/repos/.../environments/<env>/secrets/FERRUM_CREDS_BUNDLE[_N]`.
 4. Fetch the PR author's SSH public keys from `GET /users/{login}/keys`.
@@ -265,7 +417,7 @@ Trigger the `rotate.yml` workflow manually:
 Actions → GitForgeOps Rotate Credential → Run workflow
   environment: production
   consumer: app-mobile
-  credential: api_key
+  credential: keyauth/key
 ```
 
 The rotation re-generates the value, overwrites the env secret, delivers it age-encrypted to `${{ github.actor }}` (whoever triggered the workflow), and then pushes the updated consumer directly to the live Admin API. Rotation is refused in file mode because there is no live gateway push path; use materialization to produce a new resolved flat file for file-mode gateways.
@@ -276,7 +428,9 @@ File-mode gateways consume a single assembled YAML at boot. We can't commit that
 
 **Stage 1 — placeholder assembly (automatic, on every merge)**
 
-`apply-on-merge.yml` in file mode runs `gitforgeops apply --auto-approve` with `FERRUM_GATEWAY_MODE=file` and `FERRUM_FILE_OUTPUT_PATH=assembled/<env>.yaml`. The file write happens before credential allocation mutates the in-memory config, so the committed file still contains the `${gh-env-secret:alloc=...}` strings for each consumer credential. That placeholder file is safe for version control, useful as a diff artifact for PR review, and useless to an attacker. The same apply run can allocate GitHub Environment Secret slots, deliver encrypted credentials, update `.state/<env>.json`, and commit the assembled placeholder file.
+`apply-on-merge.yml` in file mode runs `gitforgeops apply --auto-approve` with `FERRUM_GATEWAY_MODE=file`, `FERRUM_FILE_OUTPUT_PATH=assembled/<env>.yaml`, and `FERRUM_MESH_FILE_OUTPUT_PATH=assembled/<env>-mesh.yaml`. The file write happens before credential allocation mutates the in-memory config, so the committed file still contains the `${gh-env-secret:alloc=...}` strings for each consumer credential. That placeholder file is safe for version control, useful as a diff artifact for PR review, and useless to an attacker. The same apply run can allocate GitHub Environment Secret slots, deliver encrypted credentials, update `.state/<env>.json`, and commit the assembled placeholder file.
+
+Both documents are published atomically (write temp → `fsync` → `rename(2)` in the destination directory), because a file-mode gateway and a mesh node both re-read their file and require two reads 20 ms apart to be byte-identical before reloading. The gateway document also carries a `resource_counts` seal that ferrum-edge's loader checks against the actual array lengths, so a truncated file fails loudly instead of silently deploying a partial config.
 
 **Stage 2 — on-demand materialization (admin-initiated, delivered encrypted)**
 
@@ -317,6 +471,73 @@ If the admin has no compatible SSH key on their GitHub account, materialization 
 
 These are committed to git automatically by the apply workflow, so `git log .state/<env>.json` is the credential history.
 
+## Mesh configuration
+
+Ferrum Edge's service mesh is configured by a document that is **not** a gateway config: mesh nodes read a standalone `{version, mesh}` YAML, and the two documents are mutually exclusive in shape. The mesh loader is `deny_unknown_fields` and rejects a document carrying `proxies:` / `upstreams:`, while a gateway in file mode ignores a `mesh:` key entirely. So gitforgeops keeps them as two artifacts.
+
+### Fragments
+
+Mesh config is authored as fragments under `resources/<namespace>/mesh/*.yaml`:
+
+```yaml
+kind: MeshConfig
+id: core            # optional; defaults to the file stem. Overlays match on it.
+spec:
+  workloads:
+    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+      selector:
+        labels: { app: api }
+      service_name: api
+      addresses: ["10.0.0.5"]
+      ports:
+        - port: 8080
+          protocol: http
+      trust_domain: cluster.local
+      namespace: ferrum
+  services:
+    - name: api
+      namespace: ferrum
+      ports:
+        - port: 80
+          protocol: http
+      workloads:
+        - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+  peer_authentications:
+    - name: mesh-strict
+      namespace: ferrum
+      mtls_mode: strict
+```
+
+Every fragment in the repo contributes to **one** merged document:
+
+- List fields (`workloads`, `services`, `peer_authentications`, …) concatenate across fragments.
+- Singleton fields (`istio_root_namespace`, `trust_bundles`, `multi_cluster`, `outbound_traffic_policy`) may be set by at most one fragment, or by several fragments agreeing on the same value. A conflict is an error, not a last-writer-wins merge.
+
+A mesh fragment has no top-level namespace of its own — the identity that matters lives inside each workload / service / policy entry. The directory namespace is only a handle for `FERRUM_NAMESPACE` filtering and overlay matching. See `resources/ferrum/mesh/_example.yaml`.
+
+### Overlays
+
+`overlays/<env>/<ns>/mesh/<same-file-name>.yaml` deep-merges onto the matching fragment. `spec.workloads` merges additively by `spiffe_id` and `spec.services` by `(name, namespace)`; **every other mesh list is replaced** by the overlay's version, so an overlay's `peer_authentications` are exactly the peer authentications for that environment.
+
+### Output and consumption
+
+`gitforgeops export` and file-mode `gitforgeops apply` publish the merged document to `FERRUM_MESH_FILE_OUTPUT_PATH` (default `./assembled/mesh.yaml`; the bundled workflows use `assembled/<env>-mesh.yaml`):
+
+```yaml
+version: "1"
+mesh:
+  workloads: [...]
+  services: [...]
+```
+
+Point a mesh node's `FERRUM_MESH_FILE_CONFIG_PATH` at that file with `FERRUM_MESH_CONFIG_PROTOCOL=file`. Every node loads the same document and derives its own slice from its `FERRUM_MESH_WORKLOAD_SPIFFE_ID`. Mesh config holds no credential placeholders, so there is no materialize stage for it — what apply writes is final.
+
+### Validation, and the absence of a mesh admin API
+
+`validate`, `plan`, and `apply` run a **second** validation pass, `ferrum-edge validate -m mesh`, against the rendered document (byte-for-byte what gets published, `version` stamp included). That pass runs the same parse → normalize → validate → slice-derivation pipeline a mesh node runs at startup. It only runs when the repo actually declares mesh fragments.
+
+There is **no mesh admin API**. Mesh resources therefore never appear in `gitforgeops diff` and are never pushed anywhere: an api-mode `apply` validates the mesh document and prints a notice telling you to run `export` or a file-mode apply to publish it. Distribute the published file to mesh nodes however you distribute config (image build, config volume, artifact download).
+
 ## Logistics: scale characteristics
 
 Practical limits you should know about:
@@ -350,26 +571,64 @@ Practical limits you should know about:
 
 There's no hard limit in `gitforgeops` on how many resources a single PR can add, modify, or delete. The loader streams one file at a time, the assembler flattens into a `GatewayConfig` in memory (tens of MB even at tens of thousands of resources), and apply runs per namespace.
 
-- **Sequential per-resource HTTP calls in incremental mode.** One PUT / DELETE / POST per changed resource. At ~100 ms round-trip per call, 1,000 changes take roughly 2 minutes. 10,000 changes would take ~20 minutes but are not fundamentally problematic.
+- **Sequential per-resource HTTP calls in incremental mode.** One PUT / DELETE / POST per changed resource. At ~100 ms round-trip per call, 1,000 changes take roughly 2 minutes. 10,000 changes would take ~20 minutes but are not fundamentally problematic. A namespace whose diff is pure adds skips this entirely via the `POST /batch` fast path (see [Apply ordering and the batch fast path](#apply-ordering-and-the-batch-fast-path)).
 - **Full-replace mode is one HTTP call per namespace.** `FERRUM_APPLY_STRATEGY=full_replace` calls `POST /restore?confirm=true` once per namespace in scope. The `/restore` call is atomic for the single namespace it targets, but **atomicity does not extend across namespaces** — an exclusive-mode env with `ownership.namespaces: [alpha, beta]` issues two independent restores, and if `beta` fails after `alpha` succeeded, `alpha` is already replaced on the gateway side. The apply loop records every namespace that fails (instead of bailing on the first) so the error message enumerates partial state, but operators must reconcile it manually. For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 - **Namespaces apply independently.** `apply_api` iterates `split_config_by_namespace` and applies each namespace in turn. A failure applying to `team-alpha` doesn't abort `team-beta` — you get per-namespace error reporting via `ApplyResult`.
 
 ### Retry behavior
 
-Every admin-API call goes through `AdminClient::send_with_retry`, which retries up to `FERRUM_GATEWAY_MAX_RETRIES` (default 3) on:
+Every admin-API call goes through `AdminClient::send_with_retry`, which retries up to `FERRUM_GATEWAY_MAX_RETRIES` (default 3). The response body is buffered before the decision is made, because the admin API's error envelope carries markers that override the status code.
+
+Retried:
 
 - **Connection errors** (`reqwest::Error::is_connect()`) — the server never saw the request, so retry is always safe.
-- **HTTP 5xx** — server-side transient; ferrum-edge admin endpoints are idempotent for PUT/DELETE/POST-restore, and create paths surface 409 on retry races (visible in `ApplyResult.errors`).
-- **HTTP 429** — inherently transient.
+- **HTTP 408, 429, 500, 502, 503, 504** — transient. ferrum-edge admin endpoints are idempotent for PUT/DELETE/POST-restore, and create paths surface 409 on retry races (visible in `ApplyResult.errors`).
+- **`/restore` 503 with `failure_class: connectivity`** — nothing was written, safe to re-send.
 
-Backoff is exponential (`500ms · 2^attempt`) capped at 8 seconds.
+Never retried:
 
-What we deliberately don't retry:
-
+- **HTTP 501** — a standalone-MongoDB gateway (no multi-document transactions) will answer it forever. For `POST /batch` this is not even an error: apply falls back to per-resource creates.
+- **`applied: false` in the body** — the write is durably committed but not live on the running gateway. Re-sending re-applies an already-committed write; check gateway health instead. Surfaces as a `CommittedNotLive` error naming the gateway's `reason` (`config_rejected` / `reload_timeout` / `sequence_unavailable`).
+- **`/restore` 500 with `rollback: incomplete` or `unknown_outcome`** — the namespace may hold a partially restored configuration and a retry would re-run a destructive replace. gitforgeops stops and tells you to inspect with `gitforgeops diff` and reconcile by hand rather than re-running apply.
 - **Request timeouts** — a timeout means state is ambiguous (gateway may or may not have applied). Retrying a large `/restore` after timeout could double-write. The next CI run re-diffs and converges.
-- **4xx other than 429** — 400/401/403/404/409/422 are permanent.
+- **4xx other than 408/429** — 400/401/403/404/409/422 are permanent.
 
-**Partial-failure visibility** (incremental mode): errors are collected per resource rather than bailing on first failure. A run where 99 of 100 resources apply cleanly but 1 hits a 400 returns an `ApplyResult` with 99 successes and 1 error. CLI exits non-zero; you see exactly which resource failed and why.
+Backoff is exponential (`500ms · 2^attempt`) capped at 8 seconds, **unless** the response carries `Retry-After`, which is honored verbatim in delta-seconds form and capped at 30 seconds so a pathological value can't wedge CI.
+
+Some failures get their own error rather than a generic HTTP one:
+
+- **403 with `Admin API is in read-only mode`** → `GatewayReadOnly`. An authenticated `GET /health` preflight runs before the first mutation, so a gateway with `admin_writes_enabled: false` (or running in `file` / `dp` / `mesh` / `node_agent` mode) fails the run once, up front, instead of producing N per-resource 403s. A `/health` that cannot be reached is treated as "unknown" and does not block.
+- **409 carrying `api_specs_at_risk`** → `ApiSpecsAtRisk`, with a pointer to `--confirm-api-spec-deletion` (see [Spec-owned resources](#spec-owned-resources-both-modes)).
+- **413** → the restore payload exceeded the gateway's body limit; the message names `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` and suggests incremental mode.
+
+**Stale gateway views.** If `GET /backup` comes back with `X-Data-Source: cached`, the gateway served its in-memory snapshot instead of the config database, so the live view may be stale. The flag is sticky for the run: any apply that would issue deletions is refused with `StaleGatewayView` unless `--allow-large-prune` is passed to acknowledge pruning from a possibly-stale view. Applies with no deletions proceed with a warning.
+
+**404-tolerant deletes.** A DELETE that answers 404 already achieved its goal. The gateway cascades deletes server-side (deleting a proxy removes its scoped plugin configs), so a diff-driven follow-up delete legitimately finds nothing; treating that as an error used to wedge every later run on the same delete.
+
+**Partial-failure visibility** (incremental mode): errors are collected per resource rather than bailing on first failure. A run where 99 of 100 resources apply cleanly but 1 hits a 400 returns an `ApplyResult` with 99 successes and 1 error. CLI exits non-zero; you see exactly which resource failed and why. Read-only refusals, stale views, and restore-rollback damage are the exceptions — they are fatal for the whole run, because continuing to the next namespace is pointless or unsafe.
+
+### Apply ordering and the batch fast path
+
+Incremental apply sorts the diff into dependency order rather than by kind, because the gateway enforces referential integrity:
+
+| Rank | Operations |
+|---|---|
+| 0 | Add/Modify Upstream, Add/Modify Consumer |
+| 1 | Add/Modify Proxy |
+| 2 | Add/Modify PluginConfig |
+| 3 | Delete PluginConfig |
+| 4 | Delete Proxy |
+| 5 | Delete Upstream, Delete Consumer |
+
+Deletes come *after* adds and modifies: an upstream can only be removed once nothing references it (`DELETE /upstreams/{id}` answers 409 while a proxy still points at it), so the proxy modify that drops the reference has to land first.
+
+Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-side cascade defaults to on and would delete the last-referenced hand-owned upstream along with the proxy — an invisible deletion that makes the next diff-driven `DELETE /upstreams/{id}` answer 404. gitforgeops owns the upstream lifecycle through its own diff and issues that delete itself.
+
+When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — one transactional, all-or-nothing call, chunked below the gateway's 1 MiB body cap. Any Modify or Delete in the set disqualifies it (`/batch` is create-only), and a 501 falls back to per-resource creates.
+
+### Post-apply convergence
+
+After an api-mode apply, gitforgeops makes a best-effort `GET /cluster` call and prints a one-line convergence summary: the gateway's mode, connected data-plane and mesh-node counts, the oldest `last_sync_at` among them, and a warning if any node reports `config_diverged`. On a DP-mode gateway it reports that node's view of its control plane instead; on a database/file-mode gateway there is no cluster to converge and it says so. Advisory only — a gateway that can't answer (older build, network hiccup) reports "unknown" and never fails the apply.
 
 ### What if apply fails after merge?
 
@@ -378,6 +637,11 @@ The merge commit is already on `main`, but config isn't (fully) applied. Re-run 
 1. Incremental mode re-fetches actual state via `GET /backup`, so already-applied resources are skipped.
 2. Full-replace mode is idempotent — `POST /restore` converges regardless of prior partial state.
 3. `.state/<env>.json` is a hash manifest of the *last successful* apply; it never causes re-runs to skip work.
+
+Two failures are the exception — do **not** blindly re-run:
+
+- **`RestoreNeedsManualRecovery`** (`/restore` answered 500 with `rollback: incomplete` or `unknown_outcome`). The namespace may hold a partially restored configuration and another restore is another destructive replace. Inspect with `gitforgeops diff`, restore from a known backup if needed, then reconcile.
+- **`CommittedNotLive`** (`applied: false`). The write is persisted but the running gateway hasn't picked it up. Re-applying re-sends an already-committed write; check gateway health instead.
 
 If a resource is permanently broken (bad schema, illegal listen_path collision), fix it in a follow-up PR.
 
@@ -410,22 +674,48 @@ Only three kinds of configuration source exist:
 |---|---|---|
 | `FERRUM_GATEWAY_URL` | yes (api mode) | Admin API base URL |
 | `FERRUM_ADMIN_JWT_SECRET` | yes (api mode) | HS256 secret for minting admin JWTs; min 32 chars |
+| `FERRUM_ADMIN_JWT_ISSUER` | no (default `ferrum-edge`) | `iss` claim; must equal the gateway's own issuer or every call is 401 |
+| `FERRUM_ADMIN_JWT_ROLE` | no (default `admin`) | `role` claim; `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only |
+| `FERRUM_ADMIN_JWT_AUDIENCE` | no | `aud` claim, emitted **only** when set — a gateway with no configured audience rejects a token that carries one |
+| `FERRUM_ADMIN_JWT_TTL_SECS` | no (default `3600`) | Token lifetime; must sit inside the gateway's `FERRUM_ADMIN_JWT_MAX_TTL` |
 | `FERRUM_GATEWAY_CA_CERT` | no | Custom CA (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_CERT` | no | Client cert for mTLS (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_KEY` | no | Client key for mTLS (base64 PEM, required if cert is set) |
 | `FERRUM_GH_PROVISIONER_TOKEN` | no (required for allocate/rotate) | GitHub App installation token or PAT with `Secrets: write` + `Environments: write` |
 | `FERRUM_CREDS_BUNDLE[_N]` | managed by broker | Credential bundles — **you generally never touch these by hand** |
 
+#### Migrating from older gitforgeops
+
+The default `iss` claim changed from `gitforgeops` to `ferrum-edge`, matching the gateway's own default issuer. Nothing to do for most repos — a gateway left at its default accepts the new value and rejected the old one.
+
+You must act only if your **gateway** is explicitly configured with `FERRUM_ADMIN_JWT_ISSUER=gitforgeops`. Then every call from a current gitforgeops is `401`, and either side can be brought back into agreement:
+
+- set the gateway's `FERRUM_ADMIN_JWT_ISSUER` to `ferrum-edge` (or unset it, which is the same thing); or
+- set `FERRUM_ADMIN_JWT_ISSUER=gitforgeops` for gitforgeops too, as an environment secret, so it keeps minting the old issuer.
+
+The two values must match exactly; the issuer is compared as an opaque string.
+
+Minted tokens also carry an `ns` claim listing the namespaces the run actually touches (from `FERRUM_NAMESPACE`, refined to an exclusive environment's namespace list where one applies). It is consulted only by gateways running with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`; elsewhere it is inert, and it is omitted entirely when the scope is "all namespaces", which is what a non-tenancy gateway expects.
+
 ### GitHub Actions variables used by bundled workflows
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML. The bundled workflows use this to choose apply/materialize behavior and to skip API-only drift checks in file-mode repos. |
-| `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
+| `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML. Values are trimmed/case-folded; every other present value fails the workflow preflight before credentials or binaries are loaded. |
+| `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for the validator. It must have an exact reviewed digest in `.github/ferrum-edge-checksums.txt`. |
 | `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
 | `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Where the `release` workflow pushes on Docker Hub. Only matters if `GITFORGEOPS_RELEASE_ENABLED=true`. GHCR path is auto-derived from the repo. |
 
 These are GitHub **Variables** because the workflow YAML reads them through `vars.*`. Runtime knobs such as `FERRUM_NAMESPACE`, `FERRUM_TLS_NO_VERIFY`, and timeout/retry settings are normal process environment variables; set them locally, or explicitly pass them through if you customize the bundled workflows.
+
+Every deployment environment also needs `GITFORGEOPS_STATE_APP_ID` and
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY` for the contents-only App that commits the
+ownership ledger through the protected branch ruleset. Set repository variable
+`GITFORGEOPS_STATE_APP_ID` to that same numeric ID so the scheduled audit can
+verify the exact bypass actor. The repository-level
+`SETTINGS_AUDIT_TOKEN` needs Administration: read and is used only by the
+scheduled default-branch settings audit. See
+[GitHub launch controls](docs/github-launch-controls.md).
 
 ### Docker Hub secrets (upstream maintainers / forks publishing their own image only)
 
@@ -438,7 +728,7 @@ Required only if you're the upstream maintainer, or if your fork has opted in vi
 | `DOCKERHUB_USERNAME` | Docker Hub account that owns the target namespace |
 | `DOCKERHUB_TOKEN` | Docker Hub access token with push access |
 
-The `release` workflow also pushes to GHCR using the built-in `GITHUB_TOKEN` — no extra secret needed. Ensure Settings → Actions → General → Workflow permissions is set to **Read and write** so `GITHUB_TOKEN` can push to `ghcr.io/<owner>/…`.
+The `release` workflow also pushes to GHCR using the built-in `GITHUB_TOKEN` — no extra secret needed. Keep repository default workflow permissions at **Read repository contents permission**; `release.yml` explicitly grants `packages: write` only to the release job for GHCR publishing.
 
 ### Local environment variables
 
@@ -458,32 +748,45 @@ Runtime variables supported by the binary include:
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Legacy/env-driven strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
 | `FERRUM_OVERLAY` | — | Legacy overlay selector used only without repo config/env selection. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode output path. Bundled file-mode apply sets this to `assembled/<env>.yaml`. |
+| `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`. Separate document, separate path — see [Mesh configuration](#mesh-configuration). Bundled workflows set `assembled/<env>-mesh.yaml`. |
+| `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | `iss` claim minted into admin tokens. |
+| `FERRUM_ADMIN_JWT_ROLE` | `admin` | `role` claim. `viewer` / `operator` are insufficient for what gitforgeops does. |
+| `FERRUM_ADMIN_JWT_AUDIENCE` | — | `aud` claim; emitted only when set. |
+| `FERRUM_ADMIN_JWT_TTL_SECS` | `3600` | Admin token lifetime. |
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validation binary path. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification for gateway HTTP calls. Dev only. |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for the Admin API. |
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end Admin API request timeout. Raise for large `/backup` or slow `/restore`. |
 | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for GitHub API calls. |
 | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` | `30` | End-to-end GitHub API request timeout. |
-| `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Retries on connection errors, HTTP 5xx, and 429. `0` disables retries. |
+| `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Retries on connection errors, HTTP 408/429/5xx (not 501). `0` disables retries. |
 
 ## CLI reference
 
 All commands accept `--env <name>` globally.
 
 ```
-gitforgeops validate [--format text|json|github-annotations]
+gitforgeops validate [--format text|json|github|github-annotations]
 gitforgeops diff [--exit-on-drift]
 gitforgeops plan
-gitforgeops apply [--auto-approve] [--allow-large-prune]
+gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
 gitforgeops export [--output PATH] [--materialize] [--encrypt-to GH_LOGIN]
-gitforgeops import --from-api true | --from-file PATH [--output-dir DIR]
-gitforgeops review [--pr N]
-gitforgeops envs [--format json|text]           # for CI matrix discovery
+gitforgeops import --from-api | --from-file PATH [--output-dir DIR]
+gitforgeops review [--pr N] [--require-live]
+gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops rotate --consumer ID --credential KEY \
   [--namespace NS] [--recipient GH_LOGIN]
 ```
 
-Current CLI parsing expects a value after `--from-api`; the value is ignored by the importer, so examples use `true`.
+Notes:
+
+- `--from-api` is a flag, not a value: `gitforgeops import --from-api`. It conflicts with `--from-file`.
+- `--format github` is an alias for `github-annotations`.
+- `--confirm-api-spec-deletion` is the opt-in for touching resources the gateway's OpenAPI spec importer owns: under `full_replace` it drops the namespace's `api_specs` section instead of carrying it through, and under exclusive incremental apply it allows pruning live resources tagged with an `api_spec_id`. Without it, those rows are reported and skipped.
+- `--allow-large-prune` doubles as the acknowledgement that pruning from a stale (`X-Data-Source: cached`) gateway view is acceptable.
+- `review --require-live` returns non-zero after rendering/posting the review if the gateway comparison was unavailable. The trusted PR workflow uses it; secretless static review intentionally does not.
+- `envs --format json --include-scopes` emits protected environment/namespace routing for trusted CI and is not a replacement for `envs --format json`'s string array.
+- `import` writes per-resource YAML for the four gateway kinds only; API specs and gateway trust bundles present in the source backup are reported as skipped rather than silently dropped, because they are managed through `/api-specs` and `/gateway-trust-bundles`, not through this repo.
 
 ## PR review output
 
@@ -501,39 +804,48 @@ Environment: `staging` · Ownership: `Shared` · Strategy: `Incremental`
 | Modify | Proxy | my-api | backend_read_timeout_ms |
 
 ### Breaking Changes
-- **Proxy `my-api`**: backend_protocol change (http → https) will reject existing connections
+- **Proxy `my-api`**: backend_scheme changed
 
 ### Security Findings
-- [WARNING] **Proxy `new-service`**: No auth plugin attached
+- [WARNING] **Proxy `new-service`** (`ferrum`): No auth plugin attached to proxy new-service in namespace ferrum — its effective plugin list contains no enabled authenticator; attach one of: jwt_auth, key_auth, ...
 
 ### Best Practice Recommendations
-- **Proxy `new-service`**: Consider adding rate_limiting plugin
+- [warning] **Proxy `new-service`** (`ferrum`): No rate-limit plugin attached to proxy new-service in namespace ferrum (scheme https) — a single client can saturate the backend; attach rate_limiting
 
 ### Unmanaged Resources (shared mode)
 These resources exist on the gateway but were not applied by this repo. They will not be modified or deleted.
 - **Proxy `admin-experiment`** (`ferrum`)
 
+### Spec-owned Resources
+These gateway resources carry an `api_spec_id`: they are provisioned by an OpenAPI spec import, not by this repo. gitforgeops does not modify or prune them.
+
+- **Proxy `petstore-list-pets`** (`ferrum`) owned by spec `petstore-v3`
+
 ### Policy Violations
-- [error] `backend_scheme` on **Proxy `my-api`** (`ferrum`): backend_protocol=http is not in the allowed list (https, wss, grpcs) · BLOCKING
-  - _Change backend_protocol to one of: https, wss, grpcs_
+- [error] `backend_scheme` on **Proxy `my-api`** (`ferrum`): backend_scheme=http is not in the allowed list (https) · BLOCKING
+  - _Change backend_scheme to one of: https_
 
 > **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label (requires `write` permission on this repo).
 
 ### Credential Slots
 | Slot | Declared as |
 |------|-------------|
-| `ferrum/app-mobile/api_key` | needs allocation (generated on apply) |
-| `ferrum/web-portal/api_key` | resolved |
+| `ferrum/app-mobile/keyauth/key` | needs allocation (generated on apply) |
+| `ferrum/web-portal/keyauth/key` | resolved |
 ```
 
 ## Trust and security posture
 
-- **Fork PRs cannot see production secrets.** `validate-pr.yml` binds each review job to the matching GitHub Environment so same-repo PRs can include live gateway comparison in review comments, but GitHub withholds environment secrets from forked `pull_request` runs. Fork PRs degrade to static-only review output, and contributors from forks can propose credential slots but cannot cause allocation.
-- **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions).
+- **PR-built code never receives production secrets.** `validate-pr.yml` has a read-only token, disables persisted checkout credentials, and binds no GitHub Environment. It runs on every PR and exposes a stable required gate while internally skipping irrelevant validation. The privileged `trusted-pr-review.yml` definition comes from the default branch, requires the static run to succeed, verifies the current same-repository PR head, and gives forks no privileged steps. Its artifact contains only bounded regular YAML beneath `resources/` and `overlays/`; environment/policy configuration and ownership state are copied from the recorded protected-branch SHA after manifest verification. Live review runs separately for each protected-branch resource namespace intersected with that environment's protected ownership/filter scope, with `FERRUM_NAMESPACE` set; that also scopes the JWT claim, so a PR-authored environment mapping or `spec.namespace` override cannot turn review into a cross-namespace read. `--require-live` makes a failed gateway comparison fail the privileged job. New namespaces receive static review until their directory is trusted on `main`. A `build.rs`, workflow, executable, symlink, traversal path, or unexpected artifact file cannot cross that data boundary.
+- **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions). Before mutation, the workflow resolves exactly one merged PR for the pushed commit; ambiguous/unattributed commits cannot borrow another PR's policy override or credential-delivery recipient.
 - **Credential values are never written back to the repo.** Only hashes and metadata in `.state/`.
+- **The state file is CI-owned and permission-attributed.** `state-guard.yml` rejects `.state/**` changes unless the latest effective override label actor currently has write/maintain/admin. Triage label authority is explicitly insufficient. Protected state commits use a short-lived, contents-only App token rather than a human PAT or unbypassable `GITHUB_TOKEN`. See [State file trust model](#state-file-trust-model).
 - **Policy overrides leave a permanent trail.** PR label event + approver permission + `.state/<env>.json.overrides` record.
 - **The provisioner token is the bootstrap credential.** Rotate periodically; prefer GitHub App installation tokens over PATs (automatic 1-hour expiry, org-scoped).
 - **TLS material stays as GitHub secrets.** The binary only ever sees the base64-decoded PEM in-process.
+- **Executable dependencies are pinned and verified.** Every third-party Action uses a full commit SHA, Rust and `cargo-llvm-cov` use exact versions, validator bytes must match publisher and checked-in SHA-256 values, and Docker bases use manifest digests without mutable package-manager installs during the release build. Releases publish max-mode provenance, SBOM attestations, a GitHub-signed GHCR provenance statement, and a retained manifest of every action/toolchain/base/binary input. Dependabot proposes controlled updates and `check_supply_chain.py` rejects regressions.
+- **GitHub settings are part of the security boundary.** CODEOWNERS alone is advisory; the active ruleset, environment reviewers/branch restrictions, Actions allowlist/SHA policy, state-App bypass, and scheduled settings audit described in [GitHub launch controls](docs/github-launch-controls.md) are launch requirements.
+- **Validation is hermetic.** `ferrum-edge validate` is invoked with `-m file` (or `-m mesh`) pinned and `-s` pointed at an empty settings file, so an inherited `FERRUM_MODE` or a stray `ferrum.conf` in the checkout can't turn validation into a fail-open no-op that still exits 0. Every `FERRUM_*` variable is removed from the child's environment for the same reason. The temporary spec is written through `tempfile` at mode 0600 with an unpredictable name and removed on drop — callers resolve credential placeholders *before* validating, so that file can hold live consumer credentials. `ferrum-edge validate` itself has no machine-readable output mode; the text/JSON/GitHub-annotation formats of `--format` are produced gitforgeops-side.
 
 ## Drift detection
 
@@ -553,7 +865,7 @@ A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into 
 
 ### Published images
 
-The `release` workflow publishes to two registries on every push to `main` and every `v*` tag:
+The `release` workflow publishes to two registries on every push to `main` and every protected `v*` tag. Images include BuildKit max-mode provenance and SBOM attestations; GHCR also receives a GitHub-signed build-provenance attestation tied to the pushed digest:
 
 - `docker.io/ferrumedge/ferrum-edge-git-forge-ops`
 - `ghcr.io/ferrum-edge/ferrum-edge-git-forge-ops`
@@ -571,16 +883,20 @@ Platforms: `linux/amd64` + `linux/arm64`.
 
 1. Docker Hub repo `ferrumedge/ferrum-edge-git-forge-ops` exists (public)
 2. Repo secrets `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` are set
-3. Settings → Actions → General → Workflow permissions = **Read and write** (for GHCR push)
+3. Settings → Actions → General → Workflow permissions = **Read repository contents permission** (recommended default; `release.yml` grants `packages: write` at job scope)
+4. A tag ruleset restricts creation/update/deletion of `v*` tags to the release administrators/App
 
 ### Building locally
 
 ```bash
 docker build -t gitforgeops .
-docker build --build-arg FERRUM_EDGE_VERSION=v0.9.0 -t gitforgeops .
 
 docker run --rm -v $(pwd):/repo gitforgeops --env staging validate
 ```
+
+The Ferrum Edge, Rust, and Debian stages are pinned by multi-architecture
+manifest digest. Update those references through reviewed Dependabot PRs; do
+not reintroduce a floating build argument for an executable base.
 
 ## Build, test, lint
 
@@ -607,7 +923,14 @@ If you'd rather not depend on the upstream image (air-gapped env, vendored build
 
 ### Version pinning
 
-Set the `FERRUM_EDGE_VERSION` GitHub Actions variable to pin the `ferrum-edge` binary version used in CI workflows. Pin this to match the version of Ferrum Edge running in your environment so validation rules stay consistent. Example: if your gateways run `v0.9.0`, set `FERRUM_EDGE_VERSION=v0.9.0`. If unset, `latest` is used.
+Set `FERRUM_EDGE_VERSION` to the release tag matching the gateway. That tag
+must appear beside the SHA-256 of `ferrum-edge-linux-x86_64` in
+`.github/ferrum-edge-checksums.txt`; adding or changing a pin therefore goes
+through normal CODEOWNER review. The installer downloads the binary and its
+publisher `.sha256` asset, verifies they agree, then verifies the computed
+bytes against the checked-in digest before making the file executable. If
+unset, the fallback selects the content-pinned 2026-08-31 `latest` snapshot;
+if that tag moves, CI stops until the lock file is deliberately updated.
 
 ## License
 

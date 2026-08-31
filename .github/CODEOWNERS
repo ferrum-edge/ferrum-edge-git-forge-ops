@@ -1,0 +1,20 @@
+# Require a repository administrator to review changes to launch trust
+# boundaries. The main ruleset must enable `require_code_owner_review` for
+# this file to become an enforced control.
+/.github/workflows/ @jeremyjpj0916
+/.github/scripts/ @jeremyjpj0916
+/.github/CODEOWNERS @jeremyjpj0916
+/.github/cargo-audit-policy.json @jeremyjpj0916
+/.github/ferrum-edge-checksums.txt @jeremyjpj0916
+/.gitforgeops/ @jeremyjpj0916
+/.state/ @jeremyjpj0916
+/assembled/ @jeremyjpj0916
+/Dockerfile @jeremyjpj0916
+/.dockerignore @jeremyjpj0916
+/Cargo.toml @jeremyjpj0916
+/Cargo.lock @jeremyjpj0916
+/rust-toolchain.toml @jeremyjpj0916
+/src/ @jeremyjpj0916
+/src/state.rs @jeremyjpj0916
+/src/reconcile.rs @jeremyjpj0916
+/src/secrets/ @jeremyjpj0916

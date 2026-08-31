@@ -15,9 +15,19 @@ use super::schema::Resource;
 ///     consumers/  -> Consumer resources
 ///     upstreams/  -> Upstream resources
 ///     plugins/    -> PluginConfig resources
+///     mesh/       -> MeshConfig fragments
 /// ```
 ///
 /// Files starting with `_` are skipped (convention for examples/templates).
+///
+/// `mesh/` differs from the four gateway directories: its files are
+/// *fragments* of one shared mesh document rather than individually
+/// addressable gateway resources, and a mesh document has no top-level
+/// namespace of its own. The directory namespace is recorded for
+/// `FERRUM_NAMESPACE` filtering and overlay matching only; the namespaces
+/// that matter to the mesh live inside each workload / service / policy
+/// entry. A mesh fragment with no explicit `id` is named after its file stem
+/// so overlays have something stable to target.
 pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String, Resource)>> {
     if !resources_dir.is_dir() {
         return Err(crate::error::Error::NoResourcesDir(
@@ -51,8 +61,8 @@ pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String,
             .unwrap_or("ferrum")
             .to_string();
 
-        // Walk subdirectories: proxies/, consumers/, upstreams/, plugins/
-        for subdir in &["proxies", "consumers", "upstreams", "plugins"] {
+        // Walk subdirectories: proxies/, consumers/, upstreams/, plugins/, mesh/
+        for subdir in &["proxies", "consumers", "upstreams", "plugins", "mesh"] {
             let subdir_path = ns_path.join(subdir);
             if !subdir_path.is_dir() {
                 continue;
@@ -84,12 +94,25 @@ pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String,
                     }
                 })?;
 
-                let resource: Resource = serde_yaml::from_str(&contents).map_err(|source| {
+                let mut resource: Resource = serde_yaml::from_str(&contents).map_err(|source| {
                     crate::error::Error::YamlParse {
                         path: path.to_path_buf(),
                         source,
                     }
                 })?;
+
+                // Mesh fragments have no id inside the mesh schema, so an
+                // unnamed one takes the file stem. Overlays match on that
+                // name; without it, two fragments in the same namespace would
+                // be indistinguishable to `apply_overlay`.
+                if let Resource::MeshConfig { id, .. } = &mut resource {
+                    if id.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                        *id = path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .map(|stem| stem.to_string());
+                    }
+                }
 
                 results.push((namespace.clone(), resource));
             }

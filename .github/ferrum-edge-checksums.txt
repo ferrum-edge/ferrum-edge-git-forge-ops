@@ -1,0 +1,2 @@
+# Release tag  Asset                           SHA-256
+latest         ferrum-edge-linux-x86_64       d011517b94903f809adf8ad308cfe512d23c8cdd5980f979682986916745f783

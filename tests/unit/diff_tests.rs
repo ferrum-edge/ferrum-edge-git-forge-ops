@@ -12,7 +12,7 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
         namespace: "ferrum".to_string(),
         hosts: vec![],
         listen_path: Some(listen_path.to_string()),
-        backend_protocol: BackendProtocol::Http,
+        backend_scheme: Some(BackendScheme::Http),
         backend_host: host.to_string(),
         backend_port: 8080,
         backend_path: None,
@@ -53,6 +53,13 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
         tcp_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
+        pool_max_requests_per_connection: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        websocket_idle_timeout_seconds: None,
+        stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
+        stream_match: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -86,6 +93,8 @@ fn make_plugin_config(
         proxy_id: None,
         enabled: true,
         priority_override: None,
+        trigger: None,
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -98,6 +107,7 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
             port: 8080,
             weight: 1,
             tags: std::collections::HashMap::new(),
+            locality: None,
             path: None,
         })
         .collect();
@@ -115,6 +125,10 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        subsets: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: vec![],
+        api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -250,6 +264,166 @@ fn breaking_detects_listen_path_change() {
     let breaking = detect_breaking_changes(&diffs, &desired, &actual);
     assert!(!breaking.is_empty());
     assert!(breaking[0].reason.to_lowercase().contains("listen_path"));
+}
+
+/// Runs `desired` vs `actual` through diff + breaking detection where the two
+/// proxies differ only in whatever `mutate` changes.
+fn breaking_reasons_for_proxy_change(mutate: impl Fn(&mut Proxy)) -> Vec<String> {
+    let actual_proxy = make_proxy("p1", "/api", "localhost");
+    let mut desired_proxy = actual_proxy.clone();
+    mutate(&mut desired_proxy);
+
+    let desired = GatewayConfig {
+        proxies: vec![desired_proxy],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![actual_proxy],
+        ..GatewayConfig::default()
+    };
+    let diffs = compute_diff(&desired, &actual);
+    detect_breaking_changes(&diffs, &desired, &actual)
+        .into_iter()
+        .map(|bc| bc.reason)
+        .collect()
+}
+
+#[test]
+fn breaking_detects_backend_scheme_change() {
+    let reasons = breaking_reasons_for_proxy_change(|p| {
+        p.backend_scheme = Some(BackendScheme::Https);
+    });
+    assert!(
+        reasons.iter().any(|r| r.contains("backend_scheme")),
+        "expected a backend_scheme breaking change, got {reasons:?}"
+    );
+    assert!(
+        !reasons.iter().any(|r| r.contains("backend_protocol")),
+        "the pre-rename field name must not appear in messages: {reasons:?}"
+    );
+}
+
+/// A live DB-backed gateway always reports a resolved scheme, so the desired
+/// side (which assembly normalizes the same way) must compare equal. Before
+/// this, a schemeless repo proxy read as `None != Some(https)` and every PR
+/// touching it carried a phantom "backend_scheme changed" banner that no edit
+/// could clear.
+#[test]
+fn schemeless_desired_proxy_is_not_a_breaking_change_against_a_resolved_live_scheme() {
+    let mut actual_proxy = make_proxy("p1", "/api", "localhost");
+    actual_proxy.backend_scheme = Some(BackendScheme::Https); // as returned by /backup
+    let mut desired_proxy = actual_proxy.clone();
+    desired_proxy.backend_scheme = None; // as authored, before normalization
+
+    let desired = GatewayConfig {
+        proxies: vec![desired_proxy],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![actual_proxy],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    let reasons: Vec<String> = detect_breaking_changes(&diffs, &desired, &actual)
+        .into_iter()
+        .map(|bc| bc.reason)
+        .collect();
+
+    assert!(
+        !reasons.iter().any(|r| r.contains("backend_scheme")),
+        "an absent scheme resolves to https, so nothing changed: {reasons:?}"
+    );
+}
+
+/// The end-to-end shape of the same bug: assemble the desired config (which
+/// resolves the scheme) and diff it against what the gateway reports. There
+/// must be no Modify at all — this is the drift that never converged.
+#[test]
+fn assembled_schemeless_proxy_diffs_clean_against_a_resolved_live_gateway() {
+    use gitforgeops::config::assemble;
+
+    let resource: Resource = serde_yaml::from_str(
+        "kind: Proxy\nspec:\n  id: p1\n  listen_path: /api\n  backend_host: localhost\n  backend_port: 8080\n",
+    )
+    .unwrap();
+    let desired = assemble(vec![("ferrum".to_string(), resource)])
+        .expect("assemble")
+        .gateway;
+
+    // What `GET /backup` returns for that proxy: same fields, scheme resolved.
+    let mut live_proxy = desired.proxies[0].clone();
+    live_proxy.backend_scheme = Some(BackendScheme::Https);
+    let actual = GatewayConfig {
+        proxies: vec![live_proxy],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    assert!(
+        diffs.is_empty(),
+        "assembled desired config must converge with the live gateway: {diffs:?}"
+    );
+}
+
+#[test]
+fn breaking_detects_upstream_subset_change() {
+    let reasons = breaking_reasons_for_proxy_change(|p| {
+        p.upstream_id = Some("pool-a".to_string());
+        p.upstream_subset = Some("canary".to_string());
+    });
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("upstream_subset") && r.contains("reroute")),
+        "expected an upstream_subset breaking change, got {reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_detects_listen_port_change() {
+    let reasons = breaking_reasons_for_proxy_change(|p| {
+        p.backend_scheme = Some(BackendScheme::Tcp);
+        p.listen_port = Some(15432);
+    });
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("listen_port") && r.contains("listener")),
+        "expected a listen_port breaking change, got {reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_detects_frontend_tls_flip() {
+    let reasons = breaking_reasons_for_proxy_change(|p| p.frontend_tls = true);
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("frontend_tls") && r.contains("false -> true")),
+        "expected a frontend_tls breaking change naming the direction, got {reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_detects_passthrough_flip() {
+    let reasons = breaking_reasons_for_proxy_change(|p| p.passthrough = true);
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("passthrough") && r.contains("false -> true")),
+        "expected a passthrough breaking change naming the direction, got {reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_ignores_non_breaking_proxy_edit() {
+    // A pure timeout bump is a modify, but nothing about it is breaking.
+    let reasons = breaking_reasons_for_proxy_change(|p| p.backend_read_timeout_ms = 45_000);
+    assert!(
+        reasons.is_empty(),
+        "timeout change should not be breaking, got {reasons:?}"
+    );
 }
 
 #[test]
@@ -410,6 +584,10 @@ fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
 #[test]
 fn security_detects_tls_verify_disabled() {
     let mut proxy = make_proxy("p1", "/api", "localhost");
+    // The check is scheme-aware: the gateway rejects
+    // `backend_tls_verify_server_cert: false` outright on plaintext schemes,
+    // so only a TLS-capable scheme makes the flag meaningful.
+    proxy.backend_scheme = Some(BackendScheme::Https);
     proxy.backend_tls_verify_server_cert = false;
     let config = GatewayConfig {
         proxies: vec![proxy],
@@ -546,10 +724,13 @@ fn best_practice_respects_global_plugins() {
                 "rate_limiting",
                 PluginScope::Global,
             ),
+            // `request_logging` is not a gateway plugin — the observability
+            // check matches the explicit built-in set, not a "logging"
+            // substring.
             make_plugin_config(
                 "global-logging",
                 "team-alpha",
-                "request_logging",
+                "http_logging",
                 PluginScope::Global,
             ),
         ],
@@ -561,4 +742,92 @@ fn best_practice_respects_global_plugins() {
         .iter()
         .any(|check| check.message.contains("rate_limiting")));
     assert!(!checks.iter().any(|check| check.message.contains("logging")));
+}
+
+// --- Spec-owned classification across kinds ----------------------------------
+//
+// `api_spec_id` lives on Proxy, Upstream and PluginConfig (never Consumer —
+// spec ingestion does not provision identities). These cover the per-kind
+// wiring; the ownership-mode semantics live in ownership_tests.rs.
+
+#[test]
+fn spec_owned_upstream_is_not_pruned_by_plain_compute_diff() {
+    // `compute_diff` is the plain exclusive entry point used by callers with
+    // no ownership context — it must protect spec-owned rows too.
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        upstreams: vec![Upstream {
+            api_spec_id: Some("spec-3".to_string()),
+            ..make_upstream("u-from-spec", 1)
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    assert!(
+        diffs.is_empty(),
+        "spec-owned upstream must not produce a Delete: {diffs:?}"
+    );
+}
+
+#[test]
+fn spec_owned_plugin_config_is_bucketed_not_deleted() {
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        plugin_configs: vec![PluginConfig {
+            api_spec_id: Some("spec-4".to_string()),
+            ..make_plugin_config("pc-from-spec", "ferrum", "rate-limit", PluginScope::Global)
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    assert!(result.diffs.is_empty(), "{:?}", result.diffs);
+    assert_eq!(result.spec_owned.len(), 1);
+    assert_eq!(result.spec_owned[0].kind, "PluginConfig");
+    assert_eq!(result.spec_owned[0].api_spec_id, "spec-4");
+}
+
+#[test]
+fn consumers_are_never_classified_as_spec_owned() {
+    // Consumers carry no `api_spec_id`; an admin-added one in exclusive mode
+    // stays an ordinary prune candidate.
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig {
+        consumers: vec![make_consumer("c1", "alice")],
+        ..GatewayConfig::default()
+    };
+
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    assert!(result.spec_owned.is_empty());
+    assert_eq!(result.diffs.len(), 1);
+    assert!(matches!(result.diffs[0].action, DiffAction::Delete));
+}
+
+#[test]
+fn spec_owned_upstream_declared_in_repo_suppresses_modify() {
+    // Repo declares two targets, the spec-provisioned live row has one. That
+    // is a Modify under normal ownership — here it must become a conflict.
+    let desired = GatewayConfig {
+        upstreams: vec![make_upstream("u-shared", 2)],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        upstreams: vec![Upstream {
+            api_spec_id: Some("spec-3".to_string()),
+            ..make_upstream("u-shared", 1)
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    assert!(
+        result.diffs.is_empty(),
+        "no Modify against a spec-owned row: {:?}",
+        result.diffs
+    );
+    let conflicts: Vec<_> = result.spec_conflicts().collect();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].kind, "Upstream");
+    assert_eq!(conflicts[0].id, "u-shared");
 }

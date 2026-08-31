@@ -3,7 +3,9 @@ use crate::config::GatewayConfig;
 use super::config::PolicyConfig;
 use super::rules::{
     AllowedBackendDomainsRule, AllowedProxyPluginsRule, BackendSchemeRule,
-    ForbidTlsVerifyDisabledRule, RequireAuthPluginRule, TimeoutBandsRule,
+    ForbidTlsVerifyDisabledRule, PluginNameIsKnownRule, PriorityOverrideRangeRule,
+    RateLimitCompletenessRule, RequireAiGuardrailsRule, RequireAuthPluginRule, TimeoutBandsRule,
+    WafEnforcementRule,
 };
 use super::{PolicyCheck, PolicyFinding};
 
@@ -38,6 +40,31 @@ pub fn build_registry(policy_cfg: &PolicyConfig) -> Vec<Box<dyn PolicyCheck>> {
     if policy_cfg.policies.allowed_backend_domains.enabled {
         rules.push(Box::new(AllowedBackendDomainsRule::new(
             policy_cfg.policies.allowed_backend_domains.clone(),
+        )));
+    }
+    if policy_cfg.policies.waf_enforcement.enabled {
+        rules.push(Box::new(WafEnforcementRule::new(
+            policy_cfg.policies.waf_enforcement.clone(),
+        )));
+    }
+    if policy_cfg.policies.require_ai_guardrails.enabled {
+        rules.push(Box::new(RequireAiGuardrailsRule::new(
+            policy_cfg.policies.require_ai_guardrails.clone(),
+        )));
+    }
+    if policy_cfg.policies.rate_limit_completeness.enabled {
+        rules.push(Box::new(RateLimitCompletenessRule::new(
+            policy_cfg.policies.rate_limit_completeness.clone(),
+        )));
+    }
+    if policy_cfg.policies.plugin_name_is_known.enabled {
+        rules.push(Box::new(PluginNameIsKnownRule::new(
+            policy_cfg.policies.plugin_name_is_known.clone(),
+        )));
+    }
+    if policy_cfg.policies.priority_override_range.enabled {
+        rules.push(Box::new(PriorityOverrideRangeRule::new(
+            policy_cfg.policies.priority_override_range.clone(),
         )));
     }
 
