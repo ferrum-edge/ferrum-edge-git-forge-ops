@@ -1,4 +1,4 @@
-# Ferrum Edge Qwen3.8 Max continuation brief
+# Ferrum Edge Git Forge Ops Qwen3.8 Max continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow every rule in
 `agent-brief.md`, especially isolation, direct implementation, host discipline, the

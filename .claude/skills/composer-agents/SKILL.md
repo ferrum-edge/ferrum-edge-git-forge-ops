@@ -1,6 +1,6 @@
 ---
 name: composer-agents
-description: Dispatch and orchestrate local Cursor Composer 2.5 subagents via the standalone cursor-agent CLI for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Composer is the fast tier of the agent fleet. Use when the user asks Claude to spawn Composer/Cursor Composer agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate local Cursor Composer 2.5 subagents via the standalone cursor-agent CLI for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Composer is the fast tier of the agent fleet. Use when the user asks Claude to spawn Composer/Cursor Composer agents on issues, PRs, review findings, or red CI.
 ---
 
 # composer-agents: Cursor Composer 2.5 subagent orchestration

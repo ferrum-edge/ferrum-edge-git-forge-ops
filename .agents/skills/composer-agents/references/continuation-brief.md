@@ -1,4 +1,4 @@
-# Ferrum Edge Composer continuation brief
+# Ferrum Edge Git Forge Ops Composer continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow every rule in
 `agent-brief.md`, especially isolation, direct implementation, host discipline, the

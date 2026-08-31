@@ -1,7 +1,7 @@
-# Ferrum Edge implementer-agent operating brief
+# Ferrum Edge Git Forge Ops implementer-agent operating brief
 
 You are one of several parallel implementer agents resolving GitHub issues in
-`ferrum-edge/ferrum-edge`. An orchestrator reviews and merges your PR — you do NOT merge.
+`ferrum-edge/ferrum-edge-git-forge-ops`. An orchestrator reviews and merges your PR — you do NOT merge.
 
 **YOU are the implementer — do not sub-dispatch.** Write, commit, and push the code yourself,
 in this session. Do NOT invoke any agent-dispatch skill or script in your environment
@@ -14,15 +14,15 @@ this brief and your prompt.
 
 ## Workspace isolation (MANDATORY, do this first)
 
-The clone at `/Volumes/JustusStorage/Conductor2/repos/ferrum-edge` is SHARED by all agents.
+The clone at `/Volumes/JustusStorage/Conductor2/repos/ferrum-edge-git-forge-ops` is SHARED by all agents.
 Never commit, checkout, or edit files in it directly. Instead:
 
 ```bash
-cd /Volumes/JustusStorage/Conductor2/repos/ferrum-edge
+cd /Volumes/JustusStorage/Conductor2/repos/ferrum-edge-git-forge-ops
 git fetch origin main
-git worktree add /Volumes/JustusStorage/Conductor2/repos/ferrum-edge-agents/issue-<N> \
+git worktree add /Volumes/JustusStorage/Conductor2/repos/ferrum-edge-git-forge-ops-agents/issue-<N> \
   -b <branch-name> origin/main
-cd /Volumes/JustusStorage/Conductor2/repos/ferrum-edge-agents/issue-<N>
+cd /Volumes/JustusStorage/Conductor2/repos/ferrum-edge-git-forge-ops-agents/issue-<N>
 ```
 
 Do ALL work inside your worktree. Leave the worktree in place when done (the orchestrator
@@ -30,7 +30,7 @@ may need it for follow-up fixes).
 
 ## Ground rules
 
-- Read the issue first: `gh issue view <N> --repo ferrum-edge/ferrum-edge`. Then read
+- Read the issue first: `gh issue view <N> --repo ferrum-edge/ferrum-edge-git-forge-ops`. Then read
   `CLAUDE.md`, the matching `.claude/rules/*.md`, and the docs the issue cites.
 - **NO local builds or tests** (no `cargo build`, `cargo test`, `cargo clippy`) unless you
   absolutely need them to resolve an ambiguity you cannot resolve by reading code. Remote CI
@@ -53,14 +53,14 @@ may need it for follow-up fixes).
    Changes, Test plan sections and `Closes #<N>`.
 3. Post exactly ONE comment: `@codex review`. The review bot takes ~10-15 min. Poll (sleep 120 between
    checks) via:
-   `gh api graphql -f query='query{repository(owner:"ferrum-edge",name:"ferrum-edge"){pullRequest(number:<PR>){reviews(last:3){nodes{author{login} submittedAt body}} reviewThreads(last:50){nodes{isResolved comments(first:3){nodes{author{login} body path}}}}}}}'`
+   `gh api graphql -f query='query{repository(owner:"ferrum-edge",name:"ferrum-edge-git-forge-ops"){pullRequest(number:<PR>){reviews(last:3){nodes{author{login} submittedAt body}} reviewThreads(last:50){nodes{isResolved comments(first:3){nodes{author{login} body path}}}}}}}'`
    Codex findings live in reviewThreads, not the review body. NEVER post `@codex review`
    twice in one round.
 4. For each finding: verify it against the code. Fix legit ones; push; then post ONE
    `@codex review` for the next round. For false positives, reply on the PR with concrete
    evidence (file:line reasoning) and do not "fix" them. Repeat until codex replies
    "Didn't find any major issues" or all remaining findings are rebutted.
-5. Watch CI: `gh pr checks <PR> --repo ferrum-edge/ferrum-edge`. If a check fails, read
+5. Watch CI: `gh pr checks <PR> --repo ferrum-edge/ferrum-edge-git-forge-ops`. If a check fails, read
    `gh run view <run-id> --log-failed` and fix, push (this also warrants a fresh
    `@codex review` if codex was otherwise clean).
 6. KNOWN FLAKY TESTS — if a CI failure matches one of these and is unrelated to your diff,

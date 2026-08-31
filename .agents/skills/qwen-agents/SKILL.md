@@ -1,6 +1,6 @@
 ---
 name: qwen-agents
-description: Dispatch and orchestrate local opencode Qwen3.8 Max agents via the opencode CLI harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Qwen3.8 Max is the large-context tier, suited to wide multi-file refactors and whole-subsystem audits. Use when the user asks GPT, Codex, or Claude to delegate to Qwen or qwen3.8-max workers, run multiple Qwen agents, resume interrupted Qwen runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local opencode Qwen3.8 Max agents via the opencode CLI harness for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Qwen3.8 Max is the large-context tier, suited to wide multi-file refactors and whole-subsystem audits. Use when the user asks GPT, Codex, or Claude to delegate to Qwen or qwen3.8-max workers, run multiple Qwen agents, resume interrupted Qwen runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Qwen3.8 Max agents

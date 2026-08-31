@@ -1,6 +1,6 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate parallel gpt-5.6-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate parallel gpt-5.6-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
 ---
 
 # sol-agents: codex CLI subagent orchestration

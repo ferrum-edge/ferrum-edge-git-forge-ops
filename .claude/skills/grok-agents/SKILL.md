@@ -1,6 +1,6 @@
 ---
 name: grok-agents
-description: Dispatch and orchestrate local Cursor Grok 4.6 subagents via the standalone cursor-agent CLI for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn Grok/Cursor Grok agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate local Cursor Grok 4.6 subagents via the standalone cursor-agent CLI for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn Grok/Cursor Grok agents on issues, PRs, review findings, or red CI.
 ---
 
 # grok-agents: Cursor Grok 4.6 subagent orchestration

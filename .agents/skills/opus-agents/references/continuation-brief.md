@@ -1,4 +1,4 @@
-# Ferrum Edge Opus continuation brief
+# Ferrum Edge Git Forge Ops Opus continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow all rules in
 `agent-brief.md`, especially isolation, direct implementation, host discipline, the

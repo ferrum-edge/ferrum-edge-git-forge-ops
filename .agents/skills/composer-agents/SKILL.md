@@ -1,6 +1,6 @@
 ---
 name: composer-agents
-description: Dispatch and orchestrate local Cursor Composer 2.5 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT, Codex, or Claude to delegate to Composer or Cursor Composer workers, run multiple Composer agents, resume interrupted Composer runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local Cursor Composer 2.5 agents via the standalone cursor-agent CLI for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT, Codex, or Claude to delegate to Composer or Cursor Composer workers, run multiple Composer agents, resume interrupted Composer runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Composer agents

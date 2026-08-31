@@ -1,6 +1,6 @@
 ---
 name: qwen-agents
-description: Dispatch and orchestrate local opencode Qwen3.8 Max subagents via the opencode CLI harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Qwen3.8 Max is the large-context tier (~983k context), suited to wide refactors and whole-subsystem audits. Use when the user asks Claude to spawn Qwen/qwen3.8-max agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate local opencode Qwen3.8 Max subagents via the opencode CLI harness for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Qwen3.8 Max is the large-context tier (~983k context), suited to wide refactors and whole-subsystem audits. Use when the user asks Claude to spawn Qwen/qwen3.8-max agents on issues, PRs, review findings, or red CI.
 ---
 
 # qwen-agents: Qwen3.8 Max subagent orchestration

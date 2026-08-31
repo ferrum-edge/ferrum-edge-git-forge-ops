@@ -1,6 +1,6 @@
 ---
 name: deepseek-pro-agents
-description: Dispatch and orchestrate local opencode DeepSeek V4 Pro subagents via the opencode CLI harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. DeepSeek V4 Pro is the deep-reasoning tier, suited to invariant-heavy security, protocol, and concurrency work. Use when the user asks Claude to spawn DeepSeek Pro/deepseek-v4-pro agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate local opencode DeepSeek V4 Pro subagents via the opencode CLI harness for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. DeepSeek V4 Pro is the deep-reasoning tier, suited to invariant-heavy security, protocol, and concurrency work. Use when the user asks Claude to spawn DeepSeek Pro/deepseek-v4-pro agents on issues, PRs, review findings, or red CI.
 ---
 
 # deepseek-pro-agents: DeepSeek V4 Pro subagent orchestration

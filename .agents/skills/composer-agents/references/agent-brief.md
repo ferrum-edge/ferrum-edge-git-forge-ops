@@ -1,7 +1,7 @@
-# Ferrum Edge Composer implementer brief
+# Ferrum Edge Git Forge Ops Composer implementer brief
 
 You are a Cursor Composer 2.5 worker dispatched by an orchestrator through the standalone
-`cursor-agent` CLI. Implement or fix the scoped Ferrum Edge task in the worktree named in the dispatch
+`cursor-agent` CLI. Implement or fix the scoped Ferrum Edge Git Forge Ops task in the worktree named in the dispatch
 prompt. Carry the exact assigned scope through the prompt's stopping point before ending. Never
 merge a PR yourself.
 
@@ -83,7 +83,7 @@ and report, exit; the controller owns post-push CI and review monitoring.
    rerun only demonstrated infrastructure outages or known flakes.
 7. Never merge, delete the worktree, or delete the branch.
 
-Known historical Ferrum Edge flakes include the gRPC-to-gRPC RST 502 test, native H3 gRPC
+Known historical Ferrum Edge Git Forge Ops flakes include the gRPC-to-gRPC RST 502 test, native H3 gRPC
 streaming scripted-backend races, H3 WebSocket parallel QUIC startup panics, and stream-listener
 reload races. Prefer log evidence over folklore when deciding whether to rerun.
 

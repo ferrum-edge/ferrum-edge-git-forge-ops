@@ -1,6 +1,6 @@
 ---
 name: deepseek-flash-agents
-description: Dispatch and orchestrate local opencode DeepSeek V4 Flash agents via the opencode CLI harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. DeepSeek V4 Flash is the fast tier, suited to mechanical, well-scoped edits and breadth-first fan-out. Use when the user asks GPT, Codex, or Claude to delegate to DeepSeek Flash or deepseek-v4-flash workers, run multiple DeepSeek Flash agents, resume interrupted runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local opencode DeepSeek V4 Flash agents via the opencode CLI harness for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. DeepSeek V4 Flash is the fast tier, suited to mechanical, well-scoped edits and breadth-first fan-out. Use when the user asks GPT, Codex, or Claude to delegate to DeepSeek Flash or deepseek-v4-flash workers, run multiple DeepSeek Flash agents, resume interrupted runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # DeepSeek V4 Flash agents

@@ -1,6 +1,6 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate external GPT-5.6 Sol Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-5.6 Sol agents, select medium/high/xhigh reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
+description: Dispatch and orchestrate external GPT-5.6 Sol Codex CLI agents for Ferrum Edge Git Forge Ops issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-5.6 Sol agents, select medium/high/xhigh reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
 ---
 
 # Sol agents

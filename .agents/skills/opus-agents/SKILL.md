@@ -1,6 +1,6 @@
 ---
 name: opus-agents
-description: Dispatch and orchestrate external Claude Code Opus 5 1M agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select low/medium/high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
+description: Dispatch and orchestrate external Claude Code Opus 5 1M agents from Codex for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work, with optional fast mode only when the user explicitly requests it. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select low/medium/high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
 ---
 
 # Opus agents

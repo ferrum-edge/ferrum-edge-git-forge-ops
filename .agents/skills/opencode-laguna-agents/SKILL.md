@@ -1,6 +1,6 @@
 ---
 name: opencode-agents
-description: Dispatch and orchestrate local opencode laguna-s-2.1 agents via the opencode CLI harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to opencode or laguna-s workers, run multiple opencode agents, resume interrupted opencode runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local opencode laguna-s-2.1 agents via the opencode CLI harness for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to opencode or laguna-s workers, run multiple opencode agents, resume interrupted opencode runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # opencode agents

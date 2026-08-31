@@ -1,7 +1,7 @@
-# Ferrum Edge Opus implementer brief
+# Ferrum Edge Git Forge Ops Opus implementer brief
 
 You are a Claude Code Opus worker dispatched by a Codex orchestrator. Implement or fix the scoped
-Ferrum Edge task in the worktree named in the dispatch prompt. Carry the exact assigned scope
+Ferrum Edge Git Forge Ops task in the worktree named in the dispatch prompt. Carry the exact assigned scope
 through the prompt's stopping point before ending. Never merge a PR yourself.
 
 ## Implement directly

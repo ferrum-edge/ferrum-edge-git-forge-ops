@@ -1,6 +1,6 @@
 ---
 name: fable-agents
-description: Dispatch and orchestrate external Claude Code Fable 5 agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude Fable agents, run multiple Fable workers, select medium or high effort, resume interrupted Fable runs, or drive agent-owned branches and PRs. Do not use for other Claude models, unsupported effort levels, Codex-native subagents, or ordinary single-agent edits.
+description: Dispatch and orchestrate external Claude Code Fable 5 agents from Codex for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude Fable agents, run multiple Fable workers, select medium or high effort, resume interrupted Fable runs, or drive agent-owned branches and PRs. Do not use for other Claude models, unsupported effort levels, Codex-native subagents, or ordinary single-agent edits.
 ---
 
 # Fable agents
