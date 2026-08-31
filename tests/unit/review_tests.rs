@@ -4,8 +4,9 @@ use gitforgeops::diff::{
 };
 use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
+use gitforgeops::review::enforce_required_comment_delivery;
 use gitforgeops::review::pr_comment::{
-    build_review_comment, build_review_comment_v2, render_spec_owned,
+    build_review_comment, build_review_comment_v2, render_spec_owned, MAX_REVIEW_COMMENT_BYTES,
 };
 use gitforgeops::secrets::ResolveReport;
 
@@ -346,4 +347,64 @@ fn review_comment_v2_omits_spec_owned_section_when_empty() {
     );
 
     assert!(!comment.contains("Spec-owned"), "{comment}");
+}
+
+#[test]
+fn review_comment_is_utf8_safe_bounded_and_reports_omissions() {
+    let diffs = (0..1_000)
+        .map(|index| ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "Consumer".to_string(),
+            id: format!("consumer-{index}-{}", "界".repeat(300)),
+            namespace: "tenant".to_string(),
+            details: (0..40)
+                .map(|field| FieldChange {
+                    field: format!("credentials.field-{field}"),
+                    old_value: "old".to_string(),
+                    new_value: "new".to_string(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let validation = format!("error before embedded fence ``` {}", "診".repeat(10_000));
+
+    let comment = build_review_comment_v2(
+        false,
+        &validation,
+        &diffs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some("Environment: `production`"),
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(
+        comment.len() <= MAX_REVIEW_COMMENT_BYTES,
+        "{}",
+        comment.len()
+    );
+    assert!(comment.is_char_boundary(comment.len()));
+    assert!(comment.contains("omitted"), "{comment}");
+    assert_eq!(
+        comment.matches("```").count(),
+        2,
+        "validation fence must stay balanced: {comment}"
+    );
+}
+
+#[test]
+fn trusted_review_requires_comment_delivery_after_fallback() {
+    assert!(enforce_required_comment_delivery(false, "HTTP 403").is_ok());
+    let error = enforce_required_comment_delivery(true, "HTTP 403").unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("required PR comment"), "{message}");
+    assert!(message.contains("HTTP 403"), "{message}");
 }

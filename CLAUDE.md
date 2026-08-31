@@ -23,7 +23,8 @@ gitforgeops diff [--exit-on-drift]                        # Compare desired vs l
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR]  # --from-api requires an explicit namespace filter
+gitforgeops import --from-api | --from-file PATH [--output-dir DIR] \
+  [--credential-bundle-output PRIVATE_PATH]               # API import requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -57,7 +58,10 @@ overlay YAML, copies environment/policy routing from the protected branch, and
 runs a trusted binary with `FERRUM_NAMESPACE` set to one protected-branch
 resource namespace per job, intersected with the environment's protected
 namespace scope. `review --require-live` fails that job when comparison is
-unavailable. Fork PRs and new/remapped namespaces never enter the privileged
+unavailable or its required PR comment cannot be delivered. Review markdown is
+bounded below GitHub's API limit, and unresolved credential values are excluded
+from live comparison when no bundle is available without hiding other Consumer
+fields. Fork PRs and new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in
 `rust-toolchain.toml`; external Actions use full commit SHAs.
 
@@ -273,8 +277,8 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
 - `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
-- `src/import/` — `from_api.rs` (walks namespaces, pulls `/backup`), `from_file.rs`, `mod.rs::split_config` (emits per-resource YAML; reports skipped `api_specs` / trust-bundle sections instead of dropping them silently)
-- `src/state.rs` — `.state/<env>.json` tracks applied hashes, credential metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
+- `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, and atomically publishes an empty output tree; reports skipped/unsupported sections)
+- `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/error.rs` — unified `Error` enum via `thiserror`
@@ -283,7 +287,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 1. **Permissive schema** — Serde types mirror Ferrum Edge but accept unknown fields. The gateway (via `validate`) is the authoritative schema.
 2. **Path-component sanitization** — resource `namespace` and `id` flow into filesystem paths during `import`. `import::safe_path_component` rejects `..`, `/`, `\`, null bytes, and empty strings before `Path::join` to prevent traversal.
-3. **Deterministic state hashes** — resources hash through `serde_json::Value` first (BTreeMap-backed in default builds) so `HashMap` field ordering doesn't produce false-positive drift in `.state/<env>.json`.
+3. **No public credential oracles** — the state ledger stores only managed-resource keys plus a constant marker and non-secret credential delivery metadata. It never hashes resolved Consumers or credential values.
 4. **Namespace-scoped operations** — every API call, diff entry, and breaking-change lookup keys on `(namespace, id)`, never `id` alone.
 5. **Partial-failure visibility** — incremental apply reports per-resource errors via `ApplyResult`; failures don't abort the whole run.
 

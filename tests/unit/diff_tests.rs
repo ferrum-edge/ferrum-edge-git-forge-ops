@@ -1,8 +1,9 @@
 use gitforgeops::config::schema::*;
 use gitforgeops::diff::{
     best_practice::check_best_practices, breaking::detect_breaking_changes,
-    resource_diff::compute_diff, resource_diff::compute_diff_with_scope, resource_diff::state_key,
-    resource_diff::DiffAction, resource_diff::OwnershipScope, security::audit_security,
+    mask_indeterminate_consumer_credentials, resource_diff::compute_diff,
+    resource_diff::compute_diff_with_scope, resource_diff::state_key, resource_diff::DiffAction,
+    resource_diff::OwnershipScope, security::audit_security,
 };
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
@@ -76,6 +77,85 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
+}
+
+#[test]
+fn credential_indeterminate_review_masks_only_matching_consumer_values() {
+    let mut desired_consumer = make_consumer("app", "expected-name");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "different-live-name");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "live-secret"}]),
+    );
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_consumer_credentials(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert_eq!(diffs[0].kind, "Consumer");
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .any(|change| change.field.contains("username")),
+        "{:?}",
+        diffs[0].details
+    );
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .all(|change| !change.field.contains("credentials")),
+        "{:?}",
+        diffs[0].details
+    );
+}
+
+#[test]
+fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
+    let mut desired_consumer = make_consumer("app", "app");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "known-desired-value"}]),
+    );
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "app");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "different-live-value"}]),
+    );
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_consumer_credentials(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .any(|change| change.field.contains("credentials")),
+        "{:?}",
+        diffs[0].details
+    );
 }
 
 fn make_plugin_config(

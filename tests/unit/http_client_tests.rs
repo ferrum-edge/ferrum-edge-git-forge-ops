@@ -979,7 +979,10 @@ fn backup_snapshot_parses_the_full_envelope() {
             "ferrum_version": "2.4.0",
             "exported_at": "2026-08-24T00:00:00Z",
             "source": "database",
-            "counts": {"proxies": 0},
+            "counts": {
+                "proxies": 0, "consumers": 0, "plugin_configs": 0, "upstreams": 0,
+                "api_specs": 1, "gateway_trust_bundles": 0
+            },
             "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": [],
             "api_specs": {"section_version": "2", "items": [{"id": "spec-a"}]},
             "gateway_trust_bundles": []
@@ -996,6 +999,173 @@ fn backup_snapshot_parses_the_full_envelope() {
         Some(serde_json::json!([]))
     );
     assert!(snapshot.config.proxies.is_empty());
+    assert!(snapshot.counts.is_some());
+    assert!(snapshot.unsupported_sections.is_empty());
+}
+
+#[test]
+fn backup_snapshot_names_unknown_top_level_sections() {
+    let snapshot = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": [],
+            "future_z": {},
+            "future_a": []
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        snapshot.unsupported_sections,
+        vec!["future_a".to_string(), "future_z".to_string()]
+    );
+}
+
+#[test]
+fn backup_snapshot_rejects_malformed_inventory_sections() {
+    for (section, malformed) in [
+        ("api_specs", serde_json::json!([])),
+        (
+            "api_specs",
+            serde_json::json!({"section_version": "2", "items": {}}),
+        ),
+        ("gateway_trust_bundles", serde_json::json!({})),
+    ] {
+        let mut backup = serde_json::json!({
+            "version": "1",
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        });
+        backup
+            .as_object_mut()
+            .unwrap()
+            .insert(section.to_string(), malformed);
+        let error = BackupSnapshot::from_value(backup).unwrap_err().to_string();
+        assert!(error.contains(section), "{error}");
+    }
+}
+
+#[test]
+fn backup_snapshot_rejects_malformed_source_metadata() {
+    let error = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "ferrum_version": 240,
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("ferrum_version"), "{error}");
+}
+
+#[test]
+fn backup_snapshot_rejects_missing_malformed_and_mismatched_count_seals() {
+    for counts in [
+        serde_json::json!([]),
+        serde_json::json!({
+            "proxies": 0, "consumers": 0, "plugin_configs": 0
+        }),
+        serde_json::json!({
+            "proxies": 1, "consumers": 0, "plugin_configs": 0, "upstreams": 0
+        }),
+        serde_json::json!({
+            "proxies": "zero", "consumers": 0, "plugin_configs": 0, "upstreams": 0
+        }),
+    ] {
+        let mut backup = serde_json::json!({
+            "version": "1",
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        });
+        backup
+            .as_object_mut()
+            .unwrap()
+            .insert("counts".to_string(), counts);
+        let error = BackupSnapshot::from_value(backup).unwrap_err().to_string();
+        assert!(error.contains("counts"), "{error}");
+    }
+}
+
+#[test]
+fn backup_snapshot_validates_file_resource_count_seal() {
+    let error = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "resource_counts": {
+                "proxies": 0, "consumers": 1, "plugin_configs": 0, "upstreams": 0
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("resource_counts.consumers"), "{error}");
+}
+
+#[test]
+fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
+    let snapshot = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "resource_counts": {
+                "proxies": 0, "consumers": 0, "plugin_configs": 0
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(snapshot.resource_counts.unwrap()["upstreams"], 0);
+
+    let error = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "resource_counts": {
+                "proxies": 0, "consumers": 0, "plugin_configs": 0
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [],
+            "upstreams": [{
+                "id": "u1", "namespace": "ferrum",
+                "targets": [{"host": "127.0.0.1", "port": 8080}]
+            }]
+        }"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("missing required count 'upstreams'"),
+        "{error}"
+    );
+
+    let error = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "resource_counts": {
+                "proxies": 0, "consumers": 0, "plugin_configs": 0, "upstreams": 1
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("resource_counts.upstreams"), "{error}");
+}
+
+#[test]
+fn backup_snapshot_does_not_copy_opaque_count_values_into_import_metadata() {
+    let snapshot = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "counts": {
+                "proxies": 0, "consumers": 0, "plugin_configs": 0, "upstreams": 0,
+                "future_private_note": "must-not-enter-the-import-manifest"
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    )
+    .unwrap();
+
+    let retained = snapshot.counts.unwrap();
+    assert!(retained.get("future_private_note").is_none(), "{retained}");
+    assert_eq!(retained["proxies"], 0);
 }
 
 #[test]

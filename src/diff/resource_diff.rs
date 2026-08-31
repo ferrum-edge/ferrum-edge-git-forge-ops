@@ -2,6 +2,44 @@ use std::collections::HashSet;
 
 use crate::config::GatewayConfig;
 
+/// Exclude credential values from a live comparison when the caller has no
+/// credential bundle and therefore cannot materialize the desired slots.
+///
+/// Only matching Consumers are aligned. Adds/deletes and every non-credential
+/// Consumer field remain visible, so the review loses no actionable drift
+/// signal beyond the values it cannot authoritatively know.
+pub fn mask_indeterminate_consumer_credentials(
+    desired: &GatewayConfig,
+    actual: &mut GatewayConfig,
+) {
+    for live in &mut actual.consumers {
+        if let Some(expected) = desired
+            .consumers
+            .iter()
+            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+            .filter(|candidate| {
+                candidate
+                    .credentials
+                    .values()
+                    .any(value_contains_placeholder)
+            })
+        {
+            live.credentials = expected.credentials.clone();
+        }
+    }
+}
+
+fn value_contains_placeholder(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            matches!(crate::secrets::parse_placeholder(value), Some(Ok(_)))
+        }
+        serde_json::Value::Array(items) => items.iter().any(value_contains_placeholder),
+        serde_json::Value::Object(map) => map.values().any(value_contains_placeholder),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffAction {
     Add,

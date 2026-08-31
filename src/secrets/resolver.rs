@@ -20,6 +20,11 @@ pub const MAX_CREDENTIAL_VALUE_CHARS: usize = 4096;
 /// bundle that contains it was seeded from the wrong endpoint.
 pub const REDACTED_SENTINEL: &str = "[REDACTED]";
 
+/// Placeholder emitted for credential values captured by `import`.
+/// `require` deliberately refuses to generate a replacement: the operator
+/// must seed the exact live value from the private migration bundle.
+pub const IMPORT_REQUIRED_PLACEHOLDER: &str = "${gh-env-secret:alloc=require}";
+
 /// Whether generation constraints ([`check_generation_constraints`]) abort the
 /// walk or are merely reflected in the returned statuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +388,98 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
         }
     }
     join_slot_components(&components)
+}
+
+/// Capture every string credential leaf under its canonical broker slot and
+/// replace it in-place with [`IMPORT_REQUIRED_PLACEHOLDER`].
+///
+/// Import is the one path where the input contains live backup credentials.
+/// Keeping slot derivation beside the ordinary resolver prevents the migration
+/// bundle and emitted placeholders from drifting to different encodings.
+/// Non-string leaves fail closed because the broker can only store strings.
+pub fn capture_and_redact_import_credentials(
+    cfg: &mut GatewayConfig,
+) -> crate::error::Result<CredentialBundle> {
+    let mut captured = CredentialBundle::new();
+
+    for consumer in &mut cfg.consumers {
+        let namespace = consumer.namespace.clone();
+        let consumer_id = consumer.id.clone();
+        for (credential_type, value) in &mut consumer.credentials {
+            let mut components = vec![
+                SlotComponent::Literal(namespace.as_str()),
+                SlotComponent::Literal(consumer_id.as_str()),
+                SlotComponent::Literal(credential_type.as_str()),
+            ];
+            capture_and_redact_value(value, &mut components, &mut captured)?;
+        }
+    }
+
+    Ok(captured)
+}
+
+fn capture_and_redact_value<'a>(
+    value: &'a mut serde_json::Value,
+    components: &mut Vec<SlotComponent<'a>>,
+    captured: &mut CredentialBundle,
+) -> crate::error::Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            let slot = join_slot_components(components);
+            if text == REDACTED_SENTINEL {
+                return Err(crate::error::Error::Config(format!(
+                    "credential slot '{slot}' contains the reserved redaction sentinel; import requires an unredacted GET /backup source"
+                )));
+            }
+            if text.starts_with("${gh-env-secret:") {
+                // A flat file exported without `--materialize` is already in
+                // the safe GitOps representation. Preserve its placeholder;
+                // storing the literal placeholder text as a bundle value
+                // would make a later resolution appear successful while
+                // still sending an unresolved placeholder to the gateway.
+                // Do not forward parser diagnostics here: malformed input can
+                // itself be secret material, and import errors must never echo
+                // a credential value.
+                let parsed = parse_placeholder(text).ok_or_else(|| {
+                    crate::error::Error::Config(format!(
+                        "credential slot '{slot}' contains a malformed gh-env-secret placeholder"
+                    ))
+                })?;
+                return parsed.map(|_| ()).map_err(|_| {
+                    crate::error::Error::Config(format!(
+                        "credential slot '{slot}' contains a malformed gh-env-secret placeholder"
+                    ))
+                });
+            }
+            let original = std::mem::replace(text, IMPORT_REQUIRED_PLACEHOLDER.to_string());
+            if captured.insert(slot.clone(), original).is_some() {
+                return Err(crate::error::Error::Config(format!(
+                    "credential slot '{slot}' is produced by multiple imported credential leaves"
+                )));
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, child) in fields {
+                components.push(SlotComponent::Literal(key.as_str()));
+                capture_and_redact_value(child, components, captured)?;
+                components.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                components.push(SlotComponent::ArrayIndex(index));
+                capture_and_redact_value(child, components, captured)?;
+                components.pop();
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            let slot = join_slot_components(components);
+            return Err(crate::error::Error::Config(format!(
+                "credential slot '{slot}' has a non-string leaf; refusing to import a credential shape that cannot be stored by the broker"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `"[12]"` → `Some(12)`; anything else → `None`.

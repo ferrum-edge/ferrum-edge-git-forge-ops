@@ -1138,6 +1138,17 @@ pub struct BackupSnapshot {
     pub ferrum_version: Option<String>,
     pub exported_at: Option<String>,
     pub source: Option<String>,
+    /// Backup-provided count inventory. Validated against the decoded
+    /// resource and extra sections before it is retained for import
+    /// provenance.
+    pub counts: Option<serde_json::Value>,
+    /// File-mode anti-truncation seal, when importing a gitforgeops/ferrum
+    /// flat document rather than an admin backup.
+    pub resource_counts: Option<serde_json::Value>,
+    /// Top-level sections not understood by this gitforgeops build. Import
+    /// reports these explicitly instead of silently discarding future backup
+    /// capabilities.
+    pub unsupported_sections: Vec<String>,
 }
 
 impl BackupSnapshot {
@@ -1146,9 +1157,14 @@ impl BackupSnapshot {
     /// future top-level sections are retained by name so full-replace can fail
     /// closed instead of silently deleting data it cannot carry through.
     pub fn from_body(body: &str) -> crate::error::Result<Self> {
-        let mut value: serde_json::Value = serde_json::from_str(body)
+        let value: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+        Self::from_value(value)
+    }
 
+    /// Parse an already-decoded JSON/YAML-compatible backup value. Shared by
+    /// API and file import so both paths inventory the same opaque sections.
+    pub fn from_value(mut value: serde_json::Value) -> crate::error::Result<Self> {
         // Lift the non-`GatewayConfig` sections *out* of the document rather
         // than copying them out of it: a production `/backup` is megabytes of
         // JSON, and cloning the whole tree just to keep two keys doubled peak
@@ -1158,6 +1174,9 @@ impl BackupSnapshot {
         let mut ferrum_version = None;
         let mut exported_at = None;
         let mut source = None;
+        let mut counts = None;
+        let mut resource_counts = None;
+        let mut unsupported_sections = Vec::new();
         if let Some(map) = value.as_object_mut() {
             const KNOWN_TOP_LEVEL: &[&str] = &[
                 "version",
@@ -1173,21 +1192,38 @@ impl BackupSnapshot {
                 "counts",
                 "resource_counts",
             ];
-            extras.unsupported_sections = map
+            unsupported_sections = map
                 .keys()
                 .filter(|key| !KNOWN_TOP_LEVEL.contains(&key.as_str()))
                 .cloned()
                 .collect();
-            extras.unsupported_sections.sort();
-            extras.api_specs = map.remove("api_specs");
-            extras.gateway_trust_bundles = map.remove("gateway_trust_bundles");
-            ferrum_version = take_string(map, "ferrum_version");
-            exported_at = take_string(map, "exported_at");
-            source = take_string(map, "source");
+            unsupported_sections.sort();
+            extras.unsupported_sections = unsupported_sections.clone();
+            for key in &unsupported_sections {
+                map.remove(key);
+            }
+
+            extras.api_specs = take_api_specs(map)?;
+            extras.gateway_trust_bundles = take_trust_bundles(map)?;
+            ferrum_version = take_optional_string(map, "ferrum_version")?;
+            exported_at = take_optional_string(map, "exported_at")?;
+            source = take_optional_string(map, "source")?;
+            // Integrity metadata is not part of GatewayConfig, but import
+            // validates and inventories it rather than silently stripping it.
+            counts = map.remove("counts");
+            resource_counts = map.remove("resource_counts");
         }
 
         let config: GatewayConfig = serde_json::from_value(value)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+            .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
+        counts = canonicalize_count_seal("counts", counts.as_ref(), &config, &extras, true)?;
+        resource_counts = canonicalize_count_seal(
+            "resource_counts",
+            resource_counts.as_ref(),
+            &config,
+            &extras,
+            false,
+        )?;
 
         Ok(Self {
             config,
@@ -1196,15 +1232,149 @@ impl BackupSnapshot {
             ferrum_version,
             exported_at,
             source,
+            counts,
+            resource_counts,
+            unsupported_sections,
         })
     }
 }
 
-/// Remove `key` from `map`, keeping it only when it is a JSON string.
-fn take_string(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+/// Validate a count seal and retain only the numeric fields this build
+/// understands. The source document is untrusted input: copying arbitrary
+/// extra values from `counts` into the import manifest would create a covert
+/// path for credential material to enter the otherwise non-secret resource
+/// tree.
+fn canonicalize_count_seal(
+    section_name: &str,
+    value: Option<&serde_json::Value>,
+    config: &GatewayConfig,
+    extras: &BackupExtras,
+    include_backup_extras: bool,
+) -> crate::error::Result<Option<serde_json::Value>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        crate::error::Error::Config(format!(
+            "invalid backup payload: top-level '{section_name}' must be an object"
+        ))
+    })?;
+    let mut canonical = serde_json::Map::new();
+
+    for (key, actual) in [
+        ("proxies", config.proxies.len()),
+        ("consumers", config.consumers.len()),
+        ("plugin_configs", config.plugin_configs.len()),
+        ("upstreams", config.upstreams.len()),
+    ] {
+        // Ferrum Edge's file seal predates the upstream section and permits
+        // `resource_counts.upstreams` to be omitted only when the decoded
+        // document actually contains zero upstreams. Database backup `counts`
+        // remains a complete four-kind seal.
+        let omitted_zero_upstreams =
+            section_name == "resource_counts" && key == "upstreams" && actual == 0;
+        validate_declared_count(section_name, object, key, actual, !omitted_zero_upstreams)?;
+        canonical.insert(key.to_string(), serde_json::json!(actual));
+    }
+    if include_backup_extras {
+        for (key, actual) in [
+            ("api_specs", extras.api_spec_count()),
+            ("gateway_trust_bundles", extras.trust_bundle_count()),
+        ] {
+            validate_declared_count(section_name, object, key, actual, false)?;
+            if object.contains_key(key) {
+                canonical.insert(key.to_string(), serde_json::json!(actual));
+            }
+        }
+    }
+    Ok(Some(serde_json::Value::Object(canonical)))
+}
+
+fn validate_declared_count(
+    section_name: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    actual: usize,
+    required: bool,
+) -> crate::error::Result<()> {
+    let Some(value) = object.get(key) else {
+        if required {
+            return Err(crate::error::Error::Config(format!(
+                "invalid backup payload: top-level '{section_name}' is missing required count '{key}'"
+            )));
+        }
+        return Ok(());
+    };
+    let declared = value
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "invalid backup payload: '{section_name}.{key}' must be a non-negative integer"
+            ))
+        })?;
+    if declared != actual {
+        return Err(crate::error::Error::Config(format!(
+            "invalid backup payload: '{section_name}.{key}' declares {declared} but the document contains {actual}"
+        )));
+    }
+    Ok(())
+}
+
+/// Remove optional string metadata while rejecting a present malformed value.
+fn take_optional_string(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> crate::error::Result<Option<String>> {
     match map.remove(key) {
-        Some(serde_json::Value::String(s)) => Some(s),
-        _ => None,
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(other) => Err(crate::error::Error::Config(format!(
+            "invalid backup payload: top-level '{key}' must be a string when present, got {}",
+            json_type_name(&other)
+        ))),
+    }
+}
+
+fn take_api_specs(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+) -> crate::error::Result<Option<serde_json::Value>> {
+    let Some(value) = map.remove("api_specs") else {
+        return Ok(None);
+    };
+    let items = value.as_object().and_then(|section| section.get("items"));
+    if !matches!(items, Some(serde_json::Value::Array(_))) {
+        return Err(crate::error::Error::Config(format!(
+            "invalid backup payload: top-level 'api_specs' must be an object containing an 'items' array, got {}",
+            json_type_name(&value)
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn take_trust_bundles(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+) -> crate::error::Result<Option<serde_json::Value>> {
+    let Some(value) = map.remove("gateway_trust_bundles") else {
+        return Ok(None);
+    };
+    if !value.is_array() {
+        return Err(crate::error::Error::Config(format!(
+            "invalid backup payload: top-level 'gateway_trust_bundles' must be an array, got {}",
+            json_type_name(&value)
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 

@@ -176,8 +176,8 @@ jobs:
             --recipient "$INPUT_RECIPIENT"
 
       - name: Commit state update
-        # Rotation metadata (last_rotated, sha256_prefix, delivered_to) lives
-        # in .state/<env>.json. If we can't persist the update, a stale state
+        # Rotation metadata (last_rotated, delivery recipient/run) lives in
+        # .state/<env>.json. If we can't persist the update, a stale state
         # misleads the next drift check — fail the job on push failure, and
         # retry on rejection (possible if an apply landed concurrently).
         # Same shell-injection protection as the Rotate step: route inputs

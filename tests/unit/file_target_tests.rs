@@ -1,4 +1,4 @@
-use gitforgeops::apply::{apply_file, render_file_yaml};
+use gitforgeops::apply::{apply_file, publish_private_export, render_file_yaml};
 use gitforgeops::config::GatewayConfig;
 
 /// Fixture is built through serde rather than struct literals so it stays
@@ -185,6 +185,37 @@ fn republish_preserves_destination_permissions() {
         .mode()
         & 0o777;
     assert_eq!(mode, 0o640, "mode was {mode:o}");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_export_forces_owner_only_permissions_on_create_and_replace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("materialized.yaml");
+    let path_str = path.to_str().expect("utf-8 path");
+
+    publish_private_export(path_str, b"secret-one").expect("first publish");
+    let first_mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(first_mode, 0o600, "mode was {first_mode:o}");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("make old destination broad");
+    publish_private_export(path_str, b"secret-two").expect("secure replacement");
+
+    let second_mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(second_mode, 0o600, "mode was {second_mode:o}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"secret-two");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 /// The two documents are published side by side and must not contaminate each

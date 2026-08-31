@@ -1,5 +1,7 @@
 use gitforgeops::config::schema::*;
 use gitforgeops::import::split_config;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 
 fn make_test_config() -> GatewayConfig {
@@ -193,7 +195,8 @@ fn import_from_file_roundtrip() {
 
     let tmp_import = tempfile::tempdir().unwrap();
     let result =
-        gitforgeops::import::from_file::import_from_file(&flat_file, tmp_import.path()).unwrap();
+        gitforgeops::import::from_file::import_from_file(&flat_file, tmp_import.path(), None)
+            .unwrap();
     assert_eq!(result.proxies, 1);
     assert_eq!(result.consumers, 1);
 
@@ -205,6 +208,345 @@ fn import_from_file_roundtrip() {
     let content = std::fs::read_to_string(&proxy_file).unwrap();
     assert!(content.contains("kind: Proxy"));
     assert!(content.contains("proxy-test"));
+}
+
+#[test]
+fn file_import_requires_an_explicit_private_bundle_for_live_credentials() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-production-key"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let error = gitforgeops::import::from_file::import_from_file(&backup_path, &output, None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("--credential-bundle-output"), "{error}");
+    assert!(!output.exists(), "no resource tree may be published");
+}
+
+#[test]
+fn file_import_preserves_existing_placeholders_without_a_migration_bundle() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("placeholder-export.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "${gh-env-secret:alloc=require}"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None).unwrap();
+
+    assert_eq!(result.redacted_credential_values, 0);
+    let consumer =
+        std::fs::read_to_string(output.join("ferrum/consumers/consumer-test.yaml")).unwrap();
+    assert!(
+        consumer.contains("${gh-env-secret:alloc=require}"),
+        "{consumer}"
+    );
+}
+
+#[test]
+fn malformed_placeholder_import_error_does_not_echo_credential_material() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "${gh-env-secret:alloc=must-not-leak}"}]
+    }))
+    .unwrap();
+
+    let error = split_config(&config, tmp.path()).unwrap_err().to_string();
+    assert!(
+        error.contains("malformed gh-env-secret placeholder"),
+        "{error}"
+    );
+    assert!(!error.contains("must-not-leak"), "{error}");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn unterminated_placeholder_import_fails_closed_without_echoing_credential_material() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "${gh-env-secret:unterminated-sensitive-value"}]
+    }))
+    .unwrap();
+
+    let error = split_config(&config, tmp.path()).unwrap_err().to_string();
+    assert!(
+        error.contains("malformed gh-env-secret placeholder"),
+        "{error}"
+    );
+    assert!(!error.contains("unterminated-sensitive-value"), "{error}");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "first-live-key"}, {"key": "second-live-key"}],
+        "jwt": [{"secret": "live-jwt-secret-that-is-long-enough"}],
+        "custom": [{"nested": {"token": "custom-live-token"}}]
+    }))
+    .unwrap();
+    let original_credentials = config.consumers[0].credentials.clone();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("credential-migration.json");
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+            .unwrap();
+
+    assert_eq!(result.redacted_credential_values, 4);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&bundle_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let raw_bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    let (merged, shards) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
+    assert_eq!(shards.len(), 1);
+    assert_eq!(
+        merged,
+        std::collections::BTreeMap::from([
+            (
+                "ferrum/consumer-test/custom/nested/token".to_string(),
+                "custom-live-token".to_string(),
+            ),
+            (
+                "ferrum/consumer-test/jwt/secret".to_string(),
+                "live-jwt-secret-that-is-long-enough".to_string(),
+            ),
+            (
+                "ferrum/consumer-test/keyauth/[1]/key".to_string(),
+                "second-live-key".to_string(),
+            ),
+            (
+                "ferrum/consumer-test/keyauth/key".to_string(),
+                "first-live-key".to_string(),
+            ),
+        ])
+    );
+
+    let resources = gitforgeops::config::load_resources(&output).unwrap();
+    let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
+    gitforgeops::secrets::resolve_secrets_with_mode(
+        &mut assembled,
+        &merged,
+        gitforgeops::config::env::GatewayMode::Api,
+    )
+    .unwrap();
+    assert_eq!(
+        assembled.consumers[0].credentials, original_credentials,
+        "import -> private bundle seed -> assemble must not introduce credential drift"
+    );
+
+    for entry in walkdir::WalkDir::new(&output) {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).unwrap();
+        for secret in merged.values() {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "secret leaked into {}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+#[test]
+fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    let values = (0..12)
+        .map(|index| {
+            serde_json::json!({
+                "token": format!("{}-{index}", "\"".repeat(4_000))
+            })
+        })
+        .collect::<Vec<_>>();
+    config.consumers[0]
+        .credentials
+        .insert("custom".to_string(), serde_json::Value::Array(values));
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("credential-migration.json");
+    gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+        .unwrap();
+
+    let raw = std::fs::read_to_string(&bundle_path).unwrap();
+    let outer: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let shards = outer.as_object().unwrap();
+    assert!(
+        shards.len() > 1,
+        "expected encoded values to require shards"
+    );
+    for (name, bundle) in shards {
+        let compact_size = serde_json::to_vec(bundle).unwrap().len();
+        assert!(
+            compact_size <= gitforgeops::secrets::bundle::BUNDLE_SOFT_LIMIT_BYTES,
+            "{name} encoded to {compact_size} bytes"
+        );
+    }
+    let (merged, parsed_shards) = gitforgeops::secrets::load_bundles_from_env(&raw).unwrap();
+    assert_eq!(merged.len(), 12);
+    assert_eq!(parsed_shards.len(), shards.len());
+}
+
+#[test]
+fn credential_migration_bundle_must_stay_outside_the_resource_tree() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-production-key"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let unsafe_bundle = output.join("do-not-commit.json");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&unsafe_bundle),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("outside the import resource tree"),
+        "{error}"
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn credential_migration_bundle_cannot_overwrite_its_source_backup() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-production-key"}]
+    }))
+    .unwrap();
+    let original = serde_yaml::to_string(&config).unwrap();
+    std::fs::write(&backup_path, &original).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let error =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&backup_path))
+            .unwrap_err()
+            .to_string();
+
+    assert!(
+        error.contains("may not overwrite its source backup"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), original);
+    assert!(!output.exists());
+}
+
+#[test]
+fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-production-key"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let unsafe_bundle = std::env::current_dir()
+        .unwrap()
+        .join(format!(".never-write-{}.json", std::process::id()));
+    assert!(!unsafe_bundle.exists());
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&unsafe_bundle),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("outside every Git worktree"), "{error}");
+    assert!(!unsafe_bundle.exists());
+    assert!(!output.exists());
+}
+
+#[test]
+fn imported_resource_yaml_is_byte_deterministic() {
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "zeta": [{"token": "z"}],
+        "alpha": [{"token": "a"}]
+    }))
+    .unwrap();
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+
+    split_config(&config, left.path()).unwrap();
+    split_config(&config, right.path()).unwrap();
+
+    for relative in [
+        ".gitforgeops-import.json",
+        "ferrum/proxies/proxy-test.yaml",
+        "ferrum/consumers/consumer-test.yaml",
+    ] {
+        assert_eq!(
+            std::fs::read(left.path().join(relative)).unwrap(),
+            std::fs::read(right.path().join(relative)).unwrap(),
+            "non-deterministic import output at {relative}"
+        );
+    }
+}
+
+#[test]
+fn import_rejects_an_empty_resource_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.proxies[0].id.clear();
+
+    let error = split_config(&config, tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("unsafe id"), "{error}");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -329,4 +671,345 @@ fn import_is_quiet_when_the_backup_has_no_unmanaged_sections() {
         ..Default::default()
     };
     assert!(result.unmanaged_sections_notice().is_none());
+}
+
+#[test]
+fn import_replaces_every_string_credential_leaf_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-key"}, {"key": "second-key"}],
+        "jwt": [{"secret": "live-jwt-secret-that-is-long-enough"}],
+        "hmac_auth": [{"secret": "live-hmac-secret-that-is-long-enough"}],
+        "mtls_auth": [{"identity": "CN=production-client"}],
+        "basicauth": [{"password_hash": "hmac_sha256:live-hash"}],
+        "custom": [{"nested": {"token": "custom-live-token"}}]
+    }))
+    .unwrap();
+
+    let result = split_config(&config, tmp.path()).unwrap();
+    assert_eq!(result.redacted_credential_values, 7);
+
+    let consumer =
+        std::fs::read_to_string(tmp.path().join("ferrum/consumers/consumer-test.yaml")).unwrap();
+    for secret in [
+        "live-key",
+        "second-key",
+        "live-jwt-secret-that-is-long-enough",
+        "live-hmac-secret-that-is-long-enough",
+        "CN=production-client",
+        "hmac_sha256:live-hash",
+        "custom-live-token",
+    ] {
+        assert!(!consumer.contains(secret), "leaked {secret:?}: {consumer}");
+    }
+    assert_eq!(
+        consumer.matches("${gh-env-secret:alloc=require}").count(),
+        7,
+        "{consumer}"
+    );
+    for entry in walkdir::WalkDir::new(tmp.path()) {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).unwrap();
+        for secret in [
+            "live-key",
+            "second-key",
+            "live-jwt-secret-that-is-long-enough",
+            "live-hmac-secret-that-is-long-enough",
+            "CN=production-client",
+            "hmac_sha256:live-hash",
+            "custom-live-token",
+        ] {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "leaked {secret:?} in {}",
+                entry.path().display()
+            );
+        }
+    }
+    let notice = result.unmanaged_sections_notice().unwrap();
+    assert!(notice.contains("7 credential value(s)"), "{notice}");
+}
+
+#[test]
+fn imported_placeholders_derive_the_expected_broker_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "first"}, {"key": "second"}],
+        "jwt": [{"secret": "jwt-secret"}],
+        "custom": [{"nested": {"token": "custom-secret"}}]
+    }))
+    .unwrap();
+    let original_credentials = config.consumers[0].credentials.clone();
+
+    split_config(&config, tmp.path()).unwrap();
+    let resources = gitforgeops::config::load_resources(tmp.path()).unwrap();
+    let assembled = gitforgeops::config::assemble(resources).unwrap();
+    let report = gitforgeops::secrets::report_secrets(
+        &assembled.gateway,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let slots = report
+        .results
+        .iter()
+        .map(|result| result.slot.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        slots,
+        std::collections::BTreeSet::from([
+            "ferrum/consumer-test/custom/nested/token",
+            "ferrum/consumer-test/jwt/secret",
+            "ferrum/consumer-test/keyauth/[1]/key",
+            "ferrum/consumer-test/keyauth/key",
+        ])
+    );
+
+    let bundle = std::collections::BTreeMap::from([
+        (
+            "ferrum/consumer-test/keyauth/key".to_string(),
+            "first".to_string(),
+        ),
+        (
+            "ferrum/consumer-test/keyauth/[1]/key".to_string(),
+            "second".to_string(),
+        ),
+        (
+            "ferrum/consumer-test/jwt/secret".to_string(),
+            "jwt-secret".to_string(),
+        ),
+        (
+            "ferrum/consumer-test/custom/nested/token".to_string(),
+            "custom-secret".to_string(),
+        ),
+    ]);
+    let mut round_tripped = assembled.gateway;
+    gitforgeops::secrets::resolve_secrets_with_mode(
+        &mut round_tripped,
+        &bundle,
+        gitforgeops::config::env::GatewayMode::Api,
+    )
+    .unwrap();
+    assert_eq!(
+        round_tripped.consumers[0].credentials, original_credentials,
+        "seeding the derived slots must reconstruct the imported credential document without drift"
+    );
+}
+
+#[test]
+fn unsafe_credential_shape_fails_before_publishing_any_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.consumers[0]
+        .credentials
+        .insert("custom".to_string(), serde_json::json!({"token": 1234}));
+
+    let error = split_config(&config, tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("non-string leaf"), "{error}");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn import_requires_an_empty_output_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sentinel = tmp.path().join("keep.txt");
+    std::fs::write(&sentinel, "keep me").unwrap();
+
+    let error = split_config(&make_test_config(), tmp.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("non-empty output directory"), "{error}");
+    assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "keep me");
+}
+
+#[test]
+fn import_atomically_creates_an_absent_output_tree() {
+    let parent = tempfile::tempdir().unwrap();
+    let output = parent.path().join("new-import");
+
+    let result = split_config(&make_test_config(), &output).unwrap();
+    assert_eq!(result.proxies, 1);
+    assert!(output.join("ferrum/proxies/proxy-test.yaml").exists());
+    assert!(std::fs::read_dir(parent.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".gitforgeops-import-")));
+}
+
+#[test]
+fn file_import_parses_and_reports_the_full_backup_envelope() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let config = make_test_config();
+    let mut backup = serde_json::to_value(config).unwrap();
+    let object = backup.as_object_mut().unwrap();
+    object.insert(
+        "api_specs".to_string(),
+        serde_json::json!({"section_version": "2", "items": [{"id": "spec-one"}]}),
+    );
+    object.insert(
+        "gateway_trust_bundles".to_string(),
+        serde_json::json!([{"revision": 1}]),
+    );
+    object.insert(
+        "future_backup_section".to_string(),
+        serde_json::json!({"opaque": true}),
+    );
+    object.insert("ferrum_version".to_string(), serde_json::json!("2.4.0"));
+    object.insert(
+        "exported_at".to_string(),
+        serde_json::json!("2026-08-30T12:00:00Z"),
+    );
+    object.insert("source".to_string(), serde_json::json!("database"));
+    object.insert(
+        "counts".to_string(),
+        serde_json::json!({
+            "proxies": 1,
+            "consumers": 1,
+            "plugin_configs": 0,
+            "upstreams": 0,
+            "api_specs": 1,
+            "gateway_trust_bundles": 1
+        }),
+    );
+    std::fs::write(&backup_path, serde_yaml::to_string(&backup).unwrap()).unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, output.path(), None)
+            .unwrap();
+
+    assert_eq!(result.skipped_api_specs, 1);
+    assert_eq!(result.skipped_trust_bundles, 1);
+    assert_eq!(
+        result.unsupported_sections,
+        vec!["future_backup_section".to_string()]
+    );
+    assert_eq!(result.sources.len(), 1);
+    assert_eq!(result.sources[0].source_kind, "file");
+    assert_eq!(result.sources[0].config_version, "1");
+    assert_eq!(result.sources[0].ferrum_version.as_deref(), Some("2.4.0"));
+    assert_eq!(result.sources[0].source.as_deref(), Some("database"));
+    let source_notice = result.source_metadata_notice().unwrap();
+    assert!(
+        source_notice.contains("ferrum_version=2.4.0"),
+        "{source_notice}"
+    );
+    assert!(source_notice.contains("source=database"), "{source_notice}");
+    let notice = result.unmanaged_sections_notice().unwrap();
+    assert!(notice.contains("future_backup_section"), "{notice}");
+
+    let manifest_path = output
+        .path()
+        .join(gitforgeops::import::IMPORT_MANIFEST_FILENAME);
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["format_version"], 1);
+    assert_eq!(manifest["import"]["skipped_api_specs"], 1);
+    assert_eq!(manifest["import"]["skipped_trust_bundles"], 1);
+    assert_eq!(manifest["import"]["sources"][0]["namespaces"][0], "ferrum");
+    assert_eq!(
+        manifest["import"]["sources"][0]["declared_counts"]["api_specs"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn api_import_rejects_cross_namespace_resources_before_writing() {
+    use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
+    use gitforgeops::http_client::AdminClient;
+
+    let mut config = make_test_config();
+    config.proxies[0].namespace = "other".to_string();
+    config.consumers.clear();
+    let body = serde_json::to_string(&config).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let env = EnvConfig {
+        gateway_url: Some(format!("http://{address}")),
+        admin_jwt_secret: Some("test-secret-must-be-at-least-32-chars".to_string()),
+        gateway_mode: GatewayMode::Api,
+        apply_strategy: ApplyStrategy::Incremental,
+        ..EnvConfig::default()
+    };
+    let client = AdminClient::new(&env).unwrap();
+    let output = tempfile::tempdir().unwrap();
+
+    let error = gitforgeops::import::from_api::import_from_api(
+        &client,
+        output.path(),
+        Some("ferrum"),
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("cross-namespace import"), "{error}");
+    assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn api_import_refuses_cached_backup_before_writing() {
+    use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
+    use gitforgeops::http_client::AdminClient;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        let body =
+            r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-data-source: cached\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let env = EnvConfig {
+        gateway_url: Some(format!("http://{address}")),
+        admin_jwt_secret: Some("test-secret-must-be-at-least-32-chars".to_string()),
+        gateway_mode: GatewayMode::Api,
+        apply_strategy: ApplyStrategy::Incremental,
+        ..EnvConfig::default()
+    };
+    let client = AdminClient::new(&env).unwrap();
+    let output = tempfile::tempdir().unwrap();
+
+    let error = gitforgeops::import::from_api::import_from_api(
+        &client,
+        output.path(),
+        Some("ferrum"),
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("X-Data-Source: cached"), "{error}");
+    assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
 }

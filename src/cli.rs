@@ -72,6 +72,11 @@ pub enum Commands {
         from_file: Option<String>,
         #[arg(long, default_value = "./resources")]
         output_dir: String,
+        /// Required when the source contains credentials. Writes canonical
+        /// slot-to-value bundles atomically at mode 0600; must be outside the
+        /// imported resource tree and every Git worktree.
+        #[arg(long, value_name = "PATH")]
+        credential_bundle_output: Option<String>,
     },
     Review {
         #[arg(long)]

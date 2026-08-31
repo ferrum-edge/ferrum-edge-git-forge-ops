@@ -4,14 +4,90 @@ pub mod from_file;
 pub use from_api::import_from_api;
 pub use from_file::import_from_file;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
 
 use crate::config::schema::{GatewayConfig, Resource};
+use crate::http_client::BackupSnapshot;
+use crate::secrets::{
+    capture_and_redact_import_credentials, CredentialBundle, IMPORT_REQUIRED_PLACEHOLDER,
+};
+
+pub const IMPORT_MANIFEST_FILENAME: &str = ".gitforgeops-import.json";
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ImportResourceCounts {
+    pub proxies: usize,
+    pub consumers: usize,
+    pub upstreams: usize,
+    pub plugin_configs: usize,
+    pub api_specs: usize,
+    pub gateway_trust_bundles: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ImportSourceMetadata {
+    /// `api`, `file`, or `in-memory` (the public split_config helper).
+    pub source_kind: String,
+    /// Namespaces represented by this source payload, sorted lexically.
+    pub namespaces: Vec<String>,
+    pub config_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ferrum_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exported_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub counts: ImportResourceCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_counts: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_counts: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_sections: Vec<String>,
+}
+
+impl ImportSourceMetadata {
+    pub(crate) fn from_snapshot(
+        source_kind: &str,
+        namespaces: Vec<String>,
+        snapshot: &BackupSnapshot,
+    ) -> Self {
+        Self {
+            source_kind: source_kind.to_string(),
+            namespaces,
+            config_version: snapshot.config.version.clone(),
+            ferrum_version: snapshot.ferrum_version.clone(),
+            exported_at: snapshot.exported_at.clone(),
+            source: snapshot.source.clone(),
+            counts: ImportResourceCounts {
+                proxies: snapshot.config.proxies.len(),
+                consumers: snapshot.config.consumers.len(),
+                upstreams: snapshot.config.upstreams.len(),
+                plugin_configs: snapshot.config.plugin_configs.len(),
+                api_specs: snapshot.extras.api_spec_count(),
+                gateway_trust_bundles: snapshot.extras.trust_bundle_count(),
+            },
+            declared_counts: snapshot.counts.clone(),
+            resource_counts: snapshot.resource_counts.clone(),
+            unsupported_sections: snapshot.unsupported_sections.clone(),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
+pub(crate) struct ImportInventory {
+    pub skipped_api_specs: usize,
+    pub skipped_trust_bundles: usize,
+    pub unsupported_sections: Vec<String>,
+    pub sources: Vec<ImportSourceMetadata>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ImportResult {
     /// Number of proxy files written.
     pub proxies: usize,
@@ -38,6 +114,12 @@ pub struct ImportResult {
     /// tries to push the repo's stale copy back. `diff` already reports them in
     /// their own "spec-owned" section, which is where they belong.
     pub skipped_spec_owned: usize,
+    /// Number of literal credential leaves replaced with broker placeholders.
+    pub redacted_credential_values: usize,
+    /// Future/unknown top-level backup sections that this build cannot import.
+    pub unsupported_sections: Vec<String>,
+    /// Validated, non-secret provenance retained in the import manifest.
+    pub sources: Vec<ImportSourceMetadata>,
 }
 
 impl ImportResult {
@@ -47,6 +129,8 @@ impl ImportResult {
         if self.skipped_api_specs == 0
             && self.skipped_trust_bundles == 0
             && self.skipped_spec_owned == 0
+            && self.redacted_credential_values == 0
+            && self.unsupported_sections.is_empty()
         {
             return None;
         }
@@ -70,8 +154,107 @@ impl ImportResult {
                 self.skipped_spec_owned
             ));
         }
+        if self.redacted_credential_values > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} credential value(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
+                self.redacted_credential_values
+            ));
+        }
+        if !self.unsupported_sections.is_empty() {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "Unsupported backup section(s) were not imported: {}.",
+                self.unsupported_sections.join(", ")
+            ));
+        }
         Some(notice)
     }
+
+    /// Bounded one-line source provenance suitable for CLI output. The same
+    /// data is persisted in full in the machine-readable import manifest.
+    pub fn source_metadata_notice(&self) -> Option<String> {
+        if self.sources.is_empty() {
+            return None;
+        }
+        const MAX_SOURCE_LINES: usize = 20;
+        const MAX_NAMESPACES_PER_SOURCE: usize = 20;
+        let mut lines = self
+            .sources
+            .iter()
+            .take(MAX_SOURCE_LINES)
+                .map(|source| {
+                    let mut namespaces = source
+                        .namespaces
+                        .iter()
+                        .take(MAX_NAMESPACES_PER_SOURCE)
+                        .map(|value| diagnostic_metadata(value))
+                        .collect::<Vec<_>>();
+                    if source.namespaces.len() > MAX_NAMESPACES_PER_SOURCE {
+                        namespaces.push(format!(
+                            "[{} more in manifest]",
+                            source.namespaces.len() - MAX_NAMESPACES_PER_SOURCE
+                        ));
+                    }
+                    format!(
+                        "Import source: kind={} namespaces={} config_version={} ferrum_version={} exported_at={} source={}",
+                        diagnostic_metadata(&source.source_kind),
+                        if namespaces.is_empty() {
+                            "<none>".to_string()
+                        } else {
+                            namespaces.join(",")
+                        },
+                        diagnostic_metadata(&source.config_version),
+                        source
+                            .ferrum_version
+                            .as_deref()
+                            .map(diagnostic_metadata)
+                            .unwrap_or_else(|| "<absent>".to_string()),
+                        source
+                            .exported_at
+                            .as_deref()
+                            .map(diagnostic_metadata)
+                            .unwrap_or_else(|| "<absent>".to_string()),
+                        source
+                            .source
+                            .as_deref()
+                            .map(diagnostic_metadata)
+                            .unwrap_or_else(|| "<absent>".to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+        if self.sources.len() > MAX_SOURCE_LINES {
+            lines.push(format!(
+                "Import sources: {} additional source record(s) are available in {}",
+                self.sources.len() - MAX_SOURCE_LINES,
+                IMPORT_MANIFEST_FILENAME
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+}
+
+fn diagnostic_metadata(value: &str) -> String {
+    const MAX_CHARS: usize = 256;
+    let mut sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .take(MAX_CHARS)
+        .collect::<String>();
+    if value.chars().count() > MAX_CHARS {
+        sanitized.push_str("[truncated]");
+    }
+    sanitized
 }
 
 /// Split a flat gateway configuration into per-resource YAML files.
@@ -93,11 +276,42 @@ pub fn split_config(
     config: &GatewayConfig,
     output_dir: &Path,
 ) -> crate::error::Result<ImportResult> {
-    let mut result = ImportResult::default();
+    split_config_with_inventory(config, output_dir, ImportInventory::default(), None, false)
+}
+
+pub(crate) fn split_config_with_inventory(
+    config: &GatewayConfig,
+    output_dir: &Path,
+    inventory: ImportInventory,
+    credential_bundle_output: Option<&Path>,
+    require_credential_bundle: bool,
+) -> crate::error::Result<ImportResult> {
+    let mut safe_config = config.clone();
+    let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
+    let mut result = ImportResult {
+        skipped_api_specs: inventory.skipped_api_specs,
+        skipped_trust_bundles: inventory.skipped_trust_bundles,
+        unsupported_sections: inventory.unsupported_sections,
+        sources: inventory.sources,
+        redacted_credential_values: captured_credentials.len(),
+        ..ImportResult::default()
+    };
+    if require_credential_bundle
+        && !captured_credentials.is_empty()
+        && credential_bundle_output.is_none()
+    {
+        return Err(crate::error::Error::Config(format!(
+            "the source contains {} live credential value(s); re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
+            captured_credentials.len()
+        )));
+    }
+    if let Some(path) = credential_bundle_output {
+        validate_migration_bundle_location(path, output_dir)?;
+    }
     let mut targets = BTreeSet::new();
     let mut planned_writes = Vec::new();
 
-    for proxy in &config.proxies {
+    for proxy in &safe_config.proxies {
         if proxy.api_spec_id.is_some() {
             result.skipped_spec_owned += 1;
             continue;
@@ -107,25 +321,25 @@ pub fn split_config(
         let resource = Resource::Proxy {
             spec: proxy.clone(),
         };
-        let yaml = serde_yaml::to_string(&resource)?;
+        let yaml = serialize_resource_yaml(&resource)?;
         let filename = resource_filename(&proxy.id, "id")?;
         plan_resource_file(&dir, filename, yaml, &mut targets, &mut planned_writes)?;
         result.proxies += 1;
     }
 
-    for consumer in &config.consumers {
+    for consumer in &safe_config.consumers {
         let namespace = safe_path_component(&consumer.namespace, "namespace")?;
         let dir = output_dir.join(namespace).join("consumers");
         let resource = Resource::Consumer {
             spec: consumer.clone(),
         };
-        let yaml = serde_yaml::to_string(&resource)?;
+        let yaml = serialize_resource_yaml(&resource)?;
         let filename = resource_filename(&consumer.id, "id")?;
         plan_resource_file(&dir, filename, yaml, &mut targets, &mut planned_writes)?;
         result.consumers += 1;
     }
 
-    for upstream in &config.upstreams {
+    for upstream in &safe_config.upstreams {
         if upstream.api_spec_id.is_some() {
             result.skipped_spec_owned += 1;
             continue;
@@ -135,13 +349,13 @@ pub fn split_config(
         let resource = Resource::Upstream {
             spec: upstream.clone(),
         };
-        let yaml = serde_yaml::to_string(&resource)?;
+        let yaml = serialize_resource_yaml(&resource)?;
         let filename = resource_filename(&upstream.id, "id")?;
         plan_resource_file(&dir, filename, yaml, &mut targets, &mut planned_writes)?;
         result.upstreams += 1;
     }
 
-    for pc in &config.plugin_configs {
+    for pc in &safe_config.plugin_configs {
         if pc.api_spec_id.is_some() {
             result.skipped_spec_owned += 1;
             continue;
@@ -149,17 +363,60 @@ pub fn split_config(
         let namespace = safe_path_component(&pc.namespace, "namespace")?;
         let dir = output_dir.join(namespace).join("plugins");
         let resource = Resource::PluginConfig { spec: pc.clone() };
-        let yaml = serde_yaml::to_string(&resource)?;
+        let yaml = serialize_resource_yaml(&resource)?;
         let filename = resource_filename(&pc.id, "id")?;
         plan_resource_file(&dir, filename, yaml, &mut targets, &mut planned_writes)?;
         result.plugin_configs += 1;
     }
 
-    for (path, yaml) in planned_writes {
-        write_resource_file(&path, yaml)?;
+    let manifest = ImportManifest {
+        format_version: 1,
+        import: &result,
+    };
+    let mut manifest_json = serde_json::to_string_pretty(&manifest)?;
+    manifest_json.push('\n');
+    planned_writes.push((output_dir.join(IMPORT_MANIFEST_FILENAME), manifest_json));
+
+    // Validate the documented empty-destination contract before replacing a
+    // pre-existing migration artifact. `publish_import_tree` repeats this
+    // check immediately before staging/publication to close the race window.
+    inspect_import_destination(output_dir)?;
+
+    // Publish the private migration bundle first. If the later directory
+    // rename fails, the complete credentials remain safely recoverable and a
+    // retry can atomically replace this same file. The inverse order could
+    // leave a published repo tree whose live credentials had already been
+    // discarded from memory.
+    if let Some(path) = credential_bundle_output {
+        let bundle_json = render_migration_bundles(&captured_credentials)?;
+        crate::apply::publish_private_export(
+            path.to_str().ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "credential migration bundle path {} is not valid UTF-8",
+                    path.display()
+                ))
+            })?,
+            bundle_json.as_bytes(),
+        )?;
     }
 
+    publish_import_tree(output_dir, planned_writes)?;
+
     Ok(result)
+}
+
+fn serialize_resource_yaml(resource: &Resource) -> crate::error::Result<String> {
+    // HashMap-backed credential/tag fields otherwise inherit randomized map
+    // iteration order. serde_json::Value uses a sorted map in this build, so
+    // this intermediate representation makes byte output deterministic.
+    let canonical = serde_json::to_value(resource)?;
+    serde_yaml::to_string(&canonical).map_err(crate::error::Error::SerdeYaml)
+}
+
+#[derive(Serialize)]
+struct ImportManifest<'a> {
+    format_version: u32,
+    import: &'a ImportResult,
 }
 
 fn plan_resource_file(
@@ -186,18 +443,373 @@ fn plan_resource_file(
     Ok(())
 }
 
-fn write_resource_file(path: &Path, yaml: String) -> crate::error::Result<()> {
-    if path.exists() {
+fn render_migration_bundles(captured: &CredentialBundle) -> crate::error::Result<String> {
+    let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::from([(0, BTreeMap::new())]);
+    let mut shard_sizes = BTreeMap::from([(0_u32, 2_usize)]); // `{}`
+
+    for (slot, value) in captured {
+        // Exact compact-JSON size, including escaping. Imported values are not
+        // generated base64 and may contain quotes/control characters whose
+        // encoded size is much larger than `value.len()`.
+        let entry_size =
+            serde_json::to_string(slot)?.len() + 1 + serde_json::to_string(value)?.len();
+        let shard = (0..shards.len() as u32)
+            .find(|candidate| {
+                let current = shard_sizes.get(candidate).copied().unwrap_or(2);
+                current + usize::from(current > 2) + entry_size
+                    <= crate::secrets::bundle::BUNDLE_SOFT_LIMIT_BYTES
+            })
+            .unwrap_or(shards.len() as u32);
+        if shard >= 100 {
+            return Err(crate::error::Error::Config(
+                "credential migration bundle would exceed GitHub's 100 environment-secret shard limit"
+                    .to_string(),
+            ));
+        }
+        let current = shard_sizes.get(&shard).copied().unwrap_or(2);
+        let projected = current + usize::from(current > 2) + entry_size;
+        if projected > crate::secrets::bundle::BUNDLE_SOFT_LIMIT_BYTES {
+            return Err(crate::error::Error::Config(format!(
+                "credential slot '{slot}' cannot fit within GitHub's credential-bundle secret size limit"
+            )));
+        }
+        shard_sizes.insert(shard, projected);
+        shards
+            .entry(shard)
+            .or_default()
+            .insert(slot.clone(), value.clone());
+    }
+
+    let outer = shards
+        .into_iter()
+        .map(|(shard, bundle)| (crate::secrets::bundle::shard_secret_name(shard), bundle))
+        .collect::<BTreeMap<_, _>>();
+    let mut json = serde_json::to_string_pretty(&outer)?;
+    json.push('\n');
+    Ok(json)
+}
+
+fn validate_migration_bundle_location(
+    bundle: &Path,
+    output_dir: &Path,
+) -> crate::error::Result<()> {
+    let lexical_bundle = lexically_normalized_absolute(bundle)?;
+    let lexical_output = lexically_normalized_absolute(output_dir)?;
+    if lexical_bundle == lexical_output || lexical_bundle.starts_with(&lexical_output) {
         return Err(crate::error::Error::Config(format!(
-            "refusing to overwrite existing import target {}; choose an empty output directory or remove the file first",
-            path.display()
+            "credential migration bundle must be outside the import resource tree {}; choose a private path elsewhere",
+            output_dir.display()
         )));
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Some(worktree) = containing_git_worktree(&lexical_bundle)? {
+        return Err(crate::error::Error::Config(format!(
+            "credential migration bundle must be outside every Git worktree; {} is inside {}",
+            lexical_bundle.display(),
+            worktree.display()
+        )));
     }
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(yaml.as_bytes())?;
+
+    // Repeat after resolving existing symlinked ancestors. The lexical check
+    // prevents replacing a symlink *located* in the resource tree/repo; this
+    // check prevents an outside-looking path from resolving back into one.
+    let resolved_bundle = resolve_for_containment(bundle)?;
+    let resolved_output = resolve_for_containment(output_dir)?;
+    if resolved_bundle == resolved_output || resolved_bundle.starts_with(&resolved_output) {
+        return Err(crate::error::Error::Config(format!(
+            "credential migration bundle resolves inside the import resource tree {}; choose a private path elsewhere",
+            output_dir.display()
+        )));
+    }
+    if let Some(worktree) = containing_git_worktree(&resolved_bundle)? {
+        return Err(crate::error::Error::Config(format!(
+            "credential migration bundle must be outside every Git worktree; {} resolves inside {}",
+            bundle.display(),
+            worktree.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_migration_bundle_source(
+    bundle: &Path,
+    source: &Path,
+) -> crate::error::Result<()> {
+    let same_lexical_path =
+        lexically_normalized_absolute(bundle)? == lexically_normalized_absolute(source)?;
+    let same_resolved_path = resolve_for_containment(bundle)? == resolve_for_containment(source)?;
+    if same_lexical_path || same_resolved_path {
+        return Err(crate::error::Error::Config(format!(
+            "credential migration bundle must be a separate file and may not overwrite its source backup {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn lexically_normalized_absolute(path: &Path) -> crate::error::Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(crate::error::Error::Config(format!(
+                        "path {} escapes the filesystem root",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn containing_git_worktree(path: &Path) -> crate::error::Result<Option<PathBuf>> {
+    let start = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    for ancestor in start.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Ok(Some(ancestor.to_path_buf())),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(crate::error::Error::Io(source)),
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve existing symlinked ancestors while still accepting a final path
+/// that does not exist yet, then normalize `.`/`..` components for a reliable
+/// containment comparison.
+fn resolve_for_containment(path: &Path) -> crate::error::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut existing = absolute.as_path();
+    let mut suffix = Vec::new();
+    let canonical = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(canonical) => break canonical,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    crate::error::Error::Config(format!(
+                        "cannot resolve path {} for containment validation",
+                        path.display()
+                    ))
+                })?;
+                suffix.push(name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    crate::error::Error::Config(format!(
+                        "cannot resolve path {} for containment validation",
+                        path.display()
+                    ))
+                })?;
+            }
+            Err(source) => return Err(crate::error::Error::Io(source)),
+        }
+    };
+    Ok(suffix
+        .into_iter()
+        .rev()
+        .fold(canonical, |resolved, component| resolved.join(component)))
+}
+
+/// Publish a complete import as one directory rename. Import is documented for
+/// an empty destination; enforcing that contract lets a late parse/write error
+/// leave the old tree untouched instead of stranding a partial migration that
+/// a rerun then refuses to overwrite.
+fn publish_import_tree(
+    output_dir: &Path,
+    planned_writes: Vec<(PathBuf, String)>,
+) -> crate::error::Result<()> {
+    let destination_existed = inspect_import_destination(output_dir)?;
+
+    let parent = output_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".gitforgeops-import-")
+        .tempdir_in(parent)?;
+
+    for (target, yaml) in planned_writes {
+        let relative = target.strip_prefix(output_dir).map_err(|_| {
+            crate::error::Error::Config(format!(
+                "planned import target {} escaped output directory {}",
+                target.display(),
+                output_dir.display()
+            ))
+        })?;
+        let staged_path = staging.path().join(relative);
+        if let Some(dir) = staged_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged_path)?;
+        file.write_all(yaml.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    apply_import_root_permissions(output_dir, staging.path())?;
+    sync_import_directories(staging.path())?;
+
+    // Re-check immediately before publication so a concurrent writer cannot be
+    // replaced after the initial emptiness test.
+    if destination_existed {
+        let metadata = std::fs::symlink_metadata(output_dir)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(crate::error::Error::Config(format!(
+                "import output {} changed type while the import was being staged",
+                output_dir.display()
+            )));
+        }
+        if std::fs::read_dir(output_dir)?.next().is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "import output directory {} changed while the import was being staged",
+                output_dir.display()
+            )));
+        }
+    } else {
+        match std::fs::symlink_metadata(output_dir) {
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(crate::error::Error::Config(format!(
+                    "import output {} appeared while the import was being staged",
+                    output_dir.display()
+                )));
+            }
+            Err(source) => return Err(crate::error::Error::Io(source)),
+        }
+    }
+
+    publish_staging_directory(staging.path(), output_dir, destination_existed)?;
+
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+
+    Ok(())
+}
+
+fn inspect_import_destination(output_dir: &Path) -> crate::error::Result<bool> {
+    match std::fs::symlink_metadata(output_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(crate::error::Error::Config(format!(
+                    "import output {} must be an empty directory and may not be a symlink",
+                    output_dir.display()
+                )));
+            }
+            if std::fs::read_dir(output_dir)?.next().is_some() {
+                return Err(crate::error::Error::Config(format!(
+                    "refusing to import into non-empty output directory {}; choose an empty directory",
+                    output_dir.display()
+                )));
+            }
+            Ok(true)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(crate::error::Error::Io(source)),
+    }
+}
+
+/// Persist the staged directory entries before making the root rename
+/// durable. File contents were fsynced individually above; syncing every
+/// directory closes the remaining crash window where a nested filename could
+/// disappear after the root was published.
+#[cfg(unix)]
+fn sync_import_directories(root: &Path) -> crate::error::Result<()> {
+    let mut directories = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_dir() => Some(Ok(entry.into_path())),
+            Ok(_) => None,
+            Err(source) => Some(Err(crate::error::Error::Config(format!(
+                "failed to inspect staged import tree: {source}"
+            )))),
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_import_directories(_root: &Path) -> crate::error::Result<()> {
+    Ok(())
+}
+
+/// POSIX rename can atomically replace an existing empty directory. Keep the
+/// destination in place until that single syscall so a crash can never leave
+/// an absent tree. Platforms without that guarantee use a guarded fallback
+/// and restore the empty directory if publication fails.
+#[cfg(unix)]
+fn publish_staging_directory(
+    staged: &Path,
+    output: &Path,
+    _destination_existed: bool,
+) -> crate::error::Result<()> {
+    std::fs::rename(staged, output)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn publish_staging_directory(
+    staged: &Path,
+    output: &Path,
+    destination_existed: bool,
+) -> crate::error::Result<()> {
+    if destination_existed {
+        std::fs::remove_dir(output)?;
+    }
+    if let Err(source) = std::fs::rename(staged, output) {
+        if destination_existed && !output.exists() {
+            let _ = std::fs::create_dir(output);
+        }
+        return Err(crate::error::Error::Io(source));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_import_root_permissions(existing: &Path, staged: &Path) -> crate::error::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = match std::fs::symlink_metadata(existing) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(crate::error::Error::Config(format!(
+                "import output {} changed type while the import was being staged",
+                existing.display()
+            )));
+        }
+        Ok(metadata) => metadata.permissions().mode() & 0o777,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => 0o755,
+        Err(source) => return Err(crate::error::Error::Io(source)),
+    };
+    std::fs::set_permissions(staged, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_import_root_permissions(_existing: &Path, _staged: &Path) -> crate::error::Result<()> {
     Ok(())
 }
 
@@ -220,9 +832,6 @@ fn safe_path_component<'a>(value: &'a str, field: &str) -> crate::error::Result<
 }
 
 fn resource_filename(id: &str, field: &str) -> crate::error::Result<String> {
-    if id.is_empty() {
-        return Ok("unnamed.yaml".to_string());
-    }
     let safe = safe_path_component(id, field)?;
     Ok(format!("{safe}.yaml"))
 }

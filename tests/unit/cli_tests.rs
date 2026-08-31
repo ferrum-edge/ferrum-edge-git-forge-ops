@@ -10,11 +10,37 @@ fn cli_import_from_api_is_a_flag() {
             from_api,
             from_file,
             output_dir,
+            credential_bundle_output,
         } => {
             assert!(from_api);
             assert!(from_file.is_none());
             assert_eq!(output_dir, "./resources");
+            assert!(credential_bundle_output.is_none());
         }
+        _ => panic!("expected import command"),
+    }
+}
+
+#[test]
+fn cli_accepts_a_private_import_bundle_path() {
+    let cli = Cli::try_parse_from([
+        "gitforgeops",
+        "import",
+        "--from-file",
+        "backup.yaml",
+        "--credential-bundle-output",
+        "/tmp/migration.json",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::Import {
+            credential_bundle_output,
+            ..
+        } => assert_eq!(
+            credential_bundle_output.as_deref(),
+            Some("/tmp/migration.json")
+        ),
         _ => panic!("expected import command"),
     }
 }

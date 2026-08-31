@@ -3,6 +3,21 @@ use std::time::Duration;
 
 use crate::config::EnvConfig;
 
+/// Promote a PR-comment delivery failure to a trusted-review failure after
+/// the caller has written its step-summary/stdout fallback. Secretless and
+/// fork reviews intentionally retain best-effort delivery.
+pub fn enforce_required_comment_delivery(
+    require_live: bool,
+    delivery_error: &str,
+) -> crate::error::Result<()> {
+    if require_live {
+        return Err(crate::error::Error::Config(format!(
+            "trusted live review could not post its required PR comment: {delivery_error}"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn post_pr_comment(
     env_config: &EnvConfig,
     pr_number: u64,
@@ -26,6 +41,7 @@ pub async fn post_pr_comment(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
@@ -40,7 +56,7 @@ pub async fn post_pr_comment(
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
     let status = resp.status().as_u16();
-    if status >= 400 {
+    if !(200..=299).contains(&status) {
         let resp_body = resp
             .text()
             .await

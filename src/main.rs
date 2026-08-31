@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
 
@@ -64,11 +64,13 @@ async fn main() {
             from_api,
             from_file,
             output_dir,
+            credential_bundle_output,
         } => {
             cmd_import(
                 from_api,
                 from_file.as_deref(),
                 &output_dir,
+                credential_bundle_output.as_deref(),
                 explicit_env.as_deref(),
             )
             .await
@@ -795,6 +797,16 @@ async fn cmd_export(
             "`--encrypt-to` requires `--materialize` (encrypting placeholders is pointless)".into(),
         );
     }
+    if materialize
+        && encrypt_to.is_none()
+        && output_path.is_none()
+        && std::io::stdout().is_terminal()
+    {
+        return Err(
+            "refusing to print materialized credentials to an interactive terminal; use --output PATH (written mode 0600) or --encrypt-to LOGIN"
+                .into(),
+        );
+    }
 
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved)?;
@@ -854,6 +866,7 @@ async fn cmd_export(
         );
     }
 
+    let plaintext_materialized = materialize && encrypt_to.is_none();
     let payload: Vec<u8> = if let Some(login) = encrypt_to {
         let client = build_github_api_client(&env_config)?;
         match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
@@ -877,14 +890,19 @@ async fn cmd_export(
 
     match output_path {
         Some(path) => {
-            if let Some(parent) = PathBuf::from(path).parent() {
-                std::fs::create_dir_all(parent)?;
+            if plaintext_materialized {
+                apply::publish_private_export(path, &payload)?;
+            } else {
+                apply::publish_export(path, &payload)?;
             }
-            let mut file = std::fs::File::create(path)?;
-            file.write_all(&payload)?;
             eprintln!("Exported to {}", path);
         }
         None => {
+            if plaintext_materialized {
+                eprintln!(
+                    "WARNING: writing plaintext materialized credentials to non-interactive stdout; ensure the receiving process and destination are private. Prefer --output PATH (mode 0600) or --encrypt-to LOGIN."
+                );
+            }
             std::io::stdout().write_all(&payload)?;
         }
     }
@@ -1023,7 +1041,16 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-
+    let bundle_loaded = env_config
+        .creds_bundle_json_file
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || env_config
+            .creds_bundle_json
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
     println!("=== Environment ===");
     println!(
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
@@ -1058,6 +1085,11 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
         println!("=== Credentials ===");
         println!("{}\n", note);
+        if !bundle_loaded {
+            println!(
+                "Credential values are excluded from the live Consumer diff because no credential bundle is available; non-credential Consumer fields are still compared.\n"
+            );
+        }
     }
 
     let state = StateFile::load(&resolved.name)?;
@@ -1067,9 +1099,17 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let (diffs, breaking, unmanaged, spec_owned, actual_available, provenance_note) = match &client
     {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
-            Ok(namespace_pairs) => {
+            Ok(mut namespace_pairs) => {
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
+                    if !bundle_loaded {
+                        for pair in &mut namespace_pairs {
+                            diff::mask_indeterminate_consumer_credentials(
+                                &desired,
+                                &mut pair.actual,
+                            );
+                        }
+                    }
                     let (d, b, u, s) = compute_namespace_diffs(
                         &namespace_pairs,
                         managed.as_ref(),
@@ -1596,7 +1636,6 @@ async fn cmd_apply(
                     state.record_credential(
                         &slot.slot,
                         slot.shard,
-                        &slot.value,
                         slot.delivered.as_ref().map(|d| d.login.as_str()),
                         run_id.as_deref(),
                     );
@@ -1783,7 +1822,6 @@ async fn cmd_apply(
                 state.record_credential(
                     &slot.slot,
                     slot.shard,
-                    &slot.value,
                     slot.delivered.as_ref().map(|d| d.login.as_str()),
                     run_id.as_deref(),
                 );
@@ -1816,9 +1854,11 @@ async fn cmd_import(
     from_api: bool,
     from_file: Option<&str>,
     output_dir: &str,
+    credential_bundle_output: Option<&str>,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_path = PathBuf::from(output_dir);
+    let credential_bundle_path = credential_bundle_output.map(PathBuf::from);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
     let result = if from_api {
@@ -1834,9 +1874,19 @@ async fn cmd_import(
             )
         })?;
         let client = AdminClient::new_scoped(&env_config, [namespace])?;
-        import::import_from_api(&client, &output_path, Some(namespace)).await?
+        import::import_from_api(
+            &client,
+            &output_path,
+            Some(namespace),
+            credential_bundle_path.as_deref(),
+        )
+        .await?
     } else if let Some(file_path) = from_file {
-        import::import_from_file(&PathBuf::from(file_path), &output_path)?
+        import::import_from_file(
+            &PathBuf::from(file_path),
+            &output_path,
+            credential_bundle_path.as_deref(),
+        )?
     } else {
         eprintln!("Specify --from-api or --from-file <PATH>");
         process::exit(1);
@@ -1846,6 +1896,19 @@ async fn cmd_import(
         "Imported: {} proxies, {} consumers, {} upstreams, {} plugin_configs",
         result.proxies, result.consumers, result.upstreams, result.plugin_configs
     );
+    println!(
+        "Import manifest: {}",
+        output_path.join(import::IMPORT_MANIFEST_FILENAME).display()
+    );
+    if let Some(path) = credential_bundle_path {
+        println!(
+            "Credential migration bundle: {} (private mode 0600; seed the listed FERRUM_CREDS_BUNDLE* environment secrets, then securely delete the local file)",
+            path.display()
+        );
+    }
+    if let Some(notice) = result.source_metadata_notice() {
+        println!("{notice}");
+    }
     if let Some(notice) = result.unmanaged_sections_notice() {
         println!("{notice}");
     }
@@ -1869,6 +1932,16 @@ async fn cmd_review(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
+    let bundle_loaded = env_config
+        .creds_bundle_json_file
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || env_config
+            .creds_bundle_json
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_ok, validation_output) = match &val_result {
@@ -1883,9 +1956,17 @@ async fn cmd_review(
 
     let (diffs, breaking, unmanaged, spec_owned, comparison_error) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
-            Ok(namespace_pairs) => {
+            Ok(mut namespace_pairs) => {
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
+                    if !bundle_loaded {
+                        for pair in &mut namespace_pairs {
+                            diff::mask_indeterminate_consumer_credentials(
+                                &desired,
+                                &mut pair.actual,
+                            );
+                        }
+                    }
                     let (d, b, u, s) = compute_namespace_diffs(
                         &namespace_pairs,
                         managed.as_ref(),
@@ -1951,17 +2032,6 @@ async fn cmd_review(
         resolved.name, resolved.ownership.mode, resolved.apply_strategy
     );
 
-    let bundle_loaded = env_config
-        .creds_bundle_json_file
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || env_config
-            .creds_bundle_json
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-
     let comment = review::build_review_comment_v2(
         validation_ok,
         &validation_output,
@@ -1987,8 +2057,10 @@ async fn cmd_review(
             // POST to /issues/{n}/comments returns 403. We still want the
             // review content visible, so fall back to $GITHUB_STEP_SUMMARY
             // (which the runner always lets us write) and to stdout.
-            // Never fail the job on a delivery-channel error — the
-            // validation itself succeeded; only the report delivery didn't.
+            // Ordinary/fork review keeps the historical step-summary fallback.
+            // Trusted `--require-live` review treats comment delivery as part
+            // of the required reviewer-facing result and fails after writing
+            // the same fallback evidence.
             match review::post_pr_comment(&env_config, pr_number, &comment).await {
                 Ok(()) => {
                     println!("Posted review comment to PR #{}", pr_number);
@@ -1999,6 +2071,7 @@ async fn cmd_review(
                     );
                     write_review_to_step_summary(&comment)?;
                     print!("{}", comment);
+                    review::enforce_required_comment_delivery(require_live, &e.to_string())?;
                 }
             }
         }
@@ -2253,7 +2326,6 @@ async fn cmd_rotate(
             state.record_credential(
                 &slot,
                 outcome.shard,
-                &outcome.value,
                 outcome.delivered.as_ref().map(|d| d.login.as_str()),
                 std::env::var("GITHUB_RUN_ID").ok().as_deref(),
             );

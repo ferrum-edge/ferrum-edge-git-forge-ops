@@ -111,8 +111,35 @@ pub fn apply_mesh_file(mesh: &MeshConfigSpec, output_path: &str) -> crate::error
     publish_document(output_path, render_mesh_yaml(mesh)?.as_bytes())
 }
 
+/// Atomically publish arbitrary export bytes with ordinary artifact
+/// permissions. Used for placeholder-only YAML and age-encrypted output.
+pub fn publish_export(output_path: &str, bytes: &[u8]) -> crate::error::Result<()> {
+    publish_document_with_permissions(output_path, bytes, PublicationPermissions::Regular)
+}
+
+/// Atomically publish a plaintext materialized export. The payload contains
+/// live consumer credentials, so its mode is forced to owner-read/write even
+/// when replacing a more broadly-readable destination.
+pub fn publish_private_export(output_path: &str, bytes: &[u8]) -> crate::error::Result<()> {
+    publish_document_with_permissions(output_path, bytes, PublicationPermissions::Private)
+}
+
 /// Create the destination directory and atomically publish `bytes` into it.
 fn publish_document(output_path: &str, bytes: &[u8]) -> crate::error::Result<()> {
+    publish_document_with_permissions(output_path, bytes, PublicationPermissions::Regular)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublicationPermissions {
+    Regular,
+    Private,
+}
+
+fn publish_document_with_permissions(
+    output_path: &str,
+    bytes: &[u8],
+    permissions: PublicationPermissions,
+) -> crate::error::Result<()> {
     let path = Path::new(output_path);
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -120,7 +147,7 @@ fn publish_document(output_path: &str, bytes: &[u8]) -> crate::error::Result<()>
     };
     std::fs::create_dir_all(parent)?;
 
-    write_atomically(path, parent, bytes)
+    write_atomically(path, parent, bytes, permissions)
 }
 
 /// Publish `bytes` at `path` with write-temp → fsync → `rename(2)`.
@@ -136,7 +163,12 @@ fn publish_document(output_path: &str, bytes: &[u8]) -> crate::error::Result<()>
 /// The temp file is created in the destination's own directory so the rename
 /// never crosses a filesystem boundary, and it is removed on drop if any step
 /// before the rename fails.
-fn write_atomically(path: &Path, parent: &Path, bytes: &[u8]) -> crate::error::Result<()> {
+fn write_atomically(
+    path: &Path,
+    parent: &Path,
+    bytes: &[u8],
+    permissions: PublicationPermissions,
+) -> crate::error::Result<()> {
     let mut temp = tempfile::Builder::new()
         .prefix(".gitforgeops-")
         .suffix(".tmp")
@@ -148,18 +180,16 @@ fn write_atomically(path: &Path, parent: &Path, bytes: &[u8]) -> crate::error::R
     // still only in the page cache can survive a crash as an empty file.
     temp.as_file().sync_all()?;
 
-    apply_destination_permissions(path, temp.path())?;
+    apply_destination_permissions(path, temp.path(), permissions)?;
 
     temp.persist(path)
         .map_err(|err| crate::error::Error::Io(err.error))?;
 
-    // Make the directory entry itself durable. Best-effort: a filesystem that
-    // refuses to open a directory for this is not a reason to fail a
-    // successful publish.
+    // Make the directory entry itself durable. On Unix, inability to sync the
+    // parent means publication durability is unknown and must be surfaced to
+    // the caller rather than reported as a successful secret export.
     #[cfg(unix)]
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    std::fs::File::open(parent)?.sync_all()?;
 
     Ok(())
 }
@@ -172,18 +202,29 @@ fn write_atomically(path: &Path, parent: &Path, bytes: &[u8]) -> crate::error::R
 /// to 0644 — what the previous `std::fs::write` produced under a default
 /// umask.
 #[cfg(unix)]
-fn apply_destination_permissions(dest: &Path, temp: &Path) -> crate::error::Result<()> {
+fn apply_destination_permissions(
+    dest: &Path,
+    temp: &Path,
+    policy: PublicationPermissions,
+) -> crate::error::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mode = match std::fs::metadata(dest) {
-        Ok(meta) => meta.permissions().mode() & 0o777,
-        Err(_) => 0o644,
+    let mode = match policy {
+        PublicationPermissions::Private => 0o600,
+        PublicationPermissions::Regular => match std::fs::metadata(dest) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(_) => 0o644,
+        },
     };
     std::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn apply_destination_permissions(_dest: &Path, _temp: &Path) -> crate::error::Result<()> {
+fn apply_destination_permissions(
+    _dest: &Path,
+    _temp: &Path,
+    _policy: PublicationPermissions,
+) -> crate::error::Result<()> {
     Ok(())
 }

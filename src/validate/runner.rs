@@ -153,7 +153,12 @@ pub fn run_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let yaml = serde_yaml::to_string(config)?;
-    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path)
+    run_validate_command(
+        GATEWAY_VALIDATE_MODE,
+        &yaml,
+        binary_path,
+        contains_credential_material(config),
+    )
 }
 
 /// Validate the standalone mesh document with
@@ -173,7 +178,30 @@ pub fn run_mesh_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let yaml = crate::apply::render_mesh_yaml(mesh)?;
-    run_validate_command(MESH_VALIDATE_MODE, &yaml, binary_path)
+    run_validate_command(MESH_VALIDATE_MODE, &yaml, binary_path, false)
+}
+
+/// True when a validator input contains a literal or already-resolved
+/// credential string. Placeholder text is repository data and safe to echo;
+/// every other string below `Consumer.credentials` may be a live secret.
+fn contains_credential_material(config: &GatewayConfig) -> bool {
+    config.consumers.iter().any(|consumer| {
+        consumer
+            .credentials
+            .values()
+            .any(value_contains_credential_material)
+    })
+}
+
+fn value_contains_credential_material(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            !matches!(crate::secrets::parse_placeholder(value), Some(Ok(_)))
+        }
+        serde_json::Value::Array(items) => items.iter().any(value_contains_credential_material),
+        serde_json::Value::Object(map) => map.values().any(value_contains_credential_material),
+        _ => false,
+    }
 }
 
 /// Shared body of [`run_validation`] and [`run_mesh_validation`]: locate the
@@ -183,6 +211,7 @@ fn run_validate_command(
     mode: &str,
     yaml: &str,
     binary_path: &str,
+    suppress_diagnostics: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
     let which_result = Command::new("which").arg(binary_path).output();
@@ -236,8 +265,20 @@ fn run_validate_command(
     let output = output?;
 
     let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, stderr) = if suppress_diagnostics {
+        let stderr = if output.status.success() {
+            String::new()
+        } else {
+            "Validation failed; validator diagnostics were suppressed because the input contained credential material.\n"
+                .to_string()
+        };
+        (String::new(), stderr)
+    } else {
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
 
     Ok(ValidationResult {
         success: output.status.success(),

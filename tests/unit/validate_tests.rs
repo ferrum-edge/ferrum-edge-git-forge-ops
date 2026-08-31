@@ -1,6 +1,6 @@
 use gitforgeops::validate::{
-    build_validate_args_for_mode, format_result, format_results, scrubbed_env_names, OutputFormat,
-    ValidationResult, GATEWAY_VALIDATE_MODE, MESH_VALIDATE_MODE,
+    build_validate_args_for_mode, format_result, format_results, run_validation,
+    scrubbed_env_names, OutputFormat, ValidationResult, GATEWAY_VALIDATE_MODE, MESH_VALIDATE_MODE,
 };
 use std::path::Path;
 
@@ -30,6 +30,88 @@ fn github_annotations_emit_generic_error_when_no_line_matches() {
     let output = format_result(&result, OutputFormat::GithubAnnotations);
 
     assert_eq!(output, "::error ::Validation failed with exit code 2\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn validator_output_cannot_echo_literal_or_resolved_credentials() {
+    use gitforgeops::config::schema::{Consumer, GatewayConfig};
+    use std::os::unix::fs::PermissionsExt;
+
+    let secret = "launch-secret-that-must-never-reach-diagnostics";
+    let config = GatewayConfig {
+        consumers: vec![Consumer {
+            id: "app".to_string(),
+            username: "app".to_string(),
+            namespace: "ferrum".to_string(),
+            custom_id: None,
+            credentials: std::collections::HashMap::from([(
+                "keyauth".to_string(),
+                serde_json::json!([{"key": secret}]),
+            )]),
+            acl_groups: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        ..GatewayConfig::default()
+    };
+
+    for exit_code in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let validator = dir.path().join(format!("echo-validator-{exit_code}"));
+        std::fs::write(
+            &validator,
+            format!("#!/bin/sh\ncat \"$7\"\ncat \"$7\" >&2\nexit {exit_code}\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&validator).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&validator, permissions).unwrap();
+
+        let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+        assert!(!result.success);
+        assert!(!result.stdout.contains(secret), "{}", result.stdout);
+        assert!(!result.stderr.contains(secret), "{}", result.stderr);
+        assert!(
+            result.stderr.contains("diagnostics were suppressed"),
+            "{}",
+            result.stderr
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn validator_diagnostics_remain_available_for_placeholder_only_credentials() {
+    use gitforgeops::config::schema::{Consumer, GatewayConfig};
+    use std::os::unix::fs::PermissionsExt;
+
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let config = GatewayConfig {
+        consumers: vec![Consumer {
+            id: "app".to_string(),
+            username: "app".to_string(),
+            namespace: "ferrum".to_string(),
+            custom_id: None,
+            credentials: std::collections::HashMap::from([(
+                "keyauth".to_string(),
+                serde_json::json!([{"key": placeholder}]),
+            )]),
+            acl_groups: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        ..GatewayConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let validator = dir.path().join("echo-validator");
+    std::fs::write(&validator, "#!/bin/sh\ncat \"$7\" >&2\nexit 1\n").unwrap();
+    let mut permissions = std::fs::metadata(&validator).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&validator, permissions).unwrap();
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+    assert!(result.stderr.contains(placeholder), "{}", result.stderr);
 }
 
 fn args_as_strings(settings: &str, spec: &str) -> Vec<String> {
