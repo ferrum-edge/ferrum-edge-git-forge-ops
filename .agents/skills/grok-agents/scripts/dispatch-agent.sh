@@ -126,6 +126,7 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 require_linked_worktree "$physical_root"
+acquire_worktree_dispatch_lock "$physical_root"
 
 # Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
 # exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).
@@ -150,7 +151,7 @@ printf '[grok-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s aut
 # --force:  no per-command approval prompts; worktree isolation is the boundary.
 # --trust:  accept the freshly created worktree as a trusted directory, which the
 #           trust gate otherwise blocks on in a non-TTY.
-exec "$cursor_bin" \
+"$cursor_bin" \
   --print \
   --force \
   --trust \

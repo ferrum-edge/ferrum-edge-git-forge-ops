@@ -40,6 +40,8 @@ Fable.
 This launcher requires Claude subscription authentication from the standalone CLI. It deliberately
 clears API-key, token, custom-base-URL, Bedrock, and Vertex overrides and ignores user, project, and
 local settings, so those sources cannot silently replace the pinned Anthropic model contract.
+Ignoring those settings also disables their hooks and guardrails for the dispatched process; the
+checked-in brief, worktree isolation, and controller review are the applicable safeguards.
 
 ## Isolate every worker
 

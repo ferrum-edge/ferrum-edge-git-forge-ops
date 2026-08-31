@@ -36,6 +36,10 @@ selected this session's model deliberately.
    user explicitly asks for a different opencode zen model (e.g. `opencode/deepseek-v4-pro`). Do not
    silently substitute a different provider or a non-opencode model.
 
+The launcher disables candidate-worktree configuration and external plugins, clears inherited
+custom-config paths, and keeps only the operator's normal global provider authentication. This
+prevents an untrusted PR from replacing the selected provider or loading candidate plugins.
+
 ## Isolate every worker
 
 Create or locate the worker's git worktree before launching opencode. Never launch a write-enabled

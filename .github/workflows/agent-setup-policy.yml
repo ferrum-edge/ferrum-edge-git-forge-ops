@@ -1,0 +1,44 @@
+name: Agent Setup Policy
+
+# pull_request_target keeps this workflow definition on the protected default
+# branch. It never executes candidate code: the candidate is data for the
+# trusted default-branch validator only.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+permissions:
+  contents: read
+
+jobs:
+  validate-trusted-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out candidate as validation data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .agent-setup-candidate
+          persist-credentials: false
+
+      - name: Check out trusted default-branch validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .agent-setup-base
+          persist-credentials: false
+
+      - name: Validate candidate with trusted policy
+        run: |
+          set -euo pipefail
+          validator=.agent-setup-base/.github/scripts/check_agent_setup.py
+          [[ -f "$validator" ]] || {
+            echo "Trusted default-branch validator is unavailable; refusing candidate bootstrap." >&2
+            exit 1
+          }
+          python3 "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"

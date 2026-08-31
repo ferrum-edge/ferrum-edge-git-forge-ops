@@ -3,7 +3,6 @@ name: Agent Setup CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
-    branches: [main]
   push:
     branches: [main]
     paths:
@@ -12,6 +11,8 @@ on:
       - '.github/scripts/check_agent_setup.py'
       - '.github/scripts/tests/test_agent_setup.py'
       - '.github/workflows/agent-setup-ci.yml'
+      - '.github/workflows/agent-setup-policy.yml'
+      - '.github/CODEOWNERS'
 
 permissions:
   contents: read

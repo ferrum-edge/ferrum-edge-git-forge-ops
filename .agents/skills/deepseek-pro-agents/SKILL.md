@@ -49,6 +49,11 @@ worker. The orchestrator selected this session's model deliberately.
    launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
    Qwen/DeepSeek variant and no rolling alias is dispatchable from this skill. Do not
    substitute a different provider or model.
+
+The launcher disables candidate-worktree configuration and external plugins and clears inherited
+custom-config paths. It retains the operator's normal global provider definition plus only the
+documented Alibaba credential, preventing an untrusted PR from replacing the endpoint or loading
+candidate plugins.
 6. The pin is the **dated snapshot**, not the rolling `deepseek-v4-pro` alias. The operator pinned
    `-0813` for its limited-time discounted rate; the rolling alias also serves on this plan, so
    this pin is a cost choice rather than an availability constraint. Re-pin here and in

@@ -40,6 +40,11 @@ model and reasoning effort deliberately.
 5. Use `danger-full-access` only for a trusted repository task where the user's requested workflow
    authorizes implementation. Worktree isolation prevents git collisions; it is not a host sandbox.
 
+The launcher keeps the operator's normal Codex credential store but ignores user configuration,
+pins the `openai` provider on the command line, and clears inherited OpenAI endpoint and API-key
+overrides. This prevents a candidate worktree or shell environment from replacing the selected
+subscription-backed model contract.
+
 ## Isolate every worker
 
 Create or locate the worker's git worktree before launching Codex. Never launch a write-enabled

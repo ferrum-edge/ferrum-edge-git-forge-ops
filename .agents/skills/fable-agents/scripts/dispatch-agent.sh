@@ -90,6 +90,7 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 require_linked_worktree "$physical_root"
+acquire_worktree_dispatch_lock "$physical_root"
 
 cd "$physical_worktree"
 
@@ -114,7 +115,7 @@ unset MAX_THINKING_TOKENS
 printf '[fable-agents] dispatch model=claude-fable-5 effort=%s worktree=%s bin=%s\n' \
   "$effort" "$physical_worktree" "$claude_bin" >&2
 
-exec "$claude_bin" -p \
+"$claude_bin" -p \
   --model claude-fable-5 \
   --effort "$effort" \
   --setting-sources '' \

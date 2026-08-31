@@ -50,6 +50,11 @@ worker. The orchestrator selected this session's model deliberately.
    Qwen/DeepSeek variant and no rolling alias is dispatchable from this skill. Do not
    substitute a different provider or model.
 
+The launcher disables candidate-worktree configuration and external plugins and clears inherited
+custom-config paths. It retains the operator's normal global provider definition plus only the
+documented Alibaba credential, preventing an untrusted PR from replacing the endpoint or loading
+candidate plugins.
+
 ## Isolate every worker
 
 Create or locate the worker's git worktree before launching opencode. Never launch a write-enabled

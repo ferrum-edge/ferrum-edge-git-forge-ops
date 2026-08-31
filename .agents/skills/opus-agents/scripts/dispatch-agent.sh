@@ -116,6 +116,7 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 require_linked_worktree "$physical_root"
+acquire_worktree_dispatch_lock "$physical_root"
 
 cd "$physical_worktree"
 
@@ -145,7 +146,7 @@ fi
 printf '[opus-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s\n' \
   "$model" "$effort" "$fast" "$physical_worktree" "$claude_bin" >&2
 
-exec "$claude_bin" -p \
+"$claude_bin" -p \
   --model "$model" \
   --effort "$effort" \
   --setting-sources '' \

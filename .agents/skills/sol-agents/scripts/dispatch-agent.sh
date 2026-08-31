@@ -101,14 +101,18 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 require_linked_worktree "$physical_root"
+acquire_worktree_dispatch_lock "$physical_root"
+isolate_codex_provider
 
 cd "$physical_worktree"
 
 printf '[sol-agents] dispatch model=gpt-5.6-sol effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
   "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
 
-exec "$codex_bin" exec \
+"$codex_bin" exec \
   --model gpt-5.6-sol \
+  --ignore-user-config \
+  --config 'model_provider="openai"' \
   --config "model_reasoning_effort=\"$effort\"" \
   --config "service_tier=\"$service_tier\"" \
   --sandbox danger-full-access \

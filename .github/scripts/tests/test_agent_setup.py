@@ -1,5 +1,7 @@
 import importlib.util
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,8 +33,10 @@ def valid_launcher(name: str) -> str:
     lines = [
         "#!/usr/bin/env bash",
         'require_linked_worktree "$physical_root"',
+        'acquire_worktree_dispatch_lock "$physical_root"',
     ]
-    if name in check_agent_setup.CLAUDE_LAUNCHER_SKILLS:
+    if name in check_agent_setup.CLAUDE_LAUNCHER_FLOOR:
+        lines.append("resolve_agent_bin claude")
         lines.extend(f"unset {variable}" for variable in check_agent_setup.CLAUDE_ENV_OVERRIDES)
         lines.append("--setting-sources ''")
     return "\n".join(lines) + "\n"
@@ -50,10 +54,18 @@ def write_valid_setup(
     scripts.mkdir()
     (agent / "SKILL.md").write_text(skill_text(name), encoding="utf-8")
     (references / "agent-brief.md").write_text(
-        "\n".join(check_agent_setup.MANDATORY_COMMANDS), encoding="utf-8"
+        "\n".join(
+            (
+                check_agent_setup.IMPLEMENTER_UNTRUSTED_GUARD,
+                *check_agent_setup.MANDATORY_COMMANDS,
+                *check_agent_setup.BRIEF_INVARIANTS,
+            )
+        ),
+        encoding="utf-8",
     )
     (references / "continuation-brief.md").write_text(
-        "Continue the assigned work.\n", encoding="utf-8"
+        f"Continue the assigned work. {check_agent_setup.CONTINUATION_UNTRUSTED_GUARD}.\n",
+        encoding="utf-8",
     )
     launcher = scripts / "dispatch-agent.sh"
     launcher.write_text(valid_launcher(name), encoding="utf-8")
@@ -61,7 +73,13 @@ def write_valid_setup(
 
     shared = root / ".agents" / "skills" / "_lib" / "resolve-agent-bin.sh"
     shared.parent.mkdir(parents=True, exist_ok=True)
-    shared.write_text("require_linked_worktree() { :; }\n", encoding="utf-8")
+    shared.write_text(
+        "require_linked_worktree() { :; }\n"
+        "acquire_worktree_dispatch_lock() { :; }\n"
+        "isolate_codex_provider() { :; }\n"
+        "isolate_opencode_provider() { :; }\n",
+        encoding="utf-8",
+    )
     (root / ".claude" / "rules").mkdir(parents=True, exist_ok=True)
     (root / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
     if claude_mirror:
@@ -76,12 +94,43 @@ def write_valid_setup(
         "on:\n"
         "  pull_request:\n"
         "    types: [opened, synchronize, reopened, edited]\n"
-        "    branches: [main]\n"
         "ref: ${{ github.event.repository.default_branch }}\n"
         "validator=.agent-setup-base/.github/scripts/check_agent_setup.py\n"
         '[[ -f "$validator" ]]\n'
         "else\n"
         "validator=.github/scripts/check_agent_setup.py\n",
+        encoding="utf-8",
+    )
+    policy = root / ".github" / "workflows" / "agent-setup-policy.yml"
+    policy.write_text(
+        "on:\n"
+        "  pull_request_target:\n"
+        "    types:\n"
+        "      - opened\n"
+        "      - synchronize\n"
+        "      - reopened\n"
+        "      - edited\n"
+        "repository: ${{ github.event.pull_request.head.repo.full_name }}\n"
+        "ref: ${{ github.event.pull_request.head.sha }}\n"
+        "ref: ${{ github.event.repository.default_branch }}\n"
+        "validator=.agent-setup-base/.github/scripts/check_agent_setup.py\n"
+        '[[ -f "$validator" ]]\n'
+        'python3 "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"\n',
+        encoding="utf-8",
+    )
+    codeowners = root / ".github" / "CODEOWNERS"
+    codeowners.write_text(
+        "\n".join(
+            f"{path} {check_agent_setup.CODEOWNER}"
+            for path in (
+                "/.github/CODEOWNERS",
+                "/.github/workflows/agent-setup-ci.yml",
+                "/.github/workflows/agent-setup-policy.yml",
+                "/.github/scripts/check_agent_setup.py",
+                "/.github/scripts/tests/test_agent_setup.py",
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
     return agent
@@ -152,6 +201,18 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("Markdown link escapes repository", joined)
         self.assertIn("referenced path does not exist", joined)
 
+    def test_rejects_missing_markdown_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            (agent / "references" / "notes.md").write_text(
+                "[missing](missing.md)\n", encoding="utf-8"
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(
+            any("Markdown link target does not exist" in item for item in violations)
+        )
+
     def test_rejects_symlinked_skill_and_support_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -171,6 +232,17 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("references directory must not be a symlink", joined)
         self.assertIn("scripts directory must not be a symlink", joined)
 
+    def test_rejects_symlinked_skill_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            agent_root = root / ".agents" / "skills"
+            real_agent_root = root / ".agents" / "real-skills"
+            agent_root.rename(real_agent_root)
+            agent_root.symlink_to(real_agent_root, target_is_directory=True)
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(any("agent skill root must not be a symlink" in item for item in violations))
+
     def test_requires_claude_mirror_except_for_claude_native_launchers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -182,6 +254,18 @@ class AgentSetupTests(unittest.TestCase):
             root = Path(directory)
             write_valid_setup(root, "fable-agents", claude_mirror=False)
             self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+    def test_rejects_unexpected_claude_mirror(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root, "fable-agents", claude_mirror=False)
+            mirror = root / ".claude" / "skills" / "fable-agents"
+            mirror.mkdir()
+            (mirror / "SKILL.md").write_text(
+                skill_text("fable-agents", claude=True), encoding="utf-8"
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(any("unexpected Claude mirror" in item for item in violations))
 
     def test_claude_launchers_must_clear_every_override_and_settings_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -198,6 +282,64 @@ class AgentSetupTests(unittest.TestCase):
         joined = "\n".join(violations)
         self.assertIn("inherited CLAUDE_CODE_USE_VERTEX is not cleared", joined)
         self.assertIn("user/project/local settings are not disabled", joined)
+
+    def test_behavioral_launcher_detection_covers_new_provider_wrappers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text(
+                valid_launcher("sample")
+                + "resolve_agent_bin claude\n"
+                + '"$claude_bin" -p\n',
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(any("inherited ANTHROPIC_API_KEY" in item for item in violations))
+
+    def test_codex_and_opencode_launchers_require_provider_isolation(self):
+        for provider in ("codex", "opencode"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                agent = write_valid_setup(root)
+                launcher = agent / "scripts" / "dispatch-agent.sh"
+                launcher.write_text(
+                    valid_launcher("sample") + f"resolve_agent_bin {provider}\n",
+                    encoding="utf-8",
+                )
+                violations = check_agent_setup.collect_violations(root)
+            self.assertTrue(
+                any(f"missing {provider if provider == 'opencode' else 'Codex'} provider isolation" in item for item in violations)
+            )
+
+    def test_briefs_require_untrusted_guidance_and_repository_invariants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            implementer = agent / "references" / "agent-brief.md"
+            continuation = agent / "references" / "continuation-brief.md"
+            implementer.write_text(
+                implementer.read_text(encoding="utf-8")
+                .replace(check_agent_setup.IMPLEMENTER_UNTRUSTED_GUARD, "")
+                .replace(check_agent_setup.BRIEF_INVARIANTS[0], ""),
+                encoding="utf-8",
+            )
+            continuation.write_text("Continue.\n", encoding="utf-8")
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn("missing untrusted-input guidance", joined)
+        self.assertIn("missing repository invariant", joined)
+
+    def test_dispatcher_requires_worktree_check_and_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn("does not enforce a linked worktree", joined)
+        self.assertIn("does not lock its target worktree", joined)
 
     def test_sol_compatibility_briefs_must_match_canonical_references(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -241,7 +383,49 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("github.event.pull_request.base.sha", joined)
         self.assertIn("candidate validator for bootstrap", joined)
 
-    def test_linked_worktree_helper_rejects_primary_and_accepts_linked(self):
+    def test_workflow_requires_policy_file_and_rejects_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            policy = root / ".github" / "workflows" / "agent-setup-policy.yml"
+            policy.unlink()
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(any("missing agent setup workflow" in item for item in violations))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            policy = root / ".github" / "workflows" / "agent-setup-policy.yml"
+            real_policy = policy.with_name("real-policy.yml")
+            policy.rename(real_policy)
+            policy.symlink_to(real_policy)
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(any("workflow must not be a symlink" in item for item in violations))
+
+    def test_workflow_accepts_quoted_inline_types_and_rejects_branch_filters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            workflow = root / ".github" / "workflows" / "agent-setup-ci.yml"
+            text = workflow.read_text(encoding="utf-8").replace(
+                "types: [opened, synchronize, reopened, edited]",
+                "types: ['opened', \"synchronize\", reopened, edited]",
+            )
+            workflow.write_text(text, encoding="utf-8")
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+            workflow.write_text(
+                text.replace(
+                    "    types: ['opened', \"synchronize\", reopened, edited]\n",
+                    "    types: ['opened', \"synchronize\", reopened, edited]\n    branches: [release]\n",
+                ),
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(any("must cover non-main and stacked" in item for item in violations))
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_linked_worktree_helper_rejects_primary_controller_and_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             linked = Path(directory) / "linked"
@@ -276,10 +460,49 @@ class AgentSetupTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
+                cwd=directory,
             )
+            controller = subprocess.run(
+                ["bash", "-c", command, "bash", str(check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"), str(linked)],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=linked,
+            )
+
+            lock_command = (
+                'source "$1"; require_linked_worktree "$2"; '
+                'acquire_worktree_dispatch_lock "$2"; printf "ready\\n"; sleep 30'
+            )
+            holder = subprocess.Popen(
+                ["bash", "-c", lock_command, "bash", str(check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"), str(linked)],
+                cwd=directory,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            self.assertEqual(holder.stdout.readline(), "ready\n")
+            duplicate = subprocess.run(
+                ["bash", "-c", lock_command.replace('; printf "ready\\n"; sleep 30', ""), "bash", str(check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"), str(linked)],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=directory,
+            )
+            os.killpg(holder.pid, signal.SIGTERM)
+            try:
+                holder.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(holder.pid, signal.SIGKILL)
+                holder.communicate(timeout=5)
         self.assertNotEqual(primary.returncode, 0)
         self.assertIn("primary checkout", primary.stderr)
         self.assertEqual(worker.returncode, 0, worker.stderr)
+        self.assertNotEqual(controller.returncode, 0)
+        self.assertIn("controller checkout", controller.stderr)
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn("concurrent dispatch", duplicate.stderr)
 
     def test_expands_every_braced_rule_path(self):
         self.assertEqual(
