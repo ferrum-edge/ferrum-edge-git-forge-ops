@@ -1,0 +1,40 @@
+name: GitHub Settings Audit
+
+# Scheduled events always load workflow code from the default branch. Keep
+# manual dispatch disabled: a dispatch can select another ref, which would let
+# branch-controlled code access the administration-read audit token.
+on:
+  schedule:
+    - cron: '41 8 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  protection-baseline:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out protected default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Audit repository and deployment protections
+        env:
+          # Fine-grained PAT or GitHub App token with Administration: read.
+          # GITHUB_TOKEN cannot read every repository-settings endpoint.
+          GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          STATE_WRITER_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+        run: |
+          python3 .github/scripts/audit_settings.py \
+            --repo "$REPO" \
+            --branch "$DEFAULT_BRANCH" \
+            --state-writer-app-id "$STATE_WRITER_APP_ID" \
+            --required-check 'Rust CI / check' \
+            --required-check 'Security / cargo-audit' \
+            --required-check 'Security / supply-chain-policy' \
+            --required-check 'GitForgeOps State Guard / reject-state-edits' \
+            --required-check 'GitForgeOps PR Static Validation / required-static-validation'

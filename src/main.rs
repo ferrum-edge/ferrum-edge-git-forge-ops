@@ -73,8 +73,13 @@ async fn main() {
             )
             .await
         }
-        cli::Commands::Review { pr } => cmd_review(pr, explicit_env.as_deref()).await,
-        cli::Commands::Envs { format } => cmd_envs(format),
+        cli::Commands::Review { pr, require_live } => {
+            cmd_review(pr, require_live, explicit_env.as_deref()).await
+        }
+        cli::Commands::Envs {
+            format,
+            include_scopes,
+        } => cmd_envs(format, include_scopes),
         cli::Commands::Rotate {
             consumer,
             credential,
@@ -1714,6 +1719,7 @@ async fn cmd_import(
 
 async fn cmd_review(
     pr: Option<u64>,
+    require_live: bool,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
@@ -1851,12 +1857,41 @@ async fn cmd_review(
         }
     }
 
+    if require_live {
+        if let Some(error) = comparison_error {
+            return Err(gitforgeops::error::Error::Config(format!(
+                "trusted PR review requires a complete live gateway comparison: {error}"
+            ))
+            .into());
+        }
+    }
+
     let _ = !secret_report.results.is_empty();
     Ok(())
 }
 
-fn cmd_envs(format: cli::EnvsFormat) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_envs(
+    format: cli::EnvsFormat,
+    include_scopes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let repo = load_repo_config()?;
+    if include_scopes {
+        if !matches!(format, cli::EnvsFormat::Json) {
+            return Err(gitforgeops::error::Error::Config(
+                "envs --include-scopes requires --format json".to_string(),
+            )
+            .into());
+        }
+        let scopes = match repo {
+            Some(r) => r.environment_scopes(),
+            None => vec![gitforgeops::config::repo_config::EnvironmentScope {
+                environment: ResolvedEnv::default_env_name(),
+                namespaces: None,
+            }],
+        };
+        println!("{}", serde_json::to_string(&scopes)?);
+        return Ok(());
+    }
     let names = match repo {
         Some(r) => r.environment_names(),
         None => vec![ResolvedEnv::default_env_name()],

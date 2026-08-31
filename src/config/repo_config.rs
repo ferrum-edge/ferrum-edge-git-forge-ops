@@ -95,6 +95,16 @@ pub struct RepoConfig {
     pub default_environment: Option<String>,
 }
 
+/// Environment routing data safe to hand to CI matrix construction.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EnvironmentScope {
+    pub environment: String,
+    /// `None` means every protected-branch resource namespace. `Some` is an
+    /// explicit filter/ownership allowlist that the caller must intersect
+    /// with those directories.
+    pub namespaces: Option<Vec<String>>,
+}
+
 fn default_version() -> u32 {
     1
 }
@@ -128,6 +138,29 @@ impl RepoConfig {
 
     pub fn environment_names(&self) -> Vec<String> {
         self.environments.keys().cloned().collect()
+    }
+
+    pub fn environment_scopes(&self) -> Vec<EnvironmentScope> {
+        self.environments
+            .iter()
+            .map(|(name, env)| {
+                let mut namespaces = match &env.namespace_filter {
+                    Some(namespace) => Some(vec![namespace.clone()]),
+                    None if matches!(env.ownership.mode, OwnershipMode::Exclusive) => {
+                        env.ownership.namespaces.clone()
+                    }
+                    None => None,
+                };
+                if let Some(values) = &mut namespaces {
+                    values.sort();
+                    values.dedup();
+                }
+                EnvironmentScope {
+                    environment: name.clone(),
+                    namespaces,
+                }
+            })
+            .collect()
     }
 
     fn validate(&self) -> crate::error::Result<()> {

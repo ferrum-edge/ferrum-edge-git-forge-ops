@@ -24,8 +24,8 @@ gitforgeops plan                                          # Validate + diff + br
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH [--output-dir DIR]  # --from-api is a flag, not a value
-gitforgeops review [--pr N]                               # Post structured PR comment via GitHub API
-gitforgeops envs [--format json|text]                     # List environments (used by CI matrix)
+gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
+gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
   [--namespace NS] [--recipient GH_LOGIN]
 ```
@@ -46,10 +46,20 @@ cargo fmt --all && cargo fmt --all -- --check
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test --test unit_tests`
 
-`.github/workflows/rust-ci.yml` runs those same three on every PR that touches
-`src/**`, `tests/**`, `Cargo.{toml,lock}`, or the Dockerfile. Resource-only
-PRs (touching `resources/**`, `overlays/**`, `.gitforgeops/**`) skip Rust CI
-and run `validate-pr.yml` instead; the two paths are mutually exclusive.
+`.github/workflows/rust-ci.yml` reports its required status on every PR and
+runs those same three commands when the PR touches current **or previous**
+Rust/build/workspace input paths (`src`, `tests`, benches/examples, `build.rs`,
+`.cargo`, Cargo manifests/lockfiles, toolchain/lint config, or Dockerfile).
+Resource-only PRs skip the Rust steps
+and run secretless `validate-pr.yml` instead. `trusted-pr-review.yml` is a
+default-branch `workflow_run` that accepts only manifest-verified resource and
+overlay YAML, copies environment/policy routing from the protected branch, and
+runs a trusted binary with `FERRUM_NAMESPACE` set to one protected-branch
+resource namespace per job, intersected with the environment's protected
+namespace scope. `review --require-live` fails that job when comparison is
+unavailable. Fork PRs and new/remapped namespaces never enter the privileged
+live-read boundary. Rust is pinned to 1.98.0 in
+`rust-toolchain.toml`; external Actions use full commit SHAs.
 
 ## Architecture
 
@@ -129,16 +139,21 @@ Configured per environment in repo config.
 
 The state file is the trust boundary for both of those, and it is CI-authored:
 `apply-on-merge.yml` / `rotate.yml` commit `.state/<env>.json` back to `main`
-as `gitforgeops[bot]`, `.gitignore` tracks `.state/*.json` (ignoring only locks
-and temp files), and `state-guard.yml` fails any PR touching `.state/**` unless
-a maintainer adds the `gitforgeops/state-override` label. That workflow runs
+as `gitforgeops[bot]` with a short-lived, contents-only GitHub App token;
+`.gitignore` tracks `.state/*.json` (ignoring only locks and temp files), and
+`state-guard.yml` fails any PR touching `.state/**` (including rename source
+paths) unless the latest effective
+`gitforgeops/state-override` label actor currently has `write`, `maintain`, or
+`admin` permission. It rejects triage/read/deleted/ambiguous actors and records
+the event ID/time/permission. Label changes rerun under per-PR concurrency so
+removed authorization cannot leave a stale success. That workflow runs
 on **every** PR with no `paths:` filter and decides internally whether
 `.state/` was touched — a path-filtered workflow reports no status on
 non-matching PRs, which stalls them forever once the check is required.
-Requiring it is a deliberate opt-in with a cost: a ruleset that requires the
-check also rejects `github-actions[bot]`'s direct push of the ledger
-(`GH013`), and GitHub Actions cannot hold a ruleset bypass, so the
-state-commit steps would first need a PAT or App token. Advisory by default. Keep the fence there
+The launch baseline requires the check and gives only the dedicated App an
+always-on `main` ruleset bypass. Environment secrets
+`GITFORGEOPS_STATE_APP_ID` / `GITFORGEOPS_STATE_APP_PRIVATE_KEY` feed the
+commit workflows; see `docs/github-launch-controls.md`. Keep the fence there
 rather than narrowing what the binary reads out of the ledger — shared mode
 must keep reconciling namespaces the repo no longer declares, or a PR that
 removes a namespace's last resource orphans it on the gateway forever.
@@ -224,7 +239,10 @@ each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
 auto-sharded by fnv-style hash when a bundle approaches 40 KB. The apply
 workflow's "Load credential bundles" step collects all matching secrets via
 `${{ toJSON(secrets) }}`, writes the filtered payload to a runner-local file,
-and exports the path as `FERRUM_CREDS_JSON_FILE`. Inline `FERRUM_CREDS_JSON`
+strictly validates the outer inventory, reserved shard names, and every inner
+string-to-string map, writes a new 0600 file without following/overwriting a
+destination, and exports the path as `FERRUM_CREDS_JSON_FILE`. Malformed input
+fails closed rather than becoming an empty bundle. Inline `FERRUM_CREDS_JSON`
 is still supported for small local tests.
 
 Allocation (first apply, or rotation): generate random value → libsodium

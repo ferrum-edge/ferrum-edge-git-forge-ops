@@ -1,50 +1,77 @@
 name: Rust CI
 
-# Runs on PRs / pushes that touch the tool's source. Path-filtered so resource-
-# only PRs (which modify resources/**, overlays/**, .gitforgeops/**) do NOT
-# trigger a cargo build — those PRs are served by validate-pr.yml instead.
-#
-# Conversely, resource workflows are filtered to their own paths and do not fire
-# on code-only PRs. The two CI paths are mutually exclusive except for PRs that
-# touch both categories (rare, by design).
+# The workflow reports its `check` status on every PR so it is safe to require
+# in a ruleset. Resource-only PRs still skip the Rust checkout/build internally
+# and are served by validate-pr.yml; a top-level paths filter would leave the
+# required check permanently "Expected" on those PRs.
 
 on:
   pull_request:
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'Dockerfile'
-      - '.github/workflows/rust-ci.yml'
   push:
     branches: [main]
     paths:
       - 'src/**'
       - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+      - 'benches/**'
+      - 'examples/**'
+      - '.cargo/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'build.rs'
       - 'rust-toolchain.toml'
+      - 'rust-toolchain'
+      - 'rustfmt.toml'
+      - '.rustfmt.toml'
+      - 'clippy.toml'
+      - '.clippy.toml'
       - 'Dockerfile'
       - '.github/workflows/rust-ci.yml'
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Detect Rust-impacting PR paths
+        if: github.event_name == 'pull_request'
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DECLARED_CHANGED: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          pages_file=$(mktemp)
+          trap 'rm -f "$pages_file"' EXIT
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --paginate --slurp > "$pages_file"
+          result=$(python3 .github/scripts/changed_files.py \
+            "$pages_file" "$DECLARED_CHANGED" rust)
+          rust=$(jq -r '.matches' <<< "$result")
+          if [ "$(jq -r '.complete' <<< "$result")" != true ]; then
+            echo "::warning::Changed-file pagination was incomplete; running Rust CI fail-safe."
+            rust=true
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
         with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v6
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -55,28 +82,57 @@ jobs:
             ${{ runner.os }}-rust-ci-
 
       - name: cargo fmt --check
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
         run: cargo test --test unit_tests
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
+      pull-requests: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Detect Rust-impacting PR paths
+        if: github.event_name == 'pull_request'
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DECLARED_CHANGED: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          pages_file=$(mktemp)
+          trap 'rm -f "$pages_file"' EXIT
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --paginate --slurp > "$pages_file"
+          result=$(python3 .github/scripts/changed_files.py \
+            "$pages_file" "$DECLARED_CHANGED" rust)
+          rust=$(jq -r '.matches' <<< "$result")
+          if [ "$(jq -r '.complete' <<< "$result")" != true ]; then rust=true; fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
         with:
+          toolchain: 1.98.0
           components: llvm-tools-preview
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v6
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -88,15 +144,18 @@ jobs:
             ${{ runner.os }}-rust-coverage-
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.86.5
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.0
 
       - name: cargo llvm-cov
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
         run: cargo llvm-cov --test unit_tests --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: lcov
           path: lcov.info

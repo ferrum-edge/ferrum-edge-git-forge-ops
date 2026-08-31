@@ -98,6 +98,39 @@ environments:
 }
 
 #[test]
+fn repo_config_emits_live_review_namespace_scopes() {
+    let yaml = r#"
+environments:
+  all-shared:
+    ownership:
+      mode: shared
+  filtered:
+    namespace_filter: team-a
+    ownership:
+      mode: shared
+  production:
+    ownership:
+      mode: exclusive
+      namespaces: [team-b, team-a, team-b]
+"#;
+    let file = write_repo_config(yaml);
+    let config = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+
+    let scopes = config.environment_scopes();
+
+    assert_eq!(scopes[0].environment, "all-shared");
+    assert_eq!(scopes[0].namespaces, None);
+    assert_eq!(
+        scopes[1].namespaces.as_deref(),
+        Some(&["team-a".to_string()][..])
+    );
+    assert_eq!(
+        scopes[2].namespaces.as_deref(),
+        Some(&["team-a".to_string(), "team-b".to_string()][..])
+    );
+}
+
+#[test]
 fn repo_config_rejects_prune_threshold_above_100() {
     // delete_pct in cmd_apply is 0..=100. A YAML value > 100 would make the
     // guard `delete_pct > threshold` never fire — mass deletions would

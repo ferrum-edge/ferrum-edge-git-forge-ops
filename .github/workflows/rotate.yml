@@ -21,25 +21,82 @@ on:
         type: string
         default: ferrum
 
-# Rotation commits state back to main; needs write on contents.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require protected default branch
+        env:
+          SOURCE_REF: ${{ github.ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          [ "$SOURCE_REF" = "$EXPECTED_REF" ] || {
+            echo "::error::Credential rotation may run only from $EXPECTED_REF."
+            exit 1
+          }
+
   rotate:
-    runs-on: ubuntu-latest
+    needs: preflight
+    runs-on: ubuntu-24.04
     environment: ${{ inputs.environment }}
     concurrency:
       group: ferrum-apply-${{ inputs.environment }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v7
+      - name: Validate environment input
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] || {
+            echo "::error::Environment must be a single safe path component."
+            exit 1
+          }
+
+      - name: Validate API-mode routing
+        id: deployment-mode
+        env:
+          RAW_MODE: ${{ vars.FERRUM_GATEWAY_MODE }}
+        run: |
+          set -euo pipefail
+          mode=$(printf '%s' "${RAW_MODE:-api}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          [ -n "$mode" ] || mode=api
+          case "$mode" in
+            api) ;;
+            file)
+              echo "::error::Credential rotation requires API mode; file mode has no live consumer update path."
+              exit 1
+              ;;
+            *)
+              echo "::error::Invalid FERRUM_GATEWAY_MODE '$RAW_MODE'; expected api or file."
+              exit 1
+              ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      - name: Mint narrowly scoped state-writer token
+        id: state-writer
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.GITFORGEOPS_STATE_APP_ID }}
+          private-key: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Check out protected main for rotation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          token: ${{ steps.state-writer.outputs.token }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
+        with:
+          toolchain: 1.98.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -49,6 +106,18 @@ jobs:
 
       - name: Install gitforgeops
         run: cargo install --path . --locked
+
+      - name: Require a configured environment
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          configured=$(gitforgeops envs --format json)
+          jq -e --arg target "$INPUT_ENVIRONMENT" \
+            'type == "array" and index($target) != null' <<< "$configured" >/dev/null || {
+            echo "::error::Environment is not declared by the protected main configuration."
+            exit 1
+          }
 
       - name: Load credential bundles
         # File-path routing around OS env-block size limits. See
@@ -60,19 +129,8 @@ jobs:
           cat > "$all_secrets" <<'SECRETS_EOF'
           ${{ toJSON(secrets) }}
           SECRETS_EOF
-          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-$$.json"
-          python3 - "$all_secrets" "$creds_file" <<'PY'
-          import json, sys
-          with open(sys.argv[1]) as f:
-              try:
-                  data = json.load(f)
-              except json.JSONDecodeError:
-                  data = {}
-          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
-          with open(sys.argv[2], "w") as out:
-              json.dump(bundles, out)
-          PY
-          chmod 600 "$creds_file"
+          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
+          python3 .github/scripts/credential_bundles.py "$all_secrets" "$creds_file"
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Rotate
@@ -96,7 +154,7 @@ jobs:
           # binary's mode preflight, write the GitHub Env Secret, and only
           # fail later when the Admin API config was missing — leaving
           # the store mutated with no corresponding gateway push path.
-          FERRUM_GATEWAY_MODE: ${{ vars.FERRUM_GATEWAY_MODE || 'api' }}
+          FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
@@ -110,6 +168,7 @@ jobs:
           INPUT_NAMESPACE: ${{ inputs.namespace }}
           INPUT_RECIPIENT: ${{ github.actor }}
         run: |
+          set -euo pipefail
           gitforgeops rotate \
             --consumer "$INPUT_CONSUMER" \
             --credential "$INPUT_CREDENTIAL" \
