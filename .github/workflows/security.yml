@@ -55,7 +55,7 @@ jobs:
           # PR #87 adds the checker itself, so its protected base cannot supply
           # it. This already-reviewed commit is a one-time immutable fallback;
           # after merge the default-branch copy always wins.
-          ref: a41c811cd39e3a7b9def9dac5fa8022587f1024e
+          ref: f15d4b089789e73e4db337b29c89603ac23371c6
           path: bootstrap-supply-chain
           persist-credentials: false
 
