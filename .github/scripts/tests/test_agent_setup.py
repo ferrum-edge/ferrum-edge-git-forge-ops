@@ -27,7 +27,9 @@ class AgentSetupTests(unittest.TestCase):
             claude.mkdir(parents=True)
             rules.mkdir(parents=True)
             (agent / "SKILL.md").write_text(
-                "---\nname: wrong\n---\ndispatched worker\nFerrum Edge task\n",
+                "---\nname: wrong\n---\ndispatched worker\nFerrum Edge task\n"
+                "Ask the user for approval before publishing.\n"
+                "[missing](references/missing.md)\n",
                 encoding="utf-8",
             )
             (agent / "scripts" / "dispatch-agent.sh").write_text(
@@ -36,7 +38,7 @@ class AgentSetupTests(unittest.TestCase):
             (agent / "references" / "agent-brief.md").write_text(
                 "\n".join(check_agent_setup.MANDATORY_COMMANDS), encoding="utf-8"
             )
-            (agent / "references" / "continuation-brief.md").write_text(
+            (agent / "references" / "notes.md").write_text(
                 "Rerun known flakes.\n", encoding="utf-8"
             )
             (claude / "SKILL.md").write_text(
@@ -59,8 +61,10 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("does not match directory", joined)
         self.assertIn("frontmatter is missing paths", joined)
         self.assertIn("referenced path does not exist", joined)
+        self.assertIn("Markdown link target does not exist", joined)
         self.assertIn("dispatcher is not executable", joined)
         self.assertIn("missing explicit user authorization for merging", joined)
+        self.assertIn("continuation-brief.md: missing required brief", joined)
         self.assertIn("path scope matches nothing", joined)
         self.assertIn("stale companion-repository marker 'known flakes'", joined)
         self.assertIn("setup content must not be a symlink", joined)
@@ -81,6 +85,32 @@ class AgentSetupTests(unittest.TestCase):
                 "tests/integration/b.rs",
             ],
         )
+
+    def test_allows_relative_links_and_agent_reference_punctuation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / ".agents" / "skills" / "sample"
+            (agent / "scripts").mkdir(parents=True)
+            (agent / "references").mkdir()
+            (agent / "SKILL.md").write_text(
+                "---\nname: sample\n---\n"
+                "This dispatched worker cannot recurse.\n"
+                "Merge only when the user explicitly authorizes it.\n"
+                "[brief](references/agent-brief.md)\n"
+                ".agents/skills/sample/references/agent-brief.md.\n",
+                encoding="utf-8",
+            )
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            (agent / "references" / "agent-brief.md").write_text(
+                "\n".join(check_agent_setup.MANDATORY_COMMANDS), encoding="utf-8"
+            )
+            (agent / "references" / "continuation-brief.md").write_text(
+                "Continue the assigned work.\n", encoding="utf-8"
+            )
+
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
 
 
 if __name__ == "__main__":

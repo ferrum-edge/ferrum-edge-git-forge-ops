@@ -14,8 +14,10 @@ ROOT = Path(__file__).resolve().parents[2]
 FRONTMATTER = re.compile(r"\A---\n(?P<body>.*?)\n---\n", re.DOTALL)
 NAME_LINE = re.compile(r"^name:\s*([A-Za-z0-9._-]+)\s*$", re.MULTILINE)
 AGENT_REFERENCE = re.compile(r"\.agents/skills/([A-Za-z0-9._-]+)(/[A-Za-z0-9._/-]+)?")
+MARKDOWN_LINK = re.compile(r"\[[^\]\n]+\]\((?P<target><[^>\n]+>|[^)\s]+)")
 MERGE_AUTHORIZATION = re.compile(
-    r"user\b.{0,64}\b(?:authoriz|approv|confirm)", re.IGNORECASE | re.DOTALL
+    r"^\s*(?:\d+[.)]\s*)?Merge only when[^\n]*\buser\b[^\n]*\b(?:authoriz|approv)",
+    re.IGNORECASE | re.MULTILINE,
 )
 STALE_BRANDING = re.compile(
     r"\bFerrum Edge (?=(?:repository|codebase|task|issue|PR|implementer|worker|agent))",
@@ -130,6 +132,32 @@ def text_files(directories: tuple[Path, ...]) -> list[Path]:
     return sorted(found)
 
 
+def validate_markdown_links(root: Path, source: Path, text: str) -> list[str]:
+    violations: list[str] = []
+    for match in MARKDOWN_LINK.finditer(text):
+        target = match.group("target").strip("<>")
+        if target.startswith(("#", "//")) or re.match(
+            r"^[A-Za-z][A-Za-z0-9+.-]*:", target
+        ):
+            continue
+        target = target.split("#", 1)[0].split("?", 1)[0]
+        if not target:
+            continue
+        referenced = (source.parent / target).resolve()
+        try:
+            relative = referenced.relative_to(root)
+        except ValueError:
+            violations.append(
+                f"{source.relative_to(root)}: Markdown link escapes repository: {target}"
+            )
+            continue
+        if not referenced.exists():
+            violations.append(
+                f"{source.relative_to(root)}: Markdown link target does not exist: {relative}"
+            )
+    return violations
+
+
 def collect_violations(root: Path) -> list[str]:
     root = root.resolve()
     violations: list[str] = []
@@ -161,12 +189,13 @@ def collect_violations(root: Path) -> list[str]:
         if MERGE_AUTHORIZATION.search(text) is None:
             violations.append(f"{relative}: missing explicit user authorization for merging")
         for match in AGENT_REFERENCE.finditer(text):
-            suffix = match.group(2) or ""
+            suffix = (match.group(2) or "").rstrip(".,;:")
             referenced = agent_skills / match.group(1) / suffix.lstrip("/")
             if not referenced.exists():
                 violations.append(
                     f"{relative}: referenced path does not exist: {referenced.relative_to(root)}"
                 )
+        violations.extend(validate_markdown_links(root, skill, text))
 
     for rule in sorted(claude_rules.glob("*.md")):
         relative = rule.relative_to(root)
@@ -184,25 +213,27 @@ def collect_violations(root: Path) -> list[str]:
         else:
             violations.extend(validate_rule_paths(root, rule, paths))
 
-    briefs = sorted(agent_skills.glob("*/references/agent-brief.md")) + [
-        claude_skills / "sol-agents" / "agent-brief.md"
-    ]
-    for brief in briefs:
-        relative = brief.relative_to(root)
-        if brief.is_symlink():
-            violations.append(f"{relative}: implementer brief must not be a symlink")
-            continue
-        if not brief.is_file():
-            violations.append(f"{relative}: missing implementer brief")
-            continue
-        text = read_text(brief)
-        for command in MANDATORY_COMMANDS:
-            if command not in text:
-                violations.append(f"{relative}: missing mandatory command {command!r}")
-
     for skill_dir in sorted(path for path in agent_skills.iterdir() if path.is_dir()):
         if skill_dir.name == "_lib":
             continue
+        references = skill_dir / "references"
+        for brief_name in ("agent-brief.md", "continuation-brief.md"):
+            brief = references / brief_name
+            relative = brief.relative_to(root)
+            if brief.is_symlink():
+                violations.append(f"{relative}: brief must not be a symlink")
+                continue
+            if not brief.is_file():
+                violations.append(f"{relative}: missing required brief")
+                continue
+            if brief_name == "agent-brief.md":
+                text = read_text(brief)
+                for command in MANDATORY_COMMANDS:
+                    if command not in text:
+                        violations.append(
+                            f"{relative}: missing mandatory command {command!r}"
+                        )
+
         launcher = skill_dir / "scripts" / "dispatch-agent.sh"
         relative = launcher.relative_to(root)
         if launcher.is_symlink():

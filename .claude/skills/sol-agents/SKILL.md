@@ -25,6 +25,12 @@ Write the prompt to a file outside the repo, then launch:
   --effort <medium|high|xhigh>
 ```
 
+Before a fresh implementer dispatch, fetch `origin/main`, create the purpose-named branch, and add
+a dedicated sibling worktree (for example, `git worktree add <ABS_WORKTREE> -b <BRANCH>
+origin/main`). For an existing PR, fetch its head into a dedicated worktree; for a follow-up round,
+reuse that verified PR worktree. Never launch a write-enabled worker in the orchestrator checkout
+or another worker's worktree.
+
 Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet. Never
 infer it from urgency, deadlines, task size, or available credits. Omit it otherwise; the launcher
 pins `service_tier="default"` without the flag and the model's Fast `priority` tier with it.
@@ -62,12 +68,15 @@ Non-negotiables:
 ## Prompt construction (all modes)
 
 Every prompt starts with:
-`First read <path-to>/agent-brief.md and follow it exactly` (implementer mode) or
-`Read <path-to>/continuation-brief.md AND <path-to>/agent-brief.md and follow them`
+`First read <ABS_REPO>/.agents/skills/sol-agents/references/agent-brief.md and follow it exactly`
+(implementer mode) or
+`Read <ABS_REPO>/.agents/skills/sol-agents/references/continuation-brief.md AND
+<ABS_REPO>/.agents/skills/sol-agents/references/agent-brief.md and follow them`
 (fix/shepherd modes — give BOTH absolute paths; the continuation brief defers to
 agent-brief for ground rules and must never be dispatched alone).
-Use the copies in THIS skill directory (they carry worktree isolation, mandatory local validation,
-review-loop discipline, failure-triage rules, and the final-report format). Verify the
+Use only those shared `.agents/skills/sol-agents/references/` paths so Claude and Codex
+orchestrators cannot drift onto private copies. They carry worktree isolation, mandatory local
+validation, review-loop discipline, failure-triage rules, and the final-report format. Verify the
 briefs' review-bot section matches reality before dispatching (Codex vs Claude
 trigger — credits come and go); update the briefs if stale.
 
