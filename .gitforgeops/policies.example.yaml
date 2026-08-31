@@ -89,6 +89,13 @@ policies:
     allowed_service_discovery_upstreams: []
     # - namespace: platform
     #   id: kubernetes-services
+    # Optional control-plane host allowlist for addresses such as Consul.
+    # This is separate from data-plane destinations so allowing Consul does
+    # not also permit direct proxy or upstream traffic to that host. When
+    # omitted, control-plane hosts fall back to allowed_domains for backward
+    # compatibility.
+    allowed_service_discovery_control_plane_addresses: []
+    # - consul.control.internal
     allowed_external_upstreams: []
     # - namespace: platform
     #   id: spec-owned-services

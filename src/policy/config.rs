@@ -141,6 +141,11 @@ pub struct AllowedBackendDomainsRuleConfig {
     /// identity so acknowledging one upstream cannot weaken the whole rule.
     #[serde(default)]
     pub allowed_service_discovery_upstreams: Vec<UpstreamAllowance>,
+    /// Hosts or IP literals allowed for statically configured service-discovery
+    /// control planes such as `consul.address`. When empty, the rule falls back
+    /// to `allowed_domains` for backward compatibility.
+    #[serde(default)]
+    pub allowed_service_discovery_control_plane_addresses: Vec<String>,
     /// Upstreams that intentionally live outside this repository's desired
     /// document, such as shared-mode or OpenAPI-spec-owned resources. Entries
     /// match exact resource identity; their runtime destinations must be

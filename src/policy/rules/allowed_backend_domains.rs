@@ -1,7 +1,7 @@
 use crate::config::GatewayConfig;
 use crate::policy::config::AllowedBackendDomainsRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 pub struct AllowedBackendDomainsRule {
@@ -73,6 +73,30 @@ impl AllowedBackendDomainsRule {
             .any(|pattern| Self::domain_matches(&host, pattern))
     }
 
+    fn classify_domain_allowlist(entries: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut valid = Vec::new();
+        let mut invalid = Vec::new();
+        for entry in entries {
+            let trimmed = entry.trim();
+            let normalized = Self::normalize_domain(trimmed);
+            let suffix = normalized.strip_prefix("*.");
+            let candidate = suffix.unwrap_or(&normalized);
+            let is_valid = if normalized == "*" {
+                trimmed == "*"
+            } else {
+                !candidate.is_empty()
+                    && Self::is_bare_destination(candidate)
+                    && !(suffix.is_some() && Self::parse_ip_literal(candidate).is_some())
+            };
+            if is_valid {
+                valid.push(normalized);
+            } else {
+                invalid.push(entry.clone());
+            }
+        }
+        (valid, invalid)
+    }
+
     fn url_destination_host(address: &str) -> Option<String> {
         let parsed = reqwest::Url::parse(address).ok()?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -93,42 +117,8 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             return findings;
         }
 
-        let mut invalid_domains = Vec::new();
-        let mut allowed_domains = Vec::new();
-        for domain in &self.config.allowed_domains {
-            let trimmed = domain.trim();
-            let normalized = Self::normalize_domain(trimmed);
-            let suffix = normalized.strip_prefix("*.");
-            let candidate = suffix.unwrap_or(&normalized);
-            let valid = if normalized == "*" {
-                trimmed == "*"
-            } else {
-                !candidate.is_empty()
-                    && Self::is_bare_destination(candidate)
-                    && !(suffix.is_some() && Self::parse_ip_literal(candidate).is_some())
-            };
-            if !valid {
-                invalid_domains.push(domain.clone());
-            } else {
-                allowed_domains.push(normalized);
-            }
-        }
-        if allowed_domains.is_empty() {
-            findings.push(PolicyFinding {
-                rule_id: self.rule_id().to_string(),
-                severity: crate::policy::Severity::Error,
-                kind: "PolicyConfig".to_string(),
-                id: self.rule_id().to_string(),
-                namespace: "global".to_string(),
-                message: "enabled policy has no valid allowed_domains entries".to_string(),
-                remediation: Some(
-                    "Add at least one exact host, a nonempty '*.suffix' entry, or the literal '*' catch-all"
-                        .to_string(),
-                ),
-                overridden_by: None,
-            });
-            return findings;
-        }
+        let (allowed_domains, invalid_domains) =
+            Self::classify_domain_allowlist(&self.config.allowed_domains);
         if !invalid_domains.is_empty() {
             findings.push(PolicyFinding {
                 rule_id: self.rule_id().to_string(),
@@ -151,8 +141,63 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 overridden_by: None,
             });
         }
+        if allowed_domains.is_empty() {
+            findings.push(PolicyFinding {
+                rule_id: self.rule_id().to_string(),
+                severity: crate::policy::Severity::Error,
+                kind: "PolicyConfig".to_string(),
+                id: self.rule_id().to_string(),
+                namespace: "global".to_string(),
+                message: "enabled policy has no valid allowed_domains entries".to_string(),
+                remediation: Some(
+                    "Add at least one exact host, a nonempty '*.suffix' entry, or the literal '*' catch-all"
+                        .to_string(),
+                ),
+                overridden_by: None,
+            });
+            return findings;
+        }
         let allowed = allowed_domains.join(", ");
         let allow_all = allowed_domains.iter().any(|domain| domain == "*");
+
+        let (configured_control_plane_addresses, invalid_control_plane_addresses) =
+            Self::classify_domain_allowlist(
+                &self
+                    .config
+                    .allowed_service_discovery_control_plane_addresses,
+            );
+        if !invalid_control_plane_addresses.is_empty() {
+            findings.push(PolicyFinding {
+                rule_id: self.rule_id().to_string(),
+                severity: crate::policy::Severity::Error,
+                kind: "PolicyConfig".to_string(),
+                id: self.rule_id().to_string(),
+                namespace: "global".to_string(),
+                message: format!(
+                    "invalid allowed_service_discovery_control_plane_addresses entries: {}",
+                    invalid_control_plane_addresses
+                        .iter()
+                        .map(|address| format!("'{address}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                remediation: Some(
+                    "Use exact control-plane hosts, IP literals, nonempty '*.suffix' entries, or the literal '*' catch-all"
+                        .to_string(),
+                ),
+                overridden_by: None,
+            });
+        }
+        let allowed_control_plane_addresses = if self
+            .config
+            .allowed_service_discovery_control_plane_addresses
+            .is_empty()
+        {
+            &allowed_domains
+        } else {
+            &configured_control_plane_addresses
+        };
+        let allowed_control_planes = allowed_control_plane_addresses.join(", ");
 
         let mut invalid_dns_override_addresses = Vec::new();
         let configured_dns_override_addresses: Vec<String> = self
@@ -198,7 +243,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 &configured_dns_override_addresses
             };
 
-        let mut upstream_key_counts: HashMap<(&str, &str), usize> = HashMap::new();
+        let mut upstream_key_counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         for upstream in &cfg.upstreams {
             *upstream_key_counts
                 .entry((upstream.namespace.as_str(), upstream.id.as_str()))
@@ -222,7 +267,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 });
             }
         }
-        let declared_upstreams: HashMap<(&str, &str), _> = cfg
+        let declared_upstreams: BTreeMap<(&str, &str), _> = cfg
             .upstreams
             .iter()
             .filter(|upstream| {
@@ -236,7 +281,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 )
             })
             .collect();
-        let mut allowed_service_discovery_upstreams = HashSet::new();
+        let mut allowed_service_discovery_upstreams = BTreeSet::new();
         for upstream in &self.config.allowed_service_discovery_upstreams {
             if upstream.namespace.trim() != upstream.namespace
                 || upstream.id.trim() != upstream.id
@@ -264,7 +309,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             allowed_service_discovery_upstreams
                 .insert((upstream.namespace.as_str(), upstream.id.as_str()));
         }
-        let mut allowed_external_upstreams = HashSet::new();
+        let mut allowed_external_upstreams = BTreeSet::new();
         for upstream in &self.config.allowed_external_upstreams {
             if upstream.namespace.trim() != upstream.namespace
                 || upstream.id.trim() != upstream.id
@@ -360,15 +405,15 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                     && allowed_external_upstreams.contains(&(proxy.namespace.as_str(), upstream_id))
             });
 
-            // When a proxy delegates to a declared upstream in the same
-            // namespace, backend_host is schema filler rather than the routed
-            // backend. Authored targets are checked below, and dynamic service
-            // discovery is rejected because its runtime targets cannot be
-            // proven against this static allowlist.
+            // A blank backend_host is schema filler when a declared upstream
+            // supplies a destination. Any nonblank fallback remains a possible
+            // dial target and must independently satisfy the allowlist.
             let external_upstream_has_no_fallback =
                 uses_allowed_external_upstream && proxy.backend_host.trim().is_empty();
-            if !uses_routable_upstream
-                && !external_upstream_has_no_fallback
+            let routable_upstream_has_no_fallback =
+                uses_routable_upstream && proxy.backend_host.trim().is_empty();
+            if !external_upstream_has_no_fallback
+                && !routable_upstream_has_no_fallback
                 && !Self::is_allowed(&proxy.backend_host, &allowed_domains)
             {
                 let (message, remediation) = if let Some(upstream_id) = upstream_id {
@@ -380,6 +425,16 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                             ),
                             format!(
                                 "Leave backend_host empty for acknowledged external upstream_id '{upstream_id}', or use a fallback matching one of these domains: {allowed}"
+                            ),
+                        )
+                    } else if uses_routable_upstream {
+                        (
+                            format!(
+                                "upstream_id '{upstream_id}' in namespace '{}' has fallback backend_host='{}' outside the allowed domain list ({allowed})",
+                                proxy.namespace, proxy.backend_host
+                            ),
+                            format!(
+                                "Leave backend_host empty when upstream_id '{upstream_id}' is authoritative, or use a fallback matching one of these domains: {allowed}"
                             ),
                         )
                     } else if resolved_upstream.is_some() {
@@ -434,6 +489,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 let disallowed: Vec<&str> = dns_override
                     .split(',')
                     .map(str::trim)
+                    .filter(|destination| !destination.is_empty())
                     .filter(|destination| {
                         !Self::is_allowed(destination, allowed_dns_override_addresses)
                     })
@@ -472,7 +528,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 let consul_host = Self::url_destination_host(&consul.address);
                 if consul_host
                     .as_deref()
-                    .is_none_or(|host| !Self::is_allowed(host, &allowed_domains))
+                    .is_none_or(|host| !Self::is_allowed(host, allowed_control_plane_addresses))
                 {
                     findings.push(PolicyFinding {
                         rule_id: self.rule_id().to_string(),
@@ -481,11 +537,11 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                         id: upstream.id.clone(),
                         namespace: upstream.namespace.clone(),
                         message: format!(
-                            "Consul discovery address='{}' has an invalid or disallowed control-plane destination ({allowed})",
+                            "Consul discovery address='{}' has an invalid or disallowed control-plane destination ({allowed_control_planes})",
                             consul.address
                         ),
                         remediation: Some(format!(
-                            "Use an http(s) Consul address whose host matches one of these domains: {allowed}"
+                            "Use an http(s) Consul address whose host matches one of these control-plane addresses: {allowed_control_planes}"
                         )),
                         overridden_by: None,
                     });
