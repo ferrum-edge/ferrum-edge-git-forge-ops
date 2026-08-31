@@ -543,6 +543,7 @@ struct NamespaceSnapshot {
     desired: GatewayConfig,
     actual: GatewayConfig,
     extras: gitforgeops::http_client::BackupExtras,
+    cached: bool,
 }
 
 /// Load per-namespace (desired, actual) snapshots from the gateway for the
@@ -566,9 +567,18 @@ async fn load_namespace_pairs_for(
             desired: desired_namespace,
             actual: snapshot.config,
             extras: snapshot.extras,
+            cached: snapshot.cached,
         });
     }
     Ok(pairs)
+}
+
+fn cached_namespace_names(namespace_pairs: &[NamespaceSnapshot]) -> Vec<String> {
+    namespace_pairs
+        .iter()
+        .filter(|pair| pair.cached)
+        .map(|pair| pair.namespace.clone())
+        .collect()
 }
 
 /// `options` mirrors the apply-time decisions that change which entries the
@@ -890,13 +900,25 @@ async fn cmd_diff(
     let mut desired = load_and_assemble_for(&resolved)?;
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
-    let mut client = AdminClient::new(&env_config)?;
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
-    client.set_namespace_scope(&namespaces);
-    let client = client;
+    let client = AdminClient::new_scoped(&env_config, &namespaces)?;
     let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+    let cached_namespaces = cached_namespace_names(&namespace_pairs);
+    if !cached_namespaces.is_empty() {
+        eprintln!(
+            "Warning: diff is approximate because cached backup data was served for namespace(s) {}. API-spec ownership metadata is unavailable, so spec-owned/conflict classification is incomplete; no authoritative sync or drift decision is possible until the configuration database returns.",
+            cached_namespaces.join(", ")
+        );
+        if exit_on_drift {
+            return Err(gitforgeops::error::Error::StaleGatewayView(format!(
+                "--exit-on-drift requires an authoritative backup, but namespace(s) {} were served from cache; refusing to return either the in-sync (0) or drift (2) result",
+                cached_namespaces.join(", ")
+            ))
+            .into());
+        }
+    }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
         &namespace_pairs,
         managed.as_ref(),
@@ -908,7 +930,13 @@ async fn cmd_diff(
         // owner is in play — but they do not make the configuration
         // out-of-sync on their own.
         print_spec_owned(&spec_owned);
-        println!("No differences found. Configuration is in sync.");
+        if cached_namespaces.is_empty() {
+            println!("No differences found. Configuration is in sync.");
+        } else {
+            println!(
+                "No differences found in the cached snapshot. Authoritative sync status is unavailable."
+            );
+        }
         return Ok(());
     }
 
@@ -1032,30 +1060,51 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
         println!("{}\n", note);
     }
 
-    let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
-    let (diffs, breaking, unmanaged, spec_owned, actual_available) = match &client {
+    let client = AdminClient::new_scoped(&env_config, &namespaces);
+    let (diffs, breaking, unmanaged, spec_owned, actual_available, provenance_note) = match &client
+    {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
-                let (d, b, u, s) = compute_namespace_diffs(
-                    &namespace_pairs,
-                    managed.as_ref(),
-                    diff::DiffOptions::default(),
-                );
-                (d, b, u, s, true)
+                let cached = cached_namespace_names(&namespace_pairs);
+                if cached.is_empty() {
+                    let (d, b, u, s) = compute_namespace_diffs(
+                        &namespace_pairs,
+                        managed.as_ref(),
+                        diff::DiffOptions::default(),
+                    );
+                    (d, b, u, s, true, None)
+                } else {
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                        Some(format!(
+                            "Live comparison skipped: cached backup data was served for namespace(s) {}. API-spec ownership is unknown until the gateway configuration database recovers.",
+                            cached.join(", ")
+                        )),
+                    )
+                }
             }
             Err(e) => {
                 eprintln!("Could not fetch live config: {}", e);
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false)
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
             }
         },
         Err(e) => {
             eprintln!("Could not create API client: {}", e);
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false)
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
         }
     };
+
+    if let Some(note) = &provenance_note {
+        println!("=== Live Data Provenance ===");
+        println!("WARNING: {note}\n");
+    }
 
     println!("=== Changes ===");
     if !actual_available {
@@ -1284,6 +1333,7 @@ async fn cmd_apply(
     // reads this after the match to persist credential metadata.
     #[allow(unused_assignments)]
     let mut allocation: Option<secrets::AllocateOutcome> = None;
+    let mut allocation_state_persisted = false;
 
     // Stash partial-failure errors from apply_api so state.record/save runs
     // BEFORE we propagate. In shared ownership this is critical: if some
@@ -1308,12 +1358,12 @@ async fn cmd_apply(
 
     match env_config.gateway_mode {
         GatewayMode::Api => {
-            let mut client = AdminClient::new(&env_config)?;
-            // Scope the `ns` claim to the namespaces this run touches. Inert
-            // unless the gateway runs with FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM.
-            client.set_namespace_scope(&namespaces);
-            let client = client;
-            let managed = previously_managed(&resolved, &state);
+            // `api_spec_id` is an admin-generated ownership marker, never a
+            // repository input. Fail before backup reads, credential
+            // allocation, or the pending-create journal is touched. The API
+            // target repeats this invariant for library callers.
+            apply::validate_no_desired_spec_tags(&desired)?;
+            let client = AdminClient::new_scoped(&env_config, &namespaces)?;
 
             // The preview must be computed with the same options the apply
             // will run under, or it describes a different run: with
@@ -1325,6 +1375,7 @@ async fn cmd_apply(
             };
 
             if !auto_approve {
+                let managed = previously_managed(&resolved, &state);
                 let namespace_pairs =
                     load_namespace_pairs_for(&client, &desired, &namespaces).await?;
                 let (diffs, _, unmanaged, spec_owned) =
@@ -1382,20 +1433,62 @@ async fn cmd_apply(
             // env secrets untouched — otherwise we'd burn a generated value
             // that the gateway never receives.
             let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
-            let (diffs, _, _, _) =
-                compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
+            if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
+                // This gate intentionally precedes credential allocation. A
+                // cached backup omits API-spec ownership metadata, so no
+                // mutation is safe and no unrelated GitHub secret should be
+                // allocated for a run that cannot proceed.
+                return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
+            }
             let actual_by_namespace: BTreeMap<String, GatewayConfig> = namespace_pairs
                 .iter()
                 .map(|pair| (pair.namespace.clone(), pair.actual.clone()))
                 .collect();
-            // `/backup` was just read for every namespace in scope; hand the
-            // backup-only sections to apply_api so a full_replace does not
-            // download the same document a second time.
+            // `/backup` was just read for every namespace in scope. Preserve
+            // each config/extras pair from the same response so full-replace
+            // preflight never combines two different gateway snapshots.
             let extras_by_namespace: BTreeMap<String, gitforgeops::http_client::BackupExtras> =
                 namespace_pairs
                     .iter()
                     .map(|pair| (pair.namespace.clone(), pair.extras.clone()))
                     .collect();
+
+            // This boundary precedes every external credential write and
+            // state journal mutation. It rejects read-only planes,
+            // API-spec ownership conflicts, unsupported restore sections,
+            // and every namespace's deterministic full-replace error before
+            // any unrelated side effect can occur. apply_api repeats the
+            // preflight immediately before its first gateway mutation.
+            apply::preflight_api_apply(
+                &desired,
+                &client,
+                &namespaces,
+                Some(&actual_by_namespace),
+                Some(&extras_by_namespace),
+                &apply::ApplyOptions {
+                    strategy: resolved.apply_strategy.clone(),
+                    pending_create_assertions: state.pending_creates.clone(),
+                    confirm_api_spec_deletion,
+                },
+            )
+            .await?;
+
+            // Recover any create whose non-idempotent POST may have committed
+            // before a prior process died. Pending rows are not deletion
+            // authority: an exact desired row remains pending until the API
+            // target asserts ownership with an idempotent PUT. If the
+            // declaration disappeared while a row is live, reconciliation
+            // fails closed instead of guessing who created it.
+            let reconciled_pending =
+                state.reconcile_pending_creates(&desired, &actual_by_namespace)?;
+            let reconciled_absent =
+                state.reconcile_absent_managed_resources(&desired, &actual_by_namespace);
+            if reconciled_pending + reconciled_absent > 0 {
+                state.save()?;
+            }
+            let managed = previously_managed(&resolved, &state);
+            let (diffs, _, _, _) =
+                compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
             let delete_count = diffs
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
@@ -1413,11 +1506,10 @@ async fn cmd_apply(
             //     because 90 admin-added resources also exist on the
             //     gateway.
             //
-            //   - Exclusive mode: every live resource in scope is part of
-            //     the ownership scope (no managed-set filter on deletes),
-            //     so live total is the right denominator. Fresh state with
-            //     N live resources reports percentages bounded by N, not
-            //     N*100/1.
+            //   - Exclusive mode: every live resource in scope that this run
+            //     may prune is in the denominator. API-spec-owned rows stay
+            //     outside it unless their deletion was explicitly confirmed;
+            //     otherwise untouchable rows could dilute the safety guard.
             //
             // Both branches naturally cap at 100% (delete_count is bounded
             // by the same set used as the denominator), so threshold = 100
@@ -1438,10 +1530,7 @@ async fn cmd_apply(
                 None => namespace_pairs
                     .iter()
                     .map(|pair| {
-                        pair.actual.proxies.len()
-                            + pair.actual.consumers.len()
-                            + pair.actual.plugin_configs.len()
-                            + pair.actual.upstreams.len()
+                        apply::exclusive_prune_denominator(&pair.actual, confirm_api_spec_deletion)
                     })
                     .sum(),
             };
@@ -1449,14 +1538,16 @@ async fn cmd_apply(
             // (exclusive bootstrap with empty gateway) → no delete is
             // possible; skip the guard rather than dividing by zero.
             if delete_count > 0 && denominator > 0 {
-                let delete_pct = (delete_count * 100) / denominator;
-                let threshold = resolved.ownership.large_prune_threshold_percent as usize;
-                if delete_pct > threshold && !allow_large_prune {
+                let threshold = resolved.ownership.large_prune_threshold_percent;
+                if apply::large_prune_exceeds_threshold(delete_count, denominator, threshold)
+                    && !allow_large_prune
+                {
                     let scope_label = if managed.is_some() {
                         "managed resources"
                     } else {
                         "live resources"
                     };
+                    let delete_pct = apply::format_prune_percentage(delete_count, denominator);
                     return Err(format!(
                         "Refusing to apply: would delete {}% of {} in scope ({}/{}, threshold {}%). Re-run with --allow-large-prune to proceed.",
                         delete_pct, scope_label, delete_count, denominator, threshold
@@ -1494,6 +1585,26 @@ async fn cmd_apply(
                 }
             }
 
+            // The GitHub Environment Secret write is an external commit of
+            // its own. Persist its shard and delivery metadata immediately so
+            // a later gateway or reporting failure cannot leave the ledger
+            // claiming the slot was never allocated.
+            state.credential_shard_count = shard_count;
+            if let Some(outcome) = &allocation {
+                let run_id = std::env::var("GITHUB_RUN_ID").ok();
+                for slot in &outcome.allocated {
+                    state.record_credential(
+                        &slot.slot,
+                        slot.shard,
+                        &slot.value,
+                        slot.delivered.as_ref().map(|d| d.login.as_str()),
+                        run_id.as_deref(),
+                    );
+                }
+                state.save()?;
+                allocation_state_persisted = true;
+            }
+
             // Surface the encrypted delivery blob BEFORE apply_api. The
             // allocator has already written the new value to the GitHub
             // Env Secret, so if apply_api fails here, the bundle will be
@@ -1508,6 +1619,15 @@ async fn cmd_apply(
                 surface_delivered_credentials(&env_config, outcome).await?;
             }
 
+            // Write-ahead journal for non-idempotent creates. This must be
+            // durable before the first POST, but it deliberately does not
+            // grant deletion authority. A later authoritative backup either
+            // leads to an idempotent ownership assertion, leaves the pending
+            // Add retryable, or blocks if ownership is ambiguous.
+            if state.reserve_adds(&diffs, &desired)? > 0 {
+                state.save()?;
+            }
+
             let mut raw = apply::apply_api(
                 &desired,
                 &client,
@@ -1520,7 +1640,7 @@ async fn cmd_apply(
                 Some(&extras_by_namespace),
                 &apply::ApplyOptions {
                     strategy: resolved.apply_strategy.clone(),
-                    allow_large_prune,
+                    pending_create_assertions: state.pending_creates.clone(),
                     confirm_api_spec_deletion,
                 },
             )
@@ -1652,27 +1772,32 @@ async fn cmd_apply(
             for op in &successful_ops {
                 state.record_op(op, &desired)?;
             }
-            state.stamp_last_applied();
+            state.stamp_last_applied_if_clean(deferred_apply_error.is_none());
         }
     }
     state.credential_shard_count = shard_count;
-    if let Some(outcome) = &allocation {
-        let run_id = std::env::var("GITHUB_RUN_ID").ok();
-        for slot in &outcome.allocated {
-            state.record_credential(
-                &slot.slot,
-                slot.shard,
-                &slot.value,
-                slot.delivered.as_ref().map(|d| d.login.as_str()),
-                run_id.as_deref(),
-            );
+    if !allocation_state_persisted {
+        if let Some(outcome) = &allocation {
+            let run_id = std::env::var("GITHUB_RUN_ID").ok();
+            for slot in &outcome.allocated {
+                state.record_credential(
+                    &slot.slot,
+                    slot.shard,
+                    &slot.value,
+                    slot.delivered.as_ref().map(|d| d.login.as_str()),
+                    run_id.as_deref(),
+                );
+            }
         }
     }
     if !overridden_for_audit.is_empty() {
-        let commit = state
-            .last_applied_commit
-            .clone()
-            .or_else(|| std::env::var("GITHUB_SHA").ok())
+        // An override belongs to the attempted commit even when the apply is
+        // partial. Prefer the workflow's immutable input SHA; falling back to
+        // last_applied first would misattribute a failed attempt to the prior
+        // successfully landed commit.
+        let commit = std::env::var("GITHUB_SHA")
+            .ok()
+            .or_else(|| state.last_applied_commit.clone())
             .unwrap_or_default();
         for (rule_id, approver) in &overridden_for_audit {
             state.record_override(rule_id, &commit, approver);
@@ -1697,8 +1822,19 @@ async fn cmd_import(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
     let result = if from_api {
-        let client = AdminClient::new(&env_config)?;
-        import::import_from_api(&client, &output_path, resolved.namespace_filter.as_deref()).await?
+        // On a namespace-claim gateway, an unscoped discovery token gets an
+        // intentionally empty `/namespaces` response. Treating that as a
+        // successful all-namespace import could atomically publish an empty
+        // tree. Require one explicit scope so the token and every backup read
+        // carry the exact same namespace authority.
+        let namespace = resolved.namespace_filter.as_deref().ok_or_else(|| {
+            gitforgeops::error::Error::Config(
+                "API import requires an explicit namespace. Set FERRUM_NAMESPACE or the selected environment's namespace filter, then import one namespace at a time."
+                    .to_string(),
+            )
+        })?;
+        let client = AdminClient::new_scoped(&env_config, [namespace])?;
+        import::import_from_api(&client, &output_path, Some(namespace)).await?
     } else if let Some(file_path) = from_file {
         import::import_from_file(&PathBuf::from(file_path), &output_path)?
     } else {
@@ -1740,20 +1876,34 @@ async fn cmd_review(
         Err(e) => (true, format!("Validation skipped: {}", e)),
     };
 
-    let client = AdminClient::new(&env_config);
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
+    let client = AdminClient::new_scoped(&env_config, &namespaces);
 
     let (diffs, breaking, unmanaged, spec_owned, comparison_error) = match &client {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(namespace_pairs) => {
-                let (d, b, u, s) = compute_namespace_diffs(
-                    &namespace_pairs,
-                    managed.as_ref(),
-                    diff::DiffOptions::default(),
-                );
-                (d, b, u, s, None)
+                let cached = cached_namespace_names(&namespace_pairs);
+                if cached.is_empty() {
+                    let (d, b, u, s) = compute_namespace_diffs(
+                        &namespace_pairs,
+                        managed.as_ref(),
+                        diff::DiffOptions::default(),
+                    );
+                    (d, b, u, s, None)
+                } else {
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Some(format!(
+                            "Live gateway comparison skipped: cached backup data was served for namespace(s) {}. API-spec ownership is unknown until the gateway configuration database recovers.",
+                            cached.join(", ")
+                        )),
+                    )
+                }
             }
             Err(e) => (
                 Vec::new(),
@@ -2181,7 +2331,7 @@ async fn push_rotated_consumer_to_gateway(
         ).into());
     }
 
-    let client = AdminClient::new(env_config)?;
+    let client = AdminClient::new_scoped(env_config, [namespace])?;
     client.update_consumer(consumer, namespace).await?;
     Ok(())
 }

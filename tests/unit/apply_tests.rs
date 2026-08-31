@@ -136,8 +136,12 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
 
 // --- Apply ordering ----------------------------------------------------------
 
-use gitforgeops::apply::{operation_rank, order_diffs, stale_view_block};
-use gitforgeops::diff::resource_diff::{DiffAction, ResourceDiff};
+use gitforgeops::apply::{
+    exclusive_prune_denominator, format_prune_percentage, large_prune_exceeds_threshold,
+    operation_rank, order_diffs, preserve_spec_owned_graph, stale_view_block,
+    validate_no_desired_spec_tags,
+};
+use gitforgeops::diff::resource_diff::{state_key, DiffAction, ResourceDiff};
 
 fn diff(action: DiffAction, kind: &str, id: &str) -> ResourceDiff {
     ResourceDiff {
@@ -269,26 +273,246 @@ fn unknown_kinds_get_a_defined_rank() {
 // --- Stale gateway view ------------------------------------------------------
 
 #[test]
-fn stale_view_blocks_prunes_from_a_cached_backup() {
-    // During a config-database outage /backup falls back to the in-memory
-    // snapshot; resources created since then read as "should be deleted".
-    let block = stale_view_block(true, 3, false).expect("should block");
+fn stale_view_blocks_every_mutation_from_a_cached_backup() {
+    // Cached fallback also strips API-spec ownership tags, so even a pure
+    // add/modify can collide with a row that only appears hand-owned.
+    let block = stale_view_block(true).expect("should block");
     assert!(block.contains("X-Data-Source: cached"), "{block}");
-    assert!(block.contains("3 computed deletion"), "{block}");
+    assert!(block.contains("API-spec ownership metadata"), "{block}");
     assert!(block.contains("--allow-large-prune"), "{block}");
+    assert!(block.contains("does not bypass"), "{block}");
 }
 
 #[test]
-fn stale_view_allows_a_pure_write_apply() {
-    // No deletes means nothing can be wrongly pruned, so a cached view is
-    // merely a warning.
-    assert!(stale_view_block(true, 0, false).is_none());
+fn fresh_view_is_not_blocked() {
+    assert!(stale_view_block(false).is_none());
 }
 
 #[test]
-fn stale_view_is_overridable_and_inert_on_a_fresh_view() {
-    assert!(stale_view_block(true, 5, true).is_none());
-    assert!(stale_view_block(false, 5, false).is_none());
+fn large_prune_threshold_uses_an_exact_ratio() {
+    assert!(large_prune_exceeds_threshold(1, 200, 0));
+    assert!(large_prune_exceeds_threshold(26, 101, 25));
+    assert!(!large_prune_exceeds_threshold(25, 100, 25));
+    assert!(!large_prune_exceeds_threshold(0, 0, 0));
+    assert!(!large_prune_exceeds_threshold(0, usize::MAX, 0));
+
+    // The comparison widens before multiplication, so large platform values
+    // cannot overflow and silently weaken the guard.
+    assert!(!large_prune_exceeds_threshold(usize::MAX, usize::MAX, 100));
+    assert!(large_prune_exceeds_threshold(usize::MAX, usize::MAX, 99));
+    assert_eq!(format_prune_percentage(26, 101), "25.74");
+    assert_eq!(format_prune_percentage(0, 0), "0.00");
+}
+
+#[test]
+fn large_prune_decision_matches_rational_reference_across_small_domain() {
+    for denominator in 0_usize..=250 {
+        for deletes in 0_usize..=denominator {
+            for threshold in 0_u8..=100 {
+                let reference = denominator > 0
+                    && (deletes as u128) * 100 > (threshold as u128) * (denominator as u128);
+                assert_eq!(
+                    large_prune_exceeds_threshold(deletes, denominator, threshold),
+                    reference,
+                    "deletes={deletes}, denominator={denominator}, threshold={threshold}"
+                );
+            }
+        }
+    }
+}
+
+// --- Full-replace API-spec graph preservation -------------------------------
+
+fn proxy(id: &str, namespace: &str, api_spec_id: Option<&str>) -> Proxy {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": namespace,
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080,
+        "api_spec_id": api_spec_id,
+    }))
+    .expect("proxy fixture")
+}
+
+fn plugin_config(
+    id: &str,
+    namespace: &str,
+    proxy_id: &str,
+    api_spec_id: Option<&str>,
+) -> gitforgeops::config::schema::PluginConfig {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": namespace,
+        "plugin_name": "cors",
+        "config": {},
+        "scope": "proxy",
+        "proxy_id": proxy_id,
+        "api_spec_id": api_spec_id,
+    }))
+    .expect("plugin fixture")
+}
+
+fn spec_extras(ids: &[&str]) -> gitforgeops::http_client::BackupExtras {
+    gitforgeops::http_client::BackupExtras {
+        api_specs: Some(serde_json::json!({
+            "section_version": "2",
+            "items": ids.iter().map(|id| serde_json::json!({
+                "id": id,
+                "namespace": "team-alpha",
+                "proxy_id": "spec-proxy"
+            })).collect::<Vec<_>>(),
+        })),
+        gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
+        unsupported_sections: Vec::new(),
+    }
+}
+
+#[test]
+fn full_replace_preserves_complete_spec_owned_resource_graph() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("repo-upstream", "team-alpha")],
+        ..Default::default()
+    };
+    let mut spec_upstream = upstream("spec-upstream", "team-alpha");
+    spec_upstream.api_spec_id = Some("spec-a".to_string());
+    let mut spec_proxy = proxy("spec-proxy", "team-alpha", Some("spec-a"));
+    spec_proxy
+        .plugins
+        .push(gitforgeops::config::schema::PluginAssociation {
+            plugin_config_id: "spec-plugin".to_string(),
+        });
+    let actual = GatewayConfig {
+        proxies: vec![spec_proxy],
+        upstreams: vec![spec_upstream.clone()],
+        plugin_configs: vec![plugin_config(
+            "spec-plugin",
+            "team-alpha",
+            "spec-proxy",
+            Some("spec-a"),
+        )],
+        ..Default::default()
+    };
+
+    let merged =
+        preserve_spec_owned_graph(&desired, &actual, &spec_extras(&["spec-a"]), "team-alpha")
+            .expect("complete graph should merge");
+
+    assert_eq!(merged.proxies.len(), 1);
+    assert_eq!(merged.plugin_configs.len(), 1);
+    assert_eq!(merged.upstreams.len(), 2);
+    assert_eq!(merged.upstreams[0].id, "repo-upstream");
+    assert_eq!(merged.upstreams[1].id, "spec-upstream");
+    assert_eq!(merged.upstreams[1].api_spec_id.as_deref(), Some("spec-a"));
+}
+
+#[test]
+fn full_replace_rejects_repo_collision_with_spec_owned_row() {
+    let desired = GatewayConfig {
+        proxies: vec![proxy("shared-id", "team-alpha", None)],
+        ..Default::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![proxy("shared-id", "team-alpha", Some("spec-a"))],
+        ..Default::default()
+    };
+
+    let error =
+        preserve_spec_owned_graph(&desired, &actual, &spec_extras(&["spec-a"]), "team-alpha")
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("conflicts"), "{error}");
+    assert!(error.contains("shared-id"), "{error}");
+    assert!(error.contains("spec-a"), "{error}");
+}
+
+#[test]
+fn every_api_strategy_rejects_repository_authored_spec_ownership_tags() {
+    let desired = GatewayConfig {
+        proxies: vec![proxy("forged-owner", "team-alpha", Some("spec-a"))],
+        ..Default::default()
+    };
+
+    let error = validate_no_desired_spec_tags(&desired)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("forged-owner"), "{error}");
+    assert!(error.contains("admin-generated"), "{error}");
+}
+
+#[test]
+fn full_replace_rejects_incomplete_spec_ownership_graph() {
+    let desired = GatewayConfig::default();
+    let actual = GatewayConfig::default();
+    let error =
+        preserve_spec_owned_graph(&desired, &actual, &spec_extras(&["spec-a"]), "team-alpha")
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("no tagged") || error.contains("owning proxy"),
+        "{error}"
+    );
+    assert!(error.contains("spec-a"), "{error}");
+}
+
+#[test]
+fn full_replace_rejects_a_tagged_proxy_that_is_not_the_declared_owner() {
+    let actual = GatewayConfig {
+        proxies: vec![proxy("wrong-proxy", "team-alpha", Some("spec-a"))],
+        ..Default::default()
+    };
+
+    let error = preserve_spec_owned_graph(
+        &GatewayConfig::default(),
+        &actual,
+        &spec_extras(&["spec-a"]),
+        "team-alpha",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("spec-proxy"), "{error}");
+    assert!(error.contains("exactly one"), "{error}");
+}
+
+#[test]
+fn full_replace_rejects_spec_owned_rows_from_another_namespace() {
+    let actual = GatewayConfig {
+        proxies: vec![proxy("spec-proxy", "foreign", Some("spec-a"))],
+        ..Default::default()
+    };
+
+    let error = preserve_spec_owned_graph(
+        &GatewayConfig::default(),
+        &actual,
+        &spec_extras(&["spec-a"]),
+        "team-alpha",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("foreign"), "{error}");
+    assert!(error.contains("team-alpha"), "{error}");
+}
+
+#[test]
+fn exclusive_prune_denominator_excludes_unconfirmed_spec_owned_rows() {
+    let actual = GatewayConfig {
+        proxies: vec![
+            proxy("manual-proxy", "team-alpha", None),
+            proxy("spec-proxy", "team-alpha", Some("spec-a")),
+        ],
+        upstreams: vec![upstream("manual-upstream", "team-alpha"), {
+            let mut value = upstream("spec-upstream", "team-alpha");
+            value.api_spec_id = Some("spec-a".to_string());
+            value
+        }],
+        plugin_configs: vec![
+            plugin_config("manual-plugin", "team-alpha", "manual-proxy", None),
+            plugin_config("spec-plugin", "team-alpha", "spec-proxy", Some("spec-a")),
+        ],
+        ..Default::default()
+    };
+
+    assert_eq!(exclusive_prune_denominator(&actual, false), 3);
+    assert_eq!(exclusive_prune_denominator(&actual, true), 6);
 }
 
 // --- Spec-owned skip messages ------------------------------------------------
@@ -458,6 +682,7 @@ use gitforgeops::http_client::AdminClient;
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 
 /// Canned-response gateway on a loopback socket, matched by the first route
 /// whose needle appears anywhere in the request (line, headers, or body).
@@ -496,6 +721,50 @@ fn spawn_stub_gateway(routes: Vec<(&'static str, u16, &'static str)>) -> String 
     format!("http://{addr}")
 }
 
+/// Owned-response variant that records every request and can attach response
+/// headers (notably `X-Data-Source: cached`).
+type RecordingRoute = (String, u16, String, Vec<(String, String)>);
+
+fn spawn_recording_gateway(routes: Vec<RecordingRoute>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let thread_requests = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let routes = routes.clone();
+            let requests = Arc::clone(&thread_requests);
+            std::thread::spawn(move || loop {
+                let request = match read_request(&mut stream) {
+                    Some(request) => request,
+                    None => return,
+                };
+                requests.lock().unwrap().push(request.clone());
+                let (status, body, headers) = routes
+                    .iter()
+                    .find(|(needle, _, _, _)| request.contains(needle))
+                    .map(|(_, status, body, headers)| (*status, body.as_str(), headers.as_slice()))
+                    .unwrap_or((200, "{}", &[]));
+                let headers = headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>();
+                if write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .is_err()
+                {
+                    return;
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
     let mut raw: Vec<u8> = Vec::new();
     loop {
@@ -526,12 +795,15 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
 }
 
 fn stub_client(url: String) -> AdminClient {
+    stub_client_with_retries(url, 0)
+}
+
+fn stub_client_with_retries(url: String, gateway_max_retries: u32) -> AdminClient {
     let env = EnvConfig {
         gateway_url: Some(url),
         admin_jwt_secret: Some("test-secret-must-be-32-chars-long".to_string()),
         gateway_mode: GatewayMode::Api,
-        // No backoff sleeps in the failure paths.
-        gateway_max_retries: 0,
+        gateway_max_retries,
         ..EnvConfig::default()
     };
     AdminClient::new(&env).unwrap()
@@ -556,6 +828,42 @@ fn empty_actuals(namespaces: &[&str]) -> BTreeMap<String, GatewayConfig> {
 }
 
 #[tokio::test]
+async fn full_replace_rejects_unknown_backup_sections_before_preflight_or_mutation() {
+    let client = stub_client("http://127.0.0.1:9".to_string());
+    let namespaces = ["team-alpha".to_string()];
+    let actuals = empty_actuals(&["team-alpha"]);
+    let extras = BTreeMap::from([(
+        "team-alpha".to_string(),
+        gitforgeops::http_client::BackupExtras {
+            unsupported_sections: vec!["future_security_policy".to_string()],
+            ..Default::default()
+        },
+    )]);
+    let options = ApplyOptions {
+        strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+        ..Default::default()
+    };
+
+    let error = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &options,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        gitforgeops::error::Error::UnsupportedBackupSections(_)
+    ));
+    assert!(error.to_string().contains("future_security_policy"));
+}
+
+#[tokio::test]
 async fn a_rejected_batch_chunk_falls_back_to_named_per_resource_creates() {
     // The old behaviour returned one opaque "POST /batch: {e}" and abandoned
     // every remaining resource. `/batch` is all-or-nothing per chunk, so
@@ -567,7 +875,7 @@ async fn a_rejected_batch_chunk_falls_back_to_named_per_resource_creates() {
         (r#""id":"u2""#, 409, r#"{"error":"duplicate id"}"#),
         ("POST /upstreams", 201, "{}"),
     ]);
-    let client = stub_client(url);
+    let client = stub_client_with_retries(url, 3);
 
     let desired = GatewayConfig {
         upstreams: vec![
@@ -607,6 +915,630 @@ async fn a_rejected_batch_chunk_falls_back_to_named_per_resource_creates() {
     created.sort_unstable();
     assert_eq!(created, vec!["u1", "u3"]);
     assert!(result.fatal_error.is_none());
+}
+
+#[tokio::test]
+async fn ambiguous_batch_is_not_replayed_and_is_recovered_from_authoritative_backup() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let backup = serde_json::to_string(&desired).unwrap();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /batch".into(),
+            503,
+            r#"{"error":"upstream response lost"}"#.into(),
+            vec![],
+        ),
+        ("GET /backup".into(), 200, backup, vec![]),
+    ]);
+    let client = stub_client_with_retries(url, 3);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("reconciliation should prove the committed chunk");
+
+    assert_eq!(result.created, 1);
+    assert_eq!(result.applied_incremental.len(), 1);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.contains("POST /batch"))
+            .count(),
+        1,
+        "the ambiguous POST must never be retried"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.contains("POST /upstreams"))
+            .count(),
+        0,
+        "an ambiguous batch must not fall back to individual creates"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.contains("PUT /upstreams/u1"))
+            .count(),
+        1,
+        "exact readback still needs an idempotent ownership assertion"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_create_is_sent_once_and_recovered_from_authoritative_backup() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let backup = serde_json::to_string(&desired).unwrap();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        (
+            "POST /upstreams".into(),
+            502,
+            r#"{"error":"response lost after commit"}"#.into(),
+            vec![],
+        ),
+        ("GET /backup".into(), 200, backup, vec![]),
+    ]);
+    let client = stub_client_with_retries(url, 3);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("reconciliation should prove the committed create");
+
+    assert_eq!(result.created, 1);
+    assert_eq!(result.applied_incremental.len(), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.contains("POST /upstreams"))
+            .count(),
+        1,
+        "the ambiguous create must never be retried"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.contains("PUT /upstreams/u1"))
+            .count(),
+        1,
+        "exact readback still needs an idempotent ownership assertion"
+    );
+}
+
+#[tokio::test]
+async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/u1".into(), 200, "{}".into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            desired.clone(),
+        )])),
+        None,
+        &ApplyOptions {
+            pending_create_assertions: std::collections::BTreeSet::from([state_key(
+                "team-alpha",
+                "Upstream",
+                "u1",
+            )]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("ownership assertion should succeed");
+
+    assert_eq!(result.updated, 1);
+    assert_eq!(result.applied_incremental.len(), 1);
+    assert!(matches!(
+        result.applied_incremental[0].action,
+        DiffAction::Modify
+    ));
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("PUT /upstreams/u1"))
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("POST /upstreams")),
+        "the uncertain create must not be replayed"
+    );
+}
+
+#[tokio::test]
+async fn committed_but_not_live_create_is_failed_without_reconciliation_success() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        (
+            "POST /upstreams".into(),
+            503,
+            r#"{"error":"reload timed out","applied":false,"reason":"reload_timeout"}"#.into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client_with_retries(url, 3);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("run-stopping failure is returned in the aggregate");
+
+    assert_eq!(result.created, 0);
+    assert!(
+        result
+            .fatal_error
+            .as_deref()
+            .is_some_and(|error| error.contains("write committed, awaiting reload")),
+        "{:?}",
+        result.fatal_error
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("POST /upstreams"))
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("GET /backup")),
+        "applied:false is a known failure, not proof that the desired resource is live"
+    );
+}
+
+#[tokio::test]
+async fn cached_backup_blocks_all_apply_mutations_before_the_first_write() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            serde_json::to_string(&GatewayConfig::default()).unwrap(),
+            vec![("X-Data-Source".into(), "cached".into())],
+        ),
+    ]);
+    let client = stub_client(url);
+    let snapshot = client
+        .get_backup_snapshot("team-alpha")
+        .await
+        .expect("cached backup itself remains readable");
+    assert!(snapshot.cached);
+
+    let error = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            snapshot.config,
+        )])),
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            snapshot.extras,
+        )])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(error, gitforgeops::error::Error::StaleGatewayView(_)),
+        "{error:?}"
+    );
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests.iter().all(|request| {
+            !request.contains("POST ") && !request.contains("PUT ") && !request.contains("DELETE ")
+        }),
+        "no mutation may be sent from cached ownership data: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revision() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("repo-upstream", "team-alpha")],
+        ..Default::default()
+    };
+    let mut spec_upstream = upstream("spec-upstream", "team-alpha");
+    spec_upstream.api_spec_id = Some("spec-a".to_string());
+    let mut spec_proxy = proxy("spec-proxy", "team-alpha", Some("spec-a"));
+    spec_proxy
+        .plugins
+        .push(gitforgeops::config::schema::PluginAssociation {
+            plugin_config_id: "spec-plugin".to_string(),
+        });
+    let actual = GatewayConfig {
+        proxies: vec![spec_proxy],
+        upstreams: vec![spec_upstream],
+        plugin_configs: vec![plugin_config(
+            "spec-plugin",
+            "team-alpha",
+            "spec-proxy",
+            Some("spec-a"),
+        )],
+        ..Default::default()
+    };
+    let extras = spec_extras(&["spec-a"]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let error = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), actual)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("conditional restore revision"),
+        "{error}"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("POST /restore")),
+        "a stale API-spec graph must never be replayed"
+    );
+}
+
+#[tokio::test]
+async fn confirmed_spec_deletion_leaves_live_trust_bundles_untouched() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("repo-upstream", "team-alpha")],
+        ..Default::default()
+    };
+    let extras = spec_extras(&["spec-a"]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true&confirm_api_spec_deletion=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            GatewayConfig::default(),
+        )])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            confirm_api_spec_deletion: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("confirmed full replace should succeed");
+
+    assert_eq!(result.created, 1);
+    let restore = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| {
+            request.contains("POST /restore?confirm=true&confirm_api_spec_deletion=true")
+        })
+        .cloned()
+        .expect("confirmed restore request");
+    assert!(restore.contains("repo-upstream"), "{restore}");
+    assert!(!restore.contains("gateway_trust_bundles"), "{restore}");
+    assert!(!restore.contains("api_specs"), "{restore}");
+    assert!(!restore.contains("spec-proxy"), "{restore}");
+}
+
+#[tokio::test]
+async fn empty_spec_snapshot_omits_api_specs_and_trust_to_close_lost_update_races() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("repo-upstream", "team-alpha")],
+        ..Default::default()
+    };
+    let extras = gitforgeops::http_client::BackupExtras {
+        api_specs: Some(serde_json::json!({"section_version": "2", "items": []})),
+        gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
+        unsupported_sections: Vec::new(),
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            GatewayConfig::default(),
+        )])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("empty spec snapshot is safe to restore");
+
+    assert_eq!(result.created, 1);
+    let restore = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.contains("POST /restore?confirm=true"))
+        .cloned()
+        .expect("restore request");
+    assert!(restore.contains("repo-upstream"), "{restore}");
+    assert!(!restore.contains("api_specs"), "{restore}");
+    assert!(!restore.contains("gateway_trust_bundles"), "{restore}");
+}
+
+#[tokio::test]
+async fn later_namespace_restore_validation_fails_before_any_namespace_is_mutated() {
+    let (url, requests) = spawn_recording_gateway(vec![]);
+    let client = stub_client(url);
+    let namespaces = vec!["alpha".to_string(), "beta".to_string()];
+    let actuals = empty_actuals(&["alpha", "beta"]);
+    let extras = BTreeMap::from([
+        (
+            "alpha".to_string(),
+            gitforgeops::http_client::BackupExtras {
+                api_specs: Some(serde_json::json!({
+                    "section_version": "2",
+                    "items": []
+                })),
+                ..Default::default()
+            },
+        ),
+        (
+            "beta".to_string(),
+            gitforgeops::http_client::BackupExtras {
+                api_specs: Some(serde_json::json!({"section_version": "2"})),
+                ..Default::default()
+            },
+        ),
+    ]);
+
+    let error = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("items"), "{error}");
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "alpha must not restore before beta's deterministic error"
+    );
+}
+
+#[tokio::test]
+async fn exact_spec_owned_conflict_blocks_unrelated_incremental_writes() {
+    let desired_proxy = proxy("shared", "alpha", None);
+    let mut spec_proxy = desired_proxy.clone();
+    spec_proxy.api_spec_id = Some("spec-a".to_string());
+    let desired = GatewayConfig {
+        proxies: vec![desired_proxy],
+        upstreams: vec![upstream("unrelated", "beta")],
+        ..Default::default()
+    };
+    let actuals = BTreeMap::from([
+        (
+            "alpha".to_string(),
+            GatewayConfig {
+                proxies: vec![spec_proxy],
+                ..Default::default()
+            },
+        ),
+        ("beta".to_string(), GatewayConfig::default()),
+    ]);
+    let (url, requests) = spawn_recording_gateway(vec![]);
+    let client = stub_client(url);
+
+    let error = apply_api(
+        &desired,
+        &client,
+        &["alpha".to_string(), "beta".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("API-spec-owned"), "{error}");
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn three_xx_batch_response_never_records_an_applied_operation() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("POST /batch".into(), 304, "{}".into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("nonfatal namespace error is aggregated");
+
+    assert_eq!(result.created, 0);
+    assert!(result.applied_incremental.is_empty());
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(
+        result
+            .fatal_error
+            .as_deref()
+            .is_some_and(|error| error.contains("304")),
+        "{:?}",
+        result.fatal_error
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains("POST /batch"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn bare_restore_403_is_refined_to_a_run_stopping_read_only_error() {
+    let read_only_health = r#"{"status":"ok","mode":"file","admin_writes_enabled":false}"#;
+    let (url, requests) = spawn_recording_gateway(vec![
+        (
+            "POST /restore?confirm=true".into(),
+            403,
+            r#"{"error":"forbidden"}"#.into(),
+            vec![],
+        ),
+        ("GET /health".into(), 200, read_only_health.into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let error = client
+        .post_restore(
+            &GatewayConfig::default(),
+            "team-a",
+            &Default::default(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{error:?}"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("POST /restore"))
+            .count(),
+        1,
+        "restore must not be replayed"
+    );
 }
 
 #[tokio::test]

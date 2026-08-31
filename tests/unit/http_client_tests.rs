@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
 use gitforgeops::config::schema::{GatewayConfig, Proxy, Upstream};
 use gitforgeops::http_client::convergence_summary;
@@ -9,7 +10,9 @@ use gitforgeops::http_client::{
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 fn base_env() -> EnvConfig {
     EnvConfig {
@@ -116,6 +119,48 @@ async fn admin_client_get_backup_sends_namespace_and_bearer_token() {
     assert!(request.starts_with("GET /backup HTTP/1.1"));
     assert!(request.contains("authorization: Bearer "));
     assert!(request.contains("x-ferrum-namespace: team-alpha"));
+}
+
+#[tokio::test]
+async fn scoped_admin_client_mints_the_resolved_namespace_claim() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        tx.send(String::from_utf8_lossy(&buf[..n]).to_string())
+            .unwrap();
+        let body =
+            r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let mut env = base_env();
+    env.gateway_url = Some(format!("http://{addr}"));
+    let client =
+        AdminClient::new_scoped(&env, ["team-beta", "team-alpha", "team-beta", ""]).unwrap();
+    client.get_backup("team-alpha").await.unwrap();
+
+    let request = rx.recv().unwrap();
+    let token = request
+        .lines()
+        .find_map(|line| line.strip_prefix("authorization: Bearer "))
+        .expect("authorization header");
+    let payload = token.split('.').nth(1).expect("JWT payload");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON claims");
+    assert_eq!(claims["ns"], serde_json::json!(["team-beta", "team-alpha"]));
 }
 
 #[tokio::test]
@@ -365,6 +410,18 @@ fn applied_false_is_never_retried() {
 }
 
 #[test]
+fn non_idempotent_create_and_batch_responses_are_never_retried() {
+    let empty = ApiErrorBody::default();
+    for status in [408, 429, 500, 502, 503, 504, 520, 599] {
+        assert_eq!(
+            classify_retry(status, &empty, RequestKind::NonIdempotentMutation),
+            RetryDecision::NoRetry,
+            "HTTP {status} after a POST has an ambiguous commit outcome"
+        );
+    }
+}
+
+#[test]
 fn restore_500_with_dirty_rollback_is_never_retried() {
     for rollback in ["incomplete", "unknown_outcome"] {
         let b = body(&format!(
@@ -377,12 +434,36 @@ fn restore_500_with_dirty_rollback_is_never_retried() {
         );
     }
 
-    // A clean rollback means nothing was left behind; the generic 500 rule
-    // applies again.
+    // A clean rollback is safer than an incomplete one, but a destructive
+    // restore is still not generally idempotent. Only the gateway's explicit
+    // pre-commit connectivity marker permits replay.
     let clean = body(r#"{"error":"restore failed","rollback":"completed"}"#);
     assert_eq!(
         classify_retry(500, &clean, RequestKind::Restore),
-        RetryDecision::Retry
+        RetryDecision::NoRetry
+    );
+}
+
+#[test]
+fn restore_failure_without_commit_proof_is_ambiguous_and_run_stopping() {
+    let error = gitforgeops::http_client::map_api_error(
+        502,
+        r#"{"error":"response lost"}"#,
+        RequestKind::Restore,
+    );
+    assert!(
+        matches!(error, gitforgeops::error::Error::AmbiguousMutation(_)),
+        "{error:?}"
+    );
+
+    let rolled_back = gitforgeops::http_client::map_api_error(
+        500,
+        r#"{"error":"validation failed","rollback":"completed"}"#,
+        RequestKind::Restore,
+    );
+    assert!(
+        matches!(rolled_back, gitforgeops::error::Error::ApiError { .. }),
+        "{rolled_back:?}"
     );
 }
 
@@ -456,6 +537,93 @@ fn stub_env(url: String) -> EnvConfig {
     // through the backoff schedule.
     env.gateway_max_retries = 0;
     env
+}
+
+#[tokio::test]
+async fn connection_drop_after_create_delivery_is_not_replayed() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = Arc::new(AtomicUsize::new(0));
+    let thread_received = Arc::clone(&received);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let received = Arc::clone(&thread_received);
+            std::thread::spawn(move || {
+                let mut bytes = [0_u8; 8192];
+                if stream.read(&mut bytes).is_ok() {
+                    // The complete request reached the server, then the
+                    // connection vanished before any HTTP response. This is
+                    // the ambiguous-after-delivery case RFC 9110 forbids a
+                    // client from blindly replaying.
+                    received.fetch_add(1, Ordering::SeqCst);
+                }
+                // Drop without a response.
+            });
+        }
+    });
+
+    let mut env = stub_env(format!("http://{addr}"));
+    env.gateway_max_retries = 1;
+    let client = AdminClient::new(&env).unwrap();
+    let upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "u1",
+        "namespace": "team-alpha",
+        "targets": [{"host": "127.0.0.1", "port": 8080}],
+    }))
+    .unwrap();
+
+    let error = client
+        .create_upstream(&upstream, "team-alpha")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, gitforgeops::error::Error::HttpClient(_)),
+        "{error:?}"
+    );
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        1,
+        "a request delivered before the response connection dropped must not be replayed"
+    );
+}
+
+#[tokio::test]
+async fn connection_drop_after_restore_delivery_is_an_ambiguous_mutation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = Arc::new(AtomicUsize::new(0));
+    let thread_received = Arc::clone(&received);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let received = Arc::clone(&thread_received);
+            std::thread::spawn(move || {
+                let mut bytes = [0_u8; 8192];
+                if stream.read(&mut bytes).is_ok() {
+                    received.fetch_add(1, Ordering::SeqCst);
+                }
+                // The restore may have committed; deliberately drop without
+                // a response to exercise the unknown-outcome path.
+            });
+        }
+    });
+
+    let env = stub_env(format!("http://{addr}"));
+    let client = AdminClient::new(&env).unwrap();
+    let error = client
+        .post_restore(
+            &GatewayConfig::default(),
+            "team-alpha",
+            &BackupExtras::default(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, gitforgeops::error::Error::AmbiguousMutation(_)),
+        "{error:?}"
+    );
+    assert_eq!(received.load(Ordering::SeqCst), 1);
 }
 
 // --- Delete tolerance --------------------------------------------------------
@@ -553,6 +721,67 @@ fn delete_treats_404_as_success() {
     assert!(!delete_succeeded(403));
     assert!(!delete_succeeded(409));
     assert!(!delete_succeeded(500));
+    assert!(!delete_succeeded(300));
+    assert!(!delete_succeeded(304));
+    assert!(!delete_succeeded(399));
+}
+
+#[tokio::test]
+async fn admin_mutations_reject_redirects_without_following_them() {
+    let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = redirect_target.local_addr().unwrap();
+    let (target_tx, target_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = redirect_target.accept() {
+            target_tx.send(()).unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\n{{}}"
+            );
+        }
+    });
+
+    let source = TcpListener::bind("127.0.0.1:0").unwrap();
+    let source_addr = source.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = source.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let body = r#"{"error":"redirect not permitted"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{target_addr}/captured\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let client = AdminClient::new(&stub_env(format!("http://{source_addr}"))).unwrap();
+    let upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": "u1",
+        "namespace": "team-alpha",
+        "targets": [{"host": "127.0.0.1", "port": 8080}],
+    }))
+    .unwrap();
+    let error = client
+        .create_upstream(&upstream, "team-alpha")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 307, .. }
+        ),
+        "{error:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        target_rx.try_recv().is_err(),
+        "the redirect target must never receive the admin mutation"
+    );
 }
 
 // --- Error mapping -----------------------------------------------------------
@@ -678,34 +907,28 @@ fn backup_extras() -> BackupExtras {
             "items": [{"id": "spec-a"}, {"id": "spec-b"}],
         })),
         gateway_trust_bundles: Some(serde_json::json!([{ "revision": 7 }])),
+        unsupported_sections: Vec::new(),
     }
 }
 
 #[test]
-fn restore_body_carries_opaque_api_specs_and_trust_bundles() {
+fn restore_body_rejects_nonempty_api_specs_and_never_replays_trust_bundles() {
     let extras = backup_extras();
-    let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
-
-    // Carried through byte-for-byte: gitforgeops does not model (or version)
-    // these sections, it just refuses to destroy them.
-    assert_eq!(body["api_specs"], extras.api_specs.clone().unwrap());
-    assert_eq!(
-        body["gateway_trust_bundles"],
-        extras.gateway_trust_bundles.clone().unwrap()
-    );
-    // The managed sections are still present alongside them.
-    assert_eq!(body["version"], "1");
-    assert!(body.get("proxies").is_some());
+    let error = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap_err();
+    assert!(error.to_string().contains("conditional restore revision"));
 }
 
 #[test]
-fn restore_body_drops_api_specs_on_explicit_confirmation() {
+fn confirmed_restore_drops_api_specs_and_leaves_trust_unchanged() {
     let body = build_restore_body(&GatewayConfig::default(), &backup_extras(), true).unwrap();
     assert!(
         body.get("api_specs").is_none(),
         "the destructive opt-in must omit the section so /restore deletes it"
     );
-    assert!(body.get("gateway_trust_bundles").is_none());
+    assert!(
+        body.get("gateway_trust_bundles").is_none(),
+        "an absent trust section preserves the live value without replaying a stale backup"
+    );
 }
 
 #[test]
@@ -717,6 +940,22 @@ fn restore_body_omits_absent_sections_entirely() {
         build_restore_body(&GatewayConfig::default(), &BackupExtras::default(), false).unwrap();
     assert!(body.get("api_specs").is_none());
     assert!(body.get("gateway_trust_bundles").is_none());
+}
+
+#[test]
+fn restore_body_omits_an_authoritative_empty_api_spec_section() {
+    let extras = BackupExtras {
+        api_specs: Some(serde_json::json!({
+            "section_version": "2",
+            "items": [],
+        })),
+        gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
+        unsupported_sections: Vec::new(),
+    };
+    let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
+    assert!(body.get("api_specs").is_none());
+    assert!(body.get("gateway_trust_bundles").is_none());
+    assert_eq!(body["version"], "1");
 }
 
 #[test]
@@ -757,6 +996,24 @@ fn backup_snapshot_parses_the_full_envelope() {
         Some(serde_json::json!([]))
     );
     assert!(snapshot.config.proxies.is_empty());
+}
+
+#[test]
+fn backup_snapshot_retains_unknown_section_names_for_restore_safety() {
+    let snapshot = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": [],
+            "future_z": {},
+            "future_a": []
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        snapshot.extras.unsupported_sections,
+        vec!["future_a".to_string(), "future_z".to_string()]
+    );
 }
 
 // --- Batch -------------------------------------------------------------------

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +41,12 @@ pub struct StateFile {
     pub last_applied_at: Option<String>,
     pub last_applied_commit: Option<String>,
     pub resources: HashMap<String, String>,
+    /// Creates durably announced before their non-idempotent POST, but not yet
+    /// proven to have landed. These keys are deliberately *not* part of the
+    /// shared-mode delete fence: a crashed request must not grant deletion
+    /// authority over a row that an administrator may have created later.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pending_creates: BTreeSet<String>,
     #[serde(default)]
     pub credentials: HashMap<String, CredentialMetadata>,
     #[serde(default)]
@@ -74,6 +80,7 @@ impl Default for StateFile {
             last_applied_at: None,
             last_applied_commit: None,
             resources: HashMap::new(),
+            pending_creates: BTreeSet::new(),
             credentials: HashMap::new(),
             credential_bundle_versions: HashMap::new(),
             credential_shard_count: 1,
@@ -145,7 +152,7 @@ impl StateFile {
     }
 
     fn validate_resource_keys(&self) -> crate::error::Result<()> {
-        for key in self.resources.keys() {
+        for key in self.resources.keys().chain(self.pending_creates.iter()) {
             if state_key_namespace(key).is_none() {
                 return Err(crate::error::Error::Config(format!(
                     "state file contains invalid resource key {key:?}; expected __gitforgeops_state_key_v2:<namespace>:<kind>:<id>"
@@ -217,6 +224,11 @@ impl StateFile {
                 .map(|ns| !scope.contains(ns.as_str()))
                 .unwrap_or(false)
         });
+        self.pending_creates.retain(|key| {
+            state_key_namespace(key)
+                .map(|ns| !scope.contains(ns.as_str()))
+                .unwrap_or(false)
+        });
 
         for proxy in &config.proxies {
             if !scope.contains(proxy.namespace.as_str()) {
@@ -271,6 +283,7 @@ impl StateFile {
         match op.action {
             DiffAction::Delete => {
                 self.resources.remove(&key);
+                self.pending_creates.remove(&key);
             }
             DiffAction::Add | DiffAction::Modify => {
                 let hash = match op.kind.as_str() {
@@ -297,11 +310,136 @@ impl StateFile {
                     _ => None,
                 };
                 if let Some(h) = hash {
-                    self.resources.insert(key, h);
+                    self.resources.insert(key.clone(), h);
+                    self.pending_creates.remove(&key);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Durably journal resources this run is about to create.
+    ///
+    /// The caller saves these reservations immediately before the first API
+    /// mutation. A pending key is not ownership: it stays outside `resources`
+    /// and therefore outside the shared-mode delete fence. On the next run,
+    /// [`Self::reconcile_pending_creates`] keeps it pending until an
+    /// idempotent update explicitly asserts repository ownership.
+    /// Existing Modify/Delete ownership is already present and is intentionally
+    /// left untouched until those operations succeed.
+    pub fn reserve_adds(
+        &mut self,
+        diffs: &[crate::diff::resource_diff::ResourceDiff],
+        desired: &GatewayConfig,
+    ) -> crate::error::Result<usize> {
+        use crate::diff::resource_diff::DiffAction;
+
+        let mut reserved = 0;
+        for diff in diffs
+            .iter()
+            .filter(|diff| matches!(diff.action, DiffAction::Add))
+        {
+            let key = state_key(&diff.namespace, &diff.kind, &diff.id);
+            if !resource_exists(desired, &key) {
+                return Err(crate::error::Error::Config(format!(
+                    "cannot journal create for {} `{}` in namespace `{}` because it is absent from the desired configuration",
+                    diff.kind, diff.id, diff.namespace
+                )));
+            }
+            if !self.resources.contains_key(&key) && self.pending_creates.insert(key) {
+                reserved += 1;
+            }
+        }
+        Ok(reserved)
+    }
+
+    /// Reconcile write-ahead create records against an authoritative backup.
+    ///
+    /// Exact current desired/live equality is intentionally *not* enough to
+    /// claim ownership: an administrator could have created the same row while
+    /// our POST outcome was unknown. The pending key stays journaled so the
+    /// apply target can issue an idempotent PUT and record ownership only after
+    /// that explicit assertion succeeds. A row absent from both desired and
+    /// live can be forgotten. The dangerous third case is a live row whose
+    /// desired declaration disappeared: its provenance is unknowable, so fail
+    /// closed rather than claiming or deleting it.
+    pub fn reconcile_pending_creates(
+        &mut self,
+        desired: &GatewayConfig,
+        actual_by_namespace: &BTreeMap<String, GatewayConfig>,
+    ) -> crate::error::Result<usize> {
+        let pending = self.pending_creates.iter().cloned().collect::<Vec<_>>();
+        let mut changed = 0;
+
+        for key in pending {
+            if self.resources.contains_key(&key) {
+                self.pending_creates.remove(&key);
+                changed += 1;
+                continue;
+            }
+
+            let Some(namespace) = state_key_namespace(&key) else {
+                // validate_resource_keys() catches this on load/save. Keep the
+                // defensive branch so an in-memory malformed value cannot be
+                // mistaken for a row in the current namespace.
+                return Err(crate::error::Error::Config(format!(
+                    "state file contains invalid pending-create key {key:?}"
+                )));
+            };
+            let Some(actual) = actual_by_namespace.get(&namespace) else {
+                // A namespace filter can intentionally leave pending entries
+                // outside this invocation's authoritative read scope.
+                continue;
+            };
+
+            let desired_exists = resource_exists(desired, &key);
+            let live_exists = resource_exists(actual, &key);
+            match (desired_exists, live_exists) {
+                (true, _) => {
+                    // Still desired: keep the journal entry. An absent or
+                    // different row takes the ordinary Add/Modify path; an
+                    // exact row gets a synthetic idempotent Modify assertion.
+                    // Either enters the managed fence only after success.
+                }
+                (false, false) => {
+                    self.pending_creates.remove(&key);
+                    changed += 1;
+                }
+                (false, true) => {
+                    return Err(crate::error::Error::Config(format!(
+                        "refusing to reconcile pending create {key:?}: the row is live but no longer declared in the repository, so its ownership cannot be proven. Re-add the desired resource and apply successfully before removing it in a later change, or resolve the live row and state journal manually."
+                    )));
+                }
+            }
+        }
+
+        Ok(changed)
+    }
+
+    /// Remove managed-ledger entries that an authoritative backup proves are
+    /// absent both from the repository and the gateway.
+    ///
+    /// Without this garbage collection, externally deleted rows remain in the
+    /// large-prune denominator forever and can dilute a later destructive
+    /// change. Entries outside the current namespace read scope are untouched.
+    pub fn reconcile_absent_managed_resources(
+        &mut self,
+        desired: &GatewayConfig,
+        actual_by_namespace: &BTreeMap<String, GatewayConfig>,
+    ) -> usize {
+        let before = self.resources.len();
+        self.resources.retain(|key, _| {
+            let Some(namespace) = state_key_namespace(key) else {
+                // Loading/saving rejects malformed keys. Retain defensively so
+                // this maintenance pass never turns corruption into deletion.
+                return true;
+            };
+            let Some(actual) = actual_by_namespace.get(&namespace) else {
+                return true;
+            };
+            resource_exists(desired, key) || resource_exists(actual, key)
+        });
+        before.saturating_sub(self.resources.len())
     }
 
     /// Drop all `resources` entries in `namespace` and rebuild from `desired`.
@@ -310,6 +448,11 @@ impl StateFile {
     /// authoritative and equals `desired`.
     pub fn record_full_replace(&mut self, namespace: &str, desired: &GatewayConfig) {
         self.resources.retain(|key, _| {
+            state_key_namespace(key)
+                .map(|ns| ns != namespace)
+                .unwrap_or(false)
+        });
+        self.pending_creates.retain(|key| {
             state_key_namespace(key)
                 .map(|ns| ns != namespace)
                 .unwrap_or(false)
@@ -354,6 +497,16 @@ impl StateFile {
         self.last_applied_commit = git_rev_parse_head();
     }
 
+    /// Stamp completion metadata only when the aggregate apply converged
+    /// cleanly. Successful per-resource ownership updates are still persisted
+    /// after a partial run, but `last_applied_*` must continue to identify the
+    /// most recent commit that landed in full.
+    pub fn stamp_last_applied_if_clean(&mut self, apply_succeeded: bool) {
+        if apply_succeeded {
+            self.stamp_last_applied();
+        }
+    }
+
     pub fn record_credential(
         &mut self,
         slot: &str,
@@ -391,6 +544,25 @@ impl StateFile {
     pub fn previously_managed_keys(&self) -> std::collections::HashSet<String> {
         self.resources.keys().cloned().collect()
     }
+}
+
+fn resource_exists(config: &GatewayConfig, key: &str) -> bool {
+    config
+        .proxies
+        .iter()
+        .any(|resource| state_key(&resource.namespace, "Proxy", &resource.id) == key)
+        || config
+            .consumers
+            .iter()
+            .any(|resource| state_key(&resource.namespace, "Consumer", &resource.id) == key)
+        || config
+            .upstreams
+            .iter()
+            .any(|resource| state_key(&resource.namespace, "Upstream", &resource.id) == key)
+        || config
+            .plugin_configs
+            .iter()
+            .any(|resource| state_key(&resource.namespace, "PluginConfig", &resource.id) == key)
 }
 
 fn hash_resource<T: serde::Serialize>(resource: &T) -> String {

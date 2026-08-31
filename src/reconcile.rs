@@ -56,7 +56,7 @@ pub fn resolved_namespaces(
                 // arrives here from state can only ever yield deletes of rows
                 // that same file claims the repo applied.
                 let mut set: BTreeSet<String> = collect_namespaces(desired).into_iter().collect();
-                for key in state.resources.keys() {
+                for key in state.resources.keys().chain(state.pending_creates.iter()) {
                     if let Some(ns) = state_key_namespace(key) {
                         set.insert(ns);
                     }
