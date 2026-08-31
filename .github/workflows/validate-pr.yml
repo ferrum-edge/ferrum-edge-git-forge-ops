@@ -40,8 +40,16 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
-          result=$(python3 trusted-scope/.github/scripts/changed_files.py \
-            "$pages_file" "$DECLARED_CHANGED" declarative)
+          helper=trusted-scope/.github/scripts/changed_files.py
+          if [ -f "$helper" ]; then
+            result=$(python3 trusted-scope/.github/scripts/changed_files.py \
+              "$pages_file" "$DECLARED_CHANGED" declarative)
+          else
+            # The helper does not exist on the base of its own bootstrap PR.
+            # Run validation fail-safe rather than executing candidate code.
+            echo "::warning::Trusted path classifier is not present on the PR base; validating fail-safe."
+            result='{"complete":false,"matches":true}'
+          fi
           relevant=$(jq -r '.matches' <<< "$result")
           if [ "$(jq -r '.complete' <<< "$result")" != true ]; then
             echo "::warning::Changed-file pagination was incomplete; validating fail-safe."
