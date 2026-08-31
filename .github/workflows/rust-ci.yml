@@ -61,8 +61,17 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
-          result=$(python3 trusted-scope/.github/scripts/changed_files.py \
-            "$pages_file" "$DECLARED_CHANGED" rust)
+          helper=trusted-scope/.github/scripts/changed_files.py
+          if [ -f "$helper" ]; then
+            result=$(python3 trusted-scope/.github/scripts/changed_files.py \
+              "$pages_file" "$DECLARED_CHANGED" rust)
+          else
+            # The helper is absent only while the PR that first introduces it
+            # is based on an older main. Never execute the candidate copy;
+            # classify as incomplete so every Rust gate runs fail-safe.
+            echo "::warning::Trusted path classifier is not present on the PR base; running Rust CI fail-safe."
+            result='{"complete":false,"matches":true}'
+          fi
           rust=$(jq -r '.matches' <<< "$result")
           if [ "$(jq -r '.complete' <<< "$result")" != true ]; then
             echo "::warning::Changed-file pagination was incomplete; running Rust CI fail-safe."
@@ -133,8 +142,16 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
-          result=$(python3 trusted-scope/.github/scripts/changed_files.py \
-            "$pages_file" "$DECLARED_CHANGED" rust)
+          helper=trusted-scope/.github/scripts/changed_files.py
+          if [ -f "$helper" ]; then
+            result=$(python3 trusted-scope/.github/scripts/changed_files.py \
+              "$pages_file" "$DECLARED_CHANGED" rust)
+          else
+            # Bootstrap the trusted helper by running the complete coverage
+            # gate. The PR-controlled helper is deliberately never executed.
+            echo "::warning::Trusted path classifier is not present on the PR base; running coverage fail-safe."
+            result='{"complete":false,"matches":true}'
+          fi
           rust=$(jq -r '.matches' <<< "$result")
           if [ "$(jq -r '.complete' <<< "$result")" != true ]; then rust=true; fi
           echo "rust=$rust" >> "$GITHUB_OUTPUT"

@@ -42,6 +42,12 @@ def trusted_classifier_violations(
         violations.append(
             f"{workflow}: path scope must not invoke the candidate-branch classifier"
         )
+    if "trusted-scope/" in trusted_invocation:
+        fail_safe = "result='{\"complete\":false,\"matches\":true}'"
+        if text.count(fail_safe) != expected_count:
+            violations.append(
+                f"{workflow}: every trusted classifier invocation needs a bootstrap fail-safe"
+            )
     return violations
 
 
