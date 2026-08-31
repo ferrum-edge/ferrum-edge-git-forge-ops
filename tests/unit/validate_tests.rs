@@ -70,8 +70,14 @@ fn validator_output_cannot_echo_literal_or_resolved_credentials() {
 
         let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
         assert!(!result.success);
-        assert!(!result.stdout.contains(secret), "{}", result.stdout);
-        assert!(!result.stderr.contains(secret), "{}", result.stderr);
+        assert!(
+            !result.stdout.contains(secret),
+            "validator stdout exposed a credential fixture"
+        );
+        assert!(
+            !result.stderr.contains(secret),
+            "validator stderr exposed a credential fixture"
+        );
         assert!(
             result.stderr.contains("diagnostics were suppressed"),
             "{}",
