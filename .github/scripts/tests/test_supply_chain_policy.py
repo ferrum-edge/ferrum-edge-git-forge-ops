@@ -35,6 +35,30 @@ result=$(python3 .github/scripts/changed_files.py
         )
         self.assertTrue(any("base SHA" in item for item in violations))
 
+    def test_missing_trusted_helper_must_run_the_gate_fail_safe(self):
+        text = """
+ref: ${{ github.event.pull_request.base.sha }}
+result=$(python3 trusted-scope/.github/scripts/changed_files.py
+"""
+        violations = check_supply_chain.trusted_classifier_violations(
+            "validate-pr.yml",
+            text,
+            "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
+            1,
+        )
+        self.assertTrue(any("bootstrap fail-safe" in item for item in violations))
+
+        secure = text + "\nresult='{\"complete\":false,\"matches\":true}'\n"
+        self.assertEqual(
+            check_supply_chain.trusted_classifier_violations(
+                "validate-pr.yml",
+                secure,
+                "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
+                1,
+            ),
+            [],
+        )
+
     def test_state_writer_token_must_follow_build_and_stay_ephemeral(self):
         secure = "\n".join(
             [
