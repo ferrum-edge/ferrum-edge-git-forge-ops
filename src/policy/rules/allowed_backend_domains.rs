@@ -1,6 +1,7 @@
 use crate::config::GatewayConfig;
 use crate::policy::config::AllowedBackendDomainsRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
+use std::collections::HashSet;
 
 pub struct AllowedBackendDomainsRule {
     config: AllowedBackendDomainsRuleConfig,
@@ -62,13 +63,26 @@ impl PolicyCheck for AllowedBackendDomainsRule {
         }
         let allowed = allowed_domains.join(", ");
 
+        let declared_upstreams: HashSet<(&str, &str)> = cfg
+            .upstreams
+            .iter()
+            .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
+            .collect();
+
         for proxy in &cfg.proxies {
-            // When a proxy delegates to an upstream, backend_host is schema
-            // filler rather than the routed backend. The upstream target loop
-            // below enforces the actual destinations.
-            if proxy.upstream_id.is_some() {
+            let uses_resolved_upstream = proxy.upstream_id.as_deref().is_some_and(|upstream_id| {
+                !upstream_id.trim().is_empty()
+                    && declared_upstreams.contains(&(proxy.namespace.as_str(), upstream_id))
+            });
+
+            // When a proxy delegates to a declared upstream in the same
+            // namespace, backend_host is schema filler rather than the routed
+            // backend. The upstream target loop below enforces the actual
+            // destinations.
+            if uses_resolved_upstream {
                 continue;
             }
+
             if !Self::is_allowed(&proxy.backend_host, &allowed_domains) {
                 findings.push(PolicyFinding {
                     rule_id: self.rule_id().to_string(),
