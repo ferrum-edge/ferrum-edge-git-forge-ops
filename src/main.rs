@@ -1745,32 +1745,37 @@ async fn cmd_review(
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
 
-    let (diffs, breaking, unmanaged, spec_owned, comparison_error) = match &client {
-        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
-            Ok(namespace_pairs) => {
-                let (d, b, u, s) = compute_namespace_diffs(
-                    &namespace_pairs,
-                    managed.as_ref(),
-                    diff::DiffOptions::default(),
-                );
-                (d, b, u, s, None)
+    let (diffs, breaking, unmanaged, spec_owned, comparison_error) =
+        if let Some(error) = review::live_comparison_precondition_error(&namespaces) {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
+        } else {
+            match &client {
+                Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+                    Ok(namespace_pairs) => {
+                        let (d, b, u, s) = compute_namespace_diffs(
+                            &namespace_pairs,
+                            managed.as_ref(),
+                            diff::DiffOptions::default(),
+                        );
+                        (d, b, u, s, None)
+                    }
+                    Err(e) => (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Some(format!("Live gateway comparison skipped: {}", e)),
+                    ),
+                },
+                Err(e) => (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Some(format!("Live gateway comparison skipped: {}", e)),
+                ),
             }
-            Err(e) => (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Some(format!("Live gateway comparison skipped: {}", e)),
-            ),
-        },
-        Err(e) => (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Some(format!("Live gateway comparison skipped: {}", e)),
-        ),
-    };
+        };
 
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);

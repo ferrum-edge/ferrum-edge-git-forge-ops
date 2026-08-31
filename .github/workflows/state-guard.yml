@@ -16,8 +16,9 @@ name: GitForgeOps State Guard
 # Escape hatch for genuine repairs (restoring a corrupted ledger, seeding an
 # environment adopted from an existing gateway): label the PR
 # `gitforgeops/state-override`. Triage users can apply labels, so label presence
-# is not authority: this workflow resolves the latest effective label event and
-# requires the actor's current permission to be write, maintain, or admin.
+# is not authority: this workflow resolves the latest effective label event,
+# requires the actor's current permission to be write, maintain, or admin, and
+# requires the label to have been applied after the current head commit.
 
 on:
   pull_request:
@@ -162,6 +163,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           OVERRIDE_LABEL: gitforgeops/state-override
         run: |
           set -euo pipefail
@@ -177,17 +179,18 @@ jobs:
 
           events_file=$(mktemp)
           trap 'rm -f "$events_file"' EXIT
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/events?per_page=100" \
-            --paginate --slurp > "$events_file"
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/timeline?per_page=100" \
+            -H 'Accept: application/vnd.github+json' --paginate --slurp > "$events_file"
 
-          # Replay exact-label events in chronological/id order. A later
-          # unlabeled event clears authority; a later re-label replaces the
-          # actor, so permission is always attributed to the effective event.
+          # Replay the trusted timeline. A later unlabeled event clears
+          # authority, a later re-label replaces the actor, and a push after
+          # the label invalidates it, so authority is bound to this exact head.
           effective=$(python3 trusted-guard/.github/scripts/state_override.py \
-            "$events_file" "$OVERRIDE_LABEL")
+            "$events_file" "$OVERRIDE_LABEL" "$EXPECTED_HEAD_SHA")
           actor=$(jq -r '.actor' <<< "$effective")
           event_id=$(jq -r '.event_id' <<< "$effective")
           labeled_at=$(jq -r '.labeled_at' <<< "$effective")
+          authorized_head=$(jq -r '.head_sha' <<< "$effective")
 
           # This endpoint returns the actor's current permission and fails for
           # deleted/suspended/non-collaborator identities. Triage is explicitly
@@ -206,6 +209,7 @@ jobs:
             echo "permission=$permission"
             echo "event_id=$event_id"
             echo "labeled_at=$labeled_at"
+            echo "head_sha=$authorized_head"
           } >> "$GITHUB_OUTPUT"
 
       - name: Reject unauthorized PR-authored state changes
@@ -228,7 +232,9 @@ jobs:
           If you are deliberately repairing or seeding the ledger, a user with
           current `write`, `maintain`, or `admin` repository permission can add
           the exact `gitforgeops/state-override` label. The latest effective
-          label event is attributed and checked; triage permission is rejected.
+          label event must follow the current head commit, is attributed and
+          checked, and rejects triage permission. A later push requires the
+          label to be removed and reapplied.
           MSG
           exit 1
 
@@ -239,6 +245,7 @@ jobs:
           PERMISSION: ${{ steps.authorize.outputs.permission }}
           EVENT_ID: ${{ steps.authorize.outputs.event_id }}
           LABELED_AT: ${{ steps.authorize.outputs.labeled_at }}
+          AUTHORIZED_HEAD: ${{ steps.authorize.outputs.head_sha }}
         run: |
           echo "::warning::.state/ changes authorized by @${ACTOR} (${PERMISSION}), label event ${EVENT_ID} at ${LABELED_AT}."
           {
@@ -248,4 +255,5 @@ jobs:
             echo "- Current permission: \`${PERMISSION}\`"
             echo "- Label event ID: \`${EVENT_ID}\`"
             echo "- Labeled at: \`${LABELED_AT}\`"
+            echo "- Authorized head: \`${AUTHORIZED_HEAD}\`"
           } >> "$GITHUB_STEP_SUMMARY"

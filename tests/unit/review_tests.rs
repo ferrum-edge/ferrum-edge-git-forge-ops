@@ -4,6 +4,7 @@ use gitforgeops::diff::{
 };
 use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
+use gitforgeops::review::live_comparison_precondition_error;
 use gitforgeops::review::pr_comment::{
     build_review_comment, build_review_comment_v2, render_spec_owned,
 };
@@ -92,6 +93,13 @@ fn review_comment_marks_live_comparison_as_skipped() {
     assert!(comment.contains("Changes: Skipped"));
     assert!(comment.contains("Breaking Changes: Skipped"));
     assert!(comment.contains("gateway unavailable"));
+}
+
+#[test]
+fn live_review_rejects_a_vacuous_zero_namespace_comparison() {
+    let error = live_comparison_precondition_error(&[]).expect("empty scope must fail closed");
+    assert!(error.contains("no trusted namespaces"));
+    assert!(live_comparison_precondition_error(&["default".to_string()]).is_none());
 }
 
 #[test]

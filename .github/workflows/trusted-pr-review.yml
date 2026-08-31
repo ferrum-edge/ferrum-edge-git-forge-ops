@@ -293,6 +293,7 @@ jobs:
           }
 
       - name: Add trusted environment and policy configuration
+        id: trusted-config
         run: |
           set -euo pipefail
           [ ! -L trusted/.gitforgeops ] || {
@@ -312,6 +313,7 @@ jobs:
           done
 
       - name: Add trusted ownership state for this environment
+        id: trusted-state
         env:
           INPUT_ENVIRONMENT: ${{ matrix.environment }}
         run: |
@@ -351,6 +353,8 @@ jobs:
           steps.verify.outcome == 'success' &&
           steps.binary.outcome == 'success' &&
           steps.current-head.outcome == 'success' &&
+          steps.trusted-config.outcome == 'success' &&
+          steps.trusted-state.outcome == 'success' &&
           steps.validator.outcome == 'success'
         working-directory: review-input
         env:

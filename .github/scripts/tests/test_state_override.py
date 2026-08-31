@@ -22,7 +22,34 @@ def event(event_id, action, actor, label="gitforgeops/state-override"):
     }
 
 
+def commit(sha):
+    return {"event": "committed", "sha": sha}
+
+
 class StateOverrideTests(unittest.TestCase):
+    def test_override_must_be_reapplied_after_the_current_head(self):
+        old_head = "1" * 40
+        current_head = "2" * 40
+        stale = [[commit(old_head), event(1, "labeled", "writer"), commit(current_head)]]
+        with self.assertRaisesRegex(state_override.OverrideError, "predates"):
+            state_override.resolve_effective_event(
+                stale, "gitforgeops/state-override", current_head
+            )
+
+        current = [[commit(old_head), commit(current_head), event(2, "labeled", "writer")]]
+        effective = state_override.resolve_effective_event(
+            current, "gitforgeops/state-override", current_head
+        )
+        self.assertEqual(effective["head_sha"], current_head)
+
+    def test_expected_head_must_be_the_latest_timeline_commit(self):
+        current_head = "2" * 40
+        pages = [[commit(current_head), commit("3" * 40), event(1, "labeled", "writer")]]
+        with self.assertRaisesRegex(state_override.OverrideError, "latest committed"):
+            state_override.resolve_effective_event(
+                pages, "gitforgeops/state-override", current_head
+            )
+
     def test_write_maintain_and_admin_are_sufficient_but_triage_is_not(self):
         for permission in ("write", "maintain", "admin"):
             self.assertTrue(state_override.permission_is_sufficient(permission))

@@ -15,28 +15,28 @@ SPEC.loader.exec_module(changed_files)
 class ChangedFilesTests(unittest.TestCase):
     def test_pr_workflows_use_head_stable_api_snapshots(self):
         workflows = {
-            "state-guard.yml": 1,
-            "rust-ci.yml": 2,
-            "validate-pr.yml": 1,
+            "state-guard.yml": (1, 2),
+            "rust-ci.yml": (2, 2),
+            "validate-pr.yml": (1, 1),
         }
         workflow_root = SCRIPT.parents[1] / "workflows"
-        for name, expected_count in workflows.items():
+        for name, (snapshot_count, head_binding_count) in workflows.items():
             with self.subTest(workflow=name):
                 text = (workflow_root / name).read_text(encoding="utf-8")
                 self.assertNotIn("github.event.pull_request.changed_files", text)
                 self.assertEqual(
                     text.count('before=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")'),
-                    expected_count,
+                    snapshot_count,
                 )
                 self.assertEqual(
                     text.count('after=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")'),
-                    expected_count,
+                    snapshot_count,
                 )
                 self.assertEqual(
                     text.count(
                         "EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}"
                     ),
-                    expected_count,
+                    head_binding_count,
                 )
                 self.assertIn("ref: ${{ github.event.repository.default_branch }}", text)
 
