@@ -5,7 +5,8 @@ use gitforgeops::diff::{
 use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::review::pr_comment::{
-    build_review_comment, build_review_comment_v2, render_environment_note, render_spec_owned,
+    build_review_comment, build_review_comment_v2, markdown_comment_for_terminal,
+    render_environment_note, render_spec_owned,
 };
 use gitforgeops::secrets::ResolveReport;
 
@@ -138,6 +139,41 @@ fn code_span_escapes_pipes_only_inside_tables() {
     assert!(comment.contains("`table\\|id`"));
     assert!(comment.contains("`bullet|id`"));
     assert!(!comment.contains("`bullet\\|id`"));
+}
+
+#[test]
+fn review_comment_replaces_invisible_format_characters_and_blank_inline_fields() {
+    let findings = vec![SecurityFinding {
+        severity: "warning".to_string(),
+        kind: " \t".to_string(),
+        id: "safe\u{202e}hidden\u{200b}".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "credential\u{2066} finding".to_string(),
+    }];
+    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+
+    assert!(!comment.contains('\u{202e}'));
+    assert!(!comment.contains('\u{200b}'));
+    assert!(!comment.contains('\u{2066}'));
+    assert!(comment.contains("**(none) `safe�hidden�`**"));
+    assert!(comment.contains("credential� finding"));
+}
+
+#[test]
+fn terminal_review_decodes_only_entities_emitted_by_the_markdown_sanitizer() {
+    let comment = build_review_comment(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        Some("https://api.example/path_with_value & literal &#46;"),
+    );
+    let terminal = markdown_comment_for_terminal(&comment);
+
+    assert!(terminal.contains("https://api.example/path_with_value & literal &#46;"));
+    assert!(!terminal.contains("api&#46;example"));
 }
 
 #[test]

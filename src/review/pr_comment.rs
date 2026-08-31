@@ -6,6 +6,22 @@ use crate::policy::config::OverrideConfig;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
 
+fn is_unsafe_format_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+        )
+}
+
 fn sanitize_markdown_inline(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     let mut pending_space = false;
@@ -18,6 +34,10 @@ fn sanitize_markdown_inline(value: &str) -> String {
             sanitized.push(' ');
         }
         pending_space = false;
+        if is_unsafe_format_character(character) {
+            sanitized.push('\u{fffd}');
+            continue;
+        }
         match character {
             '&' => sanitized.push_str("&amp;"),
             '<' => sanitized.push_str("&lt;"),
@@ -35,7 +55,11 @@ fn sanitize_markdown_inline(value: &str) -> String {
             _ => sanitized.push(character),
         }
     }
-    sanitized
+    if sanitized.is_empty() {
+        "(none)".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn sanitize_code_span(value: &str) -> String {
@@ -50,6 +74,10 @@ fn sanitize_code_span(value: &str) -> String {
             sanitized.push(' ');
         }
         pending_space = false;
+        if is_unsafe_format_character(character) {
+            sanitized.push('\u{fffd}');
+            continue;
+        }
         match character {
             '`' => sanitized.push('\''),
             _ => sanitized.push(character),
@@ -64,6 +92,23 @@ fn sanitize_code_span(value: &str) -> String {
 
 fn sanitize_table_code_span(value: &str) -> String {
     sanitize_code_span(value).replace('|', "\\|")
+}
+
+pub fn markdown_comment_for_terminal(value: &str) -> String {
+    value
+        .replace("&#91;", "[")
+        .replace("&#93;", "]")
+        .replace("&#96;", "`")
+        .replace("&#92;", "\\")
+        .replace("&#42;", "*")
+        .replace("&#95;", "_")
+        .replace("&#124;", "|")
+        .replace("&#35;", "#")
+        .replace("&#58;", ":")
+        .replace("&#46;", ".")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 pub struct EnvironmentNote(String);

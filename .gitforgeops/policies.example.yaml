@@ -81,6 +81,11 @@ policies:
       - api.internal.example.com
       - "*.svc.cluster.local"
       - "*.corp.example.com"
+    # Optional exact IP pins. When omitted, dns_override is checked against
+    # allowed_domains for backward compatibility, which also permits that IP
+    # as a direct backend or upstream target.
+    allowed_dns_override_addresses: []
+    # - 10.0.0.10
     allowed_service_discovery_upstreams: []
     # - namespace: platform
     #   id: kubernetes-services

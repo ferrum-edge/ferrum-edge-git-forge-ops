@@ -1843,12 +1843,12 @@ async fn cmd_review(
                         "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {e}"
                     );
                     write_review_to_step_summary(&comment)?;
-                    print!("{}", comment);
+                    print!("{}", review::markdown_comment_for_terminal(&comment));
                 }
             }
         }
         None => {
-            print!("{}", comment);
+            print!("{}", review::markdown_comment_for_terminal(&comment));
         }
     }
 

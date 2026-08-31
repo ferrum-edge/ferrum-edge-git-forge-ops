@@ -123,7 +123,7 @@ pub struct AllowedProxyPluginsRuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ServiceDiscoveryUpstreamAllowance {
+pub struct UpstreamAllowance {
     pub namespace: String,
     pub id: String,
 }
@@ -140,13 +140,17 @@ pub struct AllowedBackendDomainsRuleConfig {
     /// by an equivalent external egress control. Entries match exact resource
     /// identity so acknowledging one upstream cannot weaken the whole rule.
     #[serde(default)]
-    pub allowed_service_discovery_upstreams: Vec<ServiceDiscoveryUpstreamAllowance>,
+    pub allowed_service_discovery_upstreams: Vec<UpstreamAllowance>,
     /// Upstreams that intentionally live outside this repository's desired
     /// document, such as shared-mode or OpenAPI-spec-owned resources. Entries
     /// match exact resource identity; their runtime destinations must be
     /// constrained by an equivalent external egress control.
     #[serde(default)]
-    pub allowed_external_upstreams: Vec<ServiceDiscoveryUpstreamAllowance>,
+    pub allowed_external_upstreams: Vec<UpstreamAllowance>,
+    /// Exact IP literals allowed as per-proxy DNS pins. When empty, the rule
+    /// falls back to `allowed_domains` for backward compatibility.
+    #[serde(default)]
+    pub allowed_dns_override_addresses: Vec<String>,
 }
 
 /// `waf_enforcement` — a WAF that is attached but not blocking.

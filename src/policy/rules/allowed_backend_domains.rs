@@ -72,6 +72,14 @@ impl AllowedBackendDomainsRule {
             .iter()
             .any(|pattern| Self::domain_matches(&host, pattern))
     }
+
+    fn url_destination_host(address: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(address).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return None;
+        }
+        parsed.host_str().map(ToOwned::to_owned)
+    }
 }
 
 impl PolicyCheck for AllowedBackendDomainsRule {
@@ -108,7 +116,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
         if allowed_domains.is_empty() {
             findings.push(PolicyFinding {
                 rule_id: self.rule_id().to_string(),
-                severity: self.config.severity,
+                severity: crate::policy::Severity::Error,
                 kind: "PolicyConfig".to_string(),
                 id: self.rule_id().to_string(),
                 namespace: "global".to_string(),
@@ -124,7 +132,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
         if !invalid_domains.is_empty() {
             findings.push(PolicyFinding {
                 rule_id: self.rule_id().to_string(),
-                severity: self.config.severity,
+                severity: crate::policy::Severity::Error,
                 kind: "PolicyConfig".to_string(),
                 id: self.rule_id().to_string(),
                 namespace: "global".to_string(),
@@ -146,9 +154,81 @@ impl PolicyCheck for AllowedBackendDomainsRule {
         let allowed = allowed_domains.join(", ");
         let allow_all = allowed_domains.iter().any(|domain| domain == "*");
 
+        let mut invalid_dns_override_addresses = Vec::new();
+        let configured_dns_override_addresses: Vec<String> = self
+            .config
+            .allowed_dns_override_addresses
+            .iter()
+            .filter_map(|address| {
+                let trimmed = address.trim();
+                if trimmed != address || Self::parse_ip_literal(trimmed).is_none() {
+                    invalid_dns_override_addresses.push(address.clone());
+                    None
+                } else {
+                    Some(Self::normalize_domain(trimmed))
+                }
+            })
+            .collect();
+        if !invalid_dns_override_addresses.is_empty() {
+            findings.push(PolicyFinding {
+                rule_id: self.rule_id().to_string(),
+                severity: crate::policy::Severity::Error,
+                kind: "PolicyConfig".to_string(),
+                id: self.rule_id().to_string(),
+                namespace: "global".to_string(),
+                message: format!(
+                    "invalid allowed_dns_override_addresses entries: {}",
+                    invalid_dns_override_addresses
+                        .iter()
+                        .map(|address| format!("'{address}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                remediation: Some(
+                    "Use exact IPv4 or IPv6 literals without ports, padding, or wildcards"
+                        .to_string(),
+                ),
+                overridden_by: None,
+            });
+        }
+        let allowed_dns_override_addresses =
+            if self.config.allowed_dns_override_addresses.is_empty() {
+                &allowed_domains
+            } else {
+                &configured_dns_override_addresses
+            };
+
+        let mut upstream_key_counts: HashMap<(&str, &str), usize> = HashMap::new();
+        for upstream in &cfg.upstreams {
+            *upstream_key_counts
+                .entry((upstream.namespace.as_str(), upstream.id.as_str()))
+                .or_default() += 1;
+        }
+        for ((namespace, id), count) in &upstream_key_counts {
+            if *count > 1 {
+                findings.push(PolicyFinding {
+                    rule_id: self.rule_id().to_string(),
+                    severity: crate::policy::Severity::Error,
+                    kind: "PolicyConfig".to_string(),
+                    id: self.rule_id().to_string(),
+                    namespace: "global".to_string(),
+                    message: format!(
+                        "duplicate upstream identity '{namespace}:Upstream:{id}' prevents unambiguous allowlist resolution"
+                    ),
+                    remediation: Some(
+                        "Keep exactly one upstream for each (namespace, id) identity".to_string(),
+                    ),
+                    overridden_by: None,
+                });
+            }
+        }
         let declared_upstreams: HashMap<(&str, &str), _> = cfg
             .upstreams
             .iter()
+            .filter(|upstream| {
+                upstream_key_counts.get(&(upstream.namespace.as_str(), upstream.id.as_str()))
+                    == Some(&1)
+            })
             .map(|upstream| {
                 (
                     (upstream.namespace.as_str(), upstream.id.as_str()),
@@ -156,18 +236,109 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 )
             })
             .collect();
-        let allowed_service_discovery_upstreams: HashSet<(&str, &str)> = self
-            .config
-            .allowed_service_discovery_upstreams
-            .iter()
-            .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
-            .collect();
-        let allowed_external_upstreams: HashSet<(&str, &str)> = self
-            .config
-            .allowed_external_upstreams
-            .iter()
-            .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
-            .collect();
+        let mut allowed_service_discovery_upstreams = HashSet::new();
+        for upstream in &self.config.allowed_service_discovery_upstreams {
+            if upstream.namespace.trim() != upstream.namespace
+                || upstream.id.trim() != upstream.id
+                || upstream.namespace.is_empty()
+                || upstream.id.is_empty()
+            {
+                findings.push(PolicyFinding {
+                    rule_id: self.rule_id().to_string(),
+                    severity: crate::policy::Severity::Error,
+                    kind: "PolicyConfig".to_string(),
+                    id: self.rule_id().to_string(),
+                    namespace: "global".to_string(),
+                    message: format!(
+                        "invalid allowed_service_discovery_upstreams identity {{ namespace: '{}', id: '{}' }}",
+                        upstream.namespace, upstream.id
+                    ),
+                    remediation: Some(
+                        "Use exact, nonblank, unpadded namespace and upstream id values"
+                            .to_string(),
+                    ),
+                    overridden_by: None,
+                });
+                continue;
+            }
+            allowed_service_discovery_upstreams
+                .insert((upstream.namespace.as_str(), upstream.id.as_str()));
+        }
+        let mut allowed_external_upstreams = HashSet::new();
+        for upstream in &self.config.allowed_external_upstreams {
+            if upstream.namespace.trim() != upstream.namespace
+                || upstream.id.trim() != upstream.id
+                || upstream.namespace.is_empty()
+                || upstream.id.is_empty()
+            {
+                findings.push(PolicyFinding {
+                    rule_id: self.rule_id().to_string(),
+                    severity: crate::policy::Severity::Error,
+                    kind: "PolicyConfig".to_string(),
+                    id: self.rule_id().to_string(),
+                    namespace: "global".to_string(),
+                    message: format!(
+                        "invalid allowed_external_upstreams identity {{ namespace: '{}', id: '{}' }}",
+                        upstream.namespace, upstream.id
+                    ),
+                    remediation: Some(
+                        "Use exact, nonblank, unpadded namespace and upstream id values"
+                            .to_string(),
+                    ),
+                    overridden_by: None,
+                });
+                continue;
+            }
+            allowed_external_upstreams.insert((upstream.namespace.as_str(), upstream.id.as_str()));
+        }
+
+        for &(namespace, id) in &allowed_service_discovery_upstreams {
+            if !cfg.upstreams.iter().any(|upstream| {
+                upstream.namespace == namespace
+                    && upstream.id == id
+                    && upstream.service_discovery.is_some()
+            }) {
+                findings.push(PolicyFinding {
+                    rule_id: self.rule_id().to_string(),
+                    severity: crate::policy::Severity::Info,
+                    kind: "PolicyConfig".to_string(),
+                    id: self.rule_id().to_string(),
+                    namespace: "global".to_string(),
+                    message: format!(
+                        "stale allowed_service_discovery_upstreams identity {{ namespace: '{namespace}', id: '{id}' }} matches no discovery-backed upstream"
+                    ),
+                    remediation: Some(
+                        "Remove the stale acknowledgment or correct it to an exact discovery-backed upstream identity"
+                            .to_string(),
+                    ),
+                    overridden_by: None,
+                });
+            }
+        }
+        for &(namespace, id) in &allowed_external_upstreams {
+            let referenced_as_external = cfg.proxies.iter().any(|proxy| {
+                proxy.namespace == namespace
+                    && proxy.upstream_id.as_deref() == Some(id)
+                    && !declared_upstreams.contains_key(&(namespace, id))
+            });
+            if !referenced_as_external {
+                findings.push(PolicyFinding {
+                    rule_id: self.rule_id().to_string(),
+                    severity: crate::policy::Severity::Info,
+                    kind: "PolicyConfig".to_string(),
+                    id: self.rule_id().to_string(),
+                    namespace: "global".to_string(),
+                    message: format!(
+                        "stale allowed_external_upstreams identity {{ namespace: '{namespace}', id: '{id}' }} matches no unresolved proxy upstream reference"
+                    ),
+                    remediation: Some(
+                        "Remove the stale acknowledgment or correct it to an exact unresolved upstream reference"
+                            .to_string(),
+                    ),
+                    overridden_by: None,
+                });
+            }
+        }
 
         for proxy in &cfg.proxies {
             let upstream_id = proxy.upstream_id.as_deref();
@@ -263,7 +434,9 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 let disallowed: Vec<&str> = dns_override
                     .split(',')
                     .map(str::trim)
-                    .filter(|destination| !Self::is_allowed(destination, &allowed_domains))
+                    .filter(|destination| {
+                        !Self::is_allowed(destination, allowed_dns_override_addresses)
+                    })
                     .collect();
                 if !disallowed.is_empty() {
                     findings.push(PolicyFinding {
@@ -273,16 +446,17 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                         id: proxy.id.clone(),
                         namespace: proxy.namespace.clone(),
                         message: format!(
-                            "dns_override contains effective dial destination(s) outside the allowed domain list ({allowed}): {}",
+                            "dns_override contains effective dial destination(s) outside the configured DNS override list: {}",
                             disallowed
                                 .iter()
                                 .map(|destination| format!("'{destination}'"))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
-                        remediation: Some(format!(
-                            "Remove the disallowed dns_override destinations or add each exact value to allowed_domains (currently: {allowed})"
-                        )),
+                        remediation: Some(
+                            "Remove the disallowed dns_override destinations or add each exact IP to allowed_dns_override_addresses"
+                                .to_string(),
+                        ),
                         overridden_by: None,
                     });
                 }
@@ -290,6 +464,34 @@ impl PolicyCheck for AllowedBackendDomainsRule {
         }
 
         for upstream in &cfg.upstreams {
+            if let Some(consul) = upstream
+                .service_discovery
+                .as_ref()
+                .and_then(|discovery| discovery.consul.as_ref())
+            {
+                let consul_host = Self::url_destination_host(&consul.address);
+                if consul_host
+                    .as_deref()
+                    .is_none_or(|host| !Self::is_allowed(host, &allowed_domains))
+                {
+                    findings.push(PolicyFinding {
+                        rule_id: self.rule_id().to_string(),
+                        severity: self.config.severity,
+                        kind: "Upstream".to_string(),
+                        id: upstream.id.clone(),
+                        namespace: upstream.namespace.clone(),
+                        message: format!(
+                            "Consul discovery address='{}' has an invalid or disallowed control-plane destination ({allowed})",
+                            consul.address
+                        ),
+                        remediation: Some(format!(
+                            "Use an http(s) Consul address whose host matches one of these domains: {allowed}"
+                        )),
+                        overridden_by: None,
+                    });
+                }
+            }
+
             if upstream.service_discovery.is_some()
                 && !allow_all
                 && !allowed_service_discovery_upstreams
