@@ -360,9 +360,9 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
         gitforgeops::config::env::GatewayMode::Api,
     )
     .unwrap();
-    assert_eq!(
-        assembled.consumers[0].credentials, original_credentials,
-        "import -> private bundle seed -> assemble must not introduce credential drift"
+    assert!(
+        assembled.consumers[0].credentials == original_credentials,
+        "import -> private bundle seed -> assemble introduced credential drift"
     );
 
     for entry in walkdir::WalkDir::new(&output) {
@@ -701,12 +701,15 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
         "hmac_sha256:live-hash",
         "custom-live-token",
     ] {
-        assert!(!consumer.contains(secret), "leaked {secret:?}: {consumer}");
+        assert!(
+            !consumer.contains(secret),
+            "redacted Consumer output contained a credential fixture"
+        );
     }
     assert_eq!(
         consumer.matches("${gh-env-secret:alloc=require}").count(),
         7,
-        "{consumer}"
+        "redacted Consumer output did not contain every expected placeholder"
     );
     for entry in walkdir::WalkDir::new(tmp.path()) {
         let entry = entry.unwrap();
@@ -727,8 +730,7 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
                 !bytes
                     .windows(secret.len())
                     .any(|window| window == secret.as_bytes()),
-                "leaked {secret:?} in {}",
-                entry.path().display()
+                "generated import output contained a credential fixture"
             );
         }
     }
