@@ -32,7 +32,16 @@ credential locally for that recipient. The CLI never accepts an SSH private
 key and never calls RSA signing or decryption. The timing advisory concerns
 private-key operations observable by an attacker; those operations are not
 reachable from this path. Ed25519 and RSA public-recipient encryption are both
-covered by the aggregated test suite.
+covered by the aggregated test suite. `age` rejects SSH-RSA recipient keys
+smaller than 2048 bits.
+
+The audit gate machine-checks that premise before accepting the exception. It
+pins the manifest to `age 0.12` with the reviewed `ssh` and `armor` feature
+declaration, requires the dependency graph to contain only
+`gitforgeops -> age 0.12.1 -> rsa 0.9.10`, and rejects new `age` API references
+outside the encryption-only delivery module. A decrypt/private-key feature or
+second RSA dependency path therefore makes the required audit check fail even
+while the advisory tuple and exception deadline are unchanged.
 
 The exception owner must re-review or remove the entry by 2026-11-30. The
 preferred resolution is an `age` release whose stable RSA dependency contains

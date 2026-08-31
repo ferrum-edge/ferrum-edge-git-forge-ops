@@ -20,6 +20,13 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out trusted path classifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-scope
+          persist-credentials: false
+
       - name: Classify declarative changes
         id: classify
         env:
@@ -33,7 +40,7 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
-          result=$(python3 .github/scripts/changed_files.py \
+          result=$(python3 trusted-scope/.github/scripts/changed_files.py \
             "$pages_file" "$DECLARED_CHANGED" declarative)
           relevant=$(jq -r '.matches' <<< "$result")
           if [ "$(jq -r '.complete' <<< "$result")" != true ]; then
