@@ -20,6 +20,7 @@ MAX_FILES = 5_000
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_CHANGED_PATHS = 10_000
+MAX_LIVE_REVIEW_TARGETS = 256
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 class InputError(RuntimeError):
@@ -290,16 +291,20 @@ def _touched_namespaces(changed_paths_file: Path) -> set[str]:
         if any(part in {"", ".", ".."} for part in raw_parts):
             raise InputError(f"unsafe trusted changed path: {raw_path!r}")
         parts = PurePosixPath(raw_path).parts
+        if PurePosixPath(raw_path).suffix not in {".yaml", ".yml"}:
+            continue
         if parts[0] == "resources":
-            if len(parts) < 2 or not SAFE_COMPONENT_RE.fullmatch(parts[1]):
+            if len(parts) < 3:
+                continue
+            if not SAFE_COMPONENT_RE.fullmatch(parts[1]):
                 raise InputError(f"unsafe resource namespace path: {raw_path!r}")
             namespaces.add(parts[1])
         elif parts[0] == "overlays":
-            if (
-                len(parts) < 3
-                or not SAFE_COMPONENT_RE.fullmatch(parts[1])
-                or not SAFE_COMPONENT_RE.fullmatch(parts[2])
-            ):
+            if len(parts) < 4:
+                continue
+            if not SAFE_COMPONENT_RE.fullmatch(
+                parts[1]
+            ) or not SAFE_COMPONENT_RE.fullmatch(parts[2]):
                 raise InputError(f"unsafe overlay namespace path: {raw_path!r}")
             namespaces.add(parts[2])
         elif parts[0] != ".gitforgeops":
@@ -381,6 +386,11 @@ def trusted_targets(
         for namespace in sorted(set(namespaces)):
             if allowed is None or namespace in allowed:
                 targets.append({"environment": environment, "namespace": namespace})
+                if len(targets) > MAX_LIVE_REVIEW_TARGETS:
+                    raise InputError(
+                        "live-review scope exceeds GitHub's 256-job matrix limit; "
+                        "split the pull request into smaller namespace groups"
+                    )
     return targets
 
 

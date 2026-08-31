@@ -71,6 +71,17 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertFalse(result["matches"])
 
+    def test_exact_github_file_cap_is_always_treated_as_ambiguous(self):
+        records = [
+            {"filename": f"docs/file-{index}.md"}
+            for index in range(changed_files.GITHUB_PULL_FILES_LIMIT)
+        ]
+        result = changed_files.analyze(
+            [records], changed_files.GITHUB_PULL_FILES_LIMIT, "state"
+        )
+        self.assertEqual(result["observed_count"], 3_000)
+        self.assertFalse(result["complete"])
+
     def test_rust_scope_includes_build_and_workspace_inputs(self):
         for path in (
             "build.rs",

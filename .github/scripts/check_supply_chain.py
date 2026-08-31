@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         "needs: authorize-release",
         "release commit must map to exactly one merged PR",
         'gh pr checks "$pr" --repo "$REPO" --required',
-        "GitForgeOps PR Static Validation / required-static-validation",
+        "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
     ):
         if required not in release:
             violations.append(
@@ -321,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     for required in (
         "trusted-scope/.github/scripts/changed_files.py",
         "ref: ${{ github.event.repository.default_branch }}",
-        "required-static-validation:",
+        "gitforgeops-required-static-validation:",
         "if: always()",
     ):
         if required not in static_review:

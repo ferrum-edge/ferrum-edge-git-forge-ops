@@ -31,7 +31,7 @@ permissions:
   security-events: write
 
 jobs:
-  supply-chain-policy:
+  security-supply-chain-policy:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -110,7 +110,7 @@ jobs:
       - name: Test privileged-input boundary
         run: python3 -m unittest discover -s .github/scripts/tests -v
 
-  cargo-audit:
+  security-cargo-audit:
     runs-on: ubuntu-24.04
     permissions:
       contents: read

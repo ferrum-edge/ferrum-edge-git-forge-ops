@@ -1722,6 +1722,13 @@ async fn cmd_review(
     require_live: bool,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if require_live && pr.is_none() {
+        return Err(gitforgeops::error::Error::Config(
+            "review --require-live requires --pr so the result has a durable delivery target"
+                .to_string(),
+        )
+        .into());
+    }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
     // PR review preview must match apply's real validation surface, so a

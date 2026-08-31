@@ -144,10 +144,11 @@ The state file is the trust boundary for both of those, and it is CI-authored:
 as `gitforgeops[bot]` with a short-lived, contents-only GitHub App token;
 `.gitignore` tracks `.state/*.json` (ignoring only locks and temp files), and
 `state-guard.yml` fails any PR touching `.state/**` (including rename source
-paths) unless the latest effective
-`gitforgeops/state-override` label actor currently has `write`, `maintain`, or
-`admin` permission. It rejects triage/read/deleted/ambiguous actors and records
-the event ID/time/permission. Label changes rerun under per-PR concurrency so
+paths) unless the exact `gitforgeops/state-override` `labeled` webhook targets
+the current head and its actor currently has `write`, `maintain`, or `admin`
+permission. It rejects every push or other PR transition until a qualified
+maintainer removes and reapplies the label, and records the actor, permission,
+head, run ID, and attempt. Label changes rerun under per-PR concurrency so
 removed authorization cannot leave a stale success. That workflow runs
 on **every** PR with no `paths:` filter and decides internally whether
 `.state/` was touched — a path-filtered workflow reports no status on

@@ -45,12 +45,13 @@ additional include or exclusion patterns. It must:
 - dismiss stale approvals when reviewable commits are pushed;
 - require branches to be tested against the latest `main` commit;
 - block deletion and non-fast-forward updates;
-- require, at minimum, these checks (use the exact contexts GitHub displays):
-  - `Rust CI / check`
-  - `Security / cargo-audit`
-  - `Security / supply-chain-policy`
-  - `GitForgeOps State Guard / reject-state-edits`
-  - `GitForgeOps PR Static Validation / required-static-validation`
+- require, at minimum, these exact GitHub Actions job names (ruleset contexts
+  use the job name, not the `Workflow / job` PR display label):
+  - `rust-ci-check`
+  - `security-cargo-audit`
+  - `security-supply-chain-policy`
+  - `state-guard-reject-state-edits`
+  - `gitforgeops-required-static-validation`
 - contain exactly one bypass actor in any mode: the state-writer GitHub App,
   configured as an always-on bypass. Pull-request-only human/team bypasses are
   not permitted.
@@ -122,11 +123,11 @@ GH_TOKEN=<administration-read-token> python3 .github/scripts/audit_settings.py \
   --repo owner/repo \
   --branch main \
   --state-writer-app-id 123456 \
-  --required-check 'Rust CI / check' \
-  --required-check 'Security / cargo-audit' \
-  --required-check 'Security / supply-chain-policy' \
-  --required-check 'GitForgeOps State Guard / reject-state-edits' \
-  --required-check 'GitForgeOps PR Static Validation / required-static-validation'
+  --required-check 'rust-ci-check' \
+  --required-check 'security-cargo-audit' \
+  --required-check 'security-supply-chain-policy' \
+  --required-check 'state-guard-reject-state-edits' \
+  --required-check 'gitforgeops-required-static-validation'
 ```
 
 The audit is intentionally fail-closed on missing token scope, API errors,

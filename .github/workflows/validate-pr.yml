@@ -174,8 +174,8 @@ jobs:
           FERRUM_ENV: ${{ matrix.environment }}
         run: gitforgeops review
 
-  required-static-validation:
-    name: required-static-validation
+  gitforgeops-required-static-validation:
+    name: gitforgeops-required-static-validation
     if: always()
     needs: [scope, list-envs, validate]
     runs-on: ubuntu-24.04

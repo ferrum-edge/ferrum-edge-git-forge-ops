@@ -263,6 +263,35 @@ class PrInputTests(unittest.TestCase):
             )
             self.assertEqual(targets, [])
 
+    def test_trusted_targets_ignore_non_resource_files_under_declarative_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(
+                    root,
+                    ["overlays/README.md", "resources/README.md", "resources/team/.gitkeep"],
+                ),
+            )
+            self.assertEqual(targets, [])
+
+    def test_trusted_targets_reject_matrix_larger_than_github_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            changed = []
+            for index in range(pr_input.MAX_LIVE_REVIEW_TARGETS + 1):
+                namespace = f"team-{index}"
+                (root / "resources" / namespace).mkdir(parents=True)
+                changed.append(f"resources/{namespace}/proxies/api.yaml")
+            with self.assertRaisesRegex(pr_input.InputError, "256-job matrix limit"):
+                pr_input.trusted_targets(
+                    root,
+                    '[{"environment":"production","live_review":true,"namespaces":null}]',
+                    write_changed_paths(root, changed),
+                )
+
     def test_trusted_targets_reject_unsafe_changed_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
