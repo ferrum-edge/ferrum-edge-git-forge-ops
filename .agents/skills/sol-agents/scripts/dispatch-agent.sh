@@ -100,6 +100,7 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   printf 'Launch path must be the git worktree root: %s\n' "$physical_root" >&2
   exit 2
 fi
+require_linked_worktree "$physical_root"
 
 cd "$physical_worktree"
 

@@ -121,6 +121,7 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   printf 'Launch path must be the git worktree root: %s\n' "$physical_root" >&2
   exit 2
 fi
+require_linked_worktree "$physical_root"
 
 # Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
 # exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).

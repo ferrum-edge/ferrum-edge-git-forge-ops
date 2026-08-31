@@ -22,6 +22,23 @@ agent_bin_is_conductor_owned() {
   esac
 }
 
+# require_linked_worktree <absolute-worktree-root>
+# Refuse the repository's primary checkout. Write-enabled workers receive a
+# dedicated linked worktree so they cannot race with the operator or another
+# worker over one index, branch, or working tree.
+require_linked_worktree() {
+  local worktree_root=$1
+  local git_dir common_dir
+
+  git_dir=$(git -C "$worktree_root" rev-parse --path-format=absolute --git-dir) || return 2
+  common_dir=$(git -C "$worktree_root" rev-parse --path-format=absolute --git-common-dir) || return 2
+  if [[ "$git_dir" == "$common_dir" ]]; then
+    printf 'Refusing the primary checkout: dispatch requires a dedicated linked git worktree: %s\n' \
+      "$worktree_root" >&2
+    return 2
+  fi
+}
+
 # resolve_agent_bin <command-name> <env-var-name> [candidate-abs-path...]
 # Prints the resolved absolute path on stdout; diagnostics go to stderr.
 resolve_agent_bin() {

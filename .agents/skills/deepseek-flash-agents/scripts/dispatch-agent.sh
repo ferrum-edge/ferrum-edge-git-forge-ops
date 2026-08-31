@@ -145,6 +145,7 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   printf 'Launch path must be the git worktree root: %s\n' "$physical_root" >&2
   exit 2
 fi
+require_linked_worktree "$physical_root"
 
 # Resolve the operator's own opencode install. Conductor's bundled ACP-provider
 # copy under agent-binaries/acp-providers/opencode is deliberately NOT a fallback:

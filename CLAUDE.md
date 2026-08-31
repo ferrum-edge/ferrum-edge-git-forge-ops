@@ -311,7 +311,9 @@ See `.env.example` for the full list. Essentials:
 1. `cargo fmt --all` clean
 2. `cargo clippy --all-targets -- -D warnings` clean
 3. `cargo test --test unit_tests` passes
-4. No `.unwrap()` / `.expect()` in prod code
-5. New env var → `.env.example` + `env.rs` doc block
-6. Schema change → unit test in `tests/unit/schema_tests.rs`
-7. Commit messages in imperative mood; branches `feature/…`, `fix/…`, `claude/…`
+4. Agent/rule changes → `python3 .github/scripts/check_agent_setup.py` and
+   `python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'`
+5. No `.unwrap()` / `.expect()` in prod code
+6. New env var → `.env.example` + `env.rs` doc block
+7. Schema change → unit test in `tests/unit/schema_tests.rs`
+8. Commit messages in imperative mood; branches `feature/…`, `fix/…`, `claude/…`

@@ -89,6 +89,7 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   printf 'Launch path must be the git worktree root: %s\n' "$physical_root" >&2
   exit 2
 fi
+require_linked_worktree "$physical_root"
 
 cd "$physical_worktree"
 
@@ -99,8 +100,12 @@ unset ANTHROPIC_DEFAULT_SONNET_MODEL
 unset ANTHROPIC_DEFAULT_HAIKU_MODEL
 unset CLAUDE_CODE_SUBAGENT_MODEL
 unset ANTHROPIC_BASE_URL
+unset ANTHROPIC_BEDROCK_BASE_URL
+unset ANTHROPIC_VERTEX_BASE_URL
 unset ANTHROPIC_AUTH_TOKEN
 unset ANTHROPIC_API_KEY
+unset CLAUDE_CODE_USE_BEDROCK
+unset CLAUDE_CODE_USE_VERTEX
 unset CLAUDE_CODE_EFFORT_LEVEL
 unset CLAUDE_CODE_DISABLE_1M_CONTEXT
 unset CLAUDE_CODE_DISABLE_THINKING
@@ -112,6 +117,7 @@ printf '[fable-agents] dispatch model=claude-fable-5 effort=%s worktree=%s bin=%
 exec "$claude_bin" -p \
   --model claude-fable-5 \
   --effort "$effort" \
+  --setting-sources '' \
   --permission-mode bypassPermissions \
   --output-format text \
   --verbose \
