@@ -199,6 +199,26 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("inherited CLAUDE_CODE_USE_VERTEX is not cleared", joined)
         self.assertIn("user/project/local settings are not disabled", joined)
 
+    def test_sol_compatibility_briefs_must_match_canonical_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root, "sol-agents")
+            mirror = root / ".claude" / "skills" / "sol-agents"
+            for brief_name in check_agent_setup.SOL_COMPAT_BRIEFS:
+                canonical = agent / "references" / brief_name
+                (mirror / brief_name).write_text(
+                    canonical.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+            (mirror / "continuation-brief.md").write_text(
+                "stale instructions\n", encoding="utf-8"
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(
+            any("compatibility brief differs from canonical" in item for item in violations)
+        )
+
     def test_workflow_rejects_unprotected_base_and_candidate_bootstrap(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

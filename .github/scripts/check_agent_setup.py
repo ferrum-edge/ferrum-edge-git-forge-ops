@@ -71,6 +71,7 @@ UNTRUSTED_DATA_GUARD = (
 )
 LINKED_WORKTREE_GUIDANCE = "dedicated linked git worktree"
 LINKED_WORKTREE_CALL = 'require_linked_worktree "$physical_root"'
+SOL_COMPAT_BRIEFS = ("agent-brief.md", "continuation-brief.md")
 AGENT_WORKFLOW_REQUIREMENTS = (
     "types: [opened, synchronize, reopened, edited]",
     "branches: [main]",
@@ -350,6 +351,26 @@ def collect_violations(root: Path) -> list[str]:
             violations.append(
                 f"{launcher.relative_to(root)}: user/project/local settings are not disabled"
             )
+
+    # Main's trusted bootstrap validator predates the canonical references/
+    # layout and requires these Claude-side paths. Keep them as exact mirrors,
+    # not independent instructions that can silently drift.
+    if "sol-agents" in agent_names or "sol-agents" in claude_names:
+        for brief_name in SOL_COMPAT_BRIEFS:
+            canonical = agent_skills / "sol-agents" / "references" / brief_name
+            mirror = claude_skills / "sol-agents" / brief_name
+            mirror_relative = mirror.relative_to(root)
+            if mirror.is_symlink():
+                violations.append(
+                    f"{mirror_relative}: compatibility brief must not be a symlink"
+                )
+            elif not mirror.is_file():
+                violations.append(f"{mirror_relative}: missing compatibility brief")
+            elif canonical.is_file() and read_text(mirror) != read_text(canonical):
+                violations.append(
+                    f"{mirror_relative}: compatibility brief differs from canonical "
+                    f"{canonical.relative_to(root)}"
+                )
 
     shared_library = agent_skills / "_lib" / "resolve-agent-bin.sh"
     if not shared_library.is_file() or "require_linked_worktree()" not in read_text(
