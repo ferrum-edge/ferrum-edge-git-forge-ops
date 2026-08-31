@@ -49,6 +49,10 @@ jobs:
         id: list
         run: |
           set -euo pipefail
+          [[ -f .gitforgeops/config.yaml ]] || {
+            echo "::error::Repository configuration is required before binding a deployment environment."
+            exit 1
+          }
           envs=$(gitforgeops envs --format json | jq -c .)
           jq -e '
             type == "array" and

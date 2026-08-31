@@ -65,6 +65,13 @@ are used.
 
 ## 3. Protect every deployment environment
 
+Before enabling any environment-bound workflow, copy
+`.gitforgeops/config.example.yaml` to `.gitforgeops/config.yaml`, replace its
+example entries with the real deployment environments, and commit that file.
+The privileged workflows fail before binding an environment when the protected
+branch has no repository configuration, and the synthetic local `default`
+environment is never eligible for trusted live review.
+
 For every environment listed in `.gitforgeops/config.yaml`:
 
 - require at least one authorized reviewer;

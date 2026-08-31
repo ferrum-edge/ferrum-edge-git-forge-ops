@@ -377,7 +377,11 @@ def trusted_targets(
             if not entry.is_dir():
                 continue
             if not SAFE_COMPONENT_RE.fullmatch(entry.name):
-                raise InputError(f"unsafe trusted namespace directory: {entry.name!r}")
+                print(
+                    f"Ignoring non-targetable trusted namespace directory: {entry.name!r}",
+                    file=sys.stderr,
+                )
+                continue
             if entry.name in touched_namespaces:
                 namespaces.append(entry.name)
 

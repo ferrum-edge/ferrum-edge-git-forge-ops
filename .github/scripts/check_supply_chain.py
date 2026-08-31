@@ -79,6 +79,25 @@ def pull_request_trigger_violations(workflow: str, text: str) -> list[str]:
     return violations
 
 
+def workflow_name_violations(workflow: str, text: str, expected: str) -> list[str]:
+    if text.startswith(f"name: {expected}\n"):
+        return []
+    return [f"{workflow}: workflow name must remain exactly {expected!r}"]
+
+
+def installer_step_auth_violations(workflow: str, text: str) -> list[str]:
+    installer_steps = [
+        step
+        for step in text.split("\n      - name: ")
+        if "install-ferrum-edge.sh" in step
+    ]
+    if any("GITHUB_TOKEN: ${{ github.token }}" not in step for step in installer_steps):
+        return [
+            f"{workflow}: every validator download step must use the authenticated GitHub asset API"
+        ]
+    return []
+
+
 def trusted_supply_chain_policy_violations(text: str) -> list[str]:
     required = (
         "if: github.event_name == 'pull_request'",
@@ -207,6 +226,17 @@ def main(argv: list[str] | None = None) -> int:
     if "tool: cargo-llvm-cov@0.9.0" not in rust_ci:
         violations.append("rust-ci.yml: cargo-llvm-cov must use exact version 0.9.0")
 
+    for workflow_name, expected_name in (
+        ("rust-ci.yml", "Rust CI"),
+        ("security.yml", "Security"),
+        ("state-guard.yml", "GitForgeOps State Guard"),
+        ("validate-pr.yml", "GitForgeOps PR Static Validation"),
+    ):
+        workflow_text = (workflows / workflow_name).read_text(encoding="utf-8")
+        violations.extend(
+            workflow_name_violations(workflow_name, workflow_text, expected_name)
+        )
+
     release = (workflows / "release.yml").read_text(encoding="utf-8")
     if "provenance: mode=max" not in release or "sbom: true" not in release:
         violations.append("release.yml: image provenance and SBOM must both be enabled")
@@ -216,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         "authorize-release:",
         "needs: authorize-release",
         "release commit must map to exactly one merged PR",
+        "Release merge association is not yet available and unambiguous",
         'gh pr checks "$pr" --repo "$REPO" --required',
         "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
     ):
@@ -246,6 +277,13 @@ def main(argv: list[str] | None = None) -> int:
         "rotate.yml",
     ):
         text = (workflows / privileged_workflow).read_text(encoding="utf-8")
+        if (
+            "Repository configuration is required before binding a deployment environment."
+            not in text
+        ):
+            violations.append(
+                f"{privileged_workflow}: must fail before environment binding when repo config is absent"
+            )
         if ".github/scripts/credential_bundles.py" not in text:
             violations.append(
                 f"{privileged_workflow}: credential bundles must use the fail-closed loader"
@@ -363,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
         "select(.base.ref == $base)",
         "current_base=$(jq -r '.base.ref'",
+        "PR association is not yet available and unambiguous",
     ):
         if required not in trusted_review:
             violations.append(
@@ -434,13 +473,9 @@ def main(argv: list[str] | None = None) -> int:
         workflow_text = (root / ".github" / "workflows" / workflow_name).read_text(
             encoding="utf-8"
         )
-        if (
-            "install-ferrum-edge.sh" in workflow_text
-            and "GITHUB_TOKEN: ${{ github.token }}" not in workflow_text
-        ):
-            violations.append(
-                f"{workflow_name}: validator download must use the authenticated GitHub asset API"
-            )
+        violations.extend(
+            installer_step_auth_violations(workflow_name, workflow_text)
+        )
     if "FERRUM_EDGE_SHA256" in "\n".join(
         workflow.read_text(encoding="utf-8") for workflow in checked_action_files
     ):

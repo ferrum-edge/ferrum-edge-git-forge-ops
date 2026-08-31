@@ -121,6 +121,45 @@ class SupplyChainPolicyTests(unittest.TestCase):
         self.assertTrue(any("base-retarget" in item for item in violations))
         self.assertTrue(any("protected main" in item for item in violations))
 
+    def test_workflow_display_names_are_exact_contracts(self):
+        self.assertEqual(
+            check_supply_chain.workflow_name_violations(
+                "validate-pr.yml",
+                "name: GitForgeOps PR Static Validation\non: pull_request\n",
+                "GitForgeOps PR Static Validation",
+            ),
+            [],
+        )
+        violations = check_supply_chain.workflow_name_violations(
+            "validate-pr.yml",
+            "name: Renamed\non: pull_request\n",
+            "GitForgeOps PR Static Validation",
+        )
+        self.assertTrue(any("must remain exactly" in item for item in violations))
+
+    def test_validator_token_must_be_scoped_to_the_installer_step(self):
+        secure = """      - name: Download validator
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/install-ferrum-edge.sh
+      - name: Post review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+"""
+        self.assertEqual(
+            check_supply_chain.installer_step_auth_violations(
+                "trusted-pr-review.yml", secure
+            ),
+            [],
+        )
+        insecure = secure.replace(
+            "          GITHUB_TOKEN: ${{ github.token }}\n", "", 1
+        )
+        violations = check_supply_chain.installer_step_auth_violations(
+            "trusted-pr-review.yml", insecure
+        )
+        self.assertTrue(any("every validator download step" in item for item in violations))
+
     def test_candidate_branch_classifier_fails_even_when_trusted_text_remains(self):
         text = """
 ref: ${{ github.event.repository.default_branch }}

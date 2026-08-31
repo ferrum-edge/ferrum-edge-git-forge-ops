@@ -1744,7 +1744,7 @@ async fn cmd_review(
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_ok, validation_output) = match &val_result {
         Ok(r) => (r.success, format!("{}{}", r.stdout, r.stderr)),
-        Err(e) => (true, format!("Validation skipped: {}", e)),
+        Err(e) => (false, format!("Validation could not run: {}", e)),
     };
 
     let client = AdminClient::new(&env_config);
@@ -1901,7 +1901,7 @@ fn cmd_envs(
             Some(r) => r.environment_scopes(),
             None => vec![gitforgeops::config::repo_config::EnvironmentScope {
                 environment: ResolvedEnv::default_env_name(),
-                live_review: true,
+                live_review: false,
                 namespaces: None,
             }],
         };

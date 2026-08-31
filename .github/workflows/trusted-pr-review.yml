@@ -68,15 +68,23 @@ jobs:
           # workflow_run.pull_requests is observably empty for some PR runs.
           # Resolve from the exact triggering commit and require one open,
           # matching-source PR whose current head is still that commit.
-          associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp)
-          matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" '
-            [.[][]
-              | select(.state == "open")
-              | select(.head.sha == $sha)
-              | select(.head.repo.full_name == $head_repo)
-              | select(.base.ref == $base)]
-          ' <<< "$associated")
-          match_count=$(jq 'length' <<< "$matches")
+          matches='[]'
+          match_count=0
+          for attempt in 1 2 3 4 5; do
+            if associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp); then
+              matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" '
+                [.[][]
+                  | select(.state == "open")
+                  | select(.head.sha == $sha)
+                  | select(.head.repo.full_name == $head_repo)
+                  | select(.base.ref == $base)]
+              ' <<< "$associated")
+              match_count=$(jq 'length' <<< "$matches")
+              [ "$match_count" -eq 1 ] && break
+            fi
+            echo "PR association is not yet available and unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
           [ "$match_count" -eq 1 ] || { echo "Expected one open PR for workflow head; found $match_count." >&2; exit 1; }
           event_pr=$(jq -r '.[0].number' <<< "$matches")
           [[ "$event_pr" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid resolved PR number" >&2; exit 1; }

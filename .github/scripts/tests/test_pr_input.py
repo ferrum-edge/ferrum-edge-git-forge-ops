@@ -184,28 +184,18 @@ class PrInputTests(unittest.TestCase):
                 ],
             )
 
-    def test_trusted_targets_reject_unsafe_or_symlinked_namespace_paths(self):
-        for name, symlink, expected in [
-            ("unsafe namespace", False, "unsafe trusted namespace"),
-            ("linked", True, "may not be a symlink"),
-        ]:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp)
-                resources = root / "resources"
-                resources.mkdir()
-                target = resources / name
-                if symlink:
-                    target.symlink_to(root, target_is_directory=True)
-                else:
-                    target.mkdir()
-                with self.assertRaisesRegex(pr_input.InputError, expected):
-                    pr_input.trusted_targets(
-                        root,
-                        '[{"environment":"production","live_review":true,"namespaces":null}]',
-                        write_changed_paths(
-                            root, ["resources/linked/proxies/api.yaml"]
-                        ),
-                    )
+    def test_trusted_targets_reject_symlinked_namespace_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            resources = root / "resources"
+            resources.mkdir()
+            (resources / "linked").symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(pr_input.InputError, "may not be a symlink"):
+                pr_input.trusted_targets(
+                    root,
+                    '[{"environment":"production","live_review":true,"namespaces":null}]',
+                    write_changed_paths(root, ["resources/linked/proxies/api.yaml"]),
+                )
 
     def test_trusted_targets_reject_malformed_or_duplicate_scope(self):
         cases = [
@@ -281,6 +271,7 @@ class PrInputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "resources/team").mkdir(parents=True)
+            (root / "resources/_shared").mkdir()
             targets = pr_input.trusted_targets(
                 root,
                 '[{"environment":"production","live_review":true,"namespaces":null}]',

@@ -31,28 +31,40 @@ jobs:
           checks_file=$(mktemp)
           trap 'rm -f "$pulls_file" "$checks_file"' EXIT
 
-          gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
-            --paginate --slurp > "$pulls_file"
-          pr=$(jq -er --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" '
-            if type != "array" or any(.[]; type != "array") then
-              error("invalid commit-to-PR response")
-            else
-              ([
-                .[][]
-                | select(
-                    .state == "closed" and
-                    .base.ref == $branch and
-                    (.merged_at | type) == "string" and
-                    (.number | type) == "number"
-                  )
-              ] | unique_by(.number)) as $candidates
-              | ([$candidates[] | select(.merge_commit_sha == $sha)]) as $exact
-              | (if ($exact | length) > 0 then $exact else $candidates end)
-              | if length == 1 then .[0].number
-                else error("release commit must map to exactly one merged PR")
+          pr=
+          for attempt in 1 2 3 4 5; do
+            if gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
+              --paginate --slurp > "$pulls_file" &&
+              pr=$(jq -er --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" '
+                if type != "array" or any(.[]; type != "array") then
+                  error("invalid commit-to-PR response")
+                else
+                  ([
+                    .[][]
+                    | select(
+                        .state == "closed" and
+                        .base.ref == $branch and
+                        (.merged_at | type) == "string" and
+                        (.number | type) == "number"
+                      )
+                  ] | unique_by(.number)) as $candidates
+                  | ([$candidates[] | select(.merge_commit_sha == $sha)]) as $exact
+                  | (if ($exact | length) > 0 then $exact else $candidates end)
+                  | if length == 1 then .[0].number
+                    else error("release commit must map to exactly one merged PR")
+                    end
                 end
-            end
-          ' "$pulls_file")
+              ' "$pulls_file"); then
+              break
+            fi
+            pr=
+            echo "Release merge association is not yet available and unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
+          [ -n "$pr" ] || {
+            echo "::error::Release commit could not be mapped to exactly one merged PR."
+            exit 1
+          }
 
           status=0
           gh pr checks "$pr" --repo "$REPO" --required \
