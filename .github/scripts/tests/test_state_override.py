@@ -78,6 +78,13 @@ class StateOverrideTests(unittest.TestCase):
                 oversized, "gitforgeops/state-override"
             )
 
+    def test_malformed_actor_login_fails_closed(self):
+        with self.assertRaisesRegex(state_override.OverrideError, "missing/deleted actor"):
+            state_override.resolve_effective_event(
+                [[event(1, "labeled", "owner/permission")]],
+                "gitforgeops/state-override",
+            )
+
     def test_malformed_paginated_response_fails_closed(self):
         with self.assertRaisesRegex(state_override.OverrideError, "array of pages"):
             state_override.resolve_effective_event(

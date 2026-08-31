@@ -279,11 +279,16 @@ def trusted_targets(root: Path, environment_scopes_json: str) -> list[dict[str, 
     normalized_scopes: list[tuple[str, set[str] | None]] = []
     seen_environments: set[str] = set()
     for scope in scopes:
-        if not isinstance(scope, dict) or set(scope) != {"environment", "namespaces"}:
+        if not isinstance(scope, dict) or set(scope) != {
+            "environment",
+            "live_review",
+            "namespaces",
+        }:
             raise InputError(
-                "trusted environment scope must contain only environment and namespaces"
+                "trusted environment scope must contain only environment, live_review, and namespaces"
             )
         environment = scope.get("environment")
+        live_review = scope.get("live_review")
         namespaces = scope.get("namespaces")
         if not isinstance(environment, str) or not SAFE_COMPONENT_RE.fullmatch(
             environment
@@ -292,6 +297,12 @@ def trusted_targets(root: Path, environment_scopes_json: str) -> list[dict[str, 
         if environment in seen_environments:
             raise InputError(f"duplicate trusted environment scope: {environment}")
         seen_environments.add(environment)
+        if not isinstance(live_review, bool):
+            raise InputError(
+                f"trusted live_review flag for {environment!r} must be a boolean"
+            )
+        if not live_review:
+            continue
         if namespaces is not None and (
             not isinstance(namespaces, list)
             or not all(

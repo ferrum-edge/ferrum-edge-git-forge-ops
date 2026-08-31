@@ -32,11 +32,15 @@ def trusted_classifier_violations(
     violations: list[str] = []
     if text.count(trusted_invocation) != expected_count:
         violations.append(
-            f"{workflow}: path scope must run exactly {expected_count} base-SHA trusted classifier invocation(s)"
+            f"{workflow}: path scope must run exactly {expected_count} default-branch trusted classifier invocation(s)"
         )
-    if "ref: ${{ github.event.pull_request.base.sha }}" not in text:
+    if "ref: ${{ github.event.repository.default_branch }}" not in text:
         violations.append(
-            f"{workflow}: trusted classifier checkout must pin the PR base SHA"
+            f"{workflow}: trusted classifier checkout must use the protected default branch"
+        )
+    if "ref: ${{ github.event.pull_request.base.sha }}" in text:
+        violations.append(
+            f"{workflow}: unprotected PR base SHA must not supply trusted classifier code"
         )
     if "result=$(python3 .github/scripts/changed_files.py" in text:
         violations.append(
@@ -48,6 +52,27 @@ def trusted_classifier_violations(
             violations.append(
                 f"{workflow}: every trusted classifier invocation needs a bootstrap fail-safe"
             )
+    return violations
+
+
+def pull_request_trigger_violations(workflow: str, text: str) -> list[str]:
+    violations: list[str] = []
+    match = re.search(
+        r"^  pull_request:\s*$\n(?P<body>(?:^    .*\n)*)",
+        text,
+        re.MULTILINE,
+    )
+    if match is None:
+        return [f"{workflow}: pull_request trigger is missing"]
+    body = match.group("body")
+    if not re.search(r"^    types: \[[^\n]*\bedited\b", body, re.MULTILINE):
+        violations.append(
+            f"{workflow}: pull_request trigger must rerun on base-retarget edits"
+        )
+    if "    branches: [main]" not in body:
+        violations.append(
+            f"{workflow}: pull_request trigger must target only protected main"
+        )
     return violations
 
 
@@ -206,6 +231,15 @@ def main() -> int:
                 expected_count,
             )
         )
+
+    for pr_workflow in (
+        "rust-ci.yml",
+        "security.yml",
+        "state-guard.yml",
+        "validate-pr.yml",
+    ):
+        text = (WORKFLOWS / pr_workflow).read_text(encoding="utf-8")
+        violations.extend(pull_request_trigger_violations(pr_workflow, text))
     state_guard = (WORKFLOWS / "state-guard.yml").read_text(encoding="utf-8")
     if 'result=$(python3 "$helper"' not in state_guard:
         violations.append(
@@ -232,7 +266,7 @@ def main() -> int:
         )
     for required in (
         "trusted-scope/.github/scripts/changed_files.py",
-        "ref: ${{ github.event.pull_request.base.sha }}",
+        "ref: ${{ github.event.repository.default_branch }}",
         "required-static-validation:",
         "if: always()",
     ):
@@ -240,10 +274,27 @@ def main() -> int:
             violations.append(
                 f"validate-pr.yml: missing stable validation gate control {required!r}"
             )
+    if "pull-requests: read" not in static_review:
+        violations.append(
+            "validate-pr.yml: Pull Requests API access requires pull-requests: read"
+        )
 
     trusted_review = (WORKFLOWS / "trusted-pr-review.yml").read_text(
         encoding="utf-8"
     )
+    prepare_permissions = """  prepare:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+"""
+    if prepare_permissions not in trusted_review:
+        violations.append(
+            "trusted-pr-review.yml: prepare job requires explicit pull-requests: read"
+        )
     for required in (
         "workflow_run.conclusion == 'success'",
         "steps.metadata.outputs.privileged == 'true'",

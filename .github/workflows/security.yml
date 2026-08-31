@@ -4,6 +4,8 @@ on:
   # Report required security contexts on every PR. Path filtering a required
   # workflow leaves non-matching PRs stuck waiting for a status that never ran.
   pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
   push:
     branches: [main]
     paths:

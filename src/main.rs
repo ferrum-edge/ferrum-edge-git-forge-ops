@@ -1886,6 +1886,7 @@ fn cmd_envs(
             Some(r) => r.environment_scopes(),
             None => vec![gitforgeops::config::repo_config::EnvironmentScope {
                 environment: ResolvedEnv::default_env_name(),
+                live_review: true,
                 namespaces: None,
             }],
         };
