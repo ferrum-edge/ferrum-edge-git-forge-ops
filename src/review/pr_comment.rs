@@ -29,6 +29,9 @@ fn sanitize_markdown_inline(value: &str) -> String {
             '[' => sanitized.push_str("&#91;"),
             ']' => sanitized.push_str("&#93;"),
             '|' => sanitized.push_str("&#124;"),
+            '#' => sanitized.push_str("&#35;"),
+            ':' => sanitized.push_str("&#58;"),
+            '.' => sanitized.push_str("&#46;"),
             _ => sanitized.push(character),
         }
     }
@@ -49,7 +52,6 @@ fn sanitize_code_span(value: &str) -> String {
         pending_space = false;
         match character {
             '`' => sanitized.push('\''),
-            '|' => sanitized.push_str("\\|"),
             _ => sanitized.push(character),
         }
     }
@@ -58,6 +60,10 @@ fn sanitize_code_span(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn sanitize_table_code_span(value: &str) -> String {
+    sanitize_code_span(value).replace('|', "\\|")
 }
 
 pub struct EnvironmentNote(String);
@@ -119,6 +125,7 @@ pub fn build_review_comment(
 
     if let Some(reason) = comparison_error {
         md.push_str("### Changes: Skipped\n\n");
+        md.push_str("_Reason:_ ");
         md.push_str(&sanitize_markdown_inline(reason));
         md.push_str("\n\n");
     } else if !diffs.is_empty() {
@@ -144,7 +151,7 @@ pub fn build_review_comment(
                 "| {} | {} | `{}` | {} |\n",
                 action,
                 sanitize_markdown_inline(&diff.kind),
-                sanitize_code_span(&diff.id),
+                sanitize_table_code_span(&diff.id),
                 sanitize_markdown_inline(&details)
             ));
         }
@@ -155,6 +162,7 @@ pub fn build_review_comment(
 
     if let Some(reason) = comparison_error {
         md.push_str("### Breaking Changes: Skipped\n\n");
+        md.push_str("_Reason:_ ");
         md.push_str(&sanitize_markdown_inline(reason));
         md.push_str("\n\n");
     } else if !breaking.is_empty() {
@@ -391,7 +399,7 @@ pub fn build_review_comment_v2(
             };
             md.push_str(&format!(
                 "| `{}` | {} |\n",
-                sanitize_code_span(&r.slot),
+                sanitize_table_code_span(&r.slot),
                 label
             ));
         }

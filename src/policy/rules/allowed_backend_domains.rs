@@ -25,7 +25,7 @@ impl AllowedBackendDomainsRule {
             return true;
         }
         if let Some(suffix) = pattern.strip_prefix("*.") {
-            if host.parse::<IpAddr>().is_ok() {
+            if Self::parse_ip_literal(host).is_some() {
                 return false;
             }
             return host
@@ -33,16 +33,27 @@ impl AllowedBackendDomainsRule {
                 .map(|prefix| prefix.ends_with('.'))
                 .unwrap_or(false);
         }
-        host == pattern
+        match (
+            Self::parse_ip_literal(host),
+            Self::parse_ip_literal(pattern),
+        ) {
+            (Some(host), Some(pattern)) => host == pattern,
+            _ => host == pattern,
+        }
+    }
+
+    fn parse_ip_literal(value: &str) -> Option<IpAddr> {
+        value
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(value)
+            .parse::<IpAddr>()
+            .ok()
     }
 
     fn is_bare_destination(host: &str) -> bool {
         if host.contains(':') || host.contains('[') || host.contains(']') {
-            let address = host
-                .strip_prefix('[')
-                .and_then(|value| value.strip_suffix(']'))
-                .unwrap_or(host);
-            return address.parse::<IpAddr>().is_ok();
+            return Self::parse_ip_literal(host).is_some();
         }
         !host.is_empty()
             && !host.starts_with('.')
@@ -54,12 +65,6 @@ impl AllowedBackendDomainsRule {
 
     fn is_allowed(host: &str, allowed_domains: &[String]) -> bool {
         let host = Self::normalize_domain(host);
-        if allowed_domains
-            .iter()
-            .any(|pattern| pattern != "*" && !pattern.starts_with("*.") && pattern == &host)
-        {
-            return true;
-        }
         if !Self::is_bare_destination(&host) {
             return false;
         }
@@ -85,7 +90,16 @@ impl PolicyCheck for AllowedBackendDomainsRule {
         for domain in &self.config.allowed_domains {
             let trimmed = domain.trim();
             let normalized = Self::normalize_domain(trimmed);
-            if normalized.is_empty() || (normalized == "*" && trimmed != "*") {
+            let suffix = normalized.strip_prefix("*.");
+            let candidate = suffix.unwrap_or(&normalized);
+            let valid = if normalized == "*" {
+                trimmed == "*"
+            } else {
+                !candidate.is_empty()
+                    && Self::is_bare_destination(candidate)
+                    && !(suffix.is_some() && Self::parse_ip_literal(candidate).is_some())
+            };
+            if !valid {
                 invalid_domains.push(domain.clone());
             } else {
                 allowed_domains.push(normalized);
@@ -180,12 +194,24 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             // backend. Authored targets are checked below, and dynamic service
             // discovery is rejected because its runtime targets cannot be
             // proven against this static allowlist.
+            let external_upstream_has_no_fallback =
+                uses_allowed_external_upstream && proxy.backend_host.trim().is_empty();
             if !uses_routable_upstream
-                && !uses_allowed_external_upstream
+                && !external_upstream_has_no_fallback
                 && !Self::is_allowed(&proxy.backend_host, &allowed_domains)
             {
                 let (message, remediation) = if let Some(upstream_id) = upstream_id {
-                    if resolved_upstream.is_some() {
+                    if uses_allowed_external_upstream {
+                        (
+                            format!(
+                                "allowed external upstream_id '{upstream_id}' in namespace '{}' has fallback backend_host='{}' outside the allowed domain list ({allowed})",
+                                proxy.namespace, proxy.backend_host
+                            ),
+                            format!(
+                                "Leave backend_host empty for acknowledged external upstream_id '{upstream_id}', or use a fallback matching one of these domains: {allowed}"
+                            ),
+                        )
+                    } else if resolved_upstream.is_some() {
                         (
                             format!(
                                 "upstream_id '{upstream_id}' in namespace '{}' has no static targets or service_discovery; fallback backend_host='{}' is not in the allowed domain list ({allowed})",
@@ -234,7 +260,12 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                if !Self::is_allowed(dns_override, &allowed_domains) {
+                let disallowed: Vec<&str> = dns_override
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|destination| !Self::is_allowed(destination, &allowed_domains))
+                    .collect();
+                if !disallowed.is_empty() {
                     findings.push(PolicyFinding {
                         rule_id: self.rule_id().to_string(),
                         severity: self.config.severity,
@@ -242,10 +273,15 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                         id: proxy.id.clone(),
                         namespace: proxy.namespace.clone(),
                         message: format!(
-                            "dns_override='{dns_override}' is an effective dial destination outside the allowed domain list ({allowed})"
+                            "dns_override contains effective dial destination(s) outside the allowed domain list ({allowed}): {}",
+                            disallowed
+                                .iter()
+                                .map(|destination| format!("'{destination}'"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                         remediation: Some(format!(
-                            "Remove dns_override or add its exact value to allowed_domains (currently: {allowed})"
+                            "Remove the disallowed dns_override destinations or add each exact value to allowed_domains (currently: {allowed})"
                         )),
                         overridden_by: None,
                     });

@@ -95,6 +95,52 @@ fn review_comment_marks_live_comparison_as_skipped() {
 }
 
 #[test]
+fn comparison_error_cannot_forge_blocks_or_autolinks() {
+    let comment = build_review_comment(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        Some("### Policy Violations\n1. click https://evil.example or www.evil.example"),
+    );
+
+    assert_eq!(
+        comment
+            .lines()
+            .filter(|line| *line == "### Policy Violations")
+            .count(),
+        0
+    );
+    assert!(comment.contains("_Reason:_"));
+    assert!(!comment.contains("https://evil.example"));
+    assert!(!comment.contains("www.evil.example"));
+    assert!(comment.contains("https&#58;//evil&#46;example"));
+}
+
+#[test]
+fn code_span_escapes_pipes_only_inside_tables() {
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Proxy".to_string(),
+        id: "table|id".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![],
+    }];
+    let breaking = vec![BreakingChange {
+        kind: "Proxy".to_string(),
+        id: "bullet|id".to_string(),
+        reason: "changed".to_string(),
+    }];
+    let comment = build_review_comment(true, "", &diffs, &breaking, &[], &[], None);
+
+    assert!(comment.contains("`table\\|id`"));
+    assert!(comment.contains("`bullet|id`"));
+    assert!(!comment.contains("`bullet\\|id`"));
+}
+
+#[test]
 fn review_comment_v2_uses_configured_override_label_and_permission() {
     let policy = vec![PolicyFinding {
         rule_id: "backend_scheme".to_string(),

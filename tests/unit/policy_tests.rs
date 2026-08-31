@@ -400,7 +400,7 @@ fn allowed_backend_domains_checks_proxy_backend_host_when_upstream_id_is_unresol
 #[test]
 fn allowed_backend_domains_can_acknowledge_an_external_upstream_exactly() {
     let mut p = proxy("external-upstream", BackendScheme::Https, 30_000, true);
-    p.backend_host = "placeholder.invalid".to_string();
+    p.backend_host = String::new();
     p.upstream_id = Some("spec-owned-pool".to_string());
 
     let cfg = GatewayConfig {
@@ -425,6 +425,39 @@ fn allowed_backend_domains_can_acknowledge_an_external_upstream_exactly() {
     };
 
     assert!(evaluate_policies(&cfg, &policies).is_empty());
+}
+
+#[test]
+fn allowed_external_upstream_still_checks_a_nonblank_fallback() {
+    let mut p = proxy("external-fallback", BackendScheme::Https, 30_000, true);
+    p.backend_host = "attacker.invalid".to_string();
+    p.upstream_id = Some("spec-owned-pool".to_string());
+
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+                allowed_external_upstreams: vec![ServiceDiscoveryUpstreamAllowance {
+                    namespace: "ferrum".to_string(),
+                    id: "spec-owned-pool".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("allowed external upstream_id"));
+    assert!(findings[0].message.contains("attacker.invalid"));
 }
 
 #[test]
@@ -652,7 +685,7 @@ fn allowed_backend_domains_checks_dns_override_as_a_dial_destination() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].kind, "Proxy");
     assert_eq!(findings[0].id, "pinned-backend");
-    assert!(findings[0].message.contains("dns_override='203.0.113.10'"));
+    assert!(findings[0].message.contains("'203.0.113.10'"));
 }
 
 #[test]
@@ -836,7 +869,14 @@ fn allowed_backend_domains_reports_malformed_entries_in_a_mixed_allowlist() {
             allowed_backend_domains: AllowedBackendDomainsRuleConfig {
                 enabled: true,
                 severity: Severity::Error,
-                allowed_domains: vec!["*.".to_string(), "api.internal.example.com".to_string()],
+                allowed_domains: vec![
+                    "*.".to_string(),
+                    "*evil.example.com".to_string(),
+                    "https://api.example.com".to_string(),
+                    "api.example.com:443".to_string(),
+                    "bad host".to_string(),
+                    "api.internal.example.com".to_string(),
+                ],
                 ..Default::default()
             },
             ..Default::default()
@@ -848,10 +888,14 @@ fn allowed_backend_domains_reports_malformed_entries_in_a_mixed_allowlist() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].kind, "PolicyConfig");
     assert!(findings[0].message.contains("'*.'"));
+    assert!(findings[0].message.contains("'*evil.example.com'"));
+    assert!(findings[0].message.contains("'https://api.example.com'"));
+    assert!(findings[0].message.contains("'api.example.com:443'"));
+    assert!(findings[0].message.contains("'bad host'"));
 }
 
 #[test]
-fn allowed_backend_domains_accepts_an_exact_non_bare_dns_override() {
+fn allowed_backend_domains_checks_each_comma_separated_dns_override() {
     let mut p = proxy("resolver-list", BackendScheme::Https, 30_000, true);
     p.backend_host = "api.svc.cluster.local".to_string();
     p.dns_override = Some("10.0.0.1,10.0.0.2".to_string());
@@ -866,7 +910,8 @@ fn allowed_backend_domains_accepts_an_exact_non_bare_dns_override() {
                 severity: Severity::Error,
                 allowed_domains: vec![
                     "*.svc.cluster.local".to_string(),
-                    "10.0.0.1,10.0.0.2".to_string(),
+                    "10.0.0.1".to_string(),
+                    "10.0.0.2".to_string(),
                 ],
                 ..Default::default()
             },
@@ -876,6 +921,34 @@ fn allowed_backend_domains_accepts_an_exact_non_bare_dns_override() {
     };
 
     assert!(evaluate_policies(&cfg, &policies).is_empty());
+}
+
+#[test]
+fn allowed_backend_domains_reports_only_disallowed_dns_override_entries() {
+    let mut p = proxy("resolver-list", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("10.0.0.1, 203.0.113.9".to_string());
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.svc.cluster.local".to_string(), "10.0.0.1".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("'203.0.113.9'"));
+    assert!(!findings[0].message.contains("'10.0.0.1'"));
 }
 
 #[test]
@@ -1021,13 +1094,13 @@ fn allowed_backend_domains_checks_dns_override_with_routable_upstream() {
 
     let findings = evaluate_policies(&cfg, &policies);
     assert_eq!(findings.len(), 1);
-    assert!(findings[0].message.contains("dns_override='203.0.113.10'"));
+    assert!(findings[0].message.contains("'203.0.113.10'"));
 }
 
 #[test]
-fn allowed_backend_domains_matches_ip_literals_exactly() {
+fn allowed_backend_domains_canonicalizes_equivalent_ip_literals() {
     let mut p = proxy("loopback", BackendScheme::Https, 30_000, true);
-    p.backend_host = "[::1]".to_string();
+    p.backend_host = "[2001:0db8:0:0:0:0:0:1]".to_string();
     let cfg = GatewayConfig {
         proxies: vec![p],
         ..Default::default()
@@ -1037,7 +1110,7 @@ fn allowed_backend_domains_matches_ip_literals_exactly() {
             allowed_backend_domains: AllowedBackendDomainsRuleConfig {
                 enabled: true,
                 severity: Severity::Error,
-                allowed_domains: vec!["[::1]".to_string()],
+                allowed_domains: vec!["2001:db8::1".to_string()],
                 ..Default::default()
             },
             ..Default::default()
