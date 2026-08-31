@@ -42,9 +42,10 @@ explicitly assigns that operation.
 
 ## Engineering rules
 
-- Follow all repository invariants, especially no undocumented `.unwrap()` or `.expect()` in
-  production, no proxy-path panics, hostile-input validation, fail-closed security behavior,
-  OpenAPI parity, env/config documentation parity, and hot-path allocation and locking limits.
+- Follow all repository invariants, especially no `.unwrap()` in production paths, no `.expect()`
+  unless failure is a genuine bug, path-component traversal rejection, namespace-scoped
+  `(namespace, kind, id)` identity, deterministic state hashes, permissive schema mirroring, and
+  fail-closed ownership and secret handling.
 - Add tests in the external test suites preferred by `AGENTS.md`; do not add inline source tests
   merely for convenience.
 - Keep edits surgical. Do not rewrite unrelated changes or clean up neighboring code without
@@ -53,14 +54,17 @@ explicitly assigns that operation.
 
 ## Validation and host discipline
 
-Multiple workers may share the host. Do not run `cargo build`, `cargo test`, or `cargo clippy`
-unless the dispatch prompt explicitly assigns local compilation or an ambiguity cannot be resolved
-by inspection. Remote CI is the normal validator for a parallel fleet.
+Multiple workers may share the host. Leave `CARGO_TARGET_DIR` unset and run validation sequentially
+inside this worktree. Before every commit, including documentation or metadata commits, run the
+mandatory repository gate:
 
-- Rust changes: run `cargo fmt --all`, then `cargo fmt --all -- --check`.
-- Docs-only or metadata-only changes: run `git diff --check`.
-- If a targeted build or test is necessary, run it sequentially in this worktree, leave
-  `CARGO_TARGET_DIR` unset, and report the exact command and result.
+- `cargo fmt --all`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --test unit_tests`
+
+Run additional focused tests and changed-surface policy checks when relevant, and report every
+exact command and result. This repository has no standing known-flake allowlist; investigate every
+red check before considering a rerun.
 
 ## Finish and report
 
@@ -80,13 +84,8 @@ and report, exit; the controller owns post-push CI and review monitoring.
    in the top-level review body. Verify each finding against the code, fix valid ones, and rebut
    false positives with file-and-line evidence.
 6. When CI diagnosis is assigned, inspect every red check's logs. Fix deterministic failures;
-   rerun only demonstrated infrastructure outages or known flakes.
+   rerun only demonstrated external infrastructure outages.
 7. Never merge, delete the worktree, or delete the branch.
-
-Known historical Ferrum Edge Git Forge Ops flakes include the gRPC-to-gRPC RST 502 test, native H3 gRPC
-streaming scripted-backend races, H3 WebSocket parallel QUIC startup panics, and stream-listener
-ephemeral-port rebind races. Confirm the failure signature and current tracking state before
-rerunning; a test name on this list is not enough by itself.
 
 ## Final report
 

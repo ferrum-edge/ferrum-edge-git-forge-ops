@@ -69,7 +69,7 @@ orchestrators share one source of truth.
 Every prompt must also PIN THE WORKER'S ROLE:
 "YOU are the implementer: write, commit, and push the changes yourself in this session.
 Do NOT invoke agent-dispatch skills (qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, grok-agents, sol-agents, opus-agents, fable-agents, composer-agents,
+opencode-laguna-agents, grok-agents, sol-agents, opus-agents, fable-agents, composer-agents,
 .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
 
 Then append the mode block:
@@ -97,7 +97,8 @@ checks -> fmt -> push -> ONE review trigger -> EXIT with report."
 3. Triage CI reds yourself when agents are gone.
 4. Salvage protocol for dead agents: check worktree status + unpushed commits, then relaunch a
    continuation agent with a state snapshot.
-5. Merge only when: review bot clean on the CURRENT head + CI green + your own review done.
+5. Merge only when the user explicitly authorizes that exact PR, the review bot is clean on the
+   current head, CI is green, and your own review is done.
 
 ## Known failure modes
 

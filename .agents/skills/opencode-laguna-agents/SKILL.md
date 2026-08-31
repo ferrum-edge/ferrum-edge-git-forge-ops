@@ -1,5 +1,5 @@
 ---
-name: opencode-agents
+name: opencode-laguna-agents
 description: Dispatch and orchestrate local opencode laguna-s-2.1 agents via the opencode CLI harness for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to opencode or laguna-s workers, run multiple opencode agents, resume interrupted opencode runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
@@ -88,7 +88,7 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including opencode-agents, grok-agents, sol-agents, opus-agents, fable-agents,
+skills or scripts (including opencode-laguna-agents, grok-agents, sol-agents, opus-agents, fable-agents,
 or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
@@ -126,13 +126,13 @@ actionable work appears. Do not add a review trigger unless the controller expli
 2. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,
    requested validation, and any explicitly assigned review or CI actions.
 3. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's
-   worktree. Use a three-dot diff. Review fail-closed behavior, hot paths, docs/spec parity,
-   production panics, tests, and scope creep.
+   worktree. Use a three-dot diff. Review ownership and secret fail-closed behavior, namespace
+   scoping, schema/documentation parity, production panics, tests, and scope creep.
 4. For an explicitly assigned review, fix-round, or shepherd task, fetch all review threads;
    findings may not appear in the top-level review body. Verify the active review bot before
    posting a trigger that the prompt specifically requests.
-5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only demonstrated
-   infrastructure failures or repository-known flakes, and dispatch bounded repair work for
+5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only external
+   infrastructure outages proven by the failing job's logs, and dispatch bounded repair work for
    deterministic failures.
 6. If a worker dies, inspect its worktree, local commits, upstream, and remote branch before
    relaunching. Preserve useful work and launch a continuation round.
