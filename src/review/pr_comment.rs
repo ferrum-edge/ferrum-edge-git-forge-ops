@@ -50,6 +50,7 @@ fn sanitize_markdown_inline(value: &str) -> String {
             ']' => sanitized.push_str("&#93;"),
             '|' => sanitized.push_str("&#124;"),
             '#' => sanitized.push_str("&#35;"),
+            '@' => sanitized.push_str("&#64;"),
             ':' => sanitized.push_str("&#58;"),
             '.' => sanitized.push_str("&#46;"),
             _ => sanitized.push(character),
@@ -104,6 +105,7 @@ pub fn markdown_comment_for_terminal(value: &str) -> String {
         .replace("&#95;", "_")
         .replace("&#124;", "|")
         .replace("&#35;", "#")
+        .replace("&#64;", "@")
         .replace("&#58;", ":")
         .replace("&#46;", ".")
         .replace("&lt;", "<")
@@ -133,9 +135,19 @@ pub fn render_environment_note(
 }
 
 fn fenced_code(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character != '\n' && is_unsafe_format_character(character) {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect();
     let mut longest_run = 0usize;
     let mut current_run = 0usize;
-    for character in value.chars() {
+    for character in sanitized.chars() {
         if character == '`' {
             current_run += 1;
             longest_run = longest_run.max(current_run);
@@ -144,8 +156,8 @@ fn fenced_code(value: &str) -> String {
         }
     }
     let fence = "`".repeat(longest_run.saturating_add(1).max(3));
-    let separator = if value.ends_with('\n') { "" } else { "\n" };
-    format!("{fence}\n{value}{separator}{fence}\n\n")
+    let separator = if sanitized.ends_with('\n') { "" } else { "\n" };
+    format!("{fence}\n{sanitized}{separator}{fence}\n\n")
 }
 
 pub fn build_review_comment(

@@ -320,7 +320,7 @@ fn review_comment_sanitizes_policy_text_as_single_line_markdown() {
 
 #[test]
 fn review_comment_sanitizes_every_resource_section() {
-    let forged = "value`|\n\n### Forged Result\n<!-- hidden";
+    let forged = "value`|\n\n### Forged Result\n<!-- hidden @github/support";
     let diffs = vec![ResourceDiff {
         action: DiffAction::Modify,
         kind: forged.to_string(),
@@ -387,7 +387,42 @@ fn review_comment_sanitizes_every_resource_section() {
     assert!(!comment.lines().any(|line| line == "### Forged Result"));
     assert!(!comment.lines().any(|line| line.starts_with("<!-- hidden")));
     assert!(comment.contains("&lt;!-- hidden"));
+    assert!(comment.contains("&#64;github/support"));
     assert!(comment.contains("\\|"));
+}
+
+#[test]
+fn review_comment_neutralizes_mentions_in_inline_findings() {
+    let policy = vec![PolicyFinding {
+        rule_id: "allowed_backend_domains".to_string(),
+        severity: Severity::Error,
+        kind: "Proxy".to_string(),
+        id: "api".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "backend_host='@github/support' is disallowed".to_string(),
+        remediation: None,
+        overridden_by: None,
+    }];
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &policy,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(comment.contains("&#64;github/support"));
+    assert!(!comment.contains("@github/support"));
 }
 
 #[test]
@@ -441,6 +476,23 @@ fn review_comment_uses_a_safe_fence_for_validation_output() {
     );
 
     assert!(comment.contains("````\nfailed\n```\n### Forged Result\n````"));
+}
+
+#[test]
+fn review_comment_scrubs_controls_and_bidi_from_validation_output() {
+    let comment = build_review_comment(
+        false,
+        "line one\u{1b}[31m\nline \u{202e}two",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("line one�[31m\nline �two"));
+    assert!(!comment.contains('\u{1b}'));
+    assert!(!comment.contains('\u{202e}'));
 }
 
 #[test]

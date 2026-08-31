@@ -17,6 +17,37 @@ impl AllowedBackendDomainsRule {
         value.trim().trim_end_matches('.').to_ascii_lowercase()
     }
 
+    fn normalize_destination(value: &str) -> Option<String> {
+        let normalized = Self::normalize_domain(value);
+        if Self::parse_ip_literal(&normalized).is_some() {
+            return Some(normalized);
+        }
+        if normalized.is_empty()
+            || normalized.starts_with('.')
+            || normalized.contains("..")
+            || !normalized.chars().all(|character| {
+                character.is_alphanumeric() || matches!(character, '.' | '-' | '_')
+            })
+        {
+            return None;
+        }
+        if normalized.is_ascii() {
+            return Some(normalized);
+        }
+
+        let parsed = reqwest::Url::parse(&format!("https://{normalized}/")).ok()?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        parsed.host_str().map(ToOwned::to_owned)
+    }
+
     fn domain_matches(host: &str, pattern: &str) -> bool {
         if host.is_empty() || pattern.is_empty() {
             return false;
@@ -51,23 +82,10 @@ impl AllowedBackendDomainsRule {
             .ok()
     }
 
-    fn is_bare_destination(host: &str) -> bool {
-        if host.contains(':') || host.contains('[') || host.contains(']') {
-            return Self::parse_ip_literal(host).is_some();
-        }
-        !host.is_empty()
-            && !host.starts_with('.')
-            && !host.contains("..")
-            && host.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
-            })
-    }
-
     fn is_allowed(host: &str, allowed_domains: &[String]) -> bool {
-        let host = Self::normalize_domain(host);
-        if !Self::is_bare_destination(&host) {
+        let Some(host) = Self::normalize_destination(host) else {
             return false;
-        }
+        };
         allowed_domains
             .iter()
             .any(|pattern| Self::domain_matches(&host, pattern))
@@ -78,18 +96,24 @@ impl AllowedBackendDomainsRule {
         let mut invalid = Vec::new();
         for entry in entries {
             let trimmed = entry.trim();
-            let normalized = Self::normalize_domain(trimmed);
-            let suffix = normalized.strip_prefix("*.");
-            let candidate = suffix.unwrap_or(&normalized);
-            let is_valid = if normalized == "*" {
-                trimmed == "*"
+            let suffix = trimmed.strip_prefix("*.");
+            let candidate = suffix.unwrap_or(trimmed);
+            let normalized_candidate = Self::normalize_destination(candidate);
+            let normalized = normalized_candidate.as_ref().map(|candidate| {
+                if suffix.is_some() {
+                    format!("*.{candidate}")
+                } else {
+                    candidate.clone()
+                }
+            });
+            let is_valid = if trimmed == "*" {
+                true
             } else {
-                !candidate.is_empty()
-                    && Self::is_bare_destination(candidate)
+                normalized_candidate.is_some()
                     && !(suffix.is_some() && Self::parse_ip_literal(candidate).is_some())
             };
             if is_valid {
-                valid.push(normalized);
+                valid.push(normalized.unwrap_or_else(|| "*".to_string()));
             } else {
                 invalid.push(entry.clone());
             }

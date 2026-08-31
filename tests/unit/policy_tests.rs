@@ -1348,12 +1348,15 @@ fn dedicated_dns_override_allowance_canonicalizes_bracketed_ipv6() {
 
 #[test]
 fn malformed_dns_override_allowances_are_blocking_configuration_errors() {
+    let mut pinned = proxy("pinned", BackendScheme::Https, 30_000, true);
+    pinned.backend_host = "api.svc.cluster.local".to_string();
+    pinned.dns_override = Some("10.0.0.1".to_string());
     let policies = PolicyConfig {
         policies: PolicyRules {
             allowed_backend_domains: AllowedBackendDomainsRuleConfig {
                 enabled: true,
                 severity: Severity::Info,
-                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+                allowed_domains: vec!["*.svc.cluster.local".to_string(), "10.0.0.1".to_string()],
                 allowed_dns_override_addresses: vec!["10.0.0.1:53".to_string()],
                 ..Default::default()
             },
@@ -1362,10 +1365,18 @@ fn malformed_dns_override_allowances_are_blocking_configuration_errors() {
         ..Default::default()
     };
 
-    let findings = evaluate_policies(&GatewayConfig::default(), &policies);
-    assert_eq!(findings.len(), 1);
+    let findings = evaluate_policies(
+        &GatewayConfig {
+            proxies: vec![pinned],
+            ..Default::default()
+        },
+        &policies,
+    );
+    assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].kind, "PolicyConfig");
     assert_eq!(findings[0].severity, Severity::Error);
+    assert_eq!(findings[1].id, "pinned");
+    assert!(findings[1].message.contains("dns_override"));
 }
 
 #[test]
@@ -1414,15 +1425,26 @@ fn malformed_domain_allowances_are_blocking_regardless_of_rule_severity() {
 
 #[test]
 fn malformed_consul_control_plane_allowances_are_blocking_configuration_errors() {
+    let mut discovered_upstream = upstream("consul-pool", vec![]);
+    discovered_upstream.service_discovery = Some(consul_service_discovery(
+        "https://consul.control.internal:8501",
+    ));
     let policies = PolicyConfig {
         policies: PolicyRules {
             allowed_backend_domains: AllowedBackendDomainsRuleConfig {
                 enabled: true,
                 severity: Severity::Info,
-                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+                allowed_domains: vec![
+                    "*.svc.cluster.local".to_string(),
+                    "consul.control.internal".to_string(),
+                ],
                 allowed_service_discovery_control_plane_addresses: vec![
                     "https://consul.internal:8501".to_string(),
                 ],
+                allowed_service_discovery_upstreams: vec![UpstreamAllowance {
+                    namespace: "ferrum".to_string(),
+                    id: "consul-pool".to_string(),
+                }],
                 ..Default::default()
             },
             ..Default::default()
@@ -1430,12 +1452,56 @@ fn malformed_consul_control_plane_allowances_are_blocking_configuration_errors()
         ..Default::default()
     };
 
-    let findings = evaluate_policies(&GatewayConfig::default(), &policies);
-    assert_eq!(findings.len(), 1);
+    let findings = evaluate_policies(
+        &GatewayConfig {
+            upstreams: vec![discovered_upstream],
+            ..Default::default()
+        },
+        &policies,
+    );
+    assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].severity, Severity::Error);
     assert!(findings[0]
         .message
         .contains("allowed_service_discovery_control_plane_addresses"));
+    assert_eq!(findings[1].id, "consul-pool");
+    assert!(findings[1].message.contains("Consul discovery address"));
+}
+
+#[test]
+fn allowed_backend_domains_normalizes_internationalized_hosts_to_punycode() {
+    let mut direct = proxy("idn", BackendScheme::Https, 30_000, true);
+    direct.backend_host = "api.münchen.example".to_string();
+    let mut discovered_upstream = upstream("consul-idn", vec![]);
+    discovered_upstream.service_discovery = Some(consul_service_discovery(
+        "https://consul.münchen.example:8501",
+    ));
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.münchen.example".to_string()],
+                allowed_service_discovery_upstreams: vec![UpstreamAllowance {
+                    namespace: "ferrum".to_string(),
+                    id: "consul-idn".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(
+        &GatewayConfig {
+            proxies: vec![direct],
+            upstreams: vec![discovered_upstream],
+            ..Default::default()
+        },
+        &policies,
+    );
+    assert!(findings.is_empty(), "{findings:#?}");
 }
 
 #[test]
