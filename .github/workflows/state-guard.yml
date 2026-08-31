@@ -142,22 +142,30 @@ jobs:
               end
             ' "$pages_file")
           fi
-          [ "$(jq -r '.complete' <<< "$result")" = true ] || {
-            echo "::error::Changed-file pagination was incomplete; state guard fails closed."
-            exit 1
-          }
+          complete=$(jq -r '.complete' <<< "$result")
           count=$(jq '.matched_paths | length' <<< "$result")
           echo "count=${count}" >> "$GITHUB_OUTPUT"
-          if [ "$count" -eq 0 ]; then
+          if [ "$complete" != true ]; then
+            # GitHub caps this endpoint at 3,000 files. Treat an incomplete
+            # view as potentially containing protected state paths, then route
+            # it through the same current-head, permission-attributed override
+            # path as a known state edit. This remains fail closed without an
+            # authorized override but does not make an intentionally reviewed
+            # large PR permanently unmergeable.
+            echo "requires_override=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Changed-file pagination was incomplete; an authorized state override is required."
+          elif [ "$count" -eq 0 ]; then
+            echo "requires_override=false" >> "$GITHUB_OUTPUT"
             echo "No .state/ changes in this PR."
           else
+            echo "requires_override=true" >> "$GITHUB_OUTPUT"
             echo "This PR changes ${count} current or previous path(s) under .state/:"
             jq -r '.matched_paths[] | "  " + @json' <<< "$result"
           fi
 
       - name: Verify state-override authority
         id: authorize
-        if: ${{ steps.detect.outputs.count != '0' }}
+        if: ${{ steps.detect.outputs.requires_override == 'true' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -213,17 +221,19 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Reject unauthorized PR-authored state changes
-        if: ${{ steps.detect.outputs.count != '0' && steps.authorize.outcome != 'success' }}
+        if: ${{ steps.detect.outputs.requires_override == 'true' && steps.authorize.outcome != 'success' }}
         run: |
-          echo "::error::This PR modifies .state/, the CI-owned ownership ledger."
+          echo "::error::This PR modifies .state/ or exceeds GitHub's complete changed-file enumeration; an authorized override is required."
           cat >> "$GITHUB_STEP_SUMMARY" <<'MSG'
-          ## Blocked: PR modifies `.state/`
+          ## Blocked: protected state scope cannot be cleared automatically
 
           `.state/<env>.json` records which gateway resources this repo has
           applied. In `shared` ownership mode it is the only thing standing
           between a live resource and a delete, so a hand-edited state file can
           cause the next post-merge apply to remove resources the repo never
-          managed.
+          managed. GitHub also caps changed-file enumeration at 3,000 entries;
+          when that view is incomplete, this guard conservatively assumes the
+          unseen tail could contain a protected state path.
 
           It is maintained by CI: `apply-on-merge.yml` and `rotate.yml` commit
           it as `gitforgeops[bot]` after a successful run. Drop the `.state/`
@@ -239,7 +249,7 @@ jobs:
           exit 1
 
       - name: Record authorized override
-        if: ${{ steps.detect.outputs.count != '0' && steps.authorize.outcome == 'success' }}
+        if: ${{ steps.detect.outputs.requires_override == 'true' && steps.authorize.outcome == 'success' }}
         env:
           ACTOR: ${{ steps.authorize.outputs.actor }}
           PERMISSION: ${{ steps.authorize.outputs.permission }}
@@ -247,9 +257,9 @@ jobs:
           LABELED_AT: ${{ steps.authorize.outputs.labeled_at }}
           AUTHORIZED_HEAD: ${{ steps.authorize.outputs.head_sha }}
         run: |
-          echo "::warning::.state/ changes authorized by @${ACTOR} (${PERMISSION}), label event ${EVENT_ID} at ${LABELED_AT}."
+          echo "::warning::Protected state scope authorized by @${ACTOR} (${PERMISSION}), label event ${EVENT_ID} at ${LABELED_AT}."
           {
-            echo "## Authorized \`.state/\` override"
+            echo "## Authorized protected-state override"
             echo
             echo "- Actor: \`@${ACTOR}\`"
             echo "- Current permission: \`${PERMISSION}\`"

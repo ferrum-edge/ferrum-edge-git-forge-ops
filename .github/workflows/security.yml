@@ -65,6 +65,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = pull_request ]; then
+            CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py
+            if [ ! -f "$CANDIDATE_CHECKER" ] || [ -L "$CANDIDATE_CHECKER" ]; then
+              echo "Candidate must retain the regular-file supply-chain checker." >&2
+              exit 1
+            fi
             # Execute policy code from the protected default branch while
             # pointing it at the candidate tree. The global assignments keep
             # the first bootstrap compatible with the pre-`--root` checker.

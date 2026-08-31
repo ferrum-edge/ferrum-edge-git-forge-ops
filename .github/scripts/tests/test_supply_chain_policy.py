@@ -29,6 +29,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "if: github.event_name == 'pull_request'",
                 "ref: ${{ github.event.repository.default_branch }}",
                 "path: trusted-supply-chain",
+                "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
+                "Candidate must retain the regular-file supply-chain checker.",
                 "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
                 "module.ROOT = candidate",
                 'module.WORKFLOWS = candidate / ".github" / "workflows"',

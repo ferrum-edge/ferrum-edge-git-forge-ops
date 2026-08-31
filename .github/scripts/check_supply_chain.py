@@ -84,6 +84,8 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
         "if: github.event_name == 'pull_request'",
         "ref: ${{ github.event.repository.default_branch }}",
         "path: trusted-supply-chain",
+        "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
+        "Candidate must retain the regular-file supply-chain checker.",
         "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
         "module.ROOT = candidate",
         'module.WORKFLOWS = candidate / ".github" / "workflows"',
@@ -154,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     workflows = root / ".github" / "workflows"
     checked_action_files = action_files(root)
     violations: list[str] = []
+    candidate_checker = root / ".github" / "scripts" / "check_supply_chain.py"
+    if candidate_checker.is_symlink() or not candidate_checker.is_file():
+        violations.append(
+            ".github/scripts/check_supply_chain.py must remain a regular protected policy file"
+        )
     action_pins: dict[str, list[str]] = {}
     for workflow in checked_action_files:
         text = workflow.read_text(encoding="utf-8")
@@ -372,7 +379,6 @@ def main(argv: list[str] | None = None) -> int:
     for required_pattern in (
         "/.github/workflows/",
         "/.github/scripts/",
-        "/.github/cargo-audit-policy.json",
         "/.github/ferrum-edge-checksums.txt",
         "/.gitforgeops/",
         "/.state/",
@@ -431,9 +437,12 @@ def main(argv: list[str] | None = None) -> int:
         if line.strip() and not line.lstrip().startswith("#")
     ]
     if not pins or any(
-        len(pin) != 3
+        len(pin) != 5
+        or not re.fullmatch(r"release-[1-9][0-9]*", pin[0])
         or pin[1] != "ferrum-edge-linux-x86_64"
-        or not re.fullmatch(r"[0-9a-f]{64}", pin[2])
+        or not re.fullmatch(r"[1-9][0-9]*", pin[2])
+        or not re.fullmatch(r"[1-9][0-9]*", pin[3])
+        or not re.fullmatch(r"[0-9a-f]{64}", pin[4])
         for pin in pins
     ):
         violations.append("ferrum-edge-checksums.txt contains a malformed release pin")
@@ -452,7 +461,13 @@ def main(argv: list[str] | None = None) -> int:
             "actions": action_pins,
             "docker_bases": FROM.findall(dockerfile),
             "ferrum_edge_binaries": [
-                {"version": pin[0], "asset": pin[1], "sha256": pin[2]}
+                {
+                    "release_identity": pin[0],
+                    "asset": pin[1],
+                    "asset_id": int(pin[2]),
+                    "checksum_asset_id": int(pin[3]),
+                    "sha256": pin[4],
+                }
                 for pin in pins
             ],
         }

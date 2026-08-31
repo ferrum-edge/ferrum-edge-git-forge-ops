@@ -7,6 +7,9 @@ from pathlib import Path
 
 
 INSTALLER = Path(__file__).parents[1] / "install-ferrum-edge.sh"
+RELEASE_IDENTITY = "release-379454492"
+BINARY_ASSET_ID = "537268718"
+CHECKSUM_ASSET_ID = "537268721"
 
 
 class InstallerTests(unittest.TestCase):
@@ -21,10 +24,12 @@ class InstallerTests(unittest.TestCase):
 import os, pathlib, sys
 output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
 url = next(arg for arg in sys.argv if arg.startswith('https://'))
-if url.endswith('.sha256'):
+if url.endswith('/' + os.environ['FAKE_CHECKSUM_ASSET_ID']):
     output.write_text(os.environ['FAKE_PUBLISHED'] + '  ferrum-edge-linux-x86_64\\n')
-else:
+elif url.endswith('/' + os.environ['FAKE_BINARY_ASSET_ID']):
     output.write_bytes(bytes.fromhex(os.environ['FAKE_BINARY_HEX']))
+else:
+    raise SystemExit('unexpected asset URL: ' + url)
 """
             )
             curl.chmod(0o755)
@@ -33,12 +38,21 @@ else:
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
             environment["FAKE_BINARY_HEX"] = binary.hex()
             environment["FAKE_PUBLISHED"] = published_digest
+            environment["FAKE_BINARY_ASSET_ID"] = BINARY_ASSET_ID
+            environment["FAKE_CHECKSUM_ASSET_ID"] = CHECKSUM_ASSET_ID
             policy = root / "checksums.txt"
             policy.write_text(
-                f"latest ferrum-edge-linux-x86_64 {expected_digest}\n"
+                f"{RELEASE_IDENTITY} ferrum-edge-linux-x86_64 "
+                f"{BINARY_ASSET_ID} {CHECKSUM_ASSET_ID} {expected_digest}\n"
             )
             return subprocess.run(
-                ["bash", str(INSTALLER), "latest", str(destination), str(policy)],
+                [
+                    "bash",
+                    str(INSTALLER),
+                    RELEASE_IDENTITY,
+                    str(destination),
+                    str(policy),
+                ],
                 text=True,
                 capture_output=True,
                 env=environment,
@@ -72,13 +86,13 @@ else:
             root = Path(temp)
             policy = root / "checksums.txt"
             policy.write_text(
-                "v1.0.0 ferrum-edge-linux-x86_64 " + "a" * 64 + "\n"
+                "release-1 ferrum-edge-linux-x86_64 1 2 " + "a" * 64 + "\n"
             )
             result = subprocess.run(
                 [
                     "bash",
                     str(INSTALLER),
-                    "latest",
+                    RELEASE_IDENTITY,
                     str(root / "installed"),
                     str(policy),
                 ],
@@ -88,6 +102,18 @@ else:
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exactly one pin", result.stderr)
+
+    def test_movable_release_tags_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "latest", str(root / "installed")],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("immutable release identity", result.stderr)
 
 
 if __name__ == "__main__":

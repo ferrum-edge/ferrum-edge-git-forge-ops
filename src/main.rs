@@ -1835,6 +1835,7 @@ async fn cmd_review(
         bundle_loaded,
     );
 
+    let mut comment_delivery_error = None;
     match pr {
         Some(pr_number) => {
             // Fork PRs: GITHUB_TOKEN is downgraded to read-only by GitHub
@@ -1854,6 +1855,7 @@ async fn cmd_review(
                     );
                     write_review_to_step_summary(&comment)?;
                     print!("{}", comment);
+                    comment_delivery_error = Some(e.to_string());
                 }
             }
         }
@@ -1870,6 +1872,7 @@ async fn cmd_review(
             .into());
         }
     }
+    review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
 
     let _ = !secret_report.results.is_empty();
     Ok(())

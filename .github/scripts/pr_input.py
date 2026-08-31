@@ -19,6 +19,7 @@ MAX_ARCHIVE_MEMBERS = 100_000
 MAX_FILES = 5_000
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_CHANGED_PATHS = 10_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 class InputError(RuntimeError):
@@ -267,8 +268,49 @@ def verify(root: Path, expected_head_sha: str) -> dict[str, object]:
     return manifest
 
 
-def trusted_targets(root: Path, environment_scopes_json: str) -> list[dict[str, str]]:
-    """Build the privileged live-review matrix from protected-branch paths."""
+def _touched_namespaces(changed_paths_file: Path) -> set[str]:
+    try:
+        changed_paths = json.loads(changed_paths_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InputError(f"invalid trusted changed-path list: {error}") from error
+    if not isinstance(changed_paths, list) or len(changed_paths) > MAX_CHANGED_PATHS:
+        raise InputError("trusted changed paths must be a bounded array")
+
+    namespaces: set[str] = set()
+    for raw_path in changed_paths:
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or "\0" in raw_path
+            or "\\" in raw_path
+            or raw_path.startswith("/")
+        ):
+            raise InputError("trusted changed path must be a safe repository-relative string")
+        raw_parts = raw_path.split("/")
+        if any(part in {"", ".", ".."} for part in raw_parts):
+            raise InputError(f"unsafe trusted changed path: {raw_path!r}")
+        parts = PurePosixPath(raw_path).parts
+        if parts[0] == "resources":
+            if len(parts) < 2 or not SAFE_COMPONENT_RE.fullmatch(parts[1]):
+                raise InputError(f"unsafe resource namespace path: {raw_path!r}")
+            namespaces.add(parts[1])
+        elif parts[0] == "overlays":
+            if (
+                len(parts) < 3
+                or not SAFE_COMPONENT_RE.fullmatch(parts[1])
+                or not SAFE_COMPONENT_RE.fullmatch(parts[2])
+            ):
+                raise InputError(f"unsafe overlay namespace path: {raw_path!r}")
+            namespaces.add(parts[2])
+        elif parts[0] != ".gitforgeops":
+            raise InputError(f"non-declarative trusted changed path: {raw_path!r}")
+    return namespaces
+
+
+def trusted_targets(
+    root: Path, environment_scopes_json: str, changed_paths_file: Path
+) -> list[dict[str, str]]:
+    """Build the live-review matrix from protected scopes and touched namespaces."""
     try:
         scopes = json.loads(environment_scopes_json)
     except json.JSONDecodeError as error:
@@ -318,6 +360,7 @@ def trusted_targets(root: Path, environment_scopes_json: str) -> list[dict[str, 
             (environment, None if namespaces is None else set(namespaces))
         )
 
+    touched_namespaces = _touched_namespaces(changed_paths_file)
     resources = root / "resources"
     namespaces: list[str] = []
     if resources.exists() or resources.is_symlink():
@@ -330,7 +373,8 @@ def trusted_targets(root: Path, environment_scopes_json: str) -> list[dict[str, 
                 continue
             if not SAFE_COMPONENT_RE.fullmatch(entry.name):
                 raise InputError(f"unsafe trusted namespace directory: {entry.name!r}")
-            namespaces.append(entry.name)
+            if entry.name in touched_namespaces:
+                namespaces.append(entry.name)
 
     targets = []
     for environment, allowed in sorted(normalized_scopes):
@@ -353,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     targets_parser = subparsers.add_parser("targets")
     targets_parser.add_argument("root", type=Path)
     targets_parser.add_argument("environments_json")
+    targets_parser.add_argument("changed_paths", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
@@ -368,7 +413,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(
                 json.dumps(
-                    trusted_targets(args.root, args.environments_json),
+                    trusted_targets(
+                        args.root, args.environments_json, args.changed_paths
+                    ),
                     separators=(",", ":"),
                 )
             )

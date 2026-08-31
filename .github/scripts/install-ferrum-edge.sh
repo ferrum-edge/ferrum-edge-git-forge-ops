@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=${1:-}
+release_identity=${1:-}
 if [ -n "${RUNNER_TEMP:-}" ]; then
   default_destination="$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge"
 else
@@ -12,9 +12,9 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 checksum_policy=${3:-$script_dir/../ferrum-edge-checksums.txt}
 asset=ferrum-edge-linux-x86_64
 
-if [[ ! "$version" =~ ^latest$|^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-  echo "Invalid FERRUM_EDGE_VERSION: '$version'" >&2
-  echo "Expected 'latest' or a release tag like 'v1.2.3'." >&2
+if [[ ! "$release_identity" =~ ^release-[1-9][0-9]*$ ]]; then
+  echo "Invalid FERRUM_EDGE_VERSION: '$release_identity'" >&2
+  echo "Expected an immutable release identity like 'release-379454492'." >&2
   exit 1
 fi
 
@@ -22,27 +22,40 @@ if [ ! -f "$checksum_policy" ] || [ -L "$checksum_policy" ]; then
   echo "Pinned Ferrum Edge checksum policy is missing or is a symlink: $checksum_policy" >&2
   exit 1
 fi
-expected_sha256=$(awk -v version="$version" -v asset="$asset" '
-  $1 == version && $2 == asset && $3 ~ /^[0-9A-Fa-f]{64}$/ { print tolower($3) }
+policy_record=$(awk -v release_identity="$release_identity" -v asset="$asset" '
+  NF == 5 && $1 == release_identity && $2 == asset && $3 ~ /^[1-9][0-9]*$/ &&
+    $4 ~ /^[1-9][0-9]*$/ && $5 ~ /^[0-9A-Fa-f]{64}$/ {
+      print $3, $4, tolower($5)
+    }
 ' "$checksum_policy")
-if [[ -z "$expected_sha256" || "$expected_sha256" == *$'\n'* ]]; then
-  echo "Checksum policy must contain exactly one pin for $version $asset." >&2
+if [[ -z "$policy_record" || "$policy_record" == *$'\n'* ]]; then
+  echo "Checksum policy must contain exactly one pin for $release_identity $asset." >&2
   exit 1
 fi
+read -r asset_id checksum_asset_id expected_sha256 <<< "$policy_record"
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf -- "$tmp_dir"' EXIT
 binary="$tmp_dir/$asset"
 checksum="$tmp_dir/$asset.sha256"
-base_url="https://github.com/ferrum-edge/ferrum-edge/releases/download/${version}"
+asset_api="https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/assets"
 
-# Fetch both publisher artifacts. The repository-pinned digest below remains
-# the trust anchor: a compromised/moved release cannot replace both files and
-# silently pass, because the computed bytes must also match the checked-in pin.
+# Fetch both publisher artifacts by immutable GitHub asset ID, rather than by
+# a movable tag. The repository-pinned digest below remains the trust anchor:
+# deleting and re-uploading an asset produces a new ID, while changed bytes
+# also fail the checked-in SHA-256 comparison.
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  --retry 3 --retry-connrefused "$base_url/$asset" --output "$binary"
+  --retry 3 --retry-connrefused \
+  -H 'Accept: application/octet-stream' \
+  -H 'X-GitHub-Api-Version: 2022-11-28' \
+  -H 'User-Agent: gitforgeops-validator-installer' \
+  "$asset_api/$asset_id" --output "$binary"
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-  --retry 3 --retry-connrefused "$base_url/$asset.sha256" --output "$checksum"
+  --retry 3 --retry-connrefused \
+  -H 'Accept: application/octet-stream' \
+  -H 'X-GitHub-Api-Version: 2022-11-28' \
+  -H 'User-Agent: gitforgeops-validator-installer' \
+  "$asset_api/$checksum_asset_id" --output "$checksum"
 
 published_sha256=$(awk -v asset="$asset" '
   NF == 2 && ($2 == asset || $2 == "*" asset) && $1 ~ /^[0-9A-Fa-f]{64}$/ { print tolower($1) }
@@ -75,4 +88,4 @@ install -m 0755 "$binary" "$destination"
 if [ -n "${GITHUB_PATH:-}" ]; then
   dirname -- "$destination" >> "$GITHUB_PATH"
 fi
-echo "Installed $asset from release $version (sha256:$actual_sha256)."
+echo "Installed $asset from $release_identity (sha256:$actual_sha256)."

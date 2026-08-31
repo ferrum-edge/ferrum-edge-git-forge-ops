@@ -58,6 +58,12 @@ def make_archive(path, extra=None):
             extra(bundle)
 
 
+def write_changed_paths(root, paths):
+    changed_paths = root / "changed-paths.json"
+    changed_paths.write_text(json.dumps(paths))
+    return changed_paths
+
+
 class PrInputTests(unittest.TestCase):
     def test_prepare_excludes_executable_canary_and_verifies_manifest(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -161,6 +167,13 @@ class PrInputTests(unittest.TestCase):
                         },
                     ]
                 ),
+                write_changed_paths(
+                    root,
+                    [
+                        "resources/team-a/proxies/api.yaml",
+                        "overlays/staging/ferrum/proxies/api.yaml",
+                    ],
+                ),
             )
             self.assertEqual(
                 targets,
@@ -189,6 +202,9 @@ class PrInputTests(unittest.TestCase):
                     pr_input.trusted_targets(
                         root,
                         '[{"environment":"production","live_review":true,"namespaces":null}]',
+                        write_changed_paths(
+                            root, ["resources/linked/proxies/api.yaml"]
+                        ),
                     )
 
     def test_trusted_targets_reject_malformed_or_duplicate_scope(self):
@@ -207,7 +223,56 @@ class PrInputTests(unittest.TestCase):
                 with self.subTest(payload=payload), self.assertRaises(
                     pr_input.InputError
                 ):
-                    pr_input.trusted_targets(root, payload)
+                    pr_input.trusted_targets(
+                        root,
+                        payload,
+                        write_changed_paths(
+                            root, ["resources/team/proxies/api.yaml"]
+                        ),
+                    )
+
+    def test_trusted_targets_exclude_untouched_and_new_namespaces(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/touched").mkdir(parents=True)
+            (root / "resources/untouched").mkdir()
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(
+                    root,
+                    [
+                        "resources/touched/proxies/api.yaml",
+                        "resources/new/proxies/api.yaml",
+                    ],
+                ),
+            )
+            self.assertEqual(
+                targets,
+                [{"environment": "production", "namespace": "touched"}],
+            )
+
+    def test_trusted_targets_config_only_change_has_no_live_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(root, [".gitforgeops/policies.yaml"]),
+            )
+            self.assertEqual(targets, [])
+
+    def test_trusted_targets_reject_unsafe_changed_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            scopes = '[{"environment":"production","live_review":true,"namespaces":null}]'
+            for path in ("resources/../escape.yaml", "/resources/team/api.yaml", 7):
+                with self.subTest(path=path), self.assertRaises(pr_input.InputError):
+                    pr_input.trusted_targets(
+                        root, scopes, write_changed_paths(root, [path])
+                    )
 
 
 if __name__ == "__main__":
