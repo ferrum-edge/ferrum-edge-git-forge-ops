@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check_cargo_audit.py"
@@ -264,6 +265,40 @@ class CargoAuditPolicyTests(unittest.TestCase):
                 check_cargo_audit.verify_rsa_exception_reachability(
                     {check_cargo_audit.RSA_EXCEPTION_KEY: exception()}, root, tree
                 )
+
+    def test_live_dependency_tree_disables_forced_terminal_color(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src" / "secrets").mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
+                '[dependencies]\nage = { version = "0.12", features = ["ssh", "armor"] }\n',
+                encoding="utf-8",
+            )
+            (root / "src" / "secrets" / "delivery.rs").write_text(
+                "use age::ssh::Recipient;\n"
+                "fn reviewed(r: &dyn age::Recipient) {\n"
+                " let _ = age::Encryptor::with_recipients([r]);\n"
+                " let _ = age::armor::ArmoredWriter::wrap_output;\n"
+                " let _ = age::armor::Format::AsciiArmor;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            tree = (
+                "rsa v0.9.10\n"
+                "└── age v0.12.1\n"
+                f"    └── gitforgeops v0.1.0 ({root})\n"
+            )
+            completed = subprocess.CompletedProcess([], 0, tree, "")
+            with mock.patch.object(
+                check_cargo_audit.subprocess, "run", return_value=completed
+            ) as run:
+                check_cargo_audit.verify_rsa_exception_reachability(
+                    {check_cargo_audit.RSA_EXCEPTION_KEY: exception()}, root, None
+                )
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--color") + 1], "never")
 
 
 if __name__ == "__main__":
