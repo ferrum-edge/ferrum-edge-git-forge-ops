@@ -63,8 +63,10 @@ policies:
       - key_auth
       - rate_limiting
 
-  # Restrict direct proxy backends and upstream target hosts by domain.
-  # Proxies with `upstream_id` are checked through their upstream targets.
+  # Restrict direct proxy backends, DNS overrides, and upstream target hosts.
+  # Proxies skip their placeholder backend only when `upstream_id` exactly
+  # resolves in the same namespace. Dynamic service-discovery targets cannot
+  # be proven from the static document and therefore produce a finding.
   # Exact FQDNs match one host; wildcard entries like `*.svc.cluster.local`
   # match any subdomain depth under that suffix.
   # IP literals must be listed exactly; wildcard entries only apply to DNS names.

@@ -70,39 +70,89 @@ impl PolicyCheck for AllowedBackendDomainsRule {
             .collect();
 
         for proxy in &cfg.proxies {
-            let uses_resolved_upstream = proxy.upstream_id.as_deref().is_some_and(|upstream_id| {
+            let upstream_id = proxy.upstream_id.as_deref();
+            let uses_resolved_upstream = upstream_id.is_some_and(|upstream_id| {
                 !upstream_id.trim().is_empty()
                     && declared_upstreams.contains(&(proxy.namespace.as_str(), upstream_id))
             });
 
             // When a proxy delegates to a declared upstream in the same
             // namespace, backend_host is schema filler rather than the routed
-            // backend. The upstream target loop below enforces the actual
-            // destinations.
-            if uses_resolved_upstream {
-                continue;
-            }
-
-            if !Self::is_allowed(&proxy.backend_host, &allowed_domains) {
+            // backend. Authored targets are checked below, and dynamic service
+            // discovery is rejected because its runtime targets cannot be
+            // proven against this static allowlist.
+            if !uses_resolved_upstream && !Self::is_allowed(&proxy.backend_host, &allowed_domains) {
+                let (message, remediation) = if let Some(upstream_id) = upstream_id {
+                    (
+                        format!(
+                            "upstream_id '{upstream_id}' is not declared in namespace '{}'; fallback backend_host='{}' is not in the allowed domain list ({allowed})",
+                            proxy.namespace, proxy.backend_host
+                        ),
+                        format!(
+                            "Declare upstream_id '{upstream_id}' in namespace '{}' or use a backend_host matching one of these domains: {allowed}",
+                            proxy.namespace
+                        ),
+                    )
+                } else {
+                    (
+                        format!(
+                            "backend_host='{}' is not in the allowed domain list ({allowed})",
+                            proxy.backend_host
+                        ),
+                        format!("Use a backend_host matching one of these domains: {allowed}"),
+                    )
+                };
                 findings.push(PolicyFinding {
                     rule_id: self.rule_id().to_string(),
                     severity: self.config.severity,
                     kind: "Proxy".to_string(),
                     id: proxy.id.clone(),
                     namespace: proxy.namespace.clone(),
-                    message: format!(
-                        "backend_host={} is not in the allowed domain list ({allowed})",
-                        proxy.backend_host
-                    ),
-                    remediation: Some(format!(
-                        "Use a backend_host matching one of these domains: {allowed}"
-                    )),
+                    message,
+                    remediation: Some(remediation),
                     overridden_by: None,
                 });
+            }
+
+            if let Some(dns_override) = proxy.dns_override.as_deref() {
+                if !Self::is_allowed(dns_override, &allowed_domains) {
+                    findings.push(PolicyFinding {
+                        rule_id: self.rule_id().to_string(),
+                        severity: self.config.severity,
+                        kind: "Proxy".to_string(),
+                        id: proxy.id.clone(),
+                        namespace: proxy.namespace.clone(),
+                        message: format!(
+                            "dns_override='{dns_override}' is an effective dial destination outside the allowed domain list ({allowed})"
+                        ),
+                        remediation: Some(format!(
+                            "Remove dns_override or add its exact IP address to allowed_domains (currently: {allowed})"
+                        )),
+                        overridden_by: None,
+                    });
+                }
             }
         }
 
         for upstream in &cfg.upstreams {
+            if upstream.service_discovery.is_some() {
+                findings.push(PolicyFinding {
+                    rule_id: self.rule_id().to_string(),
+                    severity: self.config.severity,
+                    kind: "Upstream".to_string(),
+                    id: upstream.id.clone(),
+                    namespace: upstream.namespace.clone(),
+                    message: format!(
+                        "service_discovery can publish runtime targets that cannot be verified against the allowed domain list ({allowed})"
+                    ),
+                    remediation: Some(
+                        "Remove service_discovery and declare allowed targets statically, or use the reviewed policy override only after enforcing equivalent runtime egress controls"
+                            .to_string(),
+                    ),
+                    overridden_by: None,
+                });
+            }
+
             for target in &upstream.targets {
                 if Self::is_allowed(&target.host, &allowed_domains) {
                     continue;

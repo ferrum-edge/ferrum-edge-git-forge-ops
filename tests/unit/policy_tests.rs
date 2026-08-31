@@ -1,6 +1,6 @@
 use gitforgeops::config::schema::{
-    BackendScheme, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
-    PluginScope, Proxy, Upstream, UpstreamTarget,
+    BackendScheme, DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation,
+    PluginConfig, PluginScope, Proxy, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use gitforgeops::policy::config::{
     AllowedBackendDomainsRuleConfig, AllowedProxyPluginsRuleConfig, BackendSchemeRuleConfig,
@@ -118,6 +118,22 @@ fn target(host: &str) -> UpstreamTarget {
         tags: Default::default(),
         locality: None,
         path: None,
+    }
+}
+
+fn dns_service_discovery(service_name: &str) -> ServiceDiscoveryConfig {
+    ServiceDiscoveryConfig {
+        provider: SdProvider::DnsSd,
+        dns_sd: Some(DnsSdConfig {
+            service_name: service_name.to_string(),
+            poll_interval_seconds: 30,
+        }),
+        kubernetes: None,
+        consul: None,
+        mesh: None,
+        max_stale_seconds: None,
+        stale_policy: None,
+        default_weight: 1,
     }
 }
 
@@ -346,7 +362,7 @@ fn allowed_backend_domains_skips_proxy_backend_host_when_upstream_is_used() {
 #[test]
 fn allowed_backend_domains_checks_proxy_backend_host_when_upstream_id_is_unresolved() {
     let mut p = proxy("missing-upstream", BackendScheme::Https, 30_000, true);
-    p.backend_host = "attacker.invalid".to_string();
+    p.backend_host = String::new();
     p.upstream_id = Some("missing".to_string());
 
     let cfg = GatewayConfig {
@@ -370,6 +386,12 @@ fn allowed_backend_domains_checks_proxy_backend_host_when_upstream_id_is_unresol
     assert_eq!(findings[0].rule_id, "allowed_backend_domains");
     assert_eq!(findings[0].kind, "Proxy");
     assert_eq!(findings[0].id, "missing-upstream");
+    assert!(findings[0].message.contains("upstream_id 'missing'"));
+    assert!(findings[0].message.contains("backend_host=''"));
+    assert!(findings[0]
+        .remediation
+        .as_deref()
+        .is_some_and(|message| message.contains("Declare upstream_id 'missing'")));
 }
 
 #[test]
@@ -431,6 +453,124 @@ fn allowed_backend_domains_does_not_resolve_upstream_from_another_namespace() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].kind, "Proxy");
     assert_eq!(findings[0].id, "cross-namespace");
+}
+
+#[test]
+fn allowed_backend_domains_does_not_trim_upstream_ids_during_resolution() {
+    let mut p = proxy("padded-upstream", BackendScheme::Https, 30_000, true);
+    p.backend_host = "attacker.invalid".to_string();
+    p.upstream_id = Some(" api-pool ".to_string());
+
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        upstreams: vec![upstream("api-pool", vec![target("blue.svc.cluster.local")])],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("upstream_id ' api-pool '"));
+}
+
+#[test]
+fn allowed_backend_domains_rejects_dynamic_service_discovery() {
+    let mut discovered_upstream =
+        upstream("dynamic-pool", vec![target("fallback.svc.cluster.local")]);
+    discovered_upstream.service_discovery = Some(dns_service_discovery(
+        "_https._tcp.dynamic.svc.cluster.local",
+    ));
+
+    let cfg = GatewayConfig {
+        upstreams: vec![discovered_upstream],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, "Upstream");
+    assert_eq!(findings[0].id, "dynamic-pool");
+    assert!(findings[0]
+        .message
+        .contains("runtime targets that cannot be verified"));
+}
+
+#[test]
+fn allowed_backend_domains_checks_dns_override_as_a_dial_destination() {
+    let mut p = proxy("pinned-backend", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("203.0.113.10".to_string());
+
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, "Proxy");
+    assert_eq!(findings[0].id, "pinned-backend");
+    assert!(findings[0].message.contains("dns_override='203.0.113.10'"));
+}
+
+#[test]
+fn allowed_backend_domains_accepts_an_explicitly_allowed_dns_override() {
+    let mut p = proxy("allowed-pin", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("203.0.113.10".to_string());
+
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec![
+                    "*.svc.cluster.local".to_string(),
+                    "203.0.113.10".to_string(),
+                ],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(evaluate_policies(&cfg, &policies).is_empty());
 }
 
 #[test]
