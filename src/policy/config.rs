@@ -123,6 +123,12 @@ pub struct AllowedProxyPluginsRuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceDiscoveryUpstreamAllowance {
+    pub namespace: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AllowedBackendDomainsRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -130,6 +136,11 @@ pub struct AllowedBackendDomainsRuleConfig {
     pub severity: Severity,
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Discovery-backed upstreams whose runtime destinations are constrained
+    /// by an equivalent external egress control. Entries match exact resource
+    /// identity so acknowledging one upstream cannot weaken the whole rule.
+    #[serde(default)]
+    pub allowed_service_discovery_upstreams: Vec<ServiceDiscoveryUpstreamAllowance>,
 }
 
 /// `waf_enforcement` — a WAF that is attached but not blocking.

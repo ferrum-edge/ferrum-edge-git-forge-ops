@@ -6,6 +6,52 @@ use crate::policy::config::OverrideConfig;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
 
+fn sanitize_markdown_inline(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.trim().chars() {
+        if matches!(character, '\r' | '\n') {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !sanitized.ends_with(' ') {
+            sanitized.push(' ');
+        }
+        pending_space = false;
+        match character {
+            '&' => sanitized.push_str("&amp;"),
+            '<' => sanitized.push_str("&lt;"),
+            '>' => sanitized.push_str("&gt;"),
+            '`' => sanitized.push_str("&#96;"),
+            '\\' => sanitized.push_str("&#92;"),
+            '*' => sanitized.push_str("&#42;"),
+            '_' => sanitized.push_str("&#95;"),
+            '[' => sanitized.push_str("&#91;"),
+            ']' => sanitized.push_str("&#93;"),
+            '|' => sanitized.push_str("&#124;"),
+            _ => sanitized.push(character),
+        }
+    }
+    sanitized
+}
+
+fn sanitize_code_span(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.trim().chars() {
+        if matches!(character, '\r' | '\n') {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !sanitized.ends_with(' ') {
+            sanitized.push(' ');
+        }
+        pending_space = false;
+        sanitized.push(if character == '`' { '\'' } else { character });
+    }
+    sanitized
+}
+
 pub fn build_review_comment(
     validation_success: bool,
     validation_output: &str,
@@ -204,7 +250,9 @@ pub fn build_review_comment_v2(
         let mut has_blocking = false;
         for pf in policy {
             let status_tag = match (&pf.overridden_by, pf.severity.blocks_apply()) {
-                (Some(by), _) => format!(" · OVERRIDDEN by @{by}"),
+                (Some(by), _) => {
+                    format!(" · OVERRIDDEN by @{}", sanitize_markdown_inline(by))
+                }
                 (None, true) => {
                     has_blocking = true;
                     " · BLOCKING".to_string()
@@ -214,15 +262,15 @@ pub fn build_review_comment_v2(
             md.push_str(&format!(
                 "- [{}] `{}` on **{} `{}`** (`{}`): {}{}\n",
                 pf.severity.as_str(),
-                pf.rule_id,
-                pf.kind,
-                pf.id,
-                pf.namespace,
-                pf.message,
+                sanitize_code_span(&pf.rule_id),
+                sanitize_markdown_inline(&pf.kind),
+                sanitize_code_span(&pf.id),
+                sanitize_code_span(&pf.namespace),
+                sanitize_markdown_inline(&pf.message),
                 status_tag
             ));
             if let Some(rem) = &pf.remediation {
-                md.push_str(&format!("  - _{}_\n", rem));
+                md.push_str(&format!("  - _{}_\n", sanitize_markdown_inline(rem)));
             }
         }
         md.push('\n');

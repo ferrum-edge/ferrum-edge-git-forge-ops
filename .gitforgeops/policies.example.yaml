@@ -66,10 +66,13 @@ policies:
   # Restrict direct proxy backends, DNS overrides, and upstream target hosts.
   # Proxies skip their placeholder backend only when `upstream_id` exactly
   # resolves in the same namespace. Dynamic service-discovery targets cannot
-  # be proven from the static document and therefore produce a finding.
+  # be proven from the static document and therefore produce a finding unless
+  # the exact upstream is acknowledged below after equivalent runtime egress
+  # controls are in place.
   # Exact FQDNs match one host; wildcard entries like `*.svc.cluster.local`
   # match any subdomain depth under that suffix.
-  # IP literals must be listed exactly; wildcard entries only apply to DNS names.
+  # IP literals must be listed exactly; suffix wildcards only apply to DNS names.
+  # A bare `*` explicitly accepts every nonempty syntactically bare destination.
   allowed_backend_domains:
     enabled: false
     severity: error
@@ -77,6 +80,9 @@ policies:
       - api.internal.example.com
       - "*.svc.cluster.local"
       - "*.corp.example.com"
+    allowed_service_discovery_upstreams: []
+    # - namespace: platform
+    #   id: kubernetes-services
 
   # A `waf` plugin that is attached but not blocking. The built-in rule pack
   # ships every rule at `monitor`, so `mode: enforce` on its own rejects

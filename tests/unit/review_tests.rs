@@ -180,6 +180,51 @@ fn review_comment_v2_falls_back_to_defaults_when_no_override_config() {
 }
 
 #[test]
+fn review_comment_sanitizes_policy_text_as_single_line_markdown() {
+    let policy = vec![PolicyFinding {
+        rule_id: "allowed_backend_domains`".to_string(),
+        severity: Severity::Error,
+        kind: "Proxy".to_string(),
+        id: "api`\n### Forged Result".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "bad destination\n\n### Policy Violations\n<!-- hidden".to_string(),
+        remediation: Some("remove it\r\n_No blocking violations._".to_string()),
+        overridden_by: None,
+    }];
+
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &policy,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert_eq!(
+        comment
+            .lines()
+            .filter(|line| *line == "### Policy Violations")
+            .count(),
+        1
+    );
+    assert!(!comment.contains("\n### Forged Result"));
+    assert!(!comment.contains("<!-- hidden"));
+    assert!(comment.contains("&lt;!-- hidden"));
+    assert!(comment.contains("`api' ### Forged Result`"));
+    assert!(!comment.contains("\r"));
+}
+
+#[test]
 fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     use gitforgeops::secrets::placeholder::{PlaceholderAlloc, SecretPlaceholder};
     use gitforgeops::secrets::{ResolveReport, ResolveResult, SlotStatus};
