@@ -10,6 +10,77 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  authorize-release:
+    name: Require a checked, merged pull request
+    if: github.event.repository.fork == false || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+    steps:
+      - name: Verify the published commit passed every required check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          pulls_file=$(mktemp)
+          checks_file=$(mktemp)
+          trap 'rm -f "$pulls_file" "$checks_file"' EXIT
+
+          gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
+            --paginate --slurp > "$pulls_file"
+          pr=$(jq -er --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" '
+            if type != "array" or any(.[]; type != "array") then
+              error("invalid commit-to-PR response")
+            else
+              ([
+                .[][]
+                | select(
+                    .state == "closed" and
+                    .base.ref == $branch and
+                    (.merged_at | type) == "string" and
+                    (.number | type) == "number"
+                  )
+              ] | unique_by(.number)) as $candidates
+              | ([$candidates[] | select(.merge_commit_sha == $sha)]) as $exact
+              | (if ($exact | length) > 0 then $exact else $candidates end)
+              | if length == 1 then .[0].number
+                else error("release commit must map to exactly one merged PR")
+                end
+            end
+          ' "$pulls_file")
+
+          status=0
+          gh pr checks "$pr" --repo "$REPO" --required \
+            --json bucket,name,workflow > "$checks_file" || status=$?
+          [ "$status" -eq 0 ] || {
+            echo "::error::Required checks for merged PR #${pr} are not all passing."
+            cat "$checks_file"
+            exit 1
+          }
+
+          jq -e --argjson required '[
+            "Rust CI / check",
+            "Security / cargo-audit",
+            "Security / supply-chain-policy",
+            "GitForgeOps State Guard / reject-state-edits",
+            "GitForgeOps PR Static Validation / required-static-validation"
+          ]' '
+            map({
+              context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
+              bucket
+            }) as $checks
+            | ($required | all(. as $wanted; any($checks[]; .context == $wanted and .bucket == "pass")))
+          ' "$checks_file" >/dev/null || {
+            echo "::error::The merged PR is missing one or more successful launch-required checks."
+            cat "$checks_file"
+            exit 1
+          }
+
   docker:
     name: Build and push Docker image
     # Only run on the upstream repo by default. Forks consume the
@@ -18,6 +89,7 @@ jobs:
     # variable `GITFORGEOPS_RELEASE_ENABLED=true` and pointing
     # `DOCKERHUB_IMAGE` at a namespace it can push to (GHCR always
     # derives from `github.repository`, so no override needed there).
+    needs: authorize-release
     if: github.event.repository.fork == false || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -29,6 +101,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Ensure release tag points to main
         if: startsWith(github.ref, 'refs/tags/v')
