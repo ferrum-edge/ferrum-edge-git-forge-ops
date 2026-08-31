@@ -49,9 +49,11 @@ Non-negotiables:
 - The codex binary is resolved from `CODEX_BIN`, then `/opt/homebrew/bin/codex` /
   `/usr/local/bin/codex` / `~/.local/bin/codex`, then `PATH`. Any candidate under
   `com.conductor.app` is refused — Conductor's bundle lags the standalone release.
-- The launcher runs `codex exec --model gpt-5.6-sol --config model_reasoning_effort="<effort>"
-  --config service_tier="<default|priority>" --sandbox danger-full-access --cd <worktree> -`.
-  Worktree isolation prevents git collisions; it is not a host sandbox.
+- The launcher clears inherited `CODEX_HOME` and OpenAI endpoint/auth overrides, then runs
+  `codex exec --model gpt-5.6-sol --ignore-user-config --ignore-rules --config
+  model_reasoning_effort="<effort>" --config service_tier="<default|priority>" --sandbox
+  danger-full-access --cd <worktree> -`. Worktree isolation prevents git collisions; it is not a
+  host sandbox.
 - Run each dispatch as a **background task** (`run_in_background`); prefer one task
   per agent (separate completion notifications) over one wrapper with `&`.
 - **Liveness ground truth: `pgrep -x codex | wc -l`** — never trust stale output-file

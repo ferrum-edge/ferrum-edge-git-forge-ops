@@ -129,12 +129,11 @@ fi
 printf '[opus-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s\n' \
   "$model" "$effort" "$fast" "$physical_worktree" "$claude_bin" >&2
 
-"$claude_bin" -p \
+run_dispatch_child "$prompt_file" "$claude_bin" -p \
   --model "$model" \
   --effort "$effort" \
   --setting-sources '' \
   --settings "$fast_settings" \
   --permission-mode bypassPermissions \
   --output-format text \
-  --verbose \
-  < "$prompt_file"
+  --verbose

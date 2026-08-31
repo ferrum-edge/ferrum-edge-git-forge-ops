@@ -34,6 +34,7 @@ def valid_launcher(name: str) -> str:
         "#!/usr/bin/env bash",
         'require_linked_worktree "$physical_root"',
         'acquire_worktree_dispatch_lock "$physical_root"',
+        check_agent_setup.RUN_DISPATCH_CALL,
     ]
     if name in check_agent_setup.CLAUDE_LAUNCHER_FLOOR:
         lines.append("resolve_agent_bin claude")
@@ -76,8 +77,9 @@ def write_valid_setup(
     shared.write_text(
         "require_linked_worktree() { :; }\n"
         "acquire_worktree_dispatch_lock() { :; }\n"
-        "isolate_codex_provider() { :; }\n"
-        "isolate_opencode_provider() { :; }\n"
+        "run_dispatch_child() { :; }\n"
+        "isolate_codex_provider() { unset CODEX_HOME; }\n"
+        "isolate_opencode_provider() { unset OPENCODE_API_KEY; unset OPENCODE_AUTH_CONTENT; }\n"
         "isolate_claude_provider() { :; }\n"
         "isolate_cursor_provider() { :; }\n"
         "prepare_cursor_control_workspace() { :; }\n",
@@ -121,22 +123,16 @@ def write_valid_setup(
         "ref: ${{ github.event.repository.default_branch }}\n"
         "validator=.agent-setup-base/.github/scripts/check_agent_setup.py\n"
         '[[ -f "$validator" ]]\n'
-        'python3 "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"\n',
+        'python3 "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"\n'
+        "group: agent-setup-policy-${{ github.event.pull_request.number }}\n"
+        "cancel-in-progress: true\n",
         encoding="utf-8",
     )
     codeowners = root / ".github" / "CODEOWNERS"
     codeowners.write_text(
         "\n".join(
             f"{path} {check_agent_setup.CODEOWNER}"
-            for path in (
-                "/.github/CODEOWNERS",
-                "/.github/workflows/agent-setup-ci.yml",
-                "/.github/workflows/agent-setup-policy.yml",
-                "/.github/scripts/check_agent_setup.py",
-                "/.github/scripts/tests/test_agent_setup.py",
-                "/.agents/skills/",
-                "/.claude/",
-            )
+            for path in check_agent_setup.CODEOWNED_PATHS
         )
         + "\n",
         encoding="utf-8",
@@ -433,6 +429,20 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("unittest discover", joined)
         self.assertIn("shellcheck --external-sources", joined)
 
+    def test_codeowners_rejects_later_overriding_patterns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            codeowners = root / ".github/CODEOWNERS"
+            codeowners.write_text(
+                codeowners.read_text(encoding="utf-8") + "/.github/** @attacker\n",
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(
+            any("must be the final rules" in violation for violation in violations)
+        )
+
     def test_workflow_requires_policy_file_and_rejects_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -644,6 +654,121 @@ class AgentSetupTests(unittest.TestCase):
                 process.communicate(timeout=5)
 
     @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_pid_only_termination_reaches_worker_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            root = temp / "repo"
+            linked = temp / "linked"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Test",
+                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                    "GIT_COMMITTER_NAME": "Test",
+                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+                },
+                stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
+                check=True,
+            )
+            helper = str(
+                check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
+            )
+            worker = temp / "worker.sh"
+            marker = temp / "terminated"
+            worker.write_text(
+                "#!/usr/bin/env bash\n"
+                "trap 'printf terminated > \"$FAKE_MARKER\"; exit 0' TERM\n"
+                "printf 'worker-ready\\n'\n"
+                "while :; do sleep 1; done\n",
+                encoding="utf-8",
+            )
+            worker.chmod(0o755)
+            prompt = temp / "prompt.md"
+            prompt.write_text("work\n", encoding="utf-8")
+            command = (
+                'source "$1"; acquire_worktree_dispatch_lock "$2"; '
+                'run_dispatch_child "$3" "$4"'
+            )
+            launcher = subprocess.Popen(
+                [
+                    "bash",
+                    "-c",
+                    command,
+                    "bash",
+                    helper,
+                    str(linked),
+                    str(prompt),
+                    str(worker),
+                ],
+                cwd=temp,
+                env={**os.environ, "FAKE_MARKER": str(marker)},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            self.assertEqual(launcher.stdout.readline(), "worker-ready\n")
+            os.kill(launcher.pid, signal.SIGTERM)
+            stdout, stderr = launcher.communicate(timeout=5)
+            self.assertEqual(launcher.returncode, 143, stdout + stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "terminated")
+
+            reacquire = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; acquire_worktree_dispatch_lock "$2"',
+                    "bash",
+                    helper,
+                    str(linked),
+                ],
+                cwd=temp,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(reacquire.returncode, 0, reacquire.stderr)
+
+            git_dir = Path(
+                subprocess.check_output(
+                    ["git", "-C", str(linked), "rev-parse", "--git-dir"],
+                    text=True,
+                ).strip()
+            )
+            if not git_dir.is_absolute():
+                git_dir = linked / git_dir
+            owner = Path(f"{git_dir / 'gitforgeops-agent-dispatch.lock'}.owner")
+            self.assertFalse(owner.exists(), "lock owner sidecar must be cleaned")
+
+    def test_dispatch_child_preserves_worker_exit_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = Path(directory) / "prompt.md"
+            prompt.write_text("work\n", encoding="utf-8")
+            helper = str(
+                check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; run_dispatch_child "$2" bash -c "exit 7"',
+                    "bash",
+                    helper,
+                    str(prompt),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 7, result.stderr)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
     def test_cursor_launcher_uses_clean_control_workspace_and_scrubs_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
@@ -669,6 +794,8 @@ class AgentSetupTests(unittest.TestCase):
             fake_cursor = temp / "cursor-agent"
             fake_cursor.write_text(
                 "#!/usr/bin/env bash\n"
+                "prompt=$(cat)\n"
+                "if { : >&9; } 2>/dev/null; then fd9=open; else fd9=closed; fi\n"
                 "{\n"
                 "  printf 'cwd=%s\\n' \"$PWD\"\n"
                 "  printf 'arg=%s\\n' \"$@\"\n"
@@ -676,6 +803,8 @@ class AgentSetupTests(unittest.TestCase):
                 "  printf 'endpoint=%s\\n' \"${CURSOR_API_ENDPOINT-unset}\"\n"
                 "  printf 'config=%s\\n' \"${CURSOR_CONFIG_DIR-unset}\"\n"
                 "  printf 'credential-store=%s\\n' \"${AGENT_CLI_CREDENTIAL_STORE-unset}\"\n"
+                "  printf 'fd9=%s\\n' \"$fd9\"\n"
+                "  printf 'prompt=%s\\n' \"$prompt\"\n"
                 "} > \"$FAKE_CAPTURE\"\n",
                 encoding="utf-8",
             )
@@ -725,12 +854,16 @@ class AgentSetupTests(unittest.TestCase):
             self.assertTrue(cwd.startswith(str(temp_root)))
             self.assertFalse(Path(cwd).exists(), "control workspace must be removed")
             self.assertIn("arg=--sandbox", captured)
-            self.assertIn("arg=disabled", captured)
+            self.assertIn("arg=enabled", captured)
+            self.assertIn("arg=--add-dir", captured)
+            self.assertIn(f"arg={linked.resolve()}", captured)
             self.assertIn(f"arg={cwd}", captured)
             self.assertIn("api-key=present", captured)
             self.assertIn("endpoint=unset", captured)
             self.assertIn("config=unset", captured)
             self.assertIn("credential-store=memory", captured)
+            self.assertIn("fd9=closed", captured)
+            self.assertIn("prompt=Review only.", captured)
             self.assertNotIn("not-printed", captured)
 
     def test_claude_provider_scrubber_covers_future_and_foundry_overrides(self):
@@ -758,6 +891,27 @@ class AgentSetupTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_codex_and_opencode_provider_scrubbers_clear_auth_overrides(self):
+        helper = str(
+            check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
+        )
+        command = (
+            'source "$1"; '
+            "export CODEX_HOME=/tmp/attacker OPENAI_API_KEY=attacker; "
+            "isolate_codex_provider; "
+            '[[ -z "${CODEX_HOME-}" && -z "${OPENAI_API_KEY-}" ]] || exit 3; '
+            "export OPENCODE_API_KEY=attacker OPENCODE_AUTH_CONTENT=attacker; "
+            "isolate_opencode_provider; "
+            '[[ -z "${OPENCODE_API_KEY-}" && -z "${OPENCODE_AUTH_CONTENT-}" ]]'
+        )
+        result = subprocess.run(
+            ["bash", "-c", command, "bash", helper],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_expands_every_braced_rule_path(self):
         self.assertEqual(
             check_agent_setup.expand_braces("tests/{unit,integration}/{a,b}.rs"),
@@ -768,6 +922,17 @@ class AgentSetupTests(unittest.TestCase):
                 "tests/integration/b.rs",
             ],
         )
+
+    def test_rejects_unbounded_rule_path_brace_expansion(self):
+        pattern = "rules/" + "{a,b}" * 7 + ".md"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rule = root / ".claude/rules/explosive.md"
+            rule.parent.mkdir(parents=True)
+            rule.write_text("rule\n", encoding="utf-8")
+            violations = check_agent_setup.validate_rule_paths(root, rule, [pattern])
+        self.assertEqual(len(violations), 1)
+        self.assertIn("brace expansion exceeds 64 paths", violations[0])
 
 
 if __name__ == "__main__":

@@ -164,9 +164,8 @@ printf '[qwen-agents] dispatch model=%s worktree=%s bin=%s\n' \
 
 # `run` reads the prompt from stdin; --auto bypasses permission prompts (worktree
 # isolation is the safety boundary); --agent build selects the write-enabled agent.
-"$opencode_bin" run \
+run_dispatch_child "$prompt_file" "$opencode_bin" run \
   --pure \
   --model "$model" \
   --agent build \
-  --auto \
-  < "$prompt_file"
+  --auto

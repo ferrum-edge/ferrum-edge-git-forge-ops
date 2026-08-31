@@ -51,9 +51,10 @@ Non-negotiables:
   the key or put it in prompts, files, arguments, or logs, and do not ask the worker to log in
   interactively.
 - The launcher clears every other inherited `CURSOR_*` override and runs Cursor against a private
-  empty control workspace with `--sandbox disabled`; the prompt must name the locked target
-  worktree, and the worker changes to it before inspecting or editing. This keeps candidate
-  `.cursor` config, `AGENTS.md`, and `CLAUDE.md` out of Cursor's automatic project-rule channel.
+  empty control workspace with the sandbox enabled and only the locked target added as writable;
+  the prompt names that worktree, and the worker changes to it before inspecting or editing. This
+  keeps candidate `.cursor` config, `AGENTS.md`, and `CLAUDE.md` out of Cursor's automatic
+  project-rule channel without granting host-wide writes.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.
 

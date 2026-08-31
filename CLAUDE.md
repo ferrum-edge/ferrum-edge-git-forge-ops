@@ -300,6 +300,12 @@ See `.env.example` for the full list. Essentials:
 
 ## Development Guidelines
 
+Repository-local agent skills, Claude rules, and their dispatchers are guarded by
+`agent-setup-policy.yml`. The workflow runs trusted default-branch validation over candidate
+content on every PR, has only read access, and cancels stale runs per PR. Requiring
+`Agent Setup Policy / validate-trusted-policy` and code-owner review is what prevents a candidate
+from weakening its own validator; forks do not inherit those repository settings automatically.
+
 - **No `.unwrap()` in production code paths** — use `?`, `.unwrap_or()`, or explicit match.
 - **No `.expect()` except where failure is a genuine bug** (e.g. `serde_json::to_string` on a static `Value`).
 - Return `crate::error::Error` variants via `?`; prefer descriptive variants over `Config(String)` when the category is clear.

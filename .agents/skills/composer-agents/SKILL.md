@@ -88,9 +88,9 @@ or available credits. Omit it for every other run, including continuations unles
 the same explicit request. Record the selected mode beside each worker.
 
 The launcher resolves the operator's own `cursor-agent`, verifies and locks the worktree root, and
-runs `cursor-agent --print --force --trust --sandbox disabled --model <sku> --output-format text`
-against a private empty control workspace with the prompt file on stdin. It pins `composer-2.5` by
-default and selects
+runs `cursor-agent --print --force --trust --sandbox enabled --model <sku> --output-format text`
+against a private empty control workspace, adding only the locked worktree as a writable directory,
+with the prompt file on stdin. It pins `composer-2.5` by default and selects
 `composer-2.5-fast` only with `--fast`; Fast runs consume fast credits. Delete the temporary prompt
 after the worker exits.
 

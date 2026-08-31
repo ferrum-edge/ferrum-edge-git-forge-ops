@@ -98,11 +98,10 @@ isolate_claude_provider
 printf '[fable-agents] dispatch model=claude-fable-5 effort=%s worktree=%s bin=%s\n' \
   "$effort" "$physical_worktree" "$claude_bin" >&2
 
-"$claude_bin" -p \
+run_dispatch_child "$prompt_file" "$claude_bin" -p \
   --model claude-fable-5 \
   --effort "$effort" \
   --setting-sources '' \
   --permission-mode bypassPermissions \
   --output-format text \
-  --verbose \
-  < "$prompt_file"
+  --verbose

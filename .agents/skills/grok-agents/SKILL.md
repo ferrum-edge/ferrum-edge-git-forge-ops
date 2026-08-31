@@ -90,9 +90,9 @@ Omit it for every other run, including continuations unless they remain within t
 request. Record the selected mode beside each worker.
 
 The launcher resolves the operator's own `cursor-agent`, verifies and locks the worktree root, and
-runs `cursor-agent --print --force --trust --sandbox disabled --model <sku> --output-format text`
-against a private empty control workspace with the prompt file on stdin. It pins the non-Fast SKU
-by default and appends `-fast` only with
+runs `cursor-agent --print --force --trust --sandbox enabled --model <sku> --output-format text`
+against a private empty control workspace, adding only the locked worktree as a writable directory,
+with the prompt file on stdin. It pins the non-Fast SKU by default and appends `-fast` only with
 `--fast`; Fast runs consume fast credits. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or

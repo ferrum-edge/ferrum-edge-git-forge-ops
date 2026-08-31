@@ -153,15 +153,15 @@ printf '[grok-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s aut
 # --force:  no per-command approval prompts; worktree isolation is the boundary.
 # --trust:  accept the freshly created worktree as a trusted directory, which the
 #           trust gate otherwise blocks on in a non-TTY.
-# --sandbox disabled: the empty control workspace prevents automatic project
-#           rule/config loading; the worker reaches the already-locked target
-#           worktree by its exact absolute path from the dispatch prompt.
-"$cursor_bin" \
+# --sandbox enabled + --add-dir: the empty control workspace prevents automatic
+#           project-rule loading while filesystem writes stay confined to the
+#           explicitly locked target worktree.
+run_dispatch_child "$prompt_file" "$cursor_bin" \
   --print \
   --force \
   --trust \
-  --sandbox disabled \
+  --sandbox enabled \
   --model "$model" \
   --output-format text \
   --workspace "$cursor_control_workspace" \
-  < "$prompt_file"
+  --add-dir "$physical_worktree"

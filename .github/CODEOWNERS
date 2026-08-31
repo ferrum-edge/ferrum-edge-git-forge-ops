@@ -7,3 +7,7 @@
 /.github/scripts/tests/test_agent_setup.py @jeremyjpj0916
 /.agents/skills/ @jeremyjpj0916
 /.claude/ @jeremyjpj0916
+/CLAUDE.md @jeremyjpj0916
+/AGENTS.md @jeremyjpj0916
+/.github/workflows/ @jeremyjpj0916
+/.github/scripts/ @jeremyjpj0916
