@@ -64,11 +64,11 @@ jobs:
           }
 
           jq -e --argjson required '[
-            "Rust CI / check",
-            "Security / cargo-audit",
-            "Security / supply-chain-policy",
-            "GitForgeOps State Guard / reject-state-edits",
-            "GitForgeOps PR Static Validation / required-static-validation"
+            "Rust CI / rust-ci-check",
+            "Security / security-cargo-audit",
+            "Security / security-supply-chain-policy",
+            "GitForgeOps State Guard / state-guard-reject-state-edits",
+            "GitForgeOps PR Static Validation / gitforgeops-required-static-validation"
           ]' '
             map({
               context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),

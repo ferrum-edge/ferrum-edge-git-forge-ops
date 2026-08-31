@@ -28,9 +28,9 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
    gh label create gitforgeops/state-override --color B60205 --description "Allow this PR to modify the CI-owned .state/ ledger"
    ```
 
-   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each resolves the effective label event and requires the actor's current permission to be `write`, `maintain`, or `admin`. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
+   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each checks the actor's current permission is `write`, `maintain`, or `admin`. State authorization succeeds only on the exact override-label webhook for the current head; every push or other PR transition requires a qualified maintainer to remove and reapply it. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
 6. **Configure the mandatory GitHub launch controls.** Create the contents-only state-writer App, require the state guard and CI checks in an active `main` ruleset, protect release tags and every deployment environment, restrict Actions, and configure the scheduled settings audit. Follow [GitHub launch controls](docs/github-launch-controls.md) before adding production credentials. Forks do not inherit any of these settings.
-7. **Pin the validator release identity.** Select an allowed `FERRUM_EDGE_VERSION`. Every allowed release and digest lives in reviewed `.github/ferrum-edge-checksums.txt`; the checked-in fallback is the content-pinned 2026-08-31 `latest` snapshot. A moved tag or an unreviewed version fails before execution.
+7. **Pin the validator release identity.** Select an allowed `FERRUM_EDGE_VERSION`. Every allowed GitHub release ID, binary asset ID, checksum-asset ID, and digest lives in reviewed `.github/ferrum-edge-checksums.txt`; the checked-in fallback is the immutable `release-379454492` snapshot. A moved tag, replaced asset, or unreviewed identity fails before execution.
 8. Open a PR. The PR-built binary runs static validation without an environment or gateway secrets. A default-branch `workflow_run` then sanitizes only declarative YAML, builds and hashes the protected-branch binary once, waits for environment approval, and posts the live policy/drift/security review for same-repository PRs. Each live job is intersected with the environment's protected namespace scope and fails if comparison is unavailable. Fork PRs remain static-only.
 9. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering) and uses the short-lived state-writer App token for its protected ledger commit.
 
@@ -183,7 +183,7 @@ Both of those make sense only because the ledger is **CI-authored**. `apply-on-m
 
 That trust is enforced at the boundary, not inside the binary:
 
-- **`state-guard.yml` fails any PR that touches or renames a path from `.state/**`.** A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. Deliberate repairs need the exact `gitforgeops/state-override` label, applied after the current PR head; every later push invalidates the override until a qualified maintainer removes and reapplies it. The guard replays the paginated PR timeline, binds the latest effective label to the current head, queries that actor's current permission, rejects triage/read/deleted/unknown actors and API ambiguity, and records actor, permission, event ID, timestamp, and authorized head in the job summary. Push, label, and unlabel events rerun the check under per-PR concurrency so stale or removed authorization cannot leave an older successful run authoritative.
+- **`state-guard.yml` fails any PR that touches or renames a path from `.state/**`.** A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. GitHub caps changed-file enumeration at 3,000 entries, so observing 3,000 files is conservatively treated as incomplete rather than becoming a silent truncation. Deliberate repairs and intentionally reviewed oversized PRs need the exact `gitforgeops/state-override` label. Authorization succeeds only while processing that exact `labeled` webhook for the current head; every later push, retarget, reopen, or other configured PR event fails until a qualified maintainer removes and reapplies it. Re-running the same authorized label event remains bound to the same event actor and head. The guard queries that event actor's current permission, rejects triage/read/deleted/unknown actors and API ambiguity, and records actor, permission, authorized head, run ID, and attempt in the job summary. Push, label, and unlabel events rerun the check under per-PR concurrency so stale or removed authorization cannot leave an older successful run authoritative.
 - **`.state/*.json` is tracked in git; locks and temp files are not.** If you fork this repo, keep the `.gitignore` entries as shipped. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
 - **Apply runs post-merge only**, so a poisoned ledger has to survive review and land on `main` before it can act.
 - **The guard must be a required status check before launch.** The state-writer GitHub App is the sole ruleset bypass and receives only short-lived `Contents: write` installation tokens. See [GitHub launch controls](docs/github-launch-controls.md).
@@ -709,7 +709,7 @@ Minted tokens also carry an `ns` claim listing the namespaces the run actually t
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML. Values are trimmed/case-folded; every other present value fails the workflow preflight before credentials or binaries are loaded. |
-| `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for the validator. It must have an exact reviewed digest in `.github/ferrum-edge-checksums.txt`. |
+| `FERRUM_EDGE_VERSION` | `release-379454492` | Immutable Ferrum Edge GitHub release identity for the validator. It must have exact reviewed asset IDs and a digest in `.github/ferrum-edge-checksums.txt`. |
 | `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
 | `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Where the `release` workflow pushes on Docker Hub. Only matters if `GITFORGEOPS_RELEASE_ENABLED=true`. GHCR path is auto-derived from the repo. |
 
@@ -930,14 +930,16 @@ If you'd rather not depend on the upstream image (air-gapped env, vendored build
 
 ### Version pinning
 
-Set `FERRUM_EDGE_VERSION` to the release tag matching the gateway. That tag
-must appear beside the SHA-256 of `ferrum-edge-linux-x86_64` in
+Set `FERRUM_EDGE_VERSION` to the `release-<GitHub release ID>` identity matching
+the gateway. That identity must appear beside the immutable binary and
+checksum-asset IDs plus the SHA-256 of `ferrum-edge-linux-x86_64` in
 `.github/ferrum-edge-checksums.txt`; adding or changing a pin therefore goes
-through normal CODEOWNER review. The installer downloads the binary and its
-publisher `.sha256` asset, verifies they agree, then verifies the computed
-bytes against the checked-in digest before making the file executable. If
-unset, the fallback selects the content-pinned 2026-08-31 `latest` snapshot;
-if that tag moves, CI stops until the lock file is deliberately updated.
+through normal CODEOWNER review. The installer downloads both assets by ID,
+verifies the publisher checksum, then verifies the computed bytes against the
+checked-in digest before making the file executable. If unset, the fallback
+selects the immutable `release-379454492` snapshot; deleting and re-uploading
+either release asset produces a new ID and fails closed until the lock file is
+deliberately updated.
 
 ## License
 

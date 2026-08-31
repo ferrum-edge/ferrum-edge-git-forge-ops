@@ -102,7 +102,7 @@ jobs:
       - name: Download ferrum-edge binary
         if: steps.deployment-mode.outputs.mode == 'api'
         env:
-          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'latest' }}
+          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'release-379454492' }}
         run: |
           bash .github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
 

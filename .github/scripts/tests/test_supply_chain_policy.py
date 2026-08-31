@@ -1,10 +1,13 @@
 import importlib.util
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
+ROOT = Path(__file__).parents[3]
 SCRIPT = Path(__file__).parents[1] / "check_supply_chain.py"
 SPEC = importlib.util.spec_from_file_location("check_supply_chain", SCRIPT)
 check_supply_chain = importlib.util.module_from_spec(SPEC)
@@ -13,6 +16,43 @@ SPEC.loader.exec_module(check_supply_chain)
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
+    def test_immutable_bootstrap_checker_accepts_the_current_policy(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(
+            r"name: Check out immutable policy bootstrap.*?ref: ([0-9a-f]{40})",
+            workflow,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match, "security workflow must pin a bootstrap commit")
+        bootstrap_sha = match.group(1)
+        shown = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{bootstrap_sha}:.github/scripts/check_supply_chain.py",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if shown.returncode != 0:
+            self.skipTest("immutable bootstrap commit is unavailable in this checkout")
+
+        with tempfile.TemporaryDirectory() as directory:
+            checker = Path(directory) / "check_supply_chain.py"
+            checker.write_text(shown.stdout, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(checker), "--root", str(ROOT)],
+                cwd=ROOT,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_root_override_checks_the_selected_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -29,6 +69,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "if: github.event_name == 'pull_request'",
                 "ref: ${{ github.event.repository.default_branch }}",
                 "path: trusted-supply-chain",
+                "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
+                "Candidate must retain the regular-file supply-chain checker.",
                 "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
                 "module.ROOT = candidate",
                 'module.WORKFLOWS = candidate / ".github" / "workflows"',

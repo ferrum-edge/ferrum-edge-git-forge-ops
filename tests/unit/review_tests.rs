@@ -4,6 +4,8 @@ use gitforgeops::diff::{
 };
 use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
+use gitforgeops::review::comment_status_is_retryable;
+use gitforgeops::review::enforce_comment_delivery;
 use gitforgeops::review::live_comparison_precondition_error;
 use gitforgeops::review::pr_comment::{
     build_review_comment, build_review_comment_v2, render_spec_owned,
@@ -100,6 +102,25 @@ fn live_review_rejects_a_vacuous_zero_namespace_comparison() {
     let error = live_comparison_precondition_error(&[]).expect("empty scope must fail closed");
     assert!(error.contains("no trusted namespaces"));
     assert!(live_comparison_precondition_error(&["default".to_string()]).is_none());
+}
+
+#[test]
+fn trusted_live_review_requires_pr_comment_delivery() {
+    let error = enforce_comment_delivery(true, Some("GitHub returned 403"))
+        .expect_err("trusted live review must fail when its comment is not delivered");
+    assert!(error.to_string().contains("could not post its result"));
+    assert!(enforce_comment_delivery(false, Some("GitHub returned 403")).is_ok());
+    assert!(enforce_comment_delivery(true, None).is_ok());
+}
+
+#[test]
+fn github_comment_retries_only_explicit_transient_responses() {
+    for status in [408, 429, 500, 502, 503, 504] {
+        assert!(comment_status_is_retryable(status), "status {status}");
+    }
+    for status in [400, 401, 403, 404, 409, 422, 501] {
+        assert!(!comment_status_is_retryable(status), "status {status}");
+    }
 }
 
 #[test]

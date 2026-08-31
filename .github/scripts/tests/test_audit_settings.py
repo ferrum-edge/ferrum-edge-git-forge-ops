@@ -13,11 +13,11 @@ sys.modules[SPEC.name] = audit_settings
 SPEC.loader.exec_module(audit_settings)
 
 REQUIRED_CHECKS = {
-    "Rust CI / check",
-    "Security / cargo-audit",
-    "Security / supply-chain-policy",
-    "GitForgeOps State Guard / reject-state-edits",
-    "GitForgeOps PR Static Validation / required-static-validation",
+    "rust-ci-check",
+    "security-cargo-audit",
+    "security-supply-chain-policy",
+    "state-guard-reject-state-edits",
+    "gitforgeops-required-static-validation",
 }
 
 

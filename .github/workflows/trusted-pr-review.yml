@@ -111,6 +111,8 @@ jobs:
             exit 1
           }
           relevant=$(jq -r '.matches' <<< "$classification")
+          umask 077
+          jq -c '.matched_paths' <<< "$classification" > "$RUNNER_TEMP/trusted-changed-paths.json"
           same_repo=false
           [ "$EVENT_HEAD_REPO" = "$REPO" ] && same_repo=true
           privileged=false
@@ -199,12 +201,16 @@ jobs:
 
           # Privileged review never consumes PR-authored environment or policy
           # configuration. It binds only protected-branch environments and
-          # protected-branch resource namespace directories. FERRUM_NAMESPACE
-          # later narrows both desired loading and the JWT `ns` claim, so an
-          # untrusted YAML namespace override cannot turn live review into a
-          # cross-namespace read primitive. New namespaces receive static
-          # validation only until their directory is trusted on main.
-          targets=$(python3 trusted/.github/scripts/pr_input.py targets trusted "$scopes")
+          # protected-branch resource namespace directories, intersected with
+          # the current and previous resource/overlay paths from the stable PR
+          # file snapshot. FERRUM_NAMESPACE later narrows both desired loading
+          # and the JWT `ns` claim, so an untrusted YAML namespace override
+          # cannot turn live review into a cross-namespace read primitive. New
+          # namespaces receive static validation only until their directory is
+          # trusted on main. Protected config-only changes remain static-only
+          # because privileged review replaces candidate `.gitforgeops` files.
+          targets=$(python3 trusted/.github/scripts/pr_input.py targets \
+            trusted "$scopes" "$RUNNER_TEMP/trusted-changed-paths.json")
           echo "Trusted source SHA: ${{ steps.metadata.outputs.trusted_sha }}"
           echo "Live-review targets: $targets"
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
@@ -300,8 +306,7 @@ jobs:
             echo "Trusted .gitforgeops directory must not be a symlink." >&2
             exit 1
           }
-          mkdir -p review-input/.gitforgeops
-          chmod 0700 review-input/.gitforgeops
+          install -d -m 0700 review-input/.gitforgeops
           for name in config.yaml policies.yaml; do
             source="trusted/.gitforgeops/$name"
             [ -e "$source" ] || continue
@@ -328,14 +333,14 @@ jobs:
             exit 1
           fi
           if [ -f "$state" ]; then
-            mkdir -p review-input/.state
+            install -d -m 0700 review-input/.state
             install -m 0600 "$state" "review-input/.state/${INPUT_ENVIRONMENT}.json"
           fi
 
       - name: Download verified ferrum-edge binary
         id: validator
         env:
-          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'latest' }}
+          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'release-379454492' }}
         run: |
           bash trusted/.github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
 

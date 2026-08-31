@@ -30,7 +30,7 @@ permissions:
   contents: read
 
 jobs:
-  supply-chain-policy:
+  security-supply-chain-policy:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -47,16 +47,35 @@ jobs:
           path: trusted-supply-chain
           persist-credentials: false
 
+      - name: Check out immutable policy bootstrap
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # PR #87 adds the checker itself, so its protected base cannot supply
+          # it. This already-reviewed commit is a one-time immutable fallback;
+          # after merge the default-branch copy always wins.
+          ref: f15d4b089789e73e4db337b29c89603ac23371c6
+          path: bootstrap-supply-chain
+          persist-credentials: false
+
       - name: Check immutable workflow and container references
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = pull_request ]; then
+            CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py
+            if [ ! -f "$CANDIDATE_CHECKER" ] || [ -L "$CANDIDATE_CHECKER" ]; then
+              echo "Candidate must retain the regular-file supply-chain checker." >&2
+              exit 1
+            fi
             # Execute policy code from the protected default branch while
             # pointing it at the candidate tree. The global assignments keep
             # the first bootstrap compatible with the pre-`--root` checker.
             CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py
+            if [ ! -f "$CHECKER" ]; then
+              CHECKER=bootstrap-supply-chain/.github/scripts/check_supply_chain.py
+            fi
             [ -f "$CHECKER" ] || { echo "Trusted supply-chain checker is unavailable." >&2; exit 1; }
             python3 - "$CHECKER" "$GITHUB_WORKSPACE" <<'PY'
           import importlib.util
@@ -90,7 +109,7 @@ jobs:
       - name: Test privileged-input boundary
         run: python3 -m unittest discover -s .github/scripts/tests -v
 
-  cargo-audit:
+  security-cargo-audit:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
