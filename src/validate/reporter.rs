@@ -31,6 +31,62 @@ pub fn format_result(result: &ValidationResult, format: OutputFormat) -> String 
     }
 }
 
+/// Format a gateway result together with an optional mesh result.
+///
+/// With `mesh = None` the output is byte-identical to
+/// [`format_result`] — a repo that declares no mesh config sees exactly what
+/// it saw before mesh support existed. With a mesh result present, both are
+/// reported and the caller's success decision is the conjunction: a mesh
+/// document that fails `ferrum-edge validate -m mesh` is as fatal as a
+/// gateway document that fails `-m file`, because both are published
+/// artifacts a node will refuse to load.
+pub fn format_results(
+    gateway: &ValidationResult,
+    mesh: Option<&ValidationResult>,
+    format: OutputFormat,
+) -> String {
+    let Some(mesh) = mesh else {
+        return format_result(gateway, format);
+    };
+
+    match format {
+        OutputFormat::Text => {
+            let mut output = String::from("Gateway document:\n");
+            output.push_str(&indent_block(&format_text(gateway)));
+            output.push_str("Mesh document:\n");
+            output.push_str(&indent_block(&format_text(mesh)));
+            output
+        }
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "success": gateway.success && mesh.success,
+                "gateway": result_json(gateway),
+                "mesh": result_json(mesh),
+            });
+            serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+        }
+        OutputFormat::GithubAnnotations => {
+            let mut output = format_github_annotations(gateway);
+            output.push_str(&format_github_annotations(mesh));
+            output
+        }
+    }
+}
+
+fn indent_block(block: &str) -> String {
+    let mut output = String::with_capacity(block.len() + 8);
+    for line in block.lines() {
+        if line.is_empty() {
+            output.push('\n');
+        } else {
+            output.push_str("  ");
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
 fn format_text(result: &ValidationResult) -> String {
     let mut output = String::new();
 
@@ -57,16 +113,18 @@ fn format_text(result: &ValidationResult) -> String {
     output
 }
 
-fn format_json(result: &ValidationResult) -> String {
-    let json = serde_json::json!({
+fn result_json(result: &ValidationResult) -> serde_json::Value {
+    serde_json::json!({
         "success": result.success,
         "exit_code": result.exit_code,
         "stdout": result.stdout,
         "stderr": result.stderr,
-    });
+    })
+}
 
+fn format_json(result: &ValidationResult) -> String {
     // Safe: serde_json::to_string_pretty on a Value always succeeds
-    serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&result_json(result)).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn format_github_annotations(result: &ValidationResult) -> String {

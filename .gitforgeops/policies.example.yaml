@@ -4,6 +4,11 @@
 # `enabled: false`, so the policy framework is opt-in. When a rule fires at
 # `severity: error`, it blocks `gitforgeops apply` until the violation is
 # fixed or overridden.
+#
+# `plugin_name` values below are the gateway's real built-in names. There are
+# 82 of them and the gateway matches them exactly — `jwt`, `oauth2` and `oidc`
+# are not plugins, `jwt_auth`, `oauth2_introspection` and `oidc_relying_party`
+# are. Enable `plugin_name_is_known` to catch the difference in CI.
 
 version: 1
 
@@ -17,25 +22,33 @@ policies:
     read_timeout_ms:    { min: 1000, max: 60000 }
     write_timeout_ms:   { min: 1000, max: 60000 }
 
-  # Enforce TLS-only backends by default.
+  # Enforce TLS-only backends by default. The scheme set is now
+  # http | https | tcp | tcps | udp | dtls — `wss`/`grpcs` were folded into
+  # `https` when WebSocket and gRPC became per-request detections.
   backend_scheme:
     enabled: true
     severity: error
-    allowed_protocols: [https, wss, grpcs]
+    allowed_protocols: [https, tcps, dtls]
 
-  # Every proxy must have an auth plugin attached.
+  # Every proxy must have an auth plugin in its effective plugin list
+  # (global plugins included; disabled instances never count).
   require_auth_plugin:
     enabled: false
     severity: error
     # Plugin names that count as authentication. Matching is case-insensitive.
+    # Omit the key entirely to use all eleven built-in authenticators:
+    # spiffe_identity, mtls_auth, jwks_auth, oauth2_introspection,
+    # oidc_relying_party, jwt_auth, key_auth, ldap_auth, basic_auth,
+    # hmac_auth, soap_ws_security.
     auth_plugin_names:
-      - jwt
+      - jwt_auth
+      - jwks_auth
       - key_auth
       - basic_auth
-      - oauth2
-      - oidc
+      - oauth2_introspection
+      - oidc_relying_party
 
-  # Refuse `backend_tls_verify_server_cert: false`.
+  # Refuse `backend_tls_verify_server_cert: false` on proxies and upstreams.
   forbid_tls_verify_disabled:
     enabled: false
     severity: error
@@ -46,7 +59,7 @@ policies:
     enabled: false
     severity: error
     allowed_plugin_names:
-      - jwt
+      - jwt_auth
       - key_auth
       - rate_limiting
 
@@ -62,6 +75,64 @@ policies:
       - api.internal.example.com
       - "*.svc.cluster.local"
       - "*.corp.example.com"
+
+  # A `waf` plugin that is attached but not blocking. The built-in rule pack
+  # ships every rule at `monitor`, so `mode: enforce` on its own rejects
+  # nothing — this rule catches that, plus `mode: monitor`/`disabled` and
+  # `on_body_too_large: skip`.
+  # Suggested severity: error (a non-enforcing WAF reads as protection).
+  waf_enforcement:
+    enabled: false
+    severity: error
+    # Optional. The gateway accepts paranoia_level 1-4 and defaults to 1.
+    # min_paranoia_level: 2
+
+  # Proxies carrying AI traffic (any ai_* plugin, mcp_gateway or a2a_gateway)
+  # must also carry a content guardrail, and that guardrail must be enforcing
+  # rather than dry-run / warn-only.
+  # Suggested severity: error.
+  require_ai_guardrails:
+    enabled: false
+    severity: error
+    # Omit to accept the built-in guardrails (ai_prompt_shield,
+    # ai_semantic_firewall).
+    guardrail_plugin_names:
+      - ai_prompt_shield
+      - ai_semantic_firewall
+
+  # A rate limiter that declares no usable budget. Covers `rate_limiting`
+  # (missing/empty `limits`, no `scope: default` entry, an entry with no
+  # window+max_requests and no requests_per_*), `ai_rate_limiter` (missing
+  # `token_limit`), and `redis_failure_policy: local_fallback` on either.
+  #
+  # Also detects the removed top-level budget fields
+  # (requests_per_second/minute/hour, window_seconds, max_requests,
+  # consumer_limits): the gateway now rejects unknown top-level keys, so a
+  # config written against the old shape fails at apply.
+  # Suggested severity: error.
+  rate_limit_completeness:
+    enabled: false
+    severity: error
+
+  # `plugin_name` must be one the gateway will load. Retired names
+  # (oauth2_auth, semantic_ai_firewall) and the reserved mesh-injected
+  # `__mesh_bpf_metrics` are always reported at `error` — the gateway refuses
+  # to load a config that mentions them, so no severity setting makes them
+  # acceptable. The configured severity applies to merely unknown names.
+  # Suggested severity: warning (custom plugins are legitimate).
+  plugin_name_is_known:
+    enabled: false
+    severity: warning
+    # Custom plugins compiled into your gateway build.
+    allowed_extra_plugin_names: []
+
+  # `priority_override` must be within the gateway's accepted 0..=10000.
+  # gitforgeops models the field as a u16, so larger values round-trip locally
+  # and only fail at apply.
+  # Suggested severity: error.
+  priority_override_range:
+    enabled: false
+    severity: error
 
 # Policy override — a PR labelled with `require_label` bypasses errors when the
 # account that added the label has at least `required_permission` on the repo.

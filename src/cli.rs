@@ -52,8 +52,15 @@ pub enum Commands {
         auto_approve: bool,
         /// Allow apply even when the plan would delete more than
         /// `ownership.large_prune_threshold_percent` of managed resources.
+        /// Also acknowledges pruning from a stale (cached) gateway view.
         #[arg(long)]
         allow_large_prune: bool,
+        /// `full_replace` only: delete the namespace's API specs instead of
+        /// carrying them through the restore untouched. Destructive — API
+        /// specs are managed via the admin API and have no representation in
+        /// this repo, so without this flag `apply` preserves them.
+        #[arg(long)]
+        confirm_api_spec_deletion: bool,
     },
     Import {
         #[arg(long, conflicts_with = "from_file")]

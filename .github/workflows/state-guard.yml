@@ -1,0 +1,98 @@
+name: GitForgeOps State Guard
+
+# `.state/<env>.json` is the ownership ledger: in shared mode it is the sole
+# authority for which live gateway resources this repo may delete, and it also
+# widens the namespace set that gets reconciled. It is written by CI only —
+# apply-on-merge.yml and rotate.yml commit it back to main as gitforgeops[bot].
+#
+# A PR that hand-edits `.state/` is therefore a privilege escalation, not a
+# config change: forged entries name live resources as "previously managed"
+# and the next post-merge apply deletes them. This job is the fence. Keeping
+# the trust boundary here — rather than narrowing what the binary is willing
+# to read out of the state file — is what lets shared mode keep reconciling
+# namespaces the repo no longer declares, so orphaned resources still get
+# cleaned up (see README "State file trust model").
+#
+# Escape hatch for genuine repairs (restoring a corrupted ledger, seeding an
+# environment adopted from an existing gateway): label the PR
+# `gitforgeops/state-override`. Only users with write access can add labels,
+# and the label event is recorded in the PR timeline.
+
+on:
+  pull_request:
+    # `labeled`/`unlabeled` are not in the default activity type set
+    # (opened, synchronize, reopened). Without them, adding the override
+    # label does nothing until someone pushes another commit — the check
+    # stays red on a PR that has already been authorized, and the only way
+    # out is an empty commit. Re-evaluate on the label events themselves so
+    # the escape hatch takes effect when it is used, and so removing the
+    # label puts the fence straight back up.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # Deliberately NO `paths:` filter. This job is meant to be a required
+    # status check, and a path-filtered workflow never reports a status on
+    # PRs that don't match — GitHub then holds every such PR at "Expected —
+    # waiting for status to be reported" forever. Running always and deciding
+    # inside the job is what makes the check safe to require: it reports on
+    # every PR, and passes in three seconds when `.state/` is untouched.
+    branches: ['**']
+
+permissions:
+  contents: read
+  # Needed to list the PR's changed files.
+  pull-requests: read
+
+jobs:
+  reject-state-edits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect .state/ changes
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Read the file list from the API rather than checking out and
+          # diffing: no checkout means nothing from the PR's tree is executed
+          # or sourced, and the answer doesn't depend on merge-base subtleties.
+          files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --paginate --jq '.[].filename')
+          # `grep -c` exits 1 on no match, which `set -e` would treat as fatal.
+          count=$(printf '%s\n' "$files" | grep -c '^\.state/' || true)
+          count=${count:-0}
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "No .state/ changes in this PR."
+          else
+            echo "This PR changes ${count} file(s) under .state/:"
+            printf '%s\n' "$files" | grep '^\.state/' | sed 's/^/  /'
+          fi
+
+      - name: Reject PR-authored state changes
+        if: ${{ steps.detect.outputs.count != '0' && !contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
+        run: |
+          echo "::error::This PR modifies .state/, the CI-owned ownership ledger."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'MSG'
+          ## Blocked: PR modifies `.state/`
+
+          `.state/<env>.json` records which gateway resources this repo has
+          applied. In `shared` ownership mode it is the only thing standing
+          between a live resource and a delete, so a hand-edited state file can
+          cause the next post-merge apply to remove resources the repo never
+          managed.
+
+          It is maintained by CI: `apply-on-merge.yml` and `rotate.yml` commit
+          it as `gitforgeops[bot]` after a successful run. Drop the `.state/`
+          changes from this PR and let the next apply write them.
+
+          If you are deliberately repairing or seeding the ledger, a
+          maintainer with write access can add the
+          `gitforgeops/state-override` label to this PR.
+          MSG
+          exit 1
+
+      - name: Record override
+        if: ${{ steps.detect.outputs.count != '0' && contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
+        run: |
+          echo "::warning::.state/ changes accepted via gitforgeops/state-override label."

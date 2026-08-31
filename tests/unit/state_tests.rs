@@ -49,7 +49,7 @@ fn scoped_record_preserves_entries_outside_scope() {
     // map and repopulate only from the namespace-filtered desired. That
     // dropped managed entries for every other namespace, so the next diff
     // classified them as unmanaged and stopped reconciling.
-    use gitforgeops::config::schema::{BackendProtocol, GatewayConfig, Proxy};
+    use gitforgeops::config::schema::{BackendScheme, GatewayConfig, Proxy};
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
@@ -58,7 +58,7 @@ fn scoped_record_preserves_entries_outside_scope() {
             namespace: ns.to_string(),
             hosts: vec![],
             listen_path: Some(format!("/{id}")),
-            backend_protocol: BackendProtocol::Https,
+            backend_scheme: Some(BackendScheme::Https),
             backend_host: "b".to_string(),
             backend_port: 443,
             backend_path: None,
@@ -99,6 +99,13 @@ fn scoped_record_preserves_entries_outside_scope() {
             tcp_idle_timeout_seconds: None,
             allowed_methods: None,
             allowed_ws_origins: vec![],
+            pool_max_requests_per_connection: None,
+            upstream_subset: None,
+            api_spec_id: None,
+            websocket_idle_timeout_seconds: None,
+            stream_proxy_protocol: None,
+            backend_proxy_protocol: None,
+            stream_match: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -292,7 +299,7 @@ fn record_op_preserves_state_for_failed_delete() {
     // apply's diff still sees the resource as managed →
     // generates another Delete → retries.
     use gitforgeops::apply::AppliedOp;
-    use gitforgeops::config::schema::{BackendProtocol, Consumer, GatewayConfig, Proxy};
+    use gitforgeops::config::schema::{BackendScheme, Consumer, GatewayConfig, Proxy};
     use gitforgeops::diff::resource_diff::DiffAction;
 
     fn proxy(id: &str, ns: &str) -> Proxy {
@@ -302,7 +309,7 @@ fn record_op_preserves_state_for_failed_delete() {
             namespace: ns.to_string(),
             hosts: vec![],
             listen_path: Some(format!("/{id}")),
-            backend_protocol: BackendProtocol::Https,
+            backend_scheme: Some(BackendScheme::Https),
             backend_host: "b".to_string(),
             backend_port: 443,
             backend_path: None,
@@ -343,6 +350,13 @@ fn record_op_preserves_state_for_failed_delete() {
             tcp_idle_timeout_seconds: None,
             allowed_methods: None,
             allowed_ws_origins: vec![],
+            pool_max_requests_per_connection: None,
+            upstream_subset: None,
+            api_spec_id: None,
+            websocket_idle_timeout_seconds: None,
+            stream_proxy_protocol: None,
+            backend_proxy_protocol: None,
+            stream_match: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

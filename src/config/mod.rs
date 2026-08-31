@@ -5,14 +5,16 @@ pub mod repo_config;
 pub mod resolved;
 pub mod schema;
 
-pub use assembler::{apply_overlay, assemble};
+pub use assembler::{
+    apply_overlay, assemble, assemble_with_namespace_filter, merge_mesh_fragments, AssembledOutput,
+};
 pub use env::{load_env_config, ApplyStrategy, EnvConfig, GatewayMode};
 pub use loader::load_resources;
 pub use repo_config::{
     EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
 };
 pub use resolved::{resolve_env, validate_env_name_is_safe_path_component, ResolvedEnv};
-pub use schema::{GatewayConfig, Resource};
+pub use schema::{GatewayConfig, MeshConfigSpec, Resource};
 
 use std::collections::BTreeSet;
 

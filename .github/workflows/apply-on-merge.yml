@@ -25,13 +25,13 @@ jobs:
     outputs:
       envs: ${{ steps.list.outputs.envs }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -61,11 +61,18 @@ jobs:
       group: ferrum-apply-${{ matrix.environment }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download ferrum-edge binary
+        env:
+          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'latest' }}
         run: |
-          VERSION="${{ vars.FERRUM_EDGE_VERSION || 'latest' }}"
+          VERSION="$FERRUM_EDGE_VERSION_RAW"
+          if [[ ! "$VERSION" =~ ^latest$|^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid FERRUM_EDGE_VERSION: '$VERSION'" >&2
+            echo "Expected 'latest' or a release tag like 'v1.2.3'." >&2
+            exit 1
+          fi
           # Use the direct-tag URL (`/releases/download/<tag>/`) rather
           # than `/releases/latest/download/`, which only resolves to the
           # most recent non-prerelease. ferrum-edge's `latest` tag is
@@ -78,7 +85,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -196,6 +203,12 @@ jobs:
           # ./assembled/resources.yaml and the per-env staged path doesn't
           # exist, so placeholder-assembly changes never get committed.
           FERRUM_FILE_OUTPUT_PATH: assembled/${{ matrix.environment }}.yaml
+          # The mesh document is a SEPARATE artifact with its own destination:
+          # a mesh node's loader rejects a document carrying proxies:/
+          # upstreams:, and gateway file mode ignores a mesh: key. Written
+          # only when the repo declares `kind: MeshConfig` fragments under
+          # resources/<ns>/mesh/. Staged by the same commit step below.
+          FERRUM_MESH_FILE_OUTPUT_PATH: assembled/${{ matrix.environment }}-mesh.yaml
           FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -232,8 +245,20 @@ jobs:
           # Stage only the paths this job owns so we don't accidentally pick up
           # anything else that landed in the workdir.
           mkdir -p .state assembled
-          git add ".state/${{ matrix.environment }}.json" 2>/dev/null || true
-          git add "assembled/${{ matrix.environment }}.yaml" 2>/dev/null || true
+          # Stage only files that exist, and let a real `git add` failure
+          # (e.g. the path being gitignored) fail the job. Swallowing it with
+          # `|| true` is how state silently stopped being committed once
+          # before: the add errored, nothing was staged, and the run reported
+          # "No state changes to commit" on every apply.
+          for path in \
+            ".state/${{ matrix.environment }}.json" \
+            "assembled/${{ matrix.environment }}.yaml" \
+            "assembled/${{ matrix.environment }}-mesh.yaml"; do
+            # The assembled docs exist only in file mode, and the mesh doc only
+            # when the repo declares MeshConfig fragments — absence is normal.
+            [ -f "$path" ] || continue
+            git add "$path"
+          done
 
           if git diff --cached --quiet; then
             echo "No state changes to commit."

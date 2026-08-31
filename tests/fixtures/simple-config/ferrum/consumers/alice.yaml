@@ -3,7 +3,12 @@ spec:
   id: "consumer-alice"
   username: "alice"
   credentials:
+    # Canonical array-of-entries form — this is what `GET /backup` returns.
     keyauth:
-      key: "alice-secret-key-12345"
+      - key: "alice-secret-key-12345"
+    # basicauth in file mode needs a precomputed hash; the broker cannot
+    # generate one (see resources/ferrum/consumers/_example.yaml).
+    # basicauth:
+    #   - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
   acl_groups:
     - "engineering"

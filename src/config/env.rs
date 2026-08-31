@@ -42,6 +42,22 @@ pub struct EnvConfig {
     pub gateway_url: Option<String>,
     /// JWT secret for authenticating with the admin API.
     pub admin_jwt_secret: Option<String>,
+    /// `iss` claim minted into admin API tokens. Must equal the gateway's
+    /// `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`) or every request is
+    /// rejected with 401 `InvalidIssuer`.
+    pub admin_jwt_issuer: String,
+    /// `role` claim minted into admin API tokens (`viewer` | `operator` |
+    /// `admin`). The gateway requires this claim on every request. gitforgeops
+    /// needs `admin`: `/backup`, `/restore`, `/batch` and consumer CRUD are all
+    /// admin-only.
+    pub admin_jwt_role: String,
+    /// Optional `aud` claim. The gateway rejects a token carrying `aud` unless
+    /// its own `FERRUM_ADMIN_JWT_AUDIENCE` is configured (RFC 7519 §4.1.3
+    /// strict default), so the claim is emitted only when this is set.
+    pub admin_jwt_audience: Option<String>,
+    /// Token lifetime in seconds. Must be within the gateway's
+    /// `FERRUM_ADMIN_JWT_MAX_TTL` (default 3600; acceptance is `max + 60`).
+    pub admin_jwt_ttl_secs: i64,
     /// Only process resources for this namespace.
     pub namespace_filter: Option<String>,
     /// How to interact with the gateway.
@@ -69,6 +85,15 @@ pub struct EnvConfig {
     pub creds_bundle_json_file: Option<String>,
     /// Output path for assembled file (file mode).
     pub file_output_path: String,
+    /// Output path for the standalone mesh document (`{version, mesh}`).
+    ///
+    /// Written by file-mode `apply` and by `export` whenever the repo declares
+    /// any `MeshConfig` resource. This is a **separate document** from
+    /// `file_output_path`: a mesh node's loader is `deny_unknown_fields` and
+    /// rejects a document carrying `proxies:` / `upstreams:`, and the gateway's
+    /// own `mesh:` key is inert. Points at whatever a mesh node reads via its
+    /// `FERRUM_MESH_FILE_CONFIG_PATH`.
+    pub mesh_file_output_path: String,
     /// Path to the `ferrum-edge` binary for validation.
     pub edge_binary_path: String,
     /// Skip TLS certificate verification when talking to the gateway.
@@ -98,12 +123,55 @@ pub struct EnvConfig {
     pub gateway_max_retries: u32,
 }
 
+impl Default for EnvConfig {
+    /// The configuration `load_env_config()` produces with no `FERRUM_*` /
+    /// `GITHUB_*` variables set. Keeps struct-literal construction (tests,
+    /// synthetic runs) from having to restate every default when a field is
+    /// added.
+    fn default() -> Self {
+        Self {
+            gateway_url: None,
+            admin_jwt_secret: None,
+            admin_jwt_issuer: DEFAULT_JWT_ISSUER.to_string(),
+            admin_jwt_role: DEFAULT_JWT_ROLE.to_string(),
+            admin_jwt_audience: None,
+            admin_jwt_ttl_secs: DEFAULT_JWT_TTL_SECS,
+            namespace_filter: None,
+            gateway_mode: GatewayMode::default(),
+            apply_strategy: ApplyStrategy::default(),
+            overlay: None,
+            env_name: None,
+            github_repository: None,
+            github_token: None,
+            github_provisioner_token: None,
+            creds_bundle_json: None,
+            creds_bundle_json_file: None,
+            file_output_path: "./assembled/resources.yaml".to_string(),
+            mesh_file_output_path: DEFAULT_MESH_FILE_OUTPUT_PATH.to_string(),
+            edge_binary_path: "ferrum-edge".to_string(),
+            tls_no_verify: false,
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            gateway_connect_timeout_secs: 10,
+            gateway_request_timeout_secs: 60,
+            github_connect_timeout_secs: 10,
+            github_request_timeout_secs: 30,
+            gateway_max_retries: 3,
+        }
+    }
+}
+
 /// Load tool configuration from environment variables.
 ///
 /// | Variable                     | Field              | Default                          |
 /// |------------------------------|--------------------|----------------------------------|
 /// | `FERRUM_GATEWAY_URL`         | `gateway_url`      | `None`                           |
 /// | `FERRUM_ADMIN_JWT_SECRET`    | `admin_jwt_secret` | `None`                           |
+/// | `FERRUM_ADMIN_JWT_ISSUER`    | `admin_jwt_issuer` | `ferrum-edge`                    |
+/// | `FERRUM_ADMIN_JWT_ROLE`      | `admin_jwt_role`   | `admin`                          |
+/// | `FERRUM_ADMIN_JWT_AUDIENCE`  | `admin_jwt_audience` | `None` (claim omitted)         |
+/// | `FERRUM_ADMIN_JWT_TTL_SECS`  | `admin_jwt_ttl_secs` | `3600`                         |
 /// | `FERRUM_NAMESPACE`           | `namespace_filter` | `None`                           |
 /// | `FERRUM_GATEWAY_MODE`        | `gateway_mode`     | `api`                            |
 /// | `FERRUM_APPLY_STRATEGY`      | `apply_strategy`   | `incremental`                    |
@@ -115,6 +183,7 @@ pub struct EnvConfig {
 /// | `FERRUM_CREDS_JSON`          | `creds_bundle_json`| `None`                           |
 /// | `FERRUM_CREDS_JSON_FILE`     | `creds_bundle_json_file` | `None` (path, preferred at scale) |
 /// | `FERRUM_FILE_OUTPUT_PATH`    | `file_output_path` | `./assembled/resources.yaml`     |
+/// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
 /// | `FERRUM_GATEWAY_CA_CERT`     | `ca_cert`          | `None`                           |
@@ -127,9 +196,19 @@ pub struct EnvConfig {
 /// | `FERRUM_GATEWAY_MAX_RETRIES`          | `gateway_max_retries`          | `3`         |
 pub fn load_env_config() -> EnvConfig {
     EnvConfig {
-        gateway_url: env::var("FERRUM_GATEWAY_URL").ok(),
-        admin_jwt_secret: env::var("FERRUM_ADMIN_JWT_SECRET").ok(),
-        namespace_filter: env::var("FERRUM_NAMESPACE").ok(),
+        // Blank-as-unset matters for every var CI feeds from a `${{ secrets.* }}`
+        // expression: an unconfigured GitHub secret interpolates to "", and
+        // Some("") would produce misleading downstream errors ("secret too
+        // short") instead of the clear "not configured" ones.
+        gateway_url: non_empty_env("FERRUM_GATEWAY_URL"),
+        admin_jwt_secret: non_empty_env("FERRUM_ADMIN_JWT_SECRET"),
+        admin_jwt_issuer: non_empty_env("FERRUM_ADMIN_JWT_ISSUER")
+            .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),
+        admin_jwt_role: non_empty_env("FERRUM_ADMIN_JWT_ROLE")
+            .unwrap_or_else(|| DEFAULT_JWT_ROLE.to_string()),
+        admin_jwt_audience: non_empty_env("FERRUM_ADMIN_JWT_AUDIENCE"),
+        admin_jwt_ttl_secs: parse_i64_env("FERRUM_ADMIN_JWT_TTL_SECS", DEFAULT_JWT_TTL_SECS),
+        namespace_filter: non_empty_env("FERRUM_NAMESPACE"),
         gateway_mode: match env::var("FERRUM_GATEWAY_MODE")
             .unwrap_or_default()
             .to_lowercase()
@@ -146,29 +225,63 @@ pub fn load_env_config() -> EnvConfig {
             "full_replace" => ApplyStrategy::FullReplace,
             _ => ApplyStrategy::Incremental,
         },
-        overlay: env::var("FERRUM_OVERLAY").ok(),
-        env_name: env::var("FERRUM_ENV").ok(),
-        github_repository: env::var("GITHUB_REPOSITORY").ok(),
-        github_token: env::var("GITHUB_TOKEN").ok(),
-        github_provisioner_token: env::var("FERRUM_GH_PROVISIONER_TOKEN").ok(),
-        creds_bundle_json: env::var("FERRUM_CREDS_JSON").ok(),
-        creds_bundle_json_file: env::var("FERRUM_CREDS_JSON_FILE").ok(),
+        overlay: non_empty_env("FERRUM_OVERLAY"),
+        env_name: non_empty_env("FERRUM_ENV"),
+        github_repository: non_empty_env("GITHUB_REPOSITORY"),
+        github_token: non_empty_env("GITHUB_TOKEN"),
+        github_provisioner_token: non_empty_env("FERRUM_GH_PROVISIONER_TOKEN"),
+        creds_bundle_json: non_empty_env("FERRUM_CREDS_JSON"),
+        creds_bundle_json_file: non_empty_env("FERRUM_CREDS_JSON_FILE"),
         file_output_path: env::var("FERRUM_FILE_OUTPUT_PATH")
             .unwrap_or_else(|_| "./assembled/resources.yaml".to_string()),
+        mesh_file_output_path: non_empty_env("FERRUM_MESH_FILE_OUTPUT_PATH")
+            .unwrap_or_else(|| DEFAULT_MESH_FILE_OUTPUT_PATH.to_string()),
         edge_binary_path: env::var("FERRUM_EDGE_BINARY_PATH")
             .unwrap_or_else(|_| "ferrum-edge".to_string()),
         tls_no_verify: env::var("FERRUM_TLS_NO_VERIFY")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false),
-        ca_cert: env::var("FERRUM_GATEWAY_CA_CERT").ok(),
-        client_cert: env::var("FERRUM_GATEWAY_CLIENT_CERT").ok(),
-        client_key: env::var("FERRUM_GATEWAY_CLIENT_KEY").ok(),
+        ca_cert: non_empty_env("FERRUM_GATEWAY_CA_CERT"),
+        client_cert: non_empty_env("FERRUM_GATEWAY_CLIENT_CERT"),
+        client_key: non_empty_env("FERRUM_GATEWAY_CLIENT_KEY"),
         gateway_connect_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", 10),
         gateway_request_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", 60),
         github_connect_timeout_secs: parse_timeout_env("FERRUM_GITHUB_CONNECT_TIMEOUT_SECS", 10),
         github_request_timeout_secs: parse_timeout_env("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", 30),
         gateway_max_retries: parse_u32_env("FERRUM_GATEWAY_MAX_RETRIES", 3),
     }
+}
+
+/// Where the standalone `{version, mesh}` document lands when
+/// `FERRUM_MESH_FILE_OUTPUT_PATH` is unset. Sits alongside the assembled
+/// gateway file rather than overwriting it — the two documents are mutually
+/// exclusive in shape.
+pub const DEFAULT_MESH_FILE_OUTPUT_PATH: &str = "./assembled/mesh.yaml";
+
+/// `iss` the gateway expects by default (`FERRUM_ADMIN_JWT_ISSUER` there).
+pub const DEFAULT_JWT_ISSUER: &str = "ferrum-edge";
+/// Role gitforgeops needs: `/backup`, `/restore`, `/batch` and consumer CRUD
+/// are all admin-only, so `operator` is insufficient.
+pub const DEFAULT_JWT_ROLE: &str = "admin";
+/// Matches the gateway's default `FERRUM_ADMIN_JWT_MAX_TTL`. Acceptance is
+/// `max_ttl + 60`, so the default sits comfortably inside the window.
+pub const DEFAULT_JWT_TTL_SECS: i64 = 3600;
+
+/// Read an env var, treating empty/whitespace as unset. `aud` in particular
+/// must be *absent*, not empty, when the gateway has no audience configured.
+fn non_empty_env(var: &str) -> Option<String> {
+    env::var(var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn parse_i64_env(var: &str, default: i64) -> i64 {
+    env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 fn parse_timeout_env(var: &str, default_secs: u64) -> u64 {

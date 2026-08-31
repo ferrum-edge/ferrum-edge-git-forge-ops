@@ -1,5 +1,6 @@
-use crate::config::schema::BackendProtocol;
+use crate::config::schema::BackendScheme;
 use crate::config::GatewayConfig;
+use crate::plugin_catalog::effective_scheme;
 use crate::policy::config::BackendSchemeRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
 
@@ -10,22 +11,6 @@ pub struct BackendSchemeRule {
 impl BackendSchemeRule {
     pub fn new(config: BackendSchemeRuleConfig) -> Self {
         Self { config }
-    }
-
-    fn protocol_name(p: &BackendProtocol) -> &'static str {
-        match p {
-            BackendProtocol::Http => "http",
-            BackendProtocol::Https => "https",
-            BackendProtocol::Ws => "ws",
-            BackendProtocol::Wss => "wss",
-            BackendProtocol::Grpc => "grpc",
-            BackendProtocol::Grpcs => "grpcs",
-            BackendProtocol::H3 => "h3",
-            BackendProtocol::Tcp => "tcp",
-            BackendProtocol::TcpTls => "tcp_tls",
-            BackendProtocol::Udp => "udp",
-            BackendProtocol::Dtls => "dtls",
-        }
     }
 }
 
@@ -40,15 +25,29 @@ impl PolicyCheck for BackendSchemeRule {
             return findings;
         }
 
-        let allowed: Vec<String> = self
-            .config
-            .allowed_protocols
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+        // Allowed entries are normalized through `BackendScheme::from_wire` so a
+        // policy file still written against the legacy value set (`wss`, `grpcs`,
+        // `tcp_tls`, …) keeps meaning the same thing it did before the rename.
+        let mut allowed: Vec<String> = Vec::new();
+        for entry in &self.config.allowed_protocols {
+            let lowered = entry.to_lowercase();
+            let canonical = BackendScheme::from_wire(&lowered)
+                .map(|scheme| scheme.as_str().to_string())
+                .unwrap_or(lowered);
+            if !allowed.contains(&canonical) {
+                allowed.push(canonical);
+            }
+        }
 
         for proxy in &cfg.proxies {
-            let actual = Self::protocol_name(&proxy.backend_protocol);
+            // Assembly normalizes a schemeless HTTP-family proxy to `https`
+            // before any rule runs, so `backend_scheme` is usually already set.
+            // `effective_scheme` still applies the gateway's own default here —
+            // the rule is also evaluated on configs that did not come through
+            // the assembler (imports, `--from-file`), and a stream proxy's
+            // absent scheme has to resolve to the stream sentinel rather than
+            // to `https`.
+            let actual = effective_scheme(proxy).as_str();
             if !allowed.iter().any(|a| a == actual) {
                 findings.push(PolicyFinding {
                     rule_id: self.rule_id().to_string(),
@@ -57,11 +56,11 @@ impl PolicyCheck for BackendSchemeRule {
                     id: proxy.id.clone(),
                     namespace: proxy.namespace.clone(),
                     message: format!(
-                        "backend_protocol={actual} is not in the allowed list ({})",
+                        "backend_scheme={actual} is not in the allowed list ({})",
                         allowed.join(", ")
                     ),
                     remediation: Some(format!(
-                        "Change backend_protocol to one of: {}",
+                        "Change backend_scheme to one of: {}",
                         allowed.join(", ")
                     )),
                     overridden_by: None,
