@@ -345,7 +345,7 @@ fn allowed_backend_domains_skips_proxy_backend_host_when_upstream_is_used() {
 
 #[test]
 fn allowed_backend_domains_checks_proxy_backend_host_when_upstream_id_is_unresolved() {
-    let mut p = proxy("missing-upstream", BackendProtocol::Https, 30_000, true);
+    let mut p = proxy("missing-upstream", BackendScheme::Https, 30_000, true);
     p.backend_host = "attacker.invalid".to_string();
     p.upstream_id = Some("missing".to_string());
 
@@ -374,7 +374,7 @@ fn allowed_backend_domains_checks_proxy_backend_host_when_upstream_id_is_unresol
 
 #[test]
 fn allowed_backend_domains_checks_proxy_backend_host_when_upstream_id_is_empty() {
-    let mut p = proxy("empty-upstream", BackendProtocol::Https, 30_000, true);
+    let mut p = proxy("empty-upstream", BackendScheme::Https, 30_000, true);
     p.backend_host = "attacker.invalid".to_string();
     p.upstream_id = Some("   ".to_string());
 
@@ -399,6 +399,38 @@ fn allowed_backend_domains_checks_proxy_backend_host_when_upstream_id_is_empty()
     assert_eq!(findings[0].rule_id, "allowed_backend_domains");
     assert_eq!(findings[0].kind, "Proxy");
     assert_eq!(findings[0].id, "empty-upstream");
+}
+
+#[test]
+fn allowed_backend_domains_does_not_resolve_upstream_from_another_namespace() {
+    let mut p = proxy("cross-namespace", BackendScheme::Https, 30_000, true);
+    p.backend_host = "attacker.invalid".to_string();
+    p.upstream_id = Some("api-pool".to_string());
+
+    let mut other_namespace_upstream = upstream("api-pool", vec![target("blue.svc.cluster.local")]);
+    other_namespace_upstream.namespace = "other".to_string();
+
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        upstreams: vec![other_namespace_upstream],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.svc.cluster.local".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, "Proxy");
+    assert_eq!(findings[0].id, "cross-namespace");
 }
 
 #[test]
