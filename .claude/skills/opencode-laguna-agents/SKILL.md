@@ -1,9 +1,9 @@
 ---
-name: opencode-agents
+name: opencode-laguna-agents
 description: Dispatch and orchestrate local opencode laguna-s-2.1 subagents via the opencode CLI harness for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn opencode/laguna-s agents on issues, PRs, review findings, or red CI.
 ---
 
-# opencode-agents: opencode laguna-s-2.1 subagent orchestration
+# opencode-laguna-agents: opencode laguna-s-2.1 subagent orchestration
 
 You are the ORCHESTRATOR. opencode agents implement/fix; you verify their diffs, drive/merge
 decisions, and never let an unreviewed PR merge. This skill uses the local opencode CLI harness
@@ -16,11 +16,11 @@ another opencode worker.
 
 ## Dispatch command (exact shape)
 
-Resolve the absolute path to this repository's `.agents/skills/opencode-agents` directory, write a
+Resolve the absolute path to this repository's `.agents/skills/opencode-laguna-agents` directory, write a
 prompt file outside the repo, then launch:
 
 ```bash
-<ABS_REPO>/.agents/skills/opencode-agents/scripts/dispatch-agent.sh \
+<ABS_REPO>/.agents/skills/opencode-laguna-agents/scripts/dispatch-agent.sh \
   --worktree <ABS_PATH_TO_WORKER_WORKTREE> \
   --prompt-file <ABS_PROMPT_FILE>
 ```
@@ -43,18 +43,18 @@ Non-negotiables:
 ## Prompt construction (all modes)
 
 Every prompt starts with:
-`First read <ABS_REPO>/.agents/skills/opencode-agents/references/agent-brief.md and follow it exactly`
+`First read <ABS_REPO>/.agents/skills/opencode-laguna-agents/references/agent-brief.md and follow it exactly`
 (implementer) or
-`Read <ABS_REPO>/.agents/skills/opencode-agents/references/continuation-brief.md AND
-<ABS_REPO>/.agents/skills/opencode-agents/references/agent-brief.md and follow them`
+`Read <ABS_REPO>/.agents/skills/opencode-laguna-agents/references/continuation-brief.md AND
+<ABS_REPO>/.agents/skills/opencode-laguna-agents/references/agent-brief.md and follow them`
 (fix/shepherd — give BOTH absolute paths).
 
-Use only those `.agents/skills/opencode-agents/references/` paths so Claude and Codex/GPT
+Use only those `.agents/skills/opencode-laguna-agents/references/` paths so Claude and Codex/GPT
 orchestrators share one source of truth.
 
 Every prompt must also PIN THE WORKER'S ROLE:
 "YOU are the implementer: write, commit, and push the changes yourself in this session.
-Do NOT invoke agent-dispatch skills (opencode-agents, grok-agents, sol-agents, opus-agents,
+Do NOT invoke agent-dispatch skills (opencode-laguna-agents, grok-agents, sol-agents, opus-agents,
 fable-agents, .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
 
 Then append the mode block:
@@ -82,7 +82,8 @@ checks -> fmt -> push -> ONE review trigger -> EXIT with report."
 3. Triage CI reds yourself when agents are gone.
 4. Salvage protocol for dead agents: check worktree status + unpushed commits, then relaunch a
    continuation agent with a state snapshot.
-5. Merge only when: review bot clean on the CURRENT head + CI green + your own review done.
+5. Merge only when the user explicitly authorizes that exact PR, the review bot is clean on the
+   current head, CI is green, and your own review is done.
 
 ## Known failure modes
 

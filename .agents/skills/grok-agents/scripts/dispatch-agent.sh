@@ -9,7 +9,7 @@ usage() {
     '                         [--fast]' \
     '                         [--name NAME]' \
     '' \
-    'Runs the standalone `cursor-agent` CLI in print mode against a Cursor Grok' \
+    'Runs the standalone cursor-agent CLI in print mode against a Cursor Grok' \
     '4.6 SKU. --effort selects the SKU (default high); Cursor exposes' \
     'low/medium/high/xhigh, so max resolves to xhigh.' >&2
 }

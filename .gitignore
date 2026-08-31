@@ -5,6 +5,10 @@ target/
 *.pdb
 **/mutants.out*/
 
+# Python validator artifacts
+__pycache__/
+*.py[cod]
+
 # GitForgeOps state. The per-environment JSON manifests ARE committed —
 # apply-on-merge.yml and rotate.yml push them back to main, and shared-mode
 # ownership tracking is broken without them. Locks and the temp files

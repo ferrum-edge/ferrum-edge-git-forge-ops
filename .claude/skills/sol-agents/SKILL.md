@@ -9,6 +9,11 @@ You are the ORCHESTRATOR. Agents implement/fix; you verify their diffs, drive/me
 decisions, and never let an unreviewed PR merge. This skill encodes the process
 proven across the 2026-07 issue-backlog drive (20+ PRs merged).
 
+**Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session prompt
+references `agent-brief.md` / `continuation-brief.md`, says "YOU are the implementer", or hands
+you an existing worktree and findings to fix, implement directly. Do not recursively dispatch
+another worker.
+
 ## Dispatch command (exact shape)
 
 Write the prompt to a file outside the repo, then launch:
@@ -61,9 +66,9 @@ Every prompt starts with:
 `Read <path-to>/continuation-brief.md AND <path-to>/agent-brief.md and follow them`
 (fix/shepherd modes — give BOTH absolute paths; the continuation brief defers to
 agent-brief for ground rules and must never be dispatched alone).
-Use the copies in THIS skill directory (they carry worktree isolation, no-local-builds
-policy, review-loop discipline, known-flake list, final-report format). Verify the
-briefs' review-bot section matches reality before dispatching (codex vs claude
+Use the copies in THIS skill directory (they carry worktree isolation, mandatory local validation,
+review-loop discipline, failure-triage rules, and the final-report format). Verify the
+briefs' review-bot section matches reality before dispatching (Codex vs Claude
 trigger — credits come and go); update the briefs if stale.
 
 Every prompt must also PIN THE WORKER'S ROLE explicitly (the briefs repeat it, but the
@@ -80,8 +85,8 @@ Then append the mode block:
 
 **Implementer (fresh issue):** issue number, worktree dir `issue-<N>` under a
 sibling `<repo>-agents/` dir, branch name, acceptance criteria distilled from the
-issue, repo-invariant callouts relevant to the surface (hot path, fail-closed,
-openapi parity), scope boundaries vs neighboring in-flight PRs.
+issue, repo-invariant callouts relevant to the surface (ownership, namespace identity,
+secret handling, schema compatibility), scope boundaries vs neighboring in-flight PRs.
 
 **Fix round (existing PR):** PR number, existing worktree path, current head SHA,
 the verified findings verbatim (fetch full thread bodies first — findings live in
@@ -104,14 +109,14 @@ The orchestrator then handles verdicts/green-waiting between rounds.
    (`git fetch origin main && git diff origin/main...HEAD` — three-dot; two-dot lies
    once main moves). Focus: fail-closed posture, hot-path gating, docs honesty,
    no-unwrap-in-prod, scope creep.
-3. Triage CI reds yourself when agents are gone: outage signature
-   ("cargo fetch failed ... registry outage") → rerun; bin-target dead_code
-   (lib+bin dual module tree) → real fix; known flakes (list in agent-brief) → rerun.
+3. Triage CI reds yourself when agents are gone. Treat every red check as real until its logs prove
+   an external infrastructure outage; this repository has no standing known-flake allowlist.
 4. Salvage protocol for dead agents: check worktree `git status --porcelain` +
    `git log @{u}..HEAD`, commit/push stranded WIP, relaunch a continuation agent
    with a state snapshot (or a handoff file for large context).
-5. Merge only when: review bot clean on the CURRENT head + CI green + your own
-   review done. `gh pr merge <N> --repo <repo> --merge --delete-branch`.
+5. Merge only when the user explicitly authorizes that exact PR, the review bot is clean on the
+   current head, CI is green, and your own review is done. Never infer landing permission from a
+   request to implement, review, or shepherd the PR.
 
 ## Known failure modes
 

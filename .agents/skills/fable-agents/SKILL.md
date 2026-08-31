@@ -89,6 +89,9 @@ attributable. Never wrap the fleet in a single shell command, use `killall claud
 `pkill claude`; the user may have unrelated Claude sessions. Cap this workflow at seven concurrent
 Fable workers unless the user sets a lower limit.
 
+This skill is intentionally Codex-orchestrator-only. Claude-side sessions already have native
+Claude workers, so `.claude/skills/` does not mirror this wrapper.
+
 ## Pin the worker role
 
 Every prompt must contain this role instruction even though the briefs repeat it:
@@ -164,8 +167,8 @@ them guardrail rejections.
    prompt, such as the branch, pushed head, PR, requested validation, and any explicitly assigned
    review or CI actions.
 4. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's
-   worktree. Use a three-dot diff. Review fail-closed behavior, hot paths, docs/spec parity,
-   production panics, tests, and scope creep.
+   worktree. Use a three-dot diff. Review ownership and secret fail-closed behavior, namespace
+   scoping, schema/documentation parity, production panics, tests, and scope creep.
 5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only demonstrated
    infrastructure failures or known flakes, and dispatch bounded repair work for deterministic
    failures.

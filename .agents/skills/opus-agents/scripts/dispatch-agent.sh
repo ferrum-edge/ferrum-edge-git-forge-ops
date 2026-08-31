@@ -122,6 +122,8 @@ unset CLAUDE_CODE_EFFORT_LEVEL
 unset CLAUDE_CODE_DISABLE_1M_CONTEXT
 unset CLAUDE_CODE_DISABLE_THINKING
 unset MAX_THINKING_TOKENS
+unset ANTHROPIC_MODEL
+unset ANTHROPIC_SMALL_FAST_MODEL
 
 fast_settings='{"fastMode":false}'
 if [[ "$fast" == 'true' ]]; then
