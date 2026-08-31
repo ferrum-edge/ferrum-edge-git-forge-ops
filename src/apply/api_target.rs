@@ -872,7 +872,7 @@ fn spec_owned_conflict(
 
 fn hand_authored_spec_tag(kind: &str, id: &str, namespace: &str) -> crate::error::Error {
     crate::error::Error::Config(format!(
-        "refusing API apply for namespace `{namespace}`: desired {kind} `{id}` contains an `api_spec_id`. That ownership tag is admin-generated and cannot be declared by the repository."
+        "refusing repository configuration for namespace `{namespace}`: desired {kind} `{id}` contains an `api_spec_id`. That ownership tag is admin-generated and cannot be declared by the repository."
     ))
 }
 
@@ -1357,7 +1357,7 @@ fn resource_values_match<T: serde::Serialize>(desired: &T, live: &T) -> bool {
 /// Exact pending rows need an idempotent PUT even though their ordinary diff
 /// is empty. Equality proves the desired state is live, but not whether our
 /// uncertain POST or a racing external writer created it.
-fn pending_create_assertion_diffs(
+pub fn pending_create_assertion_diffs(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
     pending: &BTreeSet<String>,
