@@ -82,6 +82,8 @@ AGENT_CI_SCRIPT_MARKERS = (
     'python3 "$validator" --root "$GITHUB_WORKSPACE"',
     "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'",
     "shellcheck --external-sources --source-path=SCRIPTDIR",
+    "group: agent-setup-ci-${{ github.event.pull_request.number || github.ref }}",
+    "cancel-in-progress: true",
 )
 AGENT_POLICY_SCRIPT_MARKERS = (
     "repository: ${{ github.event.pull_request.head.repo.full_name }}",
@@ -100,7 +102,7 @@ CODEOWNED_PATHS = (
     "/.github/workflows/agent-setup-policy.yml",
     "/.github/scripts/check_agent_setup.py",
     "/.github/scripts/tests/test_agent_setup.py",
-    "/.agents/skills/",
+    "/.agents/",
     "/.claude/",
     "/CLAUDE.md",
     "/AGENTS.md",
@@ -376,9 +378,9 @@ def validate_agent_workflows(root: Path) -> list[str]:
         ]
         owners_by_path = dict(parsed_rules)
         for protected in CODEOWNED_PATHS:
-            if CODEOWNER not in owners_by_path.get(protected, set()):
+            if owners_by_path.get(protected) != {CODEOWNER}:
                 violations.append(
-                    f".github/CODEOWNERS: {protected} is not owned by {CODEOWNER}"
+                    f".github/CODEOWNERS: {protected} must be owned only by {CODEOWNER}"
                 )
         final_rules = parsed_rules[-len(CODEOWNED_PATHS) :]
         if len(final_rules) != len(CODEOWNED_PATHS) or any(
@@ -576,7 +578,6 @@ def collect_violations(root: Path) -> list[str]:
             for marker in (
                 "isolate_cursor_provider",
                 "prepare_cursor_control_workspace",
-                "--sandbox enabled",
                 '--workspace "$cursor_control_workspace"',
                 '--add-dir "$physical_worktree"',
             ):
@@ -584,6 +585,10 @@ def collect_violations(root: Path) -> list[str]:
                     violations.append(
                         f"{launcher.relative_to(root)}: missing Cursor provider/project isolation {marker!r}"
                     )
+            if "--sandbox" in launcher_text:
+                violations.append(
+                    f"{launcher.relative_to(root)}: Cursor sandboxing blocks required network and tool state"
+                )
 
     # Main's trusted bootstrap validator predates the canonical references/
     # layout and requires these Claude-side paths. Keep them as exact mirrors,

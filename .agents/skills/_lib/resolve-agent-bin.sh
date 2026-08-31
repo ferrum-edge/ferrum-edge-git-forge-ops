@@ -70,7 +70,7 @@ dispatch_child=''
 
 release_worktree_dispatch_lock() {
   if [[ -n "$dispatch_child" ]] && kill -0 "$dispatch_child" 2>/dev/null; then
-    kill -TERM "$dispatch_child" 2>/dev/null || true
+    kill -TERM -- "-$dispatch_child" 2>/dev/null || true
     wait "$dispatch_child" 2>/dev/null || true
   fi
   dispatch_child=''
@@ -122,7 +122,7 @@ forward_dispatch_signal() {
   local signal=$1 status=$2
 
   if [[ -n "$dispatch_child" ]] && kill -0 "$dispatch_child" 2>/dev/null; then
-    kill -s "$signal" "$dispatch_child" 2>/dev/null || true
+    kill -s "$signal" -- "-$dispatch_child" 2>/dev/null || true
     wait "$dispatch_child" 2>/dev/null || true
   fi
   dispatch_child=''
@@ -131,14 +131,19 @@ forward_dispatch_signal() {
 
 # run_dispatch_child <prompt-file> <command> [args...]
 # Keep the launcher as the stable controller PID, forward cancellation to the
-# CLI, preserve its exit status, and prevent the Linux flock descriptor from
-# leaking into the worker or any daemon it starts.
+# CLI process group, preserve its exit status, and prevent the Linux flock
+# descriptor from leaking into the worker or any daemon it starts.
 run_dispatch_child() {
   local prompt_file=$1 status
   shift
 
+  # Job control gives the worker a fresh process group and restores the default
+  # SIGINT disposition that non-interactive Bash otherwise assigns to an async
+  # child. The controller can then cancel the CLI and all of its descendants.
+  set -m
   "$@" < "$prompt_file" 9>&- &
   dispatch_child=$!
+  set +m
   if wait "$dispatch_child"; then
     status=0
   else
@@ -164,7 +169,7 @@ prepare_cursor_control_workspace() {
 # prevents two workers from being dispatched into the same linked worktree.
 acquire_worktree_dispatch_lock() {
   local worktree_root=$1
-  local git_dir owner_pid='' attempt=0 ready_file='' owner_file=''
+  local git_dir owner_pid='' ready_file='' owner_file=''
 
   worktree_root=$(cd "$worktree_root" && pwd -P) || return 2
 
@@ -206,17 +211,20 @@ acquire_worktree_dispatch_lock() {
       printf "%s\n" "$parent_pid" > "$owner_path"
       printf "ready\n" > "$ready_path"
       while [ ! -f "$release_path" ] && kill -0 "$parent_pid" 2>/dev/null; do
-        parent_state=$(ps -o stat= -p "$parent_pid" 2>/dev/null) || break
+        parent_state=$(ps -o stat= -p "$parent_pid" 2>/dev/null) || {
+          sleep 0.1
+          continue
+        }
         case "$parent_state" in *Z*) break ;; esac
-        sleep 1
+        sleep 0.1
       done
     ' sh "$$" "$owner_file" "$ready_file" "$dispatch_lock_release_file" \
       </dev/null >/dev/null 2>&1 &
     dispatch_lock_holder=$!
     dispatch_lock_backend='lockf'
+    local ready_deadline=$((SECONDS + 30))
     while [[ ! -f "$ready_file" ]] && kill -0 "$dispatch_lock_holder" 2>/dev/null; do
-      attempt=$((attempt + 1))
-      if ((attempt >= 500)); then
+      if ((SECONDS >= ready_deadline)); then
         break
       fi
       sleep 0.01

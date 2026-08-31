@@ -149,14 +149,14 @@ printf '[composer-agents] dispatch model=%s fast=%s worktree=%s bin=%s auth=%s%s
 # --force:  no per-command approval prompts; worktree isolation is the boundary.
 # --trust:  accept the freshly created worktree as a trusted directory, which the
 #           trust gate otherwise blocks on in a non-TTY.
-# --sandbox enabled + --add-dir: the empty control workspace prevents automatic
-#           project-rule loading while filesystem writes stay confined to the
-#           explicitly locked target worktree.
+# --workspace + --add-dir: the empty control workspace prevents automatic
+#           project-rule loading while making the locked target worktree
+#           available. Cursor still needs normal host/network access for build,
+#           GitHub, and git gates; worktree isolation is not a host sandbox.
 run_dispatch_child "$prompt_file" "$cursor_bin" \
   --print \
   --force \
   --trust \
-  --sandbox enabled \
   --model "$MODEL" \
   --output-format text \
   --workspace "$cursor_control_workspace" \

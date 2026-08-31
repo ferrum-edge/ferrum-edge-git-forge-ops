@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -106,7 +107,9 @@ def write_valid_setup(
         "validator=.github/scripts/check_agent_setup.py\n"
         'python3 "$validator" --root "$GITHUB_WORKSPACE"\n'
         "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'\n"
-        "shellcheck --external-sources --source-path=SCRIPTDIR\n",
+        "shellcheck --external-sources --source-path=SCRIPTDIR\n"
+        "group: agent-setup-ci-${{ github.event.pull_request.number || github.ref }}\n"
+        "cancel-in-progress: true\n",
         encoding="utf-8",
     )
     policy = root / ".github" / "workflows" / "agent-setup-policy.yml"
@@ -654,7 +657,7 @@ class AgentSetupTests(unittest.TestCase):
                 process.communicate(timeout=5)
 
     @unittest.skipUnless(shutil.which("git"), "git is required")
-    def test_pid_only_termination_reaches_worker_and_releases_lock(self):
+    def test_pid_only_cancellation_reaches_worker_group_and_releases_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             root = temp / "repo"
@@ -679,61 +682,101 @@ class AgentSetupTests(unittest.TestCase):
             helper = str(
                 check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
             )
-            worker = temp / "worker.sh"
-            marker = temp / "terminated"
+            worker = temp / "worker.py"
             worker.write_text(
-                "#!/usr/bin/env bash\n"
-                "trap 'printf terminated > \"$FAKE_MARKER\"; exit 0' TERM\n"
-                "printf 'worker-ready\\n'\n"
-                "while :; do sleep 1; done\n",
+                "import os\n"
+                "import signal\n"
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "child = subprocess.Popen(['sleep', '300'])\n"
+                "with open(os.environ['FAKE_GRANDCHILD'], 'w', encoding='utf-8') as output:\n"
+                "    output.write(str(child.pid))\n"
+                "def cancel(signum, _frame):\n"
+                "    with open(os.environ['FAKE_MARKER'], 'w', encoding='utf-8') as output:\n"
+                "        output.write(str(signum))\n"
+                "    raise SystemExit(0)\n"
+                "for name in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):\n"
+                "    signal.signal(name, cancel)\n"
+                "print('worker-ready', flush=True)\n"
+                "while True:\n"
+                "    time.sleep(1)\n",
                 encoding="utf-8",
             )
-            worker.chmod(0o755)
             prompt = temp / "prompt.md"
             prompt.write_text("work\n", encoding="utf-8")
             command = (
                 'source "$1"; acquire_worktree_dispatch_lock "$2"; '
-                'run_dispatch_child "$3" "$4"'
+                'run_dispatch_child "$3" "$4" "$5"'
             )
-            launcher = subprocess.Popen(
-                [
-                    "bash",
-                    "-c",
-                    command,
-                    "bash",
-                    helper,
-                    str(linked),
-                    str(prompt),
-                    str(worker),
-                ],
-                cwd=temp,
-                env={**os.environ, "FAKE_MARKER": str(marker)},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
-            self.assertEqual(launcher.stdout.readline(), "worker-ready\n")
-            os.kill(launcher.pid, signal.SIGTERM)
-            stdout, stderr = launcher.communicate(timeout=5)
-            self.assertEqual(launcher.returncode, 143, stdout + stderr)
-            self.assertEqual(marker.read_text(encoding="utf-8"), "terminated")
+            for sent_signal, expected_status in (
+                (signal.SIGHUP, 129),
+                (signal.SIGINT, 130),
+                (signal.SIGTERM, 143),
+            ):
+                marker = temp / f"terminated-{sent_signal.value}"
+                grandchild_file = temp / f"grandchild-{sent_signal.value}"
+                launcher = subprocess.Popen(
+                    [
+                        "bash",
+                        "-c",
+                        command,
+                        "bash",
+                        helper,
+                        str(linked),
+                        str(prompt),
+                        sys.executable,
+                        str(worker),
+                    ],
+                    cwd=temp,
+                    env={
+                        **os.environ,
+                        "FAKE_MARKER": str(marker),
+                        "FAKE_GRANDCHILD": str(grandchild_file),
+                    },
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                self.assertEqual(launcher.stdout.readline(), "worker-ready\n")
+                grandchild = int(grandchild_file.read_text(encoding="utf-8"))
+                os.kill(launcher.pid, sent_signal)
+                stdout, stderr = launcher.communicate(timeout=5)
+                self.assertEqual(launcher.returncode, expected_status, stdout + stderr)
+                self.assertEqual(
+                    marker.read_text(encoding="utf-8"), str(sent_signal.value)
+                )
+                for _ in range(50):
+                    state = subprocess.run(
+                        ["ps", "-o", "stat=", "-p", str(grandchild)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    if not state or "Z" in state:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(
+                    not state or "Z" in state,
+                    f"grandchild {grandchild} survived {sent_signal.name}: {state}",
+                )
 
-            reacquire = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    'source "$1"; acquire_worktree_dispatch_lock "$2"',
-                    "bash",
-                    helper,
-                    str(linked),
-                ],
-                cwd=temp,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(reacquire.returncode, 0, reacquire.stderr)
+                reacquire = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'source "$1"; acquire_worktree_dispatch_lock "$2"',
+                        "bash",
+                        helper,
+                        str(linked),
+                    ],
+                    cwd=temp,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(reacquire.returncode, 0, reacquire.stderr)
 
             git_dir = Path(
                 subprocess.check_output(
@@ -853,8 +896,8 @@ class AgentSetupTests(unittest.TestCase):
             self.assertNotEqual(cwd, str(linked))
             self.assertTrue(cwd.startswith(str(temp_root)))
             self.assertFalse(Path(cwd).exists(), "control workspace must be removed")
-            self.assertIn("arg=--sandbox", captured)
-            self.assertIn("arg=enabled", captured)
+            self.assertNotIn("arg=--sandbox", captured)
+            self.assertNotIn("arg=enabled", captured)
             self.assertIn("arg=--add-dir", captured)
             self.assertIn(f"arg={linked.resolve()}", captured)
             self.assertIn(f"arg={cwd}", captured)
