@@ -283,6 +283,8 @@ def verify_rsa_exception_reachability(
                 [
                     "cargo",
                     "tree",
+                    "--color",
+                    "never",
                     "--locked",
                     "--target",
                     "all",
