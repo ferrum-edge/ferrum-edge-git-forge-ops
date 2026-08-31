@@ -2,6 +2,14 @@ use crate::config::{GatewayConfig, GatewayMode};
 
 use super::bundle::CredentialBundle;
 use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
+use super::plugin_config::{sensitive_string_paths, ConfigPathComponent};
+
+/// Reserved third slot component for brokered plugin-config strings.
+///
+/// Consumer slots use their credential type here (`keyauth`, `jwt`, ...), so
+/// the marker keeps plugin config in a separate keyspace while preserving the
+/// existing `<namespace>/<resource-id>/<kind>/...` bundle shape.
+const PLUGIN_CONFIG_SLOT_KIND: &str = "@plugin-config";
 
 /// Credential types whose secret must be at least 32 characters
 /// (`jwt.secret`, `hmac_auth.secret`).
@@ -349,6 +357,19 @@ fn lookup_slot_value<'a>(
     Ok(None)
 }
 
+fn lookup_exact_slot_value<'a>(
+    slot: &str,
+    bundle: &'a CredentialBundle,
+) -> crate::error::Result<Option<&'a String>> {
+    let found = bundle.get(slot);
+    if found.is_some_and(|value| value == REDACTED_SENTINEL) {
+        return Err(crate::error::Error::Config(format!(
+            "secret slot '{slot}' holds the reserved sentinel '{REDACTED_SENTINEL}'; re-seed the bundle from an unredacted GET /backup source"
+        )));
+    }
+    Ok(found)
+}
+
 /// Build a slot path from the CLI `--credential` argument.
 ///
 /// `cred_key` is interpreted as a `/`-separated path matching the walker's
@@ -418,6 +439,40 @@ pub fn capture_and_redact_import_credentials(
     Ok(captured)
 }
 
+/// Capture sensitive string leaves from plugin configuration and replace them
+/// with broker placeholders before import writes any resource file.
+///
+/// The gateway's admin backup intentionally returns plugin configs raw. The
+/// classifier mirrors its schema-aware projection contract and fails closed
+/// for custom plugins, so OIDC/LDAP/Kafka/Redis/collector credentials and
+/// arbitrary authorization-header values cannot be committed by import.
+pub fn capture_and_redact_import_plugin_config_secrets(
+    cfg: &mut GatewayConfig,
+) -> crate::error::Result<CredentialBundle> {
+    let mut captured = CredentialBundle::new();
+
+    for plugin in &mut cfg.plugin_configs {
+        if plugin.api_spec_id.is_some() {
+            continue;
+        }
+        let paths = sensitive_string_paths(&plugin.plugin_name, &plugin.config);
+        for path in paths {
+            let slot = plugin_config_slot(&plugin.namespace, &plugin.id, &path);
+            let value = plugin_config_value_mut(&mut plugin.config, &path).ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "internal: sensitive plugin config path for slot '{slot}' disappeared during import"
+                ))
+            })?;
+            let serde_json::Value::String(text) = value else {
+                continue;
+            };
+            capture_and_redact_string(text, &slot, &mut captured, "plugin config")?;
+        }
+    }
+
+    Ok(captured)
+}
+
 fn capture_and_redact_value<'a>(
     value: &'a mut serde_json::Value,
     components: &mut Vec<SlotComponent<'a>>,
@@ -426,37 +481,7 @@ fn capture_and_redact_value<'a>(
     match value {
         serde_json::Value::String(text) => {
             let slot = join_slot_components(components);
-            if text == REDACTED_SENTINEL {
-                return Err(crate::error::Error::Config(format!(
-                    "credential slot '{slot}' contains the reserved redaction sentinel; import requires an unredacted GET /backup source"
-                )));
-            }
-            if text.starts_with("${gh-env-secret:") {
-                // A flat file exported without `--materialize` is already in
-                // the safe GitOps representation. Preserve its placeholder;
-                // storing the literal placeholder text as a bundle value
-                // would make a later resolution appear successful while
-                // still sending an unresolved placeholder to the gateway.
-                // Do not forward parser diagnostics here: malformed input can
-                // itself be secret material, and import errors must never echo
-                // a credential value.
-                let parsed = parse_placeholder(text).ok_or_else(|| {
-                    crate::error::Error::Config(format!(
-                        "credential slot '{slot}' contains a malformed gh-env-secret placeholder"
-                    ))
-                })?;
-                return parsed.map(|_| ()).map_err(|_| {
-                    crate::error::Error::Config(format!(
-                        "credential slot '{slot}' contains a malformed gh-env-secret placeholder"
-                    ))
-                });
-            }
-            let original = std::mem::replace(text, IMPORT_REQUIRED_PLACEHOLDER.to_string());
-            if captured.insert(slot.clone(), original).is_some() {
-                return Err(crate::error::Error::Config(format!(
-                    "credential slot '{slot}' is produced by multiple imported credential leaves"
-                )));
-            }
+            capture_and_redact_string(text, &slot, captured, "credential")?;
         }
         serde_json::Value::Object(fields) => {
             for (key, child) in fields {
@@ -480,6 +505,79 @@ fn capture_and_redact_value<'a>(
         }
     }
     Ok(())
+}
+
+fn capture_and_redact_string(
+    text: &mut String,
+    slot: &str,
+    captured: &mut CredentialBundle,
+    label: &str,
+) -> crate::error::Result<()> {
+    if text == REDACTED_SENTINEL {
+        return Err(crate::error::Error::Config(format!(
+            "{label} slot '{slot}' contains the reserved redaction sentinel; import requires an unredacted GET /backup source"
+        )));
+    }
+    if text.starts_with("${gh-env-secret:") {
+        // A flat file exported without `--materialize` is already in the safe
+        // GitOps representation. Preserve its placeholder; storing the literal
+        // placeholder in a bundle would only defer an unresolved-secret bug.
+        // Parser details are intentionally suppressed because malformed input
+        // can itself contain secret material.
+        let parsed = parse_placeholder(text).ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "{label} slot '{slot}' contains a malformed gh-env-secret placeholder"
+            ))
+        })?;
+        return parsed.map(|_| ()).map_err(|_| {
+            crate::error::Error::Config(format!(
+                "{label} slot '{slot}' contains a malformed gh-env-secret placeholder"
+            ))
+        });
+    }
+    let original = std::mem::replace(text, IMPORT_REQUIRED_PLACEHOLDER.to_string());
+    if captured.insert(slot.to_string(), original).is_some() {
+        return Err(crate::error::Error::Config(format!(
+            "secret slot '{slot}' is produced by multiple imported leaves"
+        )));
+    }
+    Ok(())
+}
+
+fn plugin_config_slot(namespace: &str, plugin_id: &str, path: &[ConfigPathComponent]) -> String {
+    let mut pieces = vec![
+        escape_slot_component(namespace),
+        escape_slot_component(plugin_id),
+        escape_slot_component(PLUGIN_CONFIG_SLOT_KIND),
+        "config".to_string(),
+    ];
+    pieces.extend(path.iter().map(|part| match part {
+        ConfigPathComponent::Key(key) => escape_slot_component(key),
+        ConfigPathComponent::Index(index) => format!("[{index}]"),
+    }));
+    pieces.join("/")
+}
+
+fn plugin_config_cred_key(path: &[ConfigPathComponent]) -> String {
+    let mut pieces = vec![PLUGIN_CONFIG_SLOT_KIND.to_string(), "config".to_string()];
+    pieces.extend(path.iter().map(|part| match part {
+        ConfigPathComponent::Key(key) => escape_slot_component(key),
+        ConfigPathComponent::Index(index) => format!("[{index}]"),
+    }));
+    pieces.join("/")
+}
+
+fn plugin_config_value_mut<'a>(
+    mut value: &'a mut serde_json::Value,
+    path: &[ConfigPathComponent],
+) -> Option<&'a mut serde_json::Value> {
+    for part in path {
+        value = match part {
+            ConfigPathComponent::Key(key) => value.as_object_mut()?.get_mut(key)?,
+            ConfigPathComponent::Index(index) => value.as_array_mut()?.get_mut(*index)?,
+        };
+    }
+    Some(value)
 }
 
 /// `"[12]"` → `Some(12)`; anything else → `None`.
@@ -572,6 +670,17 @@ fn report_secrets_with_mode_inner(
             walk_and_report(value, &components, bundle, &mode, constraints, &mut report)?;
         }
     }
+    for plugin in &cfg.plugin_configs {
+        let mut path = Vec::new();
+        walk_plugin_and_report(
+            &plugin.config,
+            &plugin.namespace,
+            &plugin.id,
+            &mut path,
+            bundle,
+            &mut report,
+        )?;
+    }
     // Defense-in-depth: detect any duplicate slot strings. With the escape
     // function being injective, structurally-distinct tree locations can't
     // produce the same slot — but if a future refactor breaks the
@@ -633,6 +742,20 @@ pub fn resolve_secrets_with_mode(
             ];
             walk_report_and_replace(value, &mut components, bundle, &mode, &mut report)?;
         }
+    }
+
+    for plugin in cfg.plugin_configs.iter_mut() {
+        let namespace = plugin.namespace.clone();
+        let plugin_id = plugin.id.clone();
+        let mut path = Vec::new();
+        walk_plugin_report_and_replace(
+            &mut plugin.config,
+            &namespace,
+            &plugin_id,
+            &mut path,
+            bundle,
+            &mut report,
+        )?;
     }
 
     detect_slot_collisions(&report)?;
@@ -948,6 +1071,53 @@ fn walk_and_report(
     Ok(())
 }
 
+fn walk_plugin_and_report(
+    value: &serde_json::Value,
+    namespace: &str,
+    plugin_id: &str,
+    path: &mut Vec<ConfigPathComponent>,
+    bundle: &CredentialBundle,
+    report: &mut ResolveReport,
+) -> crate::error::Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(parsed) = parse_placeholder(text) {
+                let placeholder = parsed?;
+                let slot = plugin_config_slot(namespace, plugin_id, path);
+                let existing = lookup_exact_slot_value(&slot, bundle)?;
+                let status = classify_status(&placeholder, existing);
+                report
+                    .slot_credential_types
+                    .insert(slot.clone(), PLUGIN_CONFIG_SLOT_KIND.to_string());
+                report.results.push(ResolveResult {
+                    consumer_id: plugin_id.to_string(),
+                    namespace: namespace.to_string(),
+                    cred_key: plugin_config_cred_key(path),
+                    slot,
+                    placeholder,
+                    status,
+                });
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                path.push(ConfigPathComponent::Key(key.clone()));
+                walk_plugin_and_report(child, namespace, plugin_id, path, bundle, report)?;
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                path.push(ConfigPathComponent::Index(index));
+                walk_plugin_and_report(child, namespace, plugin_id, path, bundle, report)?;
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Capture the credential type (third slot component) structurally, before it
 /// is flattened into the slot string. See
 /// [`ResolveReport::slot_credential_types`].
@@ -1014,6 +1184,56 @@ fn walk_report_and_replace<'a>(
                 components.push(SlotComponent::ArrayIndex(i));
                 walk_report_and_replace(item, components, bundle, mode, report)?;
                 components.pop();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn walk_plugin_report_and_replace(
+    value: &mut serde_json::Value,
+    namespace: &str,
+    plugin_id: &str,
+    path: &mut Vec<ConfigPathComponent>,
+    bundle: &CredentialBundle,
+    report: &mut ResolveReport,
+) -> crate::error::Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(parsed) = parse_placeholder(text) {
+                let placeholder = parsed?;
+                let slot = plugin_config_slot(namespace, plugin_id, path);
+                let existing = lookup_exact_slot_value(&slot, bundle)?;
+                let status = classify_status(&placeholder, existing);
+                report
+                    .slot_credential_types
+                    .insert(slot.clone(), PLUGIN_CONFIG_SLOT_KIND.to_string());
+                report.results.push(ResolveResult {
+                    consumer_id: plugin_id.to_string(),
+                    namespace: namespace.to_string(),
+                    cred_key: plugin_config_cred_key(path),
+                    slot,
+                    placeholder,
+                    status,
+                });
+                if let Some(replacement) = existing {
+                    *text = replacement.clone();
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                path.push(ConfigPathComponent::Key(key.clone()));
+                walk_plugin_report_and_replace(child, namespace, plugin_id, path, bundle, report)?;
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                path.push(ConfigPathComponent::Index(index));
+                walk_plugin_report_and_replace(child, namespace, plugin_id, path, bundle, report)?;
+                path.pop();
             }
         }
         _ => {}

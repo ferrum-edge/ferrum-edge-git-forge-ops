@@ -14,7 +14,8 @@ use serde::Serialize;
 use crate::config::schema::{GatewayConfig, Resource};
 use crate::http_client::BackupSnapshot;
 use crate::secrets::{
-    capture_and_redact_import_credentials, CredentialBundle, IMPORT_REQUIRED_PLACEHOLDER,
+    capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
+    CredentialBundle, IMPORT_REQUIRED_PLACEHOLDER,
 };
 
 pub const IMPORT_MANIFEST_FILENAME: &str = ".gitforgeops-import.json";
@@ -116,6 +117,10 @@ pub struct ImportResult {
     pub skipped_spec_owned: usize,
     /// Number of literal credential leaves replaced with broker placeholders.
     pub redacted_credential_values: usize,
+    /// Number of sensitive plugin-config strings replaced with broker
+    /// placeholders. This includes schema-declared endpoints/header maps and
+    /// fail-closed strings from custom plugin configs.
+    pub redacted_plugin_config_values: usize,
     /// Future/unknown top-level backup sections that this build cannot import.
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
@@ -130,6 +135,7 @@ impl ImportResult {
             && self.skipped_trust_bundles == 0
             && self.skipped_spec_owned == 0
             && self.redacted_credential_values == 0
+            && self.redacted_plugin_config_values == 0
             && self.unsupported_sections.is_empty()
         {
             return None;
@@ -161,6 +167,15 @@ impl ImportResult {
             notice.push_str(&format!(
                 "{} credential value(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
                 self.redacted_credential_values
+            ));
+        }
+        if self.redacted_plugin_config_values > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} sensitive plugin config value(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
+                self.redacted_plugin_config_values
             ));
         }
         if !self.unsupported_sections.is_empty() {
@@ -288,21 +303,33 @@ pub(crate) fn split_config_with_inventory(
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
+    let captured_plugin_config = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let credential_count = captured_credentials.len();
+    let plugin_config_count = captured_plugin_config.len();
+    let mut captured_secrets = captured_credentials;
+    for (slot, value) in captured_plugin_config {
+        if captured_secrets.insert(slot.clone(), value).is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}' is produced by both a consumer credential and plugin config"
+            )));
+        }
+    }
     let mut result = ImportResult {
         skipped_api_specs: inventory.skipped_api_specs,
         skipped_trust_bundles: inventory.skipped_trust_bundles,
         unsupported_sections: inventory.unsupported_sections,
         sources: inventory.sources,
-        redacted_credential_values: captured_credentials.len(),
+        redacted_credential_values: credential_count,
+        redacted_plugin_config_values: plugin_config_count,
         ..ImportResult::default()
     };
     if require_credential_bundle
-        && !captured_credentials.is_empty()
+        && !captured_secrets.is_empty()
         && credential_bundle_output.is_none()
     {
         return Err(crate::error::Error::Config(format!(
-            "the source contains {} live credential value(s); re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
-            captured_credentials.len()
+            "the source contains {} live secret value(s) across consumer credentials and plugin config; re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
+            captured_secrets.len()
         )));
     }
     if let Some(path) = credential_bundle_output {
@@ -388,7 +415,7 @@ pub(crate) fn split_config_with_inventory(
     // leave a published repo tree whose live credentials had already been
     // discarded from memory.
     if let Some(path) = credential_bundle_output {
-        let bundle_json = render_migration_bundles(&captured_credentials)?;
+        let bundle_json = render_migration_bundles(&captured_secrets)?;
         crate::apply::publish_private_export(
             path.to_str().ok_or_else(|| {
                 crate::error::Error::Config(format!(

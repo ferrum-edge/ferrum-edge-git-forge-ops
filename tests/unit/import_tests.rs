@@ -384,6 +384,146 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
 }
 
 #[test]
+fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    let original_plugin_config = serde_json::json!({
+        "endpoint": "https://collector.example/v1/traces?token=live-query-secret",
+        "headers": {
+            "x-honeycomb-team": "live-header-secret"
+        },
+        "protocol": "grpc"
+    });
+    config.plugin_configs.push(PluginConfig {
+        id: "otel-main".to_string(),
+        plugin_name: "otel_tracing".to_string(),
+        namespace: "ferrum".to_string(),
+        config: original_plugin_config.clone(),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("secret-migration.json");
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+            .unwrap();
+
+    assert_eq!(result.redacted_credential_values, 0);
+    assert_eq!(result.redacted_plugin_config_values, 2);
+
+    let plugin_yaml =
+        std::fs::read_to_string(output.join("ferrum/plugins/otel-main.yaml")).unwrap();
+    assert!(!plugin_yaml.contains("live-query-secret"));
+    assert!(!plugin_yaml.contains("live-header-secret"));
+    assert!(plugin_yaml.contains("protocol: grpc"));
+    assert_eq!(
+        plugin_yaml
+            .matches("${gh-env-secret:alloc=require}")
+            .count(),
+        2
+    );
+
+    let raw_bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    let (merged, _) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
+    assert_eq!(
+        merged,
+        std::collections::BTreeMap::from([
+            (
+                "ferrum/otel-main/@plugin-config/config/endpoint".to_string(),
+                "https://collector.example/v1/traces?token=live-query-secret".to_string(),
+            ),
+            (
+                "ferrum/otel-main/@plugin-config/config/headers/x-honeycomb-team".to_string(),
+                "live-header-secret".to_string(),
+            ),
+        ])
+    );
+
+    let resources = gitforgeops::config::load_resources(&output).unwrap();
+    let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
+    gitforgeops::secrets::resolve_secrets_with_mode(
+        &mut assembled,
+        &merged,
+        gitforgeops::config::env::GatewayMode::Api,
+    )
+    .unwrap();
+    assert_eq!(assembled.plugin_configs[0].config, original_plugin_config);
+}
+
+#[test]
+fn custom_plugin_import_fails_closed_for_opaque_string_config() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("secret-migration.json");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        id: "custom".to_string(),
+        plugin_name: "enterprise_custom".to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({"mode": "strict", "opaque": {"value": "possibly-secret"}}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+            .unwrap();
+    assert_eq!(result.redacted_plugin_config_values, 2);
+    let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/custom.yaml")).unwrap();
+    assert!(!plugin_yaml.contains("strict"));
+    assert!(!plugin_yaml.contains("possibly-secret"));
+}
+
+#[test]
+fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        id: "spec-otel".to_string(),
+        plugin_name: "otel_tracing".to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({"authorization": "Bearer spec-owned-secret"}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: Some("payments-v1".to_string()),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None).unwrap();
+    assert_eq!(result.skipped_spec_owned, 1);
+    assert_eq!(result.redacted_plugin_config_values, 0);
+    assert!(!output.join("ferrum/plugins/spec-otel.yaml").exists());
+}
+
+#[test]
 fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");

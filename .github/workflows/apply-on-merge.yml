@@ -92,18 +92,10 @@ jobs:
           esac
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
-      - name: Mint narrowly scoped state-writer token
-        id: state-writer
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-        with:
-          app-id: ${{ secrets.GITFORGEOPS_STATE_APP_ID }}
-          private-key: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
-          permission-contents: write
-
       - name: Check out protected main for apply
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          token: ${{ steps.state-writer.outputs.token }}
+          persist-credentials: false
 
       - name: Download ferrum-edge binary
         env:
@@ -247,6 +239,15 @@ jobs:
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
 
+      - name: Mint narrowly scoped state-writer token
+        if: ${{ !cancelled() }}
+        id: state-writer
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.GITFORGEOPS_STATE_APP_ID }}
+          private-key: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
       - name: Commit state + assembled (if changed)
         # Run on partial-failure paths too: cmd_apply persists state for the
         # successful portion of an apply BEFORE returning the deferred
@@ -266,8 +267,13 @@ jobs:
         # When the matrix runs multiple envs in parallel and they all try to
         # push to main, contention is normal — retry with rebase on rejection.
         if: ${{ !cancelled() }}
+        env:
+          STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}
         run: |
           set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "$STATE_WRITER_TOKEN" | base64 | tr -d '\n')
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
           git config user.name "gitforgeops[bot]"
           git config user.email "gitforgeops[bot]@users.noreply.github.com"
 
