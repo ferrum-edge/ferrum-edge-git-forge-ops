@@ -58,6 +58,81 @@ fn load_nonexistent_dir_returns_error() {
 }
 
 #[test]
+fn loader_rejects_a_known_resource_directory_that_is_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let namespace = tmp.path().join("team-alpha");
+    std::fs::create_dir_all(&namespace).unwrap();
+    let bad_path = namespace.join("proxies");
+    std::fs::write(&bad_path, "not a directory").unwrap();
+
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    assert!(error.contains(&bad_path.display().to_string()), "{error}");
+}
+
+#[test]
+fn loader_rejects_unknown_resource_directories_and_misplaced_yaml() {
+    for (relative, reported_relative) in [
+        ("team-alpha/proxys/api.yaml", "team-alpha/proxys"),
+        ("team-alpha/api.yaml", "team-alpha/api.yaml"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, minimal_proxy("")).unwrap();
+
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(
+            error.contains(&tmp.path().join(reported_relative).display().to_string()),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn loader_rejects_yaml_outside_a_namespace_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("api.yaml");
+    std::fs::write(&path, minimal_proxy("")).unwrap();
+
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("namespace directory"), "{error}");
+}
+
+#[test]
+fn loader_rejects_a_resource_kind_in_the_wrong_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write_resource(
+        tmp.path(),
+        "proxies",
+        "alice.yaml",
+        "kind: Consumer\nspec:\n  id: alice\n  username: alice\n",
+    );
+
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("Consumer"), "{error}");
+    assert!(error.contains("proxies"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn loader_rejects_a_symlinked_resource_root() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = tmp.path().join("resources");
+    symlink(&real, &link).unwrap();
+
+    let error = load_resources(&link).unwrap_err().to_string();
+    assert!(error.contains("symbolic links"), "{error}");
+    assert!(error.contains(&link.display().to_string()), "{error}");
+}
+
+#[test]
 fn load_skips_underscore_prefixed_files() {
     let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let resources = load_resources(&example_dir).unwrap();
@@ -65,6 +140,35 @@ fn load_skips_underscore_prefixed_files() {
         resources.is_empty(),
         "files starting with _ should be skipped"
     );
+}
+
+#[test]
+fn loader_rejects_unsupported_files_in_resource_trees() {
+    for name in ["api.YAML", "api.yam", "api.yaml.bak", "notes.txt"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_resource(tmp.path(), "proxies", name, &minimal_proxy(""));
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("unsupported file"), "{name}: {error}");
+        assert!(
+            error.contains(&path.display().to_string()),
+            "{name}: {error}"
+        );
+        assert!(error.contains("lowercase .yaml or .yml"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn loader_allows_explicit_documentation_and_disabled_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let directory = tmp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("README.md"), "resource documentation").unwrap();
+    std::fs::write(directory.join(".gitkeep"), "").unwrap();
+    std::fs::write(directory.join("_api.yaml.bak"), "intentionally disabled").unwrap();
+    std::fs::write(directory.join("api.yaml"), minimal_proxy("")).unwrap();
+
+    let resources = load_resources(tmp.path()).unwrap();
+    assert_eq!(resources.len(), 1);
 }
 
 /// `mesh/` is walked alongside the four gateway directories. It is listed last
@@ -113,4 +217,148 @@ fn load_walks_the_mesh_subdirectory_alongside_gateway_kinds() {
     for (namespace, _) in &resources {
         assert_eq!(namespace, "ferrum");
     }
+}
+
+fn write_resource(root: &std::path::Path, subdir: &str, name: &str, body: &str) -> PathBuf {
+    let directory = root.join("team-alpha").join(subdir);
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(name);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+fn minimal_proxy(extra: &str) -> String {
+    format!(
+        "kind: Proxy\nspec:\n  id: api\n  listen_path: /api\n  backend_scheme: http\n  backend_host: h\n  backend_port: 80\n{extra}"
+    )
+}
+
+#[test]
+fn loader_rejects_unknown_wrapper_and_resource_fields_with_file_and_path() {
+    for (extra, expected) in [
+        ("metadata: {}\n", ".metadata"),
+        ("spec:\n  plguins: []\n", ".spec.plguins"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = if extra.starts_with("metadata") {
+            format!("{}{}", minimal_proxy(""), extra)
+        } else {
+            // Inject the typo into the existing spec rather than creating a
+            // second YAML `spec` key.
+            minimal_proxy("  plguins: []\n")
+        };
+        let path = write_resource(tmp.path(), "proxies", "api.yaml", &body);
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains(expected), "expected {expected}: {error}");
+    }
+}
+
+#[test]
+fn loader_rejects_unknown_nested_fields_in_health_checks_and_plugin_associations() {
+    let cases = [
+        (
+            "upstreams",
+            "pool.yaml",
+            "kind: Upstream\nspec:\n  id: pool\n  targets:\n    - host: h\n      port: 80\n  health_checks:\n    active:\n      timeot_ms: 50\n",
+            "health_checks.active.timeot_ms",
+        ),
+        (
+            "proxies",
+            "api.yaml",
+            "kind: Proxy\nspec:\n  id: api\n  backend_host: h\n  backend_port: 80\n  plugins:\n    - plugin_config_id: auth\n      priorty: 10\n",
+            "plugins[0].priorty",
+        ),
+    ];
+
+    for (subdir, name, body, expected) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), subdir, name, body);
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains(expected), "expected {expected}: {error}");
+    }
+}
+
+#[test]
+fn loader_rejects_unknown_mesh_collection_but_preserves_free_form_mesh_items() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_resource(
+        tmp.path(),
+        "mesh",
+        "core.yaml",
+        "kind: MeshConfig\nspec:\n  worklaods: []\n",
+    );
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains(".spec.worklaods"), "{error}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_resource(
+        tmp.path(),
+        "mesh",
+        "core.yaml",
+        "kind: MeshConfig\nspec:\n  workloads:\n    - totally_future_field: preserved\n",
+    );
+    let resources = load_resources(tmp.path()).expect("mesh item shapes are intentionally opaque");
+    let Resource::MeshConfig { spec, .. } = &resources[0].1 else {
+        panic!("expected mesh")
+    };
+    assert_eq!(spec.workloads[0]["totally_future_field"], "preserved");
+}
+
+#[test]
+fn arbitrary_plugin_config_keys_remain_supported() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_resource(
+        tmp.path(),
+        "plugins",
+        "custom.yaml",
+        "kind: PluginConfig\nspec:\n  id: custom\n  plugin_name: custom-plugin\n  scope: global\n  config:\n    vendor_future_key:\n      nested: true\n",
+    );
+    let resources = load_resources(tmp.path()).expect("plugin config is intentionally free-form");
+    let Resource::PluginConfig { spec } = &resources[0].1 else {
+        panic!("expected plugin config")
+    };
+    assert_eq!(spec.config["vendor_future_key"]["nested"], true);
+}
+
+#[test]
+fn loader_orders_resource_paths_lexically() {
+    let tmp = tempfile::tempdir().unwrap();
+    for id in ["z-last", "a-first", "m-middle"] {
+        write_resource(
+            tmp.path(),
+            "proxies",
+            &format!("{id}.yaml"),
+            &format!("kind: Proxy\nspec:\n  id: {id}\n  backend_host: h\n  backend_port: 80\n"),
+        );
+    }
+    let resources = load_resources(tmp.path()).unwrap();
+    let ids = resources
+        .iter()
+        .map(|(_, resource)| match resource {
+            Resource::Proxy { spec } => spec.id.as_str(),
+            _ => "unexpected",
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["a-first", "m-middle", "z-last"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn loader_rejects_symlinked_files_without_reading_the_target() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside.yaml");
+    std::fs::write(&outside, minimal_proxy("")).unwrap();
+    let directory = tmp.path().join("resources/team-alpha/proxies");
+    std::fs::create_dir_all(&directory).unwrap();
+    let link = directory.join("escape.yaml");
+    symlink(&outside, &link).unwrap();
+
+    let error = load_resources(&tmp.path().join("resources"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("symbolic links"), "{error}");
+    assert!(error.contains(&link.display().to_string()), "{error}");
 }

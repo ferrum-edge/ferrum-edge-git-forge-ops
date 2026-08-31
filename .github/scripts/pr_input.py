@@ -21,6 +21,9 @@ MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 50 * 1024 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+NON_CONFIG_FILES = {"README", "README.md", ".gitkeep", ".gitforgeops-import.json"}
+
+
 class InputError(RuntimeError):
     pass
 
@@ -47,10 +50,20 @@ def _normalize_member_name(name: str) -> tuple[str, str]:
 def _is_allowed_file(relative: str) -> bool:
     path = PurePosixPath(relative)
     return (
-        len(path.parts) >= 3
+        len(path.parts) >= 2
         and path.parts[0] in {"resources", "overlays"}
         and path.suffix in {".yaml", ".yml"}
     )
+
+
+def _is_declarative_tree_file(relative: str) -> bool:
+    parts = PurePosixPath(relative).parts
+    return len(parts) >= 2 and parts[0] in {"resources", "overlays"}
+
+
+def _is_ignored_declarative_file(relative: str) -> bool:
+    name = PurePosixPath(relative).name
+    return name.startswith("_") or name in NON_CONFIG_FILES
 
 
 def _is_protected_area(relative: str) -> bool:
@@ -126,6 +139,20 @@ def prepare(archive: Path, output: Path, head_sha: str) -> dict[str, object]:
             if protected and not (member.isdir() or member.isfile()):
                 raise InputError(
                     f"special files are forbidden in declarative input: {relative}"
+                )
+            if (
+                member.isfile()
+                and _is_declarative_tree_file(relative)
+                and not _is_allowed_file(relative)
+            ):
+                if _is_ignored_declarative_file(relative):
+                    continue
+                raise InputError(
+                    "unsupported file in declarative input: "
+                    f"{relative} (configuration must use lowercase .yaml or .yml; "
+                    "intentionally disabled files must start with '_'; non-configuration "
+                    "files are limited to README, README.md, .gitkeep, or "
+                    ".gitforgeops-import.json)"
                 )
             if not _is_allowed_file(relative):
                 continue

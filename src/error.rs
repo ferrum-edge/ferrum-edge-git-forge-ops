@@ -14,6 +14,21 @@ pub enum Error {
         source: serde_yaml::Error,
     },
 
+    #[error("unknown configuration field(s) in {path}: {fields}")]
+    UnknownFields { path: PathBuf, fields: String },
+
+    #[error("failed to traverse configuration tree at {path}: {source}")]
+    WalkDir {
+        path: PathBuf,
+        source: walkdir::Error,
+    },
+
+    #[error("symbolic links are not allowed in configuration trees: {0}")]
+    ConfigSymlink(PathBuf),
+
+    #[error("configuration path exists but is not a directory: {0}")]
+    ConfigNotDirectory(PathBuf),
+
     #[error("unknown resource kind {kind:?} in {path}")]
     UnknownKind { kind: String, path: PathBuf },
 

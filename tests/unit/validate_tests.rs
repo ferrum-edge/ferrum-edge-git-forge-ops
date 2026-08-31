@@ -68,15 +68,25 @@ fn validator_output_cannot_echo_literal_or_resolved_credentials() {
         permissions.set_mode(0o700);
         std::fs::set_permissions(&validator, permissions).unwrap();
 
-        let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
-        assert!(!result.success);
-        assert!(!result.stdout.contains(secret), "{}", result.stdout);
-        assert!(!result.stderr.contains(secret), "{}", result.stderr);
-        assert!(
-            result.stderr.contains("diagnostics were suppressed"),
-            "{}",
-            result.stderr
-        );
+        match run_validation(&config, validator.to_str().unwrap()) {
+            Ok(result) => {
+                assert_eq!(exit_code, 1);
+                assert!(!result.success);
+                assert!(!result.stdout.contains(secret), "{}", result.stdout);
+                assert!(!result.stderr.contains(secret), "{}", result.stderr);
+                assert!(
+                    result.stderr.contains("diagnostics were suppressed"),
+                    "{}",
+                    result.stderr
+                );
+            }
+            Err(error) => {
+                assert_eq!(exit_code, 2);
+                let message = error.to_string();
+                assert!(!message.contains(secret), "{message}");
+                assert!(message.contains("diagnostics were suppressed"), "{message}");
+            }
+        }
     }
 }
 
@@ -179,6 +189,46 @@ fn env_scrub_targets_only_ferrum_variables() {
 fn env_scrub_keeps_the_child_environment_usable() {
     let scrubbed = scrubbed_env_names(["PATH", "HOME", "LANG", "SSL_CERT_FILE"]);
     assert!(scrubbed.is_empty(), "{scrubbed:?}");
+}
+
+#[cfg(unix)]
+fn executable_validator(exit_code: i32) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("ferrum-edge-test-validator");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf '%s\\n' validator-diagnostic >&2\nexit {exit_code}\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    temp
+}
+
+#[cfg(unix)]
+#[test]
+fn validator_exit_one_is_a_completed_schema_rejection() {
+    let temp = executable_validator(1);
+    let path = temp.path().join("ferrum-edge-test-validator");
+
+    let result = run_validation(&Default::default(), path.to_str().unwrap()).unwrap();
+    assert!(!result.success);
+    assert_eq!(result.exit_code, 1);
+    assert!(result.stderr.contains("validator-diagnostic"));
+}
+
+#[cfg(unix)]
+#[test]
+fn abnormal_validator_exit_is_an_execution_error() {
+    let temp = executable_validator(2);
+    let path = temp.path().join("ferrum-edge-test-validator");
+
+    let error = run_validation(&Default::default(), path.to_str().unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exited with code 2"), "{error}");
+    assert!(error.contains("validator-diagnostic"), "{error}");
 }
 
 /// A mesh document is validated in a different ferrum-edge mode than a gateway

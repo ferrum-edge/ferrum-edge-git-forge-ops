@@ -268,11 +268,11 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 - `src/main.rs` — async Tokio entry, command dispatch
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
-- `src/config/` — `schema.rs` (permissive serde mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and `MeshConfigSpec`), `loader.rs` (walks `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (overlay deep-merge via `serde_json::Value`, `merge_mesh_fragments`, `normalize_consumer_credentials`), `env.rs` (process-env vars), `repo_config.rs` (`.gitforgeops/config.yaml`), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
+- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (unknown-field detection with full YAML paths, lowercase-extension enforcement, and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization), `env.rs` (strict process-env parsing), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs`, `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
-- `src/policy/` — `config.rs` (yaml + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
+- `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
 - `src/secrets/` — `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
 - `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
@@ -285,7 +285,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 ### Key Design Principles
 
-1. **Permissive schema** — Serde types mirror Ferrum Edge but accept unknown fields. The gateway (via `validate`) is the authoritative schema.
+1. **Fail-closed typed schema, explicit opaque islands** — wrapper/resource/nested keys unknown to this companion version are rejected with source file + YAML path before lossy re-serialization. Intentionally free-form plugin `config`, credential maps, and per-item mesh values round-trip unchanged to the authoritative gateway validator.
 2. **Path-component sanitization** — resource `namespace` and `id` flow into filesystem paths during `import`. `import::safe_path_component` rejects `..`, `/`, `\`, null bytes, and empty strings before `Path::join` to prevent traversal.
 3. **No public credential oracles** — the state ledger stores only managed-resource keys plus a constant marker and non-secret credential delivery metadata. It never hashes resolved Consumers or credential values.
 4. **Namespace-scoped operations** — every API call, diff entry, and breaking-change lookup keys on `(namespace, id)`, never `id` alone.
@@ -304,17 +304,19 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace)
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)
-- `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge)
+- `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge; a configured missing directory is fatal)
 - `FERRUM_EDGE_BINARY_PATH` (default `ferrum-edge` on `$PATH`)
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)
 - `FERRUM_MESH_FILE_OUTPUT_PATH` (default `./assembled/mesh.yaml`) — standalone `{version, mesh}` document; separate file from the gateway doc, written by `export` and file-mode `apply` whenever the repo declares any `MeshConfig`
-- `FERRUM_TLS_NO_VERIFY` (dev only)
+- `FERRUM_TLS_NO_VERIFY` (dev only; accepted values `true|false|1|0`)
 - `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` — base64-encoded PEM. mTLS requires BOTH cert and key; setting only one is rejected.
 - `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` (default `10`) — TCP/TLS handshake cap
 - `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` (default `60`) — end-to-end request cap; raise for large `/backup` or slow `/restore`
 - `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` (default `10`) — same shape, for `gitforgeops review --pr N`
 - `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` (default `30`) — GitHub API call is small; 30s is plenty
 - `FERRUM_GATEWAY_MAX_RETRIES` (default `3`) — retries connection-establishment failures and transient responses for reads/idempotent PUT/DELETE calls; exponential backoff 500ms·2^n capped at 8s, or `Retry-After` (capped 30s). Create/batch POST responses are never retried; restore retries only an explicit `503 failure_class=connectivity` pre-commit failure.
+
+Absent/blank env values use defaults; every present invalid enum, boolean, or integer fails before loading resources or credentials. `plan` / `review` treat validator execution failure as `ERROR` and return nonzero, never as a passed/skipped validation.
 
 ## Testing
 

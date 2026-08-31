@@ -4,6 +4,7 @@ pub mod loader;
 pub mod repo_config;
 pub mod resolved;
 pub mod schema;
+mod strict;
 
 pub use assembler::{
     apply_overlay, assemble, assemble_with_namespace_filter, merge_mesh_fragments, AssembledOutput,

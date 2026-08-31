@@ -106,6 +106,66 @@ class PrInputTests(unittest.TestCase):
                 with self.assertRaisesRegex(pr_input.InputError, expected):
                     pr_input.prepare(archive, temp / "output", HEAD_SHA)
 
+    def test_prepare_rejects_unsupported_declarative_file_extensions(self):
+        for name in [
+            "resources/team/proxies/api.YAML",
+            "resources/team/proxies/api.yam",
+            "resources/team/proxies/api.yaml.bak",
+            "overlays/prod/team/proxies/api.json",
+        ]:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                temp = Path(temp)
+                archive = temp / "pr.tar.gz"
+
+                def extra(bundle):
+                    add_file(bundle, f"repo-root/{name}", "kind: Proxy\nspec: {}\n")
+
+                make_archive(archive, extra)
+                with self.assertRaisesRegex(pr_input.InputError, "unsupported file"):
+                    pr_input.prepare(archive, temp / "output", HEAD_SHA)
+
+    def test_prepare_allows_documentation_and_intentionally_disabled_files(self):
+        def extra(bundle):
+            add_file(bundle, "repo-root/resources/team/proxies/README.md", "docs")
+            add_file(bundle, "repo-root/resources/team/proxies/.gitkeep", "")
+            add_file(
+                bundle,
+                "repo-root/resources/.gitforgeops-import.json",
+                '{"schema_version": 1}',
+            )
+            add_file(
+                bundle,
+                "repo-root/resources/team/proxies/_api.yaml.bak",
+                "disabled",
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            archive = temp / "pr.tar.gz"
+            output = temp / "output"
+            make_archive(archive, extra)
+            manifest = pr_input.prepare(archive, output, HEAD_SHA)
+            self.assertEqual(
+                [entry["path"] for entry in manifest["files"]],
+                ["resources/team/proxies/api.yaml"],
+            )
+
+    def test_prepare_preserves_misplaced_lowercase_yaml_for_strict_validation(self):
+        def extra(bundle):
+            add_file(bundle, "repo-root/resources/api.yaml", "kind: Proxy\nspec: {}\n")
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            archive = temp / "pr.tar.gz"
+            output = temp / "output"
+            make_archive(archive, extra)
+            manifest = pr_input.prepare(archive, output, HEAD_SHA)
+            self.assertIn(
+                "resources/api.yaml",
+                [entry["path"] for entry in manifest["files"]],
+            )
+            pr_input.verify(output, HEAD_SHA)
+
     def test_verify_rejects_unexpected_and_tampered_files(self):
         for mutation, expected in [
             ("unexpected", "path set differs"),

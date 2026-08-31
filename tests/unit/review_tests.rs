@@ -6,7 +6,8 @@ use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::review::enforce_required_comment_delivery;
 use gitforgeops::review::pr_comment::{
-    build_review_comment, build_review_comment_v2, render_spec_owned, MAX_REVIEW_COMMENT_BYTES,
+    build_review_comment, build_review_comment_v2, build_review_comment_with_status,
+    render_spec_owned, ReviewValidationStatus, MAX_REVIEW_COMMENT_BYTES,
 };
 use gitforgeops::secrets::ResolveReport;
 
@@ -20,6 +21,57 @@ fn review_comment_shows_validation_pass() {
 fn review_comment_shows_validation_fail() {
     let comment = build_review_comment(false, "some error", &[], &[], &[], &[], None);
     assert!(comment.contains("FAIL"));
+}
+
+#[test]
+fn review_comment_renders_validator_execution_failure_as_error_never_passed() {
+    let comment = build_review_comment_with_status(
+        ReviewValidationStatus::ExecutionError,
+        "Validator execution error: binary not found",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+    assert!(comment.contains("Validation: ERROR"), "{comment}");
+    assert!(comment.contains("binary not found"), "{comment}");
+    assert!(!comment.contains("Validation: PASSED"), "{comment}");
+}
+
+#[test]
+fn review_comment_contains_backticks_in_validator_output_safely() {
+    let comment = build_review_comment_with_status(
+        ReviewValidationStatus::ExecutionError,
+        "bad value ```\n### injected heading",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("````\nbad value ```"), "{comment}");
+    assert!(comment.contains("injected heading\n````"), "{comment}");
+}
+
+#[test]
+fn review_comment_bounds_validator_output() {
+    let comment = build_review_comment_with_status(
+        ReviewValidationStatus::Rejected,
+        &"x".repeat(20_000),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(
+        comment.contains("[validator output truncated]"),
+        "{comment}"
+    );
+    assert!(comment.len() < 13_000, "{}", comment.len());
 }
 
 #[test]
@@ -37,6 +89,32 @@ fn review_comment_includes_changes_table() {
 }
 
 #[test]
+fn review_comment_escapes_untrusted_fields_outside_validator_output() {
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Proxy".to_string(),
+        id: "row` | forged |\n### Fake pass".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![],
+    }];
+    let comment = build_review_comment(
+        true,
+        "",
+        &diffs,
+        &[],
+        &[],
+        &[],
+        Some("gateway failed\n### Forged heading @reviewers <img src=x>"),
+    );
+
+    assert!(!comment.contains("\n### Forged heading"), "{comment}");
+    assert!(!comment.contains("@reviewers"), "{comment}");
+    assert!(!comment.contains("| forged |"), "{comment}");
+    assert!(comment.contains("&#64;reviewers"), "{comment}");
+    assert!(comment.contains("&lt;img src=x&gt;"), "{comment}");
+}
+
+#[test]
 fn review_comment_includes_breaking_changes() {
     let breaking = vec![BreakingChange {
         kind: "Proxy".to_string(),
@@ -44,7 +122,7 @@ fn review_comment_includes_breaking_changes() {
         reason: "listen_path changed".to_string(),
     }];
     let comment = build_review_comment(true, "", &[], &breaking, &[], &[], None);
-    assert!(comment.contains("listen_path changed"));
+    assert!(comment.contains("listen\\_path changed"));
     assert!(comment.contains("Breaking"));
 }
 
@@ -393,10 +471,13 @@ fn review_comment_is_utf8_safe_bounded_and_reports_omissions() {
     );
     assert!(comment.is_char_boundary(comment.len()));
     assert!(comment.contains("omitted"), "{comment}");
-    assert_eq!(
-        comment.matches("```").count(),
-        2,
-        "validation fence must stay balanced: {comment}"
+    assert!(
+        comment.contains("````\nerror before embedded fence ```"),
+        "validator-controlled backticks must remain inside a longer fence: {comment}"
+    );
+    assert!(
+        comment.contains("\n````\n\n"),
+        "validation fence must close cleanly: {comment}"
     );
 }
 

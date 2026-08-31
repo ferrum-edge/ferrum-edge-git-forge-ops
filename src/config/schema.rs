@@ -903,19 +903,19 @@ impl Default for GatewayConfig {
 
 // --- Mesh configuration ---
 
-/// Permissive mirror of the **user-authored** fields of ferrum-edge's
-/// `modes::mesh::config::MeshConfig`.
+/// Typed top-level mirror of the **user-authored** fields of ferrum-edge's
+/// `modes::mesh::config::MeshConfig`, with deliberately opaque collection
+/// items.
 ///
 /// # Why this is not a deep mirror
 ///
-/// ferrum-edge's `MeshConfig` is *not* `deny_unknown_fields`, and
-/// `ferrum-edge validate -m mesh` is the authoritative validator for its
-/// contents (gitforgeops shells out to it for every mesh document it
-/// produces). Mirroring the ~40 nested Istio-shaped types would buy nothing
-/// but a second, always-stale schema — so the top level is typed (one field
-/// per mesh collection, which is what fragment merging and overlay identity
-/// need) and every per-item shape stays a `serde_json::Value` that
-/// round-trips verbatim.
+/// `ferrum-edge validate -m mesh` is the authoritative validator for contents
+/// (gitforgeops shells out to it for every mesh document it produces).
+/// Mirroring the ~40 nested Istio-shaped types would buy nothing but a second,
+/// always-stale schema, so every per-item shape stays a `serde_json::Value`
+/// that round-trips verbatim. The companion still enumerates top-level
+/// collections because fragment merging needs them; the strict loader rejects
+/// an unknown collection instead of silently dropping it before validation.
 ///
 /// # What is deliberately absent
 ///

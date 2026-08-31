@@ -721,6 +721,63 @@ overrides:
     assert!(err.to_string().contains("admin"));
 }
 
+#[test]
+fn policy_config_rejects_unknown_fields_at_every_owned_level() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let cases = [
+        ("future_top_level", "version: 1\nfuture_top_level: true\n"),
+        (
+            "future_rule",
+            "version: 1\npolicies:\n  future_rule:\n    enabled: true\n",
+        ),
+        (
+            "enabeld",
+            "version: 1\npolicies:\n  backend_scheme:\n    enabeld: true\n",
+        ),
+        (
+            "maximum",
+            "version: 1\npolicies:\n  proxy_timeout_bands:\n    read_timeout_ms:\n      maximum: 1000\n",
+        ),
+        (
+            "allow_triage",
+            "version: 1\noverrides:\n  allow_triage: true\n",
+        ),
+    ];
+
+    for (unknown, yaml) in cases {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let error = load_policies_from_path(file.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(unknown), "{message}");
+        assert!(
+            message.contains(&file.path().display().to_string()),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn policy_config_rejects_unsupported_versions() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(b"version: 2\n").unwrap();
+    let error = load_policies_from_path(file.path()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("version 2"), "{message}");
+    assert!(message.contains("expected version 1"), "{message}");
+    assert!(
+        message.contains(&file.path().display().to_string()),
+        "{message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Plugin catalog + scope merge
 // ---------------------------------------------------------------------------

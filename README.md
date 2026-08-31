@@ -90,6 +90,27 @@ overlays can narrow lists such as `allowed_methods`, `hosts`,
 additive and merge by item identity, as are a mesh fragment's `spec.workloads`
 (by `spiffe_id`) and `spec.services` (by `name` + `namespace`).
 
+Input loading is fail-closed and deterministic. A selected overlay must exist;
+every resource/overlay path is sorted before parsing; walker errors propagate;
+symlinks anywhere in `resources/` or the selected overlay are rejected; and
+duplicate overlay targets name both source files instead of depending on
+filesystem order. Gateway overlay fragments require `kind` and `spec.id`;
+mesh fragments use an explicit `id` or their non-empty filename stem. Enabled
+configuration files must use lowercase `.yaml` or `.yml`. Files beginning with
+`_` are intentionally disabled, and only `README`, `README.md`, `.gitkeep`,
+and the generated `.gitforgeops-import.json` inventory are accepted as
+non-configuration files inside declarative trees; spellings
+such as `.YAML`, `.yam`, or `.yaml.bak` fail instead of disappearing from the
+desired inventory. The trusted-review archive applies the same rule before it
+crosses the privileged data boundary.
+
+The typed companion schema also rejects unknown wrapper, resource, and nested
+object keys before assembly, reporting the source file and full YAML path.
+This prevents a typo such as `spec.plguins` from disappearing before the
+authoritative `ferrum-edge validate` pass. Deliberately opaque values remain
+lossless and forward-compatible: arbitrary plugin `config`, consumer
+credential maps, and per-item mesh resource objects are preserved verbatim.
+
 ### Proxy backend scheme
 
 A proxy declares its backend wire scheme with `backend_scheme`, one of six values: `http`, `https`, `tcp`, `tcps`, `udp`, `dtls`. WebSocket and gRPC are detected per request rather than declared, and HTTP/3 is negotiated per backend, so the older wider variant set is gone.
@@ -133,6 +154,13 @@ default_environment: staging
 ```
 
 The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
+
+Repository and policy configuration are closed, versioned contracts. Both
+`.gitforgeops/config.yaml` and `.gitforgeops/policies.yaml` currently accept
+exactly `version: 1`; future versions and unknown keys at any typed level fail
+with the source path and offending key. This is intentionally stricter than
+the Ferrum Edge resource mirror, whose documented free-form plugin,
+credential, and mesh-item values remain forward-compatible.
 
 ## Ownership modes
 
@@ -719,6 +747,13 @@ verify the exact bypass actor. The repository-level
 scheduled default-branch settings audit. See
 [GitHub launch controls](docs/github-launch-controls.md).
 
+Absent or blank runtime values use the documented defaults. Present values are
+validated before repository loading, credential access, client construction,
+or file output: unknown modes/strategies/roles, invalid booleans, malformed or
+overflowing integers, and zero/negative timeout or JWT TTL values are errors.
+Mode and boolean names are trimmed and case-insensitive; accepted booleans are
+`true`, `false`, `1`, and `0`.
+
 ### Docker Hub secrets (upstream maintainers / forks publishing their own image only)
 
 **Forks don't need these.** The `release` workflow is gated; forks consume the already-published `ferrumedge/ferrum-edge-git-forge-ops` image and skip the build.
@@ -762,6 +797,12 @@ Runtime variables supported by the binary include:
 | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for GitHub API calls. |
 | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` | `30` | End-to-end GitHub API request timeout. |
 | `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Retries connection-establishment errors and transient responses for reads/idempotent writes; create/batch POST responses are never replayed. `0` disables retries. |
+
+`plan` and `review` fail closed if the validator cannot be started or executed.
+Plan prints `Validation: ERROR` and exits nonzero; review renders
+`Validation: ERROR` with a bounded diagnostic before returning nonzero. A
+schema rejection remains `FAILED`, and only a completed successful validation
+is `PASSED`.
 
 ## CLI reference
 

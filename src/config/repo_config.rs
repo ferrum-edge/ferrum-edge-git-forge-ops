@@ -16,6 +16,7 @@ pub enum OwnershipMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DriftAlertOn {
     #[serde(default = "default_true")]
     pub managed_modified: bool,
@@ -30,6 +31,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnershipConfig {
     #[serde(default)]
     pub mode: OwnershipMode,
@@ -64,6 +66,7 @@ impl Default for OwnershipConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     pub overlay: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +89,7 @@ impl Default for EnvironmentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -124,7 +128,7 @@ impl RepoConfig {
                 path: path.to_path_buf(),
                 source,
             })?;
-        config.validate()?;
+        config.validate(path)?;
         Ok(Some(config))
     }
 
@@ -163,7 +167,15 @@ impl RepoConfig {
             .collect()
     }
 
-    fn validate(&self) -> crate::error::Result<()> {
+    fn validate(&self, path: &Path) -> crate::error::Result<()> {
+        if self.version != 1 {
+            return Err(crate::error::Error::Config(format!(
+                "unsupported repository config version {} in {}; expected version 1",
+                self.version,
+                path.display()
+            )));
+        }
+
         // An empty `environments` map is almost always an operator
         // mistake (e.g., commenting out every entry). `cmd_envs` would
         // emit `[]`, and the matrix-job workflows gate on

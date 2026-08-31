@@ -429,3 +429,59 @@ environments: {}
         "expected an empty-environments error, got: {err}"
     );
 }
+
+#[test]
+fn repo_config_rejects_unknown_fields_at_every_owned_level() {
+    let cases = [
+        (
+            "future_top_level",
+            "version: 1\nenvironments:\n  staging: {}\nfuture_top_level: true\n",
+        ),
+        (
+            "future_environment",
+            "version: 1\nenvironments:\n  staging:\n    future_environment: true\n",
+        ),
+        (
+            "future_ownership",
+            "version: 1\nenvironments:\n  staging:\n    ownership:\n      future_ownership: true\n",
+        ),
+        (
+            "future_drift_flag",
+            "version: 1\nenvironments:\n  staging:\n    ownership:\n      drift_alert_on:\n        future_drift_flag: true\n",
+        ),
+    ];
+
+    for (unknown, yaml) in cases {
+        let file = write_repo_config(yaml);
+        let error = RepoConfig::load_from_path(file.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(unknown), "{message}");
+        assert!(
+            message.contains(&file.path().display().to_string()),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn repo_config_rejects_unsupported_versions() {
+    let file = write_repo_config("version: 2\nenvironments:\n  staging: {}\n");
+    let error = RepoConfig::load_from_path(file.path()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("version 2"), "{message}");
+    assert!(message.contains("expected version 1"), "{message}");
+    assert!(
+        message.contains(&file.path().display().to_string()),
+        "{message}"
+    );
+}
+
+#[test]
+fn shipped_repo_config_example_satisfies_the_closed_schema() {
+    let path = std::path::Path::new(".gitforgeops/config.example.yaml");
+    let config = RepoConfig::load_from_path(path)
+        .expect("the shipped example must parse")
+        .expect("the shipped example must exist");
+    assert_eq!(config.version, 1);
+    assert_eq!(config.default_environment.as_deref(), Some("staging"));
+}

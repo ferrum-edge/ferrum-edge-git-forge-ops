@@ -122,7 +122,7 @@ fn load_repo_config() -> Result<Option<RepoConfig>, Box<dyn std::error::Error>> 
 fn resolve_runtime(
     explicit_env: Option<&str>,
 ) -> Result<(EnvConfig, ResolvedEnv, Option<RepoConfig>), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
+    let env_config = config::load_env_config()?;
     let repo = load_repo_config()?;
     let resolved = resolve_env(repo.as_ref(), &env_config, explicit_env)?;
     Ok((env_config, resolved, repo))
@@ -141,9 +141,7 @@ fn load_and_assemble_all(
 
     if let Some(ref overlay_name) = resolved.overlay {
         let overlay_dir = PathBuf::from("./overlays").join(overlay_name);
-        if overlay_dir.is_dir() {
-            config::apply_overlay(&mut resources, &overlay_dir)?;
-        }
+        config::apply_overlay(&mut resources, &overlay_dir)?;
     }
 
     // The namespace filter is applied to mesh fragments during assembly (a
@@ -722,10 +720,9 @@ fn mesh_summary_line(mesh: &config::MeshConfigSpec) -> String {
 /// Print one document's plan-time validation verdict and return whether it
 /// counts as passing.
 ///
-/// A missing `ferrum-edge` binary is SKIPPED-not-failed, matching the
-/// pre-existing behavior: `plan` is a preview and should still show the diff
-/// on a machine without the gateway binary installed. `apply` treats the same
-/// condition as fatal.
+/// Failure to start or execute `ferrum-edge` is an ERROR, not a successful
+/// skip. A plan is a launch safety signal and must fail closed when the
+/// authoritative validator did not run.
 fn report_plan_validation(
     label: &str,
     result: &Result<validate::ValidationResult, gitforgeops::error::Error>,
@@ -741,8 +738,8 @@ fn report_plan_validation(
             r.success
         }
         Err(e) => {
-            println!("{label}: SKIPPED ({e})");
-            true
+            println!("{label}: ERROR ({e})");
+            false
         }
     }
 }
@@ -1944,9 +1941,25 @@ async fn cmd_review(
             .unwrap_or(false);
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
-    let (validation_ok, validation_output) = match &val_result {
-        Ok(r) => (r.success, format!("{}{}", r.stdout, r.stderr)),
-        Err(e) => (true, format!("Validation skipped: {}", e)),
+    let (validation_status, validation_output, validation_execution_error) = match &val_result {
+        Ok(r) if r.success => (
+            review::ReviewValidationStatus::Passed,
+            format!("{}{}", r.stdout, r.stderr),
+            None,
+        ),
+        Ok(r) => (
+            review::ReviewValidationStatus::Rejected,
+            format!("{}{}", r.stdout, r.stderr),
+            None,
+        ),
+        Err(e) => {
+            let message = format!("Validator execution error: {e}");
+            (
+                review::ReviewValidationStatus::ExecutionError,
+                message,
+                Some(e.to_string()),
+            )
+        }
     };
 
     let state = StateFile::load(&resolved.name)?;
@@ -2032,8 +2045,8 @@ async fn cmd_review(
         resolved.name, resolved.ownership.mode, resolved.apply_strategy
     );
 
-    let comment = review::build_review_comment_v2(
-        validation_ok,
+    let comment = review::build_review_comment_v2_with_status(
+        validation_status,
         &validation_output,
         &diffs,
         &breaking,
@@ -2090,6 +2103,9 @@ async fn cmd_review(
     }
 
     let _ = !secret_report.results.is_empty();
+    if let Some(error) = validation_execution_error {
+        return Err(format!("validator execution failed during review: {error}").into());
+    }
     Ok(())
 }
 
