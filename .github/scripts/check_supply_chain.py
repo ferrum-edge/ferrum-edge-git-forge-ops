@@ -26,6 +26,52 @@ USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 
 
+def trusted_classifier_violations(
+    workflow: str, text: str, trusted_invocation: str, expected_count: int
+) -> list[str]:
+    violations: list[str] = []
+    if text.count(trusted_invocation) != expected_count:
+        violations.append(
+            f"{workflow}: path scope must run exactly {expected_count} base-SHA trusted classifier invocation(s)"
+        )
+    if "ref: ${{ github.event.pull_request.base.sha }}" not in text:
+        violations.append(
+            f"{workflow}: trusted classifier checkout must pin the PR base SHA"
+        )
+    if "result=$(python3 .github/scripts/changed_files.py" in text:
+        violations.append(
+            f"{workflow}: path scope must not invoke the candidate-branch classifier"
+        )
+    return violations
+
+
+def state_writer_token_violations(
+    workflow: str, text: str, commit_step: str
+) -> list[str]:
+    violations: list[str] = []
+    if "token: ${{ steps.state-writer.outputs.token }}" in text:
+        violations.append(
+            f"{workflow}: state-writer token must not be persisted by checkout"
+        )
+    install_index = text.rfind("run: cargo install --path . --locked")
+    mint_index = text.find("- name: Mint narrowly scoped state-writer token")
+    commit_index = text.find(commit_step)
+    if not (install_index >= 0 and install_index < mint_index < commit_index):
+        violations.append(
+            f"{workflow}: state-writer token must be minted after untrusted builds and immediately before state persistence"
+        )
+    for required in (
+        "STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}",
+        "git config --local http.https://github.com/.extraheader",
+        "git config --local --unset-all http.https://github.com/.extraheader",
+    ):
+        if required not in text:
+            violations.append(
+                f"{workflow}: ephemeral push authentication is missing {required!r}"
+            )
+    return violations
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -86,6 +132,17 @@ def main() -> int:
         violations.append("release.yml: image provenance and SBOM must both be enabled")
     if "actions/attest-build-provenance@" not in release:
         violations.append("release.yml: signed GitHub build provenance is missing")
+    for required in (
+        "authorize-release:",
+        "needs: authorize-release",
+        "release commit must map to exactly one merged PR",
+        'gh pr checks "$pr" --repo "$REPO" --required',
+        "GitForgeOps PR Static Validation / required-static-validation",
+    ):
+        if required not in release:
+            violations.append(
+                f"release.yml: missing checked-merge publication gate {required!r}"
+            )
 
     apply_workflow = (WORKFLOWS / "apply-on-merge.yml").read_text(encoding="utf-8")
     if "vars.FERRUM_GATEWAY_MODE != 'file'" in apply_workflow:
@@ -117,12 +174,46 @@ def main() -> int:
                 f"{privileged_workflow}: malformed credential bundles must not fail open"
             )
 
-    for rename_sensitive_workflow in ("rust-ci.yml", "state-guard.yml"):
+    for rename_sensitive_workflow, trusted_invocation, expected_count in (
+        (
+            "rust-ci.yml",
+            "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
+            2,
+        ),
+        (
+            "state-guard.yml",
+            "helper=trusted-guard/.github/scripts/changed_files.py",
+            1,
+        ),
+        (
+            "validate-pr.yml",
+            "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
+            1,
+        ),
+    ):
         text = (WORKFLOWS / rename_sensitive_workflow).read_text(encoding="utf-8")
-        if ".github/scripts/changed_files.py" not in text:
-            violations.append(
-                f"{rename_sensitive_workflow}: path scope must inspect current and previous rename paths"
+        violations.extend(
+            trusted_classifier_violations(
+                rename_sensitive_workflow,
+                text,
+                trusted_invocation,
+                expected_count,
             )
+        )
+    state_guard = (WORKFLOWS / "state-guard.yml").read_text(encoding="utf-8")
+    if 'result=$(python3 "$helper"' not in state_guard:
+        violations.append(
+            "state-guard.yml: classifier execution must use the trusted helper variable"
+        )
+
+    for state_workflow, commit_step in (
+        ("apply-on-merge.yml", "- name: Commit state + assembled (if changed)"),
+        ("rotate.yml", "- name: Commit state update"),
+    ):
+        text = (WORKFLOWS / state_workflow).read_text(encoding="utf-8")
+        violations.extend(
+            state_writer_token_violations(state_workflow, text, commit_step)
+        )
 
     static_review = (WORKFLOWS / "validate-pr.yml").read_text(encoding="utf-8")
     if re.search(r"^ {4}environment\s*:", static_review, re.MULTILINE):
@@ -134,7 +225,8 @@ def main() -> int:
             "validate-pr.yml: a path-filtered workflow cannot provide a stable required check"
         )
     for required in (
-        ".github/scripts/changed_files.py",
+        "trusted-scope/.github/scripts/changed_files.py",
+        "ref: ${{ github.event.pull_request.base.sha }}",
         "required-static-validation:",
         "if: always()",
     ):
