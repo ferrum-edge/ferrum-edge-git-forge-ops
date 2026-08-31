@@ -341,6 +341,7 @@ jobs:
         id: validator
         env:
           FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'release-379454492' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           bash trusted/.github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
 

@@ -232,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         "steps.deployment-mode.outputs.mode == 'api'",
         "steps.deployment-mode.outputs.mode == 'file'",
         ".github/scripts/merge_context.py",
+        "if ! gh api",
     ):
         if required not in apply_workflow:
             violations.append(
@@ -418,10 +419,27 @@ def main(argv: list[str] | None = None) -> int:
         "expected_sha256",
         "published_sha256",
         "actual_sha256",
+        "Authorization: Bearer",
     ):
         if required not in installer:
             violations.append(
-                f"install-ferrum-edge.sh: missing {required} checksum comparison"
+                f"install-ferrum-edge.sh: missing required validator installer control {required!r}"
+            )
+    for workflow_name in (
+        "apply-on-merge.yml",
+        "drift-check.yml",
+        "trusted-pr-review.yml",
+        "validate-pr.yml",
+    ):
+        workflow_text = (root / ".github" / "workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        if (
+            "install-ferrum-edge.sh" in workflow_text
+            and "GITHUB_TOKEN: ${{ github.token }}" not in workflow_text
+        ):
+            violations.append(
+                f"{workflow_name}: validator download must use the authenticated GitHub asset API"
             )
     if "FERRUM_EDGE_SHA256" in "\n".join(
         workflow.read_text(encoding="utf-8") for workflow in checked_action_files

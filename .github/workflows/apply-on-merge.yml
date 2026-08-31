@@ -100,6 +100,7 @@ jobs:
       - name: Download ferrum-edge binary
         env:
           FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'release-379454492' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           bash .github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
 
@@ -165,8 +166,13 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           context=
           for attempt in 1 2 3 4 5; do
-            gh api "repos/${REPO}/commits/${PUSH_SHA}/pulls?per_page=100" \
-              --paginate --slurp > "$pages_file"
+            context=
+            if ! gh api "repos/${REPO}/commits/${PUSH_SHA}/pulls?per_page=100" \
+              --paginate --slurp > "$pages_file"; then
+              echo "Merge-association API request failed; retrying ($attempt/5)." >&2
+              if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+              continue
+            fi
             if context=$(python3 .github/scripts/merge_context.py \
               "$pages_file" "$PUSH_SHA" "$BASE_BRANCH"); then
               break

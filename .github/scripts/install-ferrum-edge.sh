@@ -39,6 +39,10 @@ trap 'rm -rf -- "$tmp_dir"' EXIT
 binary="$tmp_dir/$asset"
 checksum="$tmp_dir/$asset.sha256"
 asset_api="https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/assets"
+curl_auth=()
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  curl_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+fi
 
 # Fetch both publisher artifacts by immutable GitHub asset ID, rather than by
 # a movable tag. The repository-pinned digest below remains the trust anchor:
@@ -46,12 +50,14 @@ asset_api="https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/assets"
 # also fail the checked-in SHA-256 comparison.
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   --retry 3 --retry-connrefused \
+  "${curl_auth[@]}" \
   -H 'Accept: application/octet-stream' \
   -H 'X-GitHub-Api-Version: 2022-11-28' \
   -H 'User-Agent: gitforgeops-validator-installer' \
   "$asset_api/$asset_id" --output "$binary"
 curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   --retry 3 --retry-connrefused \
+  "${curl_auth[@]}" \
   -H 'Accept: application/octet-stream' \
   -H 'X-GitHub-Api-Version: 2022-11-28' \
   -H 'User-Agent: gitforgeops-validator-installer' \

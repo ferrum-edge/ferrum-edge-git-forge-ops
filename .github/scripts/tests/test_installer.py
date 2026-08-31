@@ -13,7 +13,13 @@ CHECKSUM_ASSET_ID = "537268721"
 
 
 class InstallerTests(unittest.TestCase):
-    def run_installer(self, binary: bytes, published_digest: str, expected_digest: str):
+    def run_installer(
+        self,
+        binary: bytes,
+        published_digest: str,
+        expected_digest: str,
+        github_token: str | None = None,
+    ):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             fake_bin = root / "bin"
@@ -22,6 +28,10 @@ class InstallerTests(unittest.TestCase):
             curl.write_text(
                 """#!/usr/bin/env python3
 import os, pathlib, sys
+headers = [sys.argv[index + 1] for index, value in enumerate(sys.argv[:-1]) if value == '-H']
+expected_auth = os.environ.get('FAKE_EXPECT_AUTH')
+if expected_auth and expected_auth not in headers:
+    raise SystemExit('missing expected authorization header')
 output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
 url = next(arg for arg in sys.argv if arg.startswith('https://'))
 if url.endswith('/' + os.environ['FAKE_CHECKSUM_ASSET_ID']):
@@ -35,11 +45,15 @@ else:
             curl.chmod(0o755)
             destination = root / "installed"
             environment = os.environ.copy()
+            environment.pop("GITHUB_TOKEN", None)
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
             environment["FAKE_BINARY_HEX"] = binary.hex()
             environment["FAKE_PUBLISHED"] = published_digest
             environment["FAKE_BINARY_ASSET_ID"] = BINARY_ASSET_ID
             environment["FAKE_CHECKSUM_ASSET_ID"] = CHECKSUM_ASSET_ID
+            if github_token is not None:
+                environment["GITHUB_TOKEN"] = github_token
+                environment["FAKE_EXPECT_AUTH"] = f"Authorization: Bearer {github_token}"
             policy = root / "checksums.txt"
             policy.write_text(
                 f"{RELEASE_IDENTITY} ferrum-edge-linux-x86_64 "
@@ -63,6 +77,12 @@ else:
         binary = b"verified ferrum edge"
         digest = hashlib.sha256(binary).hexdigest()
         result = self.run_installer(binary, digest, digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_github_token_authenticates_both_asset_requests(self):
+        binary = b"authenticated validator"
+        digest = hashlib.sha256(binary).hexdigest()
+        result = self.run_installer(binary, digest, digest, github_token="test-token")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_replaced_release_assets_fail_repository_pin(self):

@@ -277,6 +277,26 @@ class PrInputTests(unittest.TestCase):
             )
             self.assertEqual(targets, [])
 
+    def test_trusted_targets_ignore_non_targetable_namespace_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(
+                    root,
+                    [
+                        "resources/_shared/proxies/api.yaml",
+                        "overlays/My Overlay/team/proxies/api.yaml",
+                        "resources/team/proxies/api.yaml",
+                    ],
+                ),
+            )
+            self.assertEqual(
+                targets, [{"environment": "production", "namespace": "team"}]
+            )
+
     def test_trusted_targets_reject_matrix_larger_than_github_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

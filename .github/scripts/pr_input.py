@@ -297,7 +297,7 @@ def _touched_namespaces(changed_paths_file: Path) -> set[str]:
             if len(parts) < 3:
                 continue
             if not SAFE_COMPONENT_RE.fullmatch(parts[1]):
-                raise InputError(f"unsafe resource namespace path: {raw_path!r}")
+                continue
             namespaces.add(parts[1])
         elif parts[0] == "overlays":
             if len(parts) < 4:
@@ -305,7 +305,7 @@ def _touched_namespaces(changed_paths_file: Path) -> set[str]:
             if not SAFE_COMPONENT_RE.fullmatch(
                 parts[1]
             ) or not SAFE_COMPONENT_RE.fullmatch(parts[2]):
-                raise InputError(f"unsafe overlay namespace path: {raw_path!r}")
+                continue
             namespaces.add(parts[2])
         elif parts[0] != ".gitforgeops":
             raise InputError(f"non-declarative trusted changed path: {raw_path!r}")

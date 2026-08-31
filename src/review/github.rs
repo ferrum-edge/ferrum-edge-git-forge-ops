@@ -6,7 +6,7 @@ use crate::config::EnvConfig;
 const MAX_COMMENT_RETRIES: u32 = 2;
 
 pub fn comment_status_is_retryable(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 503)
 }
 
 pub async fn post_pr_comment(

@@ -143,6 +143,7 @@ jobs:
           # The selected release must have an exact digest in the checked-in
           # .github/ferrum-edge-checksums.txt allowlist.
           FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'release-379454492' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           bash .github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
 

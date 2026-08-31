@@ -115,10 +115,10 @@ fn trusted_live_review_requires_pr_comment_delivery() {
 
 #[test]
 fn github_comment_retries_only_explicit_transient_responses() {
-    for status in [408, 429, 500, 502, 503, 504] {
+    for status in [408, 429, 503] {
         assert!(comment_status_is_retryable(status), "status {status}");
     }
-    for status in [400, 401, 403, 404, 409, 422, 501] {
+    for status in [400, 401, 403, 404, 409, 422, 500, 501, 502, 504] {
         assert!(!comment_status_is_retryable(status), "status {status}");
     }
 }

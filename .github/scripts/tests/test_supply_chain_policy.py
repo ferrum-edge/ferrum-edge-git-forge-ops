@@ -27,23 +27,30 @@ class SupplyChainPolicyTests(unittest.TestCase):
         )
         self.assertIsNotNone(match, "security workflow must pin a bootstrap commit")
         bootstrap_sha = match.group(1)
-        shown = subprocess.run(
-            [
-                "git",
-                "show",
-                f"{bootstrap_sha}:.github/scripts/check_supply_chain.py",
-            ],
-            cwd=ROOT,
-            check=False,
-            text=True,
-            capture_output=True,
+        checked_out = (
+            ROOT / "bootstrap-supply-chain/.github/scripts/check_supply_chain.py"
         )
-        if shown.returncode != 0:
-            self.skipTest("immutable bootstrap commit is unavailable in this checkout")
+        if checked_out.is_file() and not checked_out.is_symlink():
+            bootstrap_source = checked_out.read_text(encoding="utf-8")
+        else:
+            shown = subprocess.run(
+                [
+                    "git",
+                    "show",
+                    f"{bootstrap_sha}:.github/scripts/check_supply_chain.py",
+                ],
+                cwd=ROOT,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            if shown.returncode != 0:
+                self.skipTest("immutable bootstrap commit is unavailable in this checkout")
+            bootstrap_source = shown.stdout
 
         with tempfile.TemporaryDirectory() as directory:
             checker = Path(directory) / "check_supply_chain.py"
-            checker.write_text(shown.stdout, encoding="utf-8")
+            checker.write_text(bootstrap_source, encoding="utf-8")
             result = subprocess.run(
                 [sys.executable, str(checker), "--root", str(ROOT)],
                 cwd=ROOT,
