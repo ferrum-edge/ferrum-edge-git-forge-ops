@@ -910,6 +910,11 @@ cargo fmt --all -- --check
 
 Rust CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --test unit_tests` on PRs/pushes that touch source, tests, Cargo metadata, the Dockerfile, or the Rust CI workflow. Resource-only PRs run `validate-pr.yml` instead.
 
+The weekly security job also rejects new vulnerabilities, unsound advisories,
+and yanked active dependencies. Any unavoidable exception is exact-version,
+owner-assigned, and time-bounded; see
+[Dependency security policy](docs/dependency-security.md).
+
 ### Publishing your own fork's image
 
 If you'd rather not depend on the upstream image (air-gapped env, vendored build, divergent customizations), your fork can publish its own:

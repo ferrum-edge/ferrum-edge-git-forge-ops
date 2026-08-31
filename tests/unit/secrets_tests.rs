@@ -6,6 +6,28 @@ use gitforgeops::secrets::{
     load_bundles_from_env, parse_placeholder, resolve_secrets, PlaceholderAlloc, SlotStatus,
 };
 
+const TEST_ED25519_PUBLIC_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJb/uPnYEeAChxZ067A7P02MTEz2XC9PmkknEGctaIuN";
+const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
+
+#[test]
+fn credential_delivery_encrypts_for_supported_ssh_recipient_types() {
+    use age::ssh::Recipient;
+    use gitforgeops::secrets::delivery::encrypt_for_ssh_recipient;
+
+    for public_key in [TEST_ED25519_PUBLIC_KEY, TEST_RSA_PUBLIC_KEY] {
+        let recipient = public_key
+            .parse::<Recipient>()
+            .expect("fixture should be a supported SSH recipient");
+        let armored = encrypt_for_ssh_recipient(&recipient, b"credential-value")
+            .expect("public-recipient encryption should succeed");
+
+        assert!(armored.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
+        assert!(armored.ends_with("-----END AGE ENCRYPTED FILE-----\n"));
+        assert!(!armored.contains("credential-value"));
+    }
+}
+
 #[test]
 fn parse_placeholder_recognizes_valid_syntax() {
     let p = parse_placeholder("${gh-env-secret:alloc=generate}")
