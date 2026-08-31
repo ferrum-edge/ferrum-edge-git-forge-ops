@@ -138,8 +138,8 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
 
 use gitforgeops::apply::{
     exclusive_prune_denominator, format_prune_percentage, large_prune_exceeds_threshold,
-    operation_rank, order_diffs, preserve_spec_owned_graph, stale_view_block,
-    validate_no_desired_spec_tags,
+    operation_rank, order_diffs, pending_create_assertion_diffs, preserve_spec_owned_graph,
+    stale_view_block, validate_no_desired_spec_tags,
 };
 use gitforgeops::diff::resource_diff::{state_key, DiffAction, ResourceDiff};
 
@@ -437,6 +437,28 @@ fn every_api_strategy_rejects_repository_authored_spec_ownership_tags() {
         .to_string();
     assert!(error.contains("forged-owner"), "{error}");
     assert!(error.contains("admin-generated"), "{error}");
+}
+
+#[test]
+fn interactive_preview_includes_pending_create_ownership_assertions() {
+    let desired_upstream = upstream("pending-upstream", "team-alpha");
+    let desired = GatewayConfig {
+        upstreams: vec![desired_upstream.clone()],
+        ..Default::default()
+    };
+    let actual = GatewayConfig {
+        upstreams: vec![desired_upstream],
+        ..Default::default()
+    };
+    let pending =
+        std::collections::BTreeSet::from([state_key("team-alpha", "Upstream", "pending-upstream")]);
+
+    let assertions = pending_create_assertion_diffs(&desired, &actual, &pending, "team-alpha");
+
+    assert_eq!(assertions.len(), 1);
+    assert!(matches!(assertions[0].action, DiffAction::Modify));
+    assert_eq!(assertions[0].kind, "Upstream");
+    assert_eq!(assertions[0].id, "pending-upstream");
 }
 
 #[test]

@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,26 @@ REQUIRED_TEXT_FIELDS = (
     "upstream",
 )
 REQUIRED_LIST_FIELDS = ("affected_call_paths", "compensating_controls")
+RSA_EXCEPTION_KEY = (
+    "vulnerability",
+    "RUSTSEC-2023-0071",
+    "rsa",
+    "0.9.10",
+    "registry+https://github.com/rust-lang/crates.io-index",
+)
+EXPECTED_RSA_TREE = re.compile(
+    r"^rsa v0\.9\.10\n"
+    r"└── age v0\.12\.1\n"
+    r"    └── gitforgeops v0\.1\.0 \([^\n]+\)\n?$"
+)
+ALLOWED_AGE_REFERENCES = {
+    "age::Encryptor",
+    "age::Recipient",
+    "age::armor::ArmoredWriter",
+    "age::armor::Format",
+    "age::ssh::Recipient",
+}
+AGE_REFERENCE = re.compile(r"\bage(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 
 
 class PolicyError(ValueError):
@@ -175,6 +197,115 @@ def evaluate(
     return reviewed, blocked, stale
 
 
+def verify_rsa_exception_reachability(
+    policy: dict[tuple[str, str, str, str, str], dict[str, Any]],
+    source_root: Path,
+    dependency_tree_path: Path | None,
+) -> None:
+    """Fail closed if the RSA exception outlives its encryption-only premise."""
+    if RSA_EXCEPTION_KEY not in policy:
+        return
+
+    manifest_path = source_root / "Cargo.toml"
+    try:
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise PolicyError(f"cannot inspect {manifest_path}: {exc}") from exc
+    age_dependency = manifest.get("dependencies", {}).get("age")
+    if not isinstance(age_dependency, dict):
+        raise PolicyError("RSA exception requires age to use an explicit dependency table")
+    if (
+        age_dependency.get("version") != "0.12"
+        or age_dependency.get("default-features", True) is not True
+        or age_dependency.get("features") != ["ssh", "armor"]
+    ):
+        raise PolicyError(
+            "RSA exception requires age 0.12 with exactly the ssh and armor features"
+        )
+
+    source_dir = source_root / "src"
+    if not source_dir.is_dir():
+        raise PolicyError(f"RSA exception source directory is missing: {source_dir}")
+    observed_age_references: set[str] = set()
+    for path in sorted(source_dir.rglob("*.rs")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PolicyError(f"cannot inspect {path}: {exc}") from exc
+        references = set(AGE_REFERENCE.findall(text))
+        if references and path.relative_to(source_root) != Path("src/secrets/delivery.rs"):
+            raise PolicyError(
+                f"RSA exception permits age calls only in src/secrets/delivery.rs; found {path.relative_to(source_root)}"
+            )
+        for reference in references:
+            allowed = next(
+                (
+                    prefix
+                    for prefix in ALLOWED_AGE_REFERENCES
+                    if reference == prefix or reference.startswith(f"{prefix}::")
+                ),
+                None,
+            )
+            if allowed is None:
+                raise PolicyError(
+                    f"RSA exception encountered an unreviewed age API reference: {reference}"
+                )
+            observed_age_references.add(allowed)
+        age_use_statements = re.findall(
+            r"^\s*use\s+(?:::)?age(?:\s|::).*?;\s*$", text, re.MULTILINE
+        )
+        if age_use_statements and (
+            path.relative_to(source_root) != Path("src/secrets/delivery.rs")
+            or [statement.strip() for statement in age_use_statements]
+            != ["use age::ssh::Recipient;"]
+        ):
+            raise PolicyError(
+                "RSA exception permits only the reviewed age::ssh::Recipient import"
+            )
+        if re.search(r"\bextern\s+crate\s+age\b|\bage\s*::\s*\{", text):
+            raise PolicyError("RSA exception forbids alternate age import forms")
+    missing = sorted(ALLOWED_AGE_REFERENCES - observed_age_references)
+    if missing:
+        raise PolicyError(
+            f"RSA exception expected encryption-only age API references are missing: {missing}"
+        )
+
+    if dependency_tree_path is not None:
+        try:
+            dependency_tree = dependency_tree_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PolicyError(
+                f"cannot inspect dependency tree {dependency_tree_path}: {exc}"
+            ) from exc
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--locked",
+                    "--target",
+                    "all",
+                    "-i",
+                    "rsa@0.9.10",
+                ],
+                cwd=source_root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise PolicyError(f"could not inspect the RSA dependency path: {exc}") from exc
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise PolicyError(f"cargo tree failed while checking the RSA path: {detail}")
+        dependency_tree = result.stdout
+    if not EXPECTED_RSA_TREE.fullmatch(dependency_tree):
+        raise PolicyError(
+            "RSA exception dependency path changed; expected only gitforgeops -> age 0.12.1 -> rsa 0.9.10"
+        )
+
+
 def _format_finding(finding: dict[str, str | None]) -> str:
     advisory = f" {finding['advisory']}" if finding.get("advisory") else ""
     return (
@@ -220,6 +351,17 @@ def parse_args() -> argparse.Namespace:
         default=dt.date.today(),
         help="policy evaluation date (YYYY-MM-DD; intended for tests)",
     )
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=Path("."),
+        help="repository root whose RSA reachability premise must be verified",
+    )
+    parser.add_argument(
+        "--dependency-tree",
+        type=Path,
+        help="read a saved cargo-tree result instead of invoking cargo tree (tests)",
+    )
     return parser.parse_args()
 
 
@@ -227,6 +369,9 @@ def main() -> int:
     args = parse_args()
     try:
         policy = load_policy(args.policy, args.today)
+        verify_rsa_exception_reachability(
+            policy, args.source_root.resolve(), args.dependency_tree
+        )
         if args.audit_json:
             report = json.loads(args.audit_json.read_text(encoding="utf-8"))
             audit_status = 0
