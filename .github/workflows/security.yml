@@ -116,6 +116,19 @@ jobs:
       - name: Build image for scan
         run: docker build -t gitforgeops:scan .
 
+      - name: Smoke-test minimal runtime
+        run: |
+          docker run --rm gitforgeops:scan --help >/dev/null
+          docker run --rm --entrypoint ferrum-edge gitforgeops:scan --help >/dev/null
+          for package in apt libapt-pkg7.0 libssl3t64 openssl-provider-legacy; do
+            status=$(docker run --rm --entrypoint dpkg-query gitforgeops:scan \
+              -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)
+            if [[ "$status" == ii* ]]; then
+              echo "Purged runtime package remains installed: $package" >&2
+              exit 1
+            fi
+          done
+
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -127,7 +140,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload Trivy SARIF
-        if: always()
+        if: ${{ always() && hashFiles('trivy-results.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         with:
           sarif_file: trivy-results.sarif
