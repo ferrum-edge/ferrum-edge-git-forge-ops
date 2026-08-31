@@ -65,7 +65,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          DECLARED_CHANGED: ${{ github.event.pull_request.changed_files }}
         run: |
           set -euo pipefail
           # Inspect both current and previous names. Looking only at
@@ -75,16 +74,21 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
+          current_changed=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files')
+          [[ "$current_changed" =~ ^[0-9]+$ ]] || {
+            echo "::error::GitHub returned an invalid current changed-file count."
+            exit 1
+          }
           helper=trusted-guard/.github/scripts/changed_files.py
           if [ -f "$helper" ]; then
-            result=$(python3 "$helper" "$pages_file" "$DECLARED_CHANGED" state)
+            result=$(python3 "$helper" "$pages_file" "$current_changed" state)
           else
             # One-time bootstrap for the PR that first adds the helper: its
             # base commit cannot contain the new file yet. Keep this equivalent
             # classifier inline so the guard still runs without executing a
             # candidate-branch script. After merge, the trusted helper path is
             # mandatory and used for every subsequent PR.
-            result=$(jq -ce --argjson declared "$DECLARED_CHANGED" '
+            result=$(jq -ce --argjson declared "$current_changed" '
               if type != "array" or any(.[]; type != "array") then
                 error("invalid pagination shape")
               else

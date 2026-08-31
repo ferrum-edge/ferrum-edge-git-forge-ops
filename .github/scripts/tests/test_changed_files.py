@@ -13,6 +13,22 @@ SPEC.loader.exec_module(changed_files)
 
 
 class ChangedFilesTests(unittest.TestCase):
+    def test_pr_workflows_use_current_api_count_not_stale_event_snapshot(self):
+        workflows = {
+            "state-guard.yml": 1,
+            "rust-ci.yml": 2,
+            "validate-pr.yml": 1,
+        }
+        workflow_root = SCRIPT.parents[1] / "workflows"
+        live_count = (
+            "gh api \"repos/${REPO}/pulls/${PR_NUMBER}\" --jq '.changed_files'"
+        )
+        for name, expected_count in workflows.items():
+            with self.subTest(workflow=name):
+                text = (workflow_root / name).read_text(encoding="utf-8")
+                self.assertNotIn("github.event.pull_request.changed_files", text)
+                self.assertEqual(text.count(live_count), expected_count)
+
     def test_current_and_previous_rename_paths_are_both_classified(self):
         pages = [
             [

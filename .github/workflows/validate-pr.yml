@@ -33,17 +33,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          DECLARED_CHANGED: ${{ github.event.pull_request.changed_files }}
         run: |
           set -euo pipefail
           pages_file=$(mktemp)
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
+          current_changed=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files')
+          [[ "$current_changed" =~ ^[0-9]+$ ]] || {
+            echo "::warning::GitHub returned an invalid current changed-file count; validating fail-safe."
+            current_changed=-1
+          }
           helper=trusted-scope/.github/scripts/changed_files.py
-          if [ -f "$helper" ]; then
+          if [ -f "$helper" ] && [ "$current_changed" -ge 0 ]; then
             result=$(python3 trusted-scope/.github/scripts/changed_files.py \
-              "$pages_file" "$DECLARED_CHANGED" declarative)
+              "$pages_file" "$current_changed" declarative)
           else
             # The helper does not exist on the base of its own bootstrap PR.
             # Run validation fail-safe rather than executing candidate code.
