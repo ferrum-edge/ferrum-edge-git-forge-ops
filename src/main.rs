@@ -1472,10 +1472,15 @@ async fn cmd_apply(
 
             // This boundary precedes every external credential write and
             // state journal mutation. It rejects read-only planes,
-            // API-spec ownership conflicts, unsupported restore sections,
-            // and every namespace's deterministic full-replace error before
-            // any unrelated side effect can occur. apply_api repeats the
-            // preflight immediately before its first gateway mutation.
+            // unsupported restore sections, and every namespace's
+            // deterministic full-replace error before any unrelated side
+            // effect can occur. apply_api repeats the preflight immediately
+            // before its first gateway mutation.
+            //
+            // A repo/spec ownership conflict is deliberately *not* one of
+            // these: it blocks its own namespace only, and surfaces as a
+            // per-namespace error during apply so the rest of the environment
+            // still reconciles.
             apply::preflight_api_apply(
                 &desired,
                 &client,

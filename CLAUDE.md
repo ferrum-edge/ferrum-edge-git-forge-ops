@@ -97,11 +97,17 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 ### Apply Strategies
 
 - **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → proxy → plugin config, then deletes in reverse). Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to per-resource creates on 501.
-- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. Non-empty live `api_specs` fail closed because the gateway has no conditional restore revision; use incremental apply to preserve them or `--confirm-api-spec-deletion` for intentional deletion. Empty/absent spec sections and all `gateway_trust_bundles` are omitted so gateway guards/no-op semantics prevent lost concurrent updates. Missing graph members, repo/spec ID conflicts, cached data, or unfamiliar top-level backup sections fail before mutation.
+- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. The body carries the repo's desired rows **plus the complete live spec-owned graph**: `/restore` validates `api_specs.items` against the tagged proxies/upstreams/plugin configs in the same payload and rejects either half on its own, and it re-creates the documents verbatim rather than re-extracting resources from them, so carrying both cannot duplicate rows. An **empty** spec section and all `gateway_trust_bundles` are omitted instead — the gateway reads `items: []` as an intentional wipe but an absent section as "count the live specs and answer 409", and an absent trust section as "leave trust exactly as it is", so omission is what preserves a concurrent update. `--confirm-api-spec-deletion` is the only path that drops the graph (trust bundles still survive). A graph that cannot be proven complete, a repo/spec ID conflict, cached data, or an unfamiliar top-level backup section fails before mutation.
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
-A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate. Create and batch POST error responses are never retried blindly: ambiguous outcomes are reconciled through an authoritative backup, then exact live rows receive idempotent PUTs that explicitly assert repository ownership before success is recorded. A separate write-ahead `pending_creates` journal closes the process-crash window without granting deletion authority: exact evidence triggers that PUT, an absent row stays retryable, and a live row whose declaration disappeared blocks for manual ownership resolution. After apply, a best-effort `GET /cluster` prints a convergence line.
+A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate.
+
+Create and batch POST error responses are never retried blindly. An ambiguous outcome is reconciled through an authoritative (non-cached) backup, and the readback has three severities (`LiveMatch`): the **exact** row live → an idempotent PUT declares repository ownership and the create is recorded; the row **absent** → the write provably did not commit, so it is an ordinary per-resource error and the rest of the run continues; the row **present but different**, or no usable verification at all → a run-stopping `AmbiguousMutation`. `resource_values_match` is a subset test (desired ⊆ live, minus server timestamps) so a gateway-populated optional does not read as a foreign row.
+
+A separate write-ahead `pending_creates` journal closes the process-crash window without granting deletion authority: exact evidence triggers that PUT, an absent row stays retryable. A live row whose declaration disappeared is **forgotten with a warning** and handed to the ordinary rules for the mode — shared reports it as unmanaged and never deletes it, exclusive prunes it under the large-prune guard, full_replace does not journal at all. Nothing here may fail closed: CI is the only writer of `.state/<env>.json` and `state-guard.yml` blocks the hand edit a wedged journal would demand. The journal survives a process crash, because `apply-on-merge.yml` commits state with `if: !cancelled()`; it does **not** survive workflow cancellation or runner loss, which leaves the row live and unjournaled for the next run's ordinary diff to pick up.
+
+After apply, a best-effort `GET /cluster` prints a convergence line.
 
 ### Mesh config
 
@@ -182,7 +188,11 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
 - Never emitted as a Modify. If the repo also declares the same
   `(namespace, kind, id)`, that is reported as a **conflict**
   (`DiffResult::spec_conflicts()`): two owners writing one row, and the spec
-  importer wins on its next run.
+  importer wins on its next run. A conflict takes the whole **namespace** out
+  of the run (`apply::spec_owned_conflict_block`) — skipping just the row and
+  exiting green would falsely report convergence — but only that namespace:
+  every other one still reconciles, and the reason lands in
+  `ApplyResult::errors` so the run exits non-zero with the conflict named.
 - Never emitted as a Delete, except in **exclusive** mode with
   `apply --confirm-api-spec-deletion` (`DiffOptions::prune_spec_owned`).
   Otherwise apply skips them with a per-resource message and counts them in
@@ -193,8 +203,10 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
   `ownership.drift_report`: a repo fighting the spec importer is a correctness
   problem, not drift noise.
 
-The same flag also drives `full_replace`, where `/restore` would otherwise wipe
-the namespace's `api_specs` section (see Apply Strategies).
+`full_replace` does not delete the graph either: the restore body carries the
+live spec-owned rows and the live `api_specs` section through unchanged, which
+is what the gateway's restore validator requires. `--confirm-api-spec-deletion`
+is the only path that drops them (see Apply Strategies).
 
 ### Policy framework
 
