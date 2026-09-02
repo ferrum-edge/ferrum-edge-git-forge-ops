@@ -321,7 +321,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 - `src/main.rs` — async Tokio entry, command dispatch
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
-- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization), `env.rs` (strict process-env parsing), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
+- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs`, `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
@@ -351,7 +351,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 See `.env.example` for the full list. Essentials:
 
-- `FERRUM_GATEWAY_URL` (required for api mode)
+- `FERRUM_GATEWAY_URL` (required for api mode) — must be `https://`; `http://` needs `FERRUM_ALLOW_INSECURE_HTTP=true`, every other scheme and any embedded `user:password@` are refused. Checked in `load_env_config` so the command fails before a client exists.
 - `FERRUM_ADMIN_JWT_SECRET` (required for api mode; ≥32 chars to match ferrum-edge)
 - `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`) — must equal the gateway's own issuer or every call is 401
 - `FERRUM_ADMIN_JWT_ROLE` (default `admin`) — `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only
@@ -365,7 +365,8 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_EDGE_BINARY_PATH` (default `ferrum-edge` on `$PATH`)
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)
 - `FERRUM_MESH_FILE_OUTPUT_PATH` (default `./assembled/mesh.yaml`) — standalone `{version, mesh}` document; separate file from the gateway doc, written by `export` and file-mode `apply` whenever the repo declares any `MeshConfig`
-- `FERRUM_TLS_NO_VERIFY` (dev only; accepted values `true|false|1|0`)
+- `FERRUM_TLS_NO_VERIFY` (dev only; accepted values `true|false|1|0`) — TLS stays on but any certificate is accepted
+- `FERRUM_ALLOW_INSECURE_HTTP` (default `false`; dev only) — permits a cleartext `http://` gateway URL. Independent of `FERRUM_TLS_NO_VERIFY`; both print a loud stderr banner once per process and both are refused when `GITHUB_ACTIONS=true` unless the gateway host is loopback (`localhost`, `127.0.0.0/8`, `::1`). `config::env::validate_gateway_transport` owns the whole rule.
 - `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` — base64-encoded PEM. mTLS requires BOTH cert and key; setting only one is rejected.
 - `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` (default `10`) — TCP/TLS handshake cap
 - `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` (default `60`) — end-to-end request cap; raise for large `/backup` or slow `/restore`

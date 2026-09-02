@@ -141,12 +141,38 @@ For every environment listed in `.gitforgeops/config.yaml`:
 - restrict deployment branches to protected branches, or add an exact custom
   policy for `main`;
 - store gateway, TLS, credential-broker, and state-App secrets only in that
-  environment.
+  environment;
+- set that environment's `FERRUM_GATEWAY_URL` secret to an **`https://`** URL.
 
 These rules secure `apply`, `rotate`, `materialize`, drift checks, and trusted
 PR live review. The manual workflows also check `github.ref == refs/heads/main`,
 but environment branch policy is the non-bypassable boundary because a workflow
 definition on an unprotected branch could remove an in-file condition.
+
+### The gateway URL must be `https://`
+
+Every environment-bound workflow mints an admin JWT into an `Authorization`
+header, and `apply` puts resolved consumer credentials in the request body. A
+cleartext gateway hands both to anything on the path, so gitforgeops refuses a
+non-`https://` `FERRUM_GATEWAY_URL` at startup, before any HTTP client exists —
+the run fails once rather than leaking request by request. Other schemes
+(`ftp://`, `file://`, `ws://`) and URLs embedding `user:password@` credentials
+are refused outright, with no opt-in.
+
+Two dev-only escape hatches exist, and **both are refused under
+`GITHUB_ACTIONS` unless the gateway host is loopback** (`localhost`,
+`127.0.0.0/8`, `::1`):
+
+- `FERRUM_ALLOW_INSECURE_HTTP=true` — permits a cleartext `http://` gateway.
+- `FERRUM_TLS_NO_VERIFY=true` — keeps TLS but accepts any certificate, which
+  makes an interceptor indistinguishable from the gateway.
+
+Neither belongs in a GitHub Environment. If a deployment gateway presents a
+certificate from a private CA, put that CA in the environment's
+`FERRUM_GATEWAY_CA_CERT` secret (base64 PEM) instead of disabling the check;
+gitforgeops then trusts that CA alone. Both switches print a loud stderr banner
+when they take effect locally, so a warning in a job log means one of them
+reached CI and should be removed from wherever it was set.
 
 ## 4. Restrict GitHub Actions
 
