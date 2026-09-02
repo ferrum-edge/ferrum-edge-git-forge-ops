@@ -306,6 +306,26 @@ class SettingsAuditTests(unittest.TestCase):
         self.assertIn("latest main commit", rendered)
         self.assertIn("broad repository roles", rendered)
 
+    def test_tag_ruleset_without_a_bypass_actor_fails(self):
+        # `creation` with an empty bypass list means nobody can push a `v*`
+        # tag, so release.yml's tag trigger can never fire. The doc
+        # (docs/github-launch-controls.md section 2) states the same rule; keep
+        # the two aligned.
+        responses = secure_responses()
+        responses["repos/acme/repo/rulesets/8"]["bypass_actors"] = []
+        with patch.object(
+            audit_settings,
+            "gh_json",
+            side_effect=lambda path, paginate=False: responses[path],
+        ):
+            audit = audit_settings.run(
+                "acme/repo", "main", REQUIRED_CHECKS, 99, "refs/tags/v*"
+            )
+        rendered = "\n".join(audit.violations)
+        self.assertIn("at least one bypass actor", rendered)
+        # An empty list is vacuously "narrow", so only the new rule fires.
+        self.assertNotIn("broad repository roles", rendered)
+
     def test_broad_verified_action_policy_and_extra_pattern_fail(self):
         responses = secure_responses()
         selected = responses[

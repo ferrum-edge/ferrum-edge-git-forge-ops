@@ -149,14 +149,22 @@ the current head and its actor currently has `write`, `maintain`, or `admin`
 permission. It rejects every push or other PR transition until a qualified
 maintainer removes and reapplies the label, and records the actor, permission,
 head, run ID, and attempt. Label changes rerun under per-PR concurrency so
-removed authorization cannot leave a stale success. That workflow runs
+removed authorization cannot leave a stale success. It triggers on
+`pull_request_target`, never `pull_request`: the latter loads the guard from
+the PR's own head, so one commit could forge a ledger entry and delete the
+check that rejects it. That is safe only because the job never checks out the
+PR — files, labels, and permission all come from `gh api`, and
+`changed_files.py` from an explicit default-branch checkout. It runs
 on **every** PR with no `paths:` filter and decides internally whether
 `.state/` was touched — a path-filtered workflow reports no status on
 non-matching PRs, which stalls them forever once the check is required.
 The launch baseline requires the check and gives only the dedicated App an
-always-on `main` ruleset bypass. Environment secrets
-`GITFORGEOPS_STATE_APP_ID` / `GITFORGEOPS_STATE_APP_PRIVATE_KEY` feed the
-commit workflows; see `docs/github-launch-controls.md`. Keep the fence there
+always-on `main` ruleset bypass. Repository variable
+`GITFORGEOPS_STATE_APP_ID` (public metadata, read identically by the workflows
+and by the settings audit) and environment secret
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY` feed the commit workflows, and both are
+verified in a preflight before the gateway is mutated; see
+`docs/github-launch-controls.md`. Keep the fence there
 rather than narrowing what the binary reads out of the ledger — shared mode
 must keep reconciling namespaces the repo no longer declares, or a PR that
 removes a namespace's last resource orphans it on the gateway forever.
