@@ -1,0 +1,101 @@
+# Every top-level collection and singleton mirrored on
+# `config::schema::MeshConfigSpec`. The per-item shapes are deliberately opaque
+# (`serde_json::Value`): `ferrum-edge validate -m mesh` is the authority on
+# their contents, and mirroring ~40 Istio-shaped types would only produce a
+# second, always-stale schema. Workloads and services carry the identities the
+# merge and overlay paths key on (`spiffe_id`; `(name, namespace)`).
+kind: MeshConfig
+id: every-field-mesh
+spec:
+  istio_root_namespace: istio-system
+  workloads:
+    - spiffe_id: spiffe://mesh/ns/ferrum/sa/checkout
+      name: checkout
+      namespace: ferrum
+      addresses: ["10.1.0.10"]
+      labels:
+        app: checkout
+    - spiffe_id: spiffe://mesh/ns/ferrum/sa/payments
+      name: payments
+      namespace: ferrum
+      addresses: ["10.1.0.11"]
+  services:
+    - name: checkout
+      namespace: ferrum
+      ports:
+        - name: https
+          port: 8443
+    - name: payments
+      namespace: ferrum
+      ports:
+        - name: https
+          port: 8444
+  mesh_policies:
+    - name: default-authz
+      namespace: istio-system
+      action: ALLOW
+  ext_authz_providers:
+    - name: external-authz
+      service: authz.example.test
+      port: 9191
+  peer_authentications:
+    - name: strict-mtls
+      namespace: ferrum
+      mtls:
+        mode: STRICT
+  service_entries:
+    - name: external-billing
+      namespace: ferrum
+      hosts: ["billing.partner.test"]
+      resolution: DNS
+  request_authentications:
+    - name: jwt-required
+      namespace: ferrum
+      jwt_rules:
+        - issuer: https://issuer.example.test
+  telemetry_resources:
+    - name: default-telemetry
+      namespace: istio-system
+      tracing:
+        - random_sampling_percentage: 1.0
+  destination_rules:
+    - name: checkout-subsets
+      namespace: ferrum
+      host: checkout.ferrum.svc.cluster.local
+      subsets:
+        - name: canary
+          labels:
+            release: canary
+  virtual_service_cors_policies:
+    - name: checkout-cors
+      namespace: ferrum
+      allow_origins: ["https://app.example.test"]
+  proxy_configs:
+    - name: default-proxy-config
+      namespace: istio-system
+      concurrency: 2
+  sidecars:
+    - name: checkout-sidecar
+      namespace: ferrum
+      egress:
+        - hosts: ["ferrum/*"]
+  waypoint_bindings:
+    - name: ferrum-waypoint
+      namespace: ferrum
+      for_service_account: checkout
+  trust_bundles:
+    trust_domain: mesh
+    bundles:
+      - id: root-2024
+        pem_path: /etc/ferrum/mesh/root-2024.pem
+  multi_cluster:
+    cluster_id: primary
+    remote_clusters:
+      - cluster_id: secondary
+        network: network-2
+  outbound_traffic_policy:
+    mode: REGISTRY_ONLY
+  extension_configs:
+    - name: wasm-header-filter
+      namespace: ferrum
+      phase: AUTHN
