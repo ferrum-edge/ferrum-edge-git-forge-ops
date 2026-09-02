@@ -15,7 +15,7 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
 ## Quick start
 
 1. Fork this repo.
-2. **Create a GitHub Environment per deployment target** (Settings → Environments → New). Name it whatever you want to call the environment — e.g. `staging`, `production`. Add its scoped secrets: `FERRUM_GATEWAY_URL`, `FERRUM_ADMIN_JWT_SECRET`, and any TLS material. Optionally set protection rules (required reviewers, wait timers).
+2. **Create a GitHub Environment per deployment target** (Settings → Environments → New). Name it whatever you want to call the environment — e.g. `staging`, `production`. Add its scoped secrets: `FERRUM_GATEWAY_URL`, `FERRUM_ADMIN_JWT_SECRET`, and any TLS material. Before launch, required reviewers, self-review prevention, and a protected-`main` deployment policy are mandatory; see step 6.
 3. **Declare those environments in `.gitforgeops/config.yaml`** — see `.gitforgeops/config.example.yaml`. The file carries overlay names and ownership modes; it does *not* carry any secret or URL.
 4. Add resources under `resources/<namespace>/{proxies,consumers,upstreams,plugins}/*.yaml` (and, for a service mesh, `resources/<namespace>/mesh/*.yaml`).
 5. **Create the two override labels** — they do not exist by default, and labels are not copied when you fork:
@@ -28,21 +28,11 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
    gh label create gitforgeops/state-override --color B60205 --description "Allow this PR to modify the CI-owned .state/ ledger"
    ```
 
-   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). Both are gated on `write` repo permission, since only users with write access can apply labels. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`.
-6. **Decide whether to require the `reject-state-edits` check.** By default it is advisory: it runs on every PR and goes red on unauthorized `.state/` edits, but nothing stops a merge. Making it a required status check is possible, with one hard constraint worth understanding before you try.
-
-   `apply-on-merge.yml` and `rotate.yml` push the ledger straight to the default branch as `github-actions[bot]`. A ruleset's required-status-check rule gates **direct pushes as well as merges**, and the bot's commit never had a PR, so no check ever reported on it. Measured on this repo, not inferred: with such a ruleset active, the bot's push is rejected with `GH013: Repository rule violations found for refs/heads/main`. GitHub Actions also cannot be added to a ruleset's bypass list — the API answers `422: Actor GitHub Actions integration must be part of the ruleset source or owner organization`. So requiring the check with the workflows as shipped **breaks the ledger**: applies still mutate the gateway, but the state commit fails and ownership tracking silently stops advancing.
-
-   Two configurations actually work:
-
-   - **Leave it advisory** (what a fresh fork gets). The guard still surfaces every unauthorized `.state/` edit in the PR's checks; enforcement is the reviewer's. Nothing else to do.
-   - **Require it, and change who pushes the ledger.** Give the state-commit steps in both workflows a token whose actor *can* hold a bypass — a fine-grained PAT with `contents: write` belonging to a repo admin, or an installation token from a GitHub App installed on the owning organization — then add that actor to the ruleset's bypass list. This trades a long-lived credential for enforcement; weigh it against [Trust and security posture](#trust-and-security-posture), where the provisioner token carries the same caveat.
-
-   Whichever you choose, don't add a `paths:` filter to `state-guard.yml`. It deliberately runs on every PR and decides internally whether `.state/` was touched: a path-filtered workflow reports no status at all on PRs that don't match, and once the check is required GitHub holds every such PR at "Expected — waiting for status to be reported" indefinitely.
-
-   Note that forks inherit neither branch protection nor rulesets, so this is a per-fork decision.
-7. Open a PR. CI runs the matrix across every declared environment, validates the assembled config, and posts a review comment per env with policy, drift, credential, security, and best-practice findings. Policy errors are enforced by `apply`.
-8. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering).
+   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each checks the actor's current permission is `write`, `maintain`, or `admin`. State authorization succeeds only on the exact override-label webhook for the current head; every push or other PR transition requires a qualified maintainer to remove and reapply it. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
+6. **Configure the mandatory GitHub launch controls.** Create the contents-only state-writer App, require the state guard and CI checks in an active `main` ruleset, protect release tags and every deployment environment, restrict Actions, and configure the scheduled settings audit. Follow [GitHub launch controls](docs/github-launch-controls.md) before adding production credentials. Forks do not inherit any of these settings.
+7. **Review the validator digest allowlist.** Nothing to configure: `.github/ferrum-edge-checksums.txt` lists the SHA-256 of every `ferrum-edge-linux-x86_64` build this repository has approved, and `install-ferrum-edge.sh` refuses to make the downloaded bytes executable unless their digest is on that list. Upstream republishes a rolling `latest` release, so the daily `validator-pin-canary.yml` opens a tracking issue with the exact line to add when a new build appears. See [Validator digest pinning](#validator-digest-pinning).
+8. Open a PR. The PR-built binary runs static validation without an environment or gateway secrets. A default-branch `workflow_run` then sanitizes only declarative YAML, builds and hashes the protected-branch binary once, waits for environment approval, and posts the live policy/drift/security review for same-repository PRs. Each live job is intersected with the environment's protected namespace scope and fails if comparison is unavailable. Fork PRs remain static-only.
+9. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering) and uses the short-lived state-writer App token for its protected ledger commit.
 
 ## Repository layout
 
@@ -83,10 +73,12 @@ assembled/                       # file-mode output (gateway doc + mesh doc)
   production.json
 
 .github/workflows/
-  validate-pr.yml                # matrix validate + review per env
+  validate-pr.yml                # secretless PR-built static validation
+  trusted-pr-review.yml          # trusted binary + sanitized-data live review
   apply-on-merge.yml             # matrix apply per env (with env binding)
   drift-check.yml                # scheduled diff per env
   state-guard.yml                # rejects PR-authored .state/ edits
+  settings-audit.yml             # detects GitHub protection drift
   rotate.yml                     # workflow_dispatch for credential rotation
   materialize-file.yml           # workflow_dispatch for encrypted flat-file delivery
   release.yml                    # builds multi-arch image on push to main / v* tag
@@ -129,6 +121,13 @@ environments:
       mode: shared               # safer; repo only manages what it declared
       drift_report: true
 
+  file-output:
+    overlay: production
+    live_review: false           # no Admin API; skip Environment-bound review
+    apply_strategy: incremental
+    ownership:
+      mode: shared
+
   production:
     overlay: production
     apply_strategy: full_replace
@@ -140,7 +139,7 @@ environments:
 default_environment: staging
 ```
 
-The environment names here must match the GitHub Environments you've set up in repo settings. The review, apply, drift, rotate, and materialize workflows bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can inject that environment's scoped secrets automatically. Fork PRs still receive empty secrets under GitHub's `pull_request` secret rules, so review falls back to static-only output there.
+The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Set `live_review: false` on file-mode environments (or any environment without a live Admin API); the protected matrix excludes them before a GitHub Environment approval is requested. Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
 
 ## Ownership modes
 
@@ -184,10 +183,10 @@ Both of those make sense only because the ledger is **CI-authored**. `apply-on-m
 
 That trust is enforced at the boundary, not inside the binary:
 
-- **`state-guard.yml` fails any PR that touches `.state/**`.** A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. Deliberate repairs (restoring a corrupted ledger, adopting an existing gateway) need the `gitforgeops/state-override` label, which only a user with `write` permission can add and which lands in the PR timeline.
+- **`state-guard.yml` fails any PR that touches or renames a path from `.state/**`.** It runs on `pull_request_target`, so the guard executing is always the one `main` reviewed — under `pull_request` a single commit could both forge a ledger entry and delete the check that rejects it. That trigger is safe here only because the job never checks out the pull request: changed files, labels, and collaborator permission all come from `gh api`, and its one piece of executable logic is checked out from the default branch. A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. GitHub caps changed-file enumeration at 3,000 entries, so observing 3,000 files is conservatively treated as incomplete rather than becoming a silent truncation. Deliberate repairs and intentionally reviewed oversized PRs need the exact `gitforgeops/state-override` label. Authorization succeeds only while processing that exact `labeled` webhook for the current head; every later push, retarget, reopen, or other configured PR event fails until a qualified maintainer removes and reapplies it. Re-running the same authorized label event remains bound to the same event actor and head. The guard queries that event actor's current permission, rejects triage/read/deleted/unknown actors and API ambiguity, and records actor, permission, authorized head, run ID, and attempt in the job summary. Push, label, and unlabel events rerun the check under per-PR concurrency so stale or removed authorization cannot leave an older successful run authoritative.
 - **`.state/*.json` is tracked in git; locks and temp files are not.** If you fork this repo, keep the `.gitignore` entries as shipped. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
 - **Apply runs post-merge only**, so a poisoned ledger has to survive review and land on `main` before it can act.
-- **The guard is advisory unless you make it a required status check**, and doing so requires changing which actor pushes the ledger — a ruleset that requires the check also rejects the bot's direct push. See [Quick start](#quick-start) step 6.
+- **The guard must be a required status check before launch.** The state-writer GitHub App is the sole ruleset bypass and receives only short-lived `Contents: write` installation tokens. See [GitHub launch controls](docs/github-launch-controls.md).
 
 Narrowing what the binary reads out of the ledger is not a substitute for any of this: an attacker who can write `.state/<env>.json` can already forge entries inside a declared namespace, which no amount of namespace scoping catches.
 
@@ -402,7 +401,7 @@ Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `
 - Auto-sharded by deterministic hash when any bundle approaches 40 KB.
 - GitHub's 100-secrets-per-env limit × ~440 slots/bundle = **~44,000 credentials per environment** before you hit any ceiling.
 
-The bundled workflows read all matching secrets via `${{ toJSON(secrets) }}`, filter `FERRUM_CREDS_BUNDLE*`, write that JSON to a temporary file, and pass the path as `FERRUM_CREDS_JSON_FILE`. The binary still supports inline `FERRUM_CREDS_JSON` for local testing, but the file form is preferred because large multi-shard bundles can exceed OS environment-block limits.
+The bundled workflows read all matching secrets via `${{ toJSON(secrets) }}` and pass them through a fail-closed loader: the outer inventory, exact `FERRUM_CREDS_BUNDLE[_N]` names, each inner JSON object, and every string slot/value are validated before a new mode-0600 runner file is published as `FERRUM_CREDS_JSON_FILE`. Malformed inventories never degrade to an empty bundle (which could otherwise trigger duplicate allocation/rotation). The binary still supports inline `FERRUM_CREDS_JSON` for local testing, but the file form is preferred because large multi-shard bundles can exceed OS environment-block limits.
 
 ### Allocation, writing, and delivery
 
@@ -709,12 +708,20 @@ Minted tokens also carry an `ns` claim listing the namespaces the run actually t
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML. The bundled workflows use this to choose apply/materialize behavior and to skip API-only drift checks in file-mode repos. |
-| `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for validation binary (e.g. `v0.9.0`). Pin this to match your runtime. |
+| `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML. Values are trimmed/case-folded; every other present value fails the workflow preflight before credentials or binaries are loaded. |
 | `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
 | `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Where the `release` workflow pushes on Docker Hub. Only matters if `GITFORGEOPS_RELEASE_ENABLED=true`. GHCR path is auto-derived from the repo. |
 
 These are GitHub **Variables** because the workflow YAML reads them through `vars.*`. Runtime knobs such as `FERRUM_NAMESPACE`, `FERRUM_TLS_NO_VERIFY`, and timeout/retry settings are normal process environment variables; set them locally, or explicitly pass them through if you customize the bundled workflows.
+
+Every deployment environment also needs `GITFORGEOPS_STATE_APP_ID` and
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY` for the contents-only App that commits the
+ownership ledger through the protected branch ruleset. Set repository variable
+`GITFORGEOPS_STATE_APP_ID` to that same numeric ID so the scheduled audit can
+verify the exact bypass actor. The repository-level
+`SETTINGS_AUDIT_TOKEN` needs Administration: read and is used only by the
+scheduled default-branch settings audit. See
+[GitHub launch controls](docs/github-launch-controls.md).
 
 ### Docker Hub secrets (upstream maintainers / forks publishing their own image only)
 
@@ -771,8 +778,8 @@ gitforgeops plan
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
 gitforgeops export [--output PATH] [--materialize] [--encrypt-to GH_LOGIN]
 gitforgeops import --from-api | --from-file PATH [--output-dir DIR]
-gitforgeops review [--pr N]
-gitforgeops envs [--format json|text]           # for CI matrix discovery
+gitforgeops review [--pr N] [--require-live]
+gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops rotate --consumer ID --credential KEY \
   [--namespace NS] [--recipient GH_LOGIN]
 ```
@@ -783,6 +790,8 @@ Notes:
 - `--format github` is an alias for `github-annotations`.
 - `--confirm-api-spec-deletion` is the opt-in for touching resources the gateway's OpenAPI spec importer owns: under `full_replace` it drops the namespace's `api_specs` section instead of carrying it through, and under exclusive incremental apply it allows pruning live resources tagged with an `api_spec_id`. Without it, those rows are reported and skipped.
 - `--allow-large-prune` doubles as the acknowledgement that pruning from a stale (`X-Data-Source: cached`) gateway view is acceptable.
+- `review --require-live` returns non-zero after rendering/posting the review if the gateway comparison was unavailable. The trusted PR workflow uses it; secretless static review intentionally does not.
+- `envs --format json --include-scopes` emits protected environment/namespace routing for trusted CI and is not a replacement for `envs --format json`'s string array.
 - `import` writes per-resource YAML for the four gateway kinds only; API specs and gateway trust bundles present in the source backup are reported as skipped rather than silently dropped, because they are managed through `/api-specs` and `/gateway-trust-bundles`, not through this repo.
 
 ## PR review output
@@ -833,13 +842,15 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 
 ## Trust and security posture
 
-- **Fork PRs cannot see production secrets.** `validate-pr.yml` binds each review job to the matching GitHub Environment so same-repo PRs can include live gateway comparison in review comments, but GitHub withholds environment secrets from forked `pull_request` runs. Fork PRs degrade to static-only review output, and contributors from forks can propose credential slots but cannot cause allocation.
-- **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions).
+- **PR-built code never receives production secrets.** `validate-pr.yml` has a read-only token, disables persisted checkout credentials, and binds no GitHub Environment. It runs on every PR and exposes a stable required gate while internally skipping irrelevant validation. The privileged `trusted-pr-review.yml` definition comes from the default branch, requires the static run to succeed, verifies the current same-repository PR head, and gives forks no privileged steps. Its artifact contains only bounded regular YAML beneath `resources/` and `overlays/`; environment/policy configuration and ownership state are copied from the recorded protected-branch SHA after manifest verification. Live review runs separately for each protected-branch resource namespace intersected with that environment's protected ownership/filter scope, with `FERRUM_NAMESPACE` set; that also scopes the JWT claim, so a PR-authored environment mapping or `spec.namespace` override cannot turn review into a cross-namespace read. `--require-live` makes a failed gateway comparison fail the privileged job. New namespaces receive static review until their directory is trusted on `main`. A `build.rs`, workflow, executable, symlink, traversal path, or unexpected artifact file cannot cross that data boundary.
+- **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions). Before mutation, the workflow resolves exactly one merged PR for the pushed commit; ambiguous/unattributed commits cannot borrow another PR's policy override or credential-delivery recipient.
 - **Credential values are never written back to the repo.** Only hashes and metadata in `.state/`.
-- **The state file is CI-owned.** `state-guard.yml` rejects PRs that modify `.state/**` unless a maintainer adds the `gitforgeops/state-override` label — the ledger decides what shared mode may delete, so a hand-edited one is a privilege escalation. See [State file trust model](#state-file-trust-model).
+- **The state file is CI-owned and permission-attributed.** `state-guard.yml` rejects `.state/**` changes unless the latest effective override label actor currently has write/maintain/admin. Triage label authority is explicitly insufficient. Protected state commits use a short-lived, contents-only App token rather than a human PAT or unbypassable `GITHUB_TOKEN`. See [State file trust model](#state-file-trust-model).
 - **Policy overrides leave a permanent trail.** PR label event + approver permission + `.state/<env>.json.overrides` record.
 - **The provisioner token is the bootstrap credential.** Rotate periodically; prefer GitHub App installation tokens over PATs (automatic 1-hour expiry, org-scoped).
 - **TLS material stays as GitHub secrets.** The binary only ever sees the base64-decoded PEM in-process.
+- **Executable dependencies are pinned and verified.** Every third-party Action uses a full commit SHA, Rust and `cargo-llvm-cov` use exact versions, validator bytes must match publisher and checked-in SHA-256 values, and Docker bases use manifest digests without mutable package-manager installs during the release build. Releases publish max-mode provenance, SBOM attestations, a GitHub-signed GHCR provenance statement, and a retained manifest of every action/toolchain/base/binary input. Dependabot proposes controlled updates and `check_supply_chain.py` rejects regressions.
+- **GitHub settings are part of the security boundary.** CODEOWNERS alone is advisory; the active ruleset, environment reviewers/branch restrictions, Actions allowlist/SHA policy, state-App bypass, and scheduled settings audit described in [GitHub launch controls](docs/github-launch-controls.md) are launch requirements.
 - **Validation is hermetic.** `ferrum-edge validate` is invoked with `-m file` (or `-m mesh`) pinned and `-s` pointed at an empty settings file, so an inherited `FERRUM_MODE` or a stray `ferrum.conf` in the checkout can't turn validation into a fail-open no-op that still exits 0. Every `FERRUM_*` variable is removed from the child's environment for the same reason. The temporary spec is written through `tempfile` at mode 0600 with an unpredictable name and removed on drop — callers resolve credential placeholders *before* validating, so that file can hold live consumer credentials. `ferrum-edge validate` itself has no machine-readable output mode; the text/JSON/GitHub-annotation formats of `--format` are produced gitforgeops-side.
 
 ## Drift detection
@@ -860,7 +871,7 @@ A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into 
 
 ### Published images
 
-The `release` workflow publishes to two registries on every push to `main` and every `v*` tag:
+The `release` workflow publishes to two registries on every push to `main` and every protected `v*` tag. Images include BuildKit max-mode provenance and SBOM attestations; GHCR also receives a GitHub-signed build-provenance attestation tied to the pushed digest:
 
 - `docker.io/ferrumedge/ferrum-edge-git-forge-ops`
 - `ghcr.io/ferrum-edge/ferrum-edge-git-forge-ops`
@@ -879,15 +890,19 @@ Platforms: `linux/amd64` + `linux/arm64`.
 1. Docker Hub repo `ferrumedge/ferrum-edge-git-forge-ops` exists (public)
 2. Repo secrets `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` are set
 3. Settings → Actions → General → Workflow permissions = **Read repository contents permission** (recommended default; `release.yml` grants `packages: write` at job scope)
+4. A tag ruleset restricts creation/update/deletion of `v*` tags to the release administrators/App
 
 ### Building locally
 
 ```bash
 docker build -t gitforgeops .
-docker build --build-arg FERRUM_EDGE_VERSION=v0.9.0 -t gitforgeops .
 
 docker run --rm -v $(pwd):/repo gitforgeops --env staging validate
 ```
+
+The Ferrum Edge, Rust, and Debian stages are pinned by multi-architecture
+manifest digest. Update those references through reviewed Dependabot PRs; do
+not reintroduce a floating build argument for an executable base.
 
 ## Build, test, lint
 
@@ -912,9 +927,65 @@ If you'd rather not depend on the upstream image (air-gapped env, vendored build
    - `DOCKERHUB_IMAGE=acme/ferrum-edge-git-forge-ops` — where to push on Docker Hub. GHCR path auto-derives from the repo.
 4. Push to `main` — `release.yml` builds + pushes to Docker Hub and GHCR.
 
-### Version pinning
+### Validator digest pinning
 
-Set the `FERRUM_EDGE_VERSION` GitHub Actions variable to pin the `ferrum-edge` binary version used in CI workflows. Pin this to match the version of Ferrum Edge running in your environment so validation rules stay consistent. Example: if your gateways run `v0.9.0`, set `FERRUM_EDGE_VERSION=v0.9.0`. If unset, `latest` is used.
+The validator binary is pinned by **content**, never by a locator. Upstream
+ferrum-edge publishes a single rolling `latest` release and deletes plus
+re-uploads its assets on every build, so release ids, asset ids and tags all
+move underneath a consumer. Only the bytes are stable.
+
+`.github/ferrum-edge-checksums.txt` is the allowlist. One record per approved
+build:
+
+```
+<64 lowercase hex sha256>  ferrum-edge-linux-x86_64  # <publish timestamp> release <tag>
+```
+
+`.github/scripts/install-ferrum-edge.sh` resolves the release through
+`releases/tags/latest` (falling back to the release list), finds the asset and
+its `.sha256` companion by exact **name**, downloads both over
+`--proto '=https' --tlsv1.2 --fail`, verifies the publisher's own checksum, and
+then requires the computed digest to appear in the allowlist. Only after that
+match does it `install -m 0755`. A build the repository has not reviewed is
+never executed. There is no environment variable or Actions variable that can
+select a different binary — the allowlist is the only control, and it is a
+CODEOWNER-owned path.
+
+Keeping several lines is deliberate: a refresh that also retains the previous
+digest lets in-flight pull requests that already downloaded the older binary
+stay green.
+
+To record a new build, review it upstream, then:
+
+```bash
+bash .github/scripts/refresh-ferrum-edge-pin.sh          # print the line
+bash .github/scripts/refresh-ferrum-edge-pin.sh --append # append it in place
+```
+
+The script downloads the current asset, cross-checks it against the publisher's
+checksum file, and refuses to emit a line if the two disagree. Commit the
+result through normal review.
+
+`validator-pin-canary.yml` runs the installer daily from the default branch (and
+on demand). When the allowlist has gone stale it opens — or updates — a single
+tracking issue titled *Refresh the pinned ferrum-edge validator digest*
+containing the exact line to add and the command above, and closes that issue
+once the allowlist covers the current build again.
+
+## Upgrading
+
+### `live_review` defaults to `true`
+
+`.gitforgeops/config.yaml` gained a per-environment `live_review` flag, and its
+default is `true`. Every environment that does not say otherwise is therefore
+opted **in** to trusted `workflow_run` live review, which binds that GitHub
+Environment and compares PR resources against the Admin API.
+
+That is right for API-mode environments and wrong for file-mode ones: with no
+live Admin API to reach, the review requests an Environment approval and then
+fails to connect. Add `live_review: false` to every file-mode environment (and
+to any environment without a reachable Admin API) before upgrading — see
+[Repo configuration](#repo-configuration-gitforgeopsconfigyaml).
 
 ## License
 

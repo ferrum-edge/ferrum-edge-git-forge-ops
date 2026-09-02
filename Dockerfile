@@ -1,24 +1,31 @@
-ARG FERRUM_EDGE_VERSION=latest
+FROM ferrumedge/ferrum-edge:latest@sha256:fb0f05b0392a272ba36a493584bced171655ce8ebd36b2ae0818bb5c3c25ef2d AS ferrum-edge
 
-FROM ferrumedge/ferrum-edge:${FERRUM_EDGE_VERSION} AS ferrum-edge
-
-FROM rust:1-bookworm AS builder
+FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release
+RUN cargo build --release --locked
 
-# Slim Debian runtime. Not fully distroless because this image is also
-# used as a GitHub Actions job container (see validate-pr.yml), which
-# requires /bin/sh for action bootstrap. Trixie matches the glibc of
-# the upstream ferrum-edge image so the copied binary links cleanly.
-FROM debian:trixie-slim
-# `upgrade` picks up security fixes published after the base image tag was
-# last rebuilt (e.g. util-linux CVE-2026-53612/53613/53614). Without it the
-# image ships known-fixed CVEs and the Trivy scan fails.
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Slim Debian runtime rather than distroless: the image is meant to be run
+# directly (`docker run ... gitforgeops plan`) and in contexts that expect a
+# usable /bin/sh, and several of its code paths shell out — `validate` execs
+# `ferrum-edge`, delivery execs `age`. Trixie matches the glibc of the upstream
+# ferrum-edge image so the copied binary links cleanly.
+FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+# Keep the release build a function of reviewed digests. `apt-get update` or
+# `upgrade` here would execute mutable repository state and make the same
+# source commit produce different runtime bytes over time. The digest-pinned
+# Rust builder already carries a CA bundle, so copy those reviewed bytes.
+# Neither Rust binary links OpenSSL. Remove apt and its otherwise-unused TLS
+# stack from the pinned base so a package-manager-only vulnerability cannot
+# become part of the runtime image. `dpkg --purge` consumes only bytes already
+# present in the reviewed base digest; it performs no network access.
+RUN dpkg --purge --force-depends \
+    apt \
+    libapt-pkg7.0 \
+    libssl3t64 \
+    openssl-provider-legacy
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 COPY --from=ferrum-edge /app/ferrum-edge /app/ferrum-edge
 COPY --from=builder /build/target/release/gitforgeops /app/gitforgeops

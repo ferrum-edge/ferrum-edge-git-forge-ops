@@ -16,22 +16,25 @@ on:
 # — with `read` the POST is rejected and delivery falls back to stdout
 # (log-only), which the intended recipient is very likely to miss.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   list-envs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       envs: ${{ steps.list.outputs.envs }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
+        with:
+          toolchain: 1.98.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -45,13 +48,43 @@ jobs:
       - name: Enumerate environments
         id: list
         run: |
-          envs=$(gitforgeops envs --format json)
+          set -euo pipefail
+          # An unconfigured repository has no `.gitforgeops/config.yaml`, and
+          # this workflow fires on every push to `main` — including the merge
+          # that first adds `.gitforgeops/config.example.yaml`. Hard-failing
+          # here turns `main` red for a repository that has simply not been
+          # configured yet.
+          #
+          # Emitting an EMPTY matrix keeps the safety property intact: the
+          # `apply` job is gated on a non-empty matrix, so no GitHub
+          # Environment is ever bound and the synthetic local `default`
+          # environment is never applied. The difference is only that an
+          # unconfigured repo skips instead of failing. Every workflow that a
+          # human explicitly starts (`rotate`, `materialize-file`) still fails
+          # loudly, because there the absent configuration contradicts an
+          # operator's stated intent.
+          if [[ ! -f .gitforgeops/config.yaml ]]; then
+            echo "::notice::No .gitforgeops/config.yaml on the protected branch; skipping apply. See docs/github-launch-controls.md to configure deployment environments."
+            echo "envs=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          envs=$(gitforgeops envs --format json | jq -c .)
+          jq -e '
+            type == "array" and
+            all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))
+          ' <<< "$envs" >/dev/null || {
+            echo "::error::Every environment must be a single safe path component."
+            exit 1
+          }
           echo "envs=$envs" >> "$GITHUB_OUTPUT"
 
   apply:
     needs: list-envs
     if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
     strategy:
       fail-fast: false
       matrix:
@@ -61,31 +94,62 @@ jobs:
       group: ferrum-apply-${{ matrix.environment }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v7
+      - name: Validate deployment routing
+        id: deployment-mode
+        env:
+          RAW_MODE: ${{ vars.FERRUM_GATEWAY_MODE }}
+        run: |
+          set -euo pipefail
+          mode=$(printf '%s' "${RAW_MODE:-api}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          [ -n "$mode" ] || mode=api
+          case "$mode" in
+            api|file) ;;
+            *)
+              echo "::error::Invalid FERRUM_GATEWAY_MODE '$RAW_MODE'; expected api or file."
+              exit 1
+              ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      # The App token itself is minted only after the untrusted build has run
+      # and immediately before the ledger is committed — `check_supply_chain.py`
+      # enforces that install < mint < commit ordering so a Contents: write
+      # token is never present while candidate code executes. The cost of that
+      # ordering is that an environment missing the App credentials would apply
+      # to the live gateway and only *then* discover it cannot record what it
+      # did, leaving `.state/<env>.json` behind live state. Shared mode reads
+      # the missing entries as "never managed" and quietly stops reconciling
+      # them. Prove the credentials exist before the mutation; keep the mint
+      # late.
+      - name: Require state-writer App credentials
+        env:
+          STATE_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+          STATE_APP_PRIVATE_KEY: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$STATE_APP_ID" ] || [ -z "$STATE_APP_PRIVATE_KEY" ]; then
+            echo "::error::The state-writer GitHub App is not configured: set repository variable GITFORGEOPS_STATE_APP_ID and environment secret GITFORGEOPS_STATE_APP_PRIVATE_KEY before applying. See docs/github-launch-controls.md."
+            exit 1
+          fi
+
+      - name: Check out protected main for apply
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Download ferrum-edge binary
         env:
-          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'latest' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          VERSION="$FERRUM_EDGE_VERSION_RAW"
-          if [[ ! "$VERSION" =~ ^latest$|^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid FERRUM_EDGE_VERSION: '$VERSION'" >&2
-            echo "Expected 'latest' or a release tag like 'v1.2.3'." >&2
-            exit 1
-          fi
-          # Use the direct-tag URL (`/releases/download/<tag>/`) rather
-          # than `/releases/latest/download/`, which only resolves to the
-          # most recent non-prerelease. ferrum-edge's `latest` tag is
-          # marked prerelease, so the indirect path returns 404.
-          URL="https://github.com/ferrum-edge/ferrum-edge/releases/download/${VERSION}/ferrum-edge-linux-x86_64"
-          curl -fsSL "$URL" -o /usr/local/bin/ferrum-edge
-          chmod +x /usr/local/bin/ferrum-edge
+          bash .github/scripts/install-ferrum-edge.sh
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
+        with:
+          toolchain: 1.98.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -108,25 +172,17 @@ jobs:
         # runner is recycled.
         run: |
           set -euo pipefail
-          all_secrets=$(mktemp)
+          # Keep the whole-secrets spill under $RUNNER_TEMP, which GitHub wipes
+          # with the workspace. A bare `mktemp` lands in /tmp, which a
+          # self-hosted runner shares between jobs and does not clean.
+          all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
           trap 'rm -f "$all_secrets"' EXIT
           cat > "$all_secrets" <<'SECRETS_EOF'
           ${{ toJSON(secrets) }}
           SECRETS_EOF
 
-          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-$$.json"
-          python3 - "$all_secrets" "$creds_file" <<'PY'
-          import json, sys
-          with open(sys.argv[1]) as f:
-              try:
-                  data = json.load(f)
-              except json.JSONDecodeError:
-                  data = {}
-          bundles = {k: v for k, v in data.items() if k.startswith("FERRUM_CREDS_BUNDLE")}
-          with open(sys.argv[2], "w") as out:
-              json.dump(bundles, out)
-          PY
-          chmod 600 "$creds_file"
+          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
+          python3 .github/scripts/credential_bundles.py "$all_secrets" "$creds_file"
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Validate
@@ -143,24 +199,43 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PUSH_SHA: ${{ github.sha }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          info=$(gh api "/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0] // {}')
-          pr=$(echo "$info" | jq -r '.number // ""')
-          author=$(echo "$info" | jq -r '.user.login // ""')
+          set -euo pipefail
+          pages_file=$(mktemp)
+          trap 'rm -f "$pages_file"' EXIT
+          context=
+          for attempt in 1 2 3 4 5; do
+            context=
+            if ! gh api "repos/${REPO}/commits/${PUSH_SHA}/pulls?per_page=100" \
+              --paginate --slurp > "$pages_file"; then
+              echo "Merge-association API request failed; retrying ($attempt/5)." >&2
+              if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+              continue
+            fi
+            if context=$(python3 .github/scripts/merge_context.py \
+              "$pages_file" "$PUSH_SHA" "$BASE_BRANCH"); then
+              break
+            fi
+            echo "Merge association is not yet unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
+          [ -n "$context" ] || {
+            echo "::error::Could not attribute this apply to exactly one merged PR."
+            exit 1
+          }
+          pr=$(jq -r '.number' <<< "$context")
+          author=$(jq -r '.author' <<< "$context")
           echo "number=$pr" >> "$GITHUB_OUTPUT"
           echo "author=$author" >> "$GITHUB_OUTPUT"
 
       - name: Apply
-        if: vars.FERRUM_GATEWAY_MODE != 'file'
+        if: steps.deployment-mode.outputs.mode == 'api'
         env:
           FERRUM_ENV: ${{ matrix.environment }}
-          # The workflow-level `if:` only gates whether this step runs; it
-          # does NOT propagate FERRUM_GATEWAY_MODE into the process env.
-          # Without this line, `gitforgeops apply` reads the unset var and
-          # falls back to its default (api). Default happens to be `api`
-          # so the non-file arm works by accident, but we make it explicit
-          # for symmetry with the file-mode step.
-          FERRUM_GATEWAY_MODE: api
+          FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
@@ -171,10 +246,10 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          # Delivery recipient: prefer the PR author (the contributor who
-          # added the placeholder); fall back to the pusher only when no PR
-          # is associated with this commit (e.g. a direct push to main).
-          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author || github.actor }}
+          # The merge association is resolved exactly before apply; generated
+          # credentials are never delivered to an arbitrary first match or
+          # to the pusher of an unattributed direct commit.
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
 
@@ -188,16 +263,10 @@ jobs:
       # the separate `materialize-file.yml` workflow which produces an
       # age-encrypted artifact.
       - name: Apply (file mode)
-        if: vars.FERRUM_GATEWAY_MODE == 'file'
+        if: steps.deployment-mode.outputs.mode == 'file'
         env:
           FERRUM_ENV: ${{ matrix.environment }}
-          # `vars.FERRUM_GATEWAY_MODE` gates expression evaluation, not the
-          # process environment. Without this explicit export the binary
-          # reads an unset FERRUM_GATEWAY_MODE, defaults to api, and tries
-          # to push to a gateway — typically failing on missing URL/JWT
-          # secrets. Must set to `file` here so apply takes the file-mode
-          # branch.
-          FERRUM_GATEWAY_MODE: file
+          FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           # Must match the path staged by the commit step below. Without
           # this override, apply writes to the default
           # ./assembled/resources.yaml and the per-env staged path doesn't
@@ -214,9 +283,18 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author || github.actor }}
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
+
+      - name: Mint narrowly scoped state-writer token
+        if: ${{ !cancelled() }}
+        id: state-writer
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+          private-key: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
+          permission-contents: write
 
       - name: Commit state + assembled (if changed)
         # Run on partial-failure paths too: cmd_apply persists state for the
@@ -237,8 +315,13 @@ jobs:
         # When the matrix runs multiple envs in parallel and they all try to
         # push to main, contention is normal — retry with rebase on rejection.
         if: ${{ !cancelled() }}
+        env:
+          STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}
         run: |
           set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "$STATE_WRITER_TOKEN" | base64 | tr -d '\n')
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
           git config user.name "gitforgeops[bot]"
           git config user.email "gitforgeops[bot]@users.noreply.github.com"
 
@@ -265,7 +348,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore(gitforgeops): state update for ${{ matrix.environment }} [skip ci]"
+          git commit -m "chore(gitforgeops): state update for ${{ matrix.environment }}"
 
           for attempt in 1 2 3 4 5; do
             if git push; then

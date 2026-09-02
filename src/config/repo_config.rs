@@ -66,6 +66,10 @@ impl Default for OwnershipConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentConfig {
     pub overlay: Option<String>,
+    /// Whether protected `workflow_run` jobs should compare PR resources to
+    /// a live Admin API. File-mode environments should set this to false.
+    #[serde(default = "default_true")]
+    pub live_review: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_filter: Option<String>,
     #[serde(default)]
@@ -78,6 +82,7 @@ impl Default for EnvironmentConfig {
     fn default() -> Self {
         Self {
             overlay: None,
+            live_review: true,
             namespace_filter: None,
             apply_strategy: ApplyStrategy::Incremental,
             ownership: OwnershipConfig::default(),
@@ -93,6 +98,17 @@ pub struct RepoConfig {
     pub environments: std::collections::BTreeMap<String, EnvironmentConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_environment: Option<String>,
+}
+
+/// Environment routing data safe to hand to CI matrix construction.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EnvironmentScope {
+    pub environment: String,
+    pub live_review: bool,
+    /// `None` means every protected-branch resource namespace. `Some` is an
+    /// explicit filter/ownership allowlist that the caller must intersect
+    /// with those directories.
+    pub namespaces: Option<Vec<String>>,
 }
 
 fn default_version() -> u32 {
@@ -128,6 +144,30 @@ impl RepoConfig {
 
     pub fn environment_names(&self) -> Vec<String> {
         self.environments.keys().cloned().collect()
+    }
+
+    pub fn environment_scopes(&self) -> Vec<EnvironmentScope> {
+        self.environments
+            .iter()
+            .map(|(name, env)| {
+                let mut namespaces = match &env.namespace_filter {
+                    Some(namespace) => Some(vec![namespace.clone()]),
+                    None if matches!(env.ownership.mode, OwnershipMode::Exclusive) => {
+                        env.ownership.namespaces.clone()
+                    }
+                    None => None,
+                };
+                if let Some(values) = &mut namespaces {
+                    values.sort();
+                    values.dedup();
+                }
+                EnvironmentScope {
+                    environment: name.clone(),
+                    live_review: env.live_review,
+                    namespaces,
+                }
+            })
+            .collect()
     }
 
     fn validate(&self) -> crate::error::Result<()> {

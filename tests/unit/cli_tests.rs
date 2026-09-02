@@ -54,8 +54,33 @@ fn cli_accepts_documented_format_values() {
 
     let envs = Cli::try_parse_from(["gitforgeops", "envs", "--format", "text"]).unwrap();
     match envs.command {
-        Commands::Envs { format } => assert!(matches!(format, EnvsFormat::Text)),
+        Commands::Envs {
+            format,
+            include_scopes,
+        } => {
+            assert!(matches!(format, EnvsFormat::Text));
+            assert!(!include_scopes);
+        }
         _ => panic!("expected envs command"),
+    }
+
+    let scoped = Cli::try_parse_from([
+        "gitforgeops",
+        "envs",
+        "--format",
+        "json",
+        "--include-scopes",
+    ])
+    .unwrap();
+    match scoped.command {
+        Commands::Envs { include_scopes, .. } => assert!(include_scopes),
+        _ => panic!("expected envs command"),
+    }
+
+    let review = Cli::try_parse_from(["gitforgeops", "review", "--require-live"]).unwrap();
+    match review.command {
+        Commands::Review { require_live, .. } => assert!(require_live),
+        _ => panic!("expected review command"),
     }
 }
 

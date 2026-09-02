@@ -73,11 +73,19 @@ pub enum Commands {
     Review {
         #[arg(long)]
         pr: Option<u64>,
+        /// Fail when the live gateway comparison cannot be completed.
+        /// Intended for the trusted, credentialed PR-review workflow.
+        #[arg(long)]
+        require_live: bool,
     },
     /// Emit JSON listing environments declared in repo config (used by CI matrix).
     Envs {
         #[arg(long, value_enum, default_value_t = EnvsFormat::Json)]
         format: EnvsFormat,
+        /// Include each environment's configured namespace scope in JSON.
+        /// Used to bound trusted PR live-review matrix entries.
+        #[arg(long)]
+        include_scopes: bool,
     },
     /// Rotate a specific credential slot. Requires provisioner token.
     Rotate {
