@@ -2613,8 +2613,15 @@ async fn cmd_rotate(
     }
 
     // Now push to the gateway.
-    let push_status =
-        push_rotated_consumer_to_gateway(&env_config, &resolved, &per_shard, ns, consumer).await;
+    let push_status = push_rotated_consumer_to_gateway(
+        &env_config,
+        &resolved,
+        &per_shard,
+        ns,
+        consumer,
+        resolve_options,
+    )
+    .await;
 
     // Persist rotation state ONLY on full success. Saving before the gateway
     // push check would claim the rotation completed even when the gateway
@@ -2663,6 +2670,7 @@ async fn push_rotated_consumer_to_gateway(
     per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
     namespace: &str,
     consumer_id: &str,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !matches!(env_config.gateway_mode, GatewayMode::Api) {
         return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
@@ -2671,8 +2679,10 @@ async fn push_rotated_consumer_to_gateway(
     let mut desired = load_and_assemble_for(resolved, env_config)?;
     let merged = secrets::merge_bundles(per_shard);
     // `rotate_and_deliver` just wrote the fresh value into the bundle; this
-    // resolve picks it up for the consumer being pushed to the gateway.
-    let _ = secrets::resolve_secrets(&mut desired, &merged)?;
+    // resolve picks it up for the consumer being pushed to the gateway. The
+    // operator's slot-remap policy applies here too, so an acknowledged
+    // shrink does not clear the shim resolve only to fail on the push.
+    let _ = secrets::resolve_secrets_with_options(&mut desired, &merged, resolve_options)?;
 
     let consumer = desired
         .consumers
