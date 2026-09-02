@@ -223,6 +223,19 @@ fn resolve_credentials(
     Ok(secrets::resolve_secrets(cfg, &bundle)?)
 }
 
+/// Is a credential bundle available to this invocation?
+///
+/// Without one, every broker-controlled leaf stays a placeholder string while
+/// the live gateway returns either the real value or `[REDACTED]`, so a naive
+/// comparison reports permanent false drift on credentials nobody changed.
+/// `diff::mask_indeterminate_secret_values` neutralizes exactly those leaves;
+/// this predicate decides when to apply it.
+fn credential_bundle_loaded(env_config: &EnvConfig) -> bool {
+    let has_content = |value: Option<&str>| value.is_some_and(|raw| !raw.trim().is_empty());
+    has_content(env_config.creds_bundle_json_file.as_deref())
+        || has_content(env_config.creds_bundle_json.as_deref())
+}
+
 /// In `exclusive` mode, every resource in `desired` must live in a namespace
 /// declared in `ownership.namespaces`, and any `namespace_filter` must be one
 /// of those allowed namespaces. Otherwise the repo would be silently pushing
@@ -913,11 +926,12 @@ async fn cmd_diff(
     let mut desired = load_and_assemble_for(&resolved)?;
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
+    let bundle_loaded = credential_bundle_loaded(&env_config);
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces)?;
-    let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+    let mut namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
     let cached_namespaces = cached_namespace_names(&namespace_pairs);
     if !cached_namespaces.is_empty() {
         eprintln!(
@@ -931,6 +945,20 @@ async fn cmd_diff(
             ))
             .into());
         }
+    }
+    // Same treatment `plan` and `review` give an unresolvable secret: with no
+    // bundle, a broker-controlled leaf is a placeholder here and a real (or
+    // `[REDACTED]`) value on the gateway, which compares as drift on every
+    // run and fails `drift-check.yml --exit-on-drift` forever. Literal
+    // siblings, extra entries, shape changes and every nonsecret field are
+    // still compared.
+    if !bundle_loaded && cached_namespaces.is_empty() {
+        for pair in &mut namespace_pairs {
+            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+        }
+        eprintln!(
+            "Note: no credential bundle is available, so unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from this comparison. Everything else is compared normally."
+        );
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
         &namespace_pairs,
@@ -1034,16 +1062,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = env_config
-        .creds_bundle_json_file
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || env_config
-            .creds_bundle_json
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
+    let bundle_loaded = credential_bundle_loaded(&env_config);
     println!("=== Environment ===");
     println!(
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
@@ -1939,16 +1958,7 @@ async fn cmd_review(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = env_config
-        .creds_bundle_json_file
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || env_config
-            .creds_bundle_json
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
+    let bundle_loaded = credential_bundle_loaded(&env_config);
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_ok, validation_output) = match &val_result {
