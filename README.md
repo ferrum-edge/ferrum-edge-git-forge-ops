@@ -28,9 +28,9 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
    gh label create gitforgeops/state-override --color B60205 --description "Allow this PR to modify the CI-owned .state/ ledger"
    ```
 
-   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each resolves the effective label event and requires the actor's current permission to be `write`, `maintain`, or `admin`. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
+   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each checks the actor's current permission is `write`, `maintain`, or `admin`. State authorization succeeds only on the exact override-label webhook for the current head; every push or other PR transition requires a qualified maintainer to remove and reapply it. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
 6. **Configure the mandatory GitHub launch controls.** Create the contents-only state-writer App, require the state guard and CI checks in an active `main` ruleset, protect release tags and every deployment environment, restrict Actions, and configure the scheduled settings audit. Follow [GitHub launch controls](docs/github-launch-controls.md) before adding production credentials. Forks do not inherit any of these settings.
-7. **Pin the validator release identity.** Select an allowed `FERRUM_EDGE_VERSION`. Every allowed release and digest lives in reviewed `.github/ferrum-edge-checksums.txt`; the checked-in fallback is the content-pinned 2026-08-27 `latest` snapshot. A moved tag or an unreviewed version fails before execution.
+7. **Review the validator digest allowlist.** Nothing to configure: `.github/ferrum-edge-checksums.txt` lists the SHA-256 of every `ferrum-edge-linux-x86_64` build this repository has approved, and `install-ferrum-edge.sh` refuses to make the downloaded bytes executable unless their digest is on that list. Upstream republishes a rolling `latest` release, so the daily `validator-pin-canary.yml` opens a tracking issue with the exact line to add when a new build appears. See [Validator digest pinning](#validator-digest-pinning).
 8. Open a PR. The PR-built binary runs static validation without an environment or gateway secrets. A default-branch `workflow_run` then sanitizes only declarative YAML, builds and hashes the protected-branch binary once, waits for environment approval, and posts the live policy/drift/security review for same-repository PRs. Each live job is intersected with the environment's protected namespace scope and fails if comparison is unavailable. Fork PRs remain static-only.
 9. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering) and uses the short-lived state-writer App token for its protected ledger commit.
 
@@ -121,6 +121,13 @@ environments:
       mode: shared               # safer; repo only manages what it declared
       drift_report: true
 
+  file-output:
+    overlay: production
+    live_review: false           # no Admin API; skip Environment-bound review
+    apply_strategy: incremental
+    ownership:
+      mode: shared
+
   production:
     overlay: production
     apply_strategy: full_replace
@@ -132,7 +139,7 @@ environments:
 default_environment: staging
 ```
 
-The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
+The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Set `live_review: false` on file-mode environments (or any environment without a live Admin API); the protected matrix excludes them before a GitHub Environment approval is requested. Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
 
 ## Ownership modes
 
@@ -150,7 +157,13 @@ The environment names here must match the GitHub Environments you've set up in r
 - Unmanaged resources → **left alone, reported in PR review**.
 - `full_replace` is rejected (would wipe unmanaged resources).
 
-Choose this when ops teams or admins still make changes via the GUI alongside the repo, or for sandbox environments where experimentation is fine. Immediately before an API create, gitforgeops durably records the key in a separate pending-create journal. Pending keys are **not** part of the delete fence. On the next authoritative backup, an exact current desired/live match triggers an idempotent PUT that explicitly asserts repository ownership before the key becomes managed; an absent live row remains an ordinary Add, and a live row whose desired declaration disappeared blocks reconciliation because ownership cannot be proven. This closes the crash window without turning an uncertain POST—or equality with a racing admin-created row—into deletion authority.
+Choose this when ops teams or admins still make changes via the GUI alongside the repo, or for sandbox environments where experimentation is fine.
+
+Immediately before an API create, gitforgeops durably records the key in a separate pending-create journal. Pending keys are **not** part of the delete fence. On the next authoritative backup, an exact current desired/live match triggers an idempotent PUT before the key becomes managed; an absent live row remains an ordinary Add. That PUT *declares* repository ownership — it overwrites the row with the repository's content so the repo is unambiguously the last writer — which is not the same as proving the repo created it. Provenance is genuinely unrecoverable after an uncertain POST; the point of the PUT is that nothing enters the delete fence on the strength of equality with a row a racing administrator might have created.
+
+A live row whose desired declaration has since disappeared is the one case with no good answer, so it gets the harmless one: the journal entry is **forgotten with a warning naming the row**, and the ordinary ownership rules take over. In `shared` mode that means it is reported as unmanaged and never deleted. In `exclusive` mode it becomes an ordinary prune candidate under the large-prune guard. `full_replace` does not write the journal at all. Reconciliation never refuses to run — CI is the only writer of `.state/<env>.json`, and `state-guard.yml` blocks the hand edit that a fail-closed journal would demand.
+
+The journal survives a crashed CI process, because the apply workflow commits state under `if: !cancelled()`. It does **not** survive a cancelled workflow or a lost runner: those leave the created row live with no journal entry, and the next run's ordinary diff picks it up as an unmanaged (shared) or prunable (exclusive) resource.
 
 ### `exclusive` (strict 1:1)
 
@@ -163,7 +176,7 @@ Choose this for production or regulated environments where git is the single sou
 
 ### First-apply behavior
 
-In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. Adds enter the pending-create journal immediately before the first create POST and enter the ownership ledger only after a successful response or an exact authoritative readback followed by a successful idempotent ownership assertion. A process failure therefore leaves a recoverable journal entry, never unproven deletion authority.
+In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. Adds enter the pending-create journal immediately before the first create POST and enter the ownership ledger only after a successful response, or after an exact authoritative readback followed by an idempotent PUT that declares the repository as the row's writer. A process failure therefore leaves a recoverable journal entry, never unproven deletion authority.
 
 ### State file trust model
 
@@ -178,7 +191,7 @@ Both of those make sense only because the ledger is **CI-authored**. `apply-on-m
 
 That trust is enforced at the boundary, not inside the binary:
 
-- **`state-guard.yml` fails any PR that touches or renames a path from `.state/**`.** A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. Deliberate repairs need the exact `gitforgeops/state-override` label. The guard replays paginated label/unlabel events, attributes the latest effective label, queries that actor's current permission, rejects triage/read/deleted/unknown actors and API ambiguity, and records actor, permission, event ID, and timestamp in the job summary. Label and unlabel events rerun the check under per-PR concurrency so a removed authorization cannot leave an older successful run authoritative.
+- **`state-guard.yml` fails any PR that touches or renames a path from `.state/**`.** It runs on `pull_request_target`, so the guard executing is always the one `main` reviewed — under `pull_request` a single commit could both forge a ledger entry and delete the check that rejects it. That trigger is safe here only because the job never checks out the pull request: changed files, labels, and collaborator permission all come from `gh api`, and its one piece of executable logic is checked out from the default branch. A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. GitHub caps changed-file enumeration at 3,000 entries, so observing 3,000 files is conservatively treated as incomplete rather than becoming a silent truncation. Deliberate repairs and intentionally reviewed oversized PRs need the exact `gitforgeops/state-override` label. Authorization succeeds only while processing that exact `labeled` webhook for the current head; every later push, retarget, reopen, or other configured PR event fails until a qualified maintainer removes and reapplies it. Re-running the same authorized label event remains bound to the same event actor and head. The guard queries that event actor's current permission, rejects triage/read/deleted/unknown actors and API ambiguity, and records actor, permission, authorized head, run ID, and attempt in the job summary. Push, label, and unlabel events rerun the check under per-PR concurrency so stale or removed authorization cannot leave an older successful run authoritative.
 - **`.state/*.json` is tracked in git; locks and temp files are not.** If you fork this repo, keep the `.gitignore` entries as shipped. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
 - **Apply runs post-merge only**, so a poisoned ledger has to survive review and land on `main` before it can act.
 - **The guard must be a required status check before launch.** The state-writer GitHub App is the sole ruleset bypass and receives only short-lived `Contents: write` installation tokens. See [GitHub launch controls](docs/github-launch-controls.md).
@@ -210,11 +223,18 @@ until the newer binary is back.
 
 A live proxy, upstream, or plugin config with `api_spec_id` set was provisioned by the gateway's OpenAPI spec importer, which re-provisions it authoritatively on every spec re-import. gitforgeops stays off those rows in **both** ownership modes, regardless of what the state file says:
 
-- Never modified. If the repo also declares the same `(namespace, kind, id)`, the run reports a **conflict** — two owners writing one row, and the spec importer wins on its next import.
+- Never modified. If the repo also declares the same `(namespace, kind, id)`, the run reports a **conflict** and takes that whole namespace out of the run — two owners writing one row, and the spec importer wins on its next import, so applying the rest of the namespace would report a convergence that will not hold. Only that namespace is blocked; the others reconcile normally, and the conflict is listed in the apply errors so the run still exits non-zero.
 - Never deleted, except in `exclusive` mode with `gitforgeops apply --confirm-api-spec-deletion`. Otherwise apply prints one line per skipped row and counts them.
 - Rendered in `plan` / `diff` output and in the PR comment's "Spec-owned Resources" section. Unlike the unmanaged block this is not gated on `ownership.drift_report` — a repo fighting the spec importer is a correctness problem, not drift noise.
 
-The same flag governs `full_replace`, but preserving API specs requires conditional restore semantics that the gateway does not currently expose. A namespace with a non-empty `api_specs` section therefore fails closed under `full_replace`; use incremental apply to retain the spec-owned graph, or pass `--confirm-api-spec-deletion` only when deleting that complete graph is intentional. An authoritative empty/absent section is omitted from the restore so a spec created after the backup triggers the gateway's 409 guard instead of being silently wiped. `gateway_trust_bundles` is always omitted: the gateway defines absence as a no-op, which preserves a concurrent trust rotation instead of replaying stale roots. A missing graph member, cached backup, repo/spec ID collision, or unfamiliar top-level backup section also fails before any namespace is mutated. Repository-authored `api_spec_id` fields are rejected under both apply strategies, even with the confirmation flag; only the gateway may assign the ownership marker.
+`full_replace` preserves the graph rather than refusing it. Ferrum Edge's `/restore` validates API-spec ownership as one unit — every `api_specs.items` entry must name an owning proxy that is present in the same payload and carries the matching `api_spec_id`, and every tagged proxy/upstream/plugin config must name a spec present in `api_specs.items` — and it re-creates the spec documents verbatim without re-extracting resources from them. So the restore body carries the repository's desired rows **and** the complete live spec-owned graph **and** the live `api_specs` section, and nothing is duplicated.
+
+Two things are deliberately left out of the body:
+
+- **An empty `api_specs` section.** The gateway reads `items: []` as an intentional wipe, but an *absent* section as "count this namespace's live specs and answer 409 if there are any" — which is the only thing that catches a spec created between the backup and the restore.
+- **`gateway_trust_bundles`, always.** The gateway defines an absent trust section as "leave trust exactly as it is", so omitting it preserves the live roots without the lost-update window that replaying a possibly-stale snapshot would open.
+
+`--confirm-api-spec-deletion` remains the only path that drops the spec graph (trust bundles still survive). A graph that cannot be proven complete — a spec document with no tagged rows, a tagged row whose spec is missing, a cross-namespace row — plus a cached backup, a repo/spec ID collision, or an unfamiliar top-level backup section, all fail before any namespace is mutated. Repository-authored `api_spec_id` fields are rejected under both apply strategies, even with the confirmation flag; only the gateway may assign the ownership marker.
 
 ## Policy framework: `.gitforgeops/policies.yaml`
 
@@ -610,11 +630,12 @@ Retried:
 Never retried:
 
 - **HTTP 501** — a standalone-MongoDB gateway (no multi-document transactions) will answer it forever. For `POST /batch` this is not even an error: apply falls back to per-resource creates.
-- **Every error response from non-idempotent create and batch POSTs** — a gateway or intermediary can return an error after commit. Gitforgeops sends the POST once, then fetches an authoritative backup after an ambiguous response. If the exact desired resource or complete batch is live, idempotent PUTs explicitly assert repository ownership before success is recorded; equality alone never grants deletion authority. A batch is decomposed into individual creates only for documented definitive rejections (400/409/413/422), never for transport/5xx ambiguity.
+- **Every error response from non-idempotent create and batch POSTs** — a gateway or intermediary can return an error after commit. Gitforgeops sends the POST once, then fetches an authoritative backup after an ambiguous response, and treats the three possible answers differently: the exact desired resource (or complete batch) live → an idempotent PUT declares repository ownership, and only then is the create recorded; nothing under that id on a fresh, database-backed backup → the write provably did not commit, so it is an ordinary per-resource failure and the run keeps going; a row that exists but is not what we sent, or no usable verification at all → the run stops for reconciliation. The ownership PUT *declares* the repository as the row's writer; it cannot prove who created it, which is exactly why equality alone never grants deletion authority. A batch is decomposed into individual creates only for documented definitive rejections (400/409/413/422), never for transport/5xx ambiguity.
 - **`applied: false` in the body** — the write is durably committed but not live on the running gateway. Re-sending re-applies an already-committed write; check gateway health instead. Surfaces as a `CommittedNotLive` error naming the gateway's `reason` (`config_rejected` / `reload_timeout` / `sequence_unavailable`).
 - **`/restore` failures other than the explicit pre-commit connectivity case** — restore is destructive and not generally idempotent. A 500 with `rollback: incomplete` or `unknown_outcome` additionally surfaces as manual-recovery-required because the namespace may be partially restored.
 - **Request timeouts** — a timeout means state is ambiguous (gateway may or may not have applied). Retrying a large `/restore` after timeout could double-write. The next CI run re-diffs and converges.
 - **4xx other than 408/429** — 400/401/403/404/409/422 are permanent.
+- **3xx** — redirects are never followed on admin calls (a 301/302 would rewrite a POST into a GET, a 307/308 would replay a destructive body against another origin). The error names the `Location` header and tells you to point `FERRUM_GATEWAY_URL` at the final origin.
 
 Backoff is exponential (`500ms · 2^attempt`) capped at 8 seconds, **unless** the response carries `Retry-After`, which is honored verbatim in delta-seconds form and capped at 30 seconds so a pathological value can't wedge CI.
 
@@ -725,7 +746,6 @@ Minted tokens also carry an `ns` claim listing the namespaces the run actually t
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML. Values are trimmed/case-folded; every other present value fails the workflow preflight before credentials or binaries are loaded. |
-| `FERRUM_EDGE_VERSION` | `latest` | Ferrum Edge release tag for the validator. It must have an exact reviewed digest in `.github/ferrum-edge-checksums.txt`. |
 | `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
 | `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Where the `release` workflow pushes on Docker Hub. Only matters if `GITFORGEOPS_RELEASE_ENABLED=true`. GHCR path is auto-derived from the repo. |
 
@@ -795,7 +815,7 @@ gitforgeops plan
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
 gitforgeops export [--output PATH] [--materialize] [--encrypt-to GH_LOGIN]
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
-  [--credential-bundle-output PRIVATE_PATH]
+  [--credential-bundle-output PRIVATE_PATH]      # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops rotate --consumer ID --credential KEY \
@@ -1032,9 +1052,13 @@ cargo fmt --all -- --check
 
 Rust CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --test unit_tests` on PRs/pushes that touch source, tests, Cargo metadata, the Dockerfile, or the Rust CI workflow. Resource-only PRs run `validate-pr.yml` instead.
 
-The weekly security job also rejects new vulnerabilities, unsound advisories,
-and yanked active dependencies. Any unavoidable exception is exact-version,
-owner-assigned, and time-bounded; see
+The security workflow runs on every pull request, on pushes to `main` that
+touch build inputs, and weekly on a schedule. It rejects new vulnerabilities,
+unsound advisories, and yanked active dependencies, and reports the remaining
+advisory buckets (`unmaintained`, `notice`) as non-blocking annotations. Any
+unavoidable exception is exact-version, owner-assigned, and time-bounded; once
+it expires the security job fails on every run, so the gate warns 21 days
+ahead. See
 [Dependency security policy](docs/dependency-security.md).
 
 ### Publishing your own fork's image
@@ -1048,16 +1072,65 @@ If you'd rather not depend on the upstream image (air-gapped env, vendored build
    - `DOCKERHUB_IMAGE=acme/ferrum-edge-git-forge-ops` — where to push on Docker Hub. GHCR path auto-derives from the repo.
 4. Push to `main` — `release.yml` builds + pushes to Docker Hub and GHCR.
 
-### Version pinning
+### Validator digest pinning
 
-Set `FERRUM_EDGE_VERSION` to the release tag matching the gateway. That tag
-must appear beside the SHA-256 of `ferrum-edge-linux-x86_64` in
-`.github/ferrum-edge-checksums.txt`; adding or changing a pin therefore goes
-through normal CODEOWNER review. The installer downloads the binary and its
-publisher `.sha256` asset, verifies they agree, then verifies the computed
-bytes against the checked-in digest before making the file executable. If
-unset, the fallback selects the content-pinned 2026-08-27 `latest` snapshot;
-if that tag moves, CI stops until the lock file is deliberately updated.
+The validator binary is pinned by **content**, never by a locator. Upstream
+ferrum-edge publishes a single rolling `latest` release and deletes plus
+re-uploads its assets on every build, so release ids, asset ids and tags all
+move underneath a consumer. Only the bytes are stable.
+
+`.github/ferrum-edge-checksums.txt` is the allowlist. One record per approved
+build:
+
+```
+<64 lowercase hex sha256>  ferrum-edge-linux-x86_64  # <publish timestamp> release <tag>
+```
+
+`.github/scripts/install-ferrum-edge.sh` resolves the release through
+`releases/tags/latest` (falling back to the release list), finds the asset and
+its `.sha256` companion by exact **name**, downloads both over
+`--proto '=https' --tlsv1.2 --fail`, verifies the publisher's own checksum, and
+then requires the computed digest to appear in the allowlist. Only after that
+match does it `install -m 0755`. A build the repository has not reviewed is
+never executed. There is no environment variable or Actions variable that can
+select a different binary — the allowlist is the only control, and it is a
+CODEOWNER-owned path.
+
+Keeping several lines is deliberate: a refresh that also retains the previous
+digest lets in-flight pull requests that already downloaded the older binary
+stay green.
+
+To record a new build, review it upstream, then:
+
+```bash
+bash .github/scripts/refresh-ferrum-edge-pin.sh          # print the line
+bash .github/scripts/refresh-ferrum-edge-pin.sh --append # append it in place
+```
+
+The script downloads the current asset, cross-checks it against the publisher's
+checksum file, and refuses to emit a line if the two disagree. Commit the
+result through normal review.
+
+`validator-pin-canary.yml` runs the installer daily from the default branch (and
+on demand). When the allowlist has gone stale it opens — or updates — a single
+tracking issue titled *Refresh the pinned ferrum-edge validator digest*
+containing the exact line to add and the command above, and closes that issue
+once the allowlist covers the current build again.
+
+## Upgrading
+
+### `live_review` defaults to `true`
+
+`.gitforgeops/config.yaml` gained a per-environment `live_review` flag, and its
+default is `true`. Every environment that does not say otherwise is therefore
+opted **in** to trusted `workflow_run` live review, which binds that GitHub
+Environment and compares PR resources against the Admin API.
+
+That is right for API-mode environments and wrong for file-mode ones: with no
+live Admin API to reach, the review requests an Environment approval and then
+fails to connect. Add `live_review: false` to every file-mode environment (and
+to any environment without a reachable Admin API) before upgrading — see
+[Repo configuration](#repo-configuration-gitforgeopsconfigyaml).
 
 ## License
 

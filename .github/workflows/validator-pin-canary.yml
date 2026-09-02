@@ -1,0 +1,135 @@
+name: GitForgeOps Validator Pin Canary
+
+# Upstream ferrum-edge republishes its rolling `latest` release on every build,
+# so the reviewed digest allowlist goes stale on upstream's schedule rather than
+# ours. This canary notices that the same day instead of when the next pull
+# request fails, and it hands a maintainer the exact reviewed line to commit.
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validator-pin-canary
+  cancel-in-progress: false
+
+jobs:
+  validator-pin-canary:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    env:
+      ISSUE_TITLE: Refresh the pinned ferrum-edge validator digest
+      ISSUE_MARKER: '<!-- gitforgeops:validator-pin-canary -->'
+    steps:
+      - name: Require protected default branch
+        env:
+          SOURCE_REF: ${{ github.ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          [ "$SOURCE_REF" = "$EXPECTED_REF" ] || {
+            echo "::error::The validator pin canary may run only from $EXPECTED_REF."
+            exit 1
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify the reviewed validator digest still resolves
+        id: verify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          status=0
+          bash .github/scripts/install-ferrum-edge.sh \
+            "$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?
+          echo "status=$status" >>"$GITHUB_OUTPUT"
+
+      - name: Compute the current upstream allowlist line
+        id: refresh
+        if: steps.verify.outputs.status != '0'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          line=$(bash .github/scripts/refresh-ferrum-edge-pin.sh)
+          {
+            echo 'line<<CANARY_EOF'
+            printf '%s\n' "$line"
+            echo 'CANARY_EOF'
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Open or update the tracking issue
+        if: steps.verify.outputs.status != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ALLOWLIST_LINE: ${{ steps.refresh.outputs.line }}
+        run: |
+          set -euo pipefail
+          cat >issue-body.md <<EOF
+          $ISSUE_MARKER
+
+          The reviewed digest allowlist no longer covers the build upstream is
+          publishing. Every workflow that runs \`ferrum-edge validate\` fails
+          until the allowlist is refreshed.
+
+          Review the upstream build, then append this exact line to
+          \`.github/ferrum-edge-checksums.txt\`:
+
+          \`\`\`
+          $ALLOWLIST_LINE
+          \`\`\`
+
+          Or regenerate it locally:
+
+          \`\`\`bash
+          bash .github/scripts/refresh-ferrum-edge-pin.sh --append
+          \`\`\`
+
+          Keep the previous line so in-flight pull requests still running the
+          older binary stay green.
+
+          Canary run: $RUN_URL
+          EOF
+
+          number=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null) | [.number, .title] | @tsv' \
+            | awk -F'\t' -v title="$ISSUE_TITLE" '$2 == title { print $1; exit }')
+
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$REPO" --body-file issue-body.md
+            echo "::notice::Updated tracking issue #$number."
+          else
+            gh issue create --repo "$REPO" --title "$ISSUE_TITLE" --body-file issue-body.md
+            echo "::notice::Opened a tracking issue for the stale validator pin."
+          fi
+
+      - name: Close a resolved tracking issue
+        if: steps.verify.outputs.status == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          number=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null) | [.number, .title] | @tsv' \
+            | awk -F'\t' -v title="$ISSUE_TITLE" '$2 == title { print $1; exit }')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --repo "$REPO" \
+              --comment 'The reviewed digest allowlist now covers the build upstream is publishing.'
+            echo "::notice::Closed resolved tracking issue #$number."
+          fi
+
+      - name: Fail when the pin is stale
+        if: steps.verify.outputs.status != '0'
+        run: |
+          echo "::error::The reviewed validator digest allowlist is stale; see the tracking issue."
+          exit 1

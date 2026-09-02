@@ -3,6 +3,16 @@ name: Release
 on:
   push:
     branches: [main]
+    # `apply-on-merge.yml` and `rotate.yml` push the ownership ledger (and, in
+    # file mode, the assembled documents) straight to `main` as the state-writer
+    # App. Those commits contain no build input, so rebuilding and republishing
+    # the image for them wastes a multi-platform build and moves the `latest`
+    # tag for no reason. They used to carry `[skip ci]`, which suppressed every
+    # workflow indiscriminately, including the required checks; scoping the
+    # exclusion to the paths CI actually should ignore is the narrower fix.
+    paths-ignore:
+      - '.state/**'
+      - 'assembled/**'
     tags: ['v*']
 
 concurrency:
@@ -31,28 +41,40 @@ jobs:
           checks_file=$(mktemp)
           trap 'rm -f "$pulls_file" "$checks_file"' EXIT
 
-          gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
-            --paginate --slurp > "$pulls_file"
-          pr=$(jq -er --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" '
-            if type != "array" or any(.[]; type != "array") then
-              error("invalid commit-to-PR response")
-            else
-              ([
-                .[][]
-                | select(
-                    .state == "closed" and
-                    .base.ref == $branch and
-                    (.merged_at | type) == "string" and
-                    (.number | type) == "number"
-                  )
-              ] | unique_by(.number)) as $candidates
-              | ([$candidates[] | select(.merge_commit_sha == $sha)]) as $exact
-              | (if ($exact | length) > 0 then $exact else $candidates end)
-              | if length == 1 then .[0].number
-                else error("release commit must map to exactly one merged PR")
+          pr=
+          for attempt in 1 2 3 4 5; do
+            if gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
+              --paginate --slurp > "$pulls_file" &&
+              pr=$(jq -er --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" '
+                if type != "array" or any(.[]; type != "array") then
+                  error("invalid commit-to-PR response")
+                else
+                  ([
+                    .[][]
+                    | select(
+                        .state == "closed" and
+                        .base.ref == $branch and
+                        (.merged_at | type) == "string" and
+                        (.number | type) == "number"
+                      )
+                  ] | unique_by(.number)) as $candidates
+                  | ([$candidates[] | select(.merge_commit_sha == $sha)]) as $exact
+                  | (if ($exact | length) > 0 then $exact else $candidates end)
+                  | if length == 1 then .[0].number
+                    else error("release commit must map to exactly one merged PR")
+                    end
                 end
-            end
-          ' "$pulls_file")
+              ' "$pulls_file"); then
+              break
+            fi
+            pr=
+            echo "Release merge association is not yet available and unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
+          [ -n "$pr" ] || {
+            echo "::error::Release commit could not be mapped to exactly one merged PR."
+            exit 1
+          }
 
           status=0
           gh pr checks "$pr" --repo "$REPO" --required \
@@ -64,11 +86,11 @@ jobs:
           }
 
           jq -e --argjson required '[
-            "Rust CI / check",
-            "Security / cargo-audit",
-            "Security / supply-chain-policy",
-            "GitForgeOps State Guard / reject-state-edits",
-            "GitForgeOps PR Static Validation / required-static-validation"
+            "Rust CI / rust-ci-check",
+            "Security / security-cargo-audit",
+            "Security / security-supply-chain-policy",
+            "GitForgeOps State Guard / state-guard-reject-state-edits",
+            "GitForgeOps PR Static Validation / gitforgeops-required-static-validation"
           ]' '
             map({
               context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
@@ -172,6 +194,30 @@ jobs:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      # `docker/build-push-action` publishes ONE manifest digest to BOTH
+      # registries, so the step above covers those exact bytes — but an
+      # attestation is bound to its `subject-name`, and a consumer pulling
+      # `docker.io/<image>` verifies against that name. Without this second
+      # subject, `gh attestation verify oci://docker.io/...` finds nothing and
+      # the Docker Hub image is effectively unattested.
+      #
+      # `push-to-registry` is deliberately off here. The attestation is
+      # recorded in GitHub's attestation store, which `gh attestation verify`
+      # consults for an image in any registry, so verification works either
+      # way; writing it into Docker Hub's referrers instead would make every
+      # release depend on a third-party registry's referrers support, and a
+      # failure there would land after the image was already pushed. GHCR
+      # keeps `push-to-registry: true` because it is this project's primary
+      # distribution point and is known to support it.
+      #
+      # DOCKERHUB_IMAGE is documented as `owner/name`; the registry host is
+      # added here because an attestation subject must be fully qualified.
+      - name: Publish signed Docker Hub build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: docker.io/${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
+          subject-digest: ${{ steps.build.outputs.digest }}
 
       - name: Bind image digest into build-input record
         env:

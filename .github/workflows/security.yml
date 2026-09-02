@@ -4,6 +4,8 @@ on:
   # Report required security contexts on every PR. Path filtering a required
   # workflow leaves non-matching PRs stuck waiting for a status that never ran.
   pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
   push:
     branches: [main]
     paths:
@@ -26,10 +28,9 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
-  supply-chain-policy:
+  security-supply-chain-policy:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -38,13 +39,86 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out trusted supply-chain policy
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted-supply-chain
+          persist-credentials: false
+
+      - name: Check out immutable policy bootstrap
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # PR #87 adds the checker itself, so its protected base cannot supply
+          # it. This already-reviewed commit of the same PR is a one-time
+          # immutable fallback; after merge the default-branch copy always wins.
+          #
+          # Re-pin this whenever the policy changes while `main` still lacks the
+          # checker: the fallback runs the OLD policy against the NEW tree, so
+          # it must stay at or after the commit that last reshaped the policy
+          # (validator digest allowlist, `state-guard.yml` on
+          # `pull_request_target`, ...) or it rejects the very tree it guards.
+          # `test_immutable_bootstrap_checker_accepts_the_current_policy` is
+          # what catches a stale pin.
+          ref: 521cca0fdd75dde4c113031ff8a1d0f941779d2e
+          path: bootstrap-supply-chain
+          persist-credentials: false
+
       - name: Check immutable workflow and container references
-        run: python3 .github/scripts/check_supply_chain.py
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = pull_request ]; then
+            CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py
+            if [ ! -f "$CANDIDATE_CHECKER" ] || [ -L "$CANDIDATE_CHECKER" ]; then
+              echo "Candidate must retain the regular-file supply-chain checker." >&2
+              exit 1
+            fi
+            # Execute policy code from the protected default branch while
+            # pointing it at the candidate tree. The global assignments keep
+            # the first bootstrap compatible with the pre-`--root` checker.
+            CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py
+            if [ ! -f "$CHECKER" ]; then
+              CHECKER=bootstrap-supply-chain/.github/scripts/check_supply_chain.py
+            fi
+            [ -f "$CHECKER" ] || { echo "Trusted supply-chain checker is unavailable." >&2; exit 1; }
+            python3 - "$CHECKER" "$GITHUB_WORKSPACE" <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          checker = Path(sys.argv[1]).resolve()
+          candidate = Path(sys.argv[2]).resolve()
+          spec = importlib.util.spec_from_file_location("trusted_supply_chain", checker)
+          if spec is None or spec.loader is None:
+              raise SystemExit("could not load trusted supply-chain checker")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module.ROOT = candidate
+          module.WORKFLOWS = candidate / ".github" / "workflows"
+          module.ACTION_FILES = sorted(
+              {
+                  *module.WORKFLOWS.glob("*.yml"),
+                  *module.WORKFLOWS.glob("*.yaml"),
+                  *(candidate / ".github" / "actions").glob("**/action.yml"),
+                  *(candidate / ".github" / "actions").glob("**/action.yaml"),
+              }
+          )
+          sys.argv = [str(checker)]
+          raise SystemExit(module.main())
+          PY
+          else
+            python3 .github/scripts/check_supply_chain.py
+          fi
 
       - name: Test privileged-input boundary
         run: python3 -m unittest discover -s .github/scripts/tests -v
 
-  cargo-audit:
+  security-cargo-audit:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -87,6 +161,9 @@ jobs:
 
   codeql:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

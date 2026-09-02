@@ -12,6 +12,14 @@ on:
     workflows: [GitForgeOps PR Static Validation]
     types: [completed]
 
+# Keyed on the reviewed head, not the PR: two different commits are two
+# different reviews and both should run, but a re-run (or a duplicated
+# workflow_run delivery) for the SAME commit would otherwise race its
+# predecessor for the environment approval and the PR comment.
+concurrency:
+  group: trusted-pr-review-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -21,6 +29,9 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       targets: ${{ steps.targets.outputs.targets }}
       head_sha: ${{ steps.metadata.outputs.head_sha }}
@@ -48,9 +59,21 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          EXPECTED_WORKFLOW_PATH: .github/workflows/validate-pr.yml
         run: |
           set -euo pipefail
           [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid head SHA" >&2; exit 1; }
+
+          # `workflow_run.workflows:` matches on the workflow's *display name*,
+          # which is just a `name:` line any workflow file may carry. Resolve
+          # the triggering run and require its definition path, so a new or
+          # renamed workflow cannot impersonate static validation and hand this
+          # privileged job a head SHA of its choosing.
+          run_path=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.path')
+          [ "$run_path" = "$EXPECTED_WORKFLOW_PATH" ] || {
+            echo "Triggering run is '${run_path}', not ${EXPECTED_WORKFLOW_PATH}." >&2
+            exit 1
+          }
           trusted_sha=$(git -C trusted rev-parse HEAD)
           if [ "$EVENT_HEAD_REPO" != "$REPO" ]; then
             {
@@ -65,15 +88,23 @@ jobs:
           # workflow_run.pull_requests is observably empty for some PR runs.
           # Resolve from the exact triggering commit and require one open,
           # matching-source PR whose current head is still that commit.
-          associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp)
-          matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" '
-            [.[][]
-              | select(.state == "open")
-              | select(.head.sha == $sha)
-              | select(.head.repo.full_name == $head_repo)
-              | select(.base.ref == $base)]
-          ' <<< "$associated")
-          match_count=$(jq 'length' <<< "$matches")
+          matches='[]'
+          match_count=0
+          for attempt in 1 2 3 4 5; do
+            if associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp); then
+              matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" '
+                [.[][]
+                  | select(.state == "open")
+                  | select(.head.sha == $sha)
+                  | select(.head.repo.full_name == $head_repo)
+                  | select(.base.ref == $base)]
+              ' <<< "$associated")
+              match_count=$(jq 'length' <<< "$matches")
+              [ "$match_count" -eq 1 ] && break
+            fi
+            echo "PR association is not yet available and unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
           [ "$match_count" -eq 1 ] || { echo "Expected one open PR for workflow head; found $match_count." >&2; exit 1; }
           event_pr=$(jq -r '.[0].number' <<< "$matches")
           [[ "$event_pr" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid resolved PR number" >&2; exit 1; }
@@ -82,6 +113,8 @@ jobs:
           current_sha=$(jq -r '.head.sha' <<< "$current")
           current_repo=$(jq -r '.head.repo.full_name' <<< "$current")
           current_base=$(jq -r '.base.ref' <<< "$current")
+          current_base_sha=$(jq -r '.base.sha' <<< "$current")
+          declared_changed=$(jq -r '.changed_files' <<< "$current")
           [ "$current_sha" = "$EVENT_HEAD_SHA" ] || { echo "PR head changed after static validation; wait for the new run." >&2; exit 1; }
           [ "$current_repo" = "$EVENT_HEAD_REPO" ] || { echo "PR source repository changed." >&2; exit 1; }
           [ "$current_base" = "$DEFAULT_BRANCH" ] || { echo "PR no longer targets the protected default branch." >&2; exit 1; }
@@ -90,8 +123,15 @@ jobs:
           trap 'rm -f "$pages_file"' EXIT
           gh api "repos/${REPO}/pulls/${event_pr}/files?per_page=100" \
             --paginate --slurp > "$pages_file"
-          declared_changed=$(jq -r '.changed_files' <<< "$current")
           [[ "$declared_changed" =~ ^[0-9]+$ ]] || { echo "Invalid changed-file count" >&2; exit 1; }
+          current_after=$(gh api "repos/${REPO}/pulls/${event_pr}")
+          [ "$(jq -r '.head.sha' <<< "$current_after")" = "$current_sha" ] && \
+          [ "$(jq -r '.base.sha' <<< "$current_after")" = "$current_base_sha" ] && \
+          [ "$(jq -r '.base.ref' <<< "$current_after")" = "$current_base" ] && \
+          [ "$(jq -r '.changed_files' <<< "$current_after")" = "$declared_changed" ] || {
+            echo "PR file metadata changed during trusted classification; wait for the new run." >&2
+            exit 1
+          }
           classification=$(python3 trusted/.github/scripts/changed_files.py \
             "$pages_file" "$declared_changed" declarative)
           [ "$(jq -r '.complete' <<< "$classification")" = true ] || {
@@ -99,6 +139,8 @@ jobs:
             exit 1
           }
           relevant=$(jq -r '.matches' <<< "$classification")
+          umask 077
+          jq -c '.matched_paths' <<< "$classification" > "$RUNNER_TEMP/trusted-changed-paths.json"
           same_repo=false
           [ "$EVENT_HEAD_REPO" = "$REPO" ] && same_repo=true
           privileged=false
@@ -187,12 +229,16 @@ jobs:
 
           # Privileged review never consumes PR-authored environment or policy
           # configuration. It binds only protected-branch environments and
-          # protected-branch resource namespace directories. FERRUM_NAMESPACE
-          # later narrows both desired loading and the JWT `ns` claim, so an
-          # untrusted YAML namespace override cannot turn live review into a
-          # cross-namespace read primitive. New namespaces receive static
-          # validation only until their directory is trusted on main.
-          targets=$(python3 trusted/.github/scripts/pr_input.py targets trusted "$scopes")
+          # protected-branch resource namespace directories, intersected with
+          # the current and previous resource/overlay paths from the stable PR
+          # file snapshot. FERRUM_NAMESPACE later narrows both desired loading
+          # and the JWT `ns` claim, so an untrusted YAML namespace override
+          # cannot turn live review into a cross-namespace read primitive. New
+          # namespaces receive static validation only until their directory is
+          # trusted on main. Protected config-only changes remain static-only
+          # because privileged review replaces candidate `.gitforgeops` files.
+          targets=$(python3 trusted/.github/scripts/pr_input.py targets \
+            trusted "$scopes" "$RUNNER_TEMP/trusted-changed-paths.json")
           echo "Trusted source SHA: ${{ steps.metadata.outputs.trusted_sha }}"
           echo "Live-review targets: $targets"
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
@@ -281,14 +327,14 @@ jobs:
           }
 
       - name: Add trusted environment and policy configuration
+        id: trusted-config
         run: |
           set -euo pipefail
           [ ! -L trusted/.gitforgeops ] || {
             echo "Trusted .gitforgeops directory must not be a symlink." >&2
             exit 1
           }
-          mkdir -p review-input/.gitforgeops
-          chmod 0700 review-input/.gitforgeops
+          install -d -m 0700 review-input/.gitforgeops
           for name in config.yaml policies.yaml; do
             source="trusted/.gitforgeops/$name"
             [ -e "$source" ] || continue
@@ -300,6 +346,7 @@ jobs:
           done
 
       - name: Add trusted ownership state for this environment
+        id: trusted-state
         env:
           INPUT_ENVIRONMENT: ${{ matrix.environment }}
         run: |
@@ -314,16 +361,16 @@ jobs:
             exit 1
           fi
           if [ -f "$state" ]; then
-            mkdir -p review-input/.state
+            install -d -m 0700 review-input/.state
             install -m 0600 "$state" "review-input/.state/${INPUT_ENVIRONMENT}.json"
           fi
 
       - name: Download verified ferrum-edge binary
         id: validator
         env:
-          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'latest' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          bash trusted/.github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
+          bash trusted/.github/scripts/install-ferrum-edge.sh
 
       - name: Validate with trusted binary
         id: validation
@@ -339,6 +386,8 @@ jobs:
           steps.verify.outcome == 'success' &&
           steps.binary.outcome == 'success' &&
           steps.current-head.outcome == 'success' &&
+          steps.trusted-config.outcome == 'success' &&
+          steps.trusted-state.outcome == 'success' &&
           steps.validator.outcome == 'success'
         working-directory: review-input
         env:

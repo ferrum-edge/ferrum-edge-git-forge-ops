@@ -1184,7 +1184,9 @@ async fn api_import_rejects_cross_namespace_resources_before_writing() {
         apply_strategy: ApplyStrategy::Incremental,
         ..EnvConfig::default()
     };
-    let client = AdminClient::new(&env).unwrap();
+    // `new_scoped` is the only public constructor; the import below is
+    // scoped to the same single namespace it asks the gateway for.
+    let client = AdminClient::new_scoped(&env, ["ferrum"]).unwrap();
     let output = tempfile::tempdir().unwrap();
 
     let error = gitforgeops::import::from_api::import_from_api(
@@ -1229,7 +1231,9 @@ async fn api_import_refuses_cached_backup_before_writing() {
         apply_strategy: ApplyStrategy::Incremental,
         ..EnvConfig::default()
     };
-    let client = AdminClient::new(&env).unwrap();
+    // `new_scoped` is the only public constructor; the import below is
+    // scoped to the same single namespace it asks the gateway for.
+    let client = AdminClient::new_scoped(&env, ["ferrum"]).unwrap();
     let output = tempfile::tempdir().unwrap();
 
     let error = gitforgeops::import::from_api::import_from_api(

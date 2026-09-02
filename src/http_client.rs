@@ -54,7 +54,13 @@ pub struct AdminClient {
 
 impl AdminClient {
     /// Build an Admin API client from resolved process/repo environment config.
-    pub fn new(env: &EnvConfig) -> crate::error::Result<Self> {
+    ///
+    /// Private on purpose. A client built here mints admin tokens with no `ns`
+    /// claim, which a gateway running `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`
+    /// rejects outright — and, worse, which a gateway *not* running it accepts
+    /// for every namespace. [`AdminClient::new_scoped`] is the only public
+    /// door, so a new call site has to say what it is allowed to touch.
+    fn new(env: &EnvConfig) -> crate::error::Result<Self> {
         let gateway_url = env
             .gateway_url
             .clone()
@@ -148,10 +154,13 @@ impl AdminClient {
     /// Build a client whose JWTs are scoped to the exact namespaces the
     /// command has resolved.
     ///
-    /// Prefer this constructor whenever the command knows its namespace set
-    /// before the first request. Keeping scoping in construction makes it
+    /// The only public constructor. Keeping scoping in construction makes it
     /// difficult for a new admin-API call site to accidentally mint an
     /// unscoped token on gateways that require the `ns` claim.
+    ///
+    /// An empty `namespaces` deliberately still builds a client — some
+    /// commands legitimately have no namespace set to declare — but it mints
+    /// an unscoped token, so pass the resolved set whenever one exists.
     pub fn new_scoped<I, S>(env: &EnvConfig, namespaces: I) -> crate::error::Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -214,6 +223,7 @@ impl AdminClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
+                    let location = header_string(&resp, "location");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
                     let body = resp
                         .text()
@@ -225,6 +235,7 @@ impl AdminClient {
                             status,
                             body,
                             data_source,
+                            location,
                         });
                     }
 
@@ -242,6 +253,7 @@ impl AdminClient {
                         status,
                         body,
                         data_source,
+                        location,
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
@@ -263,7 +275,12 @@ impl AdminClient {
         if is_success_status(resp.status) {
             return Ok(());
         }
-        Err(map_api_error(resp.status, &resp.body, kind))
+        Err(map_api_error_with_location(
+            resp.status,
+            &resp.body,
+            kind,
+            resp.location.as_deref(),
+        ))
     }
 
     /// [`AdminClient::check`] for config mutations, with one extra step: an
@@ -719,10 +736,11 @@ impl AdminClient {
             return Ok(DeleteOutcome::Deleted);
         }
         Err(self
-            .refine_mutation_error(map_api_error(
+            .refine_mutation_error(map_api_error_with_location(
                 resp.status,
                 &resp.body,
                 RequestKind::Mutation,
+                resp.location.as_deref(),
             ))
             .await)
     }
@@ -745,6 +763,9 @@ struct RawResponse {
     status: u16,
     body: String,
     data_source: Option<String>,
+    /// `Location`, kept only so a 3xx can name where the admin API is
+    /// actually being served from. Redirects are never followed.
+    location: Option<String>,
 }
 
 /// What kind of call is being made, for retry/error classification. `/restore`
@@ -869,8 +890,40 @@ fn is_success_status(status: u16) -> bool {
 
 /// Map a failing response to the most specific error variant available.
 pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error::Error {
+    map_api_error_with_location(status, body, kind, None)
+}
+
+/// [`map_api_error`] with the response's `Location` header, which only the 3xx
+/// arm consults.
+pub fn map_api_error_with_location(
+    status: u16,
+    body: &str,
+    kind: RequestKind,
+    location: Option<&str>,
+) -> crate::error::Error {
     let parsed = ApiErrorBody::parse(body);
     let message = parsed.error.clone().unwrap_or_else(|| body.to_string());
+
+    // The client is built with `redirect::Policy::none()` so a destructive
+    // body is never replayed against a different authority, which means a 3xx
+    // arrives here as a plain failure. Without this arm it read as "API error
+    // (301): " with an empty body, and the actual cause — an admin URL that
+    // has moved, or a load balancer terminating TLS and bouncing http→https —
+    // was invisible. Applies to reads as much as to mutations.
+    if (300..=399).contains(&status) {
+        let destination = match location {
+            Some(location) if !location.trim().is_empty() => {
+                format!("It pointed at `{}`. ", location.trim())
+            }
+            _ => "It carried no usable `Location` header. ".to_string(),
+        };
+        return crate::error::Error::ApiError {
+            status,
+            message: format!(
+                "the gateway answered a redirect (HTTP {status}) instead of a response.                  {destination}gitforgeops never follows redirects on admin calls — a 301/302                  would rewrite a POST into a GET and a 307/308 would replay a destructive body                  against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme,                  host, port and any path prefix) and re-run."
+            ),
+        };
+    }
 
     if status == 403 && is_read_only_refusal(&message) {
         return crate::error::Error::GatewayReadOnly(
@@ -1228,6 +1281,23 @@ impl BackupSnapshot {
         let mut resource_counts = None;
         let mut unsupported_sections = Vec::new();
         if let Some(map) = value.as_object_mut() {
+            // Pinned to ferrum-edge's `BackupPayload` (`src/admin/backup.rs`),
+            // which is constructed in exactly one place
+            // (`src/admin/mod.rs`, the `GET /backup` handler) and serializes
+            // these eleven fields — `gateway_trust_bundles` and `api_specs`
+            // being `Option`, so they are absent on filtered and
+            // cached-fallback exports.
+            //
+            // `resource_counts` is the twelfth and is *not* a gateway section:
+            // it is gitforgeops' own file-mode anti-truncation seal
+            // (`apply::file_target`), allow-listed so a round-trip through a
+            // locally exported document is not misread as an unknown section.
+            //
+            // Deliberately fail-closed: anything else here stops full replace
+            // (`ensure_restore_sections_supported`) rather than being silently
+            // dropped from a `/restore` body that would then delete it. Update
+            // this list in step with the companion, never by widening it to
+            // whatever a gateway happens to send.
             const KNOWN_TOP_LEVEL: &[&str] = &[
                 "version",
                 "proxies",
@@ -1468,17 +1538,25 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 
 /// Build the `POST /restore` body.
 ///
-/// `RestoreRequest` has no `additionalProperties: false`, so the serialized
+/// `RestorePayload` has no `deny_unknown_fields`, so the serialized
 /// `GatewayConfig` (including `version`, which the gateway validates against
 /// `CURRENT_CONFIG_VERSION`) is accepted as-is. The backup-only sections are
 /// spliced in as opaque values rather than being modeled on `GatewayConfig` —
 /// that struct mirrors what this tool manages, and API specs are not it.
+///
+/// The `api_specs` section travels with the spec-owned rows the caller already
+/// merged into `config`: the gateway validates the two halves against each
+/// other and rejects either one on its own. An **empty** section is
+/// deliberately dropped instead of forwarded — the gateway reads `items: []`
+/// as an intentional wipe, whereas an absent section makes it count the
+/// namespace's live specs and answer `409` if any exist, which is the only
+/// guard against a spec created after our backup was taken.
 pub fn build_restore_body(
     config: &GatewayConfig,
     extras: &BackupExtras,
     confirm_api_spec_deletion: bool,
 ) -> crate::error::Result<serde_json::Value> {
-    let body = serde_json::to_value(config)?;
+    let mut body = serde_json::to_value(config)?;
     if !body.is_object() {
         return Err(crate::error::Error::Config(
             "gateway config did not serialize as a JSON object".to_string(),
@@ -1496,11 +1574,9 @@ pub fn build_restore_body(
                             .to_string(),
                     )
                 })?;
-            if !items.is_empty() {
-                return Err(crate::error::Error::Config(
-                    "refusing restore with a non-empty `api_specs` snapshot: the gateway does not expose a conditional restore revision, so replay could overwrite a concurrent spec update"
-                        .to_string(),
-                ));
+            let carry = !items.is_empty();
+            if let (true, Some(map)) = (carry, body.as_object_mut()) {
+                map.insert("api_specs".to_string(), api_specs.clone());
             }
         }
     }

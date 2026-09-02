@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run cargo-audit and enforce exact, expiring dependency-risk exceptions."""
+"""Run cargo-audit and enforce reviewed, expiring dependency-risk exceptions."""
 
 from __future__ import annotations
 
@@ -11,10 +11,11 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 MAX_REVIEW_HORIZON_DAYS = 120
+REVIEW_WARNING_WINDOW_DAYS = 21
 REQUIRED_TEXT_FIELDS = (
     "kind",
     "package",
@@ -26,18 +27,33 @@ REQUIRED_TEXT_FIELDS = (
     "upstream",
 )
 REQUIRED_LIST_FIELDS = ("affected_call_paths", "compensating_controls")
-RSA_EXCEPTION_KEY = (
-    "vulnerability",
-    "RUSTSEC-2023-0071",
-    "rsa",
-    "0.9.10",
-    "registry+https://github.com/rust-lang/crates.io-index",
-)
+
+# cargo-audit buckets that fail the build. Everything else (unmaintained,
+# notice, ...) is reported as a non-fatal GitHub annotation: an advisory that
+# only says "this crate is no longer maintained" must not turn every open pull
+# request red before a human can write a reviewed exception for it.
+BLOCKING_KINDS = frozenset({"vulnerability", "unsound", "yanked"})
+
+# Reachability verifiers are selected by the exception's own `reachability`
+# field, or by (kind, advisory, package) for the entries that predate it.
+# Version is deliberately NOT part of the selector: a patch bump of the
+# vulnerable crate must not silently switch the verifier off.
+AGE_ENCRYPTION_ONLY = "age-encryption-only"
+IMPLICIT_REACHABILITY: dict[tuple[str, str, str], str] = {
+    ("vulnerability", "RUSTSEC-2023-0071", "rsa"): AGE_ENCRYPTION_ONLY,
+}
+# Packages whose exceptions must always resolve to a verifier. An rsa
+# exception the gate cannot machine-check is a policy error, never a pass.
+VERIFIER_REQUIRED_PACKAGES = frozenset({"rsa"})
+
 EXPECTED_RSA_TREE = re.compile(
-    r"^rsa v0\.9\.10\n"
-    r"└── age v0\.12\.1\n"
-    r"    └── gitforgeops v0\.1\.0 \([^\n]+\)\n?$"
+    r"^rsa v0\.9\.\d+\n"
+    r"└── age v0\.12\.\d+\n"
+    r"    └── gitforgeops v\d+\.\d+\.\d+ \([^\n]+\)\n?$"
 )
+AGE_VERSION_REQUIREMENT = re.compile(r"^0\.12(?:\.\d+)?$")
+REQUIRED_AGE_FEATURES = frozenset({"ssh", "armor"})
+REVIEWED_AGE_MODULE = Path("src/secrets/delivery.rs")
 ALLOWED_AGE_REFERENCES = {
     "age::Encryptor",
     "age::Recipient",
@@ -46,6 +62,10 @@ ALLOWED_AGE_REFERENCES = {
     "age::ssh::Recipient",
 }
 AGE_REFERENCE = re.compile(r"\bage(?:::[A-Za-z_][A-Za-z0-9_]*)+")
+CARGO_TREE_NO_MATCH = "did not match any packages"
+
+_RAW_STRING_START = re.compile(r'b?r(?P<hashes>#*)"')
+_CHAR_LITERAL = re.compile(r"b?'(?:\\.|[^\\'\n])'")
 
 
 class PolicyError(ValueError):
@@ -54,6 +74,92 @@ class PolicyError(ValueError):
 
 def _nonempty_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _is_ident_char(char: str) -> bool:
+    return char.isalnum() or char == "_"
+
+
+def strip_rust_comments_and_strings(text: str) -> str:
+    """Blank out comments, string literals, and character literals.
+
+    Removed spans become spaces (newlines preserved) so line structure and the
+    surrounding statement text survive. A `// age::Decryptor` note, a doc
+    comment, or a "age::Decryptor" string is documentation, not a call, and
+    must not trip the API allowlist.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+
+    def blank(span: str) -> None:
+        out.append("".join("\n" if char == "\n" else " " for char in span))
+
+    while index < length:
+        char = text[index]
+        preceded_by_ident = index > 0 and _is_ident_char(text[index - 1])
+
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            end = length if end == -1 else end
+            blank(text[index:end])
+            index = end
+            continue
+
+        if text.startswith("/*", index):
+            start = index
+            depth = 0
+            while index < length:
+                if text.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif text.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                    if depth == 0:
+                        break
+                else:
+                    index += 1
+            blank(text[start:index])
+            continue
+
+        if char in ("r", "b") and not preceded_by_ident:
+            raw = _RAW_STRING_START.match(text, index)
+            if raw:
+                terminator = '"' + raw.group("hashes")
+                end = text.find(terminator, raw.end())
+                end = length if end == -1 else end + len(terminator)
+                blank(text[index:end])
+                index = end
+                continue
+
+        if char == '"' or (
+            char == "b" and text.startswith('b"', index) and not preceded_by_ident
+        ):
+            start = index
+            index += 2 if char == "b" else 1
+            while index < length:
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            blank(text[start:index])
+            continue
+
+        if char in ("'", "b") and not preceded_by_ident:
+            literal = _CHAR_LITERAL.match(text, index)
+            if literal:
+                blank(literal.group(0))
+                index = literal.end()
+                continue
+
+        out.append(char)
+        index += 1
+
+    return "".join(out)
 
 
 def _finding_key(finding: dict[str, Any]) -> tuple[str, str, str, str, str]:
@@ -70,7 +176,10 @@ def collect_findings(report: dict[str, Any]) -> list[dict[str, str | None]]:
     """Flatten cargo-audit's vulnerability and warning buckets."""
     findings: list[dict[str, str | None]] = []
 
-    vulnerabilities = report.get("vulnerabilities", {}).get("list", [])
+    vulnerability_section = report.get("vulnerabilities", {})
+    if not isinstance(vulnerability_section, dict):
+        raise PolicyError("cargo-audit report has a malformed vulnerabilities object")
+    vulnerabilities = vulnerability_section.get("list", [])
     if not isinstance(vulnerabilities, list):
         raise PolicyError("cargo-audit report has a malformed vulnerabilities.list")
     for item in vulnerabilities:
@@ -86,6 +195,13 @@ def collect_findings(report: dict[str, Any]) -> list[dict[str, str | None]]:
             )
         except (KeyError, TypeError) as exc:
             raise PolicyError("cargo-audit returned a malformed vulnerability") from exc
+
+    reported_count = vulnerability_section.get("count")
+    if reported_count is not None and reported_count != len(vulnerabilities):
+        raise PolicyError(
+            f"cargo-audit reported {reported_count} vulnerabilities but this gate "
+            f"parsed {len(vulnerabilities)}; the report shape changed"
+        )
 
     warnings = report.get("warnings", {})
     if not isinstance(warnings, dict):
@@ -149,6 +265,9 @@ def load_policy(
         if kind == "yanked" and advisory not in (None, ""):
             raise PolicyError(f"{label}.advisory must be null for yanked packages")
 
+        if "reachability" in exception and not _nonempty_text(exception["reachability"]):
+            raise PolicyError(f"{label}.reachability must be non-empty text when present")
+
         try:
             review_by = dt.date.fromisoformat(exception["review_by"])
         except ValueError as exc:
@@ -172,6 +291,31 @@ def load_policy(
     return indexed
 
 
+def review_deadline_warnings(
+    policy: dict[tuple[str, str, str, str, str], dict[str, Any]], today: dt.date
+) -> list[str]:
+    """Warn before an exception expires; expiry itself is a hard, repo-wide stop."""
+    annotations: list[str] = []
+    for key in sorted(policy):
+        exception = policy[key]
+        try:
+            review_by = dt.date.fromisoformat(str(exception["review_by"]))
+        except (KeyError, ValueError):  # pragma: no cover - load_policy validated it
+            continue
+        remaining = (review_by - today).days
+        if remaining > REVIEW_WARNING_WINDOW_DAYS:
+            continue
+        advisory = f" ({exception['advisory']})" if exception.get("advisory") else ""
+        annotations.append(
+            f"::warning::cargo-audit exception for {exception['package']} "
+            f"{exception['version']}{advisory} is due for re-review by "
+            f"{review_by.isoformat()} ({remaining} day(s) left, owner "
+            f"{exception['owner']}); once it expires every pull request, push, and "
+            "scheduled security run fails"
+        )
+    return annotations
+
+
 def evaluate(
     report: dict[str, Any],
     policy: dict[tuple[str, str, str, str, str], dict[str, Any]],
@@ -179,10 +323,12 @@ def evaluate(
     list[dict[str, str | None]],
     list[dict[str, str | None]],
     list[tuple[str, str, str, str, str]],
+    list[dict[str, str | None]],
 ]:
     findings = collect_findings(report)
     reviewed: list[dict[str, str | None]] = []
     blocked: list[dict[str, str | None]] = []
+    informational: list[dict[str, str | None]] = []
     used: set[tuple[str, str, str, str, str]] = set()
 
     for finding in findings:
@@ -190,22 +336,65 @@ def evaluate(
         if key in policy:
             reviewed.append(finding)
             used.add(key)
-        else:
+        elif str(finding["kind"]) in BLOCKING_KINDS:
             blocked.append(finding)
+        else:
+            informational.append(finding)
 
     stale = sorted(set(policy) - used)
-    return reviewed, blocked, stale
+    return reviewed, blocked, stale, informational
 
 
-def verify_rsa_exception_reachability(
-    policy: dict[tuple[str, str, str, str, str], dict[str, Any]],
-    source_root: Path,
-    dependency_tree_path: Path | None,
+def _read_dependency_tree(
+    package: str, version: str, source_root: Path, dependency_tree_path: Path | None
+) -> str:
+    if dependency_tree_path is not None:
+        try:
+            return dependency_tree_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PolicyError(
+                f"cannot inspect dependency tree {dependency_tree_path}: {exc}"
+            ) from exc
+
+    spec = f"{package}@{version}"
+    try:
+        result = subprocess.run(
+            [
+                "cargo",
+                "tree",
+                "--color",
+                "never",
+                "--locked",
+                "--target",
+                "all",
+                "-i",
+                spec,
+            ],
+            cwd=source_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise PolicyError(
+            f"could not inspect the {package} dependency path: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        if CARGO_TREE_NO_MATCH in detail:
+            raise PolicyError(
+                f"stale exception: {spec} is no longer in the dependency graph. "
+                "Remove the entry from .github/cargo-audit-policy.json (or update "
+                "its version if the dependency was upgraded rather than dropped)."
+            )
+        raise PolicyError(f"cargo tree failed while checking the {package} path: {detail}")
+    return result.stdout
+
+
+def verify_age_encryption_only(
+    exception: dict[str, Any], source_root: Path, dependency_tree_path: Path | None
 ) -> None:
     """Fail closed if the RSA exception outlives its encryption-only premise."""
-    if RSA_EXCEPTION_KEY not in policy:
-        return
-
     manifest_path = source_root / "Cargo.toml"
     try:
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
@@ -214,48 +403,51 @@ def verify_rsa_exception_reachability(
     age_dependency = manifest.get("dependencies", {}).get("age")
     if not isinstance(age_dependency, dict):
         raise PolicyError("RSA exception requires age to use an explicit dependency table")
+    version = age_dependency.get("version")
+    features = age_dependency.get("features")
     if (
-        age_dependency.get("version") != "0.12"
-        or age_dependency.get("default-features", True) is not True
-        or age_dependency.get("features") != ["ssh", "armor"]
+        not isinstance(version, str)
+        or not AGE_VERSION_REQUIREMENT.fullmatch(version)
+        or not isinstance(features, list)
+        or set(features) != REQUIRED_AGE_FEATURES
     ):
         raise PolicyError(
-            "RSA exception requires age 0.12 with exactly the ssh and armor features"
+            "RSA exception requires an age 0.12 requirement with exactly the "
+            "ssh and armor features"
         )
 
     source_dir = source_root / "src"
     if not source_dir.is_dir():
         raise PolicyError(f"RSA exception source directory is missing: {source_dir}")
-    observed_age_references: set[str] = set()
     for path in sorted(source_dir.rglob("*.rs")):
         try:
-            text = path.read_text(encoding="utf-8")
+            raw_text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise PolicyError(f"cannot inspect {path}: {exc}") from exc
+        # Comments and string literals are prose, not reachable calls.
+        text = strip_rust_comments_and_strings(raw_text)
+        relative = path.relative_to(source_root)
         references = set(AGE_REFERENCE.findall(text))
-        if references and path.relative_to(source_root) != Path("src/secrets/delivery.rs"):
+        if references and relative != REVIEWED_AGE_MODULE:
             raise PolicyError(
-                f"RSA exception permits age calls only in src/secrets/delivery.rs; found {path.relative_to(source_root)}"
+                f"RSA exception permits age calls only in {REVIEWED_AGE_MODULE}; "
+                f"found {relative}"
             )
-        for reference in references:
-            allowed = next(
-                (
-                    prefix
-                    for prefix in ALLOWED_AGE_REFERENCES
-                    if reference == prefix or reference.startswith(f"{prefix}::")
-                ),
-                None,
+        for reference in sorted(references):
+            allowed = any(
+                reference == prefix or reference.startswith(f"{prefix}::")
+                for prefix in ALLOWED_AGE_REFERENCES
             )
-            if allowed is None:
+            if not allowed:
                 raise PolicyError(
-                    f"RSA exception encountered an unreviewed age API reference: {reference}"
+                    f"RSA exception encountered an unreviewed age API reference: "
+                    f"{reference}"
                 )
-            observed_age_references.add(allowed)
         age_use_statements = re.findall(
             r"^\s*use\s+(?:::)?age(?:\s|::).*?;\s*$", text, re.MULTILINE
         )
         if age_use_statements and (
-            path.relative_to(source_root) != Path("src/secrets/delivery.rs")
+            relative != REVIEWED_AGE_MODULE
             or [statement.strip() for statement in age_use_statements]
             != ["use age::ssh::Recipient;"]
         ):
@@ -264,48 +456,63 @@ def verify_rsa_exception_reachability(
             )
         if re.search(r"\bextern\s+crate\s+age\b|\bage\s*::\s*\{", text):
             raise PolicyError("RSA exception forbids alternate age import forms")
-    missing = sorted(ALLOWED_AGE_REFERENCES - observed_age_references)
-    if missing:
-        raise PolicyError(
-            f"RSA exception expected encryption-only age API references are missing: {missing}"
-        )
 
-    if dependency_tree_path is not None:
-        try:
-            dependency_tree = dependency_tree_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise PolicyError(
-                f"cannot inspect dependency tree {dependency_tree_path}: {exc}"
-            ) from exc
-    else:
-        try:
-            result = subprocess.run(
-                [
-                    "cargo",
-                    "tree",
-                    "--color",
-                    "never",
-                    "--locked",
-                    "--target",
-                    "all",
-                    "-i",
-                    "rsa@0.9.10",
-                ],
-                cwd=source_root,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError as exc:
-            raise PolicyError(f"could not inspect the RSA dependency path: {exc}") from exc
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "no output"
-            raise PolicyError(f"cargo tree failed while checking the RSA path: {detail}")
-        dependency_tree = result.stdout
+    dependency_tree = _read_dependency_tree(
+        str(exception["package"]),
+        str(exception["version"]),
+        source_root,
+        dependency_tree_path,
+    )
     if not EXPECTED_RSA_TREE.fullmatch(dependency_tree):
         raise PolicyError(
-            "RSA exception dependency path changed; expected only gitforgeops -> age 0.12.1 -> rsa 0.9.10"
+            "RSA exception dependency path changed; expected only "
+            "gitforgeops -> age 0.12.x -> rsa 0.9.x"
         )
+
+
+REACHABILITY_VERIFIERS: dict[
+    str, Callable[[dict[str, Any], Path, Path | None], None]
+] = {
+    AGE_ENCRYPTION_ONLY: verify_age_encryption_only,
+}
+
+
+def _reachability_verifier_name(
+    key: tuple[str, str, str, str, str], exception: dict[str, Any]
+) -> str | None:
+    declared = exception.get("reachability")
+    if declared is not None:
+        return str(declared).strip()
+    kind, advisory, package, _version, _source = key
+    return IMPLICIT_REACHABILITY.get((kind, advisory, package))
+
+
+def verify_exception_reachability(
+    policy: dict[tuple[str, str, str, str, str], dict[str, Any]],
+    source_root: Path,
+    dependency_tree_path: Path | None,
+) -> None:
+    """Run every exception's reachability verifier, or refuse to accept it."""
+    for key in sorted(policy):
+        exception = policy[key]
+        package = key[2]
+        name = _reachability_verifier_name(key, exception)
+        if name is None:
+            if package in VERIFIER_REQUIRED_PACKAGES:
+                raise PolicyError(
+                    f"exception for {package} {key[3]} has no reachability verifier; "
+                    f'set "reachability" to one of '
+                    f"{sorted(REACHABILITY_VERIFIERS)} or remove the exception"
+                )
+            continue
+        verifier = REACHABILITY_VERIFIERS.get(name)
+        if verifier is None:
+            raise PolicyError(
+                f"exception for {package} {key[3]} requests unknown reachability "
+                f"verifier {name!r}; known verifiers are "
+                f"{sorted(REACHABILITY_VERIFIERS)}"
+            )
+        verifier(exception, source_root, dependency_tree_path)
 
 
 def _format_finding(finding: dict[str, str | None]) -> str:
@@ -316,10 +523,11 @@ def _format_finding(finding: dict[str, str | None]) -> str:
     )
 
 
-def run_cargo_audit() -> tuple[dict[str, Any], int]:
+def run_cargo_audit(source_root: Path) -> tuple[dict[str, Any], int]:
     try:
         result = subprocess.run(
             ["cargo", "audit", "--json", "--deny", "unsound", "--deny", "yanked"],
+            cwd=source_root,
             check=False,
             capture_output=True,
             text=True,
@@ -348,6 +556,12 @@ def parse_args() -> argparse.Namespace:
         help="read a saved cargo-audit JSON report instead of invoking cargo audit",
     )
     parser.add_argument(
+        "--audit-exit-status",
+        type=int,
+        default=0,
+        help="cargo-audit exit status to assume alongside --audit-json (tests)",
+    )
+    parser.add_argument(
         "--today",
         type=dt.date.fromisoformat,
         default=dt.date.today(),
@@ -357,7 +571,7 @@ def parse_args() -> argparse.Namespace:
         "--source-root",
         type=Path,
         default=Path("."),
-        help="repository root whose RSA reachability premise must be verified",
+        help="repository root whose exception reachability premises must be verified",
     )
     parser.add_argument(
         "--dependency-tree",
@@ -369,20 +583,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    source_root = args.source_root.resolve()
     try:
         policy = load_policy(args.policy, args.today)
-        verify_rsa_exception_reachability(
-            policy, args.source_root.resolve(), args.dependency_tree
-        )
+        verify_exception_reachability(policy, source_root, args.dependency_tree)
         if args.audit_json:
             report = json.loads(args.audit_json.read_text(encoding="utf-8"))
-            audit_status = 0
+            audit_status = args.audit_exit_status
         else:
-            report, audit_status = run_cargo_audit()
-        reviewed, blocked, stale = evaluate(report, policy)
+            report, audit_status = run_cargo_audit(source_root)
+        reviewed, blocked, stale, informational = evaluate(report, policy)
     except (OSError, json.JSONDecodeError, PolicyError) as exc:
         print(f"cargo-audit policy error: {exc}", file=sys.stderr)
         return 2
+
+    for annotation in review_deadline_warnings(policy, args.today):
+        print(annotation)
 
     for finding in reviewed:
         exception = policy[_finding_key(finding)]
@@ -390,6 +606,23 @@ def main() -> int:
             f"REVIEWED until {exception['review_by']} by {exception['owner']}: "
             f"{_format_finding(finding)}"
         )
+    for finding in informational:
+        advisory = finding.get("advisory") or "no advisory id"
+        print(
+            f"::warning::cargo-audit {finding['kind']} {advisory} affects "
+            f"{finding['package']} {finding['version']} (reported, not blocking)"
+        )
+
+    parsed_findings = len(reviewed) + len(blocked) + len(informational)
+    if audit_status == 1 and parsed_findings == 0:
+        print(
+            "cargo audit reported findings this gate could not parse",
+            file=sys.stderr,
+        )
+        return 2
+    if audit_status not in (0, 1):
+        print(f"cargo audit failed operationally with exit {audit_status}", file=sys.stderr)
+        return 2
 
     if blocked:
         print("Unreviewed cargo-audit findings:", file=sys.stderr)
@@ -399,15 +632,12 @@ def main() -> int:
         print("Stale cargo-audit exceptions (finding no longer present):", file=sys.stderr)
         for key in stale:
             print(f"  - {key}", file=sys.stderr)
-
     if blocked or stale:
         return 1
-    if audit_status not in (0, 1):
-        print(f"cargo audit failed operationally with exit {audit_status}", file=sys.stderr)
-        return 2
 
     print(
         f"cargo-audit policy passed: {len(reviewed)} reviewed exception(s), "
+        f"{len(informational)} non-blocking advisory warning(s), "
         "no unreviewed vulnerability/unsound/yanked findings"
     )
     return 0
