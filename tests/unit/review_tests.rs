@@ -160,6 +160,64 @@ fn review_comment_replaces_invisible_format_characters_and_blank_inline_fields()
 }
 
 #[test]
+fn inline_sanitizers_keep_tabs_and_scrub_line_separators() {
+    let findings = vec![SecurityFinding {
+        severity: "warning".to_string(),
+        kind: "Proxy".to_string(),
+        id: "tab\tseparated".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "line\u{2028}separator\u{2029}pair".to_string(),
+    }];
+    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+
+    assert!(comment.contains("tab\tseparated"), "{comment}");
+    assert!(comment.contains("line�separator�pair"), "{comment}");
+    assert!(!comment.contains('\u{2028}'));
+    assert!(!comment.contains('\u{2029}'));
+}
+
+#[test]
+fn fenced_validation_output_keeps_tabs_and_scrubs_line_separators() {
+    let comment = build_review_comment(
+        false,
+        "error:\n\tat proxy-a\u{2028}forged",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("error:\n\tat proxy-a�forged"), "{comment}");
+    assert!(!comment.contains('\u{2028}'));
+}
+
+#[test]
+fn terminal_review_leaves_fenced_validation_output_undecoded() {
+    let comment = build_review_comment(
+        false,
+        "literal &#96;&#96;&#96; and &lt;tag&gt; and &#46;",
+        &[],
+        &[],
+        &[],
+        &[],
+        Some("skipped &#46; reason"),
+    );
+    let terminal = markdown_comment_for_terminal(&comment);
+
+    // Fenced validator output is never entity-escaped on the way in, so
+    // decoding it would rewrite the tool's own text — and `&#96;` x3 would
+    // decode into a fence that escapes the block.
+    assert!(
+        terminal.contains("literal &#96;&#96;&#96; and &lt;tag&gt; and &#46;"),
+        "{terminal}"
+    );
+    assert!(!terminal.contains("literal ``` and <tag>"), "{terminal}");
+    // Inline text outside the fence still round-trips.
+    assert!(terminal.contains("skipped &#46; reason"), "{terminal}");
+}
+
+#[test]
 fn terminal_review_decodes_only_entities_emitted_by_the_markdown_sanitizer() {
     let comment = build_review_comment(
         true,

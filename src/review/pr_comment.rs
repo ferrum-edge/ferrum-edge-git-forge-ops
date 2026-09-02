@@ -7,7 +7,9 @@ use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
 
 fn is_unsafe_format_character(character: char) -> bool {
-    character.is_control()
+    // A tab is ordinary layout in validator output and resource ids; scrubbing
+    // it to U+FFFD mangles the text without removing any spoofing risk.
+    (character.is_control() && character != '\t')
         || matches!(
             character,
             '\u{00ad}'
@@ -15,6 +17,8 @@ fn is_unsafe_format_character(character: char) -> bool {
                 | '\u{061c}'
                 | '\u{180e}'
                 | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
                 | '\u{202a}'..='\u{202e}'
                 | '\u{2060}'..='\u{206f}'
                 | '\u{feff}'
@@ -95,7 +99,49 @@ fn sanitize_table_code_span(value: &str) -> String {
     sanitize_code_span(value).replace('|', "\\|")
 }
 
+/// Length of a line's leading backtick run when the line is a fence marker.
+fn markdown_fence_run(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    let run = trimmed
+        .chars()
+        .take_while(|character| *character == '`')
+        .count();
+    if run >= 3 {
+        Some(run)
+    } else {
+        None
+    }
+}
+
+/// Undo the inline entity escaping for terminal output. Fenced blocks carry
+/// unescaped validator output verbatim, so decoding inside one would rewrite
+/// the tool's own text — and a literal ``` `&#96;&#96;&#96;` `` in it would
+/// decode into a fence that breaks the block.
 pub fn markdown_comment_for_terminal(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    let mut open_fence: Option<usize> = None;
+    for line in value.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let fence_run = markdown_fence_run(content);
+        match (open_fence, fence_run) {
+            (None, Some(run)) if !content.trim_start()[run..].contains('`') => {
+                open_fence = Some(run);
+                rendered.push_str(line);
+            }
+            (Some(open), Some(run))
+                if run >= open && content.trim_start()[run..].trim().is_empty() =>
+            {
+                open_fence = None;
+                rendered.push_str(line);
+            }
+            (Some(_), _) => rendered.push_str(line),
+            (None, _) => rendered.push_str(&decode_markdown_entities(line)),
+        }
+    }
+    rendered
+}
+
+fn decode_markdown_entities(value: &str) -> String {
     value
         .replace("&#91;", "[")
         .replace("&#93;", "]")
