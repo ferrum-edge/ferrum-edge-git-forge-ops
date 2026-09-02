@@ -13,6 +13,33 @@ SPEC.loader.exec_module(changed_files)
 
 
 class ChangedFilesTests(unittest.TestCase):
+    def test_pr_workflows_use_head_stable_api_snapshots(self):
+        workflows = {
+            "state-guard.yml": (1, 2),
+            "rust-ci.yml": (2, 2),
+            "validate-pr.yml": (1, 1),
+        }
+        workflow_root = SCRIPT.parents[1] / "workflows"
+        for name, (snapshot_count, head_binding_count) in workflows.items():
+            with self.subTest(workflow=name):
+                text = (workflow_root / name).read_text(encoding="utf-8")
+                self.assertNotIn("github.event.pull_request.changed_files", text)
+                self.assertEqual(
+                    text.count('before=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")'),
+                    snapshot_count,
+                )
+                self.assertEqual(
+                    text.count('after=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")'),
+                    snapshot_count,
+                )
+                self.assertEqual(
+                    text.count(
+                        "EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}"
+                    ),
+                    head_binding_count,
+                )
+                self.assertIn("ref: ${{ github.event.repository.default_branch }}", text)
+
     def test_current_and_previous_rename_paths_are_both_classified(self):
         pages = [
             [
@@ -43,6 +70,17 @@ class ChangedFilesTests(unittest.TestCase):
         result = changed_files.analyze([[{"filename": "README.md"}]], 2, "rust")
         self.assertFalse(result["complete"])
         self.assertFalse(result["matches"])
+
+    def test_exact_github_file_cap_is_always_treated_as_ambiguous(self):
+        records = [
+            {"filename": f"docs/file-{index}.md"}
+            for index in range(changed_files.GITHUB_PULL_FILES_LIMIT)
+        ]
+        result = changed_files.analyze(
+            [records], changed_files.GITHUB_PULL_FILES_LIMIT, "state"
+        )
+        self.assertEqual(result["observed_count"], 3_000)
+        self.assertFalse(result["complete"])
 
     def test_rust_scope_includes_build_and_workspace_inputs(self):
         for path in (

@@ -1904,6 +1904,13 @@ async fn cmd_review(
     require_live: bool,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if require_live && pr.is_none() {
+        return Err(gitforgeops::error::Error::Config(
+            "review --require-live requires --pr so the result has a durable delivery target"
+                .to_string(),
+        )
+        .into());
+    }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved)?;
     // PR review preview must match apply's real validation surface, so a
@@ -1919,7 +1926,7 @@ async fn cmd_review(
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_ok, validation_output) = match &val_result {
         Ok(r) => (r.success, format!("{}{}", r.stdout, r.stderr)),
-        Err(e) => (true, format!("Validation skipped: {}", e)),
+        Err(e) => (false, format!("Validation could not run: {}", e)),
     };
 
     let state = StateFile::load(&resolved.name)?;
@@ -1927,45 +1934,70 @@ async fn cmd_review(
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces);
 
-    let (diffs, breaking, unmanaged, spec_owned, comparison_error) = match &client {
-        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
-            Ok(namespace_pairs) => {
-                let cached = cached_namespace_names(&namespace_pairs);
-                if cached.is_empty() {
-                    let (d, b, u, s) = compute_namespace_diffs(
-                        &namespace_pairs,
-                        managed.as_ref(),
-                        diff::DiffOptions::default(),
-                    );
-                    (d, b, u, s, None)
-                } else {
+    let (diffs, breaking, unmanaged, spec_owned, comparison_error) = if let Some(error) =
+        review::live_comparison_precondition_error(&namespaces)
+    {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
+    } else {
+        match &client {
+            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+                // A `/backup` served from the gateway's in-memory snapshot
+                // is not the live view this review claims to publish, so
+                // the computed diff is dropped rather than presented as a
+                // comparison. `--require-live` fails on the recorded
+                // reason below. The per-namespace provenance is checked as
+                // well as the client's sticky flag so the reason can name
+                // exactly which namespaces came back cached.
+                Ok(namespace_pairs) => {
+                    let cached = cached_namespace_names(&namespace_pairs);
+                    match review::stale_live_view_error(c.served_from_cache() || !cached.is_empty())
+                    {
+                        Some(mut reason) => {
+                            if !cached.is_empty() {
+                                reason.push_str(&format!(
+                                    " Cached backup data was served for namespace(s) {}; API-spec ownership is unknown until the gateway configuration database recovers.",
+                                    cached.join(", ")
+                                ));
+                            }
+                            eprintln!("{reason}");
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
+                        }
+                        None => {
+                            let (d, b, u, s) = compute_namespace_diffs(
+                                &namespace_pairs,
+                                managed.as_ref(),
+                                diff::DiffOptions::default(),
+                            );
+                            (d, b, u, s, None)
+                        }
+                    }
+                }
+                // Unredacted on stderr only. The comment built below is
+                // posted to the PR and mirrored into the step summary, and
+                // a transport error's Display carries the gateway URL —
+                // an environment secret. See `review::redact_comparison_error`.
+                Err(e) => {
+                    eprintln!("Live gateway comparison failed: {e}");
                     (
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
-                        Some(format!(
-                            "Live gateway comparison skipped: cached backup data was served for namespace(s) {}. API-spec ownership is unknown until the gateway configuration database recovers.",
-                            cached.join(", ")
-                        )),
+                        Some(review::redact_comparison_error(&e)),
                     )
                 }
+            },
+            Err(e) => {
+                eprintln!("Live gateway comparison failed: {e}");
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Some(review::redact_comparison_error(e)),
+                )
             }
-            Err(e) => (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Some(format!("Live gateway comparison skipped: {}", e)),
-            ),
-        },
-        Err(e) => (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Some(format!("Live gateway comparison skipped: {}", e)),
-        ),
+        }
     };
 
     // security_findings was computed pre-resolve above; reuse it here.
@@ -2026,6 +2058,7 @@ async fn cmd_review(
         bundle_loaded,
     );
 
+    let mut comment_delivery_error = None;
     match pr {
         Some(pr_number) => {
             // Fork PRs: GITHUB_TOKEN is downgraded to read-only by GitHub
@@ -2045,6 +2078,7 @@ async fn cmd_review(
                     );
                     write_review_to_step_summary(&comment)?;
                     print!("{}", comment);
+                    comment_delivery_error = Some(e.to_string());
                 }
             }
         }
@@ -2053,14 +2087,8 @@ async fn cmd_review(
         }
     }
 
-    if require_live {
-        if let Some(error) = comparison_error {
-            return Err(gitforgeops::error::Error::Config(format!(
-                "trusted PR review requires a complete live gateway comparison: {error}"
-            ))
-            .into());
-        }
-    }
+    review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
+    review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
 
     let _ = !secret_report.results.is_empty();
     Ok(())
@@ -2082,6 +2110,7 @@ fn cmd_envs(
             Some(r) => r.environment_scopes(),
             None => vec![gitforgeops::config::repo_config::EnvironmentScope {
                 environment: ResolvedEnv::default_env_name(),
+                live_review: false,
                 namespaces: None,
             }],
         };

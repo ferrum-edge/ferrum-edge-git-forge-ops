@@ -106,6 +106,7 @@ environments:
       mode: shared
   filtered:
     namespace_filter: team-a
+    live_review: false
     ownership:
       mode: shared
   production:
@@ -119,7 +120,9 @@ environments:
     let scopes = config.environment_scopes();
 
     assert_eq!(scopes[0].environment, "all-shared");
+    assert!(scopes[0].live_review);
     assert_eq!(scopes[0].namespaces, None);
+    assert!(!scopes[1].live_review);
     assert_eq!(
         scopes[1].namespaces.as_deref(),
         Some(&["team-a".to_string()][..])

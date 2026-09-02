@@ -197,8 +197,17 @@ def audit_tag_ruleset(audit: Audit, ruleset: dict) -> None:
             rule_type in rules,
             f"release-tag ruleset is missing required rule: {rule_type}",
         )
+    # The bypass list is release publishing's only route past the `creation`
+    # rule. An empty list is therefore not "maximum strictness": nobody can push
+    # a `v*` tag at all and the tag half of release.yml can never fire, so it is
+    # reported as a misconfiguration rather than accepted. See
+    # docs/github-launch-controls.md section 2, which states the same rule.
     bypasses = ruleset.get("bypass_actors", [])
-    narrow_bypasses = bool(bypasses) and all(
+    audit.require(
+        bool(bypasses),
+        "release-tag ruleset must name at least one bypass actor; with the creation rule and no bypass, no release tag can ever be pushed",
+    )
+    narrow_bypasses = all(
         bypass.get("actor_type") in {"Integration", "Team", "User"}
         and isinstance(bypass.get("actor_id"), int)
         and bypass.get("bypass_mode") == "always"
