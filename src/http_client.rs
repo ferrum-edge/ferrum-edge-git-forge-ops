@@ -54,7 +54,13 @@ pub struct AdminClient {
 
 impl AdminClient {
     /// Build an Admin API client from resolved process/repo environment config.
-    pub fn new(env: &EnvConfig) -> crate::error::Result<Self> {
+    ///
+    /// Private on purpose. A client built here mints admin tokens with no `ns`
+    /// claim, which a gateway running `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`
+    /// rejects outright — and, worse, which a gateway *not* running it accepts
+    /// for every namespace. [`AdminClient::new_scoped`] is the only public
+    /// door, so a new call site has to say what it is allowed to touch.
+    fn new(env: &EnvConfig) -> crate::error::Result<Self> {
         let gateway_url = env
             .gateway_url
             .clone()
@@ -148,10 +154,13 @@ impl AdminClient {
     /// Build a client whose JWTs are scoped to the exact namespaces the
     /// command has resolved.
     ///
-    /// Prefer this constructor whenever the command knows its namespace set
-    /// before the first request. Keeping scoping in construction makes it
+    /// The only public constructor. Keeping scoping in construction makes it
     /// difficult for a new admin-API call site to accidentally mint an
     /// unscoped token on gateways that require the `ns` claim.
+    ///
+    /// An empty `namespaces` deliberately still builds a client — some
+    /// commands legitimately have no namespace set to declare — but it mints
+    /// an unscoped token, so pass the resolved set whenever one exists.
     pub fn new_scoped<I, S>(env: &EnvConfig, namespaces: I) -> crate::error::Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -214,6 +223,7 @@ impl AdminClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
+                    let location = header_string(&resp, "location");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
                     let body = resp
                         .text()
@@ -225,6 +235,7 @@ impl AdminClient {
                             status,
                             body,
                             data_source,
+                            location,
                         });
                     }
 
@@ -242,6 +253,7 @@ impl AdminClient {
                         status,
                         body,
                         data_source,
+                        location,
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
@@ -263,7 +275,12 @@ impl AdminClient {
         if is_success_status(resp.status) {
             return Ok(());
         }
-        Err(map_api_error(resp.status, &resp.body, kind))
+        Err(map_api_error_with_location(
+            resp.status,
+            &resp.body,
+            kind,
+            resp.location.as_deref(),
+        ))
     }
 
     /// [`AdminClient::check`] for config mutations, with one extra step: an
@@ -366,6 +383,15 @@ impl AdminClient {
 
         let mut snapshot = BackupSnapshot::from_body(&resp.body)?;
         snapshot.cached = cached;
+        // A live read never fails on the count seal (see `SealStrictness`),
+        // but an operator should know the gateway's own inventory disagreed
+        // with what it sent — and `import` turns the same notice into a hard
+        // refusal, because that document becomes permanent repo state.
+        if let Some(notice) = snapshot.seal_violation_notice() {
+            eprintln!(
+                "Warning: GET /backup for namespace '{namespace}' returned a count seal that does not match the document ({notice}). The seal was discarded; resource data is used as received."
+            );
+        }
         Ok(snapshot)
     }
 
@@ -710,10 +736,11 @@ impl AdminClient {
             return Ok(DeleteOutcome::Deleted);
         }
         Err(self
-            .refine_mutation_error(map_api_error(
+            .refine_mutation_error(map_api_error_with_location(
                 resp.status,
                 &resp.body,
                 RequestKind::Mutation,
+                resp.location.as_deref(),
             ))
             .await)
     }
@@ -736,6 +763,9 @@ struct RawResponse {
     status: u16,
     body: String,
     data_source: Option<String>,
+    /// `Location`, kept only so a 3xx can name where the admin API is
+    /// actually being served from. Redirects are never followed.
+    location: Option<String>,
 }
 
 /// What kind of call is being made, for retry/error classification. `/restore`
@@ -860,8 +890,40 @@ fn is_success_status(status: u16) -> bool {
 
 /// Map a failing response to the most specific error variant available.
 pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error::Error {
+    map_api_error_with_location(status, body, kind, None)
+}
+
+/// [`map_api_error`] with the response's `Location` header, which only the 3xx
+/// arm consults.
+pub fn map_api_error_with_location(
+    status: u16,
+    body: &str,
+    kind: RequestKind,
+    location: Option<&str>,
+) -> crate::error::Error {
     let parsed = ApiErrorBody::parse(body);
     let message = parsed.error.clone().unwrap_or_else(|| body.to_string());
+
+    // The client is built with `redirect::Policy::none()` so a destructive
+    // body is never replayed against a different authority, which means a 3xx
+    // arrives here as a plain failure. Without this arm it read as "API error
+    // (301): " with an empty body, and the actual cause — an admin URL that
+    // has moved, or a load balancer terminating TLS and bouncing http→https —
+    // was invisible. Applies to reads as much as to mutations.
+    if (300..=399).contains(&status) {
+        let destination = match location {
+            Some(location) if !location.trim().is_empty() => {
+                format!("It pointed at `{}`. ", location.trim())
+            }
+            _ => "It carried no usable `Location` header. ".to_string(),
+        };
+        return crate::error::Error::ApiError {
+            status,
+            message: format!(
+                "the gateway answered a redirect (HTTP {status}) instead of a response.                  {destination}gitforgeops never follows redirects on admin calls — a 301/302                  would rewrite a POST into a GET and a 307/308 would replay a destructive body                  against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme,                  host, port and any path prefix) and re-run."
+            ),
+        };
+    }
 
     if status == 403 && is_read_only_refusal(&message) {
         return crate::error::Error::GatewayReadOnly(
@@ -1127,6 +1189,30 @@ impl BackupExtras {
     }
 }
 
+/// How a count seal that disagrees with the decoded document is treated.
+///
+/// The seal is an anti-truncation device, and the two consumers want opposite
+/// things from a disagreement:
+///
+/// * **Import** reads a document once and turns it into the repository's
+///   permanent desired state. A seal that does not match means the source may
+///   be truncated, and publishing a partial tree is unrecoverable, so it is a
+///   hard error.
+/// * **Live reads** (`diff`, `plan`, `apply`, drift-check) run against a
+///   gateway whose seal is emitted by a different codebase on every request.
+///   A gateway that omits `counts.upstreams`, or a cached-fallback export that
+///   elides `api_specs` while retaining `counts.api_specs`, would otherwise
+///   take every one of those commands down over metadata that no decision is
+///   made from. Record the disagreement, drop the seal, and keep going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealStrictness {
+    /// Import: a disagreeing seal fails the read.
+    Strict,
+    /// Live reads: a disagreeing seal is recorded in
+    /// [`BackupSnapshot::seal_violations`] and the seal itself is discarded.
+    Advisory,
+}
+
 /// The full `BackupResponse` envelope.
 #[derive(Debug, Clone, Default)]
 pub struct BackupSnapshot {
@@ -1149,6 +1235,11 @@ pub struct BackupSnapshot {
     /// reports these explicitly instead of silently discarding future backup
     /// capabilities.
     pub unsupported_sections: Vec<String>,
+    /// Count-seal disagreements found while decoding. Always empty under
+    /// [`SealStrictness::Strict`] (the decode returns `Err` instead); under
+    /// [`SealStrictness::Advisory`] this is what the caller warns about, and
+    /// `counts` / `resource_counts` are `None`.
+    pub seal_violations: Vec<String>,
 }
 
 impl BackupSnapshot {
@@ -1159,12 +1250,24 @@ impl BackupSnapshot {
     pub fn from_body(body: &str) -> crate::error::Result<Self> {
         let value: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
-        Self::from_value(value)
+        // Live reads are advisory: see [`SealStrictness`]. Callers that turn a
+        // backup into permanent repository state re-check
+        // `seal_violations` and refuse.
+        Self::from_value_with_strictness(value, SealStrictness::Advisory)
+    }
+
+    /// Parse an already-decoded JSON/YAML-compatible backup value with the
+    /// import path's strict seal enforcement.
+    pub fn from_value(value: serde_json::Value) -> crate::error::Result<Self> {
+        Self::from_value_with_strictness(value, SealStrictness::Strict)
     }
 
     /// Parse an already-decoded JSON/YAML-compatible backup value. Shared by
     /// API and file import so both paths inventory the same opaque sections.
-    pub fn from_value(mut value: serde_json::Value) -> crate::error::Result<Self> {
+    pub fn from_value_with_strictness(
+        mut value: serde_json::Value,
+        strictness: SealStrictness,
+    ) -> crate::error::Result<Self> {
         // Lift the non-`GatewayConfig` sections *out* of the document rather
         // than copying them out of it: a production `/backup` is megabytes of
         // JSON, and cloning the whole tree just to keep two keys doubled peak
@@ -1178,6 +1281,23 @@ impl BackupSnapshot {
         let mut resource_counts = None;
         let mut unsupported_sections = Vec::new();
         if let Some(map) = value.as_object_mut() {
+            // Pinned to ferrum-edge's `BackupPayload` (`src/admin/backup.rs`),
+            // which is constructed in exactly one place
+            // (`src/admin/mod.rs`, the `GET /backup` handler) and serializes
+            // these eleven fields — `gateway_trust_bundles` and `api_specs`
+            // being `Option`, so they are absent on filtered and
+            // cached-fallback exports.
+            //
+            // `resource_counts` is the twelfth and is *not* a gateway section:
+            // it is gitforgeops' own file-mode anti-truncation seal
+            // (`apply::file_target`), allow-listed so a round-trip through a
+            // locally exported document is not misread as an unknown section.
+            //
+            // Deliberately fail-closed: anything else here stops full replace
+            // (`ensure_restore_sections_supported`) rather than being silently
+            // dropped from a `/restore` body that would then delete it. Update
+            // this list in step with the companion, never by widening it to
+            // whatever a gateway happens to send.
             const KNOWN_TOP_LEVEL: &[&str] = &[
                 "version",
                 "proxies",
@@ -1216,14 +1336,28 @@ impl BackupSnapshot {
 
         let config: GatewayConfig = serde_json::from_value(value)
             .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
-        counts = canonicalize_count_seal("counts", counts.as_ref(), &config, &extras, true)?;
+        let mut seal_violations = Vec::new();
+        counts = canonicalize_count_seal(
+            "counts",
+            counts.as_ref(),
+            &config,
+            &extras,
+            true,
+            &mut seal_violations,
+        );
         resource_counts = canonicalize_count_seal(
             "resource_counts",
             resource_counts.as_ref(),
             &config,
             &extras,
             false,
-        )?;
+            &mut seal_violations,
+        );
+        if matches!(strictness, SealStrictness::Strict) {
+            if let Some(violation) = seal_violations.first() {
+                return Err(crate::error::Error::Config(violation.clone()));
+            }
+        }
 
         Ok(Self {
             config,
@@ -1235,7 +1369,17 @@ impl BackupSnapshot {
             counts,
             resource_counts,
             unsupported_sections,
+            seal_violations,
         })
+    }
+
+    /// One-line operator summary of every count-seal disagreement, or `None`
+    /// when the seal agreed (or was absent).
+    pub fn seal_violation_notice(&self) -> Option<String> {
+        if self.seal_violations.is_empty() {
+            return None;
+        }
+        Some(self.seal_violations.join("; "))
     }
 }
 
@@ -1244,21 +1388,27 @@ impl BackupSnapshot {
 /// extra values from `counts` into the import manifest would create a covert
 /// path for credential material to enter the otherwise non-secret resource
 /// tree.
+///
+/// Disagreements are appended to `violations` rather than returned as errors,
+/// and a seal with any disagreement is discarded (`None`) instead of being
+/// half-retained. The caller decides what a violation means; see
+/// [`SealStrictness`].
 fn canonicalize_count_seal(
     section_name: &str,
     value: Option<&serde_json::Value>,
     config: &GatewayConfig,
     extras: &BackupExtras,
     include_backup_extras: bool,
-) -> crate::error::Result<Option<serde_json::Value>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let object = value.as_object().ok_or_else(|| {
-        crate::error::Error::Config(format!(
+    violations: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let value = value?;
+    let Some(object) = value.as_object() else {
+        violations.push(format!(
             "invalid backup payload: top-level '{section_name}' must be an object"
-        ))
-    })?;
+        ));
+        return None;
+    };
+    let before = violations.len();
     let mut canonical = serde_json::Map::new();
 
     for (key, actual) in [
@@ -1273,7 +1423,14 @@ fn canonicalize_count_seal(
         // remains a complete four-kind seal.
         let omitted_zero_upstreams =
             section_name == "resource_counts" && key == "upstreams" && actual == 0;
-        validate_declared_count(section_name, object, key, actual, !omitted_zero_upstreams)?;
+        check_declared_count(
+            section_name,
+            object,
+            key,
+            actual,
+            !omitted_zero_upstreams,
+            violations,
+        );
         canonical.insert(key.to_string(), serde_json::json!(actual));
     }
     if include_backup_extras {
@@ -1281,44 +1438,45 @@ fn canonicalize_count_seal(
             ("api_specs", extras.api_spec_count()),
             ("gateway_trust_bundles", extras.trust_bundle_count()),
         ] {
-            validate_declared_count(section_name, object, key, actual, false)?;
+            check_declared_count(section_name, object, key, actual, false, violations);
             if object.contains_key(key) {
                 canonical.insert(key.to_string(), serde_json::json!(actual));
             }
         }
     }
-    Ok(Some(serde_json::Value::Object(canonical)))
+    if violations.len() != before {
+        return None;
+    }
+    Some(serde_json::Value::Object(canonical))
 }
 
-fn validate_declared_count(
+fn check_declared_count(
     section_name: &str,
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
     actual: usize,
     required: bool,
-) -> crate::error::Result<()> {
+    violations: &mut Vec<String>,
+) {
     let Some(value) = object.get(key) else {
         if required {
-            return Err(crate::error::Error::Config(format!(
+            violations.push(format!(
                 "invalid backup payload: top-level '{section_name}' is missing required count '{key}'"
-            )));
+            ));
         }
-        return Ok(());
+        return;
     };
-    let declared = value
-        .as_u64()
-        .and_then(|count| usize::try_from(count).ok())
-        .ok_or_else(|| {
-            crate::error::Error::Config(format!(
-                "invalid backup payload: '{section_name}.{key}' must be a non-negative integer"
-            ))
-        })?;
+    let Some(declared) = value.as_u64().and_then(|count| usize::try_from(count).ok()) else {
+        violations.push(format!(
+            "invalid backup payload: '{section_name}.{key}' must be a non-negative integer"
+        ));
+        return;
+    };
     if declared != actual {
-        return Err(crate::error::Error::Config(format!(
+        violations.push(format!(
             "invalid backup payload: '{section_name}.{key}' declares {declared} but the document contains {actual}"
-        )));
+        ));
     }
-    Ok(())
 }
 
 /// Remove optional string metadata while rejecting a present malformed value.
@@ -1380,17 +1538,25 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 
 /// Build the `POST /restore` body.
 ///
-/// `RestoreRequest` has no `additionalProperties: false`, so the serialized
+/// `RestorePayload` has no `deny_unknown_fields`, so the serialized
 /// `GatewayConfig` (including `version`, which the gateway validates against
 /// `CURRENT_CONFIG_VERSION`) is accepted as-is. The backup-only sections are
 /// spliced in as opaque values rather than being modeled on `GatewayConfig` —
 /// that struct mirrors what this tool manages, and API specs are not it.
+///
+/// The `api_specs` section travels with the spec-owned rows the caller already
+/// merged into `config`: the gateway validates the two halves against each
+/// other and rejects either one on its own. An **empty** section is
+/// deliberately dropped instead of forwarded — the gateway reads `items: []`
+/// as an intentional wipe, whereas an absent section makes it count the
+/// namespace's live specs and answer `409` if any exist, which is the only
+/// guard against a spec created after our backup was taken.
 pub fn build_restore_body(
     config: &GatewayConfig,
     extras: &BackupExtras,
     confirm_api_spec_deletion: bool,
 ) -> crate::error::Result<serde_json::Value> {
-    let body = serde_json::to_value(config)?;
+    let mut body = serde_json::to_value(config)?;
     if !body.is_object() {
         return Err(crate::error::Error::Config(
             "gateway config did not serialize as a JSON object".to_string(),
@@ -1408,11 +1574,9 @@ pub fn build_restore_body(
                             .to_string(),
                     )
                 })?;
-            if !items.is_empty() {
-                return Err(crate::error::Error::Config(
-                    "refusing restore with a non-empty `api_specs` snapshot: the gateway does not expose a conditional restore revision, so replay could overwrite a concurrent spec update"
-                        .to_string(),
-                ));
+            let carry = !items.is_empty();
+            if let (true, Some(map)) = (carry, body.as_object_mut()) {
+                map.insert("api_specs".to_string(), api_specs.clone());
             }
         }
     }

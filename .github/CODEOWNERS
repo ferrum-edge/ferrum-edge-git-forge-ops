@@ -4,7 +4,6 @@
 /.github/workflows/ @jeremyjpj0916
 /.github/scripts/ @jeremyjpj0916
 /.github/CODEOWNERS @jeremyjpj0916
-/.github/cargo-audit-policy.json @jeremyjpj0916
 /.github/ferrum-edge-checksums.txt @jeremyjpj0916
 /.gitforgeops/ @jeremyjpj0916
 /.state/ @jeremyjpj0916

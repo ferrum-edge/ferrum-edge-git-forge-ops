@@ -3,7 +3,14 @@ use gitforgeops::cli::{Cli, Commands, EnvsFormat, ValidateFormat};
 
 #[test]
 fn cli_import_from_api_is_a_flag() {
-    let cli = Cli::try_parse_from(["gitforgeops", "import", "--from-api"]).unwrap();
+    let cli = Cli::try_parse_from([
+        "gitforgeops",
+        "import",
+        "--from-api",
+        "--output-dir",
+        "/tmp/scratch-import",
+    ])
+    .unwrap();
 
     match cli.command {
         Commands::Import {
@@ -14,11 +21,25 @@ fn cli_import_from_api_is_a_flag() {
         } => {
             assert!(from_api);
             assert!(from_file.is_none());
-            assert_eq!(output_dir, "./resources");
+            assert_eq!(output_dir, "/tmp/scratch-import");
             assert!(credential_bundle_output.is_none());
         }
         _ => panic!("expected import command"),
     }
+}
+
+/// F3: the old `./resources` default could never succeed — import refuses a
+/// non-empty destination and this repo ships `_example.yaml` files there — so
+/// the destination has to be named.
+#[test]
+fn cli_requires_an_explicit_import_output_dir() {
+    let err = match Cli::try_parse_from(["gitforgeops", "import", "--from-api"]) {
+        Err(err) => err,
+        Ok(_) => panic!("expected a missing --output-dir parse error"),
+    };
+
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    assert!(err.to_string().contains("--output-dir"), "{err}");
 }
 
 #[test]
@@ -28,6 +49,8 @@ fn cli_accepts_a_private_import_bundle_path() {
         "import",
         "--from-file",
         "backup.yaml",
+        "--output-dir",
+        "/tmp/scratch-import",
         "--credential-bundle-output",
         "/tmp/migration.json",
     ])

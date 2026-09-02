@@ -2,6 +2,8 @@ name: GitForgeOps PR Static Validation
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
 
 # This workflow executes code from the pull request, including Cargo build
 # scripts. It therefore receives no GitHub Environment, gateway credential,
@@ -9,6 +11,7 @@ on:
 # review consumes only a sanitized declarative artifact with a trusted binary.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   scope:
@@ -23,7 +26,7 @@ jobs:
       - name: Check out trusted path classifier
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: trusted-scope
           persist-credentials: false
 
@@ -33,17 +36,40 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          DECLARED_CHANGED: ${{ github.event.pull_request.changed_files }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           pages_file=$(mktemp)
           trap 'rm -f "$pages_file"' EXIT
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --paginate --slurp > "$pages_file"
+          stable=false
+          for attempt in 1 2 3; do
+            before=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            before_head=$(jq -r '.head.sha' <<< "$before")
+            before_base=$(jq -r '.base.sha' <<< "$before")
+            before_ref=$(jq -r '.base.ref' <<< "$before")
+            before_count=$(jq -r '.changed_files' <<< "$before")
+            [[ "$before_head" =~ ^[0-9a-f]{40}$ && "$before_base" =~ ^[0-9a-f]{40}$ && "$before_count" =~ ^[0-9]+$ ]] || exit 1
+            [ "$before_head" = "$EXPECTED_HEAD_SHA" ] && [ "$before_ref" = "$DEFAULT_BRANCH" ] || exit 1
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" --paginate --slurp > "$pages_file"
+            after=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            after_head=$(jq -r '.head.sha' <<< "$after")
+            after_base=$(jq -r '.base.sha' <<< "$after")
+            after_ref=$(jq -r '.base.ref' <<< "$after")
+            after_count=$(jq -r '.changed_files' <<< "$after")
+            if [ "$before_head" = "$after_head" ] && [ "$before_base" = "$after_base" ] && \
+               [ "$before_ref" = "$after_ref" ] && [ "$before_count" = "$after_count" ]; then
+              current_changed=$after_count
+              stable=true
+              break
+            fi
+            echo "::warning::PR file metadata changed during attempt ${attempt}; retrying."
+          done
+          [ "$stable" = true ] || exit 1
           helper=trusted-scope/.github/scripts/changed_files.py
           if [ -f "$helper" ]; then
             result=$(python3 trusted-scope/.github/scripts/changed_files.py \
-              "$pages_file" "$DECLARED_CHANGED" declarative)
+              "$pages_file" "$current_changed" declarative)
           else
             # The helper does not exist on the base of its own bootstrap PR.
             # Run validation fail-safe rather than executing candidate code.
@@ -114,11 +140,12 @@ jobs:
 
       - name: Download verified ferrum-edge binary
         env:
-          # The selected release must have an exact digest in the checked-in
+          # The installer resolves the upstream asset by name and refuses to
+          # execute any build whose SHA-256 is absent from the reviewed
           # .github/ferrum-edge-checksums.txt allowlist.
-          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'latest' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          bash .github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
+          bash .github/scripts/install-ferrum-edge.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
@@ -148,8 +175,8 @@ jobs:
           FERRUM_ENV: ${{ matrix.environment }}
         run: gitforgeops review
 
-  required-static-validation:
-    name: required-static-validation
+  gitforgeops-required-static-validation:
+    name: gitforgeops-required-static-validation
     if: always()
     needs: [scope, list-envs, validate]
     runs-on: ubuntu-24.04

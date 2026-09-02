@@ -69,6 +69,10 @@ impl Default for OwnershipConfig {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     pub overlay: Option<String>,
+    /// Whether protected `workflow_run` jobs should compare PR resources to
+    /// a live Admin API. File-mode environments should set this to false.
+    #[serde(default = "default_true")]
+    pub live_review: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_filter: Option<String>,
     #[serde(default)]
@@ -81,6 +85,7 @@ impl Default for EnvironmentConfig {
     fn default() -> Self {
         Self {
             overlay: None,
+            live_review: true,
             namespace_filter: None,
             apply_strategy: ApplyStrategy::Incremental,
             ownership: OwnershipConfig::default(),
@@ -103,6 +108,7 @@ pub struct RepoConfig {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EnvironmentScope {
     pub environment: String,
+    pub live_review: bool,
     /// `None` means every protected-branch resource namespace. `Some` is an
     /// explicit filter/ownership allowlist that the caller must intersect
     /// with those directories.
@@ -161,6 +167,7 @@ impl RepoConfig {
                 }
                 EnvironmentScope {
                     environment: name.clone(),
+                    live_review: env.live_review,
                     namespaces,
                 }
             })

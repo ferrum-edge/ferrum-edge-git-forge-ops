@@ -195,25 +195,116 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
     }
 }
 
+/// What a plugin config's string leaves were classified as.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PluginConfigClassification {
+    /// Leaves import must move into the private broker bundle.
+    pub sensitive: Vec<Vec<ConfigPathComponent>>,
+    /// Leaves of a **non-builtin** plugin that the heuristics did not flag, so
+    /// they stay in the committed resource file as written. Always empty for a
+    /// builtin plugin, whose schema-declared rules are authoritative.
+    ///
+    /// These are what the operator has to review by hand: gitforgeops has no
+    /// schema for the plugin and cannot tell a tuning knob from an API key.
+    pub unbrokered: Vec<Vec<ConfigPathComponent>>,
+}
+
+/// Classify a plugin config's string leaves.
+///
+/// Three cases:
+///
+/// * **A config that is not an object** (a bare string, a list). There is no
+///   key to judge anything by, so every string is brokered and nothing is
+///   reported for review — fail closed, exactly as before.
+/// * **A builtin plugin.** Its schema-declared rules
+///   ([`rules_for`]) plus the conservative key/URL heuristics decide, and the
+///   result is authoritative: nothing is left for review.
+/// * **A non-builtin (custom, future, or renamed) plugin.** Only the
+///   heuristics apply. Brokering *every* string leaf, which is what this used
+///   to do, means a plugin whose config is `{"mode": "strict"}` has `strict`
+///   captured into a GitHub Environment Secret and replaced with
+///   `${gh-env-secret:alloc=require}` — the imported repo then cannot be
+///   applied until someone hand-seeds a slot for the word "strict", and the
+///   resource file no longer says what the plugin does. The unflagged leaves
+///   are returned in `unbrokered` so the operator reviews them instead.
+pub(crate) fn classify_plugin_config(
+    plugin_name: &str,
+    config: &Value,
+) -> PluginConfigClassification {
+    let mut sensitive = BTreeSet::new();
+    let root = Vec::new();
+
+    if !config.is_null() && !config.is_object() {
+        collect_string_paths(config, &root, &mut sensitive);
+        return PluginConfigClassification {
+            sensitive: sensitive.into_iter().collect(),
+            unbrokered: Vec::new(),
+        };
+    }
+
+    if !is_builtin(plugin_name) {
+        collect_heuristic_paths(config, &root, &mut sensitive);
+        let mut all = BTreeSet::new();
+        collect_string_paths(config, &root, &mut all);
+        let unbrokered = all.difference(&sensitive).cloned().collect();
+        return PluginConfigClassification {
+            sensitive: sensitive.into_iter().collect(),
+            unbrokered,
+        };
+    }
+
+    for rule in rules_for(plugin_name) {
+        apply_rule(config, rule.path, rule.kind, &root, &mut sensitive);
+    }
+    collect_heuristic_paths(config, &root, &mut sensitive);
+    PluginConfigClassification {
+        sensitive: sensitive.into_iter().collect(),
+        unbrokered: Vec::new(),
+    }
+}
+
 /// Return every string leaf that import must move into the private broker
-/// bundle. Unknown/custom plugins fail closed by classifying every string.
+/// bundle. Shorthand for [`classify_plugin_config`]'s `sensitive` half.
 pub(crate) fn sensitive_string_paths(
     plugin_name: &str,
     config: &Value,
 ) -> Vec<Vec<ConfigPathComponent>> {
-    let mut paths = BTreeSet::new();
-    let root = Vec::new();
+    classify_plugin_config(plugin_name, config).sensitive
+}
 
-    if (!config.is_null() && !config.is_object()) || !is_builtin(plugin_name) {
-        collect_string_paths(config, &root, &mut paths);
-    } else {
-        for rule in rules_for(plugin_name) {
-            apply_rule(config, rule.path, rule.kind, &root, &mut paths);
-        }
-        collect_heuristic_paths(config, &root, &mut paths);
+/// Render a classified path the way an operator reads it: `headers.x-api-key`,
+/// `servers.[0].upstream_url`.
+pub(crate) fn render_config_path(path: &[ConfigPathComponent]) -> String {
+    if path.is_empty() {
+        return "<root>".to_string();
     }
+    path.iter()
+        .map(|part| match part {
+            ConfigPathComponent::Key(key) => key.clone(),
+            ConfigPathComponent::Index(index) => format!("[{index}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
 
-    paths.into_iter().collect()
+/// Resolve a classified path against a plugin config document.
+///
+/// The read-only twin of the resolver's `plugin_config_value_mut`: both the
+/// import capture and the validator-output scrubber need to fetch the leaf a
+/// [`sensitive_string_paths`] entry points at, and a path that no longer
+/// resolves (a concurrent edit, a future classifier bug) must be `None`
+/// rather than a panic.
+pub(crate) fn value_at<'a>(
+    mut value: &'a Value,
+    path: &[ConfigPathComponent],
+) -> Option<&'a Value> {
+    for part in path {
+        value = match part {
+            ConfigPathComponent::Key(key) => value.as_object()?.get(key)?,
+            ConfigPathComponent::Index(index) => value.as_array()?.get(*index)?,
+        };
+    }
+    Some(value)
 }
 
 fn apply_rule(
@@ -443,12 +534,66 @@ mod tests {
         assert!(paths.contains(&"producer_config.future.vendor.property".to_string()));
     }
 
+    /// A non-builtin plugin brokers only what the sensitivity heuristics
+    /// flag. Everything else stays in the committed file and is reported for
+    /// review, because gitforgeops has no schema to judge it by and capturing
+    /// `mode: strict` into a GitHub Environment Secret helps nobody.
     #[test]
-    fn custom_plugins_broker_every_string_leaf() {
-        let paths = dotted(sensitive_string_paths(
+    fn custom_plugins_broker_only_heuristic_matches_and_report_the_rest() {
+        let classification = classify_plugin_config(
             "custom_enterprise_plugin",
-            &serde_json::json!({"mode": "strict", "nested": ["value"]}),
-        ));
-        assert_eq!(paths, vec!["mode", "nested.[0]"]);
+            &serde_json::json!({
+                "mode": "strict",
+                "nested": ["value"],
+                "api_key": "live-key",
+                "headers": {"x-vendor-auth": "live-header"},
+                "callback": "https://user:pw@vendor.example/hook"
+            }),
+        );
+
+        assert_eq!(
+            dotted(classification.sensitive),
+            vec!["api_key", "callback", "headers.x-vendor-auth"]
+        );
+        assert_eq!(
+            dotted(classification.unbrokered),
+            vec!["mode", "nested.[0]"]
+        );
+    }
+
+    /// A config that is not an object has no keys to judge, so it still fails
+    /// closed with nothing left for review.
+    #[test]
+    fn non_object_custom_plugin_config_still_fails_closed() {
+        let classification =
+            classify_plugin_config("custom_enterprise_plugin", &serde_json::json!(["opaque"]));
+
+        assert_eq!(dotted(classification.sensitive), vec!["[0]"]);
+        assert!(classification.unbrokered.is_empty());
+    }
+
+    /// A builtin plugin's schema rules are authoritative: nothing is deferred
+    /// to a human.
+    #[test]
+    fn builtin_plugins_report_nothing_for_review() {
+        let classification = classify_plugin_config(
+            "otel_tracing",
+            &serde_json::json!({"endpoint": "https://collector.example", "safe": "visible"}),
+        );
+
+        assert!(classification.unbrokered.is_empty());
+    }
+
+    #[test]
+    fn config_paths_render_for_operators() {
+        assert_eq!(
+            render_config_path(&[
+                ConfigPathComponent::Key("servers".to_string()),
+                ConfigPathComponent::Index(0),
+                ConfigPathComponent::Key("upstream_url".to_string()),
+            ]),
+            "servers.[0].upstream_url"
+        );
+        assert_eq!(render_config_path(&[]), "<root>");
     }
 }

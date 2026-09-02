@@ -23,8 +23,8 @@ gitforgeops diff [--exit-on-drift]                        # Compare desired vs l
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR] \
-  [--credential-bundle-output PRIVATE_PATH]               # API import requires an explicit namespace filter
+gitforgeops import --from-api | --from-file PATH --output-dir DIR \
+  [--credential-bundle-output PRIVATE_PATH]               # --output-dir required + must be empty; API import requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -61,7 +61,9 @@ namespace scope. `review --require-live` fails that job when comparison is
 unavailable or its required PR comment cannot be delivered. Review markdown is
 bounded below GitHub's API limit, and unresolved credential values are excluded
 from live comparison when no bundle is available without hiding other Consumer
-fields. Fork PRs and new/remapped namespaces never enter the privileged
+fields. Environments with `live_review: false` are removed before the
+Environment-bound matrix, which is required for file mode. Fork PRs and
+new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in
 `rust-toolchain.toml`; external Actions use full commit SHAs.
 
@@ -91,6 +93,27 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               mesh doc → FERRUM_MESH_FILE_OUTPUT_PATH)
 ```
 
+Two things happen at the `validate` hand-off that exist nowhere else in the
+pipeline, both because resolution has already run by then:
+
+- `validate::with_validation_standins` replaces credential leaves that are
+  *still* `${gh-env-secret:…}` placeholders with a deterministic fake
+  (`gitforgeops-validation-standin-<64 hex>`, or `hmac_sha256:<64 hex>` for a
+  `basicauth` `password_hash`) derived from the slot path. `${gh-env-secret:alloc=generate}`
+  is 30 characters and ferrum-edge's floor for `jwt`/`hmac_auth` is 32, so a
+  bundle-less fork PR would otherwise fail on the placeholder rather than on
+  the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
+  no other output path ever sees a stand-in.
+- `secrets::SecretScrubber` collects every non-placeholder Consumer credential
+  leaf (minus the identity fields `basicauth[].username` /
+  `mtls_auth[].identity`) and every `sensitive_string_paths` plugin-config
+  leaf, and removes those exact byte sequences — plus their base64 and
+  percent-encoded forms — from the validator child's stdout/stderr, replacing
+  each with `[REDACTED]`. Non-credential diagnostics stay intact. Blanket
+  suppression survives only as a fallback for a secret shorter than
+  `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced without
+  mangling the report.
+
 ### Gateway Modes
 
 - **api** — push to admin REST (POST creates, PUT updates, DELETE removes, POST `/batch` for pure-add namespaces, or POST `/restore` for full-replace)
@@ -101,11 +124,17 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 ### Apply Strategies
 
 - **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → proxy → plugin config, then deletes in reverse). Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to per-resource creates on 501.
-- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. Non-empty live `api_specs` fail closed because the gateway has no conditional restore revision; use incremental apply to preserve them or `--confirm-api-spec-deletion` for intentional deletion. Empty/absent spec sections and all `gateway_trust_bundles` are omitted so gateway guards/no-op semantics prevent lost concurrent updates. Missing graph members, repo/spec ID conflicts, cached data, or unfamiliar top-level backup sections fail before mutation.
+- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. The body carries the repo's desired rows **plus the complete live spec-owned graph**: `/restore` validates `api_specs.items` against the tagged proxies/upstreams/plugin configs in the same payload and rejects either half on its own, and it re-creates the documents verbatim rather than re-extracting resources from them, so carrying both cannot duplicate rows. An **empty** spec section and all `gateway_trust_bundles` are omitted instead — the gateway reads `items: []` as an intentional wipe but an absent section as "count the live specs and answer 409", and an absent trust section as "leave trust exactly as it is", so omission is what preserves a concurrent update. `--confirm-api-spec-deletion` is the only path that drops the graph (trust bundles still survive). A graph that cannot be proven complete, a repo/spec ID conflict, cached data, or an unfamiliar top-level backup section fails before mutation.
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
-A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate. Create and batch POST error responses are never retried blindly: ambiguous outcomes are reconciled through an authoritative backup, then exact live rows receive idempotent PUTs that explicitly assert repository ownership before success is recorded. A separate write-ahead `pending_creates` journal closes the process-crash window without granting deletion authority: exact evidence triggers that PUT, an absent row stays retryable, and a live row whose declaration disappeared blocks for manual ownership resolution. After apply, a best-effort `GET /cluster` prints a convergence line.
+A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate.
+
+Create and batch POST error responses are never retried blindly. An ambiguous outcome is reconciled through an authoritative (non-cached) backup, and the readback has three severities (`LiveMatch`): the **exact** row live → an idempotent PUT declares repository ownership and the create is recorded; the row **absent** → the write provably did not commit, so it is an ordinary per-resource error and the rest of the run continues; the row **present but different**, or no usable verification at all → a run-stopping `AmbiguousMutation`. `resource_values_match` is a subset test (desired ⊆ live, minus server timestamps) so a gateway-populated optional does not read as a foreign row.
+
+A separate write-ahead `pending_creates` journal closes the process-crash window without granting deletion authority: exact evidence triggers that PUT, an absent row stays retryable. A live row whose declaration disappeared is **forgotten with a warning** and handed to the ordinary rules for the mode — shared reports it as unmanaged and never deletes it, exclusive prunes it under the large-prune guard, full_replace does not journal at all. Nothing here may fail closed: CI is the only writer of `.state/<env>.json` and `state-guard.yml` blocks the hand edit a wedged journal would demand. The journal survives a process crash, because `apply-on-merge.yml` commits state with `if: !cancelled()`; it does **not** survive workflow cancellation or runner loss, which leaves the row live and unjournaled for the next run's ordinary diff to pick up.
+
+After apply, a best-effort `GET /cluster` prints a convergence line.
 
 ### Mesh config
 
@@ -120,7 +149,8 @@ A `GET /health` preflight runs before the first mutation so a read-only plane fa
 ### Multi-Environment (repo config)
 
 `.gitforgeops/config.yaml` declares logical environments. Each entry picks an
-overlay, apply strategy, and ownership mode. **No gateway URL, no JWT, no
+overlay, apply strategy, ownership mode, and whether live PR review is enabled.
+Set `live_review: false` for file-mode environments. **No gateway URL, no JWT, no
 secret names** live in this file — those come from GitHub Environment Secrets
 of the same name as the entry (e.g. `production` entry → GitHub Environment
 `production`'s secrets are injected by the workflow). See
@@ -146,18 +176,27 @@ The state file is the trust boundary for both of those, and it is CI-authored:
 as `gitforgeops[bot]` with a short-lived, contents-only GitHub App token;
 `.gitignore` tracks `.state/*.json` (ignoring only locks and temp files), and
 `state-guard.yml` fails any PR touching `.state/**` (including rename source
-paths) unless the latest effective
-`gitforgeops/state-override` label actor currently has `write`, `maintain`, or
-`admin` permission. It rejects triage/read/deleted/ambiguous actors and records
-the event ID/time/permission. Label changes rerun under per-PR concurrency so
-removed authorization cannot leave a stale success. That workflow runs
+paths) unless the exact `gitforgeops/state-override` `labeled` webhook targets
+the current head and its actor currently has `write`, `maintain`, or `admin`
+permission. It rejects every push or other PR transition until a qualified
+maintainer removes and reapplies the label, and records the actor, permission,
+head, run ID, and attempt. Label changes rerun under per-PR concurrency so
+removed authorization cannot leave a stale success. It triggers on
+`pull_request_target`, never `pull_request`: the latter loads the guard from
+the PR's own head, so one commit could forge a ledger entry and delete the
+check that rejects it. That is safe only because the job never checks out the
+PR — files, labels, and permission all come from `gh api`, and
+`changed_files.py` from an explicit default-branch checkout. It runs
 on **every** PR with no `paths:` filter and decides internally whether
 `.state/` was touched — a path-filtered workflow reports no status on
 non-matching PRs, which stalls them forever once the check is required.
 The launch baseline requires the check and gives only the dedicated App an
-always-on `main` ruleset bypass. Environment secrets
-`GITFORGEOPS_STATE_APP_ID` / `GITFORGEOPS_STATE_APP_PRIVATE_KEY` feed the
-commit workflows; see `docs/github-launch-controls.md`. Keep the fence there
+always-on `main` ruleset bypass. Repository variable
+`GITFORGEOPS_STATE_APP_ID` (public metadata, read identically by the workflows
+and by the settings audit) and environment secret
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY` feed the commit workflows, and both are
+verified in a preflight before the gateway is mutated; see
+`docs/github-launch-controls.md`. Keep the fence there
 rather than narrowing what the binary reads out of the ledger — shared mode
 must keep reconciling namespaces the repo no longer declares, or a PR that
 removes a namespace's last resource orphans it on the gateway forever.
@@ -186,7 +225,11 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
 - Never emitted as a Modify. If the repo also declares the same
   `(namespace, kind, id)`, that is reported as a **conflict**
   (`DiffResult::spec_conflicts()`): two owners writing one row, and the spec
-  importer wins on its next run.
+  importer wins on its next run. A conflict takes the whole **namespace** out
+  of the run (`apply::spec_owned_conflict_block`) — skipping just the row and
+  exiting green would falsely report convergence — but only that namespace:
+  every other one still reconciles, and the reason lands in
+  `ApplyResult::errors` so the run exits non-zero with the conflict named.
 - Never emitted as a Delete, except in **exclusive** mode with
   `apply --confirm-api-spec-deletion` (`DiffOptions::prune_spec_owned`).
   Otherwise apply skips them with a per-resource message and counts them in
@@ -197,8 +240,10 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
   `ownership.drift_report`: a repo fighting the spec importer is a correctness
   problem, not drift noise.
 
-The same flag also drives `full_replace`, where `/restore` would otherwise wipe
-the namespace's `api_specs` section (see Apply Strategies).
+`full_replace` does not delete the graph either: the restore body carries the
+live spec-owned rows and the live `api_specs` section through unchanged, which
+is what the gateway's restore validator requires. `--confirm-api-spec-deletion`
+is the only path that drops them (see Apply Strategies).
 
 ### Policy framework
 
@@ -211,6 +256,14 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `forbid_tls_verify_disabled`, `allowed_proxy_plugins`, `allowed_backend_domains`,
 `waf_enforcement`, `require_ai_guardrails`, `rate_limit_completeness`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
+
+Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
+is schema-first for the 82 builtins and heuristics-only for anything else: a
+non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
+flag, and the leaves they did not flag come back as
+`ImportResult::unbrokered_plugin_config` for a loud per-plugin review notice.
+`basicauth[].username` and `mtls_auth[].identity` are never brokered in either
+path (`resolver::is_identity_credential_leaf`).
 
 Plugin-name knowledge lives in `src/plugin_catalog.rs` (82 builtins, retired and
 reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
@@ -273,9 +326,9 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
-- `src/secrets/` — `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
+- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
-- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
+- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections)
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal

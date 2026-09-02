@@ -382,37 +382,70 @@ impl StateFile {
     /// our POST outcome was unknown. The pending key stays journaled so the
     /// apply target can issue an idempotent PUT and record ownership only after
     /// that explicit assertion succeeds. A row absent from both desired and
-    /// live can be forgotten. The dangerous third case is a live row whose
-    /// desired declaration disappeared: its provenance is unknowable, so fail
-    /// closed rather than claiming or deleting it.
+    /// live can be forgotten.
+    ///
+    /// The awkward case is a live row whose desired declaration disappeared.
+    /// Its provenance is genuinely unknowable, but refusing to reconcile is
+    /// the one response that must never be chosen: the journal is written by
+    /// CI before the first POST and read by CI on the next run, so a hard
+    /// error there wedges the environment until somebody hand-edits
+    /// `.state/<env>.json` — which `state-guard.yml` exists to prevent. Every
+    /// resolution below therefore drops the key and lets the *ordinary*
+    /// ownership rules decide the row's fate:
+    ///
+    /// - [`PendingCreateScope::Shared`] — the row is not in `resources`, so
+    ///   dropping the key leaves it outside the delete fence and it is
+    ///   reported as unmanaged. It is never deleted. A warning names it,
+    ///   because "gitforgeops may have created this and then forgot" is
+    ///   exactly the kind of orphan an operator has to look at.
+    /// - [`PendingCreateScope::Exclusive`] — the repo is authoritative for the
+    ///   namespace, so the row is an ordinary prune candidate and the
+    ///   large-prune guard applies to it like any other.
+    /// - [`PendingCreateScope::FullReplace`] — `/restore` replaces the whole
+    ///   namespace atomically; the journal has no say in what survives.
+    ///
+    /// Returns the keys that were forgotten and the warnings to surface.
     pub fn reconcile_pending_creates(
         &mut self,
         desired: &GatewayConfig,
         actual_by_namespace: &BTreeMap<String, GatewayConfig>,
-    ) -> crate::error::Result<usize> {
+        scope: PendingCreateScope,
+    ) -> PendingCreateReconciliation {
         let pending = self.pending_creates.iter().cloned().collect::<Vec<_>>();
-        let mut changed = 0;
+        let mut report = PendingCreateReconciliation::default();
 
         for key in pending {
             if self.resources.contains_key(&key) {
                 self.pending_creates.remove(&key);
-                changed += 1;
+                report.forgotten += 1;
                 continue;
             }
 
+            // `validate_resource_keys()` rejects this shape on load and save,
+            // so it should be unreachable. Drop it rather than erroring: a
+            // journal entry nothing can parse is not a reason to refuse every
+            // future apply.
             let Some(namespace) = state_key_namespace(&key) else {
-                // validate_resource_keys() catches this on load/save. Keep the
-                // defensive branch so an in-memory malformed value cannot be
-                // mistaken for a row in the current namespace.
-                return Err(crate::error::Error::Config(format!(
-                    "state file contains invalid pending-create key {key:?}"
-                )));
+                self.pending_creates.remove(&key);
+                report.forgotten += 1;
+                report.warnings.push(format!(
+                    "dropped unparseable pending-create key {key:?} from the state journal"
+                ));
+                continue;
             };
             let Some(actual) = actual_by_namespace.get(&namespace) else {
                 // A namespace filter can intentionally leave pending entries
                 // outside this invocation's authoritative read scope.
                 continue;
             };
+
+            // Full replacement does not consult the journal at all, and the
+            // restore is authoritative for every row in the namespace.
+            if scope == PendingCreateScope::FullReplace {
+                self.pending_creates.remove(&key);
+                report.forgotten += 1;
+                continue;
+            }
 
             let desired_exists = resource_exists(desired, &key);
             let live_exists = resource_exists(actual, &key);
@@ -425,17 +458,28 @@ impl StateFile {
                 }
                 (false, false) => {
                     self.pending_creates.remove(&key);
-                    changed += 1;
+                    report.forgotten += 1;
                 }
                 (false, true) => {
-                    return Err(crate::error::Error::Config(format!(
-                        "refusing to reconcile pending create {key:?}: the row is live but no longer declared in the repository, so its ownership cannot be proven. Re-add the desired resource and apply successfully before removing it in a later change, or resolve the live row and state journal manually."
-                    )));
+                    self.pending_creates.remove(&key);
+                    report.forgotten += 1;
+                    report.warnings.push(match scope {
+                        PendingCreateScope::Shared => format!(
+                            "pending create {key:?} names a row that is live on the gateway but no longer declared in this repository. Its provenance cannot be proven, so it is being forgotten and reported as UNMANAGED — gitforgeops will not delete it. If this repository created it, remove it through the gateway admin API by hand."
+                        ),
+                        PendingCreateScope::Exclusive => format!(
+                            "pending create {key:?} names a row that is live on the gateway but no longer declared in this repository. Forgetting the journal entry; exclusive ownership means the ordinary prune path (and the large-prune guard) now decides its fate."
+                        ),
+                        // Handled above.
+                        PendingCreateScope::FullReplace => format!(
+                            "pending create {key:?} was forgotten before a full replacement of namespace `{namespace}`."
+                        ),
+                    });
                 }
             }
         }
 
-        Ok(changed)
+        report
     }
 
     /// Remove managed-ledger entries that an authoritative backup proves are
@@ -565,6 +609,36 @@ impl StateFile {
 
     pub fn previously_managed_keys(&self) -> std::collections::HashSet<String> {
         self.resources.keys().cloned().collect()
+    }
+}
+
+/// Which ownership rules apply to a run reconciling its pending-create journal.
+///
+/// The journal never decides an outcome on its own; it only says which of the
+/// ordinary rules a forgotten row falls back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingCreateScope {
+    /// Shared ownership: an undeclared live row is unmanaged and untouchable.
+    Shared,
+    /// Exclusive ownership: an undeclared live row is an ordinary prune
+    /// candidate, subject to the large-prune guard.
+    Exclusive,
+    /// `full_replace`: `/restore` is authoritative for the whole namespace.
+    FullReplace,
+}
+
+/// Outcome of [`StateFile::reconcile_pending_creates`].
+#[derive(Debug, Default)]
+pub struct PendingCreateReconciliation {
+    /// Journal entries removed by this pass.
+    pub forgotten: usize,
+    /// Operator-facing lines about rows whose provenance could not be proven.
+    pub warnings: Vec<String>,
+}
+
+impl PendingCreateReconciliation {
+    pub fn changed(&self) -> bool {
+        self.forgotten > 0
     }
 }
 
