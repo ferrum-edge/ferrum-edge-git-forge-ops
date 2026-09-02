@@ -58,23 +58,157 @@ def trusted_classifier_violations(
     return violations
 
 
-def pull_request_trigger_violations(workflow: str, text: str) -> list[str]:
+def pull_request_trigger_violations(
+    workflow: str, text: str, trigger: str = "pull_request"
+) -> list[str]:
     violations: list[str] = []
     match = re.search(
-        r"^  pull_request:\s*$\n(?P<body>(?:^    .*\n)*)",
+        rf"^  {re.escape(trigger)}:\s*$\n(?P<body>(?:^    .*\n)*)",
         text,
         re.MULTILINE,
     )
     if match is None:
-        return [f"{workflow}: pull_request trigger is missing"]
+        return [f"{workflow}: {trigger} trigger is missing"]
     body = match.group("body")
     if not re.search(r"^    types: \[[^\n]*\bedited\b", body, re.MULTILINE):
         violations.append(
-            f"{workflow}: pull_request trigger must rerun on base-retarget edits"
+            f"{workflow}: {trigger} trigger must rerun on base-retarget edits"
         )
     if "    branches: [main]" not in body:
         violations.append(
-            f"{workflow}: pull_request trigger must target only protected main"
+            f"{workflow}: {trigger} trigger must target only protected main"
+        )
+    return violations
+
+
+def state_guard_trigger_violations(text: str) -> list[str]:
+    """The ownership-ledger guard must run the definition `main` reviewed.
+
+    Under `on: pull_request` the workflow file itself comes from the pull
+    request's head, so one commit could both forge `.state/<env>.json` and
+    delete the guard that rejects it, and the check would report success.
+    `pull_request_target` always loads the definition from the default branch.
+
+    That trigger is only safe while the job never materializes PR-authored
+    bytes, so the two halves are enforced together: the trigger, and the
+    absence of any checkout of the pull request's head.
+    """
+    violations = pull_request_trigger_violations(
+        "state-guard.yml", text, "pull_request_target"
+    )
+    if re.search(r"^  pull_request:\s*$", text, re.MULTILINE):
+        violations.append(
+            "state-guard.yml: the guard must not also accept the head-loaded pull_request trigger"
+        )
+    for untrusted_ref in (
+        "github.event.pull_request.head.sha",
+        "github.event.pull_request.head.ref",
+        "github.event.pull_request.head.repo",
+    ):
+        if f"ref: ${{{{ {untrusted_ref} }}}}" in text:
+            violations.append(
+                f"state-guard.yml: pull_request_target must never check out {untrusted_ref}"
+            )
+    checkouts = re.findall(r"^\s*(?:-\s*)?uses:\s*actions/checkout@", text, re.MULTILINE)
+    if len(checkouts) != 1:
+        violations.append(
+            "state-guard.yml: exactly one checkout is permitted, and it must name the default branch"
+        )
+    return violations
+
+
+def rust_toolchain_violations(workflow: str, text: str) -> list[str]:
+    """Every `dtolnay/rust-toolchain` step must select the exact toolchain.
+
+    Checking that `toolchain: 1.98.0` appears *somewhere* in the file let a
+    second Rust step — or a copied step that lost its `with:` block — install
+    the action's floating default while the first step's pin kept the workflow
+    green. Match per step instead.
+    """
+    for step in re.split(r"\n(?=\s*-\s+(?:name|uses):)", text):
+        if "dtolnay/rust-toolchain@" not in step:
+            continue
+        if not re.search(r"^\s*toolchain:\s*1\.98\.0\s*$", step, re.MULTILINE):
+            return [
+                f"{workflow}: every dtolnay/rust-toolchain step must select exact toolchain 1.98.0"
+            ]
+    return []
+
+
+def unconfigured_repo_skip_violations(text: str) -> list[str]:
+    """`apply-on-merge.yml` must SKIP, not fail, on an unconfigured repository.
+
+    This workflow fires on every push to `main`, including the merge that first
+    adds `.gitforgeops/config.example.yaml` to a repo nobody has configured yet.
+    Hard-failing there turns `main` red for a state that is simply not set up.
+    An empty matrix carries the same guarantee — the `apply` job is gated on a
+    non-empty matrix, so no GitHub Environment is bound and the synthetic local
+    `default` environment is never applied — without the red workflow.
+
+    Workflows a human explicitly starts keep failing loudly; there the absent
+    configuration contradicts a stated intent.
+    """
+    violations: list[str] = []
+    for required in (
+        'if [[ ! -f .gitforgeops/config.yaml ]]; then',
+        'echo "envs=[]" >> "$GITHUB_OUTPUT"',
+        "needs.list-envs.outputs.envs != '[]'",
+    ):
+        if required not in text:
+            violations.append(
+                f"apply-on-merge.yml: an unconfigured repository must skip via an empty matrix, missing {required!r}"
+            )
+    if (
+        "Repository configuration is required before binding a deployment environment."
+        in text
+    ):
+        violations.append(
+            "apply-on-merge.yml: a push-triggered apply must not fail the merge on absent repository configuration"
+        )
+    return violations
+
+
+def state_writer_preflight_violations(workflow: str, text: str) -> list[str]:
+    """The state-writer App must be proven present BEFORE the gateway mutation.
+
+    The token itself is minted late on purpose (see
+    `state_writer_token_violations`), which means an environment missing the App
+    credentials would mutate the gateway and only then fail to record what it
+    did. Shared mode reads the missing ledger entries as "never managed" and
+    stops reconciling those resources.
+    """
+    violations: list[str] = []
+    preflight = text.find("- name: Require state-writer App credentials")
+    if preflight < 0:
+        return [
+            f"{workflow}: the state-writer App must be verified before any gateway mutation"
+        ]
+    mint = text.find("- name: Mint narrowly scoped state-writer token")
+    if not 0 <= preflight < mint:
+        violations.append(
+            f"{workflow}: the state-writer preflight must precede the token mint"
+        )
+    for required in (
+        "STATE_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}",
+        "STATE_APP_PRIVATE_KEY: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}",
+        'if [ -z "$STATE_APP_ID" ] || [ -z "$STATE_APP_PRIVATE_KEY" ]; then',
+    ):
+        if required not in text:
+            violations.append(
+                f"{workflow}: state-writer preflight is missing {required!r}"
+            )
+    # The App ID is public metadata, not a credential. Reading it from `vars`
+    # in one workflow and `secrets` in another is how the settings audit and
+    # the workflows drifted apart: the audit proves the ruleset bypass is THIS
+    # App by comparing against `vars.GITFORGEOPS_STATE_APP_ID`, and a secret it
+    # cannot read is a comparison it cannot make.
+    if "secrets.GITFORGEOPS_STATE_APP_ID" in text:
+        violations.append(
+            f"{workflow}: the state-writer App ID must be read from vars, matching the settings audit"
+        )
+    if "app-id: ${{ vars.GITFORGEOPS_STATE_APP_ID }}" not in text:
+        violations.append(
+            f"{workflow}: the state-writer token mint must use vars.GITFORGEOPS_STATE_APP_ID"
         )
     return violations
 
@@ -196,10 +330,9 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"{workflow.relative_to(root)}: runner image must use an explicit Ubuntu release"
             )
-        if "dtolnay/rust-toolchain" in text and "toolchain: 1.98.0" not in text:
-            violations.append(
-                f"{workflow.relative_to(root)}: Rust action must select exact toolchain 1.98.0"
-            )
+        violations.extend(
+            rust_toolchain_violations(str(workflow.relative_to(root)), text)
+        )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
                 f"{workflow.relative_to(root)}: download must go through install-ferrum-edge.sh"
@@ -240,8 +373,36 @@ def main(argv: list[str] | None = None) -> int:
     release = (workflows / "release.yml").read_text(encoding="utf-8")
     if "provenance: mode=max" not in release or "sbom: true" not in release:
         violations.append("release.yml: image provenance and SBOM must both be enabled")
-    if "actions/attest-build-provenance@" not in release:
-        violations.append("release.yml: signed GitHub build provenance is missing")
+    # One manifest digest is pushed to both registries, but an attestation is
+    # bound to its `subject-name`: a consumer verifying `docker.io/<image>`
+    # finds nothing unless that name is attested too.
+    if release.count("uses: actions/attest-build-provenance@") != 2:
+        violations.append(
+            "release.yml: every published image name needs signed build provenance (GHCR and Docker Hub)"
+        )
+    for required in (
+        "subject-name: ghcr.io/${{ github.repository }}",
+        "subject-name: ${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}",
+    ):
+        if required not in release:
+            violations.append(
+                f"release.yml: build provenance is missing subject {required!r}"
+            )
+    # The ledger commits that `apply-on-merge.yml` and `rotate.yml` push to
+    # `main` contain no build input. They used to carry `[skip ci]`, which
+    # suppressed the required checks along with everything else; excluding the
+    # paths from the image build is the narrower control.
+    release_push = re.search(
+        r"^  push:\s*$\n(?P<body>(?:^    .*\n|^      .*\n)*)", release, re.MULTILINE
+    )
+    release_push_body = release_push.group("body") if release_push else ""
+    for ignored in ("- '.state/**'", "- 'assembled/**'"):
+        if ignored not in release_push_body:
+            violations.append(
+                f"release.yml: push trigger must ignore ledger-only commits ({ignored})"
+            )
+    if "tags: ['v*']" not in release_push_body:
+        violations.append("release.yml: push trigger must keep publishing release tags")
     for required in (
         "authorize-release:",
         "needs: authorize-release",
@@ -269,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"apply-on-merge.yml: explicit validated mode mapping is missing {required!r}"
             )
+    violations.extend(unconfigured_repo_skip_violations(apply_workflow))
 
     for privileged_workflow in (
         "apply-on-merge.yml",
@@ -278,7 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     ):
         text = (workflows / privileged_workflow).read_text(encoding="utf-8")
         if (
-            "Repository configuration is required before binding a deployment environment."
+            privileged_workflow != "apply-on-merge.yml"
+            and "Repository configuration is required before binding a deployment environment."
             not in text
         ):
             violations.append(
@@ -292,6 +455,49 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"{privileged_workflow}: malformed credential bundles must not fail open"
             )
+        # `${{ toJSON(secrets) }}` spills every environment secret to disk.
+        # $RUNNER_TEMP is wiped with the workspace; a bare `mktemp` lands in a
+        # /tmp that self-hosted runners share between jobs and never clean.
+        if 'all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")' not in text:
+            violations.append(
+                f"{privileged_workflow}: the whole-secrets spill must be created under $RUNNER_TEMP"
+            )
+        if "[skip ci]" in text:
+            violations.append(
+                f"{privileged_workflow}: state commits must not suppress required checks with [skip ci]"
+            )
+
+    for state_writer_workflow in ("apply-on-merge.yml", "rotate.yml"):
+        violations.extend(
+            state_writer_preflight_violations(
+                state_writer_workflow,
+                (workflows / state_writer_workflow).read_text(encoding="utf-8"),
+            )
+        )
+
+    settings_audit = (workflows / "settings-audit.yml").read_text(encoding="utf-8")
+    # GitHub disables scheduled workflows after 60 days of repository
+    # inactivity, and an audit that has silently stopped reports no drift at
+    # all. Manual dispatch is the recovery path, and it may select any ref, so
+    # it carries the same protected-branch preflight the other manual workflows
+    # use before the administration-read token is bound.
+    for required in (
+        "  workflow_dispatch:",
+        "- name: Require protected default branch",
+        "SOURCE_REF: ${{ github.ref }}",
+        "EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}",
+        "STATE_WRITER_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}",
+    ):
+        if required not in settings_audit:
+            violations.append(
+                f"settings-audit.yml: dispatchable audit is missing {required!r}"
+            )
+    if settings_audit.find("- name: Require protected default branch") > settings_audit.find(
+        "GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}"
+    ):
+        violations.append(
+            "settings-audit.yml: the ref preflight must run before the audit token is bound"
+        )
 
     for rename_sensitive_workflow, trusted_invocation, expected_count in (
         (
@@ -323,11 +529,15 @@ def main(argv: list[str] | None = None) -> int:
     for pr_workflow in (
         "rust-ci.yml",
         "security.yml",
-        "state-guard.yml",
         "validate-pr.yml",
     ):
         text = (workflows / pr_workflow).read_text(encoding="utf-8")
         violations.extend(pull_request_trigger_violations(pr_workflow, text))
+    violations.extend(
+        state_guard_trigger_violations(
+            (workflows / "state-guard.yml").read_text(encoding="utf-8")
+        )
+    )
     violations.extend(
         trusted_supply_chain_policy_violations(
             (workflows / "security.yml").read_text(encoding="utf-8")
@@ -351,7 +561,13 @@ def main(argv: list[str] | None = None) -> int:
     static_review = (workflows / "validate-pr.yml").read_text(encoding="utf-8")
     if re.search(r"^ {4}environment\s*:", static_review, re.MULTILINE):
         violations.append("validate-pr.yml: PR-built code must not bind an Environment")
-    if re.search(r"\$\{\{[^}]*\bsecrets(?:\.|\[)", static_review):
+    # Match the whole `secrets` context, not just `secrets.NAME` /
+    # `secrets['NAME']`. `${{ toJSON(secrets) }}`,
+    # `${{ fromJSON(toJSON(secrets)) }}` and a bare `${{ secrets }}` hand over
+    # every environment secret at once and are exactly what the privileged
+    # workflows use to load credential bundles — the form most worth catching
+    # in the workflow that must never receive one.
+    if re.search(r"\$\{\{[^}]*\bsecrets\b", static_review):
         violations.append("validate-pr.yml: PR-built code must not receive any secrets")
     if re.search(r"^\s+paths\s*:", static_review, re.MULTILINE):
         violations.append(
@@ -402,6 +618,17 @@ def main(argv: list[str] | None = None) -> int:
         "select(.base.ref == $base)",
         "current_base=$(jq -r '.base.ref'",
         "PR association is not yet available and unambiguous",
+        # `workflow_run.workflows:` matches the workflow's DISPLAY name, which
+        # any workflow file may claim. Resolve the triggering run and require
+        # its definition path, so a renamed or newly added workflow cannot feed
+        # this privileged job a head SHA of its choosing.
+        "EXPECTED_WORKFLOW_PATH: .github/workflows/validate-pr.yml",
+        'run_path=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq \'.path\')',
+        '[ "$run_path" = "$EXPECTED_WORKFLOW_PATH" ]',
+        # Two deliveries for one reviewed commit must not race each other for
+        # the environment approval and the PR comment.
+        "group: trusted-pr-review-${{ github.event.workflow_run.head_sha }}",
+        "cancel-in-progress: true",
     ):
         if required not in trusted_review:
             violations.append(

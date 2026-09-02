@@ -3,6 +3,16 @@ name: Release
 on:
   push:
     branches: [main]
+    # `apply-on-merge.yml` and `rotate.yml` push the ownership ledger (and, in
+    # file mode, the assembled documents) straight to `main` as the state-writer
+    # App. Those commits contain no build input, so rebuilding and republishing
+    # the image for them wastes a multi-platform build and moves the `latest`
+    # tag for no reason. They used to carry `[skip ci]`, which suppressed every
+    # workflow indiscriminately, including the required checks; scoping the
+    # exclusion to the paths CI actually should ignore is the narrower fix.
+    paths-ignore:
+      - '.state/**'
+      - 'assembled/**'
     tags: ['v*']
 
 concurrency:
@@ -182,6 +192,19 @@ jobs:
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # `docker/build-push-action` publishes ONE manifest digest to BOTH
+      # registries, so the GHCR attestation above covers those exact bytes —
+      # but an attestation is bound to `subject-name`, and consumers pulling
+      # `docker.io/<image>` verify against that name. Without this second
+      # subject, `gh attestation verify oci://docker.io/...` finds nothing and
+      # the Docker Hub image is effectively unattested.
+      - name: Publish signed Docker Hub build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 

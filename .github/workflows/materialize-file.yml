@@ -120,7 +120,9 @@ jobs:
         # apply-on-merge.yml for the full rationale.
         run: |
           set -euo pipefail
-          all_secrets=$(mktemp)
+          # Under $RUNNER_TEMP so the runner cleans it up; a bare `mktemp`
+          # lands in a /tmp that self-hosted runners share between jobs.
+          all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
           trap 'rm -f "$all_secrets"' EXIT
           cat > "$all_secrets" <<'SECRETS_EOF'
           ${{ toJSON(secrets) }}
