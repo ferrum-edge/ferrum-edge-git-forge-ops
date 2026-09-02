@@ -12,6 +12,14 @@ on:
     workflows: [GitForgeOps PR Static Validation]
     types: [completed]
 
+# Keyed on the reviewed head, not the PR: two different commits are two
+# different reviews and both should run, but a re-run (or a duplicated
+# workflow_run delivery) for the SAME commit would otherwise race its
+# predecessor for the environment approval and the PR comment.
+concurrency:
+  group: trusted-pr-review-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -51,9 +59,21 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          EXPECTED_WORKFLOW_PATH: .github/workflows/validate-pr.yml
         run: |
           set -euo pipefail
           [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid head SHA" >&2; exit 1; }
+
+          # `workflow_run.workflows:` matches on the workflow's *display name*,
+          # which is just a `name:` line any workflow file may carry. Resolve
+          # the triggering run and require its definition path, so a new or
+          # renamed workflow cannot impersonate static validation and hand this
+          # privileged job a head SHA of its choosing.
+          run_path=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.path')
+          [ "$run_path" = "$EXPECTED_WORKFLOW_PATH" ] || {
+            echo "Triggering run is '${run_path}', not ${EXPECTED_WORKFLOW_PATH}." >&2
+            exit 1
+          }
           trusted_sha=$(git -C trusted rev-parse HEAD)
           if [ "$EVENT_HEAD_REPO" != "$REPO" ]; then
             {

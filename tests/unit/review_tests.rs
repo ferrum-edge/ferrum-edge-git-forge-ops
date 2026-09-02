@@ -2,6 +2,7 @@ use gitforgeops::diff::{
     best_practice::BestPractice, breaking::BreakingChange, resource_diff::*,
     security::SecurityFinding,
 };
+use gitforgeops::error::Error;
 use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::review::comment_status_is_retryable;
@@ -9,6 +10,9 @@ use gitforgeops::review::enforce_comment_delivery;
 use gitforgeops::review::live_comparison_precondition_error;
 use gitforgeops::review::pr_comment::{
     build_review_comment, build_review_comment_v2, render_spec_owned,
+};
+use gitforgeops::review::{
+    enforce_live_comparison, redact_comparison_error, stale_live_view_error, STALE_LIVE_VIEW_REASON,
 };
 use gitforgeops::secrets::ResolveReport;
 
@@ -375,4 +379,124 @@ fn review_comment_v2_omits_spec_owned_section_when_empty() {
     );
 
     assert!(!comment.contains("Spec-owned"), "{comment}");
+}
+
+// --- Live-comparison failures must never publish the gateway URL -----------
+//
+// `FERRUM_GATEWAY_URL` is a GitHub Environment secret, and `reqwest` appends
+// `for url (<full url>)` to its transport errors. `cmd_review` posts the
+// rendered comment to the pull request and mirrors it into
+// `$GITHUB_STEP_SUMMARY`, both world-readable on a public repo.
+
+fn comment_with_comparison_error(reason: &str) -> String {
+    build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        Some(reason),
+        None,
+        &ResolveReport::default(),
+        true,
+    )
+}
+
+#[test]
+fn redacted_transport_error_never_reaches_the_rendered_comment() {
+    let leaky = Error::HttpClient(
+        "error sending request for url (https://secret-host.internal:9443/backup): \
+         connection closed before message completed"
+            .to_string(),
+    );
+
+    let published = redact_comparison_error(&leaky);
+    let comment = comment_with_comparison_error(&published);
+
+    for secret in [
+        "secret-host.internal",
+        "9443",
+        "https://secret-host.internal:9443/backup",
+    ] {
+        assert!(
+            !comment.contains(secret),
+            "rendered comment leaked {secret:?}:\n{comment}"
+        );
+    }
+    // Nothing URL-shaped at all, and the reviewer is still told where to look.
+    assert!(!comment.contains("://"), "{comment}");
+    assert!(comment.contains("could not be reached"), "{comment}");
+    assert!(comment.contains("job log"), "{comment}");
+}
+
+#[test]
+fn redacted_api_error_keeps_the_status_and_drops_the_body() {
+    let leaky = Error::ApiError {
+        status: 502,
+        message: "upstream https://secret-host.internal:9443 said no <img src=x>".to_string(),
+    };
+
+    let published = redact_comparison_error(&leaky);
+
+    assert!(published.contains("HTTP 502"), "{published}");
+    assert!(!published.contains("secret-host.internal"), "{published}");
+    assert!(!published.contains("<img"), "{published}");
+}
+
+#[test]
+fn redacted_configuration_errors_describe_the_category_only() {
+    for (error, expected) in [
+        (Error::NoGatewayUrl, "no gateway URL"),
+        (Error::NoJwtSecret, "no admin JWT secret"),
+        (
+            Error::JwtError("secret too short".to_string()),
+            "admin token",
+        ),
+        (
+            Error::Config("FERRUM_GATEWAY_CA_CERT is not valid base64".to_string()),
+            "client configuration",
+        ),
+    ] {
+        let published = redact_comparison_error(&error);
+        assert!(
+            published.contains(expected),
+            "{published:?} should mention {expected:?}"
+        );
+        assert!(published.starts_with("Live gateway comparison skipped:"));
+    }
+}
+
+// --- A cached /backup is not a live comparison -----------------------------
+
+#[test]
+fn cached_backup_degrades_the_review_and_fails_require_live() {
+    assert!(stale_live_view_error(false).is_none());
+
+    let reason = stale_live_view_error(true).expect("a cached /backup must degrade the review");
+    let comment = comment_with_comparison_error(&reason);
+
+    assert!(comment.contains("X-Data-Source: cached"), "{comment}");
+    assert!(comment.contains("stale"), "{comment}");
+    assert!(comment.contains("### Changes: Skipped"), "{comment}");
+
+    let error = enforce_live_comparison(true, Some(&reason))
+        .expect_err("--require-live must reject a stale view");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("complete live gateway comparison"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("stale"), "{rendered}");
+}
+
+#[test]
+fn live_comparison_enforcement_is_scoped_to_require_live() {
+    assert!(enforce_live_comparison(true, None).is_ok());
+    assert!(enforce_live_comparison(false, Some(STALE_LIVE_VIEW_REASON)).is_ok());
 }

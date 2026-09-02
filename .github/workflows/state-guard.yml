@@ -21,8 +21,21 @@ name: GitForgeOps State Guard
 # write, maintain, or admin. Every push or other PR transition therefore fails
 # until a qualified maintainer removes and reapplies the label.
 
+# Deliberately `pull_request_target`, not `pull_request`. Both give this job a
+# read-only token, but `pull_request` loads the *workflow definition from the
+# pull request's own head*: a PR that edited `.state/x.json` and, in the same
+# commit, deleted or neutered this file would run its own edited guard and pass.
+# `pull_request_target` always loads the definition from the protected default
+# branch, so the fence is the one main reviewed.
+#
+# The usual `pull_request_target` hazard — running privileged against untrusted
+# code — does not apply because this job NEVER checks out the pull request. It
+# reads changed files, labels, and collaborator permission through `gh api`, and
+# gets its one piece of executable logic (`changed_files.py`) from an explicit
+# default-branch checkout. No PR-authored byte is ever executed or interpolated
+# into a `run:` block.
 on:
-  pull_request:
+  pull_request_target:
     # `labeled`/`unlabeled` are not in the default activity type set
     # (opened, synchronize, reopened). Without them, adding the override
     # label does nothing until someone pushes another commit — the check
@@ -52,6 +65,10 @@ jobs:
   state-guard-reject-state-edits:
     runs-on: ubuntu-24.04
     steps:
+      # The only checkout in this workflow, and it names the protected default
+      # branch explicitly. Never add a checkout of `github.event.pull_request.head.*`
+      # here: under `pull_request_target` that would put PR-authored code in a
+      # job holding the base repository's token.
       - name: Check out trusted guard logic
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

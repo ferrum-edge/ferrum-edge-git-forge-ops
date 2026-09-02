@@ -5,6 +5,33 @@ rulesets, environment reviewers, and repository Actions policy live in GitHub
 settings and cannot be activated by merging a pull request. Configure this
 baseline before connecting production credentials.
 
+## 0. Do this before you merge
+
+Sections 1-5 are prerequisites, not follow-ups. Two workflows are fail-closed
+by design and will report red on `main` until the settings behind them exist:
+
+| Workflow | Red until | Section |
+| --- | --- | --- |
+| `Release` | the `main` ruleset declares required checks — `gh pr checks --required` exits non-zero with "no required checks reported", so every push to `main` fails the publication gate | [§2](#2-protect-main-with-an-active-ruleset) |
+| `GitHub Settings Audit` | `SETTINGS_AUDIT_TOKEN` and repository variable `GITFORGEOPS_STATE_APP_ID` exist | [§1](#1-create-the-state-writer-github-app), [§5](#5-enable-settings-drift-monitoring) |
+
+That is the intended behaviour: neither workflow may assume a control it
+cannot verify. Configure §1-§5 first and neither is ever red.
+
+Two things deliberately do *not* fail on an unconfigured repository, because
+nobody asked them to do anything yet:
+
+- `GitForgeOps Apply` runs on every push to `main`. With no
+  `.gitforgeops/config.yaml` it emits an empty environment matrix and a
+  `::notice::`, so the merge that first adds `.gitforgeops/config.example.yaml`
+  does not turn `main` red. No GitHub Environment is bound either way.
+- `GitForgeOps Trusted PR Live Review` resolves no live-review targets and
+  skips its Environment-bound job entirely.
+
+Everything an operator explicitly starts — `rotate`, `materialize-file`, and
+the scheduled `drift-check` — still fails loudly when the configuration is
+missing, because there the absence contradicts a stated intent.
+
 ## 1. Create the state-writer GitHub App
 
 `apply-on-merge.yml` and `rotate.yml` must commit `.state/<env>.json` after a
@@ -18,15 +45,24 @@ Create and install a GitHub App with:
 - **Contents: read and write** as its only write permission;
 - no webhook subscription unless your organization separately needs one.
 
-Add the App as the sole always-on bypass actor in the `main` ruleset. Add its
-credentials to every deployment environment:
+Add the App as the sole always-on bypass actor in the `main` ruleset, then
+record its identity in exactly two places:
 
-- `GITFORGEOPS_STATE_APP_ID`
-- `GITFORGEOPS_STATE_APP_PRIVATE_KEY`
+- repository **variable** `GITFORGEOPS_STATE_APP_ID` — the numeric App ID. It
+  is public metadata, not a credential, and every consumer reads it from here:
+  `apply-on-merge.yml` and `rotate.yml` mint the installation token with it,
+  and the settings audit compares it against the ruleset's bypass actor to
+  prove the bypass is *this* App rather than merely some integration. Storing
+  it as a secret in one place and a variable in another is how those two
+  drifted apart; `check_supply_chain.py` now rejects
+  `secrets.GITFORGEOPS_STATE_APP_ID`.
+- environment **secret** `GITFORGEOPS_STATE_APP_PRIVATE_KEY` — in every
+  deployment environment. This one is a credential.
 
-Also set repository variable `GITFORGEOPS_STATE_APP_ID` to the same numeric App
-ID so the settings audit can prove the bypass is this App, rather than merely
-accepting any integration actor.
+`apply-on-merge.yml` and `rotate.yml` check that both are present *before* they
+touch the gateway. The token itself is still minted late (after the untrusted
+build, immediately before the ledger commit), but the preflight means a missing
+App can no longer let an apply land on the gateway with nothing recording it.
 
 The official `actions/create-github-app-token` action is commit-pinned and
 revokes each installation token when the job finishes. Do not substitute a
@@ -56,21 +92,45 @@ additional include or exclusion patterns. It must:
   configured as an always-on bypass. Pull-request-only human/team bypasses are
   not permitted.
 
-Protect release tags (`v*`) with a tag ruleset that prevents update and
-deletion and restricts creation to explicit release users, teams, or Apps—not
-a broad repository-role bypass. The release
-workflow also checks that a tag commit is reachable from `main`; tag protection
-ensures a branch-controlled workflow cannot remove that check before secrets
-are used.
+Protect release tags (`v*`) with a tag ruleset that carries the `creation`,
+`update`, and `deletion` rules, and that names **at least one** bypass actor —
+each one an explicit App, team, or user in always-on mode, never a broad
+repository role. The bypass list is what release publishing runs through: with
+the `creation` rule and no bypass actor at all, nobody can push a `v*` tag and
+the tag half of `release.yml` can never fire, so `audit_settings.py` treats an
+empty bypass list as a misconfiguration rather than as maximum strictness.
+
+The release workflow also checks that a tag commit is reachable from `main`;
+tag protection ensures a branch-controlled workflow cannot remove that check
+before secrets are used.
 
 ## 3. Protect every deployment environment
 
 Before enabling any environment-bound workflow, copy
 `.gitforgeops/config.example.yaml` to `.gitforgeops/config.yaml`, replace its
 example entries with the real deployment environments, and commit that file.
-The privileged workflows fail before binding an environment when the protected
-branch has no repository configuration, and the synthetic local `default`
-environment is never eligible for trusted live review.
+
+Without it, no privileged workflow ever binds an environment — but they reach
+that outcome by two different routes, and the difference matters when you are
+reading a red or a green run:
+
+- `apply-on-merge.yml` **skips**: the enumerator emits an empty matrix, so the
+  Environment-bound `apply` job never starts.
+- `trusted-pr-review.yml` **skips**: it resolves no live-review targets, so its
+  Environment-bound job never starts.
+- `rotate.yml`, `materialize-file.yml`, and `drift-check.yml` **fail** in a
+  preflight job that runs before the Environment-bound job.
+
+The synthetic local `default` environment is never eligible for trusted live
+review in any of those paths.
+
+Delete every GitHub Environment that `.gitforgeops/config.yaml` does not
+declare — including the `default` environment GitHub creates on some
+repositories. The settings audit walks `GET /repos/{repo}/environments` and
+holds *every* listed environment to the reviewer and branch-policy rules below,
+so one forgotten unprotected environment keeps the audit red forever. An
+environment nothing deploys to is also a standing invitation to store
+credentials somewhere no workflow guard covers.
 
 For every environment listed in `.gitforgeops/config.yaml`:
 
@@ -118,10 +178,19 @@ container bases, missing Rust version pins, or disabled release attestations.
 
 Create a fine-grained PAT or read-only GitHub App token with
 **Administration: read** and store it as repository secret
-`SETTINGS_AUDIT_TOKEN`. The scheduled `settings-audit.yml` runs only from the
-default branch and verifies Actions permissions, the active `main` and release
-tag rulesets, required checks, the exact state-writer App bypass, and every
-environment's reviewer/self-review/branch policy.
+`SETTINGS_AUDIT_TOKEN`. `settings-audit.yml` runs only from the default branch
+and verifies Actions permissions, the active `main` and release tag rulesets,
+required checks, the exact state-writer App bypass, and every environment's
+reviewer/self-review/branch policy.
+
+It runs weekly on a schedule **and** on `workflow_dispatch`. The manual trigger
+is not a convenience: GitHub disables a scheduled workflow after 60 days with
+no repository activity, and it does so silently. A settings audit that has been
+switched off reports no drift, which is indistinguishable from no drift
+existing — so on a quiet repository, dispatch it by hand periodically, or
+re-enable the schedule from the Actions tab. A dispatch may select any ref, so
+the job's first step refuses to run from anything but the protected default
+branch, before the administration-read token is bound to a step.
 
 You can run the same audit locally without exposing the token to Actions:
 

@@ -1752,13 +1752,24 @@ async fn cmd_review(
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
 
-    let (diffs, breaking, unmanaged, spec_owned, comparison_error) =
-        if let Some(error) = review::live_comparison_precondition_error(&namespaces) {
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
-        } else {
-            match &client {
-                Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
-                    Ok(namespace_pairs) => {
+    let (diffs, breaking, unmanaged, spec_owned, comparison_error) = if let Some(error) =
+        review::live_comparison_precondition_error(&namespaces)
+    {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
+    } else {
+        match &client {
+            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+                // A `/backup` served from the gateway's in-memory snapshot
+                // is not the live view this review claims to publish, so
+                // the computed diff is dropped rather than presented as a
+                // comparison. `--require-live` fails on the recorded
+                // reason below.
+                Ok(namespace_pairs) => match review::stale_live_view_error(c.served_from_cache()) {
+                    Some(reason) => {
+                        eprintln!("{reason}");
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
+                    }
+                    None => {
                         let (d, b, u, s) = compute_namespace_diffs(
                             &namespace_pairs,
                             managed.as_ref(),
@@ -1766,23 +1777,34 @@ async fn cmd_review(
                         );
                         (d, b, u, s, None)
                     }
-                    Err(e) => (
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Some(format!("Live gateway comparison skipped: {}", e)),
-                    ),
                 },
-                Err(e) => (
+                // Unredacted on stderr only. The comment built below is
+                // posted to the PR and mirrored into the step summary, and
+                // a transport error's Display carries the gateway URL —
+                // an environment secret. See `review::redact_comparison_error`.
+                Err(e) => {
+                    eprintln!("Live gateway comparison failed: {e}");
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Some(review::redact_comparison_error(&e)),
+                    )
+                }
+            },
+            Err(e) => {
+                eprintln!("Live gateway comparison failed: {e}");
+                (
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    Some(format!("Live gateway comparison skipped: {}", e)),
-                ),
+                    Some(review::redact_comparison_error(e)),
+                )
             }
-        };
+        }
+    };
 
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
@@ -1871,14 +1893,7 @@ async fn cmd_review(
         }
     }
 
-    if require_live {
-        if let Some(error) = comparison_error {
-            return Err(gitforgeops::error::Error::Config(format!(
-                "trusted PR review requires a complete live gateway comparison: {error}"
-            ))
-            .into());
-        }
-    }
+    review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
 
     let _ = !secret_report.results.is_empty();

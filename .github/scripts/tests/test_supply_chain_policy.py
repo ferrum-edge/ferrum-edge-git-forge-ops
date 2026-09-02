@@ -1,5 +1,6 @@
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -304,6 +305,364 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         self.assertTrue(any("persisted by checkout" in item for item in violations))
         self.assertTrue(any("minted after" in item for item in violations))
+
+    def test_every_whole_secrets_context_form_is_rejected(self):
+        # `secrets.NAME` and `secrets['NAME']` were caught, but the whole-context
+        # forms — which hand over EVERY environment secret at once, and are what
+        # the privileged workflows actually use — slipped through.
+        pattern = re.compile(r"\$\{\{[^}]*\bsecrets\b")
+        for leak in (
+            "${{ toJSON(secrets) }}",
+            "${{ fromJSON(toJSON(secrets)) }}",
+            "${{ secrets }}",
+            "${{ secrets.FERRUM_GATEWAY_URL }}",
+            "${{ secrets['FERRUM_GATEWAY_URL'] }}",
+        ):
+            self.assertRegex(leak, pattern, f"{leak} must be treated as a secret leak")
+        for benign in (
+            "# secrets never reach this job",
+            "${{ github.token }}",
+            "${{ vars.GITFORGEOPS_STATE_APP_ID }}",
+        ):
+            self.assertNotRegex(benign, pattern)
+
+    def test_validate_pr_rejects_the_whole_secrets_context(self):
+        # Guard the wiring, not just the regex: the real workflow text is run
+        # through the same check the policy applies.
+        workflow = (ROOT / ".github/workflows/validate-pr.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotRegex(workflow, r"\$\{\{[^}]*\bsecrets\b")
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/validate-pr.yml"
+            path.write_text(
+                workflow.replace(
+                    "    steps:",
+                    "    steps:\n      - run: echo '${{ toJSON(secrets) }}'",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("must not receive any secrets" in item for item in violations),
+            violations,
+        )
+
+    def test_state_guard_must_run_the_default_branch_definition(self):
+        secure = """on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    branches: [main]
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+"""
+        self.assertEqual(check_supply_chain.state_guard_trigger_violations(secure), [])
+
+        head_loaded = secure.replace("  pull_request_target:", "  pull_request:")
+        violations = check_supply_chain.state_guard_trigger_violations(head_loaded)
+        self.assertTrue(
+            any("pull_request_target trigger is missing" in item for item in violations),
+            violations,
+        )
+        self.assertTrue(
+            any("head-loaded pull_request trigger" in item for item in violations),
+            violations,
+        )
+
+    def test_state_guard_must_never_check_out_the_pull_request(self):
+        untrusted = """on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    branches: [main]
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+"""
+        violations = check_supply_chain.state_guard_trigger_violations(untrusted)
+        self.assertTrue(
+            any("never check out" in item for item in violations), violations
+        )
+        self.assertTrue(
+            any("exactly one checkout" in item for item in violations), violations
+        )
+
+    def test_every_rust_toolchain_step_must_pin_the_version(self):
+        secure = """      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
+        with:
+          toolchain: 1.98.0
+      - name: Install Rust toolchain again
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
+        with:
+          toolchain: 1.98.0
+"""
+        self.assertEqual(
+            check_supply_chain.rust_toolchain_violations("rust-ci.yml", secure), []
+        )
+
+        # One pinned step used to satisfy the whole file.
+        insecure = secure.replace(
+            """      - name: Install Rust toolchain again
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
+        with:
+          toolchain: 1.98.0
+""",
+            """      - name: Install Rust toolchain again
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
+""",
+        )
+        violations = check_supply_chain.rust_toolchain_violations(
+            "rust-ci.yml", insecure
+        )
+        self.assertTrue(
+            any("every dtolnay/rust-toolchain step" in item for item in violations),
+            violations,
+        )
+
+    def test_unconfigured_repository_skips_instead_of_failing_the_merge(self):
+        secure = "\n".join(
+            [
+                "if [[ ! -f .gitforgeops/config.yaml ]]; then",
+                'echo "envs=[]" >> "$GITHUB_OUTPUT"',
+                "needs.list-envs.outputs.envs != '[]'",
+            ]
+        )
+        self.assertEqual(check_supply_chain.unconfigured_repo_skip_violations(secure), [])
+
+        hard_failing = secure + (
+            "\necho \"::error::Repository configuration is required before binding a "
+            "deployment environment.\"\n"
+        )
+        violations = check_supply_chain.unconfigured_repo_skip_violations(hard_failing)
+        self.assertTrue(
+            any("must not fail the merge" in item for item in violations), violations
+        )
+
+        without_skip = "needs.list-envs.outputs.envs != '[]'"
+        violations = check_supply_chain.unconfigured_repo_skip_violations(without_skip)
+        self.assertTrue(
+            any("empty matrix" in item for item in violations), violations
+        )
+
+    def test_state_writer_app_must_be_proven_before_the_gateway_mutation(self):
+        secure = "\n".join(
+            [
+                "- name: Require state-writer App credentials",
+                "STATE_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}",
+                "STATE_APP_PRIVATE_KEY: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}",
+                'if [ -z "$STATE_APP_ID" ] || [ -z "$STATE_APP_PRIVATE_KEY" ]; then',
+                "- name: Mint narrowly scoped state-writer token",
+                "app-id: ${{ vars.GITFORGEOPS_STATE_APP_ID }}",
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.state_writer_preflight_violations("rotate.yml", secure),
+            [],
+        )
+
+        missing = secure.replace(
+            "- name: Require state-writer App credentials\n", "", 1
+        )
+        violations = check_supply_chain.state_writer_preflight_violations(
+            "rotate.yml", missing
+        )
+        self.assertTrue(
+            any("before any gateway mutation" in item for item in violations),
+            violations,
+        )
+
+        secret_app_id = secure.replace(
+            "app-id: ${{ vars.GITFORGEOPS_STATE_APP_ID }}",
+            "app-id: ${{ secrets.GITFORGEOPS_STATE_APP_ID }}",
+        )
+        violations = check_supply_chain.state_writer_preflight_violations(
+            "rotate.yml", secret_app_id
+        )
+        self.assertTrue(
+            any("must be read from vars" in item for item in violations), violations
+        )
+
+    def test_state_commits_must_not_suppress_required_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/rotate.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    'in ${INPUT_ENVIRONMENT}"', 'in ${INPUT_ENVIRONMENT} [skip ci]"'
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("[skip ci]" in item for item in violations), violations
+        )
+
+    def test_whole_secrets_spill_must_live_under_runner_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    'all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")',
+                    "all_secrets=$(mktemp)",
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("under $RUNNER_TEMP" in item for item in violations), violations
+        )
+
+    def test_release_must_attest_every_published_image_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index("      - name: Publish signed Docker Hub build provenance")
+            end = text.index("      - name: Bind image digest into build-input record")
+            path.write_text(text[:start] + text[end:], encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("every published image name" in item for item in violations), violations
+        )
+        self.assertTrue(
+            any("missing subject" in item for item in violations), violations
+        )
+
+    def test_release_push_trigger_ignores_ledger_commits_and_keeps_tags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace("      - '.state/**'\n", ""),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("ignore ledger-only commits" in item for item in violations), violations
+        )
+
+    def test_settings_audit_is_dispatchable_behind_a_ref_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/settings-audit.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "  workflow_dispatch:\n", ""
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("dispatchable audit is missing" in item for item in violations),
+            violations,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/settings-audit.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index("      - name: Require protected default branch")
+            end = text.index("      - name: Check out protected default branch")
+            path.write_text(text[:start] + text[end:] + text[start:end], encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("before the audit token is bound" in item for item in violations),
+            violations,
+        )
+
+    def test_trusted_review_pins_the_triggering_workflow_definition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/trusted-pr-review.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "          EXPECTED_WORKFLOW_PATH: .github/workflows/validate-pr.yml\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("EXPECTED_WORKFLOW_PATH" in item for item in violations), violations
+        )
+
+    def test_trusted_review_serializes_runs_for_one_reviewed_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/trusted-pr-review.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "  group: trusted-pr-review-${{ github.event.workflow_run.head_sha }}\n",
+                    "  group: trusted-pr-review\n",
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("trusted-pr-review-" in item for item in violations), violations
+        )
+
+    def test_mirrored_repository_is_a_clean_baseline(self):
+        # Every mutation test above asserts the checker FAILS. That only proves
+        # something if the unmutated mirror passes — otherwise a broken helper
+        # would make them all green for the wrong reason.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _mirror_repo(self, root: Path) -> Path:
+        """Copy the policy-relevant tree so a test can mutate one file.
+
+        The checker reads workflows, the Dockerfile, CODEOWNERS, the toolchain
+        pin, and the validator checksum policy, so all of them come along.
+        """
+        for relative in (
+            ".github/workflows",
+            ".github/scripts/check_supply_chain.py",
+            ".github/scripts/install-ferrum-edge.sh",
+            ".github/ferrum-edge-checksums.txt",
+            ".github/CODEOWNERS",
+            "Dockerfile",
+            ".dockerignore",
+            "rust-toolchain.toml",
+        ):
+            source = ROOT / relative
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+        return root
+
+    def _violations(self, root: Path) -> list[str]:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--root", str(root)],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        return [
+            line.strip().lstrip("- ")
+            for line in result.stderr.splitlines()
+            if line.startswith("  - ")
+        ]
 
 
 if __name__ == "__main__":
