@@ -53,6 +53,10 @@ jobs:
         id: list
         run: |
           set -euo pipefail
+          [[ -f .gitforgeops/config.yaml ]] || {
+            echo "::error::Repository configuration is required before binding a deployment environment."
+            exit 1
+          }
           envs=$(gitforgeops envs --format json | jq -c .)
           jq -e '
             type == "array" and
@@ -102,9 +106,9 @@ jobs:
       - name: Download ferrum-edge binary
         if: steps.deployment-mode.outputs.mode == 'api'
         env:
-          FERRUM_EDGE_VERSION_RAW: ${{ vars.FERRUM_EDGE_VERSION || 'latest' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          bash .github/scripts/install-ferrum-edge.sh "$FERRUM_EDGE_VERSION_RAW"
+          bash .github/scripts/install-ferrum-edge.sh
 
       - name: Install Rust toolchain
         if: steps.deployment-mode.outputs.mode == 'api'
@@ -132,7 +136,9 @@ jobs:
         # apply-on-merge.yml for the full rationale.
         run: |
           set -euo pipefail
-          all_secrets=$(mktemp)
+          # Under $RUNNER_TEMP so the runner cleans it up; a bare `mktemp`
+          # lands in a /tmp that self-hosted runners share between jobs.
+          all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
           trap 'rm -f "$all_secrets"' EXIT
           cat > "$all_secrets" <<'SECRETS_EOF'
           ${{ toJSON(secrets) }}

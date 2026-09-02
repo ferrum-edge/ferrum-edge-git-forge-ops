@@ -28,6 +28,10 @@ jobs:
   preflight:
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Require protected default branch
         env:
           SOURCE_REF: ${{ github.ref }}
@@ -35,6 +39,13 @@ jobs:
         run: |
           [ "$SOURCE_REF" = "$EXPECTED_REF" ] || {
             echo "::error::Credential rotation may run only from $EXPECTED_REF."
+            exit 1
+          }
+
+      - name: Require repository environment configuration
+        run: |
+          [[ -f .gitforgeops/config.yaml ]] || {
+            echo "::error::Repository configuration is required before binding a deployment environment."
             exit 1
           }
 
@@ -77,6 +88,25 @@ jobs:
           esac
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
+      # Rotation writes a new credential to the GitHub Environment Secret and
+      # pushes it to the live gateway, then records `last_rotated`,
+      # `sha256_prefix` and `delivered_to` in `.state/<env>.json`. The App
+      # token that commits that ledger is deliberately minted late (see
+      # `check_supply_chain.py`), so absent App credentials would surface only
+      # after the store and the gateway had already moved — leaving the next
+      # drift check reading rotation metadata that never landed. Prove them
+      # here, before anything is mutated.
+      - name: Require state-writer App credentials
+        env:
+          STATE_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+          STATE_APP_PRIVATE_KEY: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$STATE_APP_ID" ] || [ -z "$STATE_APP_PRIVATE_KEY" ]; then
+            echo "::error::The state-writer GitHub App is not configured: set repository variable GITFORGEOPS_STATE_APP_ID and environment secret GITFORGEOPS_STATE_APP_PRIVATE_KEY before rotating. See docs/github-launch-controls.md."
+            exit 1
+          fi
+
       - name: Check out protected main for rotation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -116,7 +146,9 @@ jobs:
         # apply-on-merge.yml for the full rationale.
         run: |
           set -euo pipefail
-          all_secrets=$(mktemp)
+          # Under $RUNNER_TEMP so the runner cleans it up; a bare `mktemp`
+          # lands in a /tmp that self-hosted runners share between jobs.
+          all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
           trap 'rm -f "$all_secrets"' EXIT
           cat > "$all_secrets" <<'SECRETS_EOF'
           ${{ toJSON(secrets) }}
@@ -168,14 +200,20 @@ jobs:
             --recipient "$INPUT_RECIPIENT"
 
       - name: Mint narrowly scoped state-writer token
+        # `!cancelled()` for the same reason apply-on-merge uses it: rotation
+        # persists what it managed to do before returning a deferred error, so
+        # skipping the commit on failure loses the record of a credential that
+        # really was rotated.
+        if: ${{ !cancelled() }}
         id: state-writer
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.GITFORGEOPS_STATE_APP_ID }}
+          app-id: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
           private-key: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
           permission-contents: write
 
       - name: Commit state update
+        if: ${{ !cancelled() }}
         # Rotation metadata (last_rotated, sha256_prefix, delivered_to) lives
         # in .state/<env>.json. If we can't persist the update, a stale state
         # misleads the next drift check — fail the job on push failure, and
@@ -204,7 +242,7 @@ jobs:
             echo "No state changes to commit."
             exit 0
           fi
-          git commit -m "chore(gitforgeops): rotate ${INPUT_CONSUMER}.${INPUT_CREDENTIAL} in ${INPUT_ENVIRONMENT} [skip ci]"
+          git commit -m "chore(gitforgeops): rotate ${INPUT_CONSUMER}.${INPUT_CREDENTIAL} in ${INPUT_ENVIRONMENT}"
           for attempt in 1 2 3 4 5; do
             if git push; then exit 0; fi
             echo "Push rejected on attempt $attempt; rebasing..."

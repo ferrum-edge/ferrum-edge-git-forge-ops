@@ -57,7 +57,8 @@ overlay YAML, copies environment/policy routing from the protected branch, and
 runs a trusted binary with `FERRUM_NAMESPACE` set to one protected-branch
 resource namespace per job, intersected with the environment's protected
 namespace scope. `review --require-live` fails that job when comparison is
-unavailable. Fork PRs and new/remapped namespaces never enter the privileged
+unavailable. Environments with `live_review: false` are removed before the
+Environment-bound matrix, which is required for file mode. Fork PRs and new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in
 `rust-toolchain.toml`; external Actions use full commit SHAs.
 
@@ -116,7 +117,8 @@ A `GET /health` preflight runs before the first mutation so a read-only plane fa
 ### Multi-Environment (repo config)
 
 `.gitforgeops/config.yaml` declares logical environments. Each entry picks an
-overlay, apply strategy, and ownership mode. **No gateway URL, no JWT, no
+overlay, apply strategy, ownership mode, and whether live PR review is enabled.
+Set `live_review: false` for file-mode environments. **No gateway URL, no JWT, no
 secret names** live in this file — those come from GitHub Environment Secrets
 of the same name as the entry (e.g. `production` entry → GitHub Environment
 `production`'s secrets are injected by the workflow). See
@@ -142,18 +144,27 @@ The state file is the trust boundary for both of those, and it is CI-authored:
 as `gitforgeops[bot]` with a short-lived, contents-only GitHub App token;
 `.gitignore` tracks `.state/*.json` (ignoring only locks and temp files), and
 `state-guard.yml` fails any PR touching `.state/**` (including rename source
-paths) unless the latest effective
-`gitforgeops/state-override` label actor currently has `write`, `maintain`, or
-`admin` permission. It rejects triage/read/deleted/ambiguous actors and records
-the event ID/time/permission. Label changes rerun under per-PR concurrency so
-removed authorization cannot leave a stale success. That workflow runs
+paths) unless the exact `gitforgeops/state-override` `labeled` webhook targets
+the current head and its actor currently has `write`, `maintain`, or `admin`
+permission. It rejects every push or other PR transition until a qualified
+maintainer removes and reapplies the label, and records the actor, permission,
+head, run ID, and attempt. Label changes rerun under per-PR concurrency so
+removed authorization cannot leave a stale success. It triggers on
+`pull_request_target`, never `pull_request`: the latter loads the guard from
+the PR's own head, so one commit could forge a ledger entry and delete the
+check that rejects it. That is safe only because the job never checks out the
+PR — files, labels, and permission all come from `gh api`, and
+`changed_files.py` from an explicit default-branch checkout. It runs
 on **every** PR with no `paths:` filter and decides internally whether
 `.state/` was touched — a path-filtered workflow reports no status on
 non-matching PRs, which stalls them forever once the check is required.
 The launch baseline requires the check and gives only the dedicated App an
-always-on `main` ruleset bypass. Environment secrets
-`GITFORGEOPS_STATE_APP_ID` / `GITFORGEOPS_STATE_APP_PRIVATE_KEY` feed the
-commit workflows; see `docs/github-launch-controls.md`. Keep the fence there
+always-on `main` ruleset bypass. Repository variable
+`GITFORGEOPS_STATE_APP_ID` (public metadata, read identically by the workflows
+and by the settings audit) and environment secret
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY` feed the commit workflows, and both are
+verified in a preflight before the gateway is mutated; see
+`docs/github-launch-controls.md`. Keep the fence there
 rather than narrowing what the binary reads out of the ledger — shared mode
 must keep reconciling namespaces the repo no longer declares, or a PR that
 removes a namespace's last resource orphans it on the gateway forever.

@@ -6,10 +6,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 RUN cargo build --release --locked
 
-# Slim Debian runtime. Not fully distroless because this image is also
-# used as a GitHub Actions job container (see validate-pr.yml), which
-# requires /bin/sh for action bootstrap. Trixie matches the glibc of
-# the upstream ferrum-edge image so the copied binary links cleanly.
+# Slim Debian runtime rather than distroless: the image is meant to be run
+# directly (`docker run ... gitforgeops plan`) and in contexts that expect a
+# usable /bin/sh, and several of its code paths shell out — `validate` execs
+# `ferrum-edge`, delivery execs `age`. Trixie matches the glibc of the upstream
+# ferrum-edge image so the copied binary links cleanly.
 FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 # Keep the release build a function of reviewed digests. `apt-get update` or
 # `upgrade` here would execute mutable repository state and make the same

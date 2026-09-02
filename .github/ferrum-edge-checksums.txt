@@ -1,2 +1,16 @@
-# Release tag  Asset                           SHA-256
-latest         ferrum-edge-linux-x86_64       ef270790e2fd1d38ade33082a887e0a0742869c159906a3bd2d1273fb423a19a
+# Reviewed SHA-256 allowlist for the Ferrum Edge validator binary.
+#
+# Format: <64 lowercase hex sha256>  ferrum-edge-linux-x86_64  # <date/note>
+#
+# Upstream publishes a single rolling `latest` release and deletes plus
+# re-uploads its assets on every build, so release ids, asset ids and tags are
+# all mutable. Content is the only stable pin. `install-ferrum-edge.sh` resolves
+# the asset by name, verifies the publisher's own checksum, and then refuses to
+# make the bytes executable unless the digest appears below.
+#
+# Keep one line per approved build. Retaining the previous line means a refresh
+# does not break in-flight pull requests that still run against the older
+# binary. Regenerate a line with:
+#
+#   bash .github/scripts/refresh-ferrum-edge-pin.sh --append
+db496ec730d4ec6bf7c03eff21649ba859e236356d843c37da9700c28215dfdb  ferrum-edge-linux-x86_64  # 2026-09-02T03:02:29Z release latest

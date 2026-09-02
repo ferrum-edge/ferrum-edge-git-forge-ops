@@ -16,11 +16,26 @@ name: GitForgeOps State Guard
 # Escape hatch for genuine repairs (restoring a corrupted ledger, seeding an
 # environment adopted from an existing gateway): label the PR
 # `gitforgeops/state-override`. Triage users can apply labels, so label presence
-# is not authority: this workflow resolves the latest effective label event and
-# requires the actor's current permission to be write, maintain, or admin.
+# is not authority: authorization succeeds only on the exact `labeled` webhook
+# for the current head and requires that event actor's current permission to be
+# write, maintain, or admin. Every push or other PR transition therefore fails
+# until a qualified maintainer removes and reapplies the label.
 
+# Deliberately `pull_request_target`, not `pull_request`. Both give this job a
+# read-only token, but `pull_request` loads the *workflow definition from the
+# pull request's own head*: a PR that edited `.state/x.json` and, in the same
+# commit, deleted or neutered this file would run its own edited guard and pass.
+# `pull_request_target` always loads the definition from the protected default
+# branch, so the fence is the one main reviewed.
+#
+# The usual `pull_request_target` hazard — running privileged against untrusted
+# code — does not apply because this job NEVER checks out the pull request. It
+# reads changed files, labels, and collaborator permission through `gh api`, and
+# gets its one piece of executable logic (`changed_files.py`) from an explicit
+# default-branch checkout. No PR-authored byte is ever executed or interpolated
+# into a `run:` block.
 on:
-  pull_request:
+  pull_request_target:
     # `labeled`/`unlabeled` are not in the default activity type set
     # (opened, synchronize, reopened). Without them, adding the override
     # label does nothing until someone pushes another commit — the check
@@ -28,14 +43,14 @@ on:
     # out is an empty commit. Re-evaluate on the label events themselves so
     # the escape hatch takes effect when it is used, and so removing the
     # label puts the fence straight back up.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
     # Deliberately NO `paths:` filter. This job is meant to be a required
-    # status check, and a path-filtered workflow never reports a status on
-    # PRs that don't match — GitHub then holds every such PR at "Expected —
+    # status check for `main`, and a path-filtered workflow never reports a status on
+    # matching-base PRs that don't match — GitHub then holds every such PR at "Expected —
     # waiting for status to be reported" forever. Running always and deciding
     # inside the job is what makes the check safe to require: it reports on
-    # every PR, and passes in three seconds when `.state/` is untouched.
-    branches: ['**']
+    # every PR to `main`, and passes in three seconds when `.state/` is untouched.
+    branches: [main]
 
 concurrency:
   group: state-guard-${{ github.event.pull_request.number }}
@@ -45,17 +60,19 @@ permissions:
   contents: read
   # Needed to list the PR's changed files.
   pull-requests: read
-  # Needed to read label timeline events.
-  issues: read
 
 jobs:
-  reject-state-edits:
+  state-guard-reject-state-edits:
     runs-on: ubuntu-24.04
     steps:
+      # The only checkout in this workflow, and it names the protected default
+      # branch explicitly. Never add a checkout of `github.event.pull_request.head.*`
+      # here: under `pull_request_target` that would put PR-authored code in a
+      # job holding the base repository's token.
       - name: Check out trusted guard logic
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: trusted-guard
           persist-credentials: false
 
@@ -65,7 +82,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          DECLARED_CHANGED: ${{ github.event.pull_request.changed_files }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # Inspect both current and previous names. Looking only at
@@ -73,18 +91,54 @@ jobs:
           # evade the ownership-ledger guard.
           pages_file=$(mktemp)
           trap 'rm -f "$pages_file"' EXIT
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --paginate --slurp > "$pages_file"
+          stable=false
+          for attempt in 1 2 3; do
+            before=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            before_head=$(jq -r '.head.sha' <<< "$before")
+            before_base=$(jq -r '.base.sha' <<< "$before")
+            before_ref=$(jq -r '.base.ref' <<< "$before")
+            before_count=$(jq -r '.changed_files' <<< "$before")
+            [[ "$before_head" =~ ^[0-9a-f]{40}$ && "$before_base" =~ ^[0-9a-f]{40}$ && "$before_count" =~ ^[0-9]+$ ]] || {
+              echo "::error::GitHub returned invalid PR file metadata."
+              exit 1
+            }
+            [ "$before_head" = "$EXPECTED_HEAD_SHA" ] || {
+              echo "::error::PR head changed while the state guard was running; wait for the new run."
+              exit 1
+            }
+            [ "$before_ref" = "$DEFAULT_BRANCH" ] || {
+              echo "::error::State guard only trusts PRs targeting the protected default branch."
+              exit 1
+            }
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+              --paginate --slurp > "$pages_file"
+            after=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            after_head=$(jq -r '.head.sha' <<< "$after")
+            after_base=$(jq -r '.base.sha' <<< "$after")
+            after_ref=$(jq -r '.base.ref' <<< "$after")
+            after_count=$(jq -r '.changed_files' <<< "$after")
+            if [ "$before_head" = "$after_head" ] && [ "$before_base" = "$after_base" ] && \
+               [ "$before_ref" = "$after_ref" ] && [ "$before_count" = "$after_count" ]; then
+              current_changed=$after_count
+              stable=true
+              break
+            fi
+            echo "::warning::PR file metadata changed during attempt ${attempt}; retrying a stable snapshot."
+          done
+          [ "$stable" = true ] || {
+            echo "::error::Could not obtain a stable PR file snapshot; state guard fails closed."
+            exit 1
+          }
           helper=trusted-guard/.github/scripts/changed_files.py
           if [ -f "$helper" ]; then
-            result=$(python3 "$helper" "$pages_file" "$DECLARED_CHANGED" state)
+            result=$(python3 "$helper" "$pages_file" "$current_changed" state)
           else
             # One-time bootstrap for the PR that first adds the helper: its
             # base commit cannot contain the new file yet. Keep this equivalent
             # classifier inline so the guard still runs without executing a
             # candidate-branch script. After merge, the trusted helper path is
             # mandatory and used for every subsequent PR.
-            result=$(jq -ce --argjson declared "$DECLARED_CHANGED" '
+            result=$(jq -ce --argjson declared "$current_changed" '
               if type != "array" or any(.[]; type != "array") then
                 error("invalid pagination shape")
               else
@@ -97,37 +151,60 @@ jobs:
                   else
                     ([$records[] | .filename, (.previous_filename // empty)] | unique) as $paths
                     | {
-                        complete: (($records | length) == $declared),
+                        complete: (($records | length) == $declared and ($records | length) < 3000),
                         matched_paths: [$paths[] | select(startswith(".state/"))]
                       }
                   end
               end
             ' "$pages_file")
           fi
-          [ "$(jq -r '.complete' <<< "$result")" = true ] || {
-            echo "::error::Changed-file pagination was incomplete; state guard fails closed."
-            exit 1
-          }
+          complete=$(jq -r '.complete' <<< "$result")
           count=$(jq '.matched_paths | length' <<< "$result")
           echo "count=${count}" >> "$GITHUB_OUTPUT"
-          if [ "$count" -eq 0 ]; then
+          if [ "$complete" != true ]; then
+            # GitHub caps this endpoint at 3,000 files. Treat an incomplete
+            # view as potentially containing protected state paths, then route
+            # it through the same current-head, permission-attributed override
+            # path as a known state edit. This remains fail closed without an
+            # authorized override but does not make an intentionally reviewed
+            # large PR permanently unmergeable.
+            echo "requires_override=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Changed-file pagination was incomplete; an authorized state override is required."
+          elif [ "$count" -eq 0 ]; then
+            echo "requires_override=false" >> "$GITHUB_OUTPUT"
             echo "No .state/ changes in this PR."
           else
+            echo "requires_override=true" >> "$GITHUB_OUTPUT"
             echo "This PR changes ${count} current or previous path(s) under .state/:"
             jq -r '.matched_paths[] | "  " + @json' <<< "$result"
           fi
 
       - name: Verify state-override authority
         id: authorize
-        if: ${{ steps.detect.outputs.count != '0' }}
+        if: ${{ steps.detect.outputs.requires_override == 'true' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           OVERRIDE_LABEL: gitforgeops/state-override
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name || '' }}
+          EVENT_ACTOR: ${{ github.event.sender.login }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+
+          [ "$EVENT_ACTION" = labeled ] && [ "$EVENT_LABEL" = "$OVERRIDE_LABEL" ] || {
+            echo "::error::State override must be freshly applied to this exact PR head. Remove and reapply the label after every push or PR transition."
+            exit 1
+          }
+          [[ "$EVENT_ACTOR" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,33}\[bot\])$ ]] || {
+            echo "::error::Override event actor is missing or malformed."
+            exit 1
+          }
 
           # Query current state instead of trusting the triggering event's
           # possibly stale label array. Exact string matching also makes a
@@ -138,51 +215,46 @@ jobs:
             exit 1
           fi
 
-          events_file=$(mktemp)
-          trap 'rm -f "$events_file"' EXIT
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/events?per_page=100" \
-            --paginate --slurp > "$events_file"
-
-          # Replay exact-label events in chronological/id order. A later
-          # unlabeled event clears authority; a later re-label replaces the
-          # actor, so permission is always attributed to the effective event.
-          effective=$(python3 trusted-guard/.github/scripts/state_override.py \
-            "$events_file" "$OVERRIDE_LABEL")
-          actor=$(jq -r '.actor' <<< "$effective")
-          event_id=$(jq -r '.event_id' <<< "$effective")
-          labeled_at=$(jq -r '.labeled_at' <<< "$effective")
+          current=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          [ "$(jq -r '.head.sha' <<< "$current")" = "$EXPECTED_HEAD_SHA" ] || {
+            echo "::error::PR head changed after state-scope detection; wait for the new run."
+            exit 1
+          }
 
           # This endpoint returns the actor's current permission and fails for
           # deleted/suspended/non-collaborator identities. Triage is explicitly
           # insufficient even though it can manage labels.
-          permission=$(gh api "repos/${REPO}/collaborators/${actor}/permission" --jq '.permission')
+          permission=$(gh api "repos/${REPO}/collaborators/${EVENT_ACTOR}/permission" --jq '.permission')
           case "$permission" in
             write|maintain|admin) ;;
             *)
-              echo "::error::@${actor} has '${permission:-unknown}' permission; state override requires write, maintain, or admin."
+              echo "::error::@${EVENT_ACTOR} has '${permission:-unknown}' permission; state override requires write, maintain, or admin."
               exit 1
               ;;
           esac
 
           {
-            echo "actor=$actor"
+            echo "actor=$EVENT_ACTOR"
             echo "permission=$permission"
-            echo "event_id=$event_id"
-            echo "labeled_at=$labeled_at"
+            echo "head_sha=$EXPECTED_HEAD_SHA"
+            echo "run_id=$RUN_ID"
+            echo "run_attempt=$RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
 
       - name: Reject unauthorized PR-authored state changes
-        if: ${{ steps.detect.outputs.count != '0' && steps.authorize.outcome != 'success' }}
+        if: ${{ steps.detect.outputs.requires_override == 'true' && steps.authorize.outcome != 'success' }}
         run: |
-          echo "::error::This PR modifies .state/, the CI-owned ownership ledger."
+          echo "::error::This PR modifies .state/ or exceeds GitHub's complete changed-file enumeration; an authorized override is required."
           cat >> "$GITHUB_STEP_SUMMARY" <<'MSG'
-          ## Blocked: PR modifies `.state/`
+          ## Blocked: protected state scope cannot be cleared automatically
 
           `.state/<env>.json` records which gateway resources this repo has
           applied. In `shared` ownership mode it is the only thing standing
           between a live resource and a delete, so a hand-edited state file can
           cause the next post-merge apply to remove resources the repo never
-          managed.
+          managed. GitHub also caps changed-file enumeration at 3,000 entries;
+          when that view is incomplete, this guard conservatively assumes the
+          unseen tail could contain a protected state path.
 
           It is maintained by CI: `apply-on-merge.yml` and `rotate.yml` commit
           it as `gitforgeops[bot]` after a successful run. Drop the `.state/`
@@ -190,25 +262,28 @@ jobs:
 
           If you are deliberately repairing or seeding the ledger, a user with
           current `write`, `maintain`, or `admin` repository permission can add
-          the exact `gitforgeops/state-override` label. The latest effective
-          label event is attributed and checked; triage permission is rejected.
+          the exact `gitforgeops/state-override` label. Authorization succeeds
+          only on that exact `labeled` webhook for the current head and rejects
+          triage permission. A later push or PR transition requires the label
+          to be removed and reapplied.
           MSG
           exit 1
 
       - name: Record authorized override
-        if: ${{ steps.detect.outputs.count != '0' && steps.authorize.outcome == 'success' }}
+        if: ${{ steps.detect.outputs.requires_override == 'true' && steps.authorize.outcome == 'success' }}
         env:
           ACTOR: ${{ steps.authorize.outputs.actor }}
           PERMISSION: ${{ steps.authorize.outputs.permission }}
-          EVENT_ID: ${{ steps.authorize.outputs.event_id }}
-          LABELED_AT: ${{ steps.authorize.outputs.labeled_at }}
+          AUTHORIZED_HEAD: ${{ steps.authorize.outputs.head_sha }}
+          RUN_ID: ${{ steps.authorize.outputs.run_id }}
+          RUN_ATTEMPT: ${{ steps.authorize.outputs.run_attempt }}
         run: |
-          echo "::warning::.state/ changes authorized by @${ACTOR} (${PERMISSION}), label event ${EVENT_ID} at ${LABELED_AT}."
+          echo "::warning::Protected state scope authorized by @${ACTOR} (${PERMISSION}) for head ${AUTHORIZED_HEAD}."
           {
-            echo "## Authorized \`.state/\` override"
+            echo "## Authorized protected-state override"
             echo
             echo "- Actor: \`@${ACTOR}\`"
             echo "- Current permission: \`${PERMISSION}\`"
-            echo "- Label event ID: \`${EVENT_ID}\`"
-            echo "- Labeled at: \`${LABELED_AT}\`"
+            echo "- Authorized head: \`${AUTHORIZED_HEAD}\`"
+            echo "- Workflow run: \`${RUN_ID}\` (attempt \`${RUN_ATTEMPT}\`)"
           } >> "$GITHUB_STEP_SUMMARY"

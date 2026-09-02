@@ -29,6 +29,10 @@ jobs:
   preflight:
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Require protected default branch
         env:
           SOURCE_REF: ${{ github.ref }}
@@ -36,6 +40,13 @@ jobs:
         run: |
           [ "$SOURCE_REF" = "$EXPECTED_REF" ] || {
             echo "::error::Materialization may run only from $EXPECTED_REF."
+            exit 1
+          }
+
+      - name: Require repository environment configuration
+        run: |
+          [[ -f .gitforgeops/config.yaml ]] || {
+            echo "::error::Repository configuration is required before binding a deployment environment."
             exit 1
           }
 
@@ -109,7 +120,9 @@ jobs:
         # apply-on-merge.yml for the full rationale.
         run: |
           set -euo pipefail
-          all_secrets=$(mktemp)
+          # Under $RUNNER_TEMP so the runner cleans it up; a bare `mktemp`
+          # lands in a /tmp that self-hosted runners share between jobs.
+          all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
           trap 'rm -f "$all_secrets"' EXIT
           cat > "$all_secrets" <<'SECRETS_EOF'
           ${{ toJSON(secrets) }}
