@@ -553,6 +553,20 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("trusted-pr-review-" in item for item in violations), violations
         )
 
+    def test_mirrored_repository_is_a_clean_baseline(self):
+        # Every mutation test above asserts the checker FAILS. That only proves
+        # something if the unmutated mirror passes — otherwise a broken helper
+        # would make them all green for the wrong reason.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     # -- helpers ------------------------------------------------------------
 
     def _mirror_repo(self, root: Path) -> Path:
