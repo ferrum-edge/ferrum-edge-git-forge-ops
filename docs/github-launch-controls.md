@@ -188,6 +188,22 @@ Repository policy is backed by `.github/scripts/check_supply_chain.py`, which
 fails CI on tag-based action references, floating runner releases, unpinned
 container bases, missing Rust version pins, or disabled release attestations.
 
+It also rejects any workflow expression that reaches the whole `secrets`
+context (`toJSON(secrets)`, a bare `${{ secrets }}`, `secrets: inherit`).
+GitHub holds public-repository runs that read the whole context for manual
+approval, and the credential broker never needs more than the
+`FERRUM_CREDS_BUNDLE[_N]` shards, which the privileged workflows bind by name.
+
+The `security-supply-chain-policy` check always runs the **protected
+branch's** copy of the checker against the candidate tree, so a pull request
+cannot weaken the policy that judges it. The flip side: a pull request that
+changes the checker *and* the workflow shape it governs fails its own policy
+check exactly once, because the old policy is judging the new shape. Prefer
+landing such changes as expand/contract pairs (accept both shapes, migrate,
+then reject the old shape). When that is impractical, a maintainer reviews
+the red check, confirms every violation is the intended migration, and merges
+with a ruleset bypass; the next run on `main` judges with the new policy.
+
 ## 5. Enable settings-drift monitoring
 
 Create a fine-grained PAT or read-only GitHub App token with
