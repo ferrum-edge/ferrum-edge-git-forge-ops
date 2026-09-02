@@ -142,19 +142,31 @@ jobs:
           }
 
       - name: Load credential bundles
-        # File-path routing around OS env-block size limits. See
+        # Every credential-bundle secret is bound by name — never the whole
+        # `secrets` context. The shard list is capped by MAX_BUNDLE_SHARDS in
+        # src/secrets/bundle.rs and .github/scripts/credential_bundles.py; see
         # apply-on-merge.yml for the full rationale.
+        env:
+          FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}
+          FERRUM_CREDS_BUNDLE_1: ${{ secrets.FERRUM_CREDS_BUNDLE_1 }}
+          FERRUM_CREDS_BUNDLE_2: ${{ secrets.FERRUM_CREDS_BUNDLE_2 }}
+          FERRUM_CREDS_BUNDLE_3: ${{ secrets.FERRUM_CREDS_BUNDLE_3 }}
+          FERRUM_CREDS_BUNDLE_4: ${{ secrets.FERRUM_CREDS_BUNDLE_4 }}
+          FERRUM_CREDS_BUNDLE_5: ${{ secrets.FERRUM_CREDS_BUNDLE_5 }}
+          FERRUM_CREDS_BUNDLE_6: ${{ secrets.FERRUM_CREDS_BUNDLE_6 }}
+          FERRUM_CREDS_BUNDLE_7: ${{ secrets.FERRUM_CREDS_BUNDLE_7 }}
+          FERRUM_CREDS_BUNDLE_8: ${{ secrets.FERRUM_CREDS_BUNDLE_8 }}
+          FERRUM_CREDS_BUNDLE_9: ${{ secrets.FERRUM_CREDS_BUNDLE_9 }}
+          FERRUM_CREDS_BUNDLE_10: ${{ secrets.FERRUM_CREDS_BUNDLE_10 }}
+          FERRUM_CREDS_BUNDLE_11: ${{ secrets.FERRUM_CREDS_BUNDLE_11 }}
+          FERRUM_CREDS_BUNDLE_12: ${{ secrets.FERRUM_CREDS_BUNDLE_12 }}
+          FERRUM_CREDS_BUNDLE_13: ${{ secrets.FERRUM_CREDS_BUNDLE_13 }}
+          FERRUM_CREDS_BUNDLE_14: ${{ secrets.FERRUM_CREDS_BUNDLE_14 }}
+          FERRUM_CREDS_BUNDLE_15: ${{ secrets.FERRUM_CREDS_BUNDLE_15 }}
         run: |
           set -euo pipefail
-          # Under $RUNNER_TEMP so the runner cleans it up; a bare `mktemp`
-          # lands in a /tmp that self-hosted runners share between jobs.
-          all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
-          trap 'rm -f "$all_secrets"' EXIT
-          cat > "$all_secrets" <<'SECRETS_EOF'
-          ${{ toJSON(secrets) }}
-          SECRETS_EOF
           creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
-          python3 .github/scripts/credential_bundles.py "$all_secrets" "$creds_file"
+          python3 .github/scripts/credential_bundles.py "$creds_file"
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Rotate

@@ -148,6 +148,20 @@ PR live review. The manual workflows also check `github.ref == refs/heads/main`,
 but environment branch policy is the non-bypassable boundary because a workflow
 definition on an unprotected branch could remove an in-file condition.
 
+Credential-broker bundles are the one secret family the workflows enumerate.
+No workflow reads the whole `secrets` context — `${{ toJSON(secrets) }}` would
+hand a bundle-loading step the admin JWT signing key and the state-writer App
+private key as well, and GitHub holds public-repository runs that read it for
+manual approval. Instead each privileged workflow binds
+`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15` by name, which caps an
+environment at `MAX_BUNDLE_SHARDS` = 16 shards (~7,000 credential slots). A
+shard beyond that would be written but never read back, so `apply` and
+`rotate` refuse to create one. Raising the ceiling means editing
+`MAX_BUNDLE_SHARDS` in `src/secrets/bundle.rs` and
+`.github/scripts/credential_bundles.py` and extending the bindings in all four
+workflows; `.github/scripts/check_supply_chain.py` fails the build if they
+disagree.
+
 ## 4. Restrict GitHub Actions
 
 In **Settings → Actions → General**:

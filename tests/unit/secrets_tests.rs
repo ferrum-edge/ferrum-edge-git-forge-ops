@@ -1476,3 +1476,121 @@ fn plan_time_and_generate_time_minimum_checks_agree() {
         );
     }
 }
+
+/// The bundle layout is capped because the privileged workflows bind every
+/// `FERRUM_CREDS_BUNDLE[_N]` secret by name. A shard past the ceiling would be
+/// written to GitHub and then never read back, so the next run would treat
+/// every slot it holds as unallocated and mint duplicates.
+#[test]
+fn reserve_shard_refuses_to_create_a_shard_past_the_ceiling() {
+    use gitforgeops::secrets::bundle::{
+        reserve_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
+    };
+
+    let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    for shard in 0..MAX_BUNDLE_SHARDS {
+        shards.entry(shard).or_default().insert(
+            format!("filler-{shard}"),
+            "x".repeat(BUNDLE_SOFT_LIMIT_BYTES),
+        );
+    }
+
+    let mut shard_count = MAX_BUNDLE_SHARDS;
+    let error = reserve_shard(
+        "ferrum/app/keyauth/key",
+        64,
+        &shards,
+        &mut shard_count,
+        "allocating",
+    )
+    .expect_err("a full layout at the ceiling must refuse, not grow");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("MAX_BUNDLE_SHARDS"),
+        "refusal must name the constant: {message}"
+    );
+    assert!(
+        message.contains("src/secrets/bundle.rs")
+            && message.contains(".github/scripts/credential_bundles.py"),
+        "refusal must name both constant sites: {message}"
+    );
+    assert!(
+        message.contains(".github/workflows/apply-on-merge.yml"),
+        "refusal must name the workflow that binds the shard secrets: {message}"
+    );
+    assert!(
+        message.contains(&format!("FERRUM_CREDS_BUNDLE_{MAX_BUNDLE_SHARDS}")),
+        "refusal must name the shard secret it would have needed: {message}"
+    );
+    assert_eq!(
+        shard_count, MAX_BUNDLE_SHARDS,
+        "a refused allocation must not leave an out-of-range shard count behind"
+    );
+}
+
+/// Growth is still automatic below the ceiling — the cap only stops the last
+/// step, so a repository that legitimately needs a second shard gets one.
+#[test]
+fn reserve_shard_grows_up_to_the_ceiling() {
+    use gitforgeops::secrets::bundle::{
+        reserve_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
+    };
+
+    let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    shards
+        .entry(0)
+        .or_default()
+        .insert("filler-0".to_string(), "x".repeat(BUNDLE_SOFT_LIMIT_BYTES));
+
+    let mut shard_count = 1;
+    let shard = reserve_shard(
+        "ferrum/app/keyauth/key",
+        64,
+        &shards,
+        &mut shard_count,
+        "allocating",
+    )
+    .expect("a full shard 0 below the ceiling must grow the layout");
+    assert_eq!(shard_count, 2);
+    assert_eq!(shard, 1);
+    assert!(shard < MAX_BUNDLE_SHARDS);
+}
+
+/// A slot that already lives somewhere stays there: re-picking after growth
+/// could write the fresh value to a different shard and leave a stale copy on
+/// the old one, which `merge_bundles` would then prefer.
+#[test]
+fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
+    use gitforgeops::secrets::bundle::{reserve_shard, CredentialBundle};
+
+    let slot = "ferrum/app/keyauth/key";
+    let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    shards
+        .entry(3)
+        .or_default()
+        .insert(slot.to_string(), "old".to_string());
+
+    let mut shard_count = 8;
+    let shard = reserve_shard(slot, 64, &shards, &mut shard_count, "rotating")
+        .expect("an already-placed slot always resolves");
+    assert_eq!(shard, 3);
+    assert_eq!(shard_count, 8, "an existing slot must not grow the layout");
+}
+
+/// A state file written under an older, higher ceiling must not steer new
+/// slots onto a shard the workflows no longer bind.
+#[test]
+fn pick_shard_never_targets_an_unbound_shard_index() {
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, MAX_BUNDLE_SHARDS};
+
+    let shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    for n in 0..64 {
+        let slot = format!("ferrum/app-{n}/keyauth/key");
+        let chosen = pick_shard(&slot, 64, &shards, 100).expect("empty shards always have room");
+        assert!(
+            chosen < MAX_BUNDLE_SHARDS,
+            "slot {slot} landed on unbound shard {chosen}"
+        );
+    }
+}
