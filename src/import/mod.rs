@@ -15,7 +15,7 @@ use crate::config::schema::{GatewayConfig, Resource};
 use crate::http_client::BackupSnapshot;
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
-    CredentialBundle, IMPORT_REQUIRED_PLACEHOLDER,
+    CredentialBundle, UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER,
 };
 
 pub const IMPORT_MANIFEST_FILENAME: &str = ".gitforgeops-import.json";
@@ -125,6 +125,17 @@ pub struct ImportResult {
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
     pub sources: Vec<ImportSourceMetadata>,
+    /// Non-builtin plugins whose config strings were left in the imported
+    /// files because the sensitivity heuristics did not flag them. Surfaced
+    /// by [`ImportResult::custom_plugin_review_notice`] so an operator reads
+    /// them before committing.
+    ///
+    /// Deliberately kept out of the import manifest: the manifest is a
+    /// stable, machine-readable inventory of *what was imported*, and this is
+    /// a transient human review prompt about what the classifier could not
+    /// judge. Nothing downstream keys on it.
+    #[serde(skip)]
+    pub unbrokered_plugin_config: Vec<UnbrokeredPluginConfig>,
 }
 
 impl ImportResult {
@@ -185,6 +196,46 @@ impl ImportResult {
             notice.push_str(&format!(
                 "Unsupported backup section(s) were not imported: {}.",
                 self.unsupported_sections.join(", ")
+            ));
+        }
+        Some(notice)
+    }
+
+    /// Loud per-plugin review list for non-builtin plugins.
+    ///
+    /// gitforgeops has no schema for a plugin it does not know, so it brokers
+    /// only what the key/URL sensitivity heuristics flag and leaves the rest
+    /// in the committed resource file. That is the right default — capturing
+    /// `mode: strict` into a GitHub Environment Secret makes the import
+    /// unusable — but it means a vendor field the heuristics do not recognize
+    /// as a credential lands in Git as written. Name every one of them.
+    pub fn custom_plugin_review_notice(&self) -> Option<String> {
+        if self.unbrokered_plugin_config.is_empty() {
+            return None;
+        }
+        const MAX_PATHS_PER_PLUGIN: usize = 50;
+        let mut notice = String::from(
+            "WARNING: review these plugin config values before committing. They belong to plugins this build does not recognize, so there is no schema to classify them by; only key/URL heuristics ran, and everything they did not flag was left in the imported files verbatim. If any of them is a credential, move it into the broker by hand:",
+        );
+        for plugin in &self.unbrokered_plugin_config {
+            let mut paths = plugin
+                .paths
+                .iter()
+                .take(MAX_PATHS_PER_PLUGIN)
+                .map(|path| diagnostic_metadata(path))
+                .collect::<Vec<_>>();
+            if plugin.paths.len() > MAX_PATHS_PER_PLUGIN {
+                paths.push(format!(
+                    "[{} more]",
+                    plugin.paths.len() - MAX_PATHS_PER_PLUGIN
+                ));
+            }
+            notice.push_str(&format!(
+                "\n  PluginConfig {} ({}, plugin_name={}): {}",
+                diagnostic_metadata(&plugin.plugin_id),
+                diagnostic_metadata(&plugin.namespace),
+                diagnostic_metadata(&plugin.plugin_name),
+                paths.join(", ")
             ));
         }
         Some(notice)
@@ -303,11 +354,12 @@ pub(crate) fn split_config_with_inventory(
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
-    let captured_plugin_config = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let unbrokered_plugin_config = plugin_capture.unbrokered;
     let credential_count = captured_credentials.len();
-    let plugin_config_count = captured_plugin_config.len();
+    let plugin_config_count = plugin_capture.captured.len();
     let mut captured_secrets = captured_credentials;
-    for (slot, value) in captured_plugin_config {
+    for (slot, value) in plugin_capture.captured {
         if captured_secrets.insert(slot.clone(), value).is_some() {
             return Err(crate::error::Error::Config(format!(
                 "secret slot '{slot}' is produced by both a consumer credential and plugin config"
@@ -321,6 +373,7 @@ pub(crate) fn split_config_with_inventory(
         sources: inventory.sources,
         redacted_credential_values: credential_count,
         redacted_plugin_config_values: plugin_config_count,
+        unbrokered_plugin_config,
         ..ImportResult::default()
     };
     if require_credential_bundle

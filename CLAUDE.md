@@ -233,6 +233,14 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `waf_enforcement`, `require_ai_guardrails`, `rate_limit_completeness`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
 
+Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
+is schema-first for the 82 builtins and heuristics-only for anything else: a
+non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
+flag, and the leaves they did not flag come back as
+`ImportResult::unbrokered_plugin_config` for a loud per-plugin review notice.
+`basicauth[].username` and `mtls_auth[].identity` are never brokered in either
+path (`resolver::is_identity_credential_leaf`).
+
 Plugin-name knowledge lives in `src/plugin_catalog.rs` (82 builtins, retired and
 reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
 where a scoped plugin config replaces a global one of the same `plugin_name`).

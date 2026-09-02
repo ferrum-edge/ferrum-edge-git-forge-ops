@@ -1914,6 +1914,11 @@ async fn cmd_import(
     if let Some(notice) = result.unmanaged_sections_notice() {
         println!("{notice}");
     }
+    // Loud and last, so it is the final thing on screen: these are the values
+    // gitforgeops could not classify and a human has to.
+    if let Some(notice) = result.custom_plugin_review_notice() {
+        eprintln!("{notice}");
+    }
 
     Ok(())
 }

@@ -2,7 +2,7 @@ use crate::config::{GatewayConfig, GatewayMode};
 
 use super::bundle::CredentialBundle;
 use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
-use super::plugin_config::{sensitive_string_paths, ConfigPathComponent};
+use super::plugin_config::{classify_plugin_config, render_config_path, ConfigPathComponent};
 
 /// Reserved third slot component for brokered plugin-config strings.
 ///
@@ -453,11 +453,39 @@ pub fn capture_and_redact_import_credentials(
                 SlotComponent::Literal(consumer_id.as_str()),
                 SlotComponent::Literal(credential_type.as_str()),
             ];
-            capture_and_redact_value(value, &mut components, &mut captured)?;
+            let credential_type = credential_type.clone();
+            capture_and_redact_value(
+                value,
+                &mut components,
+                &credential_type,
+                None,
+                &mut captured,
+            )?;
         }
     }
 
     Ok(captured)
+}
+
+/// One non-builtin plugin's config strings that import left in place.
+#[derive(Debug, Clone)]
+pub struct UnbrokeredPluginConfig {
+    pub namespace: String,
+    pub plugin_id: String,
+    pub plugin_name: String,
+    /// Dotted paths, rendered for a human
+    /// (`headers.x-vendor-auth`, `servers.[0].upstream_url`).
+    pub paths: Vec<String>,
+}
+
+/// What [`capture_and_redact_import_plugin_config_secrets`] found.
+#[derive(Debug, Clone, Default)]
+pub struct PluginConfigCapture {
+    /// Slot → live value for every leaf moved into the private bundle.
+    pub captured: CredentialBundle,
+    /// Per-plugin review lists for non-builtin plugins. Empty when the repo
+    /// imported only builtin plugins.
+    pub unbrokered: Vec<UnbrokeredPluginConfig>,
 }
 
 /// Capture sensitive string leaves from plugin configuration and replace them
@@ -469,15 +497,28 @@ pub fn capture_and_redact_import_credentials(
 /// arbitrary authorization-header values cannot be committed by import.
 pub fn capture_and_redact_import_plugin_config_secrets(
     cfg: &mut GatewayConfig,
-) -> crate::error::Result<CredentialBundle> {
-    let mut captured = CredentialBundle::new();
+) -> crate::error::Result<PluginConfigCapture> {
+    let mut capture = PluginConfigCapture::default();
+    let captured = &mut capture.captured;
 
     for plugin in &mut cfg.plugin_configs {
         if plugin.api_spec_id.is_some() {
             continue;
         }
-        let paths = sensitive_string_paths(&plugin.plugin_name, &plugin.config);
-        for path in paths {
+        let classification = classify_plugin_config(&plugin.plugin_name, &plugin.config);
+        if !classification.unbrokered.is_empty() {
+            capture.unbrokered.push(UnbrokeredPluginConfig {
+                namespace: plugin.namespace.clone(),
+                plugin_id: plugin.id.clone(),
+                plugin_name: plugin.plugin_name.clone(),
+                paths: classification
+                    .unbrokered
+                    .iter()
+                    .map(|path| render_config_path(path))
+                    .collect(),
+            });
+        }
+        for path in classification.sensitive {
             let slot = plugin_config_slot(&plugin.namespace, &plugin.id, &path);
             let value = plugin_config_value_mut(&mut plugin.config, &path).ok_or_else(|| {
                 crate::error::Error::Config(format!(
@@ -487,18 +528,27 @@ pub fn capture_and_redact_import_plugin_config_secrets(
             let serde_json::Value::String(text) = value else {
                 continue;
             };
-            capture_and_redact_string(text, &slot, &mut captured, "plugin config")?;
+            capture_and_redact_string(text, &slot, captured, "plugin config")?;
         }
     }
 
-    Ok(captured)
+    Ok(capture)
 }
 
 fn capture_and_redact_value<'a>(
     value: &'a mut serde_json::Value,
     components: &mut Vec<SlotComponent<'a>>,
+    credential_type: &str,
+    leaf: Option<&str>,
     captured: &mut CredentialBundle,
 ) -> crate::error::Result<()> {
+    // `basicauth[].username` and `mtls_auth[].identity` are the public halves
+    // of their credentials (see `is_identity_credential_leaf`). Brokering them
+    // would demand a hand-seeded slot for a value that is not secret and blank
+    // out the field that says which credential a resource file describes.
+    if is_identity_credential_leaf(credential_type, leaf) {
+        return Ok(());
+    }
     match value {
         serde_json::Value::String(text) => {
             let slot = join_slot_components(components);
@@ -507,14 +557,29 @@ fn capture_and_redact_value<'a>(
         serde_json::Value::Object(fields) => {
             for (key, child) in fields {
                 components.push(SlotComponent::Literal(key.as_str()));
-                capture_and_redact_value(child, components, captured)?;
+                let child_leaf = key.clone();
+                capture_and_redact_value(
+                    child,
+                    components,
+                    credential_type,
+                    Some(&child_leaf),
+                    captured,
+                )?;
                 components.pop();
             }
         }
         serde_json::Value::Array(items) => {
             for (index, child) in items.iter_mut().enumerate() {
                 components.push(SlotComponent::ArrayIndex(index));
-                capture_and_redact_value(child, components, captured)?;
+                // An index does not change which field a leaf is.
+                let inherited = leaf.map(str::to_string);
+                capture_and_redact_value(
+                    child,
+                    components,
+                    credential_type,
+                    inherited.as_deref(),
+                    captured,
+                )?;
                 components.pop();
             }
         }

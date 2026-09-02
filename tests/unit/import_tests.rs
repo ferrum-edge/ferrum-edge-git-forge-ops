@@ -460,8 +460,13 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
     assert_eq!(assembled.plugin_configs[0].config, original_plugin_config);
 }
 
+/// F5: a plugin this build does not know has no schema to classify it by, so
+/// only the key/URL sensitivity heuristics run. What they flag is brokered;
+/// what they do not is left in the committed file and named in a review
+/// notice, because capturing `mode: strict` into a GitHub Environment Secret
+/// makes the imported repo unappliable without telling anyone why.
 #[test]
-fn custom_plugin_import_fails_closed_for_opaque_string_config() {
+fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
     let destination_parent = tempfile::tempdir().unwrap();
@@ -472,7 +477,12 @@ fn custom_plugin_import_fails_closed_for_opaque_string_config() {
         id: "custom".to_string(),
         plugin_name: "enterprise_custom".to_string(),
         namespace: "ferrum".to_string(),
-        config: serde_json::json!({"mode": "strict", "opaque": {"value": "possibly-secret"}}),
+        config: serde_json::json!({
+            "mode": "strict",
+            "opaque": {"value": "probably-a-tuning-knob"},
+            "api_key": "live-vendor-key",
+            "headers": {"x-vendor-auth": "live-vendor-header"}
+        }),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -487,10 +497,61 @@ fn custom_plugin_import_fails_closed_for_opaque_string_config() {
     let result =
         gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
             .unwrap();
+
     assert_eq!(result.redacted_plugin_config_values, 2);
     let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/custom.yaml")).unwrap();
-    assert!(!plugin_yaml.contains("strict"));
-    assert!(!plugin_yaml.contains("possibly-secret"));
+    assert!(!plugin_yaml.contains("live-vendor-key"), "{plugin_yaml}");
+    assert!(!plugin_yaml.contains("live-vendor-header"), "{plugin_yaml}");
+    // The plugin still says what it does.
+    assert!(plugin_yaml.contains("strict"), "{plugin_yaml}");
+    assert!(
+        plugin_yaml.contains("probably-a-tuning-knob"),
+        "{plugin_yaml}"
+    );
+
+    let notice = result.custom_plugin_review_notice().expect("review notice");
+    assert!(notice.contains("WARNING"), "{notice}");
+    assert!(notice.contains("plugin_name=enterprise_custom"), "{notice}");
+    assert!(notice.contains("mode"), "{notice}");
+    assert!(notice.contains("opaque.value"), "{notice}");
+    assert!(!notice.contains("api_key"), "{notice}");
+}
+
+/// A builtin plugin's schema rules are authoritative, so there is nothing for
+/// a human to review afterwards.
+#[test]
+fn builtin_plugin_import_raises_no_review_notice() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("secret-migration.json");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        id: "otel".to_string(),
+        plugin_name: "otel_tracing".to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({
+            "endpoint": "https://collector.example/v1/traces",
+            "headers": {"x-honeycomb-team": "live-team-key"}
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+            .unwrap();
+
+    assert_eq!(result.redacted_plugin_config_values, 2);
+    assert!(result.custom_plugin_review_notice().is_none());
 }
 
 #[test]
@@ -828,7 +889,10 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
     .unwrap();
 
     let result = split_config(&config, tmp.path()).unwrap();
-    assert_eq!(result.redacted_credential_values, 7);
+    // `mtls_auth[].identity` is a certificate subject, not a secret: it has to
+    // match a real certificate, cannot be generated, and blanking it would
+    // leave the resource file unable to say which certificate it means.
+    assert_eq!(result.redacted_credential_values, 6);
 
     let consumer =
         std::fs::read_to_string(tmp.path().join("ferrum/consumers/consumer-test.yaml")).unwrap();
@@ -837,7 +901,6 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
         "second-key",
         "live-jwt-secret-that-is-long-enough",
         "live-hmac-secret-that-is-long-enough",
-        "CN=production-client",
         "hmac_sha256:live-hash",
         "custom-live-token",
     ] {
@@ -846,9 +909,13 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
             "redacted Consumer output contained a credential fixture"
         );
     }
+    assert!(
+        consumer.contains("CN=production-client"),
+        "the mTLS identity must survive import: {consumer}"
+    );
     assert_eq!(
         consumer.matches("${gh-env-secret:alloc=require}").count(),
-        7,
+        6,
         "redacted Consumer output did not contain every expected placeholder"
     );
     for entry in walkdir::WalkDir::new(tmp.path()) {
@@ -862,7 +929,6 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
             "second-key",
             "live-jwt-secret-that-is-long-enough",
             "live-hmac-secret-that-is-long-enough",
-            "CN=production-client",
             "hmac_sha256:live-hash",
             "custom-live-token",
         ] {
@@ -875,7 +941,30 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
         }
     }
     let notice = result.unmanaged_sections_notice().unwrap();
-    assert!(notice.contains("7 credential value(s)"), "{notice}");
+    assert!(notice.contains("6 credential value(s)"), "{notice}");
+}
+
+/// F5: `basicauth[].username` is the login name the caller presents, not a
+/// secret. Brokering it would demand a hand-seeded slot for a public value.
+#[test]
+fn import_keeps_consumer_identity_fields_out_of_the_broker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "basicauth": [{"username": "service-account-alpha", "password_hash": "hmac_sha256:live"}],
+        "mtls_auth": [{"identity": "CN=production-client", "ca_pin": "live-pin-value"}]
+    }))
+    .unwrap();
+
+    let result = split_config(&config, tmp.path()).unwrap();
+
+    assert_eq!(result.redacted_credential_values, 2);
+    let consumer =
+        std::fs::read_to_string(tmp.path().join("ferrum/consumers/consumer-test.yaml")).unwrap();
+    assert!(consumer.contains("service-account-alpha"), "{consumer}");
+    assert!(consumer.contains("CN=production-client"), "{consumer}");
+    assert!(!consumer.contains("hmac_sha256:live"), "{consumer}");
+    assert!(!consumer.contains("live-pin-value"), "{consumer}");
 }
 
 #[test]
