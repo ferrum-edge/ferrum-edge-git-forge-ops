@@ -1126,6 +1126,138 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
 }
 
 #[tokio::test]
+async fn a_create_proven_uncommitted_is_an_ordinary_error_and_later_namespaces_still_apply() {
+    // The gateway told us, authoritatively, that nothing landed. That is an
+    // ordinary per-resource failure — retryable next run — not a reason to
+    // abandon every namespace after it.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum"), upstream("u2", "team-b")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        // Authoritative and empty: the create provably did not commit.
+        (
+            "GET /backup".into(),
+            200,
+            serde_json::to_string(&GatewayConfig::default()).unwrap(),
+            vec![],
+        ),
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        (
+            "x-ferrum-namespace: ferrum".into(),
+            502,
+            r#"{"error":"bad gateway"}"#.into(),
+            vec![],
+        ),
+        ("POST /upstreams".into(), 201, "{}".into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["ferrum", "team-b"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("a proven no-op is not fatal");
+
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].contains("[ferrum] Upstream u1 create"),
+        "{:?}",
+        result.errors
+    );
+    assert!(
+        result.errors[0].contains("did not commit"),
+        "{:?}",
+        result.errors
+    );
+    assert_eq!(result.created, 1, "team-b must still be reconciled");
+    assert_eq!(
+        result
+            .applied_incremental
+            .iter()
+            .map(|op| op.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["u2"]
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("POST /upstreams")
+                && request.contains("x-ferrum-namespace: ferrum"))
+            .count(),
+        1,
+        "the ambiguous create must never be retried"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("PUT /upstreams/u1")),
+        "nothing landed, so there is no ownership to assert"
+    );
+}
+
+#[tokio::test]
+async fn a_create_whose_readback_finds_a_different_row_still_stops_the_run() {
+    // Something holds the identity, but not what we sent. That could be a
+    // partially applied write or another writer; either way no automatic
+    // recovery is safe.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum"), upstream("u2", "team-b")],
+        ..Default::default()
+    };
+    let mut foreign = upstream("u1", "ferrum");
+    foreign.targets.clear();
+    let live = GatewayConfig {
+        upstreams: vec![foreign],
+        ..Default::default()
+    };
+    let (url, _requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            serde_json::to_string(&live).unwrap(),
+            vec![],
+        ),
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        (
+            "POST /upstreams".into(),
+            502,
+            r#"{"error":"bad gateway"}"#.into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["ferrum", "team-b"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("the stop rides on the result");
+
+    let fatal = result.fatal_error.expect("an unprovable outcome is fatal");
+    assert!(fatal.contains("[ferrum]"), "{fatal}");
+    assert!(fatal.contains("not the resource we sent"), "{fatal}");
+    assert_eq!(result.created, 0);
+}
+
+#[tokio::test]
 async fn committed_but_not_live_create_is_failed_without_reconciliation_success() {
     let desired = GatewayConfig {
         upstreams: vec![upstream("u1", "team-alpha")],

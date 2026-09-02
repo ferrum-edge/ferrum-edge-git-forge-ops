@@ -1276,43 +1276,90 @@ impl<'a> CreateResource<'a> {
     }
 
     fn exact_desired_is_live(self, actual: &GatewayConfig) -> bool {
+        matches!(self.live_match(actual), LiveMatch::Exact)
+    }
+
+    /// Classify what an authoritative backup says about this resource.
+    ///
+    /// The three answers are not interchangeable after an ambiguous create:
+    /// `Absent` proves the write did not commit, `Different` proves *something*
+    /// holds the identity but not what we sent, and `Exact` is the only one
+    /// that permits recording the create as landed.
+    fn live_match(self, actual: &GatewayConfig) -> LiveMatch {
+        fn classify<T: serde::Serialize>(live: Option<&T>, desired: &T) -> LiveMatch {
+            match live {
+                None => LiveMatch::Absent,
+                Some(live) if resource_values_match(desired, live) => LiveMatch::Exact,
+                Some(_) => LiveMatch::Different,
+            }
+        }
+
         match self {
-            Self::Proxy(desired) => actual
-                .proxies
-                .iter()
-                .find(|candidate| {
+            Self::Proxy(desired) => classify(
+                actual.proxies.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
-                })
-                .is_some_and(|live| resource_values_match(desired, live)),
-            Self::Consumer(desired) => actual
-                .consumers
-                .iter()
-                .find(|candidate| {
+                }),
+                desired,
+            ),
+            Self::Consumer(desired) => classify(
+                actual.consumers.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
-                })
-                .is_some_and(|live| resource_values_match(desired, live)),
-            Self::Upstream(desired) => actual
-                .upstreams
-                .iter()
-                .find(|candidate| {
+                }),
+                desired,
+            ),
+            Self::Upstream(desired) => classify(
+                actual.upstreams.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
-                })
-                .is_some_and(|live| resource_values_match(desired, live)),
-            Self::PluginConfig(desired) => actual
-                .plugin_configs
-                .iter()
-                .find(|candidate| {
+                }),
+                desired,
+            ),
+            Self::PluginConfig(desired) => classify(
+                actual.plugin_configs.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
-                })
-                .is_some_and(|live| resource_values_match(desired, live)),
+                }),
+                desired,
+            ),
         }
     }
+}
+
+/// What an authoritative `GET /backup` says about one desired resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveMatch {
+    /// No row holds the `(namespace, id)` at all.
+    Absent,
+    /// A row exists but is not byte-for-byte the resource we sent.
+    Different,
+    /// The exact desired resource is live, apart from server timestamps.
+    Exact,
 }
 
 /// Send one create exactly once. If its response is ambiguous, perform an
 /// authoritative read-after-write and convert it to success only when the
 /// exact desired resource (apart from server timestamps) is live *and* a
 /// subsequent idempotent update explicitly asserts repository ownership.
+///
+/// The readback has three outcomes and they get three different severities:
+///
+/// - **Exact row live** → assert ownership with an idempotent PUT, record the
+///   create.
+/// - **Row absent** from a fresh, database-backed backup → the write provably
+///   did not commit. That is an ordinary per-resource failure: it is recorded
+///   in [`ApplyResult::errors`], the remaining resources and namespaces are
+///   still reconciled, and the next run retries the create. Treating it as
+///   fatal meant one transient 502 stopped every later namespace even though
+///   the gateway had told us, authoritatively, that nothing happened.
+/// - **Row present but different**, or no usable verification at all (the
+///   read failed, or came back `X-Data-Source: cached`) → the write may have
+///   committed. That stays a run-stopping [`crate::error::Error::AmbiguousMutation`].
+///
+/// Caveat, stated because it bounds the "provably did not commit" claim: this
+/// trusts `GET /backup` to be read from the gateway's primary. Ferrum Edge
+/// serves it from the config database and flags a degraded in-memory fallback
+/// with `X-Data-Source: cached`, which is rejected above — but an operator who
+/// fronts the admin API with something that answers reads from a lagging
+/// replica would turn a committed write into an "absent" verdict, and the
+/// next run would re-send the create and get a 409.
 async fn create_with_reconciliation(
     client: &AdminClient,
     namespace: &str,
@@ -1339,29 +1386,35 @@ async fn create_with_reconciliation(
                     resource.id(),
                 )));
             }
-            if resource.exact_desired_is_live(&snapshot.config) {
-                resource
-                    .assert_ownership(client, namespace)
-                    .await
-                    .map_err(|assertion| {
-                        crate::error::Error::AmbiguousMutation(format!(
-                            "{} `{}` in namespace `{namespace}` returned `{original}`; an authoritative backup found the exact desired row, but the idempotent ownership assertion failed: {assertion}. The row remains outside the managed delete fence.",
-                            resource.kind(),
-                            resource.id(),
-                        ))
-                    })?;
-                eprintln!(
-                    "[{namespace}] {} `{}` returned an ambiguous response; an authoritative backup found the exact desired resource live and an idempotent update asserted repository ownership without replaying the create",
+            match resource.live_match(&snapshot.config) {
+                LiveMatch::Exact => {
+                    resource
+                        .assert_ownership(client, namespace)
+                        .await
+                        .map_err(|assertion| {
+                            crate::error::Error::AmbiguousMutation(format!(
+                                "{} `{}` in namespace `{namespace}` returned `{original}`; an authoritative backup found the exact desired row, but the idempotent ownership assertion failed: {assertion}. The row remains outside the managed delete fence.",
+                                resource.kind(),
+                                resource.id(),
+                            ))
+                        })?;
+                    eprintln!(
+                        "[{namespace}] {} `{}` returned an ambiguous response; an authoritative backup found the exact desired resource live and an idempotent update asserted repository ownership without replaying the create",
+                        resource.kind(),
+                        resource.id(),
+                    );
+                    Ok(())
+                }
+                // Proven not to have committed. Ordinary failure: report it,
+                // keep reconciling everything else, retry next run.
+                LiveMatch::Absent => Err(crate::error::Error::Config(format!(
+                    "returned `{original}`, and an authoritative (non-cached) backup proves no row holds that id, so the write did not commit. Nothing was replayed; the next run recreates it."
+                ))),
+                LiveMatch::Different => Err(crate::error::Error::AmbiguousMutation(format!(
+                    "{} `{}` in namespace `{namespace}` returned `{original}`, and an authoritative backup found a row under that id that is not the resource we sent. It may be a partially applied write or another writer's row. Re-run diff before retrying.",
                     resource.kind(),
                     resource.id(),
-                );
-                Ok(())
-            } else {
-                Err(crate::error::Error::AmbiguousMutation(format!(
-                    "{} `{}` in namespace `{namespace}` returned `{original}`, and an authoritative backup did not prove the exact desired resource is live. Re-run diff before retrying.",
-                    resource.kind(),
-                    resource.id(),
-                )))
+                ))),
             }
         }
         Err(error) => Err(error),
@@ -1378,6 +1431,27 @@ fn create_outcome_is_ambiguous(error: &crate::error::Error) -> bool {
     }
 }
 
+/// Does the live row carry everything the repository asked for?
+///
+/// Deliberately a *subset* test, not equality. The question this answers is
+/// "did the gateway store what we sent?", and the gateway is entitled to add
+/// things we never declared: server timestamps, and any optional field it
+/// populates itself (which `skip_serializing_if = "Option::is_none"` keeps out
+/// of the desired document entirely). Under strict equality every one of those
+/// reads as "this is not our row", which turned a successful write into an
+/// unresolvable ambiguity — and, before the journal was made non-blocking,
+/// into a state file that needed hand-editing.
+///
+/// So: every key the desired document serializes must be present in the live
+/// row with the same value, recursively through nested objects. Arrays and
+/// scalars still compare exactly — a differing target list or timeout is a
+/// real difference, not a gateway default. Extra keys on the live side are
+/// ignored. `created_at` / `updated_at` are dropped outright because the
+/// desired side fabricates them at deserialize time.
+///
+/// This is not an ownership proof and is never used as one: the callers follow
+/// a positive match with an idempotent PUT that overwrites the row with the
+/// desired content before anything enters the managed delete fence.
 fn resource_values_match<T: serde::Serialize>(desired: &T, live: &T) -> bool {
     fn without_server_timestamps<T: serde::Serialize>(value: &T) -> Option<serde_json::Value> {
         let mut value = serde_json::to_value(value).ok()?;
@@ -1392,8 +1466,24 @@ fn resource_values_match<T: serde::Serialize>(desired: &T, live: &T) -> bool {
         without_server_timestamps(desired),
         without_server_timestamps(live),
     ) {
-        (Some(desired), Some(live)) => desired == live,
+        (Some(desired), Some(live)) => json_contains(&desired, &live),
         _ => false,
+    }
+}
+
+/// `live` carries every key/value in `desired`, recursively.
+fn json_contains(desired: &serde_json::Value, live: &serde_json::Value) -> bool {
+    match (desired, live) {
+        (serde_json::Value::Object(desired), serde_json::Value::Object(live)) => {
+            desired.iter().all(|(key, value)| {
+                live.get(key)
+                    .is_some_and(|found| json_contains(value, found))
+            })
+        }
+        // Arrays are ordered, meaningful config (targets, plugin
+        // associations, credential entries); a shorter or reordered live list
+        // is a real difference.
+        (desired, live) => desired == live,
     }
 }
 
@@ -1620,8 +1710,10 @@ async fn try_batch_create(
             // the same 403 N times.
             Err(e @ crate::error::Error::GatewayReadOnly(_)) => {
                 result.fatal_error = Some(e.to_string());
+                note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
                 return Ok(Some(result));
             }
+
             Err(e) if batch_rejection_allows_replay(&e) => {
                 eprintln!(
                     "[{namespace}] POST /batch chunk {} was definitively rejected ({e}); creating the remaining {} resource(s) individually so each failure is reported on its own.",
@@ -1633,39 +1725,19 @@ async fn try_batch_create(
             }
             Err(e) if create_outcome_is_ambiguous(&e) => {
                 let original = e.to_string();
-                match client.get_backup_snapshot(namespace).await {
-                    Ok(snapshot)
-                        if !snapshot.cached
-                            && batch_exact_desired_is_live(chunk, &snapshot.config) =>
-                    {
-                        let errors_before = result.errors.len();
-                        assert_batch_ownership(chunk, client, namespace, &mut result).await;
-                        if result.fatal_error.is_some() || result.errors.len() > errors_before {
-                            return Ok(Some(result));
-                        }
-                        eprintln!(
-                            "[{namespace}] POST /batch chunk {} returned an ambiguous response; an authoritative backup found all {} exact desired resources live and idempotent updates asserted repository ownership without replaying the batch",
-                            position + 1,
-                            chunk.len(),
-                        );
-                    }
-                    Ok(snapshot) => {
-                        let verification = if snapshot.cached {
-                            "verification returned only a cached backup with incomplete ownership metadata"
-                                .to_string()
-                        } else {
-                            "an authoritative backup did not prove every exact desired resource live"
-                                .to_string()
-                        };
+                let snapshot = match client.get_backup_snapshot(namespace).await {
+                    Ok(snapshot) if snapshot.cached => {
                         result.fatal_error = Some(
                             crate::error::Error::AmbiguousMutation(format!(
-                                "POST /batch chunk {} in namespace `{namespace}` returned `{original}`, and {verification}. No individual create was replayed; re-run diff before retrying.",
+                                "POST /batch chunk {} in namespace `{namespace}` returned `{original}`, and verification returned only a cached backup with incomplete ownership metadata. No individual create was replayed; re-run diff before retrying.",
                                 position + 1,
                             ))
                             .to_string(),
                         );
+                        note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
                         return Ok(Some(result));
                     }
+                    Ok(snapshot) => snapshot,
                     Err(verification) => {
                         result.fatal_error = Some(
                             crate::error::Error::AmbiguousMutation(format!(
@@ -1674,6 +1746,44 @@ async fn try_batch_create(
                             ))
                             .to_string(),
                         );
+                        note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
+                        return Ok(Some(result));
+                    }
+                };
+
+                match batch_live_match(chunk, &snapshot.config) {
+                    LiveMatch::Exact => {
+                        let errors_before = result.errors.len();
+                        assert_batch_ownership(chunk, client, namespace, &mut result).await;
+                        if result.fatal_error.is_some() || result.errors.len() > errors_before {
+                            note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
+                            return Ok(Some(result));
+                        }
+                        eprintln!(
+                            "[{namespace}] POST /batch chunk {} returned an ambiguous response; an authoritative backup found all {} exact desired resources live and idempotent updates asserted repository ownership without replaying the batch",
+                            position + 1,
+                            chunk.len(),
+                        );
+                    }
+                    // `/batch` is one transaction: no row live means it did
+                    // not commit. That is an ordinary failure — report the
+                    // chunk, keep going, retry it next run.
+                    LiveMatch::Absent => {
+                        result.errors.push(format!(
+                            "POST /batch chunk {} ({} resource(s)) returned `{original}`, and an authoritative (non-cached) backup proves none of them are live, so the transaction did not commit. Nothing was replayed; the next run recreates them.",
+                            position + 1,
+                            chunk.len(),
+                        ));
+                    }
+                    LiveMatch::Different => {
+                        result.fatal_error = Some(
+                            crate::error::Error::AmbiguousMutation(format!(
+                                "POST /batch chunk {} in namespace `{namespace}` returned `{original}`, and an authoritative backup proved neither that the whole chunk landed nor that none of it did. No individual create was replayed; re-run diff before retrying.",
+                                position + 1,
+                            ))
+                            .to_string(),
+                        );
+                        note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
                         return Ok(Some(result));
                     }
                 }
@@ -1683,6 +1793,7 @@ async fn try_batch_create(
                     "POST /batch chunk {} failed ({e}); the response is not a documented all-or-nothing validation rejection, so no per-resource replay was attempted",
                     position + 1,
                 ));
+                note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
                 return Ok(Some(result));
             }
         }
@@ -1705,23 +1816,69 @@ fn batch_rejection_allows_replay(error: &crate::error::Error) -> bool {
     )
 }
 
-fn batch_exact_desired_is_live(batch: &BatchCreate, actual: &GatewayConfig) -> bool {
-    batch
-        .proxies
+/// Classify a whole `/batch` chunk against an authoritative backup.
+///
+/// `/batch` is one transaction, so the chunk only has three honest answers:
+/// every row landed exactly as sent (`Exact`), no row landed at all
+/// (`Absent`, which proves the transaction did not commit), or the live view
+/// is some third thing (`Different`) that no read can reconcile automatically.
+fn batch_live_match(batch: &BatchCreate, actual: &GatewayConfig) -> LiveMatch {
+    let mut any_exact = false;
+    let mut any_absent = false;
+    let mut any_different = false;
+
+    let mut record = |outcome: LiveMatch| match outcome {
+        LiveMatch::Exact => any_exact = true,
+        LiveMatch::Absent => any_absent = true,
+        LiveMatch::Different => any_different = true,
+    };
+
+    for resource in &batch.proxies {
+        record(CreateResource::Proxy(resource).live_match(actual));
+    }
+    for resource in &batch.consumers {
+        record(CreateResource::Consumer(resource).live_match(actual));
+    }
+    for resource in &batch.upstreams {
+        record(CreateResource::Upstream(resource).live_match(actual));
+    }
+    for resource in &batch.plugin_configs {
+        record(CreateResource::PluginConfig(resource).live_match(actual));
+    }
+
+    match (any_exact, any_absent, any_different) {
+        // An empty chunk cannot reach here (`try_batch_create` short-circuits
+        // an empty batch), but treat it as unprovable rather than as success.
+        (false, false, false) => LiveMatch::Different,
+        (true, false, false) => LiveMatch::Exact,
+        (false, true, false) => LiveMatch::Absent,
+        _ => LiveMatch::Different,
+    }
+}
+
+/// Name the chunks a stopped batch never attempted.
+///
+/// Returning silently left those resources neither created nor mentioned
+/// anywhere, so an operator reading the failure had no way to know how much of
+/// the namespace was still outstanding.
+fn note_unattempted_chunks(
+    chunks: &[BatchCreate],
+    next_position: usize,
+    namespace: &str,
+    result: &mut ApplyResult,
+) {
+    let remaining: usize = chunks
         .iter()
-        .all(|resource| CreateResource::Proxy(resource).exact_desired_is_live(actual))
-        && batch
-            .consumers
-            .iter()
-            .all(|resource| CreateResource::Consumer(resource).exact_desired_is_live(actual))
-        && batch
-            .upstreams
-            .iter()
-            .all(|resource| CreateResource::Upstream(resource).exact_desired_is_live(actual))
-        && batch
-            .plugin_configs
-            .iter()
-            .all(|resource| CreateResource::PluginConfig(resource).exact_desired_is_live(actual))
+        .skip(next_position)
+        .map(BatchCreate::len)
+        .sum();
+    if remaining == 0 {
+        return;
+    }
+    result.errors.push(format!(
+        "{} further POST /batch chunk(s) covering {remaining} resource(s) in namespace `{namespace}` were not attempted after the failure above; re-run apply once it is resolved",
+        chunks.len().saturating_sub(next_position),
+    ));
 }
 
 async fn assert_batch_ownership(
