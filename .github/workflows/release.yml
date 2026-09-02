@@ -196,17 +196,28 @@ jobs:
           push-to-registry: true
 
       # `docker/build-push-action` publishes ONE manifest digest to BOTH
-      # registries, so the GHCR attestation above covers those exact bytes —
-      # but an attestation is bound to `subject-name`, and consumers pulling
-      # `docker.io/<image>` verify against that name. Without this second
+      # registries, so the step above covers those exact bytes — but an
+      # attestation is bound to its `subject-name`, and a consumer pulling
+      # `docker.io/<image>` verifies against that name. Without this second
       # subject, `gh attestation verify oci://docker.io/...` finds nothing and
       # the Docker Hub image is effectively unattested.
+      #
+      # `push-to-registry` is deliberately off here. The attestation is
+      # recorded in GitHub's attestation store, which `gh attestation verify`
+      # consults for an image in any registry, so verification works either
+      # way; writing it into Docker Hub's referrers instead would make every
+      # release depend on a third-party registry's referrers support, and a
+      # failure there would land after the image was already pushed. GHCR
+      # keeps `push-to-registry: true` because it is this project's primary
+      # distribution point and is known to support it.
+      #
+      # DOCKERHUB_IMAGE is documented as `owner/name`; the registry host is
+      # added here because an attestation subject must be fully qualified.
       - name: Publish signed Docker Hub build provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-name: ${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
+          subject-name: docker.io/${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
           subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
 
       - name: Bind image digest into build-input record
         env:

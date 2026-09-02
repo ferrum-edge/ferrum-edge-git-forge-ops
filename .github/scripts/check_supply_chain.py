@@ -382,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     for required in (
         "subject-name: ghcr.io/${{ github.repository }}",
-        "subject-name: ${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}",
+        "subject-name: docker.io/${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}",
     ):
         if required not in release:
             violations.append(
