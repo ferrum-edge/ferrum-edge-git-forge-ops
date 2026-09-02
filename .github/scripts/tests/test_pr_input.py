@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tarfile
 import tempfile
 import unittest
@@ -56,6 +57,12 @@ def make_archive(path, extra=None):
         )
         if extra:
             extra(bundle)
+
+
+def write_changed_paths(root, paths):
+    changed_paths = root / "changed-paths.json"
+    changed_paths.write_text(json.dumps(paths))
+    return changed_paths
 
 
 class PrInputTests(unittest.TestCase):
@@ -150,6 +157,48 @@ class PrInputTests(unittest.TestCase):
                 ["resources/team/proxies/api.yaml"],
             )
 
+    def test_prepare_silently_skips_os_artifacts(self):
+        # Finder and Explorer drop these into any directory they display.
+        # There is nothing for an author to commit that removes them for good,
+        # so the trusted-input gate skips them exactly like the Rust loader.
+        def extra(bundle):
+            for artifact in sorted(pr_input.OS_ARTIFACT_FILES):
+                add_file(
+                    bundle, f"repo-root/resources/team/proxies/{artifact}", "junk"
+                )
+                add_file(bundle, f"repo-root/overlays/prod/team/{artifact}", "junk")
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            archive = temp / "pr.tar.gz"
+            output = temp / "output"
+            make_archive(archive, extra)
+            manifest = pr_input.prepare(archive, output, HEAD_SHA)
+            self.assertEqual(
+                [entry["path"] for entry in manifest["files"]],
+                ["resources/team/proxies/api.yaml"],
+            )
+
+    def test_prepare_still_rejects_config_shaped_lookalikes(self):
+        # The skip list matches exact names. Anything that could be a resource
+        # document stays fatal: a file that looks like configuration and is
+        # silently not loaded is how a typo becomes a prune.
+        for name in [
+            "resources/team/proxies/thumbs.db",
+            "resources/team/proxies/Desktop.ini",
+            "resources/team/proxies/ds_store.yaml.bak",
+        ]:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                temp = Path(temp)
+                archive = temp / "pr.tar.gz"
+
+                def extra(bundle, name=name):
+                    add_file(bundle, f"repo-root/{name}", "junk")
+
+                make_archive(archive, extra)
+                with self.assertRaisesRegex(pr_input.InputError, "unsupported file"):
+                    pr_input.prepare(archive, temp / "output", HEAD_SHA)
+
     def test_prepare_preserves_misplaced_lowercase_yaml_for_strict_validation(self):
         def extra(bundle):
             add_file(bundle, "repo-root/resources/api.yaml", "kind: Proxy\nspec: {}\n")
@@ -204,12 +253,29 @@ class PrInputTests(unittest.TestCase):
                 root,
                 json.dumps(
                     [
-                        {"environment": "staging", "namespaces": None},
+                        {
+                            "environment": "staging",
+                            "live_review": True,
+                            "namespaces": None,
+                        },
                         {
                             "environment": "production",
+                            "live_review": True,
                             "namespaces": ["team-a"],
                         },
+                        {
+                            "environment": "file-output",
+                            "live_review": False,
+                            "namespaces": None,
+                        },
                     ]
+                ),
+                write_changed_paths(
+                    root,
+                    [
+                        "resources/team-a/proxies/api.yaml",
+                        "overlays/staging/ferrum/proxies/api.yaml",
+                    ],
                 ),
             )
             self.assertEqual(
@@ -221,33 +287,27 @@ class PrInputTests(unittest.TestCase):
                 ],
             )
 
-    def test_trusted_targets_reject_unsafe_or_symlinked_namespace_paths(self):
-        for name, symlink, expected in [
-            ("unsafe namespace", False, "unsafe trusted namespace"),
-            ("linked", True, "may not be a symlink"),
-        ]:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp)
-                resources = root / "resources"
-                resources.mkdir()
-                target = resources / name
-                if symlink:
-                    target.symlink_to(root, target_is_directory=True)
-                else:
-                    target.mkdir()
-                with self.assertRaisesRegex(pr_input.InputError, expected):
-                    pr_input.trusted_targets(
-                        root,
-                        '[{"environment":"production","namespaces":null}]',
-                    )
+    def test_trusted_targets_reject_symlinked_namespace_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            resources = root / "resources"
+            resources.mkdir()
+            (resources / "linked").symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(pr_input.InputError, "may not be a symlink"):
+                pr_input.trusted_targets(
+                    root,
+                    '[{"environment":"production","live_review":true,"namespaces":null}]',
+                    write_changed_paths(root, ["resources/linked/proxies/api.yaml"]),
+                )
 
     def test_trusted_targets_reject_malformed_or_duplicate_scope(self):
         cases = [
             '["production"]',
-            '[{"environment":"production","namespaces":["unsafe namespace"]}]',
-            '[{"environment":"production","namespaces":null},'
-            '{"environment":"production","namespaces":null}]',
-            '[{"environment":"production","namespaces":null,"extra":true}]',
+            '[{"environment":"production","live_review":true,"namespaces":["unsafe namespace"]}]',
+            '[{"environment":"production","live_review":true,"namespaces":null},'
+            '{"environment":"production","live_review":true,"namespaces":null}]',
+            '[{"environment":"production","live_review":true,"namespaces":null,"extra":true}]',
+            '[{"environment":"production","live_review":"yes","namespaces":null}]',
         ]
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -256,7 +316,151 @@ class PrInputTests(unittest.TestCase):
                 with self.subTest(payload=payload), self.assertRaises(
                     pr_input.InputError
                 ):
-                    pr_input.trusted_targets(root, payload)
+                    pr_input.trusted_targets(
+                        root,
+                        payload,
+                        write_changed_paths(
+                            root, ["resources/team/proxies/api.yaml"]
+                        ),
+                    )
+
+    def test_trusted_targets_exclude_untouched_and_new_namespaces(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/touched").mkdir(parents=True)
+            (root / "resources/untouched").mkdir()
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(
+                    root,
+                    [
+                        "resources/touched/proxies/api.yaml",
+                        "resources/new/proxies/api.yaml",
+                    ],
+                ),
+            )
+            self.assertEqual(
+                targets,
+                [{"environment": "production", "namespace": "touched"}],
+            )
+
+    def test_trusted_targets_config_only_change_has_no_live_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(root, [".gitforgeops/policies.yaml"]),
+            )
+            self.assertEqual(targets, [])
+
+    def test_trusted_targets_ignore_non_resource_files_under_declarative_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(
+                    root,
+                    ["overlays/README.md", "resources/README.md", "resources/team/.gitkeep"],
+                ),
+            )
+            self.assertEqual(targets, [])
+
+    def test_trusted_targets_ignore_non_targetable_namespace_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            (root / "resources/_shared").mkdir()
+            targets = pr_input.trusted_targets(
+                root,
+                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                write_changed_paths(
+                    root,
+                    [
+                        "resources/_shared/proxies/api.yaml",
+                        "overlays/My Overlay/team/proxies/api.yaml",
+                        "resources/team/proxies/api.yaml",
+                    ],
+                ),
+            )
+            self.assertEqual(
+                targets, [{"environment": "production", "namespace": "team"}]
+            )
+
+    def test_trusted_targets_reject_matrix_larger_than_github_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            changed = []
+            for index in range(pr_input.MAX_LIVE_REVIEW_TARGETS + 1):
+                namespace = f"team-{index}"
+                (root / "resources" / namespace).mkdir(parents=True)
+                changed.append(f"resources/{namespace}/proxies/api.yaml")
+            with self.assertRaisesRegex(pr_input.InputError, "256-job matrix limit"):
+                pr_input.trusted_targets(
+                    root,
+                    '[{"environment":"production","live_review":true,"namespaces":null}]',
+                    write_changed_paths(root, changed),
+                )
+
+    def test_trusted_targets_reject_unsafe_changed_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/team").mkdir(parents=True)
+            scopes = '[{"environment":"production","live_review":true,"namespaces":null}]'
+            for path in ("resources/../escape.yaml", "/resources/team/api.yaml", 7):
+                with self.subTest(path=path), self.assertRaises(pr_input.InputError):
+                    pr_input.trusted_targets(
+                        root, scopes, write_changed_paths(root, [path])
+                    )
+
+
+class AllowlistParityTests(unittest.TestCase):
+    """The Rust loader and this gate guard the same `resources/` and
+    `overlays/` trees on either side of the trusted-review boundary. A file one
+    of them skips and the other rejects (or vice versa) means a PR that passes
+    static validation and then fails live review, or worse, an artifact that
+    silently omits a resource. Rather than hope the two lists stay in step,
+    read the Rust ones and compare."""
+
+    REPO_ROOT = Path(__file__).resolve().parents[3]
+
+    def _rust_array(self, source: str, name: str) -> list[str]:
+        start = source.index(f"const {name}:")
+        body = source[start : source.index("];", start)]
+        return re.findall(r'"([^"]*)"', body[body.index("=") :])
+
+    def test_non_config_allowlist_matches_the_rust_loader(self):
+        strict = (self.REPO_ROOT / "src/config/strict.rs").read_text()
+        # `NON_CONFIG_FILES` names the import manifest through a constant, so
+        # the literal comes from `import::IMPORT_MANIFEST_FILENAME`.
+        expected = set(self._rust_array(strict, "NON_CONFIG_FILES"))
+        expected.add(self._import_manifest_filename())
+        self.assertEqual(expected, pr_input.NON_CONFIG_FILES)
+
+    def test_os_artifact_allowlist_matches_the_rust_loader(self):
+        strict = (self.REPO_ROOT / "src/config/strict.rs").read_text()
+        self.assertEqual(
+            set(self._rust_array(strict, "OS_ARTIFACT_FILES")),
+            pr_input.OS_ARTIFACT_FILES,
+        )
+
+    def test_import_manifest_filename_matches_the_rust_constant(self):
+        # `.gitforgeops-import.json` is spelled out here but derived from
+        # `import::IMPORT_MANIFEST_FILENAME` in Rust; a rename on one side
+        # would otherwise make the manifest fatal input to live review.
+        self.assertIn(self._import_manifest_filename(), pr_input.NON_CONFIG_FILES)
+
+    def _import_manifest_filename(self) -> str:
+        source = (self.REPO_ROOT / "src/import/mod.rs").read_text()
+        match = re.search(
+            r'pub const IMPORT_MANIFEST_FILENAME: &str = "([^"]+)";', source
+        )
+        assert match, "IMPORT_MANIFEST_FILENAME not found in src/import/mod.rs"
+        return match.group(1)
 
 
 if __name__ == "__main__":

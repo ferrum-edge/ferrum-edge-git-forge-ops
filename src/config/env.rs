@@ -60,6 +60,17 @@ pub struct EnvConfig {
     pub admin_jwt_ttl_secs: i64,
     /// Only process resources for this namespace.
     pub namespace_filter: Option<String>,
+    /// Carry unknown **top-level** `spec` fields verbatim instead of rejecting
+    /// them (default `false`, fail-closed).
+    ///
+    /// The typed mirror in `config::schema` is authoritative-by-rejection so a
+    /// misspelled field cannot silently drop out of desired state. That makes a
+    /// gateway release which adds a field an outage until gitforgeops ships a
+    /// matching release; this is the escape hatch. Unknown top-level fields are
+    /// kept in `PassthroughFields` and passed through export/diff/apply for the
+    /// gateway — the authoritative schema — to judge, with a loud per-file
+    /// warning on stderr. Nested unknown fields stay hard errors either way.
+    pub allow_unknown_fields: bool,
     /// How to interact with the gateway.
     pub gateway_mode: GatewayMode,
     /// How to apply config changes.
@@ -137,6 +148,7 @@ impl Default for EnvConfig {
             admin_jwt_audience: None,
             admin_jwt_ttl_secs: DEFAULT_JWT_TTL_SECS,
             namespace_filter: None,
+            allow_unknown_fields: false,
             gateway_mode: GatewayMode::default(),
             apply_strategy: ApplyStrategy::default(),
             overlay: None,
@@ -173,6 +185,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_ADMIN_JWT_AUDIENCE`  | `admin_jwt_audience` | `None` (claim omitted)         |
 /// | `FERRUM_ADMIN_JWT_TTL_SECS`  | `admin_jwt_ttl_secs` | `3600`                         |
 /// | `FERRUM_NAMESPACE`           | `namespace_filter` | `None`                           |
+/// | `FERRUM_ALLOW_UNKNOWN_FIELDS`| `allow_unknown_fields` | `false` (unknown fields are rejected) |
 /// | `FERRUM_GATEWAY_MODE`        | `gateway_mode`     | `api`                            |
 /// | `FERRUM_APPLY_STRATEGY`      | `apply_strategy`   | `incremental`                    |
 /// | `FERRUM_OVERLAY`             | `overlay`          | `None`                           |
@@ -237,6 +250,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
             DEFAULT_JWT_TTL_SECS,
         )?,
         namespace_filter: non_empty_env("FERRUM_NAMESPACE"),
+        allow_unknown_fields: parse_bool_env("FERRUM_ALLOW_UNKNOWN_FIELDS", false)?,
         gateway_mode,
         apply_strategy,
         overlay: non_empty_env("FERRUM_OVERLAY"),

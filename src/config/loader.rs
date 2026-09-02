@@ -3,7 +3,7 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 use super::schema::Resource;
-use super::strict;
+use super::strict::{self, LoadOptions};
 
 /// Walk `resources/<namespace>/` directories and parse each `.yaml`/`.yml` file
 /// as a `Resource`. Returns `(namespace, Resource)` pairs.
@@ -30,6 +30,17 @@ use super::strict;
 /// entry. A mesh fragment with no explicit `id` is named after its file stem
 /// so overlays have something stable to target.
 pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String, Resource)>> {
+    load_resources_with_options(resources_dir, LoadOptions::STRICT)
+}
+
+/// [`load_resources`] with an explicit unknown-field policy.
+///
+/// `main` passes the policy derived from `FERRUM_ALLOW_UNKNOWN_FIELDS`; every
+/// other caller gets the fail-closed default from [`load_resources`].
+pub fn load_resources_with_options(
+    resources_dir: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<Vec<(String, Resource)>> {
     let root_metadata = match std::fs::symlink_metadata(resources_dir) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -174,7 +185,7 @@ pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String,
                     }
                 })?;
 
-                let mut resource = strict::resource_from_yaml(&contents, &path)?;
+                let mut resource = strict::resource_from_yaml(&contents, &path, options)?;
                 let declared_kind = strict::resource_kind(&resource);
                 if declared_kind != expected_kind {
                     return Err(crate::error::Error::Config(format!(

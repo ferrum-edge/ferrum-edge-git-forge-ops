@@ -16,6 +16,7 @@ use gitforgeops::state::StateFile;
 
 fn proxy(id: &str, namespace: &str) -> Proxy {
     Proxy {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: namespace.to_string(),

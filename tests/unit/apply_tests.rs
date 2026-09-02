@@ -68,6 +68,7 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
     let path = tmp.path().join("nested/resources.yaml");
     let config = GatewayConfig {
         proxies: vec![Proxy {
+            extra: Default::default(),
             id: "p1".to_string(),
             name: None,
             namespace: "ferrum".to_string(),
@@ -273,17 +274,6 @@ fn unknown_kinds_get_a_defined_rank() {
 // --- Stale gateway view ------------------------------------------------------
 
 #[test]
-fn stale_view_blocks_every_mutation_from_a_cached_backup() {
-    // Cached fallback also strips API-spec ownership tags, so even a pure
-    // add/modify can collide with a row that only appears hand-owned.
-    let block = stale_view_block(true).expect("should block");
-    assert!(block.contains("X-Data-Source: cached"), "{block}");
-    assert!(block.contains("API-spec ownership metadata"), "{block}");
-    assert!(block.contains("--allow-large-prune"), "{block}");
-    assert!(block.contains("does not bypass"), "{block}");
-}
-
-#[test]
 fn fresh_view_is_not_blocked() {
     assert!(stale_view_block(false).is_none());
 }
@@ -305,12 +295,39 @@ fn large_prune_threshold_uses_an_exact_ratio() {
 }
 
 #[test]
-fn large_prune_decision_matches_rational_reference_across_small_domain() {
+fn large_prune_decision_matches_an_independent_reference_across_a_small_domain() {
+    // The reference is deliberately computed a different way from the
+    // implementation: reduce deletes/denominator and threshold/100 to lowest
+    // terms and cross-multiply the reduced fractions. Restating the
+    // implementation's own expression here would have asserted nothing.
+    fn gcd(mut a: u128, mut b: u128) -> u128 {
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        a.max(1)
+    }
+    /// `deletes/denominator > threshold/100`, via reduced fractions.
+    fn exceeds(deletes: u128, denominator: u128, threshold: u128) -> bool {
+        if denominator == 0 {
+            return false;
+        }
+        let (ln, ld) = {
+            let g = gcd(deletes, denominator);
+            (deletes / g, denominator / g)
+        };
+        let (rn, rd) = {
+            let g = gcd(threshold, 100);
+            (threshold / g, 100 / g)
+        };
+        ln * rd > rn * ld
+    }
+
     for denominator in 0_usize..=250 {
         for deletes in 0_usize..=denominator {
             for threshold in 0_u8..=100 {
-                let reference = denominator > 0
-                    && (deletes as u128) * 100 > (threshold as u128) * (denominator as u128);
+                let reference = exceeds(deletes as u128, denominator as u128, threshold as u128);
                 assert_eq!(
                     large_prune_exceeds_threshold(deletes, denominator, threshold),
                     reference,
@@ -319,6 +336,13 @@ fn large_prune_decision_matches_rational_reference_across_small_domain() {
             }
         }
     }
+
+    // Spot-check the reference itself against hand-computed answers, so a bug
+    // in the reference cannot silently agree with a bug in the implementation.
+    assert!(exceeds(1, 3, 33));
+    assert!(!exceeds(1, 4, 25));
+    assert!(!exceeds(0, 10, 0));
+    assert!(exceeds(1, 10, 0));
 }
 
 // --- Full-replace API-spec graph preservation -------------------------------
@@ -367,8 +391,10 @@ fn spec_extras(ids: &[&str]) -> gitforgeops::http_client::BackupExtras {
     }
 }
 
-#[test]
-fn full_replace_preserves_complete_spec_owned_resource_graph() {
+/// Repo-owned desired rows plus the live spec-owned graph they must be
+/// restored alongside: one API spec `spec-a` owning proxy `spec-proxy`,
+/// upstream `spec-upstream` and plugin config `spec-plugin`.
+fn spec_owned_graph() -> (GatewayConfig, GatewayConfig) {
     let desired = GatewayConfig {
         upstreams: vec![upstream("repo-upstream", "team-alpha")],
         ..Default::default()
@@ -383,7 +409,7 @@ fn full_replace_preserves_complete_spec_owned_resource_graph() {
         });
     let actual = GatewayConfig {
         proxies: vec![spec_proxy],
-        upstreams: vec![spec_upstream.clone()],
+        upstreams: vec![spec_upstream],
         plugin_configs: vec![plugin_config(
             "spec-plugin",
             "team-alpha",
@@ -392,6 +418,12 @@ fn full_replace_preserves_complete_spec_owned_resource_graph() {
         )],
         ..Default::default()
     };
+    (desired, actual)
+}
+
+#[test]
+fn merging_the_spec_owned_graph_keeps_repo_rows_authoritative() {
+    let (desired, actual) = spec_owned_graph();
 
     let merged =
         preserve_spec_owned_graph(&desired, &actual, &spec_extras(&["spec-a"]), "team-alpha")
@@ -816,6 +848,13 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
     }
 }
 
+/// Namespace scope every test client is built with.
+///
+/// `AdminClient::new_scoped` is the only public constructor, so tests declare
+/// a scope like production call sites do. The stub gateways ignore the token,
+/// but this keeps the tests honest about the constructor's contract.
+const TEST_NAMESPACES: [&str; 5] = ["team-alpha", "team-a", "team-b", "ferrum", "alpha"];
+
 fn stub_client(url: String) -> AdminClient {
     stub_client_with_retries(url, 0)
 }
@@ -828,7 +867,7 @@ fn stub_client_with_retries(url: String, gateway_max_retries: u32) -> AdminClien
         gateway_max_retries,
         ..EnvConfig::default()
     };
-    AdminClient::new(&env).unwrap()
+    AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap()
 }
 
 fn upstream(id: &str, namespace: &str) -> Upstream {
@@ -1111,6 +1150,138 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
 }
 
 #[tokio::test]
+async fn a_create_proven_uncommitted_is_an_ordinary_error_and_later_namespaces_still_apply() {
+    // The gateway told us, authoritatively, that nothing landed. That is an
+    // ordinary per-resource failure — retryable next run — not a reason to
+    // abandon every namespace after it.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum"), upstream("u2", "team-b")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        // Authoritative and empty: the create provably did not commit.
+        (
+            "GET /backup".into(),
+            200,
+            serde_json::to_string(&GatewayConfig::default()).unwrap(),
+            vec![],
+        ),
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        (
+            "x-ferrum-namespace: ferrum".into(),
+            502,
+            r#"{"error":"bad gateway"}"#.into(),
+            vec![],
+        ),
+        ("POST /upstreams".into(), 201, "{}".into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["ferrum", "team-b"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("a proven no-op is not fatal");
+
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].contains("[ferrum] Upstream u1 create"),
+        "{:?}",
+        result.errors
+    );
+    assert!(
+        result.errors[0].contains("did not commit"),
+        "{:?}",
+        result.errors
+    );
+    assert_eq!(result.created, 1, "team-b must still be reconciled");
+    assert_eq!(
+        result
+            .applied_incremental
+            .iter()
+            .map(|op| op.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["u2"]
+    );
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("POST /upstreams")
+                && request.contains("x-ferrum-namespace: ferrum"))
+            .count(),
+        1,
+        "the ambiguous create must never be retried"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("PUT /upstreams/u1")),
+        "nothing landed, so there is no ownership to assert"
+    );
+}
+
+#[tokio::test]
+async fn a_create_whose_readback_finds_a_different_row_still_stops_the_run() {
+    // Something holds the identity, but not what we sent. That could be a
+    // partially applied write or another writer; either way no automatic
+    // recovery is safe.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum"), upstream("u2", "team-b")],
+        ..Default::default()
+    };
+    let mut foreign = upstream("u1", "ferrum");
+    foreign.targets.clear();
+    let live = GatewayConfig {
+        upstreams: vec![foreign],
+        ..Default::default()
+    };
+    let (url, _requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            serde_json::to_string(&live).unwrap(),
+            vec![],
+        ),
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        (
+            "POST /upstreams".into(),
+            502,
+            r#"{"error":"bad gateway"}"#.into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["ferrum", "team-b"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("the stop rides on the result");
+
+    let fatal = result.fatal_error.expect("an unprovable outcome is fatal");
+    assert!(fatal.contains("[ferrum]"), "{fatal}");
+    assert!(fatal.contains("not the resource we sent"), "{fatal}");
+    assert_eq!(result.created, 0);
+}
+
+#[tokio::test]
 async fn committed_but_not_live_create_is_failed_without_reconciliation_success() {
     let desired = GatewayConfig {
         upstreams: vec![upstream("u1", "team-alpha")],
@@ -1210,6 +1381,15 @@ async fn cached_backup_blocks_all_apply_mutations_before_the_first_write() {
         matches!(error, gitforgeops::error::Error::StaleGatewayView(_)),
         "{error:?}"
     );
+    // The wording is the operator's only clue about why an apply that looks
+    // routine refused, so assert it where it is actually produced.
+    let message = error.to_string();
+    assert!(message.contains("X-Data-Source: cached"), "{message}");
+    assert!(message.contains("API-spec ownership metadata"), "{message}");
+    assert!(
+        message.contains("--allow-large-prune") && message.contains("does not bypass"),
+        "the one override an operator would reach for must be ruled out: {message}"
+    );
     let requests = requests.lock().unwrap();
     assert!(
         requests.iter().all(|request| {
@@ -1220,30 +1400,14 @@ async fn cached_backup_blocks_all_apply_mutations_before_the_first_write() {
 }
 
 #[tokio::test]
-async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revision() {
-    let desired = GatewayConfig {
-        upstreams: vec![upstream("repo-upstream", "team-alpha")],
-        ..Default::default()
-    };
-    let mut spec_upstream = upstream("spec-upstream", "team-alpha");
-    spec_upstream.api_spec_id = Some("spec-a".to_string());
-    let mut spec_proxy = proxy("spec-proxy", "team-alpha", Some("spec-a"));
-    spec_proxy
-        .plugins
-        .push(gitforgeops::config::schema::PluginAssociation {
-            plugin_config_id: "spec-plugin".to_string(),
-        });
-    let actual = GatewayConfig {
-        proxies: vec![spec_proxy],
-        upstreams: vec![spec_upstream],
-        plugin_configs: vec![plugin_config(
-            "spec-plugin",
-            "team-alpha",
-            "spec-proxy",
-            Some("spec-a"),
-        )],
-        ..Default::default()
-    };
+async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
+    // Issue #71. `/restore` validates the ownership graph as one unit: an
+    // `api_specs` document whose owning proxy is missing, or a tagged row
+    // whose spec is missing, is a 400 before anything is deleted. So the body
+    // has to carry the repo's desired rows AND the live spec-owned rows AND
+    // the live `api_specs` section. Restore never re-extracts resources from
+    // the documents, so nothing is duplicated by carrying both.
+    let (desired, actual) = spec_owned_graph();
     let extras = spec_extras(&["spec-a"]);
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
@@ -1256,7 +1420,7 @@ async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revisio
     ]);
     let client = stub_client(url);
 
-    let error = apply_api(
+    let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
@@ -1269,19 +1433,104 @@ async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revisio
         },
     )
     .await
-    .unwrap_err();
+    .expect("a namespace with API specs must be restorable");
+
+    assert_eq!(
+        result.created, 1,
+        "only the repo-owned row counts as applied; preserved spec rows are not this repo's"
+    );
+    assert_eq!(result.fully_replaced_namespaces, vec!["team-alpha"]);
+
+    let restore = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.contains("POST /restore?confirm=true"))
+        .cloned()
+        .expect("restore request");
+    let body: serde_json::Value =
+        serde_json::from_str(restore.split_once("\r\n\r\n").expect("request body").1)
+            .expect("restore body is JSON");
 
     assert!(
-        error.to_string().contains("conditional restore revision"),
-        "{error}"
+        !restore.contains("confirm_api_spec_deletion"),
+        "preservation must not use the destructive opt-in: {restore}"
     );
+
+    let ids = |section: &str| {
+        body[section]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|value| value["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids("upstreams"), vec!["repo-upstream", "spec-upstream"]);
+    assert_eq!(ids("proxies"), vec!["spec-proxy"]);
+    assert_eq!(ids("plugin_configs"), vec!["spec-plugin"]);
+
+    // Every tagged row names a spec that is present in `api_specs.items`, and
+    // that spec's owning proxy is present and carries the tag — the exact two
+    // directions ferrum-edge's restore validator checks.
+    assert_eq!(body["api_specs"]["items"][0]["id"], "spec-a");
+    assert_eq!(body["api_specs"]["items"][0]["proxy_id"], "spec-proxy");
+    for section in ["proxies", "upstreams", "plugin_configs"] {
+        for row in body[section].as_array().into_iter().flatten() {
+            if let Some(tag) = row["api_spec_id"].as_str() {
+                assert_eq!(tag, "spec-a", "{section}: {row}");
+            }
+        }
+    }
+
+    assert!(
+        !restore.contains("gateway_trust_bundles"),
+        "an absent trust section preserves the live roots: {restore}"
+    );
+}
+
+#[tokio::test]
+async fn full_replace_refuses_an_incomplete_spec_owned_graph_before_mutating() {
+    // The preservation path is only safe while the graph can be proven whole.
+    // A spec document whose tagged rows are missing from the same
+    // authoritative backup means the view is incomplete, not that the rows
+    // should be deleted.
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let error = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            spec_extras(&["spec-a"]),
+        )])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("spec-a"), "{error}");
     assert!(
         requests
             .lock()
             .unwrap()
             .iter()
             .all(|request| !request.contains("POST /restore")),
-        "a stale API-spec graph must never be replayed"
+        "an unprovable graph must never reach /restore"
     );
 }
 
@@ -1440,7 +1689,11 @@ async fn later_namespace_restore_validation_fails_before_any_namespace_is_mutate
 }
 
 #[tokio::test]
-async fn exact_spec_owned_conflict_blocks_unrelated_incremental_writes() {
+async fn a_spec_owned_conflict_blocks_only_the_conflicting_namespace() {
+    // Two owners writing one row is a correctness problem in *that* namespace.
+    // Stopping every other namespace turned one team's mis-declared proxy into
+    // an outage for everybody sharing the environment, so the block is scoped
+    // and reported as a per-namespace error — the run still exits non-zero.
     let desired_proxy = proxy("shared", "alpha", None);
     let mut spec_proxy = desired_proxy.clone();
     spec_proxy.api_spec_id = Some("spec-a".to_string());
@@ -1459,10 +1712,18 @@ async fn exact_spec_owned_conflict_blocks_unrelated_incremental_writes() {
         ),
         ("beta".to_string(), GatewayConfig::default()),
     ]);
-    let (url, requests) = spawn_recording_gateway(vec![]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /batch".into(),
+            200,
+            r#"{"created":{"upstreams":1}}"#.into(),
+            vec![],
+        ),
+    ]);
     let client = stub_client(url);
 
-    let error = apply_api(
+    let result = apply_api(
         &desired,
         &client,
         &["alpha".to_string(), "beta".to_string()],
@@ -1472,10 +1733,41 @@ async fn exact_spec_owned_conflict_blocks_unrelated_incremental_writes() {
         &ApplyOptions::default(),
     )
     .await
-    .unwrap_err();
+    .expect("the conflict rides on the result as a per-namespace error");
 
-    assert!(error.to_string().contains("API-spec-owned"), "{error}");
-    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].starts_with("[alpha]"),
+        "{:?}",
+        result.errors
+    );
+    assert!(
+        result.errors[0].contains("API-spec-owned"),
+        "{:?}",
+        result.errors
+    );
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+
+    assert_eq!(result.created, 1, "beta still reconciles");
+    assert_eq!(
+        result
+            .applied_incremental
+            .iter()
+            .map(|op| op.namespace.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta"],
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("x-ferrum-namespace: alpha")),
+        "nothing may be written to the conflicting namespace"
+    );
+
+    // ...and the run is still a failure.
+    assert!(result.into_result().is_err());
 }
 
 #[tokio::test]

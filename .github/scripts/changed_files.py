@@ -21,6 +21,7 @@ PATTERNS = {
     "declarative": re.compile(r"^(?:resources/|overlays/|\.gitforgeops/)"),
     "state": re.compile(r"^\.state/"),
 }
+GITHUB_PULL_FILES_LIMIT = 3_000
 
 
 class ChangedFilesError(RuntimeError):
@@ -53,7 +54,12 @@ def analyze(pages: Any, declared_count: int, area: str) -> dict[str, object]:
         "area": area,
         "declared_count": declared_count,
         "observed_count": observed_count,
-        "complete": observed_count == declared_count,
+        # GitHub's pull-files endpoint returns at most 3,000 entries. Treat an
+        # exact-limit response as ambiguous even if the PR object's
+        # `changed_files` count is also capped, so a hidden tail can never be
+        # mistaken for a complete snapshot.
+        "complete": observed_count == declared_count
+        and observed_count < GITHUB_PULL_FILES_LIMIT,
         "matches": bool(matched),
         "matched_paths": matched,
     }

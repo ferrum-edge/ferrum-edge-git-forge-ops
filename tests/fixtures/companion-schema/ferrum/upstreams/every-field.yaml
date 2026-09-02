@@ -1,0 +1,100 @@
+# Every field mirrored on `config::schema::Upstream`, including both health
+# check shapes, every backend-TLS knob, named subsets, and all four service
+# discovery provider sub-structs. A real upstream names one provider; naming
+# all four here is what makes this file cover every mirrored type.
+kind: Upstream
+spec:
+  id: every-field-upstream
+  name: Every Field Upstream
+  namespace: ferrum
+  targets:
+    - host: backend-a.example.test
+      port: 8443
+      weight: 3
+      tags:
+        zone: a
+        role: primary
+      locality: us-east-1/use1-az1/subzone-a
+      path: /v1
+    - host: backend-b.example.test
+      port: 8444
+      weight: 1
+      tags:
+        zone: b
+      locality: us-east-1/use1-az2/subzone-b
+      path: /v1
+  algorithm: consistent_hashing
+  hash_on: cookie
+  hash_on_cookie_config:
+    path: /
+    ttl_seconds: 1800
+    session_cookie: false
+    domain: example.test
+    http_only: true
+    secure: true
+    same_site: Lax
+  health_checks:
+    active:
+      http_path: /healthz
+      interval_seconds: 15
+      timeout_ms: 2000
+      healthy_threshold: 2
+      unhealthy_threshold: 4
+      healthy_status_codes: [200, 204]
+      use_tls: true
+      probe_type: grpc
+      udp_probe_payload: cGluZw==
+      grpc_service_name: grpc.health.v1.Health
+    passive:
+      unhealthy_status_codes: [500, 503]
+      unhealthy_threshold: 5
+      unhealthy_window_seconds: 60
+      healthy_after_seconds: 45
+      max_ejection_percent: 40
+      gateway_error_codes: [502, 504]
+      split_external_local_origin_errors: true
+  service_discovery:
+    provider: mesh
+    dns_sd:
+      service_name: _https._tcp.example.test
+      poll_interval_seconds: 20
+    kubernetes:
+      namespace: production
+      service_name: checkout
+      port_name: https
+      label_selector: app=checkout,tier=backend
+      poll_interval_seconds: 25
+    consul:
+      address: https://consul.example.test:8501
+      service_name: checkout
+      datacenter: dc1
+      tag: canary
+      healthy_only: true
+      token: consul-token-placeholder
+      poll_interval_seconds: 35
+    mesh:
+      service_name: checkout
+      namespace: ferrum
+      port: 8443
+      poll_interval_seconds: 40
+      topology: sidecar
+    max_stale_seconds: 300
+    stale_policy: fail_readiness
+    default_weight: 2
+  subsets:
+    - name: canary
+      labels:
+        release: canary
+    - name: stable
+      labels:
+        release: stable
+  backend_tls_client_cert_path: /etc/ferrum/tls/upstream-client.crt
+  backend_tls_client_key_path: /etc/ferrum/tls/upstream-client.key
+  backend_tls_verify_server_cert: true
+  backend_tls_server_ca_cert_path: /etc/ferrum/tls/upstream-ca.crt
+  backend_tls_sni: backend.internal.example.test
+  backend_tls_san_allow_list:
+    - backend.internal.example.test
+    - spiffe://mesh/ns/ferrum/sa/checkout
+  created_at: "2024-01-01T00:00:00Z"
+  updated_at: "2024-01-02T00:00:00Z"

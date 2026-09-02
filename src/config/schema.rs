@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -221,8 +221,14 @@ pub struct UpstreamTarget {
     pub port: u16,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// `BTreeMap`, not `HashMap`: this map is serialized straight into the
+    /// exported document and into every admin-API request body. `HashMap`
+    /// iteration order varies *per map instance* (`RandomState` re-seeds on
+    /// every `new`), so the same input would export different bytes on every
+    /// run — republishing the file-mode document (and costing a gateway
+    /// reload) for a configuration that never changed.
     #[serde(default)]
-    pub tags: HashMap<String, String>,
+    pub tags: BTreeMap<String, String>,
     /// Istio-style `region/zone/subzone` locality for this target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<String>,
@@ -237,8 +243,9 @@ pub struct UpstreamTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubsetDefinition {
     pub name: String,
+    /// Ordered for the same reason as [`UpstreamTarget::tags`].
     #[serde(default)]
-    pub labels: HashMap<String, String>,
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,6 +649,51 @@ pub enum PluginTriggerProtocol {
 
 // --- Top-level resources ---
 
+/// Unknown **top-level** `spec` fields a resource carried through unmodelled.
+///
+/// # Why a pass-through exists at all
+///
+/// The typed mirror is authoritative-by-rejection: a field it does not model is
+/// an error, which is what stops a typo from silently dropping out of desired
+/// state. The cost is that a gateway release adding a field breaks every repo
+/// that starts using it, with no remedy but a new gitforgeops release. The
+/// escape hatch is `FERRUM_ALLOW_UNKNOWN_FIELDS=true`: unknown *top-level*
+/// fields are kept verbatim in this map and travel through overlay merge,
+/// export, diff and apply untouched, letting the gateway — the authoritative
+/// schema — judge them.
+///
+/// # Why only top-level
+///
+/// A nested unknown field cannot be carried this way without mirroring
+/// `#[serde(flatten)]` onto every nested struct, which would turn each of them
+/// into a silent-accept surface and re-open the original bug at depth. Nested
+/// unknowns stay hard errors in both modes.
+///
+/// # Ownership
+///
+/// A key that appears only on the *live* side (a field a newer gateway invented
+/// and the repo never declared) is **not** drift: gitforgeops is not
+/// authoritative over fields it does not model and the repo does not name. Only
+/// a key the desired resource declares is compared. See
+/// `diff::resource_diff::compare_fields`.
+pub trait PassthroughFields {
+    fn passthrough(&self) -> &BTreeMap<String, serde_json::Value>;
+}
+
+macro_rules! impl_passthrough_fields {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl PassthroughFields for $type {
+                fn passthrough(&self) -> &BTreeMap<String, serde_json::Value> {
+                    &self.extra
+                }
+            }
+        )+
+    };
+}
+
+impl_passthrough_fields!(Proxy, Consumer, Upstream, PluginConfig);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proxy {
     #[serde(default)]
@@ -779,6 +831,13 @@ pub struct Proxy {
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,14 +849,25 @@ pub struct Consumer {
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_id: Option<String>,
+    /// Credential type → array of entries. Ordered for the same reason as
+    /// [`UpstreamTarget::tags`], with a second one: the credential broker
+    /// walks this map to derive slot names, and a stable walk keeps the
+    /// per-run ordering of allocations and of the review comment reproducible.
     #[serde(default)]
-    pub credentials: HashMap<String, serde_json::Value>,
+    pub credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub acl_groups: Vec<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,6 +913,13 @@ pub struct Upstream {
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -871,6 +948,13 @@ pub struct PluginConfig {
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 // --- Root config ---

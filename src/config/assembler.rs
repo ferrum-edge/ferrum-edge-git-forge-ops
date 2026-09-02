@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::schema::{BackendScheme, GatewayConfig, MeshConfigSpec, Resource};
-use super::strict;
+use super::strict::{self, LoadOptions};
 
 /// Everything one load+assemble pass produces.
 ///
@@ -450,6 +450,19 @@ pub fn apply_overlay(
     base: &mut [(String, Resource)],
     overlay_dir: &Path,
 ) -> crate::error::Result<()> {
+    apply_overlay_with_options(base, overlay_dir, LoadOptions::STRICT)
+}
+
+/// [`apply_overlay`] with an explicit unknown-field policy.
+///
+/// The merged document is re-validated through the strict loader, so an overlay
+/// is free to *set* an unknown top-level field (or override one the base
+/// declared) on exactly the same terms as the base tree.
+pub fn apply_overlay_with_options(
+    base: &mut [(String, Resource)],
+    overlay_dir: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<()> {
     let root_metadata = match std::fs::symlink_metadata(overlay_dir) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -534,7 +547,7 @@ pub fn apply_overlay(
                 let base_value = serde_json::to_value(&*base_resource)?;
                 let merged =
                     deep_merge_values(base_value, overlay.value, &mut Vec::new(), overlay.kind);
-                *base_resource = strict::resource_from_json_value(merged, &overlay.path)?;
+                *base_resource = strict::resource_from_json_value(merged, &overlay.path, options)?;
 
                 if *base_ns == "ferrum" && overlay_key.namespace != "ferrum" {
                     *base_ns = overlay_key.namespace;
@@ -719,6 +732,7 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
                             source,
                         }
                     })?;
+                strict::reject_non_string_keys(&yaml_value, &path)?;
                 let json_value: serde_json::Value =
                     serde_json::to_value(yaml_value).map_err(crate::error::Error::SerdeJson)?;
                 let object = json_value.as_object().ok_or_else(|| {

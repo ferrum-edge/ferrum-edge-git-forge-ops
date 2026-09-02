@@ -30,7 +30,7 @@ fn admin_client_rejects_client_cert_without_key() {
     env.client_cert = Some("dummy".to_string());
     env.client_key = None;
 
-    let err = match AdminClient::new(&env) {
+    let err = match AdminClient::new_scoped(&env, TEST_NAMESPACES) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
@@ -46,7 +46,7 @@ fn admin_client_rejects_client_key_without_cert() {
     env.client_cert = None;
     env.client_key = Some("dummy".to_string());
 
-    let err = match AdminClient::new(&env) {
+    let err = match AdminClient::new_scoped(&env, TEST_NAMESPACES) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
@@ -61,7 +61,7 @@ fn admin_client_rejects_short_jwt_secret() {
     let mut env = base_env();
     env.admin_jwt_secret = Some("too-short".to_string());
 
-    let err = match AdminClient::new(&env) {
+    let err = match AdminClient::new_scoped(&env, TEST_NAMESPACES) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
@@ -74,7 +74,7 @@ fn admin_client_rejects_short_jwt_secret() {
 #[test]
 fn admin_client_builds_without_mtls() {
     let env = base_env();
-    AdminClient::new(&env).expect("client should build without mTLS");
+    AdminClient::new_scoped(&env, TEST_NAMESPACES).expect("client should build without mTLS");
 }
 
 #[test]
@@ -82,7 +82,8 @@ fn admin_client_honors_custom_timeouts() {
     let mut env = base_env();
     env.gateway_connect_timeout_secs = 3;
     env.gateway_request_timeout_secs = 15;
-    AdminClient::new(&env).expect("client should build with custom timeouts");
+    AdminClient::new_scoped(&env, TEST_NAMESPACES)
+        .expect("client should build with custom timeouts");
 }
 
 #[tokio::test]
@@ -110,7 +111,7 @@ async fn admin_client_get_backup_sends_namespace_and_bearer_token() {
 
     let mut env = base_env();
     env.gateway_url = Some(format!("http://{addr}"));
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let backup = client.get_backup("team-alpha").await.unwrap();
     assert!(backup.proxies.is_empty());
@@ -166,7 +167,7 @@ async fn scoped_admin_client_mints_the_resolved_namespace_claim() {
 #[tokio::test]
 async fn admin_client_rejects_unsafe_resource_ids_in_paths() {
     let env = base_env();
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let err = client
         .delete_proxy("../consumers/victim?confirm=true", "team-alpha")
@@ -200,7 +201,7 @@ async fn admin_client_accepts_safe_resource_id_in_paths() {
 
     let mut env = base_env();
     env.gateway_url = Some(format!("http://{addr}"));
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let outcome = client
         .delete_proxy("proxy-01._~A", "team-alpha")
@@ -269,7 +270,7 @@ fn resource_ids_that_escape_the_path_segment_are_rejected() {
 #[tokio::test]
 async fn admin_client_rejects_ids_over_the_length_limit() {
     let env = base_env();
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let too_long = "a".repeat(255);
     let err = client.delete_proxy(&too_long, "team-alpha").await;
@@ -530,6 +531,13 @@ fn spawn_stub_gateway(routes: Vec<(&'static str, u16, &'static str)>) -> String 
     format!("http://{addr}")
 }
 
+/// Namespace scope every test client is built with.
+///
+/// `AdminClient::new_scoped` is the only public constructor, so tests declare
+/// a scope like production call sites do. The stub gateways ignore the token,
+/// but this keeps the tests honest about the constructor's contract.
+const TEST_NAMESPACES: [&str; 5] = ["team-alpha", "team-a", "team-b", "ferrum", "alpha"];
+
 fn stub_env(url: String) -> EnvConfig {
     let mut env = base_env();
     env.gateway_url = Some(url);
@@ -564,7 +572,7 @@ async fn connection_drop_after_create_delivery_is_not_replayed() {
 
     let mut env = stub_env(format!("http://{addr}"));
     env.gateway_max_retries = 1;
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
     let upstream: Upstream = serde_json::from_value(serde_json::json!({
         "id": "u1",
         "namespace": "team-alpha",
@@ -608,7 +616,7 @@ async fn connection_drop_after_restore_delivery_is_an_ambiguous_mutation() {
     });
 
     let env = stub_env(format!("http://{addr}"));
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
     let error = client
         .post_restore(
             &GatewayConfig::default(),
@@ -637,7 +645,7 @@ async fn delete_reports_a_404_as_already_gone() {
         404,
         r#"{"error":"not found"}"#,
     )]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let outcome = client.delete_upstream("u1", "team-alpha").await.unwrap();
     assert_eq!(outcome, DeleteOutcome::NotFound);
@@ -656,7 +664,7 @@ async fn unclassified_mutation_403_is_upgraded_via_health() {
             r#"{"status":"degraded","mode":"database","admin_writes_enabled":false}"#,
         ),
     ]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
     assert!(
@@ -683,7 +691,7 @@ async fn a_403_on_a_writable_gateway_stays_a_plain_api_error() {
             r#"{"status":"ok","mode":"database","admin_writes_enabled":true}"#,
         ),
     ]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
     assert!(
@@ -700,7 +708,7 @@ async fn the_health_recheck_is_best_effort() {
         ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
         ("GET /health", 500, r#"{"error":"boom"}"#),
     ]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
     assert!(
@@ -759,7 +767,9 @@ async fn admin_mutations_reject_redirects_without_following_them() {
         .unwrap();
     });
 
-    let client = AdminClient::new(&stub_env(format!("http://{source_addr}"))).unwrap();
+    let client =
+        AdminClient::new_scoped(&stub_env(format!("http://{source_addr}")), TEST_NAMESPACES)
+            .unwrap();
     let upstream: Upstream = serde_json::from_value(serde_json::json!({
         "id": "u1",
         "namespace": "team-alpha",
@@ -777,6 +787,15 @@ async fn admin_mutations_reject_redirects_without_following_them() {
         ),
         "{error:?}"
     );
+    // A bare "API error (307)" told the operator nothing. The one thing they
+    // need is where the admin API actually lives.
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("http://{target_addr}/captured")),
+        "the Location must be named: {message}"
+    );
+    assert!(message.contains("FERRUM_GATEWAY_URL"), "{message}");
+    assert!(message.contains("never follows redirects"), "{message}");
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(
         target_rx.try_recv().is_err(),
@@ -891,6 +910,18 @@ fn applied_false_maps_to_committed_not_live() {
 }
 
 #[test]
+fn a_redirect_without_a_location_still_explains_itself() {
+    let error = map_api_error(301, "", RequestKind::Read);
+    let message = error.to_string();
+    assert!(matches!(
+        error,
+        gitforgeops::error::Error::ApiError { status: 301, .. }
+    ));
+    assert!(message.contains("no usable `Location` header"), "{message}");
+    assert!(message.contains("FERRUM_GATEWAY_URL"), "{message}");
+}
+
+#[test]
 fn payload_too_large_names_the_limit_knob() {
     let err = map_api_error(413, r#"{"error":"body too large"}"#, RequestKind::Restore);
     assert!(err
@@ -912,10 +943,31 @@ fn backup_extras() -> BackupExtras {
 }
 
 #[test]
-fn restore_body_rejects_nonempty_api_specs_and_never_replays_trust_bundles() {
+fn restore_body_carries_the_api_spec_section_and_never_replays_trust_bundles() {
+    // ferrum-edge validates `api_specs.items` against the tagged rows in the
+    // same payload and rejects either half on its own, so the section has to
+    // travel with the spec-owned graph the caller merged into the config.
     let extras = backup_extras();
+    let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
+    assert_eq!(
+        body.get("api_specs"),
+        extras.api_specs.as_ref(),
+        "the live section must be forwarded verbatim"
+    );
+    assert!(
+        body.get("gateway_trust_bundles").is_none(),
+        "an absent trust section preserves the live roots without a lost-update window"
+    );
+}
+
+#[test]
+fn restore_body_rejects_a_malformed_api_spec_section() {
+    let extras = BackupExtras {
+        api_specs: Some(serde_json::json!({"section_version": "2"})),
+        ..Default::default()
+    };
     let error = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap_err();
-    assert!(error.to_string().contains("conditional restore revision"));
+    assert!(error.to_string().contains("`items` array"), "{error}");
 }
 
 #[test]
@@ -1085,9 +1137,15 @@ fn backup_snapshot_rejects_missing_malformed_and_mismatched_count_seals() {
     }
 }
 
+/// Import decodes strictly: the document becomes the repository's permanent
+/// desired state, so a seal that disagrees means it may be truncated.
+fn import_decode(body: &str) -> gitforgeops::error::Result<BackupSnapshot> {
+    BackupSnapshot::from_value(serde_json::from_str(body).expect("valid json"))
+}
+
 #[test]
 fn backup_snapshot_validates_file_resource_count_seal() {
-    let error = BackupSnapshot::from_body(
+    let error = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1103,7 +1161,7 @@ fn backup_snapshot_validates_file_resource_count_seal() {
 
 #[test]
 fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
-    let snapshot = BackupSnapshot::from_body(
+    let snapshot = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1115,7 +1173,7 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
     .unwrap();
     assert_eq!(snapshot.resource_counts.unwrap()["upstreams"], 0);
 
-    let error = BackupSnapshot::from_body(
+    let error = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1135,7 +1193,7 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
         "{error}"
     );
 
-    let error = BackupSnapshot::from_body(
+    let error = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1147,6 +1205,67 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("resource_counts.upstreams"), "{error}");
+}
+
+/// F4: the count seal is metadata no live decision is made from, and it is
+/// emitted by a gateway build this one does not control. A live `GET /backup`
+/// that disagrees must not take `diff`/`plan`/`apply`/drift-check down — it
+/// records the disagreement, drops the seal, and hands over the resources.
+#[test]
+fn live_backup_reads_downgrade_count_seal_mismatches_to_advisories() {
+    for body in [
+        // A gateway that omits `counts.upstreams` entirely.
+        r#"{
+            "version": "1",
+            "counts": {"proxies": 0, "consumers": 0, "plugin_configs": 0},
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+        // A cached-fallback export that elides api_specs but keeps its count.
+        r#"{
+            "version": "1",
+            "counts": {
+                "proxies": 0, "consumers": 0, "plugin_configs": 0, "upstreams": 0,
+                "api_specs": 3
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+        // An outright mismatch on a managed kind.
+        r#"{
+            "version": "1",
+            "resource_counts": {
+                "proxies": 0, "consumers": 7, "plugin_configs": 0, "upstreams": 0
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    ] {
+        let snapshot = BackupSnapshot::from_body(body).expect("live read must not fail");
+        assert!(
+            !snapshot.seal_violations.is_empty(),
+            "the disagreement must still be recorded: {body}"
+        );
+        assert!(snapshot.seal_violation_notice().is_some());
+        // A seal that disagrees is discarded rather than half-retained.
+        assert!(snapshot.counts.is_none() || snapshot.resource_counts.is_none());
+
+        // The same document is refused outright on the import path.
+        assert!(import_decode(body).is_err(), "{body}");
+    }
+}
+
+/// An agreeing seal still round-trips on a live read.
+#[test]
+fn live_backup_reads_keep_a_seal_that_agrees() {
+    let snapshot = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "counts": {"proxies": 0, "consumers": 0, "plugin_configs": 0, "upstreams": 0},
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    )
+    .unwrap();
+
+    assert!(snapshot.seal_violations.is_empty());
+    assert_eq!(snapshot.counts.unwrap()["proxies"], 0);
 }
 
 #[test]
@@ -1166,6 +1285,87 @@ fn backup_snapshot_does_not_copy_opaque_count_values_into_import_metadata() {
     let retained = snapshot.counts.unwrap();
     assert!(retained.get("future_private_note").is_none(), "{retained}");
     assert_eq!(retained["proxies"], 0);
+}
+
+/// A realistic, complete `GET /backup` body: every top-level section
+/// ferrum-edge's `BackupPayload` can emit, populated the way a namespace with
+/// both repo-owned and API-spec-owned resources actually looks.
+const FULL_BACKUP: &str = include_str!("../fixtures/backup/full-backup.json");
+
+#[test]
+fn a_complete_gateway_backup_has_no_unsupported_sections() {
+    // `KNOWN_TOP_LEVEL` is what decides whether full replace is possible at
+    // all, and it fails closed. Pin it to a whole real envelope so a section
+    // added to the companion's `BackupPayload` shows up here as a red test
+    // rather than as a refused `full_replace` in somebody's pipeline.
+    let snapshot = BackupSnapshot::from_body(FULL_BACKUP).expect("fixture parses");
+
+    assert!(
+        snapshot.extras.unsupported_sections.is_empty(),
+        "unrecognized backup section(s): {:?}",
+        snapshot.extras.unsupported_sections
+    );
+
+    assert_eq!(snapshot.ferrum_version.as_deref(), Some("2.9.1"));
+    assert_eq!(snapshot.source.as_deref(), Some("database"));
+    assert!(!snapshot.cached);
+
+    assert_eq!(snapshot.config.proxies.len(), 2);
+    assert_eq!(snapshot.config.consumers.len(), 1);
+    assert_eq!(snapshot.config.plugin_configs.len(), 2);
+    assert_eq!(snapshot.config.upstreams.len(), 2);
+    assert_eq!(snapshot.extras.api_spec_count(), 1);
+    assert_eq!(snapshot.extras.trust_bundle_count(), 1);
+
+    // The ownership tags are what full replace has to carry through; losing
+    // them in the permissive schema would silently hand the spec importer's
+    // rows to the prune path.
+    assert_eq!(
+        snapshot
+            .config
+            .proxies
+            .iter()
+            .filter_map(|proxy| proxy.api_spec_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["spec-orders"]
+    );
+    assert_eq!(
+        snapshot
+            .config
+            .upstreams
+            .iter()
+            .filter_map(|upstream| upstream.api_spec_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["spec-orders"]
+    );
+    assert_eq!(
+        snapshot
+            .config
+            .plugin_configs
+            .iter()
+            .filter_map(|plugin| plugin.api_spec_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["spec-orders"]
+    );
+}
+
+#[test]
+fn a_complete_gateway_backup_round_trips_into_a_restore_body() {
+    let snapshot = BackupSnapshot::from_body(FULL_BACKUP).expect("fixture parses");
+    let body = build_restore_body(&snapshot.config, &snapshot.extras, false).unwrap();
+
+    // Every section `/restore` accepts, and nothing it does not.
+    assert_eq!(body["api_specs"]["items"][0]["id"], "spec-orders");
+    assert!(body.get("gateway_trust_bundles").is_none());
+    for section in [
+        "version",
+        "proxies",
+        "consumers",
+        "plugin_configs",
+        "upstreams",
+    ] {
+        assert!(body.get(section).is_some(), "missing {section}");
+    }
 }
 
 #[test]

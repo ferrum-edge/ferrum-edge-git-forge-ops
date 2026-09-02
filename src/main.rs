@@ -136,6 +136,15 @@ fn resolve_runtime(
     let env_config = config::load_env_config()?;
     let repo = load_repo_config()?;
     let resolved = resolve_env(repo.as_ref(), &env_config, explicit_env)?;
+    // Up front, before any resource file is read: a configured overlay that is
+    // not in the tree is a repository mistake, and the error should name the
+    // environment and the file that selected it rather than surfacing from the
+    // middle of the assembly pipeline.
+    config::validate_overlay_selection(
+        &resolved,
+        repo.as_ref(),
+        &PathBuf::from(config::OVERLAYS_ROOT),
+    )?;
     Ok((env_config, resolved, repo))
 }
 
@@ -146,13 +155,21 @@ fn resolve_runtime(
 /// `validate`, `plan`, `export` and file-mode `apply` also act on `.mesh`.
 fn load_and_assemble_all(
     resolved: &ResolvedEnv,
+    env_config: &EnvConfig,
 ) -> Result<config::AssembledOutput, Box<dyn std::error::Error>> {
+    // Fail-closed unless the operator explicitly set
+    // FERRUM_ALLOW_UNKNOWN_FIELDS. The policy is resolved once, here, and
+    // threaded down rather than read from the process environment inside the
+    // parse loop.
+    let load_options = config::LoadOptions {
+        allow_unknown_fields: env_config.allow_unknown_fields,
+    };
     let resources_dir = PathBuf::from("./resources");
-    let mut resources = config::load_resources(&resources_dir)?;
+    let mut resources = config::load_resources_with_options(&resources_dir, load_options)?;
 
     if let Some(ref overlay_name) = resolved.overlay {
-        let overlay_dir = PathBuf::from("./overlays").join(overlay_name);
-        config::apply_overlay(&mut resources, &overlay_dir)?;
+        let overlay_dir = PathBuf::from(config::OVERLAYS_ROOT).join(overlay_name);
+        config::apply_overlay_with_options(&mut resources, &overlay_dir, load_options)?;
     }
 
     // The namespace filter is applied to mesh fragments during assembly (a
@@ -180,8 +197,9 @@ fn load_and_assemble_all(
 /// `rotate` have nothing to do with it.
 fn load_and_assemble_for(
     resolved: &ResolvedEnv,
+    env_config: &EnvConfig,
 ) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
-    Ok(load_and_assemble_all(resolved)?.gateway)
+    Ok(load_and_assemble_all(resolved, env_config)?.gateway)
 }
 
 fn load_credential_bundles(
@@ -243,6 +261,19 @@ fn resolve_credentials(
         &bundle,
         secrets::ResolveOptions::allowing_slot_remap(true),
     )?)
+}
+
+/// Is a credential bundle available to this invocation?
+///
+/// Without one, every broker-controlled leaf stays a placeholder string while
+/// the live gateway returns either the real value or `[REDACTED]`, so a naive
+/// comparison reports permanent false drift on credentials nobody changed.
+/// `diff::mask_indeterminate_secret_values` neutralizes exactly those leaves;
+/// this predicate decides when to apply it.
+fn credential_bundle_loaded(env_config: &EnvConfig) -> bool {
+    let has_content = |value: Option<&str>| value.is_some_and(|raw| !raw.trim().is_empty());
+    has_content(env_config.creds_bundle_json_file.as_deref())
+        || has_content(env_config.creds_bundle_json.as_deref())
 }
 
 /// In `exclusive` mode, every resource in `desired` must live in a namespace
@@ -806,7 +837,7 @@ fn cmd_validate(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
     let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
@@ -864,7 +895,7 @@ async fn cmd_export(
     }
 
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
 
     if materialize {
@@ -971,14 +1002,15 @@ async fn cmd_diff(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
+    let bundle_loaded = credential_bundle_loaded(&env_config);
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces)?;
-    let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+    let mut namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
     let cached_namespaces = cached_namespace_names(&namespace_pairs);
     if !cached_namespaces.is_empty() {
         eprintln!(
@@ -992,6 +1024,20 @@ async fn cmd_diff(
             ))
             .into());
         }
+    }
+    // Same treatment `plan` and `review` give an unresolvable secret: with no
+    // bundle, a broker-controlled leaf is a placeholder here and a real (or
+    // `[REDACTED]`) value on the gateway, which compares as drift on every
+    // run and fails `drift-check.yml --exit-on-drift` forever. Literal
+    // siblings, extra entries, shape changes and every nonsecret field are
+    // still compared.
+    if !bundle_loaded && cached_namespaces.is_empty() {
+        for pair in &mut namespace_pairs {
+            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+        }
+        eprintln!(
+            "Note: no credential bundle is available, so unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from this comparison. Everything else is compared normally."
+        );
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
         &namespace_pairs,
@@ -1081,7 +1127,7 @@ async fn cmd_plan(
     allow_credential_slot_remap: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
     // Plan must see the same scope/validation errors as apply would hit, so
@@ -1098,16 +1144,7 @@ async fn cmd_plan(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = env_config
-        .creds_bundle_json_file
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || env_config
-            .creds_bundle_json
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
+    let bundle_loaded = credential_bundle_loaded(&env_config);
     println!("=== Environment ===");
     println!(
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
@@ -1330,7 +1367,7 @@ async fn cmd_apply(
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
 
@@ -1669,10 +1706,15 @@ async fn cmd_apply(
 
             // This boundary precedes every external credential write and
             // state journal mutation. It rejects read-only planes,
-            // API-spec ownership conflicts, unsupported restore sections,
-            // and every namespace's deterministic full-replace error before
-            // any unrelated side effect can occur. apply_api repeats the
-            // preflight immediately before its first gateway mutation.
+            // unsupported restore sections, and every namespace's
+            // deterministic full-replace error before any unrelated side
+            // effect can occur. apply_api repeats the preflight immediately
+            // before its first gateway mutation.
+            //
+            // A repo/spec ownership conflict is deliberately *not* one of
+            // these: it blocks its own namespace only, and surfaces as a
+            // per-namespace error during apply so the rest of the environment
+            // still reconciles.
             apply::preflight_api_apply(
                 &desired,
                 &client,
@@ -1690,14 +1732,30 @@ async fn cmd_apply(
             // Recover any create whose non-idempotent POST may have committed
             // before a prior process died. Pending rows are not deletion
             // authority: an exact desired row remains pending until the API
-            // target asserts ownership with an idempotent PUT. If the
-            // declaration disappeared while a row is live, reconciliation
-            // fails closed instead of guessing who created it.
+            // target asserts ownership with an idempotent PUT. A row that is
+            // live but no longer declared is forgotten and handed back to the
+            // ordinary ownership rules for the run's mode — the journal must
+            // never be able to wedge an environment, because CI is the only
+            // writer of `.state/<env>.json` and `state-guard.yml` blocks the
+            // hand edit that a fail-closed arm would demand.
+            let pending_scope = if matches!(
+                resolved.apply_strategy,
+                gitforgeops::config::ApplyStrategy::FullReplace
+            ) {
+                gitforgeops::state::PendingCreateScope::FullReplace
+            } else if matches!(resolved.ownership.mode, OwnershipMode::Shared) {
+                gitforgeops::state::PendingCreateScope::Shared
+            } else {
+                gitforgeops::state::PendingCreateScope::Exclusive
+            };
             let reconciled_pending =
-                state.reconcile_pending_creates(&desired, &actual_by_namespace)?;
+                state.reconcile_pending_creates(&desired, &actual_by_namespace, pending_scope);
+            for warning in &reconciled_pending.warnings {
+                eprintln!("Warning: {warning}");
+            }
             let reconciled_absent =
                 state.reconcile_absent_managed_resources(&desired, &actual_by_namespace);
-            if reconciled_pending + reconciled_absent > 0 {
+            if reconciled_pending.changed() || reconciled_absent > 0 {
                 state.save()?;
             }
             let managed = previously_managed(&resolved, &state);
@@ -1836,9 +1894,17 @@ async fn cmd_apply(
             // Write-ahead journal for non-idempotent creates. This must be
             // durable before the first POST, but it deliberately does not
             // grant deletion authority. A later authoritative backup either
-            // leads to an idempotent ownership assertion, leaves the pending
-            // Add retryable, or blocks if ownership is ambiguous.
-            if state.reserve_adds(&diffs, &desired)? > 0 {
+            // leads to an idempotent ownership assertion or leaves the pending
+            // Add retryable.
+            //
+            // `full_replace` is exempt: `/restore` is atomic per namespace and
+            // never consumes the journal, so writing keys there only creates
+            // entries a later run has to clean up.
+            if !matches!(
+                resolved.apply_strategy,
+                gitforgeops::config::ApplyStrategy::FullReplace
+            ) && state.reserve_adds(&diffs, &desired)? > 0
+            {
                 state.save()?;
             }
 
@@ -2088,6 +2154,11 @@ async fn cmd_import(
     if let Some(notice) = result.unmanaged_sections_notice() {
         println!("{notice}");
     }
+    // Loud and last, so it is the final thing on screen: these are the values
+    // gitforgeops could not classify and a human has to.
+    if let Some(notice) = result.custom_plugin_review_notice() {
+        eprintln!("{notice}");
+    }
 
     Ok(())
 }
@@ -2097,8 +2168,15 @@ async fn cmd_review(
     require_live: bool,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if require_live && pr.is_none() {
+        return Err(gitforgeops::error::Error::Config(
+            "review --require-live requires --pr so the result has a durable delivery target"
+                .to_string(),
+        )
+        .into());
+    }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
     // apply would produce.
@@ -2108,16 +2186,7 @@ async fn cmd_review(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = env_config
-        .creds_bundle_json_file
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || env_config
-            .creds_bundle_json
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
+    let bundle_loaded = credential_bundle_loaded(&env_config);
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_status, validation_output, validation_execution_error) = match &val_result {
@@ -2146,50 +2215,85 @@ async fn cmd_review(
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces);
 
-    let (diffs, breaking, unmanaged, spec_owned, comparison_error) = match &client {
-        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
-            Ok(mut namespace_pairs) => {
-                let cached = cached_namespace_names(&namespace_pairs);
-                if cached.is_empty() {
-                    if !bundle_loaded {
-                        for pair in &mut namespace_pairs {
-                            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+    let (diffs, breaking, unmanaged, spec_owned, comparison_error) = if let Some(error) =
+        review::live_comparison_precondition_error(&namespaces)
+    {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
+    } else {
+        match &client {
+            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+                // A `/backup` served from the gateway's in-memory snapshot
+                // is not the live view this review claims to publish, so
+                // the computed diff is dropped rather than presented as a
+                // comparison. `--require-live` fails on the recorded
+                // reason below. The per-namespace provenance is checked as
+                // well as the client's sticky flag so the reason can name
+                // exactly which namespaces came back cached.
+                Ok(mut namespace_pairs) => {
+                    let cached = cached_namespace_names(&namespace_pairs);
+                    match review::stale_live_view_error(c.served_from_cache() || !cached.is_empty())
+                    {
+                        Some(mut reason) => {
+                            if !cached.is_empty() {
+                                reason.push_str(&format!(
+                                    " Cached backup data was served for namespace(s) {}; API-spec ownership is unknown until the gateway configuration database recovers.",
+                                    cached.join(", ")
+                                ));
+                            }
+                            eprintln!("{reason}");
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
+                        }
+                        None => {
+                            // Same treatment `plan` and `diff` give an
+                            // unresolvable secret: with no bundle loaded a
+                            // broker-controlled leaf is still a placeholder
+                            // here and a real (or `[REDACTED]`) value on the
+                            // gateway, so comparing them would publish
+                            // permanent false drift — and echo the live value
+                            // into a world-readable PR comment.
+                            if !bundle_loaded {
+                                for pair in &mut namespace_pairs {
+                                    diff::mask_indeterminate_secret_values(
+                                        &desired,
+                                        &mut pair.actual,
+                                    );
+                                }
+                            }
+                            let (d, b, u, s) = compute_namespace_diffs(
+                                &namespace_pairs,
+                                managed.as_ref(),
+                                diff::DiffOptions::default(),
+                            );
+                            (d, b, u, s, None)
                         }
                     }
-                    let (d, b, u, s) = compute_namespace_diffs(
-                        &namespace_pairs,
-                        managed.as_ref(),
-                        diff::DiffOptions::default(),
-                    );
-                    (d, b, u, s, None)
-                } else {
+                }
+                // Unredacted on stderr only. The comment built below is
+                // posted to the PR and mirrored into the step summary, and
+                // a transport error's Display carries the gateway URL —
+                // an environment secret. See `review::redact_comparison_error`.
+                Err(e) => {
+                    eprintln!("Live gateway comparison failed: {e}");
                     (
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
-                        Some(format!(
-                            "Live gateway comparison skipped: cached backup data was served for namespace(s) {}. API-spec ownership is unknown until the gateway configuration database recovers.",
-                            cached.join(", ")
-                        )),
+                        Some(review::redact_comparison_error(&e)),
                     )
                 }
+            },
+            Err(e) => {
+                eprintln!("Live gateway comparison failed: {e}");
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Some(review::redact_comparison_error(e)),
+                )
             }
-            Err(e) => (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Some(format!("Live gateway comparison skipped: {}", e)),
-            ),
-        },
-        Err(e) => (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Some(format!("Live gateway comparison skipped: {}", e)),
-        ),
+        }
     };
 
     // security_findings was computed pre-resolve above; reuse it here.
@@ -2216,9 +2320,10 @@ async fn cmd_review(
         None => (Vec::new(), None, None),
     };
 
-    let ownership_note = format!(
-        "Environment: `{}` · Ownership: `{:?}` · Strategy: `{:?}`",
-        resolved.name, resolved.ownership.mode, resolved.apply_strategy
+    let ownership_note = review::environment_header(
+        &resolved.name,
+        &format!("{:?}", resolved.ownership.mode),
+        &format!("{:?}", resolved.apply_strategy),
     );
 
     let comment = review::build_review_comment_v2_with_status(
@@ -2239,6 +2344,7 @@ async fn cmd_review(
         bundle_loaded,
     );
 
+    let mut comment_delivery_error = None;
     match pr {
         Some(pr_number) => {
             // Fork PRs: GITHUB_TOKEN is downgraded to read-only by GitHub
@@ -2260,7 +2366,12 @@ async fn cmd_review(
                     );
                     write_review_to_step_summary(&comment)?;
                     print!("{}", comment);
-                    review::enforce_required_comment_delivery(require_live, &e.to_string())?;
+                    // Recorded rather than raised here: when the live
+                    // comparison also failed, that is the root cause and has
+                    // to be the reported one, and its gate only runs below.
+                    // `review::enforce_comment_delivery` then turns this into
+                    // the same hard failure `--require-live` demands.
+                    comment_delivery_error = Some(e.to_string());
                 }
             }
         }
@@ -2269,14 +2380,11 @@ async fn cmd_review(
         }
     }
 
-    if require_live {
-        if let Some(error) = comparison_error {
-            return Err(gitforgeops::error::Error::Config(format!(
-                "trusted PR review requires a complete live gateway comparison: {error}"
-            ))
-            .into());
-        }
-    }
+    // Order matters: a trusted review that could neither compare against the
+    // gateway nor post its comment reports the comparison failure, which is
+    // what the reviewer has to act on.
+    review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
+    review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
 
     let _ = !secret_report.results.is_empty();
     if let Some(error) = validation_execution_error {
@@ -2301,6 +2409,7 @@ fn cmd_envs(
             Some(r) => r.environment_scopes(),
             None => vec![gitforgeops::config::repo_config::EnvironmentScope {
                 environment: ResolvedEnv::default_env_name(),
+                live_review: false,
                 namespaces: None,
             }],
         };
@@ -2370,7 +2479,7 @@ async fn cmd_rotate(
         );
     }
 
-    let desired_for_check = load_and_assemble_for(&resolved)?;
+    let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
 
     // Preflight 1b: in exclusive mode, the same ownership-scope rules
     // apply/diff/plan/review enforce must apply here too. A manual rotate
@@ -2559,7 +2668,7 @@ async fn push_rotated_consumer_to_gateway(
         return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
     }
 
-    let mut desired = load_and_assemble_for(resolved)?;
+    let mut desired = load_and_assemble_for(resolved, env_config)?;
     let merged = secrets::merge_bundles(per_shard);
     // `rotate_and_deliver` just wrote the fresh value into the bundle; this
     // resolve picks it up for the consumer being pushed to the gateway.

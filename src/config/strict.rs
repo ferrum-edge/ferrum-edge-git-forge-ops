@@ -1,8 +1,38 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
 
-use super::schema::Resource;
+use super::schema::{PassthroughFields, Resource};
+
+/// How strictly one load pass treats fields the typed mirror does not model.
+///
+/// Fail-closed is the default and stays the default: `LoadOptions::default()`
+/// rejects every unknown field. The permissive variant is only ever reached by
+/// an operator setting `FERRUM_ALLOW_UNKNOWN_FIELDS=true`, and even then it
+/// only relaxes *top-level* `spec` fields — see
+/// [`super::schema::PassthroughFields`].
+///
+/// This is a parameter rather than a process-global read so that the parse path
+/// stays free of environment access: the flag is resolved once, in `main`, and
+/// threaded down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Keep unknown top-level `spec` fields verbatim instead of rejecting them.
+    pub allow_unknown_fields: bool,
+}
+
+impl LoadOptions {
+    /// The fail-closed default, spelled out at call sites that mean it.
+    pub const STRICT: Self = Self {
+        allow_unknown_fields: false,
+    };
+
+    /// Keep unknown top-level `spec` fields (`FERRUM_ALLOW_UNKNOWN_FIELDS`).
+    pub const ALLOW_UNKNOWN_FIELDS: Self = Self {
+        allow_unknown_fields: true,
+    };
+}
 
 pub(crate) const RESOURCE_SUBDIRECTORIES: [(&str, &str); 5] = [
     ("proxies", "Proxy"),
@@ -12,19 +42,36 @@ pub(crate) const RESOURCE_SUBDIRECTORIES: [(&str, &str); 5] = [
     ("mesh", "MeshConfig"),
 ];
 
-const NON_CONFIG_FILES: [&str; 4] = [
+pub(crate) const NON_CONFIG_FILES: [&str; 4] = [
     "README",
     "README.md",
     ".gitkeep",
     crate::import::IMPORT_MANIFEST_FILENAME,
 ];
 
+/// Files an operating system or file browser drops into a directory without
+/// anyone asking, which carry no configuration and cannot be authored away.
+///
+/// These are skipped **silently**, unlike the [`NON_CONFIG_FILES`] allowlist:
+/// there is nothing for an operator to fix, and a `.DS_Store` that Finder
+/// re-creates the moment the folder is opened must not be able to fail a
+/// validate-and-apply pipeline. Everything config-shaped — any `.y*ml`-ish,
+/// `.json`, `.toml`, or extensionless file — stays fatal, because a file that
+/// *looks* like a resource but is not loaded is how a typo turns into a prune.
+///
+/// Kept byte-identical to `NON_CONFIG_FILES` / `OS_ARTIFACT_FILES` in
+/// `.github/scripts/pr_input.py`; the two allowlists gate the same trees on
+/// either side of the trusted-review boundary, and a Python-side test
+/// cross-checks them against this file.
+pub(crate) const OS_ARTIFACT_FILES: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
+
 /// Decide whether a regular file inside a declarative configuration tree is
 /// an enabled resource document. Only lowercase `.yaml`/`.yml` is executable
 /// configuration. A leading underscore is the documented opt-out convention,
-/// and a small explicit non-configuration allowlist stays non-executable. Every
-/// other file fails closed so `api.YAML`, `api.yam`, or `api.yaml.bak` cannot be
-/// silently omitted from desired state and trigger a prune.
+/// a small explicit non-configuration allowlist stays non-executable, and
+/// well-known OS artifacts are ignored outright. Every other file fails closed
+/// so `api.YAML`, `api.yam`, or `api.yaml.bak` cannot be silently omitted from
+/// desired state and trigger a prune.
 pub(crate) fn enabled_yaml_file(path: &Path, tree_name: &str) -> crate::error::Result<bool> {
     let file_name = path
         .file_name()
@@ -35,7 +82,10 @@ pub(crate) fn enabled_yaml_file(path: &Path, tree_name: &str) -> crate::error::R
                 path.display()
             ))
         })?;
-    if file_name.starts_with('_') || NON_CONFIG_FILES.contains(&file_name) {
+    if file_name.starts_with('_')
+        || NON_CONFIG_FILES.contains(&file_name)
+        || OS_ARTIFACT_FILES.contains(&file_name)
+    {
         return Ok(false);
     }
 
@@ -45,9 +95,10 @@ pub(crate) fn enabled_yaml_file(path: &Path, tree_name: &str) -> crate::error::R
     }
 
     Err(crate::error::Error::Config(format!(
-        "unsupported file in {tree_name}: {} (configuration must use lowercase .yaml or .yml; intentionally disabled files must start with '_'; non-configuration files are limited to README, README.md, .gitkeep, or {})",
+        "unsupported file in {tree_name}: {} (configuration must use lowercase .yaml or .yml; intentionally disabled files must start with '_'; non-configuration files are limited to README, README.md, .gitkeep, {}, or an OS artifact: {})",
         path.display(),
         crate::import::IMPORT_MANIFEST_FILENAME,
+        OS_ARTIFACT_FILES.join(", "),
     )))
 }
 
@@ -147,14 +198,96 @@ pub(crate) fn resource_kind(resource: &Resource) -> &'static str {
 /// `serde_ignored`. Direct concrete deserialization is important:
 /// `#[serde(tag = "kind")]` buffers enum contents before the ignored-field
 /// adapter sees them, which would recreate the original silent-drop bug.
-pub(crate) fn resource_from_yaml(contents: &str, path: &Path) -> crate::error::Result<Resource> {
+pub(crate) fn resource_from_yaml(
+    contents: &str,
+    path: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<Resource> {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str(contents).map_err(|source| crate::error::Error::YamlParse {
             path: path.to_path_buf(),
             source,
         })?;
+    reject_non_string_keys(&yaml, path)?;
     let value = serde_json::to_value(yaml)?;
-    resource_from_json_value(value, path)
+    resource_from_json_value(value, path, options)
+}
+
+/// Reject YAML mapping keys that are not strings, naming the mapping they
+/// appear in.
+///
+/// Every document takes a `serde_yaml::Value` → `serde_json::Value` hop before
+/// it is deserialized, and the opaque islands gitforgeops carries verbatim
+/// (a `PluginConfig.config`, a `Consumer.credentials` entry, a mesh workload)
+/// are *JSON* values on the far side of it. JSON has string keys only, so a
+/// YAML `2019: …` or `true: …` key is silently rewritten to `"2019"` / `"true"`
+/// on the way through — a quiet change of meaning in exactly the sections
+/// gitforgeops promises not to interpret. Rejecting them keeps "opaque" honest:
+/// what survives the hop is JSON-shaped, and anything that would not survive it
+/// is an error the author sees, not a rewrite they do not.
+pub(crate) fn reject_non_string_keys(
+    value: &serde_yaml::Value,
+    source_path: &Path,
+) -> crate::error::Result<()> {
+    let mut path = String::new();
+    walk_yaml_keys(value, &mut path, source_path)
+}
+
+fn walk_yaml_keys(
+    value: &serde_yaml::Value,
+    path: &mut String,
+    source_path: &Path,
+) -> crate::error::Result<()> {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            for (key, child) in mapping {
+                let serde_yaml::Value::String(name) = key else {
+                    let location = if path.is_empty() {
+                        "the document root".to_string()
+                    } else {
+                        format!("`{path}`")
+                    };
+                    return Err(crate::error::Error::Config(format!(
+                        "resource file {} has a non-string mapping key ({}) in {location}; \
+                         configuration is JSON-shaped and only string keys survive parsing — \
+                         quote the key to keep it",
+                        source_path.display(),
+                        describe_yaml_key(key),
+                    )));
+                };
+                let restore = path.len();
+                path.push('.');
+                path.push_str(name);
+                walk_yaml_keys(child, path, source_path)?;
+                path.truncate(restore);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let restore = path.len();
+                path.push('[');
+                path.push_str(&index.to_string());
+                path.push(']');
+                walk_yaml_keys(item, path, source_path)?;
+                path.truncate(restore);
+            }
+        }
+        serde_yaml::Value::Tagged(tagged) => walk_yaml_keys(&tagged.value, path, source_path)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn describe_yaml_key(key: &serde_yaml::Value) -> String {
+    match key {
+        serde_yaml::Value::Null => "null".to_string(),
+        serde_yaml::Value::Bool(value) => format!("boolean `{value}`"),
+        serde_yaml::Value::Number(value) => format!("number `{value}`"),
+        serde_yaml::Value::Sequence(_) => "a sequence".to_string(),
+        serde_yaml::Value::Mapping(_) => "a mapping".to_string(),
+        serde_yaml::Value::Tagged(tagged) => format!("a `{}`-tagged value", tagged.tag),
+        serde_yaml::Value::String(value) => format!("string `{value}`"),
+    }
 }
 
 /// Strictly deserialize a complete resource wrapper, including a fully merged
@@ -162,6 +295,7 @@ pub(crate) fn resource_from_yaml(contents: &str, path: &Path) -> crate::error::R
 pub(crate) fn resource_from_json_value(
     value: serde_json::Value,
     source_path: &Path,
+    options: LoadOptions,
 ) -> crate::error::Result<Resource> {
     let object = value.as_object().ok_or_else(|| {
         crate::error::Error::Config(format!(
@@ -197,16 +331,16 @@ pub(crate) fn resource_from_json_value(
 
     match kind {
         "Proxy" => Ok(Resource::Proxy {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "Consumer" => Ok(Resource::Consumer {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "Upstream" => Ok(Resource::Upstream {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "PluginConfig" => Ok(Resource::PluginConfig {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "MeshConfig" => {
             let id = match object.get("id") {
@@ -229,6 +363,55 @@ pub(crate) fn resource_from_json_value(
             path: source_path.to_path_buf(),
         }),
     }
+}
+
+/// [`deserialize_spec`] for the four gateway kinds, which additionally carry a
+/// `#[serde(flatten)]` map of unknown top-level fields.
+///
+/// `serde_ignored` never sees those: `flatten` captures an unrecognized key
+/// into the map instead of asking the deserializer to ignore it. That is the
+/// mechanism the pass-through relies on, and also why the fail-closed check has
+/// to live here rather than in `reject_ignored` — the map is the only place an
+/// unknown top-level field shows up. Nested unknowns are unaffected: known
+/// fields are still deserialized straight from the map access, so
+/// `serde_ignored` reports anything ignored inside them exactly as before.
+fn deserialize_gateway_spec<T: DeserializeOwned + PassthroughFields>(
+    value: serde_json::Value,
+    source_path: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<T> {
+    let parsed: T = deserialize_spec(value, source_path)?;
+    check_passthrough_fields(parsed.passthrough(), source_path, options)?;
+    Ok(parsed)
+}
+
+/// Fail closed on unknown top-level `spec` fields, or announce them loudly when
+/// the operator has opted into carrying them.
+fn check_passthrough_fields(
+    extra: &BTreeMap<String, serde_json::Value>,
+    source_path: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<()> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+
+    let fields: Vec<String> = extra.keys().map(|key| format!(".spec.{key}")).collect();
+    if !options.allow_unknown_fields {
+        return reject_ignored(source_path, fields);
+    }
+
+    // stderr, never stdout: `gitforgeops export` writes the assembled YAML to
+    // stdout and a warning interleaved into it would corrupt the document.
+    eprintln!(
+        "Warning: {}: {} unknown top-level field(s) kept verbatim because \
+         FERRUM_ALLOW_UNKNOWN_FIELDS is set: {}. gitforgeops does not model these — the gateway \
+         is the authority on whether they are valid.",
+        source_path.display(),
+        fields.len(),
+        fields.join(", "),
+    );
+    Ok(())
 }
 
 fn deserialize_spec<T: DeserializeOwned>(

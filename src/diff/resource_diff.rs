@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::config::schema::PassthroughFields;
 use crate::config::GatewayConfig;
 
 /// Exclude only unresolved broker-controlled leaves from a live comparison
@@ -342,7 +343,7 @@ struct CollectionContext<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn diff_collection<T: serde::Serialize>(
+fn diff_collection<T: serde::Serialize + PassthroughFields>(
     desired: &[T],
     actual: &[T],
     kind: &str,
@@ -376,7 +377,7 @@ fn diff_collection<T: serde::Serialize>(
                     });
                     continue;
                 }
-                let details = compare_fields(desired_res, actual_res);
+                let details = compare_fields(*desired_res, *actual_res);
                 if !details.is_empty() {
                     result.diffs.push(ResourceDiff {
                         action: DiffAction::Modify,
@@ -467,7 +468,22 @@ fn diff_collection<T: serde::Serialize>(
     }
 }
 
-fn compare_fields<T: serde::Serialize>(desired: &T, actual: &T) -> Vec<FieldChange> {
+/// Field-level delta between one desired and one live resource.
+///
+/// Unknown top-level fields (`config::schema::PassthroughFields`) are part of
+/// the comparison in one direction only. A key the *repo* declares is compared
+/// like any other field: declaring it is how a repo takes ownership of it, and
+/// export/apply push it. A key that only the *live* resource carries — a field
+/// a newer gateway invented that this client does not model and the repo never
+/// named — is skipped. Reporting it would turn every gateway upgrade into
+/// permanent, unfixable drift on every resource: `apply` cannot clear it (the
+/// gateway re-adds its own field) and `drift-check --exit-on-drift` would never
+/// go green again. Same rule as unmanaged resources: what the repo never
+/// claimed, the repo does not reconcile.
+fn compare_fields<T: serde::Serialize + PassthroughFields>(
+    desired: &T,
+    actual: &T,
+) -> Vec<FieldChange> {
     let desired_val = serde_json::to_value(desired).unwrap_or_default();
     let actual_val = serde_json::to_value(actual).unwrap_or_default();
 
@@ -495,6 +511,10 @@ fn compare_fields<T: serde::Serialize>(desired: &T, actual: &T) -> Vec<FieldChan
 
         for (key, a_val) in a_map {
             if key == "created_at" || key == "updated_at" {
+                continue;
+            }
+            // Live-only unmodelled field the repo never declared — not drift.
+            if actual.passthrough().contains_key(key) && !desired.passthrough().contains_key(key) {
                 continue;
             }
             if !d_map.contains_key(key) {

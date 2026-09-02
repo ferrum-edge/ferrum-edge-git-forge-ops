@@ -312,6 +312,24 @@ fn inline_code(value: &str) -> String {
     }
 }
 
+/// Render the comment's own environment banner: which environment this preview
+/// ran for, under which ownership mode and apply strategy.
+///
+/// gitforgeops writes this line itself, so it is markdown, not content —
+/// running the assembled line through `bounded_markdown_text` escaped
+/// gitforgeops' own backticks and rendered `Environment: \`default\`` with
+/// literal backslashes. The three values are still fenced individually with
+/// [`bounded_inline_code`] (an environment name is operator input), and the
+/// caller inserts the result verbatim.
+pub fn environment_header(env_name: &str, ownership_mode: &str, apply_strategy: &str) -> String {
+    format!(
+        "Environment: {} · Ownership: {} · Strategy: {}",
+        bounded_inline_code(env_name),
+        bounded_inline_code(ownership_mode),
+        bounded_inline_code(apply_strategy),
+    )
+}
+
 fn bounded_inline_code(value: &str) -> String {
     let (bounded, omitted) = truncate_utf8(value, MAX_INLINE_BYTES);
     if omitted > 0 {
@@ -488,8 +506,11 @@ pub fn build_review_comment_v2_with_status(
         comparison_error,
     );
 
+    // Already-rendered markdown from `environment_header` — gitforgeops'
+    // own banner, whose untrusted components are fenced there. Escaping it
+    // again here would print the fences as literal backslash-backticks.
     if let Some(note) = environment_note {
-        md.insert_str(0, &format!("{}\n\n", bounded_markdown_text(note)));
+        md.insert_str(0, &format!("{note}\n\n"));
     }
 
     if !unmanaged.is_empty() {

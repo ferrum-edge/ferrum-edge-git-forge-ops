@@ -8,6 +8,7 @@ use gitforgeops::diff::{
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
     Proxy {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: "ferrum".to_string(),
@@ -68,11 +69,12 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
 
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        extra: Default::default(),
         id: id.to_string(),
         username: username.to_string(),
         namespace: "ferrum".to_string(),
         custom_id: None,
-        credentials: std::collections::HashMap::new(),
+        credentials: std::collections::BTreeMap::new(),
         acl_groups: vec![],
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -198,6 +200,54 @@ fn credential_indeterminate_review_masks_only_placeholder_leaves() {
     );
 }
 
+/// F7: `diff` needs the same masking `plan` and `review` already do. Without
+/// it, a repo with no credential bundle reports the identical spurious change
+/// on every run — the desired side is a placeholder, the live side is the real
+/// value (or `[REDACTED]`) — and `drift-check.yml --exit-on-drift` can never
+/// go green no matter what anyone commits.
+#[test]
+fn unmasked_broker_controlled_leaves_are_permanent_false_drift() {
+    let mut desired_consumer = make_consumer("app", "app");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=generate}"}]),
+    );
+    let mut desired_plugin =
+        make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    desired_plugin.config = serde_json::json!({
+        "authorization": "${gh-env-secret:alloc=require}"
+    });
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        plugin_configs: vec![desired_plugin],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "app");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "[REDACTED]"}]),
+    );
+    let mut live_plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    live_plugin.config = serde_json::json!({"authorization": "Bearer live-secret"});
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        plugin_configs: vec![live_plugin],
+        ..GatewayConfig::default()
+    };
+
+    // What `diff` reported before it masked: two changes nobody made.
+    assert_eq!(compute_diff(&desired, &actual).len(), 2);
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+
+    assert!(
+        compute_diff(&desired, &actual).is_empty(),
+        "{:?}",
+        compute_diff(&desired, &actual)
+    );
+}
+
 #[test]
 fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
     let mut desired_plugin =
@@ -238,6 +288,7 @@ fn make_plugin_config(
     scope: PluginScope,
 ) -> PluginConfig {
     PluginConfig {
+        extra: Default::default(),
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
         namespace: namespace.to_string(),
@@ -259,12 +310,13 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
             host: format!("host-{i}.internal"),
             port: 8080,
             weight: 1,
-            tags: std::collections::HashMap::new(),
+            tags: std::collections::BTreeMap::new(),
             locality: None,
             path: None,
         })
         .collect();
     Upstream {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: "ferrum".to_string(),
@@ -614,7 +666,7 @@ fn breaking_auth_plugin_deletion_scoped_by_namespace() {
 
 #[test]
 fn security_detects_literal_credential() {
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "literal-secret-key"}),
@@ -637,7 +689,7 @@ fn security_blockers_selects_only_error_severity_findings() {
 
     // A literal credential (error) alongside the warning every auth-less proxy
     // produces. `apply` must refuse on the first and not the second.
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!([{"key": "literal-secret-key"}]),
@@ -670,7 +722,7 @@ fn security_blockers_is_empty_for_a_brokered_consumer() {
 
     // The supported on-disk form. Placeholders are repository data, not
     // secrets, so nothing here may block an apply.
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
@@ -695,7 +747,7 @@ fn security_blockers_is_empty_for_no_findings() {
 
 #[test]
 fn security_detects_nested_literal_credential() {
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!({"outer": {"inner": "literal-secret-key"}}),
@@ -716,7 +768,7 @@ fn security_detects_nested_literal_credential() {
 
 #[test]
 fn security_passes_template_credential() {
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "${API_KEY}"}),
@@ -747,7 +799,7 @@ fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
     // This test verifies the invariant by simulating both orderings.
 
     // Pre-resolve: placeholder in the config. Audit sees a ${...} string.
-    let mut creds_pre = std::collections::HashMap::new();
+    let mut creds_pre = std::collections::BTreeMap::new();
     creds_pre.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "${gh-env-secret:alloc=require}"}),
@@ -772,7 +824,7 @@ fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
     // Post-resolve (simulated): the placeholder has been replaced with a real
     // value. Audit now incorrectly sees a "literal" credential. This is the
     // behavior we want to AVOID by auditing before resolve.
-    let mut creds_post = std::collections::HashMap::new();
+    let mut creds_post = std::collections::BTreeMap::new();
     creds_post.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "real-random-value"}),

@@ -1,7 +1,10 @@
 use std::sync::Mutex;
 
+use std::collections::BTreeMap;
+
+use gitforgeops::config::schema::GatewayConfig;
 use gitforgeops::diff::resource_diff::{state_key, state_key_namespace, DiffAction, ResourceDiff};
-use gitforgeops::state::StateFile;
+use gitforgeops::state::{PendingCreateScope, StateFile};
 use tempfile::TempDir;
 
 // Process-wide lock — tests in this file all mutate CWD, and cargo runs tests
@@ -78,6 +81,7 @@ fn scoped_record_preserves_entries_outside_scope() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: ns.to_string(),
@@ -217,9 +221,7 @@ fn write_ahead_add_reservation_survives_before_gateway_success_is_recorded() {
 
 #[test]
 fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
-    use std::collections::BTreeMap;
-
-    use gitforgeops::config::schema::{GatewayConfig, Upstream};
+    use gitforgeops::config::schema::Upstream;
 
     let desired = GatewayConfig {
         upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
@@ -247,7 +249,9 @@ fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
     let actual = BTreeMap::from([("ferrum".to_string(), exact_live)]);
 
     assert_eq!(
-        state.reconcile_pending_creates(&desired, &actual).unwrap(),
+        state
+            .reconcile_pending_creates(&desired, &actual, PendingCreateScope::Shared)
+            .forgotten,
         0
     );
     assert!(state.pending_creates.contains(&key));
@@ -256,9 +260,7 @@ fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
 
 #[test]
 fn pending_create_stays_unmanaged_until_live_evidence_matches() {
-    use std::collections::BTreeMap;
-
-    use gitforgeops::config::schema::{GatewayConfig, Upstream};
+    use gitforgeops::config::schema::Upstream;
 
     let desired = GatewayConfig {
         upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
@@ -282,7 +284,9 @@ fn pending_create_stays_unmanaged_until_live_evidence_matches() {
 
     let actual = BTreeMap::from([("ferrum".to_string(), GatewayConfig::default())]);
     assert_eq!(
-        state.reconcile_pending_creates(&desired, &actual).unwrap(),
+        state
+            .reconcile_pending_creates(&desired, &actual, PendingCreateScope::Shared)
+            .forgotten,
         0
     );
     assert!(state.pending_creates.contains(&key));
@@ -291,9 +295,7 @@ fn pending_create_stays_unmanaged_until_live_evidence_matches() {
 
 #[test]
 fn pending_create_without_desired_or_live_row_is_cleared() {
-    use std::collections::BTreeMap;
-
-    use gitforgeops::config::schema::{GatewayConfig, Upstream};
+    use gitforgeops::config::schema::Upstream;
 
     let original_desired = GatewayConfig {
         upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
@@ -317,16 +319,20 @@ fn pending_create_without_desired_or_live_row_is_cleared() {
 
     let empty = GatewayConfig::default();
     let actual = BTreeMap::from([("ferrum".to_string(), empty.clone())]);
-    assert_eq!(state.reconcile_pending_creates(&empty, &actual).unwrap(), 1);
+    assert_eq!(
+        state
+            .reconcile_pending_creates(&empty, &actual, PendingCreateScope::Shared)
+            .forgotten,
+        1
+    );
     assert!(!state.pending_creates.contains(&key));
     assert!(!state.previously_managed_keys().contains(&key));
 }
 
-#[test]
-fn pending_create_with_removed_desired_but_live_row_fails_closed() {
-    use std::collections::BTreeMap;
-
-    use gitforgeops::config::schema::{GatewayConfig, Upstream};
+/// Build a state file with one journaled pending create whose desired
+/// declaration has since been removed, while the row is still live.
+fn undeclared_live_pending_row() -> (StateFile, String, BTreeMap<String, GatewayConfig>) {
+    use gitforgeops::config::schema::Upstream;
 
     let original_desired = GatewayConfig {
         upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
@@ -347,23 +353,126 @@ fn pending_create_with_removed_desired_but_live_row_fails_closed() {
     let key = state_key("ferrum", "Upstream", "new-upstream");
     let mut state = StateFile::default();
     state.reserve_adds(&diffs, &original_desired).unwrap();
-
     let actual = BTreeMap::from([("ferrum".to_string(), original_desired)]);
-    let error = state
-        .reconcile_pending_creates(&GatewayConfig::default(), &actual)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("ownership cannot be proven"), "{error}");
-    assert!(state.pending_creates.contains(&key));
-    assert!(!state.previously_managed_keys().contains(&key));
+    (state, key, actual)
+}
+
+#[test]
+fn shared_mode_forgets_an_undeclared_live_pending_row_and_warns() {
+    // The old behaviour returned Err before any namespace was touched, for
+    // every mode and strategy, and told the operator to hand-edit `.state` —
+    // which `state-guard.yml` blocks. Nothing may wedge here.
+    let (mut state, key, actual) = undeclared_live_pending_row();
+
+    let report = state.reconcile_pending_creates(
+        &GatewayConfig::default(),
+        &actual,
+        PendingCreateScope::Shared,
+    );
+
+    assert_eq!(report.forgotten, 1);
+    assert!(!state.pending_creates.contains(&key));
+    assert!(
+        !state.previously_managed_keys().contains(&key),
+        "forgetting the journal entry must never grant deletion authority"
+    );
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    let warning = &report.warnings[0];
+    assert!(warning.contains("new-upstream"), "{warning}");
+    assert!(warning.contains("UNMANAGED"), "{warning}");
+    assert!(warning.contains("will not delete it"), "{warning}");
+}
+
+#[test]
+fn exclusive_mode_forgets_an_undeclared_live_pending_row_for_the_prune_path() {
+    let (mut state, key, actual) = undeclared_live_pending_row();
+
+    let report = state.reconcile_pending_creates(
+        &GatewayConfig::default(),
+        &actual,
+        PendingCreateScope::Exclusive,
+    );
+
+    assert_eq!(report.forgotten, 1);
+    assert!(!state.pending_creates.contains(&key));
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("large-prune guard"),
+        "{}",
+        report.warnings[0]
+    );
+}
+
+#[test]
+fn full_replace_forgets_every_pending_key_without_warning() {
+    // `/restore` replaces the namespace atomically and never consults the
+    // journal, so a leftover key is noise, not a decision.
+    let (mut state, key, actual) = undeclared_live_pending_row();
+
+    let report = state.reconcile_pending_creates(
+        &GatewayConfig::default(),
+        &actual,
+        PendingCreateScope::FullReplace,
+    );
+
+    assert_eq!(report.forgotten, 1);
+    assert!(!state.pending_creates.contains(&key));
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+#[test]
+fn full_replace_forgets_a_still_declared_pending_key_too() {
+    use gitforgeops::config::schema::Upstream;
+
+    let desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
+            "id": "new-upstream",
+            "namespace": "ferrum",
+            "targets": [{"host": "127.0.0.1", "port": 8080}]
+        }))
+        .unwrap()],
+        ..GatewayConfig::default()
+    };
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Upstream".to_string(),
+        id: "new-upstream".to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }];
+    let mut state = StateFile::default();
+    state.reserve_adds(&diffs, &desired).unwrap();
+    let actual = BTreeMap::from([("ferrum".to_string(), desired.clone())]);
+
+    let report =
+        state.reconcile_pending_creates(&desired, &actual, PendingCreateScope::FullReplace);
+
+    assert_eq!(report.forgotten, 1);
+    assert!(state.pending_creates.is_empty());
+}
+
+#[test]
+fn a_pending_key_outside_the_read_scope_is_left_alone_in_every_mode() {
+    // A namespace filter means we have no authoritative view of that
+    // namespace. Forgetting the key there would lose the crash-recovery
+    // record it exists for.
+    let (mut state, key, _) = undeclared_live_pending_row();
+    let out_of_scope: BTreeMap<String, GatewayConfig> = BTreeMap::new();
+
+    for scope in [
+        PendingCreateScope::Shared,
+        PendingCreateScope::Exclusive,
+        PendingCreateScope::FullReplace,
+    ] {
+        let report =
+            state.reconcile_pending_creates(&GatewayConfig::default(), &out_of_scope, scope);
+        assert_eq!(report.forgotten, 0, "{scope:?}");
+        assert!(state.pending_creates.contains(&key), "{scope:?}");
+    }
 }
 
 #[test]
 fn authoritative_absence_removes_stale_managed_denominator_entries() {
-    use std::collections::BTreeMap;
-
-    use gitforgeops::config::schema::GatewayConfig;
-
     let stale_key = state_key("ferrum", "Upstream", "already-gone");
     let outside_scope_key = state_key("platform", "Upstream", "not-read");
     let mut state = StateFile::default();
@@ -665,6 +774,7 @@ fn record_op_preserves_state_for_failed_delete() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: ns.to_string(),
@@ -805,6 +915,7 @@ fn record_op_preserves_state_for_failed_delete() {
         .resources
         .insert(app_key.clone(), "sha256:STALE".to_string());
     let consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),

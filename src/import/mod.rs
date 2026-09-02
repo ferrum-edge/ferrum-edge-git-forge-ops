@@ -15,7 +15,7 @@ use crate::config::schema::{GatewayConfig, Resource};
 use crate::http_client::BackupSnapshot;
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
-    CredentialBundle, IMPORT_REQUIRED_PLACEHOLDER,
+    CredentialBundle, UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER,
 };
 
 pub const IMPORT_MANIFEST_FILENAME: &str = ".gitforgeops-import.json";
@@ -125,6 +125,17 @@ pub struct ImportResult {
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
     pub sources: Vec<ImportSourceMetadata>,
+    /// Non-builtin plugins whose config strings were left in the imported
+    /// files because the sensitivity heuristics did not flag them. Surfaced
+    /// by [`ImportResult::custom_plugin_review_notice`] so an operator reads
+    /// them before committing.
+    ///
+    /// Deliberately kept out of the import manifest: the manifest is a
+    /// stable, machine-readable inventory of *what was imported*, and this is
+    /// a transient human review prompt about what the classifier could not
+    /// judge. Nothing downstream keys on it.
+    #[serde(skip)]
+    pub unbrokered_plugin_config: Vec<UnbrokeredPluginConfig>,
 }
 
 impl ImportResult {
@@ -182,9 +193,57 @@ impl ImportResult {
             if !notice.is_empty() {
                 notice.push(' ');
             }
+            // Section names come straight out of an untrusted backup
+            // document. Printing them raw lets a crafted key inject ANSI
+            // escapes or newlines into an operator's terminal and CI log, the
+            // same hazard `source_metadata_notice` already routes around.
             notice.push_str(&format!(
                 "Unsupported backup section(s) were not imported: {}.",
-                self.unsupported_sections.join(", ")
+                self.unsupported_sections
+                    .iter()
+                    .map(|section| diagnostic_metadata(section))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Some(notice)
+    }
+
+    /// Loud per-plugin review list for non-builtin plugins.
+    ///
+    /// gitforgeops has no schema for a plugin it does not know, so it brokers
+    /// only what the key/URL sensitivity heuristics flag and leaves the rest
+    /// in the committed resource file. That is the right default — capturing
+    /// `mode: strict` into a GitHub Environment Secret makes the import
+    /// unusable — but it means a vendor field the heuristics do not recognize
+    /// as a credential lands in Git as written. Name every one of them.
+    pub fn custom_plugin_review_notice(&self) -> Option<String> {
+        if self.unbrokered_plugin_config.is_empty() {
+            return None;
+        }
+        const MAX_PATHS_PER_PLUGIN: usize = 50;
+        let mut notice = String::from(
+            "WARNING: review these plugin config values before committing. They belong to plugins this build does not recognize, so there is no schema to classify them by; only key/URL heuristics ran, and everything they did not flag was left in the imported files verbatim. If any of them is a credential, move it into the broker by hand:",
+        );
+        for plugin in &self.unbrokered_plugin_config {
+            let mut paths = plugin
+                .paths
+                .iter()
+                .take(MAX_PATHS_PER_PLUGIN)
+                .map(|path| diagnostic_metadata(path))
+                .collect::<Vec<_>>();
+            if plugin.paths.len() > MAX_PATHS_PER_PLUGIN {
+                paths.push(format!(
+                    "[{} more]",
+                    plugin.paths.len() - MAX_PATHS_PER_PLUGIN
+                ));
+            }
+            notice.push_str(&format!(
+                "\n  PluginConfig {} ({}, plugin_name={}): {}",
+                diagnostic_metadata(&plugin.plugin_id),
+                diagnostic_metadata(&plugin.namespace),
+                diagnostic_metadata(&plugin.plugin_name),
+                paths.join(", ")
             ));
         }
         Some(notice)
@@ -278,6 +337,22 @@ fn diagnostic_metadata(value: &str) -> String {
 /// would target the same path, and pre-existing output files. Callers should use
 /// an empty output directory or clean it intentionally before importing.
 ///
+/// # Warning for library callers: captured secrets are discarded
+///
+/// Every credential and sensitive plugin-config string in `config` is replaced
+/// with [`IMPORT_REQUIRED_PLACEHOLDER`] before anything is written, and the
+/// live values it captured are **dropped on return** — this entry point has
+/// nowhere to put them. That is safe (nothing leaks) but lossy: the emitted
+/// tree cannot be applied until every derived slot is seeded from somewhere
+/// else, and if `config` was the only copy of those values, they are gone.
+///
+/// The CLI does not use this path. `import --from-api` / `--from-file` go
+/// through `split_config_with_inventory`, which requires
+/// `--credential-bundle-output` whenever the source carries a live secret and
+/// writes the captured values to a private mode-0600 bundle *before* the
+/// redacted tree. Prefer those unless you genuinely want the placeholders and
+/// nothing else.
+///
 /// # Spec-owned resources are skipped
 ///
 /// A proxy, upstream or plugin config carrying an `api_spec_id` belongs to the
@@ -303,11 +378,12 @@ pub(crate) fn split_config_with_inventory(
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
-    let captured_plugin_config = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let unbrokered_plugin_config = plugin_capture.unbrokered;
     let credential_count = captured_credentials.len();
-    let plugin_config_count = captured_plugin_config.len();
+    let plugin_config_count = plugin_capture.captured.len();
     let mut captured_secrets = captured_credentials;
-    for (slot, value) in captured_plugin_config {
+    for (slot, value) in plugin_capture.captured {
         if captured_secrets.insert(slot.clone(), value).is_some() {
             return Err(crate::error::Error::Config(format!(
                 "secret slot '{slot}' is produced by both a consumer credential and plugin config"
@@ -321,6 +397,7 @@ pub(crate) fn split_config_with_inventory(
         sources: inventory.sources,
         redacted_credential_values: credential_count,
         redacted_plugin_config_values: plugin_config_count,
+        unbrokered_plugin_config,
         ..ImportResult::default()
     };
     if require_credential_bundle
@@ -620,12 +697,19 @@ fn containing_git_worktree(path: &Path) -> crate::error::Result<Option<PathBuf>>
 /// Resolve existing symlinked ancestors while still accepting a final path
 /// that does not exist yet, then normalize `.`/`..` components for a reliable
 /// containment comparison.
+///
+/// The lexical normalization runs **first**, before the canonicalize walk.
+/// `..` under an ancestor that does not exist otherwise walks the loop up to a
+/// component whose `file_name()` is `None` — a path ending in `..` has no file
+/// name — and reports "cannot resolve path … for containment validation",
+/// which says nothing about the actual problem. Collapsing the components up
+/// front turns `/nonexistent/../wanted` into `/wanted` and the check proceeds
+/// normally. Normalizing before resolution can differ from the kernel's view
+/// when a `..` crosses a symlink, but every symlinked *ancestor* that exists
+/// is still canonicalized below, and the only decision made from the result is
+/// a containment comparison that this makes stricter, not looser.
 fn resolve_for_containment(path: &Path) -> crate::error::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+    let absolute = lexically_normalized_absolute(path)?;
     let mut existing = absolute.as_path();
     let mut suffix = Vec::new();
     let canonical = loop {
@@ -858,12 +942,28 @@ fn safe_path_component<'a>(value: &'a str, field: &str) -> crate::error::Result<
     Ok(value)
 }
 
+/// Filename for one imported resource, derived from its id.
+///
+/// A leading `_` is the loader's "intentionally disabled" marker, so an id like
+/// `_internal-api` cannot become `_internal-api.yaml` — the file would be
+/// written and then skipped on every subsequent load, silently dropping the
+/// resource from desired state (and, in exclusive mode, pruning it). Failing
+/// the whole import instead is no better: the id is the gateway's, the
+/// operator cannot rename it from here, and one such resource dead-ends the
+/// migration entirely.
+///
+/// So the leading character is percent-encoded — `_internal-api` becomes
+/// `%5Finternal-api.yaml`. The loader reads a resource's identity from
+/// `spec.id`, never from the filename, so the encoded name round-trips
+/// unchanged. A leading `%` is encoded too (`%25…`), which keeps the mapping
+/// injective: without it `%5Ffoo` and `_foo` would collide on one path (caught
+/// by `plan_resource_file`, but as a confusing duplicate-target error).
 fn resource_filename(id: &str, field: &str) -> crate::error::Result<String> {
     let safe = safe_path_component(id, field)?;
-    if safe.starts_with('_') {
-        return Err(crate::error::Error::Config(format!(
-            "unsafe {field} {safe:?} — imported resource filenames cannot start with '_' because the loader treats that prefix as intentionally disabled"
-        )));
-    }
-    Ok(format!("{safe}.yaml"))
+    let encoded = match safe.as_bytes().first() {
+        Some(b'_') => format!("%5F{}", &safe[1..]),
+        Some(b'%') => format!("%25{}", &safe[1..]),
+        _ => safe.to_string(),
+    };
+    Ok(format!("{encoded}.yaml"))
 }
