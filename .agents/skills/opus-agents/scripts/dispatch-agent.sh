@@ -116,6 +116,10 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
+# shellcheck source=../../_lib/require-trusted-worktree.sh
+. "$script_dir/../../_lib/require-trusted-worktree.sh"
+require_trusted_worktree "$physical_root" "$script_dir"
+
 cd "$physical_worktree"
 
 unset CLAUDE_CODE_EFFORT_LEVEL
@@ -135,7 +139,7 @@ exec "$claude_bin" -p \
   --model "$model" \
   --effort "$effort" \
   --settings "$fast_settings" \
-  --permission-mode bypassPermissions \
+  --permission-mode default \
   --output-format text \
   --verbose \
   < "$prompt_file"

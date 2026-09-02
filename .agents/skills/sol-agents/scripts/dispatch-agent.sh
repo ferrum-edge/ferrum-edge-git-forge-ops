@@ -101,6 +101,10 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
+# shellcheck source=../../_lib/require-trusted-worktree.sh
+. "$script_dir/../../_lib/require-trusted-worktree.sh"
+require_trusted_worktree "$physical_root" "$script_dir"
+
 cd "$physical_worktree"
 
 printf '[sol-agents] dispatch model=gpt-5.6-sol effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
@@ -110,6 +114,6 @@ exec "$codex_bin" exec \
   --model gpt-5.6-sol \
   --config "model_reasoning_effort=\"$effort\"" \
   --config "service_tier=\"$service_tier\"" \
-  --sandbox danger-full-access \
+  --sandbox workspace-write \
   --cd "$physical_worktree" \
   - < "$prompt_file"

@@ -90,6 +90,10 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
+# shellcheck source=../../_lib/require-trusted-worktree.sh
+. "$script_dir/../../_lib/require-trusted-worktree.sh"
+require_trusted_worktree "$physical_root" "$script_dir"
+
 cd "$physical_worktree"
 
 unset ANTHROPIC_MODEL
@@ -104,7 +108,7 @@ printf '[fable-agents] dispatch model=claude-fable-5 effort=%s worktree=%s bin=%
 exec "$claude_bin" -p \
   --model claude-fable-5 \
   --effort "$effort" \
-  --permission-mode bypassPermissions \
+  --permission-mode default \
   --output-format text \
   --verbose \
   < "$prompt_file"

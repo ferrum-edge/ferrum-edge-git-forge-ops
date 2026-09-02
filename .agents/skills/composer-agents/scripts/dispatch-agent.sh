@@ -122,6 +122,10 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
+# shellcheck source=../../_lib/require-trusted-worktree.sh
+. "$script_dir/../../_lib/require-trusted-worktree.sh"
+require_trusted_worktree "$physical_root" "$script_dir"
+
 # Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
 # exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).
 # Current Cursor CLI releases can initialize the default macOS credential
@@ -141,13 +145,11 @@ printf '[composer-agents] dispatch model=%s fast=%s worktree=%s bin=%s auth=%s%s
   "$MODEL" "$fast" "$physical_worktree" "$cursor_bin" "$auth_source" \
   "${name:+ name=$name}" >&2
 
-# --print: non-interactive, full tool access (read, write, shell).
-# --force:  no per-command approval prompts; worktree isolation is the boundary.
+# --print: non-interactive. Destructive tools retain their approval gates.
 # --trust:  accept the freshly created worktree as a trusted directory, which the
 #           trust gate otherwise blocks on in a non-TTY.
 exec "$cursor_bin" \
   --print \
-  --force \
   --trust \
   --model "$MODEL" \
   --output-format text \

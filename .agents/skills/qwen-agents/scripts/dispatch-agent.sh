@@ -146,6 +146,10 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   exit 2
 fi
 
+# shellcheck source=../../_lib/require-trusted-worktree.sh
+. "$script_dir/../../_lib/require-trusted-worktree.sh"
+require_trusted_worktree "$physical_root" "$script_dir"
+
 # Resolve the operator's own opencode install. Conductor's bundled ACP-provider
 # copy under agent-binaries/acp-providers/opencode is deliberately NOT a fallback:
 # it lags the standalone release and is refused by the shared resolver.
@@ -159,10 +163,9 @@ cd "$physical_worktree"
 printf '[qwen-agents] dispatch model=%s worktree=%s bin=%s\n' \
   "$model" "$physical_worktree" "$opencode_bin" >&2
 
-# `run` reads the prompt from stdin; --auto bypasses permission prompts (worktree
-# isolation is the safety boundary); --agent build selects the write-enabled agent.
+# `run` reads the prompt from stdin; --agent build selects the write-enabled agent.
+# Keep opencode's permission prompts enabled as a second boundary.
 exec "$opencode_bin" run \
   --model "$model" \
   --agent build \
-  --auto \
   < "$prompt_file"
