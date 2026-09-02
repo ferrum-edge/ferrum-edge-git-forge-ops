@@ -89,8 +89,8 @@ jobs:
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
       # Rotation writes a new credential to the GitHub Environment Secret and
-      # pushes it to the live gateway, then records `last_rotated`,
-      # `sha256_prefix` and `delivered_to` in `.state/<env>.json`. The App
+      # pushes it to the live gateway, then records `last_rotated` and the
+      # delivery recipient/run in `.state/<env>.json`. The App
       # token that commits that ledger is deliberately minted late (see
       # `check_supply_chain.py`), so absent App credentials would surface only
       # after the store and the gateway had already moved — leaving the next
@@ -214,8 +214,8 @@ jobs:
 
       - name: Commit state update
         if: ${{ !cancelled() }}
-        # Rotation metadata (last_rotated, sha256_prefix, delivered_to) lives
-        # in .state/<env>.json. If we can't persist the update, a stale state
+        # Rotation metadata (last_rotated, delivery recipient/run) lives in
+        # .state/<env>.json. If we can't persist the update, a stale state
         # misleads the next drift check — fail the job on push failure, and
         # retry on rejection (possible if an apply landed concurrently).
         # Same shell-injection protection as the Rotate step: route inputs

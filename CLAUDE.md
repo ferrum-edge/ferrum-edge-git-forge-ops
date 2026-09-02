@@ -23,7 +23,8 @@ gitforgeops diff [--exit-on-drift]                        # Compare desired vs l
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR]  # --from-api requires an explicit namespace filter
+gitforgeops import --from-api | --from-file PATH --output-dir DIR \
+  [--credential-bundle-output PRIVATE_PATH]               # --output-dir required + must be empty; API import requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -57,8 +58,12 @@ overlay YAML, copies environment/policy routing from the protected branch, and
 runs a trusted binary with `FERRUM_NAMESPACE` set to one protected-branch
 resource namespace per job, intersected with the environment's protected
 namespace scope. `review --require-live` fails that job when comparison is
-unavailable. Environments with `live_review: false` are removed before the
-Environment-bound matrix, which is required for file mode. Fork PRs and new/remapped namespaces never enter the privileged
+unavailable or its required PR comment cannot be delivered. Review markdown is
+bounded below GitHub's API limit, and unresolved credential values are excluded
+from live comparison when no bundle is available without hiding other Consumer
+fields. Environments with `live_review: false` are removed before the
+Environment-bound matrix, which is required for file mode. Fork PRs and
+new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in
 `rust-toolchain.toml`; external Actions use full commit SHAs.
 
@@ -87,6 +92,27 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                              (gateway doc → FERRUM_FILE_OUTPUT_PATH,
                               mesh doc → FERRUM_MESH_FILE_OUTPUT_PATH)
 ```
+
+Two things happen at the `validate` hand-off that exist nowhere else in the
+pipeline, both because resolution has already run by then:
+
+- `validate::with_validation_standins` replaces credential leaves that are
+  *still* `${gh-env-secret:…}` placeholders with a deterministic fake
+  (`gitforgeops-validation-standin-<64 hex>`, or `hmac_sha256:<64 hex>` for a
+  `basicauth` `password_hash`) derived from the slot path. `${gh-env-secret:alloc=generate}`
+  is 30 characters and ferrum-edge's floor for `jwt`/`hmac_auth` is 32, so a
+  bundle-less fork PR would otherwise fail on the placeholder rather than on
+  the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
+  no other output path ever sees a stand-in.
+- `secrets::SecretScrubber` collects every non-placeholder Consumer credential
+  leaf (minus the identity fields `basicauth[].username` /
+  `mtls_auth[].identity`) and every `sensitive_string_paths` plugin-config
+  leaf, and removes those exact byte sequences — plus their base64 and
+  percent-encoded forms — from the validator child's stdout/stderr, replacing
+  each with `[REDACTED]`. Non-credential diagnostics stay intact. Blanket
+  suppression survives only as a fallback for a secret shorter than
+  `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced without
+  mangling the report.
 
 ### Gateway Modes
 
@@ -231,6 +257,14 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `waf_enforcement`, `require_ai_guardrails`, `rate_limit_completeness`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
 
+Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
+is schema-first for the 82 builtins and heuristics-only for anything else: a
+non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
+flag, and the leaves they did not flag come back as
+`ImportResult::unbrokered_plugin_config` for a loud per-plugin review notice.
+`basicauth[].username` and `mtls_auth[].identity` are never brokered in either
+path (`resolver::is_identity_credential_leaf`).
+
 Plugin-name knowledge lives in `src/plugin_catalog.rs` (82 builtins, retired and
 reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
 where a scoped plugin config replaces a global one of the same `plugin_name`).
@@ -292,12 +326,12 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (yaml + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
-- `src/secrets/` — `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
+- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
-- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
+- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
-- `src/import/` — `from_api.rs` (walks namespaces, pulls `/backup`), `from_file.rs`, `mod.rs::split_config` (emits per-resource YAML; reports skipped `api_specs` / trust-bundle sections instead of dropping them silently)
-- `src/state.rs` — `.state/<env>.json` tracks applied hashes, credential metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
+- `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, and atomically publishes an empty output tree; reports skipped/unsupported sections)
+- `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/error.rs` — unified `Error` enum via `thiserror`
@@ -306,7 +340,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 1. **Permissive schema** — Serde types mirror Ferrum Edge but accept unknown fields. The gateway (via `validate`) is the authoritative schema.
 2. **Path-component sanitization** — resource `namespace` and `id` flow into filesystem paths during `import`. `import::safe_path_component` rejects `..`, `/`, `\`, null bytes, and empty strings before `Path::join` to prevent traversal.
-3. **Deterministic state hashes** — resources hash through `serde_json::Value` first (BTreeMap-backed in default builds) so `HashMap` field ordering doesn't produce false-positive drift in `.state/<env>.json`.
+3. **No public credential oracles** — the state ledger stores only managed-resource keys plus a constant marker and non-secret credential delivery metadata. It never hashes resolved Consumers or credential values.
 4. **Namespace-scoped operations** — every API call, diff entry, and breaking-change lookup keys on `(namespace, id)`, never `id` alone.
 5. **Partial-failure visibility** — incremental apply reports per-resource errors via `ApplyResult`; failures don't abort the whole run.
 

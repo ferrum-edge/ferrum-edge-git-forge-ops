@@ -70,8 +70,18 @@ pub enum Commands {
         from_api: bool,
         #[arg(long, conflicts_with = "from_api")]
         from_file: Option<String>,
-        #[arg(long, default_value = "./resources")]
+        /// Destination for the imported resource tree. Required and with no
+        /// default: `import` refuses a non-empty destination, and this repo
+        /// ships `_example.yaml` files under `resources/`, so a `./resources`
+        /// default could only ever fail. Import into an empty scratch
+        /// directory, review it, then move the tree into `resources/`.
+        #[arg(long, value_name = "DIR")]
         output_dir: String,
+        /// Required when the source contains credentials. Writes canonical
+        /// slot-to-value bundles atomically at mode 0600; must be outside the
+        /// imported resource tree and every Git worktree.
+        #[arg(long, value_name = "PATH")]
+        credential_bundle_output: Option<String>,
     },
     Review {
         #[arg(long)]

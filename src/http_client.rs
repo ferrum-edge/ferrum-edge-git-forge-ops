@@ -383,6 +383,15 @@ impl AdminClient {
 
         let mut snapshot = BackupSnapshot::from_body(&resp.body)?;
         snapshot.cached = cached;
+        // A live read never fails on the count seal (see `SealStrictness`),
+        // but an operator should know the gateway's own inventory disagreed
+        // with what it sent — and `import` turns the same notice into a hard
+        // refusal, because that document becomes permanent repo state.
+        if let Some(notice) = snapshot.seal_violation_notice() {
+            eprintln!(
+                "Warning: GET /backup for namespace '{namespace}' returned a count seal that does not match the document ({notice}). The seal was discarded; resource data is used as received."
+            );
+        }
         Ok(snapshot)
     }
 
@@ -1180,6 +1189,30 @@ impl BackupExtras {
     }
 }
 
+/// How a count seal that disagrees with the decoded document is treated.
+///
+/// The seal is an anti-truncation device, and the two consumers want opposite
+/// things from a disagreement:
+///
+/// * **Import** reads a document once and turns it into the repository's
+///   permanent desired state. A seal that does not match means the source may
+///   be truncated, and publishing a partial tree is unrecoverable, so it is a
+///   hard error.
+/// * **Live reads** (`diff`, `plan`, `apply`, drift-check) run against a
+///   gateway whose seal is emitted by a different codebase on every request.
+///   A gateway that omits `counts.upstreams`, or a cached-fallback export that
+///   elides `api_specs` while retaining `counts.api_specs`, would otherwise
+///   take every one of those commands down over metadata that no decision is
+///   made from. Record the disagreement, drop the seal, and keep going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealStrictness {
+    /// Import: a disagreeing seal fails the read.
+    Strict,
+    /// Live reads: a disagreeing seal is recorded in
+    /// [`BackupSnapshot::seal_violations`] and the seal itself is discarded.
+    Advisory,
+}
+
 /// The full `BackupResponse` envelope.
 #[derive(Debug, Clone, Default)]
 pub struct BackupSnapshot {
@@ -1191,6 +1224,22 @@ pub struct BackupSnapshot {
     pub ferrum_version: Option<String>,
     pub exported_at: Option<String>,
     pub source: Option<String>,
+    /// Backup-provided count inventory. Validated against the decoded
+    /// resource and extra sections before it is retained for import
+    /// provenance.
+    pub counts: Option<serde_json::Value>,
+    /// File-mode anti-truncation seal, when importing a gitforgeops/ferrum
+    /// flat document rather than an admin backup.
+    pub resource_counts: Option<serde_json::Value>,
+    /// Top-level sections not understood by this gitforgeops build. Import
+    /// reports these explicitly instead of silently discarding future backup
+    /// capabilities.
+    pub unsupported_sections: Vec<String>,
+    /// Count-seal disagreements found while decoding. Always empty under
+    /// [`SealStrictness::Strict`] (the decode returns `Err` instead); under
+    /// [`SealStrictness::Advisory`] this is what the caller warns about, and
+    /// `counts` / `resource_counts` are `None`.
+    pub seal_violations: Vec<String>,
 }
 
 impl BackupSnapshot {
@@ -1199,9 +1248,26 @@ impl BackupSnapshot {
     /// future top-level sections are retained by name so full-replace can fail
     /// closed instead of silently deleting data it cannot carry through.
     pub fn from_body(body: &str) -> crate::error::Result<Self> {
-        let mut value: serde_json::Value = serde_json::from_str(body)
+        let value: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+        // Live reads are advisory: see [`SealStrictness`]. Callers that turn a
+        // backup into permanent repository state re-check
+        // `seal_violations` and refuse.
+        Self::from_value_with_strictness(value, SealStrictness::Advisory)
+    }
 
+    /// Parse an already-decoded JSON/YAML-compatible backup value with the
+    /// import path's strict seal enforcement.
+    pub fn from_value(value: serde_json::Value) -> crate::error::Result<Self> {
+        Self::from_value_with_strictness(value, SealStrictness::Strict)
+    }
+
+    /// Parse an already-decoded JSON/YAML-compatible backup value. Shared by
+    /// API and file import so both paths inventory the same opaque sections.
+    pub fn from_value_with_strictness(
+        mut value: serde_json::Value,
+        strictness: SealStrictness,
+    ) -> crate::error::Result<Self> {
         // Lift the non-`GatewayConfig` sections *out* of the document rather
         // than copying them out of it: a production `/backup` is megabytes of
         // JSON, and cloning the whole tree just to keep two keys doubled peak
@@ -1211,6 +1277,9 @@ impl BackupSnapshot {
         let mut ferrum_version = None;
         let mut exported_at = None;
         let mut source = None;
+        let mut counts = None;
+        let mut resource_counts = None;
+        let mut unsupported_sections = Vec::new();
         if let Some(map) = value.as_object_mut() {
             // Pinned to ferrum-edge's `BackupPayload` (`src/admin/backup.rs`),
             // which is constructed in exactly one place
@@ -1243,21 +1312,52 @@ impl BackupSnapshot {
                 "counts",
                 "resource_counts",
             ];
-            extras.unsupported_sections = map
+            unsupported_sections = map
                 .keys()
                 .filter(|key| !KNOWN_TOP_LEVEL.contains(&key.as_str()))
                 .cloned()
                 .collect();
-            extras.unsupported_sections.sort();
-            extras.api_specs = map.remove("api_specs");
-            extras.gateway_trust_bundles = map.remove("gateway_trust_bundles");
-            ferrum_version = take_string(map, "ferrum_version");
-            exported_at = take_string(map, "exported_at");
-            source = take_string(map, "source");
+            unsupported_sections.sort();
+            extras.unsupported_sections = unsupported_sections.clone();
+            for key in &unsupported_sections {
+                map.remove(key);
+            }
+
+            extras.api_specs = take_api_specs(map)?;
+            extras.gateway_trust_bundles = take_trust_bundles(map)?;
+            ferrum_version = take_optional_string(map, "ferrum_version")?;
+            exported_at = take_optional_string(map, "exported_at")?;
+            source = take_optional_string(map, "source")?;
+            // Integrity metadata is not part of GatewayConfig, but import
+            // validates and inventories it rather than silently stripping it.
+            counts = map.remove("counts");
+            resource_counts = map.remove("resource_counts");
         }
 
         let config: GatewayConfig = serde_json::from_value(value)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+            .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
+        let mut seal_violations = Vec::new();
+        counts = canonicalize_count_seal(
+            "counts",
+            counts.as_ref(),
+            &config,
+            &extras,
+            true,
+            &mut seal_violations,
+        );
+        resource_counts = canonicalize_count_seal(
+            "resource_counts",
+            resource_counts.as_ref(),
+            &config,
+            &extras,
+            false,
+            &mut seal_violations,
+        );
+        if matches!(strictness, SealStrictness::Strict) {
+            if let Some(violation) = seal_violations.first() {
+                return Err(crate::error::Error::Config(violation.clone()));
+            }
+        }
 
         Ok(Self {
             config,
@@ -1266,15 +1366,173 @@ impl BackupSnapshot {
             ferrum_version,
             exported_at,
             source,
+            counts,
+            resource_counts,
+            unsupported_sections,
+            seal_violations,
         })
+    }
+
+    /// One-line operator summary of every count-seal disagreement, or `None`
+    /// when the seal agreed (or was absent).
+    pub fn seal_violation_notice(&self) -> Option<String> {
+        if self.seal_violations.is_empty() {
+            return None;
+        }
+        Some(self.seal_violations.join("; "))
     }
 }
 
-/// Remove `key` from `map`, keeping it only when it is a JSON string.
-fn take_string(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+/// Validate a count seal and retain only the numeric fields this build
+/// understands. The source document is untrusted input: copying arbitrary
+/// extra values from `counts` into the import manifest would create a covert
+/// path for credential material to enter the otherwise non-secret resource
+/// tree.
+///
+/// Disagreements are appended to `violations` rather than returned as errors,
+/// and a seal with any disagreement is discarded (`None`) instead of being
+/// half-retained. The caller decides what a violation means; see
+/// [`SealStrictness`].
+fn canonicalize_count_seal(
+    section_name: &str,
+    value: Option<&serde_json::Value>,
+    config: &GatewayConfig,
+    extras: &BackupExtras,
+    include_backup_extras: bool,
+    violations: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let value = value?;
+    let Some(object) = value.as_object() else {
+        violations.push(format!(
+            "invalid backup payload: top-level '{section_name}' must be an object"
+        ));
+        return None;
+    };
+    let before = violations.len();
+    let mut canonical = serde_json::Map::new();
+
+    for (key, actual) in [
+        ("proxies", config.proxies.len()),
+        ("consumers", config.consumers.len()),
+        ("plugin_configs", config.plugin_configs.len()),
+        ("upstreams", config.upstreams.len()),
+    ] {
+        // Ferrum Edge's file seal predates the upstream section and permits
+        // `resource_counts.upstreams` to be omitted only when the decoded
+        // document actually contains zero upstreams. Database backup `counts`
+        // remains a complete four-kind seal.
+        let omitted_zero_upstreams =
+            section_name == "resource_counts" && key == "upstreams" && actual == 0;
+        check_declared_count(
+            section_name,
+            object,
+            key,
+            actual,
+            !omitted_zero_upstreams,
+            violations,
+        );
+        canonical.insert(key.to_string(), serde_json::json!(actual));
+    }
+    if include_backup_extras {
+        for (key, actual) in [
+            ("api_specs", extras.api_spec_count()),
+            ("gateway_trust_bundles", extras.trust_bundle_count()),
+        ] {
+            check_declared_count(section_name, object, key, actual, false, violations);
+            if object.contains_key(key) {
+                canonical.insert(key.to_string(), serde_json::json!(actual));
+            }
+        }
+    }
+    if violations.len() != before {
+        return None;
+    }
+    Some(serde_json::Value::Object(canonical))
+}
+
+fn check_declared_count(
+    section_name: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    actual: usize,
+    required: bool,
+    violations: &mut Vec<String>,
+) {
+    let Some(value) = object.get(key) else {
+        if required {
+            violations.push(format!(
+                "invalid backup payload: top-level '{section_name}' is missing required count '{key}'"
+            ));
+        }
+        return;
+    };
+    let Some(declared) = value.as_u64().and_then(|count| usize::try_from(count).ok()) else {
+        violations.push(format!(
+            "invalid backup payload: '{section_name}.{key}' must be a non-negative integer"
+        ));
+        return;
+    };
+    if declared != actual {
+        violations.push(format!(
+            "invalid backup payload: '{section_name}.{key}' declares {declared} but the document contains {actual}"
+        ));
+    }
+}
+
+/// Remove optional string metadata while rejecting a present malformed value.
+fn take_optional_string(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> crate::error::Result<Option<String>> {
     match map.remove(key) {
-        Some(serde_json::Value::String(s)) => Some(s),
-        _ => None,
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(other) => Err(crate::error::Error::Config(format!(
+            "invalid backup payload: top-level '{key}' must be a string when present, got {}",
+            json_type_name(&other)
+        ))),
+    }
+}
+
+fn take_api_specs(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+) -> crate::error::Result<Option<serde_json::Value>> {
+    let Some(value) = map.remove("api_specs") else {
+        return Ok(None);
+    };
+    let items = value.as_object().and_then(|section| section.get("items"));
+    if !matches!(items, Some(serde_json::Value::Array(_))) {
+        return Err(crate::error::Error::Config(format!(
+            "invalid backup payload: top-level 'api_specs' must be an object containing an 'items' array, got {}",
+            json_type_name(&value)
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn take_trust_bundles(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+) -> crate::error::Result<Option<serde_json::Value>> {
+    let Some(value) = map.remove("gateway_trust_bundles") else {
+        return Ok(None);
+    };
+    if !value.is_array() {
+        return Err(crate::error::Error::Config(format!(
+            "invalid backup payload: top-level 'gateway_trust_bundles' must be an array, got {}",
+            json_type_name(&value)
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 

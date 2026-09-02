@@ -1,8 +1,9 @@
 use gitforgeops::config::schema::*;
 use gitforgeops::diff::{
     best_practice::check_best_practices, breaking::detect_breaking_changes,
-    resource_diff::compute_diff, resource_diff::compute_diff_with_scope, resource_diff::state_key,
-    resource_diff::DiffAction, resource_diff::OwnershipScope, security::audit_security,
+    is_sensitive_diff_field, mask_indeterminate_secret_values, resource_diff::compute_diff,
+    resource_diff::compute_diff_with_scope, resource_diff::state_key, resource_diff::DiffAction,
+    resource_diff::OwnershipScope, security::audit_security,
 };
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
@@ -76,6 +77,206 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
+}
+
+#[test]
+fn credential_indeterminate_review_masks_only_matching_consumer_values() {
+    let mut desired_consumer = make_consumer("app", "expected-name");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "different-live-name");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "live-secret"}]),
+    );
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert_eq!(diffs[0].kind, "Consumer");
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .any(|change| change.field.contains("username")),
+        "{:?}",
+        diffs[0].details
+    );
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .all(|change| !change.field.contains("credentials")),
+        "{:?}",
+        diffs[0].details
+    );
+}
+
+#[test]
+fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
+    let mut desired_consumer = make_consumer("app", "app");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "known-desired-value"}]),
+    );
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "app");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "different-live-value"}]),
+    );
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .any(|change| change.field.contains("credentials")),
+        "{:?}",
+        diffs[0].details
+    );
+}
+
+#[test]
+fn credential_indeterminate_review_masks_only_placeholder_leaves() {
+    let mut desired_consumer = make_consumer("app", "app");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([
+            {"key": "${gh-env-secret:alloc=require}", "label": "desired-label"}
+        ]),
+    );
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "app");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([
+            {"key": "live-secret", "label": "changed-label"},
+            {"key": "unexpected-extra-live-secret"}
+        ]),
+    );
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert!(
+        diffs[0]
+            .details
+            .iter()
+            .any(|change| change.field == "credentials"),
+        "literal and extra live credential data must remain comparable: {:?}",
+        diffs[0].details
+    );
+}
+
+/// F7: `diff` needs the same masking `plan` and `review` already do. Without
+/// it, a repo with no credential bundle reports the identical spurious change
+/// on every run — the desired side is a placeholder, the live side is the real
+/// value (or `[REDACTED]`) — and `drift-check.yml --exit-on-drift` can never
+/// go green no matter what anyone commits.
+#[test]
+fn unmasked_broker_controlled_leaves_are_permanent_false_drift() {
+    let mut desired_consumer = make_consumer("app", "app");
+    desired_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=generate}"}]),
+    );
+    let mut desired_plugin =
+        make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    desired_plugin.config = serde_json::json!({
+        "authorization": "${gh-env-secret:alloc=require}"
+    });
+    let desired = GatewayConfig {
+        consumers: vec![desired_consumer],
+        plugin_configs: vec![desired_plugin],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_consumer = make_consumer("app", "app");
+    live_consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "[REDACTED]"}]),
+    );
+    let mut live_plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    live_plugin.config = serde_json::json!({"authorization": "Bearer live-secret"});
+    let mut actual = GatewayConfig {
+        consumers: vec![live_consumer],
+        plugin_configs: vec![live_plugin],
+        ..GatewayConfig::default()
+    };
+
+    // What `diff` reported before it masked: two changes nobody made.
+    assert_eq!(compute_diff(&desired, &actual).len(), 2);
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+
+    assert!(
+        compute_diff(&desired, &actual).is_empty(),
+        "{:?}",
+        compute_diff(&desired, &actual)
+    );
+}
+
+#[test]
+fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
+    let mut desired_plugin =
+        make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    desired_plugin.config = serde_json::json!({
+        "authorization": "${gh-env-secret:alloc=require}",
+        "protocol": "grpc"
+    });
+    let desired = GatewayConfig {
+        plugin_configs: vec![desired_plugin],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    live_plugin.config = serde_json::json!({
+        "authorization": "Bearer live-secret",
+        "protocol": "http/protobuf"
+    });
+    let mut actual = GatewayConfig {
+        plugin_configs: vec![live_plugin],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual);
+    assert_eq!(diffs.len(), 1, "{:?}", diffs);
+    assert_eq!(diffs[0].details.len(), 1, "{:?}", diffs[0].details);
+    assert_eq!(diffs[0].details[0].field, "config");
+    assert!(is_sensitive_diff_field("PluginConfig", "config"));
+    assert!(is_sensitive_diff_field("Consumer", "credentials"));
+    assert!(!is_sensitive_diff_field("PluginConfig", "plugin_name"));
 }
 
 fn make_plugin_config(

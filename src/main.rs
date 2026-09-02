@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
 
@@ -64,11 +64,13 @@ async fn main() {
             from_api,
             from_file,
             output_dir,
+            credential_bundle_output,
         } => {
             cmd_import(
                 from_api,
                 from_file.as_deref(),
                 &output_dir,
+                credential_bundle_output.as_deref(),
                 explicit_env.as_deref(),
             )
             .await
@@ -221,6 +223,19 @@ fn resolve_credentials(
     Ok(secrets::resolve_secrets(cfg, &bundle)?)
 }
 
+/// Is a credential bundle available to this invocation?
+///
+/// Without one, every broker-controlled leaf stays a placeholder string while
+/// the live gateway returns either the real value or `[REDACTED]`, so a naive
+/// comparison reports permanent false drift on credentials nobody changed.
+/// `diff::mask_indeterminate_secret_values` neutralizes exactly those leaves;
+/// this predicate decides when to apply it.
+fn credential_bundle_loaded(env_config: &EnvConfig) -> bool {
+    let has_content = |value: Option<&str>| value.is_some_and(|raw| !raw.trim().is_empty());
+    has_content(env_config.creds_bundle_json_file.as_deref())
+        || has_content(env_config.creds_bundle_json.as_deref())
+}
+
 /// In `exclusive` mode, every resource in `desired` must live in a namespace
 /// declared in `ownership.namespaces`, and any `namespace_filter` must be one
 /// of those allowed namespaces. Otherwise the repo would be silently pushing
@@ -342,16 +357,6 @@ fn build_github_api_client(
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
         .build()
         .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))
-}
-
-/// Field names whose diff values must never be printed verbatim. These
-/// carry secret material — consumer credentials hold API keys, JWT
-/// signing keys, HMAC secrets, etc. Once resolved from the bundle, the
-/// values ARE the secret. `cmd_diff` echoes to stdout which is captured
-/// in CI logs (especially drift-check.yml), so printing them would
-/// exfiltrate secrets through a side channel.
-fn is_sensitive_field(kind: &str, field: &str) -> bool {
-    matches!((kind, field), ("Consumer", "credentials"))
 }
 
 /// Append `comment` to `$GITHUB_STEP_SUMMARY` when running under GitHub
@@ -695,7 +700,7 @@ fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) 
     if report.results.is_empty() {
         return None;
     }
-    let mut lines = vec![format!("Credential slots (env {}):", resolved.name)];
+    let mut lines = vec![format!("Secret broker slots (env {}):", resolved.name)];
     for r in &report.results {
         let status = match r.status {
             secrets::SlotStatus::Resolved => "resolved",
@@ -800,6 +805,16 @@ async fn cmd_export(
             "`--encrypt-to` requires `--materialize` (encrypting placeholders is pointless)".into(),
         );
     }
+    if materialize
+        && encrypt_to.is_none()
+        && output_path.is_none()
+        && std::io::stdout().is_terminal()
+    {
+        return Err(
+            "refusing to print materialized credentials to an interactive terminal; use --output PATH (written mode 0600) or --encrypt-to LOGIN"
+                .into(),
+        );
+    }
 
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved)?;
@@ -859,6 +874,7 @@ async fn cmd_export(
         );
     }
 
+    let plaintext_materialized = materialize && encrypt_to.is_none();
     let payload: Vec<u8> = if let Some(login) = encrypt_to {
         let client = build_github_api_client(&env_config)?;
         match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
@@ -882,14 +898,19 @@ async fn cmd_export(
 
     match output_path {
         Some(path) => {
-            if let Some(parent) = PathBuf::from(path).parent() {
-                std::fs::create_dir_all(parent)?;
+            if plaintext_materialized {
+                apply::publish_private_export(path, &payload)?;
+            } else {
+                apply::publish_export(path, &payload)?;
             }
-            let mut file = std::fs::File::create(path)?;
-            file.write_all(&payload)?;
             eprintln!("Exported to {}", path);
         }
         None => {
+            if plaintext_materialized {
+                eprintln!(
+                    "WARNING: writing plaintext materialized credentials to non-interactive stdout; ensure the receiving process and destination are private. Prefer --output PATH (mode 0600) or --encrypt-to LOGIN."
+                );
+            }
             std::io::stdout().write_all(&payload)?;
         }
     }
@@ -905,11 +926,12 @@ async fn cmd_diff(
     let mut desired = load_and_assemble_for(&resolved)?;
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
+    let bundle_loaded = credential_bundle_loaded(&env_config);
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces)?;
-    let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+    let mut namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
     let cached_namespaces = cached_namespace_names(&namespace_pairs);
     if !cached_namespaces.is_empty() {
         eprintln!(
@@ -923,6 +945,20 @@ async fn cmd_diff(
             ))
             .into());
         }
+    }
+    // Same treatment `plan` and `review` give an unresolvable secret: with no
+    // bundle, a broker-controlled leaf is a placeholder here and a real (or
+    // `[REDACTED]`) value on the gateway, which compares as drift on every
+    // run and fails `drift-check.yml --exit-on-drift` forever. Literal
+    // siblings, extra entries, shape changes and every nonsecret field are
+    // still compared.
+    if !bundle_loaded && cached_namespaces.is_empty() {
+        for pair in &mut namespace_pairs {
+            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+        }
+        eprintln!(
+            "Note: no credential bundle is available, so unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from this comparison. Everything else is compared normally."
+        );
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
         &namespace_pairs,
@@ -955,12 +991,10 @@ async fn cmd_diff(
             };
             println!("  {} {} {} ({})", action, d.kind, d.id, d.namespace);
             for change in &d.details {
-                if is_sensitive_field(&d.kind, &change.field) {
-                    // Credentials carry actual secret material (rotated
-                    // values, generated keys). Printing them here would
-                    // leak to CI logs — drift-check.yml echoes stdout
-                    // into the workflow log, which is viewable by anyone
-                    // with read access to the run.
+                if diff::is_sensitive_diff_field(&d.kind, &change.field) {
+                    // Consumer credentials and plugin config can carry actual
+                    // secret material. Printing them here would leak to CI
+                    // logs, which are visible to anyone with run access.
                     println!("    {}: [REDACTED] -> [REDACTED]", change.field);
                 } else {
                     println!(
@@ -1028,7 +1062,7 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-
+    let bundle_loaded = credential_bundle_loaded(&env_config);
     println!("=== Environment ===");
     println!(
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
@@ -1063,6 +1097,11 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
         println!("=== Credentials ===");
         println!("{}\n", note);
+        if !bundle_loaded {
+            println!(
+                "Unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from the live diff because no secret bundle is available; literal siblings, extra entries, shape changes, and nonsecret fields are still compared.\n"
+            );
+        }
     }
 
     let state = StateFile::load(&resolved.name)?;
@@ -1072,9 +1111,14 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     let (diffs, breaking, unmanaged, spec_owned, actual_available, provenance_note) = match &client
     {
         Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
-            Ok(namespace_pairs) => {
+            Ok(mut namespace_pairs) => {
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
+                    if !bundle_loaded {
+                        for pair in &mut namespace_pairs {
+                            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+                        }
+                    }
                     let (d, b, u, s) = compute_namespace_diffs(
                         &namespace_pairs,
                         managed.as_ref(),
@@ -1634,7 +1678,6 @@ async fn cmd_apply(
                     state.record_credential(
                         &slot.slot,
                         slot.shard,
-                        &slot.value,
                         slot.delivered.as_ref().map(|d| d.login.as_str()),
                         run_id.as_deref(),
                     );
@@ -1829,7 +1872,6 @@ async fn cmd_apply(
                 state.record_credential(
                     &slot.slot,
                     slot.shard,
-                    &slot.value,
                     slot.delivered.as_ref().map(|d| d.login.as_str()),
                     run_id.as_deref(),
                 );
@@ -1862,9 +1904,11 @@ async fn cmd_import(
     from_api: bool,
     from_file: Option<&str>,
     output_dir: &str,
+    credential_bundle_output: Option<&str>,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_path = PathBuf::from(output_dir);
+    let credential_bundle_path = credential_bundle_output.map(PathBuf::from);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
     let result = if from_api {
@@ -1880,9 +1924,19 @@ async fn cmd_import(
             )
         })?;
         let client = AdminClient::new_scoped(&env_config, [namespace])?;
-        import::import_from_api(&client, &output_path, Some(namespace)).await?
+        import::import_from_api(
+            &client,
+            &output_path,
+            Some(namespace),
+            credential_bundle_path.as_deref(),
+        )
+        .await?
     } else if let Some(file_path) = from_file {
-        import::import_from_file(&PathBuf::from(file_path), &output_path)?
+        import::import_from_file(
+            &PathBuf::from(file_path),
+            &output_path,
+            credential_bundle_path.as_deref(),
+        )?
     } else {
         eprintln!("Specify --from-api or --from-file <PATH>");
         process::exit(1);
@@ -1892,8 +1946,26 @@ async fn cmd_import(
         "Imported: {} proxies, {} consumers, {} upstreams, {} plugin_configs",
         result.proxies, result.consumers, result.upstreams, result.plugin_configs
     );
+    println!(
+        "Import manifest: {}",
+        output_path.join(import::IMPORT_MANIFEST_FILENAME).display()
+    );
+    if let Some(path) = credential_bundle_path {
+        println!(
+            "Secret migration bundle: {} (private mode 0600; seed the listed FERRUM_CREDS_BUNDLE* environment secrets, then securely delete the local file)",
+            path.display()
+        );
+    }
+    if let Some(notice) = result.source_metadata_notice() {
+        println!("{notice}");
+    }
     if let Some(notice) = result.unmanaged_sections_notice() {
         println!("{notice}");
+    }
+    // Loud and last, so it is the final thing on screen: these are the values
+    // gitforgeops could not classify and a human has to.
+    if let Some(notice) = result.custom_plugin_review_notice() {
+        eprintln!("{notice}");
     }
 
     Ok(())
@@ -1922,6 +1994,7 @@ async fn cmd_review(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
+    let bundle_loaded = credential_bundle_loaded(&env_config);
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
     let (validation_ok, validation_output) = match &val_result {
@@ -1948,7 +2021,7 @@ async fn cmd_review(
                 // reason below. The per-namespace provenance is checked as
                 // well as the client's sticky flag so the reason can name
                 // exactly which namespaces came back cached.
-                Ok(namespace_pairs) => {
+                Ok(mut namespace_pairs) => {
                     let cached = cached_namespace_names(&namespace_pairs);
                     match review::stale_live_view_error(c.served_from_cache() || !cached.is_empty())
                     {
@@ -1963,6 +2036,21 @@ async fn cmd_review(
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
                         }
                         None => {
+                            // Same treatment `plan` and `diff` give an
+                            // unresolvable secret: with no bundle loaded a
+                            // broker-controlled leaf is still a placeholder
+                            // here and a real (or `[REDACTED]`) value on the
+                            // gateway, so comparing them would publish
+                            // permanent false drift — and echo the live value
+                            // into a world-readable PR comment.
+                            if !bundle_loaded {
+                                for pair in &mut namespace_pairs {
+                                    diff::mask_indeterminate_secret_values(
+                                        &desired,
+                                        &mut pair.actual,
+                                    );
+                                }
+                            }
                             let (d, b, u, s) = compute_namespace_diffs(
                                 &namespace_pairs,
                                 managed.as_ref(),
@@ -2029,17 +2117,6 @@ async fn cmd_review(
         resolved.name, resolved.ownership.mode, resolved.apply_strategy
     );
 
-    let bundle_loaded = env_config
-        .creds_bundle_json_file
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || env_config
-            .creds_bundle_json
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-
     let comment = review::build_review_comment_v2(
         validation_ok,
         &validation_output,
@@ -2066,8 +2143,10 @@ async fn cmd_review(
             // POST to /issues/{n}/comments returns 403. We still want the
             // review content visible, so fall back to $GITHUB_STEP_SUMMARY
             // (which the runner always lets us write) and to stdout.
-            // Never fail the job on a delivery-channel error — the
-            // validation itself succeeded; only the report delivery didn't.
+            // Ordinary/fork review keeps the historical step-summary fallback.
+            // Trusted `--require-live` review treats comment delivery as part
+            // of the required reviewer-facing result and fails after writing
+            // the same fallback evidence.
             match review::post_pr_comment(&env_config, pr_number, &comment).await {
                 Ok(()) => {
                     println!("Posted review comment to PR #{}", pr_number);
@@ -2078,6 +2157,11 @@ async fn cmd_review(
                     );
                     write_review_to_step_summary(&comment)?;
                     print!("{}", comment);
+                    // Recorded rather than raised here: when the live
+                    // comparison also failed, that is the root cause and has
+                    // to be the reported one, and its gate only runs below.
+                    // `review::enforce_comment_delivery` then turns this into
+                    // the same hard failure `--require-live` demands.
                     comment_delivery_error = Some(e.to_string());
                 }
             }
@@ -2087,6 +2171,9 @@ async fn cmd_review(
         }
     }
 
+    // Order matters: a trusted review that could neither compare against the
+    // gateway nor post its comment reports the comparison failure, which is
+    // what the reviewer has to act on.
     review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
 
@@ -2328,7 +2415,6 @@ async fn cmd_rotate(
             state.record_credential(
                 &slot,
                 outcome.shard,
-                &outcome.value,
                 outcome.delivered.as_ref().map(|d| d.login.as_str()),
                 std::env::var("GITHUB_RUN_ID").ok().as_deref(),
             );
