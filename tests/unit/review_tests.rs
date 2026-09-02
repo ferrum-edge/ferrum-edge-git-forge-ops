@@ -508,3 +508,59 @@ fn trusted_review_requires_comment_delivery_after_fallback() {
     assert!(message.contains("required PR comment"), "{message}");
     assert!(message.contains("HTTP 403"), "{message}");
 }
+
+/// gitforgeops' own banner is markdown, not content. Escaping it turned
+/// ``Environment: `default` `` into a line rendering literal backslashes.
+#[test]
+fn review_comment_environment_header_renders_as_markdown_not_escaped_text() {
+    use gitforgeops::review::environment_header;
+
+    let header = environment_header("default", "Shared", "Incremental");
+    assert_eq!(
+        header,
+        "Environment: `default` · Ownership: `Shared` · Strategy: `Incremental`"
+    );
+
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some(&header),
+        &ResolveReport::default(),
+        true,
+    );
+    let first_line = comment.lines().next().unwrap();
+    assert_eq!(
+        first_line,
+        "Environment: `default` · Ownership: `Shared` · Strategy: `Incremental`"
+    );
+    assert!(
+        !comment.contains("\\`"),
+        "the header must not be escaped: {comment}"
+    );
+}
+
+/// The three values are still operator input, so each is fenced individually
+/// rather than trusted into the line.
+#[test]
+fn review_comment_environment_header_fences_hostile_environment_names() {
+    use gitforgeops::review::environment_header;
+
+    let header = environment_header("`rm -rf`\n## injected", "Shared", "Incremental");
+    assert!(!header.contains('\n'), "line breaks flattened: {header}");
+    assert!(
+        !header.contains("## injected\n"),
+        "an injected heading cannot start a line: {header}"
+    );
+    assert!(header.starts_with("Environment: "), "{header}");
+    assert!(header.contains("Ownership: `Shared`"), "{header}");
+}

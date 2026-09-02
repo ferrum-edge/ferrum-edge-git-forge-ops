@@ -2048,9 +2048,10 @@ async fn cmd_review(
         None => (Vec::new(), None, None),
     };
 
-    let ownership_note = format!(
-        "Environment: `{}` · Ownership: `{:?}` · Strategy: `{:?}`",
-        resolved.name, resolved.ownership.mode, resolved.apply_strategy
+    let ownership_note = review::environment_header(
+        &resolved.name,
+        &format!("{:?}", resolved.ownership.mode),
+        &format!("{:?}", resolved.apply_strategy),
     );
 
     let comment = review::build_review_comment_v2_with_status(
