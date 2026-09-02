@@ -1,4 +1,5 @@
 mod analysis_tests;
+mod apply_gate_tests;
 mod apply_tests;
 mod assembler_tests;
 mod cli_tests;

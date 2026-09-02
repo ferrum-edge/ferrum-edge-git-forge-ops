@@ -343,6 +343,8 @@ spec:
       - secret: "${gh-env-secret:alloc=generate|len=32}"
 ```
 
+Placeholders are the only supported on-disk form, and that is enforced rather than advised. Before it reads the credential bundle, contacts a gateway, allocates a slot, or publishes a file, `apply` audits the **unresolved** document and refuses every error-severity security finding — a credential string that is not a `${gh-env-secret:...}` placeholder is a secret committed to the repository, and applying it would publish it. `plan` exits non-zero on the same set, so a preview never disagrees with the post-merge apply, and the PR comment marks the findings as blocking. The escape hatch is the same one policy violations use: the `gitforgeops/policy-override` label, added by an account with `write` permission (see [Override flow](#override-flow-b2-label--permission)). Use it to land an emergency change, not as a way to keep literals in the tree.
+
 ### Credential shapes
 
 ferrum-edge recognizes exactly five credential types, and each one is an **array** of entries:
@@ -828,6 +830,7 @@ Notes:
 - `--format github` is an alias for `github-annotations`.
 - `--confirm-api-spec-deletion` is the opt-in for touching resources the gateway's OpenAPI spec importer owns: a namespace with live API specs otherwise rejects `full_replace`, and exclusive incremental apply otherwise skips tagged resources. Repository/spec identity conflicts always block the whole apply before unrelated writes; the confirmation flag is not a way to make two owners share one row.
 - `--allow-large-prune` acknowledges only the configured deletion percentage. A cached (`X-Data-Source: cached`) backup blocks every mutation and has no override because API-spec ownership is unknown.
+- `plan` exits non-zero when schema validation fails **or** the pre-resolve security audit reports an error-severity finding — the same set `apply` refuses on. Findings are always printed first; the exit code carries nothing the operator has not already seen.
 - API import requires `FERRUM_NAMESPACE` (or the selected environment's namespace filter), mints an exact namespace-scoped JWT, and imports one namespace at a time. This fails closed on gateways that require namespace claims: an unscoped `GET /namespaces` intentionally returns an empty list and therefore cannot safely drive an all-namespace import.
 - `review --require-live` returns non-zero after rendering the fallback report if either the gateway comparison was unavailable or the required PR comment could not be posted. The trusted PR workflow uses it; secretless static review intentionally keeps comment delivery best-effort. Review comments are UTF-8-safe and capped below GitHub's API limit, with explicit omission counts. When a review has no credential bundle, only unresolved broker-controlled leaves in Consumer credentials and plugin config are excluded from live comparison; literal siblings, extra entries, shape changes, adds/deletes, and all nonsecret fields remain authoritative.
 - `envs --format json --include-scopes` emits protected environment/namespace routing for trusted CI and is not a replacement for `envs --format json`'s string array.

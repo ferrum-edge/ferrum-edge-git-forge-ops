@@ -632,6 +632,68 @@ fn security_detects_literal_credential() {
 }
 
 #[test]
+fn security_blockers_selects_only_error_severity_findings() {
+    use gitforgeops::diff::security_blockers;
+
+    // A literal credential (error) alongside the warning every auth-less proxy
+    // produces. `apply` must refuse on the first and not the second.
+    let mut creds = std::collections::HashMap::new();
+    creds.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "literal-secret-key"}]),
+    );
+    let config = GatewayConfig {
+        consumers: vec![Consumer {
+            credentials: creds,
+            ..make_consumer("c1", "alice")
+        }],
+        proxies: vec![make_proxy("p1", "/a", "backend.internal")],
+        ..GatewayConfig::default()
+    };
+
+    let findings = audit_security(&config);
+    assert!(
+        findings.iter().any(|f| f.severity == "warning"),
+        "fixture must produce at least one non-blocking finding: {findings:?}"
+    );
+
+    let blockers = security_blockers(&findings);
+    assert_eq!(blockers.len(), 1, "got {blockers:?}");
+    assert_eq!(blockers[0].kind, "Consumer");
+    assert!(blockers[0].message.contains("Literal credential"));
+    assert!(blockers.iter().all(|f| f.severity == "error"));
+}
+
+#[test]
+fn security_blockers_is_empty_for_a_brokered_consumer() {
+    use gitforgeops::diff::security_blockers;
+
+    // The supported on-disk form. Placeholders are repository data, not
+    // secrets, so nothing here may block an apply.
+    let mut creds = std::collections::HashMap::new();
+    creds.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    let config = GatewayConfig {
+        consumers: vec![Consumer {
+            credentials: creds,
+            ..make_consumer("c1", "alice")
+        }],
+        ..GatewayConfig::default()
+    };
+
+    assert!(security_blockers(&audit_security(&config)).is_empty());
+}
+
+#[test]
+fn security_blockers_is_empty_for_no_findings() {
+    use gitforgeops::diff::security_blockers;
+
+    assert!(security_blockers(&[]).is_empty());
+}
+
+#[test]
 fn security_detects_nested_literal_credential() {
     let mut creds = std::collections::HashMap::new();
     creds.insert(

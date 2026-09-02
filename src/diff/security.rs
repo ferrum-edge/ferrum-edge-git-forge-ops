@@ -40,6 +40,30 @@ impl SecurityFinding {
     }
 }
 
+/// Severity string that blocks `apply`. Matches
+/// [`crate::policy::Severity::blocks_apply`] so the two gates share one notion
+/// of "this must not reach a gateway".
+pub const BLOCKING_SEVERITY: &str = "error";
+
+/// The findings that must stop an `apply`.
+///
+/// Pure and total so the gate itself is testable without a gateway, a repo
+/// checkout, or a process: `apply` refuses when this is non-empty (absent an
+/// override), and `plan` exits non-zero on exactly the same set, so a preview
+/// and the post-merge apply never disagree.
+///
+/// The load-bearing member is `check_literal_credentials`: a consumer
+/// credential string that is not a `${gh-env-secret:…}` placeholder is a
+/// secret committed to the repository, and applying it publishes it to the
+/// gateway. That is only true of the **pre-resolve** config — see
+/// [`audit_security_with_policy`].
+pub fn security_blockers(findings: &[SecurityFinding]) -> Vec<&SecurityFinding> {
+    findings
+        .iter()
+        .filter(|finding| finding.severity == BLOCKING_SEVERITY)
+        .collect()
+}
+
 /// Audit with the repository's default notion of what counts as authentication.
 pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
     audit_security_with_policy(config, None)

@@ -183,6 +183,22 @@ fn build_review_comment_inner(
         }
         append_omitted_list_item(&mut md, security.len(), "security finding");
         md.push('\n');
+        // The reviewer's copy of apply's verdict. `cmd_apply` refuses on
+        // exactly this set (see `diff::security_blockers`), so a comment that
+        // listed the findings without saying they are terminal would read as
+        // advice on a PR that cannot be merged-and-applied.
+        let blocking = security
+            .iter()
+            .filter(|finding| finding.severity == crate::diff::security::BLOCKING_SEVERITY)
+            .count();
+        if blocking > 0 {
+            md.push_str(&format!(
+                "> **Apply is blocked** by {blocking} error-severity security finding(s). \
+                 Consumer credentials must be committed as `${{gh-env-secret:...}}` placeholders — \
+                 a literal value in repository YAML is a committed secret, and applying it \
+                 publishes it to the gateway.\n\n"
+            ));
+        }
     }
 
     if !best_practices.is_empty() {

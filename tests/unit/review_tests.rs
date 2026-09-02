@@ -508,3 +508,35 @@ fn trusted_review_requires_comment_delivery_after_fallback() {
     assert!(message.contains("required PR comment"), "{message}");
     assert!(message.contains("HTTP 403"), "{message}");
 }
+
+#[test]
+fn review_comment_marks_error_severity_security_findings_as_blocking() {
+    let findings = vec![
+        SecurityFinding {
+            severity: "error".to_string(),
+            kind: "Consumer".to_string(),
+            id: "app".to_string(),
+            namespace: "ferrum".to_string(),
+            message: "Literal credential in 'keyauth[0].key' on consumer app".to_string(),
+        },
+        SecurityFinding {
+            severity: "warning".to_string(),
+            kind: "Proxy".to_string(),
+            id: "p1".to_string(),
+            namespace: "ferrum".to_string(),
+            message: "No auth plugin attached".to_string(),
+        },
+    ];
+
+    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+
+    assert!(
+        comment.contains("**Apply is blocked** by 1 error-severity security finding"),
+        "the comment must state apply's verdict: {comment}"
+    );
+    assert!(comment.contains("gh-env-secret"), "{comment}");
+
+    // A warning-only audit is advice, not a blocker.
+    let advisory = build_review_comment(true, "", &[], &[], &findings[1..], &[], None);
+    assert!(!advisory.contains("Apply is blocked"), "{advisory}");
+}

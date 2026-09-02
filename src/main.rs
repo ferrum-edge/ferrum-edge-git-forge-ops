@@ -671,6 +671,43 @@ fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
     println!();
 }
 
+/// Reserved rule id recorded in the state file's override ledger when a
+/// maintainer overrides the pre-resolve security audit.
+///
+/// Policy findings carry their own `rule_id`; the audit is one gate rather
+/// than a registry of rules, so a bypass of it is recorded under a single id
+/// that cannot collide with a policy rule (`.` is not used in rule ids).
+const SECURITY_AUDIT_RULE_ID: &str = "diff.security";
+
+/// Print the pre-resolve security audit for `apply`, blockers first.
+///
+/// Written to stderr rather than stdout: `apply`'s stdout carries the change
+/// list an operator (or a workflow step summary) reads back, and a refusal has
+/// to survive being piped away from it.
+fn print_security_findings(findings: &[diff::SecurityFinding]) {
+    if findings.is_empty() {
+        return;
+    }
+    eprintln!("=== Security Findings ===");
+    let blockers = diff::security_blockers(findings);
+    for finding in &blockers {
+        eprintln!(
+            "  [{}] {} {} ({}): {}",
+            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+        );
+    }
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.severity != diff::BLOCKING_SEVERITY)
+    {
+        eprintln!(
+            "  [{}] {} {} ({}): {}",
+            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+        );
+    }
+    eprintln!();
+}
+
 /// Best-effort post-apply convergence line. Never fails an apply — a gateway
 /// that cannot answer `GET /cluster` (older build, DP/CP not in play, network
 /// blip) produces one "unavailable" line and nothing else.
@@ -1173,10 +1210,22 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     }
 
     // security_findings was computed pre-resolve above; reuse it here.
+    let security_blockers = diff::security_blockers(&security_findings);
+    let security_blocked = !security_blockers.is_empty();
     if !security_findings.is_empty() {
         println!("=== Security Findings ===");
         for sf in &security_findings {
             println!("  [{}] {} {}: {}", sf.severity, sf.kind, sf.id, sf.message);
+        }
+        if security_blocked {
+            // Same set `apply` refuses on, so the preview and the post-merge
+            // apply cannot disagree about whether this repo is applyable.
+            println!(
+                "\n{} error-severity finding(s) block apply. Consumer credentials belong in the \
+                 broker as ${{gh-env-secret:...}} placeholders; a literal value in repository YAML \
+                 is a committed secret.",
+                security_blockers.len()
+            );
         }
         println!();
     }
@@ -1209,7 +1258,11 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
         }
     }
 
-    if !validation_ok {
+    // Plan's exit code is the preview's verdict: nonzero for anything that
+    // would stop `apply`. Schema validation and the error-severity security
+    // audit are both in that set, and both have already been printed in full
+    // above — the exit code carries no information the operator has not seen.
+    if !validation_ok || security_blocked {
         process::exit(1);
     }
 
@@ -1230,6 +1283,79 @@ async fn cmd_apply(
     // Exclusive ownership: enforce namespace scope before anything else so the
     // operator fails fast on a misconfigured resource, not deep in apply.
     enforce_exclusive_scope(&resolved, &desired)?;
+
+    // Literal consumer credentials block apply; they are not an advisory.
+    //
+    // The audit must see the UNRESOLVED document. `check_literal_credentials`
+    // calls any credential string that is not a `${gh-env-secret:...}`
+    // placeholder a committed secret, so auditing after resolution would flag
+    // every correctly brokered value and miss nothing else. Running it here —
+    // before the state lock, before the credential bundle is read, and before
+    // any gateway call, health preflight, credential allocation or file
+    // publish — is what makes it impossible for an apply to publish a secret
+    // that was committed to the repository.
+    let policy_cfg = policy::load_policies()?;
+    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    print_security_findings(&security_findings);
+    let security_blocked = !diff::security_blockers(&security_findings).is_empty();
+
+    // One override decision serves both fail-closed reporters: the same PR
+    // label, added by the same sufficiently-permissioned account, clears the
+    // security audit and the policy rules. Resolved once so apply makes at
+    // most one round trip, and only when something could actually be
+    // overridden.
+    let override_cfg = policy_cfg
+        .as_ref()
+        .map(|cfg| cfg.overrides.clone())
+        .unwrap_or_default();
+    let override_decision = if security_blocked || policy_cfg.is_some() {
+        match resolve_pr_number(&env_config).await {
+            Some(pr) => Some(policy::check_override(&env_config, &override_cfg, pr).await?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let override_approver = override_decision
+        .as_ref()
+        .filter(|decision| decision.active)
+        .and_then(|decision| decision.approver.clone());
+
+    // Overridden rule ids are captured as they are cleared and written into
+    // state after apply, so an audit can see which blocking findings were
+    // bypassed and by whom.
+    let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
+
+    if security_blocked {
+        let blocker_count = diff::security_blockers(&security_findings).len();
+        match &override_approver {
+            Some(approver) => {
+                eprintln!(
+                    "{blocker_count} error-severity security finding(s) overridden by @{approver}; continuing."
+                );
+                overridden_for_audit.push((SECURITY_AUDIT_RULE_ID.to_string(), approver.clone()));
+            }
+            None => {
+                eprintln!(
+                    "Refusing to apply: {blocker_count} error-severity security finding(s) listed above. \
+                     Consumer credentials belong in the broker as ${{gh-env-secret:...}} placeholders; a literal \
+                     value in repository YAML is a committed secret and applying it publishes it to the gateway. \
+                     To override, add the '{}' label to the PR from an account with '{}' permission.",
+                    override_cfg.require_label, override_cfg.required_permission
+                );
+                match &override_decision {
+                    Some(decision) if !decision.active => {
+                        eprintln!("(override inactive: {})", decision.reason)
+                    }
+                    Some(_) => {}
+                    None => {
+                        eprintln!("(no PR associated with this commit; overrides not evaluated)")
+                    }
+                }
+                return Err("unresolved security findings".into());
+            }
+        }
+    }
 
     let _state_lock = StateFile::lock(&resolved.name)?;
     let mut state = StateFile::load(&resolved.name)?;
@@ -1300,29 +1426,20 @@ async fn cmd_apply(
         }
     }
 
-    // Policy enforcement (with optional override). Overridden rule_ids are
-    // captured here and written into state after a successful apply so audits
-    // can see which blocking findings were bypassed by whom.
-    let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
-    if let Some(policy_cfg) = policy::load_policies()? {
-        let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
-        let pr_number = resolve_pr_number(&env_config).await;
-        let override_decision = if let Some(pr) = pr_number {
-            let d = policy::check_override(&env_config, &policy_cfg.overrides, pr).await?;
-            policy::github_override::apply_override(&mut findings, &d);
-            Some(d)
-        } else {
-            None
-        };
-
+    // Policy enforcement, sharing the override decision resolved before the
+    // security gate. Overridden rule_ids are captured here and written into
+    // state after a successful apply so audits can see which blocking findings
+    // were bypassed by whom.
+    if let Some(policy_cfg) = &policy_cfg {
+        let mut findings = policy::evaluate_policies(&desired, policy_cfg);
         if let Some(d) = &override_decision {
-            if d.active {
-                if let Some(approver) = &d.approver {
-                    for f in &findings {
-                        if f.overridden_by.is_some() {
-                            overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
-                        }
-                    }
+            policy::github_override::apply_override(&mut findings, d);
+        }
+
+        if let Some(approver) = &override_approver {
+            for f in &findings {
+                if f.overridden_by.is_some() {
+                    overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
                 }
             }
         }
