@@ -366,6 +366,15 @@ impl AdminClient {
 
         let mut snapshot = BackupSnapshot::from_body(&resp.body)?;
         snapshot.cached = cached;
+        // A live read never fails on the count seal (see `SealStrictness`),
+        // but an operator should know the gateway's own inventory disagreed
+        // with what it sent — and `import` turns the same notice into a hard
+        // refusal, because that document becomes permanent repo state.
+        if let Some(notice) = snapshot.seal_violation_notice() {
+            eprintln!(
+                "Warning: GET /backup for namespace '{namespace}' returned a count seal that does not match the document ({notice}). The seal was discarded; resource data is used as received."
+            );
+        }
         Ok(snapshot)
     }
 
@@ -1127,6 +1136,30 @@ impl BackupExtras {
     }
 }
 
+/// How a count seal that disagrees with the decoded document is treated.
+///
+/// The seal is an anti-truncation device, and the two consumers want opposite
+/// things from a disagreement:
+///
+/// * **Import** reads a document once and turns it into the repository's
+///   permanent desired state. A seal that does not match means the source may
+///   be truncated, and publishing a partial tree is unrecoverable, so it is a
+///   hard error.
+/// * **Live reads** (`diff`, `plan`, `apply`, drift-check) run against a
+///   gateway whose seal is emitted by a different codebase on every request.
+///   A gateway that omits `counts.upstreams`, or a cached-fallback export that
+///   elides `api_specs` while retaining `counts.api_specs`, would otherwise
+///   take every one of those commands down over metadata that no decision is
+///   made from. Record the disagreement, drop the seal, and keep going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealStrictness {
+    /// Import: a disagreeing seal fails the read.
+    Strict,
+    /// Live reads: a disagreeing seal is recorded in
+    /// [`BackupSnapshot::seal_violations`] and the seal itself is discarded.
+    Advisory,
+}
+
 /// The full `BackupResponse` envelope.
 #[derive(Debug, Clone, Default)]
 pub struct BackupSnapshot {
@@ -1149,6 +1182,11 @@ pub struct BackupSnapshot {
     /// reports these explicitly instead of silently discarding future backup
     /// capabilities.
     pub unsupported_sections: Vec<String>,
+    /// Count-seal disagreements found while decoding. Always empty under
+    /// [`SealStrictness::Strict`] (the decode returns `Err` instead); under
+    /// [`SealStrictness::Advisory`] this is what the caller warns about, and
+    /// `counts` / `resource_counts` are `None`.
+    pub seal_violations: Vec<String>,
 }
 
 impl BackupSnapshot {
@@ -1159,12 +1197,24 @@ impl BackupSnapshot {
     pub fn from_body(body: &str) -> crate::error::Result<Self> {
         let value: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
-        Self::from_value(value)
+        // Live reads are advisory: see [`SealStrictness`]. Callers that turn a
+        // backup into permanent repository state re-check
+        // `seal_violations` and refuse.
+        Self::from_value_with_strictness(value, SealStrictness::Advisory)
+    }
+
+    /// Parse an already-decoded JSON/YAML-compatible backup value with the
+    /// import path's strict seal enforcement.
+    pub fn from_value(value: serde_json::Value) -> crate::error::Result<Self> {
+        Self::from_value_with_strictness(value, SealStrictness::Strict)
     }
 
     /// Parse an already-decoded JSON/YAML-compatible backup value. Shared by
     /// API and file import so both paths inventory the same opaque sections.
-    pub fn from_value(mut value: serde_json::Value) -> crate::error::Result<Self> {
+    pub fn from_value_with_strictness(
+        mut value: serde_json::Value,
+        strictness: SealStrictness,
+    ) -> crate::error::Result<Self> {
         // Lift the non-`GatewayConfig` sections *out* of the document rather
         // than copying them out of it: a production `/backup` is megabytes of
         // JSON, and cloning the whole tree just to keep two keys doubled peak
@@ -1216,14 +1266,28 @@ impl BackupSnapshot {
 
         let config: GatewayConfig = serde_json::from_value(value)
             .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
-        counts = canonicalize_count_seal("counts", counts.as_ref(), &config, &extras, true)?;
+        let mut seal_violations = Vec::new();
+        counts = canonicalize_count_seal(
+            "counts",
+            counts.as_ref(),
+            &config,
+            &extras,
+            true,
+            &mut seal_violations,
+        );
         resource_counts = canonicalize_count_seal(
             "resource_counts",
             resource_counts.as_ref(),
             &config,
             &extras,
             false,
-        )?;
+            &mut seal_violations,
+        );
+        if matches!(strictness, SealStrictness::Strict) {
+            if let Some(violation) = seal_violations.first() {
+                return Err(crate::error::Error::Config(violation.clone()));
+            }
+        }
 
         Ok(Self {
             config,
@@ -1235,7 +1299,17 @@ impl BackupSnapshot {
             counts,
             resource_counts,
             unsupported_sections,
+            seal_violations,
         })
+    }
+
+    /// One-line operator summary of every count-seal disagreement, or `None`
+    /// when the seal agreed (or was absent).
+    pub fn seal_violation_notice(&self) -> Option<String> {
+        if self.seal_violations.is_empty() {
+            return None;
+        }
+        Some(self.seal_violations.join("; "))
     }
 }
 
@@ -1244,21 +1318,27 @@ impl BackupSnapshot {
 /// extra values from `counts` into the import manifest would create a covert
 /// path for credential material to enter the otherwise non-secret resource
 /// tree.
+///
+/// Disagreements are appended to `violations` rather than returned as errors,
+/// and a seal with any disagreement is discarded (`None`) instead of being
+/// half-retained. The caller decides what a violation means; see
+/// [`SealStrictness`].
 fn canonicalize_count_seal(
     section_name: &str,
     value: Option<&serde_json::Value>,
     config: &GatewayConfig,
     extras: &BackupExtras,
     include_backup_extras: bool,
-) -> crate::error::Result<Option<serde_json::Value>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let object = value.as_object().ok_or_else(|| {
-        crate::error::Error::Config(format!(
+    violations: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let value = value?;
+    let Some(object) = value.as_object() else {
+        violations.push(format!(
             "invalid backup payload: top-level '{section_name}' must be an object"
-        ))
-    })?;
+        ));
+        return None;
+    };
+    let before = violations.len();
     let mut canonical = serde_json::Map::new();
 
     for (key, actual) in [
@@ -1273,7 +1353,14 @@ fn canonicalize_count_seal(
         // remains a complete four-kind seal.
         let omitted_zero_upstreams =
             section_name == "resource_counts" && key == "upstreams" && actual == 0;
-        validate_declared_count(section_name, object, key, actual, !omitted_zero_upstreams)?;
+        check_declared_count(
+            section_name,
+            object,
+            key,
+            actual,
+            !omitted_zero_upstreams,
+            violations,
+        );
         canonical.insert(key.to_string(), serde_json::json!(actual));
     }
     if include_backup_extras {
@@ -1281,44 +1368,45 @@ fn canonicalize_count_seal(
             ("api_specs", extras.api_spec_count()),
             ("gateway_trust_bundles", extras.trust_bundle_count()),
         ] {
-            validate_declared_count(section_name, object, key, actual, false)?;
+            check_declared_count(section_name, object, key, actual, false, violations);
             if object.contains_key(key) {
                 canonical.insert(key.to_string(), serde_json::json!(actual));
             }
         }
     }
-    Ok(Some(serde_json::Value::Object(canonical)))
+    if violations.len() != before {
+        return None;
+    }
+    Some(serde_json::Value::Object(canonical))
 }
 
-fn validate_declared_count(
+fn check_declared_count(
     section_name: &str,
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
     actual: usize,
     required: bool,
-) -> crate::error::Result<()> {
+    violations: &mut Vec<String>,
+) {
     let Some(value) = object.get(key) else {
         if required {
-            return Err(crate::error::Error::Config(format!(
+            violations.push(format!(
                 "invalid backup payload: top-level '{section_name}' is missing required count '{key}'"
-            )));
+            ));
         }
-        return Ok(());
+        return;
     };
-    let declared = value
-        .as_u64()
-        .and_then(|count| usize::try_from(count).ok())
-        .ok_or_else(|| {
-            crate::error::Error::Config(format!(
-                "invalid backup payload: '{section_name}.{key}' must be a non-negative integer"
-            ))
-        })?;
+    let Some(declared) = value.as_u64().and_then(|count| usize::try_from(count).ok()) else {
+        violations.push(format!(
+            "invalid backup payload: '{section_name}.{key}' must be a non-negative integer"
+        ));
+        return;
+    };
     if declared != actual {
-        return Err(crate::error::Error::Config(format!(
+        violations.push(format!(
             "invalid backup payload: '{section_name}.{key}' declares {declared} but the document contains {actual}"
-        )));
+        ));
     }
-    Ok(())
 }
 
 /// Remove optional string metadata while rejecting a present malformed value.

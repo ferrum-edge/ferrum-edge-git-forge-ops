@@ -1085,9 +1085,15 @@ fn backup_snapshot_rejects_missing_malformed_and_mismatched_count_seals() {
     }
 }
 
+/// Import decodes strictly: the document becomes the repository's permanent
+/// desired state, so a seal that disagrees means it may be truncated.
+fn import_decode(body: &str) -> gitforgeops::error::Result<BackupSnapshot> {
+    BackupSnapshot::from_value(serde_json::from_str(body).expect("valid json"))
+}
+
 #[test]
 fn backup_snapshot_validates_file_resource_count_seal() {
-    let error = BackupSnapshot::from_body(
+    let error = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1103,7 +1109,7 @@ fn backup_snapshot_validates_file_resource_count_seal() {
 
 #[test]
 fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
-    let snapshot = BackupSnapshot::from_body(
+    let snapshot = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1115,7 +1121,7 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
     .unwrap();
     assert_eq!(snapshot.resource_counts.unwrap()["upstreams"], 0);
 
-    let error = BackupSnapshot::from_body(
+    let error = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1135,7 +1141,7 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
         "{error}"
     );
 
-    let error = BackupSnapshot::from_body(
+    let error = import_decode(
         r#"{
             "version": "1",
             "resource_counts": {
@@ -1147,6 +1153,67 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("resource_counts.upstreams"), "{error}");
+}
+
+/// F4: the count seal is metadata no live decision is made from, and it is
+/// emitted by a gateway build this one does not control. A live `GET /backup`
+/// that disagrees must not take `diff`/`plan`/`apply`/drift-check down — it
+/// records the disagreement, drops the seal, and hands over the resources.
+#[test]
+fn live_backup_reads_downgrade_count_seal_mismatches_to_advisories() {
+    for body in [
+        // A gateway that omits `counts.upstreams` entirely.
+        r#"{
+            "version": "1",
+            "counts": {"proxies": 0, "consumers": 0, "plugin_configs": 0},
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+        // A cached-fallback export that elides api_specs but keeps its count.
+        r#"{
+            "version": "1",
+            "counts": {
+                "proxies": 0, "consumers": 0, "plugin_configs": 0, "upstreams": 0,
+                "api_specs": 3
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+        // An outright mismatch on a managed kind.
+        r#"{
+            "version": "1",
+            "resource_counts": {
+                "proxies": 0, "consumers": 7, "plugin_configs": 0, "upstreams": 0
+            },
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    ] {
+        let snapshot = BackupSnapshot::from_body(body).expect("live read must not fail");
+        assert!(
+            !snapshot.seal_violations.is_empty(),
+            "the disagreement must still be recorded: {body}"
+        );
+        assert!(snapshot.seal_violation_notice().is_some());
+        // A seal that disagrees is discarded rather than half-retained.
+        assert!(snapshot.counts.is_none() || snapshot.resource_counts.is_none());
+
+        // The same document is refused outright on the import path.
+        assert!(import_decode(body).is_err(), "{body}");
+    }
+}
+
+/// An agreeing seal still round-trips on a live read.
+#[test]
+fn live_backup_reads_keep_a_seal_that_agrees() {
+    let snapshot = BackupSnapshot::from_body(
+        r#"{
+            "version": "1",
+            "counts": {"proxies": 0, "consumers": 0, "plugin_configs": 0, "upstreams": 0},
+            "proxies": [], "consumers": [], "plugin_configs": [], "upstreams": []
+        }"#,
+    )
+    .unwrap();
+
+    assert!(snapshot.seal_violations.is_empty());
+    assert_eq!(snapshot.counts.unwrap()["proxies"], 0);
 }
 
 #[test]

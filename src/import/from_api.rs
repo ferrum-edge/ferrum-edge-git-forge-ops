@@ -36,6 +36,15 @@ pub async fn import_from_api(
                 "refusing to import namespace '{namespace}' from X-Data-Source: cached: the snapshot may be stale and omits API-spec ownership metadata; wait for the config database to recover"
             )));
         }
+        // Live reads treat a mismatched count seal as advisory so a single
+        // gateway quirk cannot take `diff`/`plan`/`apply` down. Import is the
+        // opposite case: this document becomes the repository's permanent
+        // desired state, and a seal that disagrees means it may be truncated.
+        if let Some(notice) = snapshot.seal_violation_notice() {
+            return Err(crate::error::Error::Config(format!(
+                "refusing to import namespace '{namespace}': the backup's count seal does not match the document it sealed ({notice}). The snapshot may be truncated; publishing it would make a partial configuration the repository's desired state."
+            )));
+        }
         validate_snapshot_namespace(&snapshot.config, &namespace)?;
 
         match &backup_version {
