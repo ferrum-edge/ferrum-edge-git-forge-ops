@@ -858,12 +858,28 @@ fn safe_path_component<'a>(value: &'a str, field: &str) -> crate::error::Result<
     Ok(value)
 }
 
+/// Filename for one imported resource, derived from its id.
+///
+/// A leading `_` is the loader's "intentionally disabled" marker, so an id like
+/// `_internal-api` cannot become `_internal-api.yaml` — the file would be
+/// written and then skipped on every subsequent load, silently dropping the
+/// resource from desired state (and, in exclusive mode, pruning it). Failing
+/// the whole import instead is no better: the id is the gateway's, the
+/// operator cannot rename it from here, and one such resource dead-ends the
+/// migration entirely.
+///
+/// So the leading character is percent-encoded — `_internal-api` becomes
+/// `%5Finternal-api.yaml`. The loader reads a resource's identity from
+/// `spec.id`, never from the filename, so the encoded name round-trips
+/// unchanged. A leading `%` is encoded too (`%25…`), which keeps the mapping
+/// injective: without it `%5Ffoo` and `_foo` would collide on one path (caught
+/// by `plan_resource_file`, but as a confusing duplicate-target error).
 fn resource_filename(id: &str, field: &str) -> crate::error::Result<String> {
     let safe = safe_path_component(id, field)?;
-    if safe.starts_with('_') {
-        return Err(crate::error::Error::Config(format!(
-            "unsafe {field} {safe:?} — imported resource filenames cannot start with '_' because the loader treats that prefix as intentionally disabled"
-        )));
-    }
-    Ok(format!("{safe}.yaml"))
+    let encoded = match safe.as_bytes().first() {
+        Some(b'_') => format!("%5F{}", &safe[1..]),
+        Some(b'%') => format!("%25{}", &safe[1..]),
+        _ => safe.to_string(),
+    };
+    Ok(format!("{encoded}.yaml"))
 }

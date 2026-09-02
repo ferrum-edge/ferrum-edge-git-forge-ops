@@ -690,15 +690,48 @@ fn import_rejects_an_empty_resource_id() {
 }
 
 #[test]
-fn import_rejects_ids_that_would_create_disabled_resource_files() {
+fn import_encodes_leading_underscore_ids_instead_of_dead_ending() {
+    // A live id starting with `_` cannot become `_id.yaml` (the loader treats
+    // that prefix as intentionally disabled and would silently drop the
+    // resource), but failing the whole import is no better: the id belongs to
+    // the gateway and the operator cannot rename it from here. The leading
+    // character is percent-encoded instead, and identity still comes from
+    // `spec.id`, so the resource round-trips.
     let tmp = tempfile::tempdir().unwrap();
     let mut config = make_test_config();
     config.proxies[0].id = "_disabled-by-loader".to_string();
 
-    let error = split_config(&config, tmp.path()).unwrap_err().to_string();
-    assert!(error.contains("cannot start with '_'"), "{error}");
-    assert!(error.contains("intentionally disabled"), "{error}");
-    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    split_config(&config, tmp.path()).expect("import must not dead-end on an underscore id");
+    let written = tmp.path().join("ferrum/proxies/%5Fdisabled-by-loader.yaml");
+    assert!(written.is_file(), "expected {}", written.display());
+
+    let loaded = gitforgeops::config::load_resources(tmp.path()).unwrap();
+    let ids: Vec<String> = loaded
+        .iter()
+        .filter_map(|(_, resource)| match resource {
+            Resource::Proxy { spec } => Some(spec.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec!["_disabled-by-loader".to_string()]);
+}
+
+#[test]
+fn import_keeps_encoded_and_literal_ids_distinct() {
+    // Encoding only the first character keeps the mapping injective: `_foo`
+    // and `%5Ffoo` are different resources and must not collide on one path.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.proxies[0].id = "_collide".to_string();
+    let mut twin = config.proxies[0].clone();
+    twin.id = "%5Fcollide".to_string();
+    config.proxies.push(twin);
+
+    split_config(&config, tmp.path()).unwrap();
+    for name in ["%5Fcollide.yaml", "%255Fcollide.yaml"] {
+        let path = tmp.path().join("ferrum/proxies").join(name);
+        assert!(path.is_file(), "expected {}", path.display());
+    }
 }
 
 #[test]
