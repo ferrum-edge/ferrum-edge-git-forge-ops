@@ -1244,3 +1244,55 @@ async fn api_import_refuses_cached_backup_before_writing() {
     assert!(error.contains("X-Data-Source: cached"), "{error}");
     assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
 }
+
+/// F6: top-level section names come out of an untrusted backup document, so a
+/// crafted key must not carry ANSI escapes or line breaks into the operator's
+/// terminal and the CI log.
+#[test]
+fn unsupported_section_names_are_sanitized_before_being_printed() {
+    let result = gitforgeops::import::ImportResult {
+        unsupported_sections: vec![
+            "future_a\u{1b}[2J\u{1b}[H".to_string(),
+            "future_b\nImported: 0 proxies".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    let notice = result.unmanaged_sections_notice().expect("notice");
+
+    assert!(
+        !notice.chars().any(|character| character.is_control()),
+        "{notice:?}"
+    );
+    assert!(notice.contains("future_a"), "{notice}");
+    assert!(notice.contains("future_b"), "{notice}");
+}
+
+/// F11: a `..` under an ancestor that does not exist used to walk the
+/// containment resolver up to a component with no file name and report
+/// "cannot resolve path", which describes nothing an operator can act on.
+/// Collapsing the components lexically first makes the path resolve normally.
+#[test]
+fn migration_bundle_paths_normalize_dotdot_under_a_missing_ancestor() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-key"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent
+        .path()
+        .join("not-created-yet")
+        .join("..")
+        .join("migration.json");
+
+    gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+        .expect("a normalizable path must not be refused by the containment resolver");
+
+    assert!(destination_parent.path().join("migration.json").exists());
+}

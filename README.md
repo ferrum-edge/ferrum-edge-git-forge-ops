@@ -185,6 +185,27 @@ That trust is enforced at the boundary, not inside the binary:
 
 Narrowing what the binary reads out of the ledger is not a substitute for any of this: an attacker who can write `.state/<env>.json` can already forge entries inside a declared namespace, which no amount of namespace scoping catches.
 
+#### Rollback caveat: v3 ledgers are one-way
+
+This release writes `.state/<env>.json` at **version 3**, and the first apply
+(or rotation) after upgrading rewrites the ledger in place. A v3 file is not
+readable by an earlier gitforgeops, for two independent reasons:
+
+- The older binary accepts versions 2 and below and refuses a higher one
+  outright: `state file for environment '<env>' has unsupported version 3`.
+- v3 also drops two offline verification oracles that the older binary's
+  deserializer required — most notably `CredentialMetadata.sha256_prefix`,
+  which was not `#[serde(default)]` there. Even forcing the version number back
+  would not make the file parse.
+
+So downgrading the binary after a v3 apply leaves every command failing to load
+the ledger, and an empty ledger is not a safe substitute: in `shared` mode it
+means "this repo manages nothing", which silently stops all deletion and
+reports the entire gateway as unmanaged. If you need to roll back, restore the
+pre-upgrade `.state/<env>.json` from Git history in the same commit that pins
+the older image, and expect resources applied in between to show as unmanaged
+until the newer binary is back.
+
 ### Spec-owned resources (both modes)
 
 A live proxy, upstream, or plugin config with `api_spec_id` set was provisioned by the gateway's OpenAPI spec importer, which re-provisions it authoritatively on every spec re-import. gitforgeops stays off those rows in **both** ownership modes, regardless of what the state file says:

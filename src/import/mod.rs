@@ -193,9 +193,17 @@ impl ImportResult {
             if !notice.is_empty() {
                 notice.push(' ');
             }
+            // Section names come straight out of an untrusted backup
+            // document. Printing them raw lets a crafted key inject ANSI
+            // escapes or newlines into an operator's terminal and CI log, the
+            // same hazard `source_metadata_notice` already routes around.
             notice.push_str(&format!(
                 "Unsupported backup section(s) were not imported: {}.",
-                self.unsupported_sections.join(", ")
+                self.unsupported_sections
+                    .iter()
+                    .map(|section| diagnostic_metadata(section))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         Some(notice)
@@ -328,6 +336,22 @@ fn diagnostic_metadata(value: &str) -> String {
 /// The function refuses unsafe path components, duplicate source resources that
 /// would target the same path, and pre-existing output files. Callers should use
 /// an empty output directory or clean it intentionally before importing.
+///
+/// # Warning for library callers: captured secrets are discarded
+///
+/// Every credential and sensitive plugin-config string in `config` is replaced
+/// with [`IMPORT_REQUIRED_PLACEHOLDER`] before anything is written, and the
+/// live values it captured are **dropped on return** — this entry point has
+/// nowhere to put them. That is safe (nothing leaks) but lossy: the emitted
+/// tree cannot be applied until every derived slot is seeded from somewhere
+/// else, and if `config` was the only copy of those values, they are gone.
+///
+/// The CLI does not use this path. `import --from-api` / `--from-file` go
+/// through `split_config_with_inventory`, which requires
+/// `--credential-bundle-output` whenever the source carries a live secret and
+/// writes the captured values to a private mode-0600 bundle *before* the
+/// redacted tree. Prefer those unless you genuinely want the placeholders and
+/// nothing else.
 ///
 /// # Spec-owned resources are skipped
 ///
@@ -673,12 +697,19 @@ fn containing_git_worktree(path: &Path) -> crate::error::Result<Option<PathBuf>>
 /// Resolve existing symlinked ancestors while still accepting a final path
 /// that does not exist yet, then normalize `.`/`..` components for a reliable
 /// containment comparison.
+///
+/// The lexical normalization runs **first**, before the canonicalize walk.
+/// `..` under an ancestor that does not exist otherwise walks the loop up to a
+/// component whose `file_name()` is `None` — a path ending in `..` has no file
+/// name — and reports "cannot resolve path … for containment validation",
+/// which says nothing about the actual problem. Collapsing the components up
+/// front turns `/nonexistent/../wanted` into `/wanted` and the check proceeds
+/// normally. Normalizing before resolution can differ from the kernel's view
+/// when a `..` crosses a symlink, but every symlinked *ancestor* that exists
+/// is still canonicalized below, and the only decision made from the result is
+/// a containment comparison that this makes stricter, not looser.
 fn resolve_for_containment(path: &Path) -> crate::error::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+    let absolute = lexically_normalized_absolute(path)?;
     let mut existing = absolute.as_path();
     let mut suffix = Vec::new();
     let canonical = loop {

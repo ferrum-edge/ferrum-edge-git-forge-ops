@@ -5,7 +5,7 @@ use rand::Rng;
 use reqwest::Client;
 
 use super::bundle::{
-    bundle_hash, merge_bundles, pick_shard, serialize_bundle, shard_secret_name, CredentialBundle,
+    merge_bundles, pick_shard, serialize_bundle, shard_secret_name, CredentialBundle,
 };
 use super::delivery::{deliver_to_author, DeliveryResult};
 use super::github_api::{fetch_public_key, put_environment_secret};
@@ -27,7 +27,6 @@ pub struct AllocatedSlot {
 #[derive(Debug, Clone, Default)]
 pub struct AllocateOutcome {
     pub allocated: Vec<AllocatedSlot>,
-    pub bundle_hashes: BTreeMap<u32, String>,
     pub shard_count: u32,
 }
 
@@ -274,7 +273,6 @@ pub async fn allocate_and_deliver(
         {
             Ok(()) => {
                 shards.insert(shard, shard_bundle.clone());
-                let hash = bundle_hash(&shard_bundle);
                 for p in batch {
                     outcome.allocated.push(AllocatedSlot {
                         slot: p.slot,
@@ -284,7 +282,6 @@ pub async fn allocate_and_deliver(
                         delivered: p.delivered,
                     });
                 }
-                outcome.bundle_hashes.insert(shard, hash);
             }
             Err(e) => {
                 outcome.shard_count = *shard_count;
