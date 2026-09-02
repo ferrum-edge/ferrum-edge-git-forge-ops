@@ -5,6 +5,7 @@ pub mod github_api;
 pub mod placeholder;
 mod plugin_config;
 pub mod resolver;
+pub mod scrubber;
 
 pub use allocator::{
     allocate_and_deliver, generate_credential_value, generate_credential_value_typed,
@@ -21,3 +22,4 @@ pub use resolver::{
     MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS,
     REDACTED_SENTINEL,
 };
+pub use scrubber::{SecretScrubber, MIN_SCRUB_LENGTH, REDACTION};

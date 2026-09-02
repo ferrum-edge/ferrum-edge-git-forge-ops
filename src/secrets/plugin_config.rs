@@ -216,6 +216,26 @@ pub(crate) fn sensitive_string_paths(
     paths.into_iter().collect()
 }
 
+/// Resolve a classified path against a plugin config document.
+///
+/// The read-only twin of the resolver's `plugin_config_value_mut`: both the
+/// import capture and the validator-output scrubber need to fetch the leaf a
+/// [`sensitive_string_paths`] entry points at, and a path that no longer
+/// resolves (a concurrent edit, a future classifier bug) must be `None`
+/// rather than a panic.
+pub(crate) fn value_at<'a>(
+    mut value: &'a Value,
+    path: &[ConfigPathComponent],
+) -> Option<&'a Value> {
+    for part in path {
+        value = match part {
+            ConfigPathComponent::Key(key) => value.as_object()?.get(key)?,
+            ConfigPathComponent::Index(index) => value.as_array()?.get(*index)?,
+        };
+    }
+    Some(value)
+}
+
 fn apply_rule(
     value: &Value,
     path: &[&str],

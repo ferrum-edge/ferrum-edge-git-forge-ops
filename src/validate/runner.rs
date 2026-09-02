@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::GatewayConfig;
+use crate::secrets::SecretScrubber;
 
 /// Result of running `ferrum-edge validate`.
 ///
@@ -148,17 +149,20 @@ fn private_temp_file(
 /// placeholders *before* validating — the document on disk can contain live
 /// consumer credentials and must never land in a world-readable shared temp
 /// file under a guessable name.
+///
+/// The same resolution is why the child's output is passed through a
+/// [`SecretScrubber`] built from `config`: `ferrum-edge validate` quotes the
+/// document it was handed, so on a bundle-loaded run every credential in a
+/// diagnostic is a live value. Only those exact byte sequences are replaced
+/// with `[REDACTED]`; every other diagnostic — the proxy typo that actually
+/// failed the run — is returned intact.
 pub fn run_validation(
     config: &GatewayConfig,
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
+    let scrubber = SecretScrubber::from_gateway_config(config);
     let yaml = serde_yaml::to_string(config)?;
-    run_validate_command(
-        GATEWAY_VALIDATE_MODE,
-        &yaml,
-        binary_path,
-        contains_credential_material(config),
-    )
+    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, &scrubber)
 }
 
 /// Validate the standalone mesh document with
@@ -178,40 +182,38 @@ pub fn run_mesh_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let yaml = crate::apply::render_mesh_yaml(mesh)?;
-    run_validate_command(MESH_VALIDATE_MODE, &yaml, binary_path, false)
+    // A mesh document carries no brokered credential material — the
+    // gh-env-secret broker walks consumer credentials and plugin config, and
+    // neither exists in a mesh slice — so there is nothing to redact and
+    // every diagnostic is printed verbatim.
+    run_validate_command(
+        MESH_VALIDATE_MODE,
+        &yaml,
+        binary_path,
+        &SecretScrubber::default(),
+    )
 }
 
-/// True when a validator input contains a literal or already-resolved
-/// credential string. Placeholder text is repository data and safe to echo;
-/// every other string below `Consumer.credentials` may be a live secret.
-fn contains_credential_material(config: &GatewayConfig) -> bool {
-    config.consumers.iter().any(|consumer| {
-        consumer
-            .credentials
-            .values()
-            .any(value_contains_credential_material)
-    })
-}
-
-fn value_contains_credential_material(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(value) => {
-            !matches!(crate::secrets::parse_placeholder(value), Some(Ok(_)))
-        }
-        serde_json::Value::Array(items) => items.iter().any(value_contains_credential_material),
-        serde_json::Value::Object(map) => map.values().any(value_contains_credential_material),
-        _ => false,
-    }
-}
+/// Emitted in place of the validator's own output when, and only when,
+/// redaction provably failed. See [`crate::secrets::MIN_SCRUB_LENGTH`]: a
+/// credential shorter than the substring-replacement floor cannot be removed
+/// from a diagnostic without corrupting it, so the diagnostic goes instead.
+const SUPPRESSED_NOTICE: &str = "Validator diagnostics were withheld: a credential value survived redaction, so the output could not be shown without leaking it. Credentials shorter than 8 bytes cannot be redacted from a diagnostic without mangling it — lengthen the credential, or move the literal value into the ${gh-env-secret:...} broker.\n";
 
 /// Shared body of [`run_validation`] and [`run_mesh_validation`]: locate the
 /// binary, write `yaml` to a private temp file, and run `validate` in `mode`
 /// with a scrubbed environment and pinned settings.
+///
+/// `scrubber` holds the secret byte sequences to remove from the child's
+/// stdout and stderr before either is returned. Everything else the validator
+/// said — schema errors on proxies, upstreams, plugins, the lot — survives,
+/// which is the whole point: a bundle-loaded apply run must still be able to
+/// report a proxy typo.
 fn run_validate_command(
     mode: &str,
     yaml: &str,
     binary_path: &str,
-    suppress_diagnostics: bool,
+    scrubber: &SecretScrubber,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
     let which_result = Command::new("which").arg(binary_path).output();
@@ -265,20 +267,16 @@ fn run_validate_command(
     let output = output?;
 
     let exit_code = output.status.code().unwrap_or(-1);
-    let (stdout, stderr) = if suppress_diagnostics {
-        let stderr = if output.status.success() {
-            String::new()
-        } else {
-            "Validation failed; validator diagnostics were suppressed because the input contained credential material.\n"
-                .to_string()
-        };
-        (String::new(), stderr)
-    } else {
-        (
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        )
-    };
+    let mut stdout = scrubber.scrub(&String::from_utf8_lossy(&output.stdout));
+    let mut stderr = scrubber.scrub(&String::from_utf8_lossy(&output.stderr));
+
+    // Last resort. Substring replacement removes every secret at or above
+    // `MIN_SCRUB_LENGTH`, so reaching here means a credential too short to
+    // replace safely was echoed back. Drop the stream rather than print it.
+    if scrubber.leaks(&stdout) || scrubber.leaks(&stderr) {
+        stdout = String::new();
+        stderr = SUPPRESSED_NOTICE.to_string();
+    }
 
     Ok(ValidationResult {
         success: output.status.success(),

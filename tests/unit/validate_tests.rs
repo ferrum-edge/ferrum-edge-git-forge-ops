@@ -33,40 +33,61 @@ fn github_annotations_emit_generic_error_when_no_line_matches() {
 }
 
 #[cfg(unix)]
-#[test]
-fn validator_output_cannot_echo_literal_or_resolved_credentials() {
-    use gitforgeops::config::schema::{Consumer, GatewayConfig};
+fn echo_validator(dir: &Path, name: &str, script: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    let secret = "launch-secret-that-must-never-reach-diagnostics";
-    let config = GatewayConfig {
+    let validator = dir.join(name);
+    std::fs::write(&validator, script).unwrap();
+    let mut permissions = std::fs::metadata(&validator).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&validator, permissions).unwrap();
+    validator
+}
+
+/// A validator that echoes the spec it was handed on both streams, plus one
+/// ordinary schema diagnostic that has nothing to do with credentials.
+#[cfg(unix)]
+const ECHO_SPEC_WITH_PROXY_ERROR: &str = "#!/bin/sh\ncat \"$7\"\necho 'error: proxy httpbin: unknown field `listen_path_typo`' >&2\ncat \"$7\" >&2\nexit 1\n";
+
+#[cfg(unix)]
+fn consumer_config(credentials: serde_json::Value) -> gitforgeops::config::schema::GatewayConfig {
+    use gitforgeops::config::schema::{Consumer, GatewayConfig};
+
+    GatewayConfig {
         consumers: vec![Consumer {
             id: "app".to_string(),
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
             custom_id: None,
-            credentials: std::collections::HashMap::from([(
-                "keyauth".to_string(),
-                serde_json::json!([{"key": secret}]),
-            )]),
+            credentials: credentials
+                .as_object()
+                .expect("credentials object")
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             acl_groups: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }],
         ..GatewayConfig::default()
-    };
+    }
+}
+
+/// F1: a resolved (or literal) consumer credential is redacted from the
+/// validator's diagnostics, and everything else the validator said survives.
+#[cfg(unix)]
+#[test]
+fn resolved_credentials_are_redacted_but_other_diagnostics_survive() {
+    let secret = "launch-secret-that-must-never-reach-diagnostics";
+    let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
 
     for exit_code in [1, 2] {
         let dir = tempfile::tempdir().unwrap();
-        let validator = dir.path().join(format!("echo-validator-{exit_code}"));
-        std::fs::write(
-            &validator,
-            format!("#!/bin/sh\ncat \"$7\"\ncat \"$7\" >&2\nexit {exit_code}\n"),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&validator).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&validator, permissions).unwrap();
+        let validator = echo_validator(
+            dir.path(),
+            &format!("echo-validator-{exit_code}"),
+            &ECHO_SPEC_WITH_PROXY_ERROR.replace("exit 1", &format!("exit {exit_code}")),
+        );
 
         let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
         assert!(!result.success);
@@ -79,11 +100,156 @@ fn validator_output_cannot_echo_literal_or_resolved_credentials() {
             "validator stderr exposed a credential fixture"
         );
         assert!(
-            result.stderr.contains("diagnostics were suppressed"),
-            "{}",
+            result.stdout.contains("[REDACTED]"),
+            "the credential should be replaced in place, not dropped: {}",
+            result.stdout
+        );
+        assert!(
+            result.stderr.contains("unknown field `listen_path_typo`"),
+            "an unrelated schema diagnostic must stay visible: {}",
             result.stderr
         );
+        // The consumer id still identifies which resource failed.
+        assert!(result.stdout.contains("app"), "{}", result.stdout);
     }
+}
+
+/// F1: the fixture repo commits a literal `keyauth.key`. That used to blank
+/// the whole stream on every fork PR; now only the key is redacted.
+#[cfg(unix)]
+#[test]
+fn literal_fixture_credentials_do_not_blank_the_diagnostics() {
+    let config =
+        consumer_config(serde_json::json!({"keyauth": [{"key": "alice-secret-key-12345"}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(
+        !result.stderr.contains("alice-secret-key-12345"),
+        "{}",
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("unknown field `listen_path_typo`"),
+        "{}",
+        result.stderr
+    );
+}
+
+/// F1: `basicauth[].username` and `mtls_auth[].identity` are identities, not
+/// secrets, so a diagnostic naming them stays readable.
+#[cfg(unix)]
+#[test]
+fn credential_identity_fields_are_not_redacted() {
+    let config = consumer_config(serde_json::json!({
+        "basicauth": [{"username": "alice-login", "password": "alice-password-value"}],
+        "mtls_auth": [{"identity": "CN=alice.example.internal"}],
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(result.stdout.contains("alice-login"), "{}", result.stdout);
+    assert!(
+        result.stdout.contains("CN=alice.example.internal"),
+        "{}",
+        result.stdout
+    );
+    assert!(
+        !result.stdout.contains("alice-password-value"),
+        "{}",
+        result.stdout
+    );
+}
+
+/// F2: plugin-config secrets brokered by this release are scrubbed too, while
+/// the plugin's non-sensitive settings stay visible.
+#[cfg(unix)]
+#[test]
+fn resolved_plugin_config_secrets_are_redacted() {
+    use gitforgeops::config::schema::{GatewayConfig, PluginConfig, PluginScope};
+
+    let secret = "honeycomb-team-key-must-not-be-echoed";
+    let config = GatewayConfig {
+        plugin_configs: vec![PluginConfig {
+            id: "otel".to_string(),
+            plugin_name: "otel_tracing".to_string(),
+            namespace: "ferrum".to_string(),
+            config: serde_json::json!({
+                "headers": {"x-honeycomb-team": secret},
+                "sample_rate": "0.1"
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        ..GatewayConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(!result.stdout.contains(secret), "{}", result.stdout);
+    assert!(!result.stderr.contains(secret), "{}", result.stderr);
+    assert!(result.stdout.contains("sample_rate"), "{}", result.stdout);
+    assert!(
+        result.stderr.contains("unknown field `listen_path_typo`"),
+        "{}",
+        result.stderr
+    );
+}
+
+/// A base64-wrapped echo of the credential is removed too.
+#[cfg(unix)]
+#[test]
+fn common_encodings_of_a_secret_are_redacted() {
+    use base64::Engine;
+
+    let secret = "encoded-secret-value-should-not-survive";
+    let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(
+        dir.path(),
+        "encoding-validator",
+        &format!("#!/bin/sh\necho 'token={encoded}'\nexit 1\n"),
+    );
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(!result.stdout.contains(&encoded), "{}", result.stdout);
+    assert_eq!(result.stdout, "token=[REDACTED]\n");
+}
+
+/// Last-resort suppression: a credential too short to substring-replace
+/// cannot be redacted without mangling the diagnostic, so the stream goes
+/// instead of the secret.
+#[cfg(unix)]
+#[test]
+fn a_secret_below_the_scrub_floor_falls_back_to_suppression() {
+    let config = consumer_config(serde_json::json!({"keyauth": [{"key": "hunter2"}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(!result.stdout.contains("hunter2"), "{}", result.stdout);
+    assert!(!result.stderr.contains("hunter2"), "{}", result.stderr);
+    assert_eq!(result.stdout, "");
+    assert!(
+        result.stderr.contains("survived redaction"),
+        "{}",
+        result.stderr
+    );
 }
 
 #[cfg(unix)]
