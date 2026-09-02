@@ -159,25 +159,33 @@ The environment names here must match the GitHub Environments you've set up in r
 
 Choose this when ops teams or admins still make changes via the GUI alongside the repo, or for sandbox environments where experimentation is fine.
 
+Immediately before an API create, gitforgeops durably records the key in a separate pending-create journal. Pending keys are **not** part of the delete fence. On the next authoritative backup, an exact current desired/live match triggers an idempotent PUT before the key becomes managed; an absent live row remains an ordinary Add. That PUT *declares* repository ownership — it overwrites the row with the repository's content so the repo is unambiguously the last writer — which is not the same as proving the repo created it. Provenance is genuinely unrecoverable after an uncertain POST; the point of the PUT is that nothing enters the delete fence on the strength of equality with a row a racing administrator might have created.
+
+A live row whose desired declaration has since disappeared is the one case with no good answer, so it gets the harmless one: the journal entry is **forgotten with a warning naming the row**, and the ordinary ownership rules take over. In `shared` mode that means it is reported as unmanaged and never deleted. In `exclusive` mode it becomes an ordinary prune candidate under the large-prune guard. `full_replace` does not write the journal at all. Reconciliation never refuses to run — CI is the only writer of `.state/<env>.json`, and `state-guard.yml` blocks the hand edit that a fail-closed journal would demand.
+
+The journal survives a crashed CI process, because the apply workflow commits state under `if: !cancelled()`. It does **not** survive a cancelled workflow or a lost runner: those leave the created row live with no journal entry, and the next run's ordinary diff picks it up as an unmanaged (shared) or prunable (exclusive) resource.
+
 ### `exclusive` (strict 1:1)
 
 - Repo is authoritative for the listed `namespaces`.
 - Unmanaged resources in those namespaces → **pruned**.
 - Requires explicit `namespaces` list (safety rail against misconfiguration).
-- `large_prune_threshold_percent` guards against runaway deletions. Default 25%: if an apply would delete more than 25% of the managed set, it refuses unless `--allow-large-prune` is passed.
+- `large_prune_threshold_percent` guards against runaway deletions. Default 25%: if an apply would delete more than 25% of the managed set, it refuses unless `--allow-large-prune` is passed. The decision compares the exact ratio (an exact threshold match is allowed), so fractional percentages are never truncated below the limit.
 
 Choose this for production or regulated environments where git is the single source of truth.
 
 ### First-apply behavior
 
-In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. The state file is written at the end, so subsequent applies distinguish between bucket 2 and bucket 3 correctly.
+In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. Adds enter the pending-create journal immediately before the first create POST and enter the ownership ledger only after a successful response, or after an exact authoritative readback followed by an idempotent PUT that declares the repository as the row's writer. A process failure therefore leaves a recoverable journal entry, never unproven deletion authority.
 
 ### State file trust model
 
 `.state/<env>.json` is the ownership ledger, and it is load-bearing twice over:
 
 - `previously_managed` reads it to decide **what shared mode may delete**. A resource the ledger doesn't list is unmanaged; nothing outside the ledger is ever removed.
-- `resolved_namespaces` unions the namespaces it names with the namespaces the repo currently declares, deciding **what gets reconciled at all**. Without that union, a PR removing the last resource from namespace `foo` would stop `foo` being diffed entirely — the orphaned resource would stay on the gateway forever while its key sat in the ledger, never re-reconciled.
+- `resolved_namespaces` unions the namespaces named by managed and pending-create entries with the namespaces the repo currently declares, deciding **what gets reconciled at all**. Without that union, a PR removing the last resource from namespace `foo` would stop `foo` being diffed entirely — an orphan or uncertain create could stay on the gateway forever, never re-reconciled.
+
+Before computing the large-prune ratio, an authoritative backup also removes ledger keys absent from both desired and live state. Otherwise externally deleted rows would accumulate forever and dilute the denominator used by the deletion guard. Namespace-filtered runs touch only keys in namespaces they actually read.
 
 Both of those make sense only because the ledger is **CI-authored**. `apply-on-merge.yml` and `rotate.yml` write it after a successful run and push it to `main` as `gitforgeops[bot]`; nobody edits it by hand.
 
@@ -194,11 +202,18 @@ Narrowing what the binary reads out of the ledger is not a substitute for any of
 
 A live proxy, upstream, or plugin config with `api_spec_id` set was provisioned by the gateway's OpenAPI spec importer, which re-provisions it authoritatively on every spec re-import. gitforgeops stays off those rows in **both** ownership modes, regardless of what the state file says:
 
-- Never modified. If the repo also declares the same `(namespace, kind, id)`, the run reports a **conflict** — two owners writing one row, and the spec importer wins on its next import.
+- Never modified. If the repo also declares the same `(namespace, kind, id)`, the run reports a **conflict** and takes that whole namespace out of the run — two owners writing one row, and the spec importer wins on its next import, so applying the rest of the namespace would report a convergence that will not hold. Only that namespace is blocked; the others reconcile normally, and the conflict is listed in the apply errors so the run still exits non-zero.
 - Never deleted, except in `exclusive` mode with `gitforgeops apply --confirm-api-spec-deletion`. Otherwise apply prints one line per skipped row and counts them.
 - Rendered in `plan` / `diff` output and in the PR comment's "Spec-owned Resources" section. Unlike the unmanaged block this is not gated on `ownership.drift_report` — a repo fighting the spec importer is a correctness problem, not drift noise.
 
-The same flag governs `full_replace`: by default a restore carries the namespace's live `api_specs` and `gateway_trust_bundles` sections through untouched (a bare restore would read as "delete every API spec here" and the gateway answers 409). `--confirm-api-spec-deletion` opts into dropping them.
+`full_replace` preserves the graph rather than refusing it. Ferrum Edge's `/restore` validates API-spec ownership as one unit — every `api_specs.items` entry must name an owning proxy that is present in the same payload and carries the matching `api_spec_id`, and every tagged proxy/upstream/plugin config must name a spec present in `api_specs.items` — and it re-creates the spec documents verbatim without re-extracting resources from them. So the restore body carries the repository's desired rows **and** the complete live spec-owned graph **and** the live `api_specs` section, and nothing is duplicated.
+
+Two things are deliberately left out of the body:
+
+- **An empty `api_specs` section.** The gateway reads `items: []` as an intentional wipe, but an *absent* section as "count this namespace's live specs and answer 409 if there are any" — which is the only thing that catches a spec created between the backup and the restore.
+- **`gateway_trust_bundles`, always.** The gateway defines an absent trust section as "leave trust exactly as it is", so omitting it preserves the live roots without the lost-update window that replaying a possibly-stale snapshot would open.
+
+`--confirm-api-spec-deletion` remains the only path that drops the spec graph (trust bundles still survive). A graph that cannot be proven complete — a spec document with no tagged rows, a tagged row whose spec is missing, a cross-namespace row — plus a cached backup, a repo/spec ID collision, or an unfamiliar top-level backup section, all fail before any namespace is mutated. Repository-authored `api_spec_id` fields are rejected under both apply strategies, even with the confirmation flag; only the gateway may assign the ownership marker.
 
 ## Policy framework: `.gitforgeops/policies.yaml`
 
@@ -579,7 +594,7 @@ Practical limits you should know about:
 There's no hard limit in `gitforgeops` on how many resources a single PR can add, modify, or delete. The loader streams one file at a time, the assembler flattens into a `GatewayConfig` in memory (tens of MB even at tens of thousands of resources), and apply runs per namespace.
 
 - **Sequential per-resource HTTP calls in incremental mode.** One PUT / DELETE / POST per changed resource. At ~100 ms round-trip per call, 1,000 changes take roughly 2 minutes. 10,000 changes would take ~20 minutes but are not fundamentally problematic. A namespace whose diff is pure adds skips this entirely via the `POST /batch` fast path (see [Apply ordering and the batch fast path](#apply-ordering-and-the-batch-fast-path)).
-- **Full-replace mode is one HTTP call per namespace.** `FERRUM_APPLY_STRATEGY=full_replace` calls `POST /restore?confirm=true` once per namespace in scope. The `/restore` call is atomic for the single namespace it targets, but **atomicity does not extend across namespaces** — an exclusive-mode env with `ownership.namespaces: [alpha, beta]` issues two independent restores, and if `beta` fails after `alpha` succeeded, `alpha` is already replaced on the gateway side. The apply loop records every namespace that fails (instead of bailing on the first) so the error message enumerates partial state, but operators must reconcile it manually. For strict environment-wide atomicity, scope `full_replace` to a single namespace.
+- **Full-replace mode is one HTTP call per namespace.** `FERRUM_APPLY_STRATEGY=full_replace` prebuilds and validates every namespace payload before the first mutation, then calls `POST /restore?confirm=true` once per namespace in scope. The `/restore` call is atomic for one namespace, but **atomicity does not extend across namespaces** — a runtime failure on `beta` after `alpha` succeeds leaves `alpha` replaced. Deterministic errors in any namespace, including unsupported backup sections and malformed/spec-owned graphs, now yield zero restore calls. Runtime failures still require manual reconciliation. For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 - **Namespaces apply independently.** `apply_api` iterates `split_config_by_namespace` and applies each namespace in turn. A failure applying to `team-alpha` doesn't abort `team-beta` — you get per-namespace error reporting via `ApplyResult`.
 
 ### Retry behavior
@@ -588,17 +603,19 @@ Every admin-API call goes through `AdminClient::send_with_retry`, which retries 
 
 Retried:
 
-- **Connection errors** (`reqwest::Error::is_connect()`) — the server never saw the request, so retry is always safe.
-- **HTTP 408, 429, 500, 502, 503, 504** — transient. ferrum-edge admin endpoints are idempotent for PUT/DELETE/POST-restore, and create paths surface 409 on retry races (visible in `ApplyResult.errors`).
+- **Connection-establishment errors** (`reqwest::Error::is_connect()`) — no HTTP response was received and the connection could not be established.
+- **HTTP 408, 429, and 5xx except 501 for reads and idempotent PUT/DELETE calls** — transient responses are safe to replay for those endpoint semantics.
 - **`/restore` 503 with `failure_class: connectivity`** — nothing was written, safe to re-send.
 
 Never retried:
 
 - **HTTP 501** — a standalone-MongoDB gateway (no multi-document transactions) will answer it forever. For `POST /batch` this is not even an error: apply falls back to per-resource creates.
+- **Every error response from non-idempotent create and batch POSTs** — a gateway or intermediary can return an error after commit. Gitforgeops sends the POST once, then fetches an authoritative backup after an ambiguous response, and treats the three possible answers differently: the exact desired resource (or complete batch) live → an idempotent PUT declares repository ownership, and only then is the create recorded; nothing under that id on a fresh, database-backed backup → the write provably did not commit, so it is an ordinary per-resource failure and the run keeps going; a row that exists but is not what we sent, or no usable verification at all → the run stops for reconciliation. The ownership PUT *declares* the repository as the row's writer; it cannot prove who created it, which is exactly why equality alone never grants deletion authority. A batch is decomposed into individual creates only for documented definitive rejections (400/409/413/422), never for transport/5xx ambiguity.
 - **`applied: false` in the body** — the write is durably committed but not live on the running gateway. Re-sending re-applies an already-committed write; check gateway health instead. Surfaces as a `CommittedNotLive` error naming the gateway's `reason` (`config_rejected` / `reload_timeout` / `sequence_unavailable`).
-- **`/restore` 500 with `rollback: incomplete` or `unknown_outcome`** — the namespace may hold a partially restored configuration and a retry would re-run a destructive replace. gitforgeops stops and tells you to inspect with `gitforgeops diff` and reconcile by hand rather than re-running apply.
+- **`/restore` failures other than the explicit pre-commit connectivity case** — restore is destructive and not generally idempotent. A 500 with `rollback: incomplete` or `unknown_outcome` additionally surfaces as manual-recovery-required because the namespace may be partially restored.
 - **Request timeouts** — a timeout means state is ambiguous (gateway may or may not have applied). Retrying a large `/restore` after timeout could double-write. The next CI run re-diffs and converges.
 - **4xx other than 408/429** — 400/401/403/404/409/422 are permanent.
+- **3xx** — redirects are never followed on admin calls (a 301/302 would rewrite a POST into a GET, a 307/308 would replay a destructive body against another origin). The error names the `Location` header and tells you to point `FERRUM_GATEWAY_URL` at the final origin.
 
 Backoff is exponential (`500ms · 2^attempt`) capped at 8 seconds, **unless** the response carries `Retry-After`, which is honored verbatim in delta-seconds form and capped at 30 seconds so a pathological value can't wedge CI.
 
@@ -608,7 +625,7 @@ Some failures get their own error rather than a generic HTTP one:
 - **409 carrying `api_specs_at_risk`** → `ApiSpecsAtRisk`, with a pointer to `--confirm-api-spec-deletion` (see [Spec-owned resources](#spec-owned-resources-both-modes)).
 - **413** → the restore payload exceeded the gateway's body limit; the message names `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` and suggests incremental mode.
 
-**Stale gateway views.** If `GET /backup` comes back with `X-Data-Source: cached`, the gateway served its in-memory snapshot instead of the config database, so the live view may be stale. The flag is sticky for the run: any apply that would issue deletions is refused with `StaleGatewayView` unless `--allow-large-prune` is passed to acknowledge pruning from a possibly-stale view. Applies with no deletions proceed with a warning.
+**Stale gateway views.** If `GET /backup` comes back with `X-Data-Source: cached`, the gateway served its in-memory snapshot instead of the config database. That fallback also omits API-spec documents and clears ownership tags, so **every API-mode mutation** is refused with `StaleGatewayView` before credential allocation or the first write. `--allow-large-prune` does not bypass this ownership-safety gate; validation and read-only reporting remain available while the database recovers.
 
 **404-tolerant deletes.** A DELETE that answers 404 already achieved its goal. The gateway cascades deletes server-side (deleting a proxy removes its scoped plugin configs), so a diff-driven follow-up delete legitimately finds nothing; treating that as an error used to wedge every later run on the same delete.
 
@@ -765,7 +782,7 @@ Runtime variables supported by the binary include:
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end Admin API request timeout. Raise for large `/backup` or slow `/restore`. |
 | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for GitHub API calls. |
 | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` | `30` | End-to-end GitHub API request timeout. |
-| `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Retries on connection errors, HTTP 408/429/5xx (not 501). `0` disables retries. |
+| `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Retries connection-establishment errors and transient responses for reads/idempotent writes; create/batch POST responses are never replayed. `0` disables retries. |
 
 ## CLI reference
 
@@ -777,7 +794,7 @@ gitforgeops diff [--exit-on-drift]
 gitforgeops plan
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
 gitforgeops export [--output PATH] [--materialize] [--encrypt-to GH_LOGIN]
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR]
+gitforgeops import --from-api | --from-file PATH [--output-dir DIR]  # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops rotate --consumer ID --credential KEY \
@@ -788,8 +805,9 @@ Notes:
 
 - `--from-api` is a flag, not a value: `gitforgeops import --from-api`. It conflicts with `--from-file`.
 - `--format github` is an alias for `github-annotations`.
-- `--confirm-api-spec-deletion` is the opt-in for touching resources the gateway's OpenAPI spec importer owns: under `full_replace` it drops the namespace's `api_specs` section instead of carrying it through, and under exclusive incremental apply it allows pruning live resources tagged with an `api_spec_id`. Without it, those rows are reported and skipped.
-- `--allow-large-prune` doubles as the acknowledgement that pruning from a stale (`X-Data-Source: cached`) gateway view is acceptable.
+- `--confirm-api-spec-deletion` is the opt-in for touching resources the gateway's OpenAPI spec importer owns: a namespace with live API specs otherwise rejects `full_replace`, and exclusive incremental apply otherwise skips tagged resources. Repository/spec identity conflicts always block the whole apply before unrelated writes; the confirmation flag is not a way to make two owners share one row.
+- `--allow-large-prune` acknowledges only the configured deletion percentage. A cached (`X-Data-Source: cached`) backup blocks every mutation and has no override because API-spec ownership is unknown.
+- API import requires `FERRUM_NAMESPACE` (or the selected environment's namespace filter), mints an exact namespace-scoped JWT, and imports one namespace at a time. This fails closed on gateways that require namespace claims: an unscoped `GET /namespaces` intentionally returns an empty list and therefore cannot safely drive an all-namespace import.
 - `review --require-live` returns non-zero after rendering/posting the review if the gateway comparison was unavailable. The trusted PR workflow uses it; secretless static review intentionally does not.
 - `envs --format json --include-scopes` emits protected environment/namespace routing for trusted CI and is not a replacement for `envs --format json`'s string array.
 - `import` writes per-resource YAML for the four gateway kinds only; API specs and gateway trust bundles present in the source backup are reported as skipped rather than silently dropped, because they are managed through `/api-specs` and `/gateway-trust-bundles`, not through this repo.

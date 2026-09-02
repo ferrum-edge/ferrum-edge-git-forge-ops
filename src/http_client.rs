@@ -54,7 +54,13 @@ pub struct AdminClient {
 
 impl AdminClient {
     /// Build an Admin API client from resolved process/repo environment config.
-    pub fn new(env: &EnvConfig) -> crate::error::Result<Self> {
+    ///
+    /// Private on purpose. A client built here mints admin tokens with no `ns`
+    /// claim, which a gateway running `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`
+    /// rejects outright — and, worse, which a gateway *not* running it accepts
+    /// for every namespace. [`AdminClient::new_scoped`] is the only public
+    /// door, so a new call site has to say what it is allowed to touch.
+    fn new(env: &EnvConfig) -> crate::error::Result<Self> {
         let gateway_url = env
             .gateway_url
             .clone()
@@ -77,7 +83,11 @@ impl AdminClient {
         // the request timeout raised via env.
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(env.gateway_connect_timeout_secs))
-            .timeout(Duration::from_secs(env.gateway_request_timeout_secs));
+            .timeout(Duration::from_secs(env.gateway_request_timeout_secs))
+            // Admin mutations must never be redirected. Following a 301/302
+            // can rewrite POST to GET, while following a 307/308 can replay a
+            // destructive body against a different authority or path.
+            .redirect(reqwest::redirect::Policy::none());
 
         if env.tls_no_verify {
             builder = builder.danger_accept_invalid_certs(true);
@@ -141,6 +151,26 @@ impl AdminClient {
         })
     }
 
+    /// Build a client whose JWTs are scoped to the exact namespaces the
+    /// command has resolved.
+    ///
+    /// The only public constructor. Keeping scoping in construction makes it
+    /// difficult for a new admin-API call site to accidentally mint an
+    /// unscoped token on gateways that require the `ns` claim.
+    ///
+    /// An empty `namespaces` deliberately still builds a client — some
+    /// commands legitimately have no namespace set to declare — but it mints
+    /// an unscoped token, so pass the resolved set whenever one exists.
+    pub fn new_scoped<I, S>(env: &EnvConfig, namespaces: I) -> crate::error::Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut client = Self::new(env)?;
+        client.set_namespace_scope(namespaces);
+        Ok(client)
+    }
+
     /// Narrow the `ns` claim minted into admin tokens to the namespaces this
     /// run actually touches. Only consulted by gateways running with
     /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`; elsewhere it is inert.
@@ -193,17 +223,19 @@ impl AdminClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
+                    let location = header_string(&resp, "location");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
                     let body = resp
                         .text()
                         .await
                         .unwrap_or_else(|_| String::from("<no body>"));
 
-                    if status < 400 {
+                    if is_success_status(status) {
                         return Ok(RawResponse {
                             status,
                             body,
                             data_source,
+                            location,
                         });
                     }
 
@@ -221,6 +253,7 @@ impl AdminClient {
                         status,
                         body,
                         data_source,
+                        location,
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
@@ -239,10 +272,15 @@ impl AdminClient {
 
     /// Turn a completed response into `Ok(())` or a typed error.
     fn check(&self, resp: &RawResponse, kind: RequestKind) -> crate::error::Result<()> {
-        if resp.status < 400 {
+        if is_success_status(resp.status) {
             return Ok(());
         }
-        Err(map_api_error(resp.status, &resp.body, kind))
+        Err(map_api_error_with_location(
+            resp.status,
+            &resp.body,
+            kind,
+            resp.location.as_deref(),
+        ))
     }
 
     /// [`AdminClient::check`] for config mutations, with one extra step: an
@@ -257,8 +295,12 @@ impl AdminClient {
     ///
     /// Strictly best-effort: a `/health` that cannot be reached or that reports
     /// writes as enabled leaves the original 403 exactly as it was.
-    async fn check_mutation(&self, resp: &RawResponse) -> crate::error::Result<()> {
-        match self.check(resp, RequestKind::Mutation) {
+    async fn check_mutation(
+        &self,
+        resp: &RawResponse,
+        kind: RequestKind,
+    ) -> crate::error::Result<()> {
+        match self.check(resp, kind) {
             Ok(()) => Ok(()),
             Err(e) => Err(self.refine_mutation_error(e).await),
         }
@@ -389,11 +431,10 @@ impl AdminClient {
 
     /// Replace a namespace's configuration atomically.
     ///
-    /// `extras` carries the live `api_specs` / `gateway_trust_bundles` sections
-    /// straight back through, so a full replace does not destroy resources that
-    /// gitforgeops does not model. With `confirm_api_spec_deletion` the
-    /// sections are dropped and the destructive opt-in is passed on the query
-    /// string instead.
+    /// `extras` carries a concurrency-safe `api_specs` section when one can be
+    /// proven safe. Gateway trust bundles are deliberately never replayed by
+    /// GitOps: an absent section is a server-side no-op, so a trust rotation
+    /// that races an otherwise unrelated restore cannot be rolled back.
     pub async fn post_restore(
         &self,
         config: &GatewayConfig,
@@ -416,8 +457,19 @@ impl AdminClient {
                     .header("X-Ferrum-Namespace", namespace)
                     .json(&body)
             })
-            .await?;
-        self.check(&resp, RequestKind::Restore)
+            .await
+            .map_err(|error| match error {
+                // Once a non-idempotent restore request leaves this process,
+                // a transport failure cannot prove whether the namespace was
+                // replaced. Stop all later namespaces for reconciliation.
+                crate::error::Error::HttpClient(message) => {
+                    crate::error::Error::AmbiguousMutation(format!(
+                        "POST /restore ended without an HTTP response: {message}. The namespace may already have been replaced; inspect it with `gitforgeops diff` before retrying."
+                    ))
+                }
+                other => other,
+            })?;
+        self.check_mutation(&resp, RequestKind::Restore).await
     }
 
     /// Create-only bulk import. All-or-nothing in one transaction; it cannot
@@ -433,7 +485,7 @@ impl AdminClient {
     ) -> crate::error::Result<Option<BatchCreated>> {
         let token = self.token()?;
         let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, || {
                 self.client
                     .post(self.url("/batch"))
                     .bearer_auth(&token)
@@ -445,7 +497,8 @@ impl AdminClient {
         if resp.status == 501 {
             return Ok(None);
         }
-        self.check_mutation(&resp).await?;
+        self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
+            .await?;
 
         // 201 `{"created": {...}}`. A gateway that answers 200 with no body is
         // still a success — fall back to the counts we sent.
@@ -458,7 +511,7 @@ impl AdminClient {
     pub async fn create_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
         let token = self.token()?;
         let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, || {
                 self.client
                     .post(self.url("/proxies"))
                     .bearer_auth(&token)
@@ -466,7 +519,8 @@ impl AdminClient {
                     .json(proxy)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
+            .await
     }
 
     pub async fn update_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
@@ -482,7 +536,7 @@ impl AdminClient {
                     .json(proxy)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::Mutation).await
     }
 
     /// Delete a proxy without the server-side orphan cleanup.
@@ -510,7 +564,7 @@ impl AdminClient {
     ) -> crate::error::Result<()> {
         let token = self.token()?;
         let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, || {
                 self.client
                     .post(self.url("/consumers"))
                     .bearer_auth(&token)
@@ -518,7 +572,8 @@ impl AdminClient {
                     .json(consumer)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
+            .await
     }
 
     pub async fn update_consumer(
@@ -538,7 +593,7 @@ impl AdminClient {
                     .json(consumer)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::Mutation).await
     }
 
     pub async fn delete_consumer(
@@ -558,7 +613,7 @@ impl AdminClient {
     ) -> crate::error::Result<()> {
         let token = self.token()?;
         let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, || {
                 self.client
                     .post(self.url("/upstreams"))
                     .bearer_auth(&token)
@@ -566,7 +621,8 @@ impl AdminClient {
                     .json(upstream)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
+            .await
     }
 
     pub async fn update_upstream(
@@ -586,7 +642,7 @@ impl AdminClient {
                     .json(upstream)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::Mutation).await
     }
 
     pub async fn delete_upstream(
@@ -606,7 +662,7 @@ impl AdminClient {
     ) -> crate::error::Result<()> {
         let token = self.token()?;
         let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, || {
                 self.client
                     .post(self.url("/plugins/config"))
                     .bearer_auth(&token)
@@ -614,7 +670,8 @@ impl AdminClient {
                     .json(pc)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
+            .await
     }
 
     pub async fn update_plugin_config(
@@ -634,7 +691,7 @@ impl AdminClient {
                     .json(pc)
             })
             .await?;
-        self.check_mutation(&resp).await
+        self.check_mutation(&resp, RequestKind::Mutation).await
     }
 
     pub async fn delete_plugin_config(
@@ -670,10 +727,11 @@ impl AdminClient {
             return Ok(DeleteOutcome::Deleted);
         }
         Err(self
-            .refine_mutation_error(map_api_error(
+            .refine_mutation_error(map_api_error_with_location(
                 resp.status,
                 &resp.body,
                 RequestKind::Mutation,
+                resp.location.as_deref(),
             ))
             .await)
     }
@@ -696,6 +754,9 @@ struct RawResponse {
     status: u16,
     body: String,
     data_source: Option<String>,
+    /// `Location`, kept only so a 3xx can name where the admin API is
+    /// actually being served from. Redirects are never followed.
+    location: Option<String>,
 }
 
 /// What kind of call is being made, for retry/error classification. `/restore`
@@ -704,7 +765,11 @@ struct RawResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
     Read,
+    /// PUT and DELETE calls whose endpoint semantics are idempotent.
     Mutation,
+    /// Create and batch POSTs. An error response can arrive after the server
+    /// committed the write, so these are never replayed automatically.
+    NonIdempotentMutation,
     Restore,
 }
 
@@ -773,6 +838,9 @@ pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> Re
     if body.applied == Some(false) {
         return RetryDecision::NoRetry;
     }
+    if kind == RequestKind::NonIdempotentMutation {
+        return RetryDecision::NoRetry;
+    }
     if kind == RequestKind::Restore {
         if status == 500 && rollback_needs_manual_recovery(body.rollback.as_deref()) {
             return RetryDecision::NoRetry;
@@ -780,6 +848,10 @@ pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> Re
         if status == 503 && body.failure_class.as_deref() == Some("connectivity") {
             return RetryDecision::Retry;
         }
+        // A restore is destructive and not generally idempotent. Only the
+        // gateway's explicit pre-commit connectivity marker proves replay is
+        // safe; every other response requires reconciliation instead.
+        return RetryDecision::NoRetry;
     }
     match status {
         // 501 already returned NoRetry above, so the range is safe to take
@@ -800,13 +872,49 @@ fn rollback_needs_manual_recovery(rollback: Option<&str>) -> bool {
 /// error left the state entry in place and wedged every later run on the same
 /// delete.
 pub fn delete_succeeded(status: u16) -> bool {
-    status < 400 || status == 404
+    is_success_status(status) || status == 404
+}
+
+fn is_success_status(status: u16) -> bool {
+    (200..=299).contains(&status)
 }
 
 /// Map a failing response to the most specific error variant available.
 pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error::Error {
+    map_api_error_with_location(status, body, kind, None)
+}
+
+/// [`map_api_error`] with the response's `Location` header, which only the 3xx
+/// arm consults.
+pub fn map_api_error_with_location(
+    status: u16,
+    body: &str,
+    kind: RequestKind,
+    location: Option<&str>,
+) -> crate::error::Error {
     let parsed = ApiErrorBody::parse(body);
     let message = parsed.error.clone().unwrap_or_else(|| body.to_string());
+
+    // The client is built with `redirect::Policy::none()` so a destructive
+    // body is never replayed against a different authority, which means a 3xx
+    // arrives here as a plain failure. Without this arm it read as "API error
+    // (301): " with an empty body, and the actual cause — an admin URL that
+    // has moved, or a load balancer terminating TLS and bouncing http→https —
+    // was invisible. Applies to reads as much as to mutations.
+    if (300..=399).contains(&status) {
+        let destination = match location {
+            Some(location) if !location.trim().is_empty() => {
+                format!("It pointed at `{}`. ", location.trim())
+            }
+            _ => "It carried no usable `Location` header. ".to_string(),
+        };
+        return crate::error::Error::ApiError {
+            status,
+            message: format!(
+                "the gateway answered a redirect (HTTP {status}) instead of a response.                  {destination}gitforgeops never follows redirects on admin calls — a 301/302                  would rewrite a POST into a GET and a 307/308 would replay a destructive body                  against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme,                  host, port and any path prefix) and re-run."
+            ),
+        };
+    }
 
     if status == 403 && is_read_only_refusal(&message) {
         return crate::error::Error::GatewayReadOnly(
@@ -821,9 +929,9 @@ pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error
         let at_risk = describe_api_specs_at_risk(&parsed.api_specs_at_risk);
         return crate::error::Error::ApiSpecsAtRisk(format!(
             "full_replace refused: the namespace holds API spec(s) this payload would delete ({at_risk}). \
-             API specs are managed through the admin API, not this repo. Either keep them (the default: \
-             gitforgeops carries the live `api_specs` section through the restore) or re-run \
-             `gitforgeops apply --confirm-api-spec-deletion` to delete them deliberately. Gateway said: {message}"
+             API specs are managed through the admin API, not this repo. Use incremental apply to keep \
+             them, or re-run `gitforgeops apply --confirm-api-spec-deletion` to delete the complete \
+             ownership graph deliberately. Gateway said: {message}"
         ));
     }
 
@@ -851,6 +959,19 @@ pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error
                  Re-applying would re-send an already-committed write; check gateway health instead."
             ),
         };
+    }
+
+    if kind == RequestKind::Restore
+        && (matches!(status, 408 | 429) || (500..=599).contains(&status))
+        && !(status == 503 && parsed.failure_class.as_deref() == Some("connectivity"))
+        && !matches!(
+            parsed.rollback.as_deref(),
+            Some("completed") | Some("not_needed")
+        )
+    {
+        return crate::error::Error::AmbiguousMutation(format!(
+            "POST /restore returned HTTP {status} without proving a pre-commit rejection or completed rollback. The namespace may already have been replaced; inspect it with `gitforgeops diff` before retrying. Gateway said: {message}"
+        ));
     }
 
     if status == 413 {
@@ -1018,8 +1139,9 @@ pub fn merge_pages(pages: Vec<Vec<String>>) -> Vec<String> {
 // --- Backup / restore --------------------------------------------------------
 
 /// Sections of `GET /backup` that `GatewayConfig` deliberately does not model.
-/// Held as opaque JSON so they can be carried back through `/restore` verbatim
-/// without this tool having to understand (or version) their schema.
+/// Held as opaque JSON for fail-closed inspection. API specs require
+/// concurrency-safe restore handling; trust bundles are never replayed by
+/// GitOps because restore omission preserves their current live value.
 #[derive(Debug, Clone, Default)]
 pub struct BackupExtras {
     /// `{section_version, items}`. Absent on cached-fallback exports.
@@ -1027,6 +1149,10 @@ pub struct BackupExtras {
     /// Array; namespace singleton. Three-valued on restore: absent = no-op,
     /// present-empty = revoke, present non-empty = authoritative.
     pub gateway_trust_bundles: Option<serde_json::Value>,
+    /// Top-level sections returned by a newer gateway that this build does not
+    /// understand. Incremental reconciliation can leave them alone; a
+    /// full-replace must fail closed rather than omit them from `/restore`.
+    pub unsupported_sections: Vec<String>,
 }
 
 impl BackupExtras {
@@ -1048,7 +1174,9 @@ impl BackupExtras {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.api_specs.is_none() && self.gateway_trust_bundles.is_none()
+        self.api_specs.is_none()
+            && self.gateway_trust_bundles.is_none()
+            && self.unsupported_sections.is_empty()
     }
 }
 
@@ -1067,8 +1195,9 @@ pub struct BackupSnapshot {
 
 impl BackupSnapshot {
     /// Parse a backup body. The four managed sections deserialize into the
-    /// permissive `GatewayConfig`; the rest is picked out by key so unknown
-    /// future metadata is simply ignored.
+    /// permissive `GatewayConfig`; the rest is picked out by key. Unknown
+    /// future top-level sections are retained by name so full-replace can fail
+    /// closed instead of silently deleting data it cannot carry through.
     pub fn from_body(body: &str) -> crate::error::Result<Self> {
         let mut value: serde_json::Value = serde_json::from_str(body)
             .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
@@ -1083,6 +1212,43 @@ impl BackupSnapshot {
         let mut exported_at = None;
         let mut source = None;
         if let Some(map) = value.as_object_mut() {
+            // Pinned to ferrum-edge's `BackupPayload` (`src/admin/backup.rs`),
+            // which is constructed in exactly one place
+            // (`src/admin/mod.rs`, the `GET /backup` handler) and serializes
+            // these eleven fields — `gateway_trust_bundles` and `api_specs`
+            // being `Option`, so they are absent on filtered and
+            // cached-fallback exports.
+            //
+            // `resource_counts` is the twelfth and is *not* a gateway section:
+            // it is gitforgeops' own file-mode anti-truncation seal
+            // (`apply::file_target`), allow-listed so a round-trip through a
+            // locally exported document is not misread as an unknown section.
+            //
+            // Deliberately fail-closed: anything else here stops full replace
+            // (`ensure_restore_sections_supported`) rather than being silently
+            // dropped from a `/restore` body that would then delete it. Update
+            // this list in step with the companion, never by widening it to
+            // whatever a gateway happens to send.
+            const KNOWN_TOP_LEVEL: &[&str] = &[
+                "version",
+                "proxies",
+                "consumers",
+                "plugin_configs",
+                "upstreams",
+                "api_specs",
+                "gateway_trust_bundles",
+                "ferrum_version",
+                "exported_at",
+                "source",
+                "counts",
+                "resource_counts",
+            ];
+            extras.unsupported_sections = map
+                .keys()
+                .filter(|key| !KNOWN_TOP_LEVEL.contains(&key.as_str()))
+                .cloned()
+                .collect();
+            extras.unsupported_sections.sort();
             extras.api_specs = map.remove("api_specs");
             extras.gateway_trust_bundles = map.remove("gateway_trust_bundles");
             ferrum_version = take_string(map, "ferrum_version");
@@ -1114,35 +1280,51 @@ fn take_string(map: &mut serde_json::Map<String, serde_json::Value>, key: &str) 
 
 /// Build the `POST /restore` body.
 ///
-/// `RestoreRequest` has no `additionalProperties: false`, so the serialized
+/// `RestorePayload` has no `deny_unknown_fields`, so the serialized
 /// `GatewayConfig` (including `version`, which the gateway validates against
 /// `CURRENT_CONFIG_VERSION`) is accepted as-is. The backup-only sections are
 /// spliced in as opaque values rather than being modeled on `GatewayConfig` —
 /// that struct mirrors what this tool manages, and API specs are not it.
+///
+/// The `api_specs` section travels with the spec-owned rows the caller already
+/// merged into `config`: the gateway validates the two halves against each
+/// other and rejects either one on its own. An **empty** section is
+/// deliberately dropped instead of forwarded — the gateway reads `items: []`
+/// as an intentional wipe, whereas an absent section makes it count the
+/// namespace's live specs and answer `409` if any exist, which is the only
+/// guard against a spec created after our backup was taken.
 pub fn build_restore_body(
     config: &GatewayConfig,
     extras: &BackupExtras,
     confirm_api_spec_deletion: bool,
 ) -> crate::error::Result<serde_json::Value> {
     let mut body = serde_json::to_value(config)?;
-    let serde_json::Value::Object(map) = &mut body else {
+    if !body.is_object() {
         return Err(crate::error::Error::Config(
             "gateway config did not serialize as a JSON object".to_string(),
         ));
-    };
-
-    if confirm_api_spec_deletion {
-        // Explicit destructive opt-in: omit the sections so the restore wipes
-        // them, and let the caller pass `confirm_api_spec_deletion=true`.
-        return Ok(body);
     }
 
-    if let Some(api_specs) = extras.api_specs.clone() {
-        map.insert("api_specs".to_string(), api_specs);
+    if !confirm_api_spec_deletion {
+        if let Some(api_specs) = extras.api_specs.as_ref() {
+            let items = api_specs
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    crate::error::Error::Config(
+                        "refusing restore: `api_specs` is not an object with an `items` array"
+                            .to_string(),
+                    )
+                })?;
+            let carry = !items.is_empty();
+            if let (true, Some(map)) = (carry, body.as_object_mut()) {
+                map.insert("api_specs".to_string(), api_specs.clone());
+            }
+        }
     }
-    if let Some(bundles) = extras.gateway_trust_bundles.clone() {
-        map.insert("gateway_trust_bundles".to_string(), bundles);
-    }
+    // Trust roots have their own authoritative API and revision. Restore's
+    // absent-section contract preserves the current live value, whereas
+    // replaying the earlier backup value creates a lost-update race.
     Ok(body)
 }
 

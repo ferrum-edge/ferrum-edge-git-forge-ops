@@ -142,6 +142,26 @@ fn shared_mode_unions_declared_and_previously_managed_without_duplicates() {
 }
 
 #[test]
+fn shared_mode_keeps_pending_create_namespaces_in_recovery_scope() {
+    let resolved = env(OwnershipMode::Shared, None);
+    let mut state = StateFile::default();
+    state
+        .pending_creates
+        .insert(state_key("pending-only", "Proxy", "possibly-created"));
+
+    assert_eq!(
+        resolved_namespaces(&resolved, &GatewayConfig::default(), &state),
+        vec!["pending-only".to_string()]
+    );
+    assert!(
+        !previously_managed(&resolved, &state)
+            .unwrap()
+            .contains(&state_key("pending-only", "Proxy", "possibly-created")),
+        "recovery scope must not become deletion authority"
+    );
+}
+
+#[test]
 fn shared_mode_namespace_filter_overrides_both_sources() {
     let mut resolved = env(OwnershipMode::Shared, None);
     resolved.namespace_filter = Some("ferrum".to_string());
