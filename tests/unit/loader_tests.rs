@@ -362,3 +362,108 @@ fn loader_rejects_symlinked_files_without_reading_the_target() {
     assert!(error.contains("symbolic links"), "{error}");
     assert!(error.contains(&link.display().to_string()), "{error}");
 }
+
+/// OS and file-browser droppings are skipped silently. Finder re-creates
+/// `.DS_Store` the moment a folder is opened, so failing on it would let a
+/// desktop file manager break a validate-and-apply pipeline, with nothing the
+/// author could commit to fix it.
+#[test]
+fn loader_silently_skips_os_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let directory = tmp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&directory).unwrap();
+    for artifact in [".DS_Store", "Thumbs.db", "desktop.ini"] {
+        std::fs::write(directory.join(artifact), "binary junk").unwrap();
+    }
+    // ...including at the namespace and tree levels, where a file manager is
+    // just as likely to leave one.
+    std::fs::write(tmp.path().join("team-alpha/.DS_Store"), "junk").unwrap();
+    std::fs::write(tmp.path().join(".DS_Store"), "junk").unwrap();
+    std::fs::write(directory.join("api.yaml"), minimal_proxy("")).unwrap();
+
+    let resources = load_resources(tmp.path()).unwrap();
+    assert_eq!(resources.len(), 1, "{resources:#?}");
+}
+
+/// The skip list is exhaustive by name, not by shape: anything that could be a
+/// resource document stays fatal, because a file that looks like configuration
+/// and is silently not loaded is how a typo becomes a prune.
+#[test]
+fn loader_still_rejects_config_shaped_files_next_to_os_artifacts() {
+    for name in [
+        "ds_store.yaml.bak",
+        "thumbs.db",
+        "Desktop.ini",
+        "settings.json",
+        "settings.toml",
+        "Makefile",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), "proxies", name, "not configuration");
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("unsupported file"), "{name}: {error}");
+    }
+
+    // Matching is by exact file name: `.DS_Store.yaml` is a lowercase `.yaml`
+    // document and is loaded like any other, not skipped by association.
+    let tmp = tempfile::tempdir().unwrap();
+    write_resource(tmp.path(), "proxies", ".DS_Store.yaml", "not configuration");
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("must contain a YAML object"), "{error}");
+}
+
+/// Non-string YAML keys would be silently stringified by the
+/// `serde_yaml::Value` → `serde_json::Value` hop every document takes, quietly
+/// rewriting exactly the sections gitforgeops promises to carry verbatim.
+#[test]
+fn loader_rejects_non_string_mapping_keys_and_names_the_mapping() {
+    let cases = [
+        (
+            "plugins",
+            "kind: PluginConfig\nspec:\n  id: p\n  plugin_name: key_auth\n  scope: global\n  config:\n    status_codes:\n      404: not found\n",
+            "`.spec.config.status_codes`",
+            "number `404`",
+        ),
+        (
+            "mesh",
+            "kind: MeshConfig\nspec:\n  workloads:\n    - labels:\n        true: yes-please\n",
+            "`.spec.workloads[0].labels`",
+            "boolean `true`",
+        ),
+        (
+            "proxies",
+            "kind: Proxy\nspec:\n  id: api\n  backend_host: h\n  backend_port: 80\n  ? [a, b]\n  : value\n",
+            "`.spec`",
+            "a sequence",
+        ),
+    ];
+
+    for (subdir, body, location, description) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), subdir, "doc.yaml", body);
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("non-string mapping key"), "{error}");
+        assert!(error.contains(location), "expected {location}: {error}");
+        assert!(
+            error.contains(description),
+            "expected {description}: {error}"
+        );
+    }
+}
+
+/// YAML merge keys are not supported: `serde_yaml` leaves `<<` as an ordinary
+/// string key (merging is opt-in and gitforgeops does not opt in), so it
+/// surfaces as an unknown field rather than silently doing nothing.
+#[test]
+fn loader_rejects_yaml_merge_keys_as_an_unknown_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_resource(
+        tmp.path(),
+        "proxies",
+        "api.yaml",
+        "kind: Proxy\nspec:\n  id: api\n  backend_host: h\n  circuit_breaker: &defaults\n    failure_threshold: 5\n  <<: *defaults\n",
+    );
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("unknown configuration field"), "{error}");
+    assert!(error.contains(".spec.<<"), "{error}");
+}

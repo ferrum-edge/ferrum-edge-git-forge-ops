@@ -719,6 +719,7 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
                             source,
                         }
                     })?;
+                strict::reject_non_string_keys(&yaml_value, &path)?;
                 let json_value: serde_json::Value =
                     serde_json::to_value(yaml_value).map_err(crate::error::Error::SerdeJson)?;
                 let object = json_value.as_object().ok_or_else(|| {

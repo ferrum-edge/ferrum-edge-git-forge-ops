@@ -21,7 +21,16 @@ MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 50 * 1024 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+# Kept byte-identical to NON_CONFIG_FILES / OS_ARTIFACT_FILES in
+# src/config/strict.rs (and IMPORT_MANIFEST_FILENAME in src/import/mod.rs).
+# Both gate the same resources/ and overlays/ trees on either side of the
+# trusted-review boundary, so a file the Rust loader skips must not fail here
+# and vice versa. tests/test_pr_input.py cross-checks them against the source.
 NON_CONFIG_FILES = {"README", "README.md", ".gitkeep", ".gitforgeops-import.json"}
+# OS/file-browser droppings: skipped silently, since there is nothing for an
+# author to fix and Finder re-creates .DS_Store on sight. Anything
+# config-shaped stays fatal.
+OS_ARTIFACT_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 
 class InputError(RuntimeError):
@@ -63,7 +72,11 @@ def _is_declarative_tree_file(relative: str) -> bool:
 
 def _is_ignored_declarative_file(relative: str) -> bool:
     name = PurePosixPath(relative).name
-    return name.startswith("_") or name in NON_CONFIG_FILES
+    return (
+        name.startswith("_")
+        or name in NON_CONFIG_FILES
+        or name in OS_ARTIFACT_FILES
+    )
 
 
 def _is_protected_area(relative: str) -> bool:
@@ -151,8 +164,10 @@ def prepare(archive: Path, output: Path, head_sha: str) -> dict[str, object]:
                     "unsupported file in declarative input: "
                     f"{relative} (configuration must use lowercase .yaml or .yml; "
                     "intentionally disabled files must start with '_'; non-configuration "
-                    "files are limited to README, README.md, .gitkeep, or "
-                    ".gitforgeops-import.json)"
+                    "files are limited to README, README.md, .gitkeep, "
+                    ".gitforgeops-import.json, or an OS artifact: "
+                    + ", ".join(sorted(OS_ARTIFACT_FILES))
+                    + ")"
                 )
             if not _is_allowed_file(relative):
                 continue
