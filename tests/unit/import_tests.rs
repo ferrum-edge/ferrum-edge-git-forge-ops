@@ -68,7 +68,7 @@ fn make_test_config() -> GatewayConfig {
             username: "testuser".to_string(),
             namespace: "ferrum".to_string(),
             custom_id: None,
-            credentials: std::collections::HashMap::new(),
+            credentials: std::collections::BTreeMap::new(),
             acl_groups: vec![],
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

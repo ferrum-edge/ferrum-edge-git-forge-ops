@@ -719,7 +719,7 @@ fn consumer_config_with_credentials(
     use gitforgeops::config::schema::Consumer;
 
     let mut cfg = gitforgeops::config::GatewayConfig::default();
-    let map: std::collections::HashMap<String, serde_json::Value> =
+    let map: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_value(credentials).unwrap();
     cfg.consumers.push(Consumer {
         id: "app".to_string(),

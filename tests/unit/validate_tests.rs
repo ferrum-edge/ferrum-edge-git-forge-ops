@@ -45,7 +45,7 @@ fn validator_output_cannot_echo_literal_or_resolved_credentials() {
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
             custom_id: None,
-            credentials: std::collections::HashMap::from([(
+            credentials: std::collections::BTreeMap::from([(
                 "keyauth".to_string(),
                 serde_json::json!([{"key": secret}]),
             )]),
@@ -114,7 +114,7 @@ fn validator_diagnostics_remain_available_for_placeholder_only_credentials() {
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
             custom_id: None,
-            credentials: std::collections::HashMap::from([(
+            credentials: std::collections::BTreeMap::from([(
                 "keyauth".to_string(),
                 serde_json::json!([{"key": placeholder}]),
             )]),

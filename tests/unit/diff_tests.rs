@@ -72,7 +72,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         username: username.to_string(),
         namespace: "ferrum".to_string(),
         custom_id: None,
-        credentials: std::collections::HashMap::new(),
+        credentials: std::collections::BTreeMap::new(),
         acl_groups: vec![],
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -259,7 +259,7 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
             host: format!("host-{i}.internal"),
             port: 8080,
             weight: 1,
-            tags: std::collections::HashMap::new(),
+            tags: std::collections::BTreeMap::new(),
             locality: None,
             path: None,
         })
@@ -614,7 +614,7 @@ fn breaking_auth_plugin_deletion_scoped_by_namespace() {
 
 #[test]
 fn security_detects_literal_credential() {
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "literal-secret-key"}),
@@ -633,7 +633,7 @@ fn security_detects_literal_credential() {
 
 #[test]
 fn security_detects_nested_literal_credential() {
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!({"outer": {"inner": "literal-secret-key"}}),
@@ -654,7 +654,7 @@ fn security_detects_nested_literal_credential() {
 
 #[test]
 fn security_passes_template_credential() {
-    let mut creds = std::collections::HashMap::new();
+    let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "${API_KEY}"}),
@@ -685,7 +685,7 @@ fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
     // This test verifies the invariant by simulating both orderings.
 
     // Pre-resolve: placeholder in the config. Audit sees a ${...} string.
-    let mut creds_pre = std::collections::HashMap::new();
+    let mut creds_pre = std::collections::BTreeMap::new();
     creds_pre.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "${gh-env-secret:alloc=require}"}),
@@ -710,7 +710,7 @@ fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
     // Post-resolve (simulated): the placeholder has been replaced with a real
     // value. Audit now incorrectly sees a "literal" credential. This is the
     // behavior we want to AVOID by auditing before resolve.
-    let mut creds_post = std::collections::HashMap::new();
+    let mut creds_post = std::collections::BTreeMap::new();
     creds_post.insert(
         "keyauth".to_string(),
         serde_json::json!({"key": "real-random-value"}),

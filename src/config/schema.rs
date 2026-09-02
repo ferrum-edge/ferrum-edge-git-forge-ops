@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -221,8 +221,14 @@ pub struct UpstreamTarget {
     pub port: u16,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// `BTreeMap`, not `HashMap`: this map is serialized straight into the
+    /// exported document and into every admin-API request body. `HashMap`
+    /// iteration order varies *per map instance* (`RandomState` re-seeds on
+    /// every `new`), so the same input would export different bytes on every
+    /// run — republishing the file-mode document (and costing a gateway
+    /// reload) for a configuration that never changed.
     #[serde(default)]
-    pub tags: HashMap<String, String>,
+    pub tags: BTreeMap<String, String>,
     /// Istio-style `region/zone/subzone` locality for this target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<String>,
@@ -237,8 +243,9 @@ pub struct UpstreamTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubsetDefinition {
     pub name: String,
+    /// Ordered for the same reason as [`UpstreamTarget::tags`].
     #[serde(default)]
-    pub labels: HashMap<String, String>,
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,7 +798,7 @@ pub struct Consumer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_id: Option<String>,
     #[serde(default)]
-    pub credentials: HashMap<String, serde_json::Value>,
+    pub credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub acl_groups: Vec<String>,
     #[serde(default = "Utc::now")]
@@ -842,6 +849,10 @@ pub struct Upstream {
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
+    /// Credential type → array of entries. Ordered for the same reason as
+    /// [`UpstreamTarget::tags`], with a second one: the credential broker
+    /// walks this map to derive slot names, and a stable walk keeps the
+    /// per-run ordering of allocations and of the review comment reproducible.
     pub updated_at: DateTime<Utc>,
 }
 
