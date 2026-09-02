@@ -54,7 +54,13 @@ pub struct AdminClient {
 
 impl AdminClient {
     /// Build an Admin API client from resolved process/repo environment config.
-    pub fn new(env: &EnvConfig) -> crate::error::Result<Self> {
+    ///
+    /// Private on purpose. A client built here mints admin tokens with no `ns`
+    /// claim, which a gateway running `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`
+    /// rejects outright — and, worse, which a gateway *not* running it accepts
+    /// for every namespace. [`AdminClient::new_scoped`] is the only public
+    /// door, so a new call site has to say what it is allowed to touch.
+    fn new(env: &EnvConfig) -> crate::error::Result<Self> {
         let gateway_url = env
             .gateway_url
             .clone()
@@ -148,10 +154,13 @@ impl AdminClient {
     /// Build a client whose JWTs are scoped to the exact namespaces the
     /// command has resolved.
     ///
-    /// Prefer this constructor whenever the command knows its namespace set
-    /// before the first request. Keeping scoping in construction makes it
+    /// The only public constructor. Keeping scoping in construction makes it
     /// difficult for a new admin-API call site to accidentally mint an
     /// unscoped token on gateways that require the `ns` claim.
+    ///
+    /// An empty `namespaces` deliberately still builds a client — some
+    /// commands legitimately have no namespace set to declare — but it mints
+    /// an unscoped token, so pass the resolved set whenever one exists.
     pub fn new_scoped<I, S>(env: &EnvConfig, namespaces: I) -> crate::error::Result<Self>
     where
         I: IntoIterator<Item = S>,

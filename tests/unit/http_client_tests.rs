@@ -30,7 +30,7 @@ fn admin_client_rejects_client_cert_without_key() {
     env.client_cert = Some("dummy".to_string());
     env.client_key = None;
 
-    let err = match AdminClient::new(&env) {
+    let err = match AdminClient::new_scoped(&env, TEST_NAMESPACES) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
@@ -46,7 +46,7 @@ fn admin_client_rejects_client_key_without_cert() {
     env.client_cert = None;
     env.client_key = Some("dummy".to_string());
 
-    let err = match AdminClient::new(&env) {
+    let err = match AdminClient::new_scoped(&env, TEST_NAMESPACES) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
@@ -61,7 +61,7 @@ fn admin_client_rejects_short_jwt_secret() {
     let mut env = base_env();
     env.admin_jwt_secret = Some("too-short".to_string());
 
-    let err = match AdminClient::new(&env) {
+    let err = match AdminClient::new_scoped(&env, TEST_NAMESPACES) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
@@ -74,7 +74,7 @@ fn admin_client_rejects_short_jwt_secret() {
 #[test]
 fn admin_client_builds_without_mtls() {
     let env = base_env();
-    AdminClient::new(&env).expect("client should build without mTLS");
+    AdminClient::new_scoped(&env, TEST_NAMESPACES).expect("client should build without mTLS");
 }
 
 #[test]
@@ -82,7 +82,8 @@ fn admin_client_honors_custom_timeouts() {
     let mut env = base_env();
     env.gateway_connect_timeout_secs = 3;
     env.gateway_request_timeout_secs = 15;
-    AdminClient::new(&env).expect("client should build with custom timeouts");
+    AdminClient::new_scoped(&env, TEST_NAMESPACES)
+        .expect("client should build with custom timeouts");
 }
 
 #[tokio::test]
@@ -110,7 +111,7 @@ async fn admin_client_get_backup_sends_namespace_and_bearer_token() {
 
     let mut env = base_env();
     env.gateway_url = Some(format!("http://{addr}"));
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let backup = client.get_backup("team-alpha").await.unwrap();
     assert!(backup.proxies.is_empty());
@@ -166,7 +167,7 @@ async fn scoped_admin_client_mints_the_resolved_namespace_claim() {
 #[tokio::test]
 async fn admin_client_rejects_unsafe_resource_ids_in_paths() {
     let env = base_env();
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let err = client
         .delete_proxy("../consumers/victim?confirm=true", "team-alpha")
@@ -200,7 +201,7 @@ async fn admin_client_accepts_safe_resource_id_in_paths() {
 
     let mut env = base_env();
     env.gateway_url = Some(format!("http://{addr}"));
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let outcome = client
         .delete_proxy("proxy-01._~A", "team-alpha")
@@ -269,7 +270,7 @@ fn resource_ids_that_escape_the_path_segment_are_rejected() {
 #[tokio::test]
 async fn admin_client_rejects_ids_over_the_length_limit() {
     let env = base_env();
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let too_long = "a".repeat(255);
     let err = client.delete_proxy(&too_long, "team-alpha").await;
@@ -530,6 +531,13 @@ fn spawn_stub_gateway(routes: Vec<(&'static str, u16, &'static str)>) -> String 
     format!("http://{addr}")
 }
 
+/// Namespace scope every test client is built with.
+///
+/// `AdminClient::new_scoped` is the only public constructor, so tests declare
+/// a scope like production call sites do. The stub gateways ignore the token,
+/// but this keeps the tests honest about the constructor's contract.
+const TEST_NAMESPACES: [&str; 5] = ["team-alpha", "team-a", "team-b", "ferrum", "alpha"];
+
 fn stub_env(url: String) -> EnvConfig {
     let mut env = base_env();
     env.gateway_url = Some(url);
@@ -564,7 +572,7 @@ async fn connection_drop_after_create_delivery_is_not_replayed() {
 
     let mut env = stub_env(format!("http://{addr}"));
     env.gateway_max_retries = 1;
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
     let upstream: Upstream = serde_json::from_value(serde_json::json!({
         "id": "u1",
         "namespace": "team-alpha",
@@ -608,7 +616,7 @@ async fn connection_drop_after_restore_delivery_is_an_ambiguous_mutation() {
     });
 
     let env = stub_env(format!("http://{addr}"));
-    let client = AdminClient::new(&env).unwrap();
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
     let error = client
         .post_restore(
             &GatewayConfig::default(),
@@ -637,7 +645,7 @@ async fn delete_reports_a_404_as_already_gone() {
         404,
         r#"{"error":"not found"}"#,
     )]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let outcome = client.delete_upstream("u1", "team-alpha").await.unwrap();
     assert_eq!(outcome, DeleteOutcome::NotFound);
@@ -656,7 +664,7 @@ async fn unclassified_mutation_403_is_upgraded_via_health() {
             r#"{"status":"degraded","mode":"database","admin_writes_enabled":false}"#,
         ),
     ]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
     assert!(
@@ -683,7 +691,7 @@ async fn a_403_on_a_writable_gateway_stays_a_plain_api_error() {
             r#"{"status":"ok","mode":"database","admin_writes_enabled":true}"#,
         ),
     ]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
     assert!(
@@ -700,7 +708,7 @@ async fn the_health_recheck_is_best_effort() {
         ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
         ("GET /health", 500, r#"{"error":"boom"}"#),
     ]);
-    let client = AdminClient::new(&stub_env(url)).unwrap();
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
     assert!(
@@ -759,7 +767,9 @@ async fn admin_mutations_reject_redirects_without_following_them() {
         .unwrap();
     });
 
-    let client = AdminClient::new(&stub_env(format!("http://{source_addr}"))).unwrap();
+    let client =
+        AdminClient::new_scoped(&stub_env(format!("http://{source_addr}")), TEST_NAMESPACES)
+            .unwrap();
     let upstream: Upstream = serde_json::from_value(serde_json::json!({
         "id": "u1",
         "namespace": "team-alpha",

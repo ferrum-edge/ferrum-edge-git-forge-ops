@@ -816,6 +816,13 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
     }
 }
 
+/// Namespace scope every test client is built with.
+///
+/// `AdminClient::new_scoped` is the only public constructor, so tests declare
+/// a scope like production call sites do. The stub gateways ignore the token,
+/// but this keeps the tests honest about the constructor's contract.
+const TEST_NAMESPACES: [&str; 5] = ["team-alpha", "team-a", "team-b", "ferrum", "alpha"];
+
 fn stub_client(url: String) -> AdminClient {
     stub_client_with_retries(url, 0)
 }
@@ -828,7 +835,7 @@ fn stub_client_with_retries(url: String, gateway_max_retries: u32) -> AdminClien
         gateway_max_retries,
         ..EnvConfig::default()
     };
-    AdminClient::new(&env).unwrap()
+    AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap()
 }
 
 fn upstream(id: &str, namespace: &str) -> Upstream {
