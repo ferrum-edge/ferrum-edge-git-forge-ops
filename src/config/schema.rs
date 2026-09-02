@@ -649,6 +649,51 @@ pub enum PluginTriggerProtocol {
 
 // --- Top-level resources ---
 
+/// Unknown **top-level** `spec` fields a resource carried through unmodelled.
+///
+/// # Why a pass-through exists at all
+///
+/// The typed mirror is authoritative-by-rejection: a field it does not model is
+/// an error, which is what stops a typo from silently dropping out of desired
+/// state. The cost is that a gateway release adding a field breaks every repo
+/// that starts using it, with no remedy but a new gitforgeops release. The
+/// escape hatch is `FERRUM_ALLOW_UNKNOWN_FIELDS=true`: unknown *top-level*
+/// fields are kept verbatim in this map and travel through overlay merge,
+/// export, diff and apply untouched, letting the gateway — the authoritative
+/// schema — judge them.
+///
+/// # Why only top-level
+///
+/// A nested unknown field cannot be carried this way without mirroring
+/// `#[serde(flatten)]` onto every nested struct, which would turn each of them
+/// into a silent-accept surface and re-open the original bug at depth. Nested
+/// unknowns stay hard errors in both modes.
+///
+/// # Ownership
+///
+/// A key that appears only on the *live* side (a field a newer gateway invented
+/// and the repo never declared) is **not** drift: gitforgeops is not
+/// authoritative over fields it does not model and the repo does not name. Only
+/// a key the desired resource declares is compared. See
+/// `diff::resource_diff::compare_fields`.
+pub trait PassthroughFields {
+    fn passthrough(&self) -> &BTreeMap<String, serde_json::Value>;
+}
+
+macro_rules! impl_passthrough_fields {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl PassthroughFields for $type {
+                fn passthrough(&self) -> &BTreeMap<String, serde_json::Value> {
+                    &self.extra
+                }
+            }
+        )+
+    };
+}
+
+impl_passthrough_fields!(Proxy, Consumer, Upstream, PluginConfig);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proxy {
     #[serde(default)]
@@ -786,6 +831,13 @@ pub struct Proxy {
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -797,6 +849,10 @@ pub struct Consumer {
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_id: Option<String>,
+    /// Credential type → array of entries. Ordered for the same reason as
+    /// [`UpstreamTarget::tags`], with a second one: the credential broker
+    /// walks this map to derive slot names, and a stable walk keeps the
+    /// per-run ordering of allocations and of the review comment reproducible.
     #[serde(default)]
     pub credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -805,6 +861,13 @@ pub struct Consumer {
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -849,11 +912,14 @@ pub struct Upstream {
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
-    /// Credential type → array of entries. Ordered for the same reason as
-    /// [`UpstreamTarget::tags`], with a second one: the credential broker
-    /// walks this map to derive slot names, and a stable walk keeps the
-    /// per-run ordering of allocations and of the review comment reproducible.
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,6 +948,13 @@ pub struct PluginConfig {
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// Unknown top-level fields, carried verbatim. Empty unless
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
+    /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
+    /// flattened empty map contributes no entries, so an untouched resource
+    /// serializes byte-identically to one without this field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 // --- Root config ---

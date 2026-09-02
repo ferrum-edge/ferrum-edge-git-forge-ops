@@ -12,6 +12,7 @@ mod loader_tests;
 mod mesh_tests;
 mod ownership_tests;
 mod policy_tests;
+mod passthrough_tests;
 mod reconcile_tests;
 mod repo_config_tests;
 mod review_tests;

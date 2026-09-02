@@ -595,6 +595,7 @@ fn make_proxy(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Proxy {
         spec: Proxy {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: "ferrum".to_string(),
@@ -658,6 +659,7 @@ fn make_consumer(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Consumer {
         spec: Consumer {
+            extra: Default::default(),
             id: id.to_string(),
             username: id.to_string(),
             namespace: "ferrum".to_string(),
@@ -674,6 +676,7 @@ fn make_upstream(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Upstream {
         spec: Upstream {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: "ferrum".to_string(),
@@ -722,6 +725,7 @@ fn consumer_config_with_credentials(
     let map: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_value(credentials).unwrap();
     cfg.consumers.push(Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),

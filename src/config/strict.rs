@@ -1,8 +1,38 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
 
-use super::schema::Resource;
+use super::schema::{PassthroughFields, Resource};
+
+/// How strictly one load pass treats fields the typed mirror does not model.
+///
+/// Fail-closed is the default and stays the default: `LoadOptions::default()`
+/// rejects every unknown field. The permissive variant is only ever reached by
+/// an operator setting `FERRUM_ALLOW_UNKNOWN_FIELDS=true`, and even then it
+/// only relaxes *top-level* `spec` fields — see
+/// [`super::schema::PassthroughFields`].
+///
+/// This is a parameter rather than a process-global read so that the parse path
+/// stays free of environment access: the flag is resolved once, in `main`, and
+/// threaded down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Keep unknown top-level `spec` fields verbatim instead of rejecting them.
+    pub allow_unknown_fields: bool,
+}
+
+impl LoadOptions {
+    /// The fail-closed default, spelled out at call sites that mean it.
+    pub const STRICT: Self = Self {
+        allow_unknown_fields: false,
+    };
+
+    /// Keep unknown top-level `spec` fields (`FERRUM_ALLOW_UNKNOWN_FIELDS`).
+    pub const ALLOW_UNKNOWN_FIELDS: Self = Self {
+        allow_unknown_fields: true,
+    };
+}
 
 pub(crate) const RESOURCE_SUBDIRECTORIES: [(&str, &str); 5] = [
     ("proxies", "Proxy"),
@@ -168,7 +198,11 @@ pub(crate) fn resource_kind(resource: &Resource) -> &'static str {
 /// `serde_ignored`. Direct concrete deserialization is important:
 /// `#[serde(tag = "kind")]` buffers enum contents before the ignored-field
 /// adapter sees them, which would recreate the original silent-drop bug.
-pub(crate) fn resource_from_yaml(contents: &str, path: &Path) -> crate::error::Result<Resource> {
+pub(crate) fn resource_from_yaml(
+    contents: &str,
+    path: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<Resource> {
     let yaml: serde_yaml::Value =
         serde_yaml::from_str(contents).map_err(|source| crate::error::Error::YamlParse {
             path: path.to_path_buf(),
@@ -176,8 +210,9 @@ pub(crate) fn resource_from_yaml(contents: &str, path: &Path) -> crate::error::R
         })?;
     reject_non_string_keys(&yaml, path)?;
     let value = serde_json::to_value(yaml)?;
-    resource_from_json_value(value, path)
+    resource_from_json_value(value, path, options)
 }
+
 /// Reject YAML mapping keys that are not strings, naming the mapping they
 /// appear in.
 ///
@@ -255,12 +290,12 @@ fn describe_yaml_key(key: &serde_yaml::Value) -> String {
     }
 }
 
-
 /// Strictly deserialize a complete resource wrapper, including a fully merged
 /// overlay document.
 pub(crate) fn resource_from_json_value(
     value: serde_json::Value,
     source_path: &Path,
+    options: LoadOptions,
 ) -> crate::error::Result<Resource> {
     let object = value.as_object().ok_or_else(|| {
         crate::error::Error::Config(format!(
@@ -296,16 +331,16 @@ pub(crate) fn resource_from_json_value(
 
     match kind {
         "Proxy" => Ok(Resource::Proxy {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "Consumer" => Ok(Resource::Consumer {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "Upstream" => Ok(Resource::Upstream {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "PluginConfig" => Ok(Resource::PluginConfig {
-            spec: deserialize_spec(spec, source_path)?,
+            spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
         "MeshConfig" => {
             let id = match object.get("id") {
@@ -328,6 +363,55 @@ pub(crate) fn resource_from_json_value(
             path: source_path.to_path_buf(),
         }),
     }
+}
+
+/// [`deserialize_spec`] for the four gateway kinds, which additionally carry a
+/// `#[serde(flatten)]` map of unknown top-level fields.
+///
+/// `serde_ignored` never sees those: `flatten` captures an unrecognized key
+/// into the map instead of asking the deserializer to ignore it. That is the
+/// mechanism the pass-through relies on, and also why the fail-closed check has
+/// to live here rather than in `reject_ignored` — the map is the only place an
+/// unknown top-level field shows up. Nested unknowns are unaffected: known
+/// fields are still deserialized straight from the map access, so
+/// `serde_ignored` reports anything ignored inside them exactly as before.
+fn deserialize_gateway_spec<T: DeserializeOwned + PassthroughFields>(
+    value: serde_json::Value,
+    source_path: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<T> {
+    let parsed: T = deserialize_spec(value, source_path)?;
+    check_passthrough_fields(parsed.passthrough(), source_path, options)?;
+    Ok(parsed)
+}
+
+/// Fail closed on unknown top-level `spec` fields, or announce them loudly when
+/// the operator has opted into carrying them.
+fn check_passthrough_fields(
+    extra: &BTreeMap<String, serde_json::Value>,
+    source_path: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<()> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+
+    let fields: Vec<String> = extra.keys().map(|key| format!(".spec.{key}")).collect();
+    if !options.allow_unknown_fields {
+        return reject_ignored(source_path, fields);
+    }
+
+    // stderr, never stdout: `gitforgeops export` writes the assembled YAML to
+    // stdout and a warning interleaved into it would corrupt the document.
+    eprintln!(
+        "Warning: {}: {} unknown top-level field(s) kept verbatim because \
+         FERRUM_ALLOW_UNKNOWN_FIELDS is set: {}. gitforgeops does not model these — the gateway \
+         is the authority on whether they are valid.",
+        source_path.display(),
+        fields.len(),
+        fields.join(", "),
+    );
+    Ok(())
 }
 
 fn deserialize_spec<T: DeserializeOwned>(

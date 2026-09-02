@@ -144,13 +144,21 @@ fn resolve_runtime(
 /// `validate`, `plan`, `export` and file-mode `apply` also act on `.mesh`.
 fn load_and_assemble_all(
     resolved: &ResolvedEnv,
+    env_config: &EnvConfig,
 ) -> Result<config::AssembledOutput, Box<dyn std::error::Error>> {
+    // Fail-closed unless the operator explicitly set
+    // FERRUM_ALLOW_UNKNOWN_FIELDS. The policy is resolved once, here, and
+    // threaded down rather than read from the process environment inside the
+    // parse loop.
+    let load_options = config::LoadOptions {
+        allow_unknown_fields: env_config.allow_unknown_fields,
+    };
     let resources_dir = PathBuf::from("./resources");
-    let mut resources = config::load_resources(&resources_dir)?;
+    let mut resources = config::load_resources_with_options(&resources_dir, load_options)?;
 
     if let Some(ref overlay_name) = resolved.overlay {
-        let overlay_dir = PathBuf::from("./overlays").join(overlay_name);
-        config::apply_overlay(&mut resources, &overlay_dir)?;
+        let overlay_dir = PathBuf::from(config::OVERLAYS_ROOT).join(overlay_name);
+        config::apply_overlay_with_options(&mut resources, &overlay_dir, load_options)?;
     }
 
     // The namespace filter is applied to mesh fragments during assembly (a
@@ -178,8 +186,9 @@ fn load_and_assemble_all(
 /// `rotate` have nothing to do with it.
 fn load_and_assemble_for(
     resolved: &ResolvedEnv,
+    env_config: &EnvConfig,
 ) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
-    Ok(load_and_assemble_all(resolved)?.gateway)
+    Ok(load_and_assemble_all(resolved, env_config)?.gateway)
 }
 
 fn load_credential_bundles(
@@ -753,7 +762,7 @@ fn cmd_validate(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
     let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
@@ -810,7 +819,7 @@ async fn cmd_export(
     }
 
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
 
     if materialize {
@@ -916,7 +925,7 @@ async fn cmd_diff(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
     let state = StateFile::load(&resolved.name)?;
@@ -1023,7 +1032,7 @@ async fn cmd_diff(
 
 async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
     // Plan must see the same scope/validation errors as apply would hit, so
@@ -1232,7 +1241,7 @@ async fn cmd_apply(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
 
@@ -1930,7 +1939,7 @@ async fn cmd_review(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
     // apply would produce.
@@ -2202,7 +2211,7 @@ async fn cmd_rotate(
         );
     }
 
-    let desired_for_check = load_and_assemble_for(&resolved)?;
+    let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
 
     // Preflight 1b: in exclusive mode, the same ownership-scope rules
     // apply/diff/plan/review enforce must apply here too. A manual rotate
@@ -2391,7 +2400,7 @@ async fn push_rotated_consumer_to_gateway(
         return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
     }
 
-    let mut desired = load_and_assemble_for(resolved)?;
+    let mut desired = load_and_assemble_for(resolved, env_config)?;
     let merged = secrets::merge_bundles(per_shard);
     // `rotate_and_deliver` just wrote the fresh value into the bundle; this
     // resolve picks it up for the consumer being pushed to the gateway.

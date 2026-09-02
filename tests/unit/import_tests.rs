@@ -7,6 +7,7 @@ use std::path::PathBuf;
 fn make_test_config() -> GatewayConfig {
     GatewayConfig {
         proxies: vec![Proxy {
+            extra: Default::default(),
             id: "proxy-test".to_string(),
             name: Some("Test".to_string()),
             namespace: "ferrum".to_string(),
@@ -64,6 +65,7 @@ fn make_test_config() -> GatewayConfig {
             updated_at: chrono::Utc::now(),
         }],
         consumers: vec![Consumer {
+            extra: Default::default(),
             id: "consumer-test".to_string(),
             username: "testuser".to_string(),
             namespace: "ferrum".to_string(),
@@ -396,6 +398,7 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         "protocol": "grpc"
     });
     config.plugin_configs.push(PluginConfig {
+        extra: Default::default(),
         id: "otel-main".to_string(),
         plugin_name: "otel_tracing".to_string(),
         namespace: "ferrum".to_string(),
@@ -469,6 +472,7 @@ fn custom_plugin_import_fails_closed_for_opaque_string_config() {
     let bundle_path = destination_parent.path().join("secret-migration.json");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        extra: Default::default(),
         id: "custom".to_string(),
         plugin_name: "enterprise_custom".to_string(),
         namespace: "ferrum".to_string(),
@@ -499,6 +503,7 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        extra: Default::default(),
         id: "spec-otel".to_string(),
         plugin_name: "otel_tracing".to_string(),
         namespace: "ferrum".to_string(),

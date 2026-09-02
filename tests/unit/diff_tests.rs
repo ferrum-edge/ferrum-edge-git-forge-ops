@@ -8,6 +8,7 @@ use gitforgeops::diff::{
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
     Proxy {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: "ferrum".to_string(),
@@ -68,6 +69,7 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
 
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        extra: Default::default(),
         id: id.to_string(),
         username: username.to_string(),
         namespace: "ferrum".to_string(),
@@ -238,6 +240,7 @@ fn make_plugin_config(
     scope: PluginScope,
 ) -> PluginConfig {
     PluginConfig {
+        extra: Default::default(),
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
         namespace: namespace.to_string(),
@@ -265,6 +268,7 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
         })
         .collect();
     Upstream {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: "ferrum".to_string(),

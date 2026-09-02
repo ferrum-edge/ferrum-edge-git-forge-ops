@@ -41,6 +41,7 @@ fn validator_output_cannot_echo_literal_or_resolved_credentials() {
     let secret = "launch-secret-that-must-never-reach-diagnostics";
     let config = GatewayConfig {
         consumers: vec![Consumer {
+            extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
@@ -110,6 +111,7 @@ fn validator_diagnostics_remain_available_for_placeholder_only_credentials() {
     let placeholder = "${gh-env-secret:alloc=require}";
     let config = GatewayConfig {
         consumers: vec![Consumer {
+            extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
