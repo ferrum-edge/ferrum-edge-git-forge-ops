@@ -141,7 +141,45 @@ The audit is intentionally fail-closed on missing token scope, API errors,
 pagination/response-shape changes, missing controls, or a non-App always-on
 bypass.
 
-## 6. Verify the trust split
+## 6. Keep the validator digest allowlist fresh
+
+The `ferrum-edge` validator is pinned by **content**, not by a locator. Upstream
+publishes one rolling `latest` release and deletes plus re-uploads its assets on
+every build, so release ids, asset ids and tags all move. Nothing on the GitHub
+side selects a validator version: `.github/ferrum-edge-checksums.txt` lists the
+approved SHA-256 digests, and `.github/scripts/install-ferrum-edge.sh` refuses to
+make downloaded bytes executable unless the digest is on that list. There is no
+`FERRUM_EDGE_VERSION` variable to set, and `check_supply_chain.py` fails CI if a
+workflow reintroduces one.
+
+Because the pin tracks content, it goes stale whenever upstream rebuilds — on
+upstream's schedule, not yours. `validator-pin-canary.yml` runs the installer
+daily from the default branch (plus `workflow_dispatch`), and needs no
+configuration:
+
+- On a stale pin it opens, or updates, exactly one tracking issue titled
+  *Refresh the pinned ferrum-edge validator digest*. The body carries the exact
+  allowlist line to commit and the command that regenerates it.
+- Once the allowlist covers the current build again, the canary closes that
+  issue.
+- It holds `contents: read` plus `issues: write` and never touches a deployment
+  environment or a gateway credential.
+
+To refresh, review the upstream build and run:
+
+```bash
+bash .github/scripts/refresh-ferrum-edge-pin.sh --append
+```
+
+Commit the new line through normal CODEOWNER review and **keep the previous
+line**: pull requests already running the older binary stay green, and the
+installer accepts any allowlisted digest.
+
+GitHub disables scheduled workflows after 60 days without repository activity.
+The canary shares that fate with `drift-check.yml` and `settings-audit.yml`; if
+the repository goes quiet, re-enable the schedules from the Actions tab.
+
+## 7. Verify the trust split
 
 After merging the workflow changes and configuring the controls:
 

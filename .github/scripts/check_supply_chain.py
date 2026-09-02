@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 ACTION_SHA = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$")
 USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
+VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
+DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
 
 
 def action_files(root: Path) -> list[Path]:
@@ -96,6 +98,64 @@ def installer_step_auth_violations(workflow: str, text: str) -> list[str]:
             f"{workflow}: every validator download step must use the authenticated GitHub asset API"
         ]
     return []
+
+
+def allowlisted_validator_digests(text: str) -> list[str]:
+    """Return every approved validator digest, in file order."""
+    digests: list[str] = []
+    for line in text.splitlines():
+        record = line.split("#", 1)[0].strip()
+        match = DIGEST_ENTRY.fullmatch(record) if record else None
+        if match is not None:
+            digests.append(match.group(1))
+    return digests
+
+
+def digest_allowlist_violations(text: str) -> list[str]:
+    """The validator is pinned by content, so the allowlist must stay exact.
+
+    One `<sha256>  <asset>` record per approved build, comments allowed, and no
+    locator fields: release ids, asset ids and tags all move underneath us when
+    upstream re-uploads its rolling release.
+    """
+    violations: list[str] = []
+    digests: list[str] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        record = line.split("#", 1)[0].strip()
+        if not record:
+            continue
+        match = DIGEST_ENTRY.fullmatch(record)
+        if match is None:
+            violations.append(
+                f"ferrum-edge-checksums.txt:{number}: entry must be exactly "
+                f"'<64 lowercase hex sha256>  {VALIDATOR_ASSET}' plus an optional '# comment'"
+            )
+            continue
+        digests.append(match.group(1))
+    if not digests:
+        violations.append(
+            "ferrum-edge-checksums.txt must approve at least one validator digest"
+        )
+    if len(set(digests)) != len(digests):
+        violations.append(
+            "ferrum-edge-checksums.txt must not repeat an approved validator digest"
+        )
+    return violations
+
+
+def validator_locator_violations(texts: list[str]) -> list[str]:
+    """Reject any attempt to re-pin the validator by a mutable locator."""
+    joined = "\n".join(texts)
+    violations: list[str] = []
+    if "FERRUM_EDGE_SHA256" in joined:
+        violations.append(
+            "workflows must not replace the checked-in validator digest with a mutable variable"
+        )
+    if "FERRUM_EDGE_VERSION" in joined:
+        violations.append(
+            "workflows must not select the validator by release identity; the reviewed digest allowlist is the pin"
+        )
+    return violations
 
 
 def trusted_supply_chain_policy_violations(text: str) -> list[str]:
@@ -231,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         ("security.yml", "Security"),
         ("state-guard.yml", "GitForgeOps State Guard"),
         ("validate-pr.yml", "GitForgeOps PR Static Validation"),
+        ("validator-pin-canary.yml", "GitForgeOps Validator Pin Canary"),
     ):
         workflow_text = (workflows / workflow_name).read_text(encoding="utf-8")
         violations.extend(
@@ -450,15 +511,28 @@ def main(argv: list[str] | None = None) -> int:
     if 'channel = "1.98.0"' not in toolchain:
         violations.append("rust-toolchain.toml: channel must be pinned to 1.98.0")
 
+    for script_name in ("install-ferrum-edge.sh", "refresh-ferrum-edge-pin.sh"):
+        script = root / ".github" / "scripts" / script_name
+        if script.is_symlink() or not script.is_file():
+            violations.append(
+                f"{script_name} must remain a regular protected script"
+            )
     installer = (root / ".github" / "scripts" / "install-ferrum-edge.sh").read_text(
         encoding="utf-8"
     )
     for required in (
         "ferrum-edge-checksums.txt",
-        "expected_sha256",
+        "allowed_digests",
         "published_sha256",
         "actual_sha256",
         "Authorization: Bearer",
+        "--proto '=https'",
+        "--tlsv1.2",
+        "--fail",
+        '"$releases_api/tags/latest"',
+        '"$releases_api?per_page=5"',
+        "select(.name == $name)",
+        "install -m 0755",
     ):
         if required not in installer:
             violations.append(
@@ -469,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
         "drift-check.yml",
         "trusted-pr-review.yml",
         "validate-pr.yml",
+        "validator-pin-canary.yml",
     ):
         workflow_text = (root / ".github" / "workflows" / workflow_name).read_text(
             encoding="utf-8"
@@ -476,29 +551,37 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(
             installer_step_auth_violations(workflow_name, workflow_text)
         )
-    if "FERRUM_EDGE_SHA256" in "\n".join(
-        workflow.read_text(encoding="utf-8") for workflow in checked_action_files
-    ):
-        violations.append(
-            "workflows must not replace the checked-in validator digest with a mutable variable"
+    violations.extend(
+        validator_locator_violations(
+            [workflow.read_text(encoding="utf-8") for workflow in checked_action_files]
         )
+    )
+
+    canary = (workflows / "validator-pin-canary.yml").read_text(encoding="utf-8")
+    for required in (
+        "  schedule:",
+        "  workflow_dispatch:",
+        "Require protected default branch",
+        "EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}",
+        "issues: write",
+        ".github/scripts/refresh-ferrum-edge-pin.sh",
+        "gh issue create",
+    ):
+        if required not in canary:
+            violations.append(
+                f"validator-pin-canary.yml: missing stale-pin canary control {required!r}"
+            )
 
     checksum_policy = root / ".github" / "ferrum-edge-checksums.txt"
-    pins = [
-        line.split()
-        for line in checksum_policy.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    if not pins or any(
-        len(pin) != 5
-        or not re.fullmatch(r"release-[1-9][0-9]*", pin[0])
-        or pin[1] != "ferrum-edge-linux-x86_64"
-        or not re.fullmatch(r"[1-9][0-9]*", pin[2])
-        or not re.fullmatch(r"[1-9][0-9]*", pin[3])
-        or not re.fullmatch(r"[0-9a-f]{64}", pin[4])
-        for pin in pins
-    ):
-        violations.append("ferrum-edge-checksums.txt contains a malformed release pin")
+    if checksum_policy.is_symlink() or not checksum_policy.is_file():
+        violations.append(
+            "ferrum-edge-checksums.txt must remain a regular protected policy file"
+        )
+        allowlist_text = ""
+    else:
+        allowlist_text = checksum_policy.read_text(encoding="utf-8")
+        violations.extend(digest_allowlist_violations(allowlist_text))
+    approved_digests = allowlisted_validator_digests(allowlist_text)
 
     if violations:
         print("Supply-chain policy violations:", file=sys.stderr)
@@ -514,14 +597,8 @@ def main(argv: list[str] | None = None) -> int:
             "actions": action_pins,
             "docker_bases": FROM.findall(dockerfile),
             "ferrum_edge_binaries": [
-                {
-                    "release_identity": pin[0],
-                    "asset": pin[1],
-                    "asset_id": int(pin[2]),
-                    "checksum_asset_id": int(pin[3]),
-                    "sha256": pin[4],
-                }
-                for pin in pins
+                {"asset": VALIDATOR_ASSET, "sha256": digest}
+                for digest in approved_digests
             ],
         }
         args.write_manifest.write_text(

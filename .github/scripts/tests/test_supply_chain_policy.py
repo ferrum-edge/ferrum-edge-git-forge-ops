@@ -222,6 +222,62 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             [],
         )
 
+    def test_digest_allowlist_accepts_multiple_commented_builds(self):
+        text = (
+            "# Reviewed SHA-256 allowlist.\n"
+            "\n"
+            + "a" * 64
+            + "  ferrum-edge-linux-x86_64  # 2026-08-01T00:00:00Z release latest\n"
+            + "b" * 64
+            + "  ferrum-edge-linux-x86_64  # 2026-09-02T03:02:29Z release latest\n"
+        )
+        self.assertEqual(check_supply_chain.digest_allowlist_violations(text), [])
+        self.assertEqual(
+            check_supply_chain.allowlisted_validator_digests(text),
+            ["a" * 64, "b" * 64],
+        )
+
+    def test_digest_allowlist_rejects_locator_pins_and_bad_records(self):
+        for malformed in (
+            "release-379454492 ferrum-edge-linux-x86_64 537268718 537268721 "
+            + "c" * 64
+            + "\n",
+            "C" * 64 + "  ferrum-edge-linux-x86_64\n",
+            "c" * 64 + "  ferrum-edge-macos-x86_64\n",
+            "c" * 64 + "\n",
+            "c" * 64 + "  ferrum-edge-linux-x86_64  537268718\n",
+        ):
+            with self.subTest(malformed=malformed.strip()):
+                violations = check_supply_chain.digest_allowlist_violations(malformed)
+                self.assertTrue(any("entry must be exactly" in item for item in violations))
+
+    def test_digest_allowlist_must_approve_exactly_one_build_per_digest(self):
+        empty = check_supply_chain.digest_allowlist_violations("# nothing yet\n")
+        self.assertTrue(any("at least one" in item for item in empty))
+        duplicated = ("d" * 64 + "  ferrum-edge-linux-x86_64\n") * 2
+        self.assertTrue(
+            any(
+                "must not repeat" in item
+                for item in check_supply_chain.digest_allowlist_violations(duplicated)
+            )
+        )
+
+    def test_validator_may_not_be_repinned_by_a_mutable_locator(self):
+        self.assertEqual(
+            check_supply_chain.validator_locator_violations(
+                ["run: bash .github/scripts/install-ferrum-edge.sh\n"]
+            ),
+            [],
+        )
+        digest_variable = check_supply_chain.validator_locator_violations(
+            ["env:\n  FERRUM_EDGE_SHA256: ${{ vars.FERRUM_EDGE_SHA256 }}\n"]
+        )
+        self.assertTrue(any("mutable variable" in item for item in digest_variable))
+        release_identity = check_supply_chain.validator_locator_violations(
+            ["env:\n  RAW: ${{ vars.FERRUM_EDGE_VERSION || 'release-1' }}\n"]
+        )
+        self.assertTrue(any("release identity" in item for item in release_identity))
+
     def test_state_writer_token_must_follow_build_and_stay_ephemeral(self):
         secure = "\n".join(
             [
