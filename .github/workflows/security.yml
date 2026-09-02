@@ -54,9 +54,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # PR #87 adds the checker itself, so its protected base cannot supply
-          # it. This already-reviewed commit is a one-time immutable fallback;
-          # after merge the default-branch copy always wins.
-          ref: f15d4b089789e73e4db337b29c89603ac23371c6
+          # it. This already-pushed commit of the same PR is a one-time
+          # immutable fallback; after merge the default-branch copy always wins.
+          # It must stay at or after the commit that reshaped the validator
+          # digest allowlist, or the fallback rejects the very policy it guards.
+          ref: cdfeaa2446f7203444c2b88edbc55cb5c37f202e
           path: bootstrap-supply-chain
           persist-credentials: false
 
