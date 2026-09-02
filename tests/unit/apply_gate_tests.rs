@@ -37,6 +37,17 @@ spec:
 /// elided, so the slot is `ferrum/app/keyauth/key`.
 const BUNDLE: &str = r#"{"FERRUM_CREDS_BUNDLE": {"ferrum/app/keyauth/key": "bundle-value"}}"#;
 
+/// The same consumer after the *first* of two `keyauth` entries was deleted.
+/// The survivor shifts into the elided slot and inherits the deleted entry's
+/// value; `[1]` is left orphaned in the bundle below.
+const SHRUNK_CONSUMER: &str = BROKERED_CONSUMER;
+
+/// Bundle from before the shrink: both entries were allocated.
+const TWO_SLOT_BUNDLE: &str = r#"{"FERRUM_CREDS_BUNDLE": {
+    "ferrum/app/keyauth/key": "first-entry-value",
+    "ferrum/app/keyauth/[1]/key": "second-entry-value"
+}}"#;
+
 /// A throwaway repository checkout plus a stub validator.
 struct Repo {
     dir: TempDir,
@@ -196,5 +207,102 @@ fn plan_exits_zero_for_a_brokered_consumer() {
         "a placeholder is repository data, not a finding; stdout={} stderr={}",
         stdout(&output),
         stderr(&output)
+    );
+}
+
+#[test]
+fn apply_refuses_a_credential_array_shrink_that_reassigns_a_stored_slot() {
+    let repo = Repo::with_consumer(SHRUNK_CONSUMER);
+
+    let output = repo.run(
+        &["apply", "--auto-approve"],
+        &[("FERRUM_CREDS_JSON", TWO_SLOT_BUNDLE)],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a shrink that re-owns a stored slot must not apply; stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("ferrum/app/keyauth/[1]/key"),
+        "the refusal must name the orphaned slot: {stderr}"
+    );
+    assert!(
+        !stderr.contains("first-entry-value") && !stderr.contains("second-entry-value"),
+        "a refusal must never echo bundle values: {stderr}"
+    );
+    assert!(
+        !repo.published().exists(),
+        "a refused apply must leave the bundle and the published document untouched"
+    );
+}
+
+#[test]
+fn apply_accepts_a_shrink_when_the_remap_is_explicitly_allowed() {
+    let repo = Repo::with_consumer(SHRUNK_CONSUMER);
+
+    let output = repo.run(
+        &["apply", "--auto-approve", "--allow-credential-slot-remap"],
+        &[("FERRUM_CREDS_JSON", TWO_SLOT_BUNDLE)],
+    );
+
+    assert!(
+        output.status.success(),
+        "the documented shrink-then-rotate sequence must stay reachable; stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        repo.published().exists(),
+        "an accepted apply publishes as usual"
+    );
+    assert!(
+        stderr(&output).contains("ferrum/app/keyauth/[1]/key"),
+        "the hazard is accepted, not hidden: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn plan_exits_nonzero_on_an_unacknowledged_credential_slot_remap() {
+    let repo = Repo::with_consumer(SHRUNK_CONSUMER);
+
+    let output = repo.run(&["plan"], &[("FERRUM_CREDS_JSON", TWO_SLOT_BUNDLE)]);
+
+    assert!(
+        !output.status.success(),
+        "plan's verdict must match apply's; stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let planned = stdout(&output);
+    assert!(
+        planned.contains("Credential Slot Remaps")
+            && planned.contains("ferrum/app/keyauth/[1]/key"),
+        "the hazard must be rendered in plan output, not only on stderr: {planned}"
+    );
+    assert!(
+        planned.contains("block apply"),
+        "plan must say the finding is terminal: {planned}"
+    );
+
+    // Acknowledged, the same repository plans clean.
+    let allowed = repo.run(
+        &["plan", "--allow-credential-slot-remap"],
+        &[("FERRUM_CREDS_JSON", TWO_SLOT_BUNDLE)],
+    );
+    assert!(
+        allowed.status.success(),
+        "stdout={} stderr={}",
+        stdout(&allowed),
+        stderr(&allowed)
+    );
+    assert!(
+        stdout(&allowed).contains("Accepted via --allow-credential-slot-remap"),
+        "{}",
+        stdout(&allowed)
     );
 }

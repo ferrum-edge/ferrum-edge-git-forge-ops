@@ -157,3 +157,41 @@ fn cli_apply_exposes_the_api_spec_deletion_opt_in() {
         _ => panic!("expected apply command"),
     }
 }
+
+#[test]
+fn cli_exposes_the_credential_slot_remap_opt_in_globally() {
+    // The refusal comes from credential resolution, which plan, apply,
+    // review, export --materialize and rotate all go through, so the
+    // acknowledgement has to be reachable from any of them — before or after
+    // the subcommand.
+    let default = Cli::try_parse_from(["gitforgeops", "apply", "--auto-approve"]).unwrap();
+    assert!(
+        !default.allow_credential_slot_remap,
+        "a slot reassignment must be refused unless explicitly accepted"
+    );
+
+    for argv in [
+        vec!["gitforgeops", "apply", "--allow-credential-slot-remap"],
+        vec!["gitforgeops", "--allow-credential-slot-remap", "apply"],
+        vec!["gitforgeops", "plan", "--allow-credential-slot-remap"],
+        vec![
+            "gitforgeops",
+            "rotate",
+            "--consumer",
+            "app",
+            "--credential",
+            "keyauth/[1]/key",
+            "--allow-credential-slot-remap",
+        ],
+        vec![
+            "gitforgeops",
+            "export",
+            "--materialize",
+            "--allow-credential-slot-remap",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(argv.clone())
+            .unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
+        assert!(cli.allow_credential_slot_remap, "{argv:?}");
+    }
+}

@@ -413,9 +413,23 @@ after:   keyauth: [{key: B}]                B -> ferrum/app/keyauth/key   <-- no
 
 The credential you meant to retire is still live, now issued to the entry that shifted into index 0, and `[1]` is orphaned in the bundle where re-growing the list would resurrect it.
 
-So: **rotate, don't delete or reorder.** `gitforgeops rotate --consumer app --credential keyauth/[1]/key` replaces a value in place and leaves every other slot alone. Deleting the *last* entry of a list is safe; deleting or reordering anything else is not.
+So: **rotate, don't delete or reorder.** `gitforgeops rotate --consumer app --credential keyauth/[1]/key` replaces a value in place and leaves every other slot alone.
 
-`plan`, `diff` and `apply` detect both shapes and print a warning: one when a brokered credential array has more than one entry (order is identity), and one naming any bundle slot whose index is past the end of the current array (orphaned by a shrink). Neither blocks the run — the bundle is not corrupt — but an orphaned slot should be rotated rather than left to be re-inherited.
+The two shapes get very different treatment, because only one of them leaves evidence:
+
+- **Order is identity** — a warning, printed whenever a brokered credential array has more than one entry. A reorder or a prepend really does re-own stored values, but it is invisible from the document: array length, bundle keys, and every slot status are byte-identical to a stable array that nobody touched. Refusing on this shape would mean refusing every multi-entry brokered credential forever, so it stays advisory.
+- **A stored slot the array no longer owns** — a **refusal**. If the bundle holds a value for entry index *N* and the array now has *N* entries or fewer, the array shrank: the entry that shifted into the vacated index has inherited a credential you meant to retire, and re-growing the list would resurrect the orphan for a new entry. `apply`, `export --materialize` and `rotate` refuse; `plan` prints a `Credential Slot Remaps` section and exits non-zero; the PR comment renders it as blocking. Messages name slots only, never values.
+
+The refusal covers deleting the *last* entry too. Nothing shifted in that case, but the orphaned value is still sitting in the bundle waiting to be handed to the next entry added at that index.
+
+To land the shrink, rotate first and delete second:
+
+```
+gitforgeops rotate --consumer app --credential keyauth/[1]/key   # retire the live value
+# then remove the entry from the YAML and merge
+```
+
+If you would rather accept the reassignment as-is, pass `--allow-credential-slot-remap` (global; works on `plan`, `apply`, `export --materialize` and `rotate`). It downgrades the refusal to the report it replaced — the hazard is still printed and still rendered in the PR comment, it just no longer stops the run.
 
 ### Storage: bundled environment secrets
 
@@ -808,7 +822,7 @@ is `PASSED`.
 
 ## CLI reference
 
-All commands accept `--env <name>` globally.
+All commands accept `--env <name>` and `--allow-credential-slot-remap` globally.
 
 ```
 gitforgeops validate [--format text|json|github|github-annotations]
@@ -830,7 +844,8 @@ Notes:
 - `--format github` is an alias for `github-annotations`.
 - `--confirm-api-spec-deletion` is the opt-in for touching resources the gateway's OpenAPI spec importer owns: a namespace with live API specs otherwise rejects `full_replace`, and exclusive incremental apply otherwise skips tagged resources. Repository/spec identity conflicts always block the whole apply before unrelated writes; the confirmation flag is not a way to make two owners share one row.
 - `--allow-large-prune` acknowledges only the configured deletion percentage. A cached (`X-Data-Source: cached`) backup blocks every mutation and has no override because API-spec ownership is unknown.
-- `plan` exits non-zero when schema validation fails **or** the pre-resolve security audit reports an error-severity finding — the same set `apply` refuses on. Findings are always printed first; the exit code carries nothing the operator has not already seen.
+- `--allow-credential-slot-remap` accepts a credential-array shape change that reassigns a stored broker slot. Slot identity is the entry's array index, so shrinking a multi-entry credential hands the retired slot's value to whichever entry shifts into its index. The safe sequence is `gitforgeops rotate --credential <type>/[N]/<key>` first, remove the entry second; see [Hazard: entry position is the slot identity](#hazard-entry-position-is-the-slot-identity). There is deliberately no environment variable for it — accepting a credential reassignment is a per-run decision, not a repository setting.
+- `plan` exits non-zero when schema validation fails, the pre-resolve security audit reports an error-severity finding, **or** an unacknowledged credential-slot remap is detected — the same set `apply` refuses on. Findings are always printed first; the exit code carries nothing the operator has not already seen.
 - API import requires `FERRUM_NAMESPACE` (or the selected environment's namespace filter), mints an exact namespace-scoped JWT, and imports one namespace at a time. This fails closed on gateways that require namespace claims: an unscoped `GET /namespaces` intentionally returns an empty list and therefore cannot safely drive an all-namespace import.
 - `review --require-live` returns non-zero after rendering the fallback report if either the gateway comparison was unavailable or the required PR comment could not be posted. The trusted PR workflow uses it; secretless static review intentionally keeps comment delivery best-effort. Review comments are UTF-8-safe and capped below GitHub's API limit, with explicit omission counts. When a review has no credential bundle, only unresolved broker-controlled leaves in Consumer credentials and plugin config are excluded from live comparison; literal siblings, extra entries, shape changes, adds/deletes, and all nonsecret fields remain authoritative.
 - `envs --format json --include-scopes` emits protected environment/namespace routing for trusted CI and is not a replacement for `envs --format json`'s string array.

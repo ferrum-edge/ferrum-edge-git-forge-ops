@@ -33,6 +33,44 @@ pub const REDACTED_SENTINEL: &str = "[REDACTED]";
 /// must seed the exact live value from the private migration bundle.
 pub const IMPORT_REQUIRED_PLACEHOLDER: &str = "${gh-env-secret:alloc=require}";
 
+/// What resolution does with a detected credential-array slot remap
+/// (see [`check_array_slot_identity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlotRemapPolicy {
+    /// Fail resolution. The default, and what every mutating path uses: a
+    /// remap silently re-issues a retired credential, and a warning in a CI
+    /// log is not a control.
+    #[default]
+    Refuse,
+    /// Record the hazard on [`ResolveReport::slot_remaps`] and continue.
+    ///
+    /// Two callers want this. `--allow-credential-slot-remap` is the
+    /// operator's explicit acknowledgement of the documented
+    /// shrink-then-rotate sequence; `plan` and `review` use it because they
+    /// render the hazard themselves (and `plan` supplies its own non-zero
+    /// exit) instead of aborting with a bare error string.
+    Allow,
+}
+
+/// Knobs that change resolution's *verdict* without changing what it walks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResolveOptions {
+    pub slot_remap: SlotRemapPolicy,
+}
+
+impl ResolveOptions {
+    /// Report slot remaps instead of failing on them.
+    pub fn allowing_slot_remap(allow: bool) -> Self {
+        Self {
+            slot_remap: if allow {
+                SlotRemapPolicy::Allow
+            } else {
+                SlotRemapPolicy::Refuse
+            },
+        }
+    }
+}
+
 /// Whether generation constraints ([`check_generation_constraints`]) abort the
 /// walk or are merely reflected in the returned statuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,13 +120,27 @@ pub struct ResolveReport {
     pub results: Vec<ResolveResult>,
     /// Non-fatal advisories raised while walking the credential tree.
     ///
-    /// Currently these are the array-slot-identity hazards described on
-    /// [`is_elided`]: entry *position* is the slot identity, so removing or
-    /// reordering entries of a multi-entry credential array silently hands a
-    /// retired slot's value to whichever entry shifted into its index. Each
-    /// message is also echoed to stderr by the entrypoints so it shows up in
-    /// CI logs even when the caller ignores this field.
+    /// These describe the array-slot-identity hazard from [`is_elided`] in the
+    /// abstract — entry *position* is the slot identity, so a multi-entry
+    /// credential array is order-sensitive — without any evidence that a remap
+    /// has actually happened. A steady multi-entry array raises one on every
+    /// run, which is exactly why they cannot be fatal. Proven remaps go to
+    /// [`Self::slot_remaps`] instead. Each message is echoed to stderr once
+    /// per process so it shows up in CI logs even when the caller ignores this
+    /// field.
     pub warnings: Vec<String>,
+    /// Credential-array shape changes that provably re-own a stored slot.
+    ///
+    /// Populated when the bundle still holds a value for an entry index the
+    /// declared array no longer has: the value has either already been handed
+    /// to whichever entry shifted into its index, or is sitting orphaned
+    /// waiting for the next grow to resurrect it. Unlike [`Self::warnings`]
+    /// this cannot fire in steady state, so it is fatal by default —
+    /// resolution returns [`crate::error::Error::CredentialSlotRemap`] unless
+    /// the caller passes [`SlotRemapPolicy::Allow`].
+    ///
+    /// Messages name slots only. A bundle value never appears in one.
+    pub slot_remaps: Vec<String>,
     /// `slot → credential type` for every slot in `results`, captured
     /// structurally while walking (the type is the third path component, known
     /// before the slot string is ever joined).
@@ -612,6 +664,21 @@ pub fn report_secrets(
     report_secrets_with_mode(cfg, bundle, current_gateway_mode()?)
 }
 
+/// [`report_secrets`] with the slot-remap verdict supplied explicitly.
+pub fn report_secrets_with_options(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+    options: ResolveOptions,
+) -> crate::error::Result<ResolveReport> {
+    report_secrets_with_mode_inner(
+        cfg,
+        bundle,
+        current_gateway_mode()?,
+        ConstraintMode::Enforce,
+        options,
+    )
+}
+
 /// [`report_secrets`] that never fails on a *generation constraint*.
 ///
 /// Same signature and return type as [`report_secrets`]; the only difference
@@ -639,6 +706,7 @@ pub fn report_secrets_lenient(
         bundle,
         current_gateway_mode()?,
         ConstraintMode::ReportOnly,
+        ResolveOptions::default(),
     )
 }
 
@@ -648,7 +716,18 @@ pub fn report_secrets_with_mode(
     bundle: &CredentialBundle,
     mode: GatewayMode,
 ) -> crate::error::Result<ResolveReport> {
-    report_secrets_with_mode_inner(cfg, bundle, mode, ConstraintMode::Enforce)
+    report_secrets_with_mode_and_options(cfg, bundle, mode, ResolveOptions::default())
+}
+
+/// [`report_secrets`] with both the gateway mode and the slot-remap verdict
+/// supplied explicitly.
+pub fn report_secrets_with_mode_and_options(
+    cfg: &crate::config::GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
+    options: ResolveOptions,
+) -> crate::error::Result<ResolveReport> {
+    report_secrets_with_mode_inner(cfg, bundle, mode, ConstraintMode::Enforce, options)
 }
 
 fn report_secrets_with_mode_inner(
@@ -656,6 +735,7 @@ fn report_secrets_with_mode_inner(
     bundle: &CredentialBundle,
     mode: GatewayMode,
     constraints: ConstraintMode,
+    options: ResolveOptions,
 ) -> crate::error::Result<ResolveReport> {
     let mut report = ResolveReport::default();
     for consumer in &cfg.consumers {
@@ -687,6 +767,7 @@ fn report_secrets_with_mode_inner(
     // invariant, this catches it before we silently collapse two
     // credentials into one GitHub Env Secret entry.
     detect_slot_collisions(&report)?;
+    enforce_slot_remap_policy(&report, &options)?;
     Ok(report)
 }
 
@@ -723,11 +804,31 @@ pub fn resolve_secrets(
     resolve_secrets_with_mode(cfg, bundle, current_gateway_mode()?)
 }
 
+/// [`resolve_secrets`] with the slot-remap verdict supplied explicitly.
+pub fn resolve_secrets_with_options(
+    cfg: &mut GatewayConfig,
+    bundle: &CredentialBundle,
+    options: ResolveOptions,
+) -> crate::error::Result<ResolveReport> {
+    resolve_secrets_with_mode_and_options(cfg, bundle, current_gateway_mode()?, options)
+}
+
 /// [`resolve_secrets`] with the gateway mode supplied explicitly.
 pub fn resolve_secrets_with_mode(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
     mode: GatewayMode,
+) -> crate::error::Result<ResolveReport> {
+    resolve_secrets_with_mode_and_options(cfg, bundle, mode, ResolveOptions::default())
+}
+
+/// [`resolve_secrets`] with both the gateway mode and the slot-remap verdict
+/// supplied explicitly.
+pub fn resolve_secrets_with_mode_and_options(
+    cfg: &mut GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
+    options: ResolveOptions,
 ) -> crate::error::Result<ResolveReport> {
     let mut report = ResolveReport::default();
 
@@ -759,6 +860,7 @@ pub fn resolve_secrets_with_mode(
     }
 
     detect_slot_collisions(&report)?;
+    enforce_slot_remap_policy(&report, &options)?;
     Ok(report)
 }
 
@@ -879,23 +981,32 @@ fn contains_placeholder(value: &serde_json::Value) -> bool {
     }
 }
 
-/// G3 advisories for one credential **array** node.
+/// Slot-identity findings for one credential **array** node.
 ///
 /// Slot identity is positional (see [`is_elided`]): entry 0 owns the elided
 /// slot, entry 1 owns `[1]`, and so on. Nothing in the entry's own content
-/// participates in the slot name, so:
+/// participates in the slot name, which produces two findings of very
+/// different weight.
 ///
-/// * **Reorder/delete hazard** — deleting the first of two `keyauth` entries
-///   shifts the survivor into index 0 and hands it the deleted entry's stored
-///   value. The credential the operator meant to retire stays live under a new
-///   owner. Warn whenever a brokered array has more than one entry.
-/// * **Orphaned slot** — the bundle still holds a slot for an index the array
-///   no longer has (the array shrank). That value is now unreferenced, and
-///   re-growing the array would silently resurrect it for the new entry.
+/// * **Order is identity** ([`ResolveReport::warnings`], advisory) — a
+///   brokered array with more than one entry is order-sensitive: reordering
+///   it, or prepending to it, re-owns stored values. That hazard is real but
+///   *undetectable from the document*. A reorder leaves the array length, the
+///   bundle keys and every slot status byte-identical to steady state, and a
+///   prepend is indistinguishable from an append. Promoting this to an error
+///   would therefore mean refusing every multi-entry brokered credential
+///   forever, so it stays a warning and the safe operation is named in it.
 ///
-/// Both are warnings, not errors: the bundle is not corrupt, and failing an
-/// apply over a shape that is merely dangerous would block legitimate
-/// shrink-then-rotate workflows.
+/// * **Orphaned slot** ([`ResolveReport::slot_remaps`], fatal by default) —
+///   the bundle still holds a value for an entry index the array no longer
+///   has. This *is* evidence: the array shrank. Either the survivor at the
+///   vacated index inherited a credential the operator meant to retire, or
+///   the value sits unreferenced until a later grow resurrects it for a new
+///   entry. It cannot occur in steady state, so it is refused unless the
+///   caller passes [`SlotRemapPolicy::Allow`].
+///
+/// The orphan scan runs regardless of `brokered`, because an array that lost
+/// its last placeholder is exactly the shrink case.
 fn check_array_slot_identity(
     components: &[SlotComponent<'_>],
     items: &[serde_json::Value],
@@ -919,9 +1030,6 @@ fn check_array_slot_identity(
         );
     }
 
-    // Orphan scan: a bundle slot under this array whose entry index is beyond
-    // the array's current length. Runs regardless of `brokered`, because an
-    // array that lost its last placeholder is exactly the shrink case.
     let scan_prefix = format!("{prefix}/");
     for slot in bundle.keys() {
         let Some(rest) = slot.strip_prefix(&scan_prefix) else {
@@ -929,20 +1037,43 @@ fn check_array_slot_identity(
         };
         let index = entry_index_of_suffix(rest);
         if index >= items.len() {
-            push_warning(
+            push_slot_remap(
                 report,
                 format!(
-                    "credential slot '{slot}' is orphaned: the credential bundle still holds it, \
-                     but array '{prefix}' now has {} entr{} (entry index {index} no longer \
-                     exists). Slot identity is positional, so re-adding an entry at that index \
-                     would resurrect the stale value — rotate the slot instead of relying on the \
-                     array length.",
+                    "credential slot '{slot}' is orphaned: the credential bundle still holds a \
+                     value for it, but array '{prefix}' now has {} entr{} (entry index {index} no \
+                     longer exists). Slot identity is positional, so the entry that shifted into \
+                     a vacated index has inherited a retired credential, and re-growing the array \
+                     would resurrect this value for a new entry. Rotate the slot in place first \
+                     ('gitforgeops rotate --consumer <id> --credential <type>/[{index}]/<key>'), \
+                     then remove the entry — or pass --allow-credential-slot-remap to accept the \
+                     reassignment.",
                     items.len(),
                     if items.len() == 1 { "y" } else { "ies" }
                 ),
             );
         }
     }
+}
+
+/// Turn detected remaps into the resolution verdict.
+///
+/// Called at the end of every walk so `plan`, `apply`, `review`,
+/// `export --materialize` and `rotate` all reach the same conclusion from the
+/// same evidence, rather than each entrypoint re-deriving it.
+fn enforce_slot_remap_policy(
+    report: &ResolveReport,
+    options: &ResolveOptions,
+) -> crate::error::Result<()> {
+    if report.slot_remaps.is_empty() || matches!(options.slot_remap, SlotRemapPolicy::Allow) {
+        return Ok(());
+    }
+    Err(crate::error::Error::CredentialSlotRemap(format!(
+        "Refusing to resolve credentials: {} credential slot(s) would be reassigned by a \
+         credential-array shape change:\n  {}",
+        report.slot_remaps.len(),
+        report.slot_remaps.join("\n  ")
+    )))
 }
 
 /// Entry index a bundle-slot suffix belongs to: `"[2]/key"` → 2, and anything
@@ -965,6 +1096,18 @@ fn push_warning(report: &mut ResolveReport, message: String) {
         eprintln!("Warning: {message}");
     }
     report.warnings.push(message);
+}
+
+/// [`push_warning`] for a proven remap. Deduplicated and echoed the same way,
+/// but recorded where the callers look for something that blocks.
+fn push_slot_remap(report: &mut ResolveReport, message: String) {
+    if report.slot_remaps.contains(&message) {
+        return;
+    }
+    if warn_once(&message) {
+        eprintln!("Credential slot remap: {message}");
+    }
+    report.slot_remaps.push(message);
 }
 
 fn warn_once(message: &str) -> bool {

@@ -108,6 +108,14 @@ pub enum Error {
     #[error("{0}")]
     StaleGatewayView(String),
 
+    /// A brokered credential array shrank while the bundle still stores a
+    /// value for an index the array no longer owns. Slot identity is
+    /// positional, so the stored value has either been handed to whichever
+    /// entry shifted into its index or is waiting to be resurrected by the
+    /// next entry added there. Carries the remediation; never a value.
+    #[error("{0}")]
+    CredentialSlotRemap(String),
+
     #[error("JWT error: {0}")]
     JwtError(String),
 

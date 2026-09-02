@@ -19,6 +19,20 @@ pub struct Cli {
     /// Overrides `FERRUM_ENV` if both are set.
     #[arg(long, global = true)]
     pub env: Option<String>,
+
+    /// Accept a credential-array shape change that reassigns a stored broker
+    /// slot. Credential slot identity is the entry's array index, so shrinking
+    /// a multi-entry credential hands the retired slot's value to whichever
+    /// entry shifts into its index and orphans the rest; without this flag
+    /// that is refused. The safe sequence is to rotate the slot in place first
+    /// (`gitforgeops rotate --credential <type>/[N]/<key>`) and remove the
+    /// entry afterwards.
+    ///
+    /// Global rather than per-subcommand because the refusal comes from
+    /// credential resolution itself, which `plan`, `apply`, `review`,
+    /// `export --materialize` and `rotate` all go through.
+    #[arg(long, global = true)]
+    pub allow_credential_slot_remap: bool,
 }
 
 #[derive(Subcommand)]

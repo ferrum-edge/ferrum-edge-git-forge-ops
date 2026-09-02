@@ -25,6 +25,12 @@ use gitforgeops::validate;
 async fn main() {
     let cli = cli::Cli::parse();
     let explicit_env = cli.env.clone();
+    // `--allow-credential-slot-remap` downgrades the credential-slot-remap
+    // refusal to a report. The reporting commands (`diff`, `plan`, `review`)
+    // always resolve in reporting mode so they can render the hazard
+    // themselves; `plan` then supplies its own non-zero exit.
+    let resolve_options =
+        secrets::ResolveOptions::allowing_slot_remap(cli.allow_credential_slot_remap);
 
     let result = match cli.command {
         cli::Commands::Validate { format } => {
@@ -40,13 +46,16 @@ async fn main() {
                 materialize,
                 encrypt_to.as_deref(),
                 explicit_env.as_deref(),
+                resolve_options,
             )
             .await
         }
         cli::Commands::Diff { exit_on_drift } => {
             cmd_diff(exit_on_drift, explicit_env.as_deref()).await
         }
-        cli::Commands::Plan {} => cmd_plan(explicit_env.as_deref()).await,
+        cli::Commands::Plan {} => {
+            cmd_plan(explicit_env.as_deref(), cli.allow_credential_slot_remap).await
+        }
         cli::Commands::Apply {
             auto_approve,
             allow_large_prune,
@@ -57,6 +66,7 @@ async fn main() {
                 allow_large_prune,
                 confirm_api_spec_deletion,
                 explicit_env.as_deref(),
+                resolve_options,
             )
             .await
         }
@@ -94,6 +104,7 @@ async fn main() {
                 namespace.as_deref(),
                 recipient.as_deref(),
                 explicit_env.as_deref(),
+                resolve_options,
             )
             .await
         }
@@ -213,12 +224,25 @@ fn load_credential_bundles(
 /// (and fail `drift-check.yml --exit-on-drift`). Rotation is now always
 /// explicit via `gitforgeops rotate`, so there's no two-pass allocate-then-
 /// replace dance to preserve.
+///
+/// Credential-slot remaps are *reported* rather than raised here. These
+/// callers exist to render a picture of the repository: aborting mid-walk
+/// would replace a diff, a plan or a PR comment with one error line, and the
+/// hazard would be the only thing the reviewer could not see in context. Each
+/// caller decides what the report means — `plan` exits non-zero, `review`
+/// renders it as blocking, `diff` keeps reporting drift. The refusal itself
+/// belongs to the mutating paths (`apply`, `export --materialize`, `rotate`),
+/// which resolve with the operator's own [`secrets::ResolveOptions`].
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
 ) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
     let (bundle, _) = load_credential_bundles(env_config)?;
-    Ok(secrets::resolve_secrets(cfg, &bundle)?)
+    Ok(secrets::resolve_secrets_with_options(
+        cfg,
+        &bundle,
+        secrets::ResolveOptions::allowing_slot_remap(true),
+    )?)
 }
 
 /// In `exclusive` mode, every resource in `desired` must live in a namespace
@@ -467,6 +491,7 @@ async fn allocate_if_needed(
     report: &secrets::ResolveReport,
     per_shard: &mut BTreeMap<u32, secrets::CredentialBundle>,
     shard_count: &mut u32,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<Option<secrets::AllocateOutcome>, Box<dyn std::error::Error>> {
     if report.needs_allocation().is_empty() {
         return Ok(None);
@@ -521,7 +546,7 @@ async fn allocate_if_needed(
     // (first-apply generate OR first-apply rotate). Already-allocated
     // placeholders were resolved in the initial `resolve_secrets` pass.
     let merged = secrets::merge_bundles(per_shard);
-    let _ = secrets::resolve_secrets(desired, &merged)?;
+    let _ = secrets::resolve_secrets_with_options(desired, &merged, resolve_options)?;
 
     Ok(Some(outcome))
 }
@@ -820,6 +845,7 @@ async fn cmd_export(
     materialize: bool,
     encrypt_to: Option<&str>,
     explicit_env: Option<&str>,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if encrypt_to.is_some() && !materialize {
         return Err(
@@ -854,7 +880,8 @@ async fn cmd_export(
         // classification, since that classification is computed against the
         // PRE-resolve bundle snapshot.
         let (bundle, _) = load_credential_bundles(&env_config)?;
-        let _ = secrets::resolve_secrets(&mut gateway_config, &bundle)?;
+        let _ =
+            secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, resolve_options)?;
         let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
         if !remaining.results.is_empty() {
             return Err(format!(
@@ -1049,7 +1076,10 @@ async fn cmd_diff(
     Ok(())
 }
 
-async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_plan(
+    explicit_env: Option<&str>,
+    allow_credential_slot_remap: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved)?;
     let desired_mesh = assembled.mesh;
@@ -1117,6 +1147,28 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
                 "Unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from the live diff because no secret bundle is available; literal siblings, extra entries, shape changes, and nonsecret fields are still compared.\n"
             );
         }
+    }
+
+    // A shrunk credential array reassigns a stored broker slot. `apply` and
+    // `rotate` refuse it outright; plan prints it here and carries it into the
+    // exit code, so the preview an operator reads matches what apply will do.
+    let remap_blocked = !secret_report.slot_remaps.is_empty() && !allow_credential_slot_remap;
+    if !secret_report.slot_remaps.is_empty() {
+        println!("=== Credential Slot Remaps ===");
+        for remap in &secret_report.slot_remaps {
+            println!("  {remap}");
+        }
+        if remap_blocked {
+            println!(
+                "\n{} slot reassignment(s) block apply. Rotate the affected slot in place before \
+                 removing the entry, or re-run with --allow-credential-slot-remap to accept the \
+                 reassignment.",
+                secret_report.slot_remaps.len()
+            );
+        } else {
+            println!("\nAccepted via --allow-credential-slot-remap.");
+        }
+        println!();
     }
 
     let state = StateFile::load(&resolved.name)?;
@@ -1259,10 +1311,11 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     }
 
     // Plan's exit code is the preview's verdict: nonzero for anything that
-    // would stop `apply`. Schema validation and the error-severity security
-    // audit are both in that set, and both have already been printed in full
-    // above — the exit code carries no information the operator has not seen.
-    if !validation_ok || security_blocked {
+    // would stop `apply`. Schema validation, the error-severity security audit
+    // and an unacknowledged credential-slot remap are all in that set, and all
+    // have already been printed in full above — the exit code carries no
+    // information the operator has not seen.
+    if !validation_ok || security_blocked || remap_blocked {
         process::exit(1);
     }
 
@@ -1274,6 +1327,7 @@ async fn cmd_apply(
     allow_large_prune: bool,
     confirm_api_spec_deletion: bool,
     explicit_env: Option<&str>,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved)?;
@@ -1377,8 +1431,12 @@ async fn cmd_apply(
     let mut shard_count = state.credential_shard_count.max(1);
     let initial_bundle = secrets::merge_bundles(&per_shard);
     let secret_report = match env_config.gateway_mode {
-        GatewayMode::File => secrets::report_secrets(&desired, &initial_bundle)?,
-        GatewayMode::Api => secrets::resolve_secrets(&mut desired, &initial_bundle)?,
+        GatewayMode::File => {
+            secrets::report_secrets_with_options(&desired, &initial_bundle, resolve_options)?
+        }
+        GatewayMode::Api => {
+            secrets::resolve_secrets_with_options(&mut desired, &initial_bundle, resolve_options)?
+        }
     };
 
     // Missing required credentials → fail fast before we touch the gateway.
@@ -1722,6 +1780,7 @@ async fn cmd_apply(
                 &secret_report,
                 &mut per_shard,
                 &mut shard_count,
+                resolve_options,
             )
             .await?;
 
@@ -1890,6 +1949,7 @@ async fn cmd_apply(
                 &secret_report,
                 &mut per_shard,
                 &mut shard_count,
+                resolve_options,
             )
             .await?;
 
@@ -2270,6 +2330,7 @@ async fn cmd_rotate(
     namespace: Option<&str>,
     recipient: Option<&str>,
     explicit_env: Option<&str>,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
@@ -2374,7 +2435,7 @@ async fn cmd_rotate(
         let mut shim_bundle = current_bundle.clone();
         shim_bundle.insert(slot.clone(), "__rotate-preflight-shim__".to_string());
         single.consumers.push(c.clone());
-        let _ = secrets::resolve_secrets(&mut single, &shim_bundle)?;
+        let _ = secrets::resolve_secrets_with_options(&mut single, &shim_bundle, resolve_options)?;
         c = single.consumers.remove(0);
         let mut remaining_cfg = gitforgeops::config::GatewayConfig::default();
         remaining_cfg.consumers.push(c);

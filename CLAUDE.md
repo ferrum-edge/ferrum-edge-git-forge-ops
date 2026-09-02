@@ -15,12 +15,21 @@ All commands accept `--env <name>` to select an environment declared in
 is also unset and the repo config has one entry or a `default_environment`,
 that is used.
 
+They also accept `--allow-credential-slot-remap`, which downgrades the
+credential-array slot-remap refusal to a report (see Credential broker). It is
+CLI-only on purpose — no env var — because accepting a credential reassignment
+is a per-run decision, not a repository setting. The safe alternative is
+slot-addressed rotation: `gitforgeops rotate --credential <type>/[N]/<key>`
+first, remove the entry second.
+
 ```bash
 gitforgeops validate [--format text|json|github|github-annotations] # Assemble + shell to `ferrum-edge validate`
 gitforgeops export [--output PATH]                        # Emit flat YAML (placeholders preserved) + mesh doc
 gitforgeops export --materialize [--encrypt-to GH_LOGIN]  # Resolve creds; age-encrypt output (file mode stage 2)
 gitforgeops diff [--exit-on-drift]                        # Compare desired vs live gateway (/backup)
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
+                                                          # Exits 1 on validation failure, an error-severity security
+                                                          # finding, or an unacknowledged credential-slot remap
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH [--output-dir DIR] \
@@ -241,6 +250,28 @@ writes an unusable value: `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥
 entropy bytes); `basicauth` generation is refused in file mode and
 `basicauth/…/password_hash` in either mode (the hash is HMAC-SHA256 under the
 gateway's own secret); a bundle value of `[REDACTED]` is refused.
+
+Slot identity is positional, and `resolver::check_array_slot_identity` splits
+the two consequences by whether evidence exists:
+
+- Multi-entry brokered array → `ResolveReport::warnings`, advisory. A reorder
+  or prepend re-owns stored values but leaves the document, the bundle keys and
+  every slot status identical to steady state, so refusing here would refuse
+  every multi-entry credential forever.
+- Bundle holds a slot at an entry index the array no longer has (a shrink) →
+  `ResolveReport::slot_remaps`, and resolution returns
+  `Error::CredentialSlotRemap`. This cannot fire in steady state. `apply`,
+  `export --materialize` and `rotate` refuse; `plan` and `review` resolve with
+  `SlotRemapPolicy::Allow` so they can render it (plan then exits 1 itself).
+  `--allow-credential-slot-remap` downgrades the refusal for the documented
+  shrink-then-rotate sequence. Messages name slots only, never values.
+
+Literal (non-placeholder) consumer credentials are an apply blocker too:
+`cmd_apply` runs `diff::audit_security_with_policy` on the **unresolved**
+document before the state lock, the bundle read, and any gateway call, health
+preflight, allocation or file publish, and refuses every finding
+`diff::security_blockers` returns. The escape hatch is the policy override (PR
+label + repo permission), resolved once and shared by both gates.
 
 Storage: one or more GitHub Environment Secrets named `FERRUM_CREDS_BUNDLE[_N]`,
 each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
