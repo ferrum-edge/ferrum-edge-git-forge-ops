@@ -219,6 +219,14 @@ pub fn order_diffs(mut diffs: Vec<ResourceDiff>) -> Vec<ResourceDiff> {
 struct PreparedApply {
     actuals: BTreeMap<String, GatewayConfig>,
     full_replaces: BTreeMap<String, PreparedFullReplace>,
+    /// Namespaces that cannot be reconciled this run, keyed to the reason.
+    ///
+    /// A repository declaration colliding with an API-spec-owned row is a
+    /// property of *that* namespace, not of the gateway or of the run, so it
+    /// stops writes to that namespace only. Every other namespace still
+    /// reconciles, and the reason lands in `ApplyResult::errors` so the run
+    /// exits non-zero with the conflict named.
+    blocked: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -277,6 +285,11 @@ pub async fn apply_api(
     let mut aggregate = ApplyResult::default();
 
     for namespace in namespaces {
+        if let Some(reason) = prepared.blocked.get(namespace) {
+            eprintln!("[{namespace}] {reason}");
+            aggregate.errors.push(format!("[{namespace}] {reason}"));
+            continue;
+        }
         let desired_namespace = crate::config::filter_config_by_namespace(desired, namespace);
         let namespace_result = match options.strategy {
             ApplyStrategy::FullReplace => {
@@ -426,7 +439,10 @@ async fn prepare_apply(
                 "internal error: authoritative backup for namespace `{namespace}` was not prepared"
             ))
         })?;
-        ensure_no_spec_owned_conflicts(&desired_namespace, actual, namespace)?;
+        if let Some(conflict) = spec_owned_conflict_block(&desired_namespace, actual, namespace) {
+            prepared.blocked.insert(namespace.clone(), conflict);
+            continue;
+        }
 
         if matches!(options.strategy, ApplyStrategy::FullReplace) {
             let live_extras = extras.get(namespace).ok_or_else(|| {
@@ -447,13 +463,19 @@ async fn prepare_apply(
 
 /// A repository declaration and a live API-spec-owned row are two writers for
 /// one identity. Skipping the row and exiting green falsely reports a
-/// successful convergence, so every strategy rejects all such conflicts as a
-/// whole-run preflight before unrelated writes can land.
-fn ensure_no_spec_owned_conflicts(
+/// successful convergence, so the namespace is taken out of the run entirely.
+///
+/// The block is namespace-scoped on purpose. The conflict says nothing about
+/// any other namespace's rows, and stopping the whole run turned one team's
+/// mis-declared proxy into an outage for every other team sharing the
+/// environment. `Some(reason)` means "reconcile nothing in this namespace and
+/// report this"; the caller records it as a per-namespace error, so the run
+/// still exits non-zero.
+fn spec_owned_conflict_block(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
     namespace: &str,
-) -> crate::error::Result<()> {
+) -> Option<String> {
     let result = compute_diff_with_options(
         desired,
         actual,
@@ -470,12 +492,12 @@ fn ensure_no_spec_owned_conflicts(
         })
         .collect::<Vec<_>>();
     if conflicts.is_empty() {
-        return Ok(());
+        return None;
     }
-    Err(crate::error::Error::Config(format!(
-        "refusing apply for namespace `{namespace}`: repository declarations conflict with live API-spec-owned resources: {}. Remove the repository declaration or manage the row through the API spec importer",
+    Some(format!(
+        "refusing apply for namespace `{namespace}`: repository declarations conflict with live API-spec-owned resources: {}. Remove the repository declaration or manage the row through the API spec importer. No resource in this namespace was written; other namespaces were reconciled normally",
         conflicts.join(", ")
-    )))
+    ))
 }
 
 /// Errors that make continuing to the next namespace pointless or unsafe.

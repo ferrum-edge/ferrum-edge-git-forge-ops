@@ -1533,7 +1533,11 @@ async fn later_namespace_restore_validation_fails_before_any_namespace_is_mutate
 }
 
 #[tokio::test]
-async fn exact_spec_owned_conflict_blocks_unrelated_incremental_writes() {
+async fn a_spec_owned_conflict_blocks_only_the_conflicting_namespace() {
+    // Two owners writing one row is a correctness problem in *that* namespace.
+    // Stopping every other namespace turned one team's mis-declared proxy into
+    // an outage for everybody sharing the environment, so the block is scoped
+    // and reported as a per-namespace error — the run still exits non-zero.
     let desired_proxy = proxy("shared", "alpha", None);
     let mut spec_proxy = desired_proxy.clone();
     spec_proxy.api_spec_id = Some("spec-a".to_string());
@@ -1552,10 +1556,18 @@ async fn exact_spec_owned_conflict_blocks_unrelated_incremental_writes() {
         ),
         ("beta".to_string(), GatewayConfig::default()),
     ]);
-    let (url, requests) = spawn_recording_gateway(vec![]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /batch".into(),
+            200,
+            r#"{"created":{"upstreams":1}}"#.into(),
+            vec![],
+        ),
+    ]);
     let client = stub_client(url);
 
-    let error = apply_api(
+    let result = apply_api(
         &desired,
         &client,
         &["alpha".to_string(), "beta".to_string()],
@@ -1565,10 +1577,41 @@ async fn exact_spec_owned_conflict_blocks_unrelated_incremental_writes() {
         &ApplyOptions::default(),
     )
     .await
-    .unwrap_err();
+    .expect("the conflict rides on the result as a per-namespace error");
 
-    assert!(error.to_string().contains("API-spec-owned"), "{error}");
-    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].starts_with("[alpha]"),
+        "{:?}",
+        result.errors
+    );
+    assert!(
+        result.errors[0].contains("API-spec-owned"),
+        "{:?}",
+        result.errors
+    );
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+
+    assert_eq!(result.created, 1, "beta still reconciles");
+    assert_eq!(
+        result
+            .applied_incremental
+            .iter()
+            .map(|op| op.namespace.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta"],
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("x-ferrum-namespace: alpha")),
+        "nothing may be written to the conflicting namespace"
+    );
+
+    // ...and the run is still a failure.
+    assert!(result.into_result().is_err());
 }
 
 #[tokio::test]
