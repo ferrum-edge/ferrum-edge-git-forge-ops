@@ -910,9 +910,13 @@ cargo fmt --all -- --check
 
 Rust CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --test unit_tests` on PRs/pushes that touch source, tests, Cargo metadata, the Dockerfile, or the Rust CI workflow. Resource-only PRs run `validate-pr.yml` instead.
 
-The weekly security job also rejects new vulnerabilities, unsound advisories,
-and yanked active dependencies. Any unavoidable exception is exact-version,
-owner-assigned, and time-bounded; see
+The security workflow runs on every pull request, on pushes to `main` that
+touch build inputs, and weekly on a schedule. It rejects new vulnerabilities,
+unsound advisories, and yanked active dependencies, and reports the remaining
+advisory buckets (`unmaintained`, `notice`) as non-blocking annotations. Any
+unavoidable exception is exact-version, owner-assigned, and time-bounded; once
+it expires the security job fails on every run, so the gate warns 21 days
+ahead. See
 [Dependency security policy](docs/dependency-security.md).
 
 ### Publishing your own fork's image
