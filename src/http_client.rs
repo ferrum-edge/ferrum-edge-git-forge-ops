@@ -223,6 +223,7 @@ impl AdminClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
+                    let location = header_string(&resp, "location");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
                     let body = resp
                         .text()
@@ -234,6 +235,7 @@ impl AdminClient {
                             status,
                             body,
                             data_source,
+                            location,
                         });
                     }
 
@@ -251,6 +253,7 @@ impl AdminClient {
                         status,
                         body,
                         data_source,
+                        location,
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
@@ -272,7 +275,12 @@ impl AdminClient {
         if is_success_status(resp.status) {
             return Ok(());
         }
-        Err(map_api_error(resp.status, &resp.body, kind))
+        Err(map_api_error_with_location(
+            resp.status,
+            &resp.body,
+            kind,
+            resp.location.as_deref(),
+        ))
     }
 
     /// [`AdminClient::check`] for config mutations, with one extra step: an
@@ -719,10 +727,11 @@ impl AdminClient {
             return Ok(DeleteOutcome::Deleted);
         }
         Err(self
-            .refine_mutation_error(map_api_error(
+            .refine_mutation_error(map_api_error_with_location(
                 resp.status,
                 &resp.body,
                 RequestKind::Mutation,
+                resp.location.as_deref(),
             ))
             .await)
     }
@@ -745,6 +754,9 @@ struct RawResponse {
     status: u16,
     body: String,
     data_source: Option<String>,
+    /// `Location`, kept only so a 3xx can name where the admin API is
+    /// actually being served from. Redirects are never followed.
+    location: Option<String>,
 }
 
 /// What kind of call is being made, for retry/error classification. `/restore`
@@ -869,8 +881,40 @@ fn is_success_status(status: u16) -> bool {
 
 /// Map a failing response to the most specific error variant available.
 pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error::Error {
+    map_api_error_with_location(status, body, kind, None)
+}
+
+/// [`map_api_error`] with the response's `Location` header, which only the 3xx
+/// arm consults.
+pub fn map_api_error_with_location(
+    status: u16,
+    body: &str,
+    kind: RequestKind,
+    location: Option<&str>,
+) -> crate::error::Error {
     let parsed = ApiErrorBody::parse(body);
     let message = parsed.error.clone().unwrap_or_else(|| body.to_string());
+
+    // The client is built with `redirect::Policy::none()` so a destructive
+    // body is never replayed against a different authority, which means a 3xx
+    // arrives here as a plain failure. Without this arm it read as "API error
+    // (301): " with an empty body, and the actual cause — an admin URL that
+    // has moved, or a load balancer terminating TLS and bouncing http→https —
+    // was invisible. Applies to reads as much as to mutations.
+    if (300..=399).contains(&status) {
+        let destination = match location {
+            Some(location) if !location.trim().is_empty() => {
+                format!("It pointed at `{}`. ", location.trim())
+            }
+            _ => "It carried no usable `Location` header. ".to_string(),
+        };
+        return crate::error::Error::ApiError {
+            status,
+            message: format!(
+                "the gateway answered a redirect (HTTP {status}) instead of a response.                  {destination}gitforgeops never follows redirects on admin calls — a 301/302                  would rewrite a POST into a GET and a 307/308 would replay a destructive body                  against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme,                  host, port and any path prefix) and re-run."
+            ),
+        };
+    }
 
     if status == 403 && is_read_only_refusal(&message) {
         return crate::error::Error::GatewayReadOnly(

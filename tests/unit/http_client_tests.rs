@@ -787,6 +787,15 @@ async fn admin_mutations_reject_redirects_without_following_them() {
         ),
         "{error:?}"
     );
+    // A bare "API error (307)" told the operator nothing. The one thing they
+    // need is where the admin API actually lives.
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("http://{target_addr}/captured")),
+        "the Location must be named: {message}"
+    );
+    assert!(message.contains("FERRUM_GATEWAY_URL"), "{message}");
+    assert!(message.contains("never follows redirects"), "{message}");
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(
         target_rx.try_recv().is_err(),
@@ -898,6 +907,18 @@ fn applied_false_maps_to_committed_not_live() {
         }
         other => panic!("expected CommittedNotLive, got {other:?}"),
     }
+}
+
+#[test]
+fn a_redirect_without_a_location_still_explains_itself() {
+    let error = map_api_error(301, "", RequestKind::Read);
+    let message = error.to_string();
+    assert!(matches!(
+        error,
+        gitforgeops::error::Error::ApiError { status: 301, .. }
+    ));
+    assert!(message.contains("no usable `Location` header"), "{message}");
+    assert!(message.contains("FERRUM_GATEWAY_URL"), "{message}");
 }
 
 #[test]
