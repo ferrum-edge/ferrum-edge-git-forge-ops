@@ -14,7 +14,10 @@ pub use loader::load_resources;
 pub use repo_config::{
     EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
 };
-pub use resolved::{resolve_env, validate_env_name_is_safe_path_component, ResolvedEnv};
+pub use resolved::{
+    resolve_env, validate_env_name_is_safe_path_component, validate_overlay_selection, ResolvedEnv,
+    OVERLAYS_ROOT,
+};
 pub use schema::{GatewayConfig, MeshConfigSpec, Resource};
 
 use std::collections::BTreeSet;

@@ -485,3 +485,95 @@ fn shipped_repo_config_example_satisfies_the_closed_schema() {
     assert_eq!(config.version, 1);
     assert_eq!(config.default_environment.as_deref(), Some("staging"));
 }
+
+/// Every overlay the shipped example selects has to exist in this repository.
+/// The README tells operators to copy that file verbatim; an environment
+/// pointing at a directory nobody shipped fails `validate` / `plan` / `apply`
+/// for that environment, and the `validate-pr` matrix job with it.
+#[test]
+fn every_overlay_named_by_the_shipped_example_is_present_in_the_repository() {
+    let config =
+        RepoConfig::load_from_path(std::path::Path::new(".gitforgeops/config.example.yaml"))
+            .unwrap()
+            .unwrap();
+
+    let overlays = std::path::Path::new(gitforgeops::config::OVERLAYS_ROOT);
+    for name in config.environment_names() {
+        let Some(overlay) = config
+            .environment(&name)
+            .and_then(|env| env.overlay.clone())
+        else {
+            continue;
+        };
+        let directory = overlays.join(&overlay);
+        assert!(
+            directory.is_dir(),
+            "environment '{name}' selects overlay '{overlay}' but {} does not exist",
+            directory.display()
+        );
+    }
+}
+
+#[test]
+fn a_missing_overlay_directory_is_reported_up_front_with_environment_and_source() {
+    use gitforgeops::config::env::EnvConfig;
+    use gitforgeops::config::{resolve_env, validate_overlay_selection};
+
+    let file = write_repo_config(
+        "version: 1\nenvironments:\n  sandbox:\n    overlay: sandbox\ndefault_environment: sandbox\n",
+    );
+    let repo = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+    let env_config = EnvConfig::default();
+    let resolved = resolve_env(Some(&repo), &env_config, Some("sandbox")).unwrap();
+
+    let overlays = tempfile::tempdir().unwrap();
+    let error = validate_overlay_selection(&resolved, Some(&repo), overlays.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("environment 'sandbox'"), "{error}");
+    assert!(error.contains("overlay 'sandbox'"), "{error}");
+    assert!(
+        error.contains(gitforgeops::config::REPO_CONFIG_PATH),
+        "the message must name the file that declared the selection: {error}"
+    );
+    assert!(
+        error.contains(&overlays.path().join("sandbox").display().to_string()),
+        "{error}"
+    );
+
+    // Once the directory exists, the check is silent.
+    std::fs::create_dir_all(overlays.path().join("sandbox")).unwrap();
+    validate_overlay_selection(&resolved, Some(&repo), overlays.path()).unwrap();
+}
+
+#[test]
+fn a_missing_overlay_from_the_env_var_blames_the_env_var_not_the_config_file() {
+    use gitforgeops::config::env::EnvConfig;
+    use gitforgeops::config::{resolve_env, validate_overlay_selection};
+
+    let env_config = EnvConfig {
+        overlay: Some("nope".to_string()),
+        ..EnvConfig::default()
+    };
+    let resolved = resolve_env(None, &env_config, None).unwrap();
+
+    let overlays = tempfile::tempdir().unwrap();
+    let error = validate_overlay_selection(&resolved, None, overlays.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("FERRUM_OVERLAY"), "{error}");
+    assert!(
+        !error.contains(gitforgeops::config::REPO_CONFIG_PATH),
+        "no repo config declared this overlay: {error}"
+    );
+}
+
+#[test]
+fn an_environment_without_an_overlay_is_never_checked() {
+    use gitforgeops::config::env::EnvConfig;
+    use gitforgeops::config::{resolve_env, validate_overlay_selection};
+
+    let resolved = resolve_env(None, &EnvConfig::default(), None).unwrap();
+    assert!(resolved.overlay.is_none());
+    validate_overlay_selection(&resolved, None, std::path::Path::new("/nonexistent")).unwrap();
+}

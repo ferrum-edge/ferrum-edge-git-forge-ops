@@ -125,6 +125,15 @@ fn resolve_runtime(
     let env_config = config::load_env_config()?;
     let repo = load_repo_config()?;
     let resolved = resolve_env(repo.as_ref(), &env_config, explicit_env)?;
+    // Up front, before any resource file is read: a configured overlay that is
+    // not in the tree is a repository mistake, and the error should name the
+    // environment and the file that selected it rather than surfacing from the
+    // middle of the assembly pipeline.
+    config::validate_overlay_selection(
+        &resolved,
+        repo.as_ref(),
+        &PathBuf::from(config::OVERLAYS_ROOT),
+    )?;
     Ok((env_config, resolved, repo))
 }
 
