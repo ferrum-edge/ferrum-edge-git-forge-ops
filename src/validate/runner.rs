@@ -156,12 +156,20 @@ fn private_temp_file(
 /// diagnostic is a live value. Only those exact byte sequences are replaced
 /// with `[REDACTED]`; every other diagnostic — the proxy typo that actually
 /// failed the run — is returned intact.
+///
+/// Credential leaves that are *still* placeholders (no bundle loaded, as on a
+/// fork PR) are replaced with [`crate::validate::validation_standin`] values
+/// in the temp spec only, so shape checks such as ferrum-edge's 32-character
+/// `jwt`/`hmac_auth` floor grade the repo's structure instead of failing on
+/// the 30-character placeholder literal.
 pub fn run_validation(
     config: &GatewayConfig,
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config(config);
-    let yaml = serde_yaml::to_string(config)?;
+    // Stand-ins are fabricated here and go no further than `spec_file` below.
+    let standins = crate::validate::standin::with_validation_standins(config);
+    let yaml = serde_yaml::to_string(standins.as_ref().unwrap_or(config))?;
     run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, &scrubber)
 }
 

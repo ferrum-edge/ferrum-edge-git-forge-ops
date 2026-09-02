@@ -91,6 +91,27 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               mesh doc → FERRUM_MESH_FILE_OUTPUT_PATH)
 ```
 
+Two things happen at the `validate` hand-off that exist nowhere else in the
+pipeline, both because resolution has already run by then:
+
+- `validate::with_validation_standins` replaces credential leaves that are
+  *still* `${gh-env-secret:…}` placeholders with a deterministic fake
+  (`gitforgeops-validation-standin-<64 hex>`, or `hmac_sha256:<64 hex>` for a
+  `basicauth` `password_hash`) derived from the slot path. `${gh-env-secret:alloc=generate}`
+  is 30 characters and ferrum-edge's floor for `jwt`/`hmac_auth` is 32, so a
+  bundle-less fork PR would otherwise fail on the placeholder rather than on
+  the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
+  no other output path ever sees a stand-in.
+- `secrets::SecretScrubber` collects every non-placeholder Consumer credential
+  leaf (minus the identity fields `basicauth[].username` /
+  `mtls_auth[].identity`) and every `sensitive_string_paths` plugin-config
+  leaf, and removes those exact byte sequences — plus their base64 and
+  percent-encoded forms — from the validator child's stdout/stderr, replacing
+  each with `[REDACTED]`. Non-credential diagnostics stay intact. Blanket
+  suppression survives only as a fallback for a secret shorter than
+  `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced without
+  mangling the report.
+
 ### Gateway Modes
 
 - **api** — push to admin REST (POST creates, PUT updates, DELETE removes, POST `/batch` for pure-add namespaces, or POST `/restore` for full-replace)
@@ -273,9 +294,9 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (yaml + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
-- `src/secrets/` — `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
+- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
-- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
+- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, and atomically publishes an empty output tree; reports skipped/unsupported sections)
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
