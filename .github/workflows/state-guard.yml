@@ -51,6 +51,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
           set -euo pipefail
           # Read the file list from the API rather than checking out and
@@ -58,29 +59,44 @@ jobs:
           # or sourced, and the answer doesn't depend on merge-base subtleties.
           files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
             --paginate --jq '.[].filename')
+          inspected=$(printf '%s\n' "$files" | grep -c . || true)
           # `grep -c` exits 1 on no match, which `set -e` would treat as fatal.
           count=$(printf '%s\n' "$files" | grep -c '^\.state/' || true)
           count=${count:-0}
+          blocked=false
+          if [ "$inspected" -ne "$EXPECTED_FILES" ]; then
+            # GitHub caps this endpoint at 3,000 files. Never treat a partial
+            # response as proof that the omitted files do not touch .state/.
+            blocked=true
+            echo "::error::Inspected ${inspected} of ${EXPECTED_FILES} changed files; refusing to approve an incomplete file list."
+          elif [ "$count" -ne 0 ]; then
+            blocked=true
+          fi
           echo "count=${count}" >> "$GITHUB_OUTPUT"
-          if [ "$count" -eq 0 ]; then
+          echo "blocked=${blocked}" >> "$GITHUB_OUTPUT"
+          if [ "$blocked" = false ]; then
             echo "No .state/ changes in this PR."
-          else
+          elif [ "$count" -ne 0 ]; then
             echo "This PR changes ${count} file(s) under .state/:"
             printf '%s\n' "$files" | grep '^\.state/' | sed 's/^/  /'
           fi
 
       - name: Reject PR-authored state changes
-        if: ${{ steps.detect.outputs.count != '0' && !contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
+        if: ${{ steps.detect.outputs.blocked == 'true' && !contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
         run: |
-          echo "::error::This PR modifies .state/, the CI-owned ownership ledger."
+          echo "::error::This PR may modify .state/, the CI-owned ownership ledger."
           cat >> "$GITHUB_STEP_SUMMARY" <<'MSG'
-          ## Blocked: PR modifies `.state/`
+          ## Blocked: PR may modify `.state/`
 
           `.state/<env>.json` records which gateway resources this repo has
           applied. In `shared` ownership mode it is the only thing standing
           between a live resource and a delete, so a hand-edited state file can
           cause the next post-merge apply to remove resources the repo never
           managed.
+
+          The guard also fails closed when GitHub's changed-files API returns
+          fewer files than the PR reports, because an omitted file could be a
+          `.state/` edit.
 
           It is maintained by CI: `apply-on-merge.yml` and `rotate.yml` commit
           it as `gitforgeops[bot]` after a successful run. Drop the `.state/`
@@ -93,6 +109,6 @@ jobs:
           exit 1
 
       - name: Record override
-        if: ${{ steps.detect.outputs.count != '0' && contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
+        if: ${{ steps.detect.outputs.blocked == 'true' && contains(github.event.pull_request.labels.*.name, 'gitforgeops/state-override') }}
         run: |
           echo "::warning::.state/ changes accepted via gitforgeops/state-override label."
