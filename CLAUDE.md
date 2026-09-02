@@ -23,8 +23,8 @@ gitforgeops diff [--exit-on-drift]                        # Compare desired vs l
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR] \
-  [--credential-bundle-output PRIVATE_PATH]               # API import requires an explicit namespace filter
+gitforgeops import --from-api | --from-file PATH --output-dir DIR \
+  [--credential-bundle-output PRIVATE_PATH]               # --output-dir required + must be empty; API import requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver

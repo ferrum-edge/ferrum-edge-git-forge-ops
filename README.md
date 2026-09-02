@@ -773,7 +773,7 @@ gitforgeops diff [--exit-on-drift]
 gitforgeops plan
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
 gitforgeops export [--output PATH] [--materialize] [--encrypt-to GH_LOGIN]
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR] \
+gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--credential-bundle-output PRIVATE_PATH]
 gitforgeops review [--pr N] [--require-live]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
@@ -784,6 +784,7 @@ gitforgeops rotate --consumer ID --credential KEY \
 Notes:
 
 - `--from-api` is a flag, not a value: `gitforgeops import --from-api`. It conflicts with `--from-file`.
+- `--output-dir` is required and has no default. `import` refuses a destination that is not empty, and this repo ships `_example.yaml` files under `resources/`, so importing straight into `resources/` can only fail. See [Adopting an existing gateway](#adopting-an-existing-gateway).
 - `--format github` is an alias for `github-annotations`.
 - **Validator diagnostics are redacted, not withheld.** `validate` / `plan` / `apply` resolve credentials before shelling out, so `ferrum-edge validate` quotes live secrets back in its errors. gitforgeops removes exactly those byte sequences — every resolved or literal Consumer credential leaf and every sensitivity-classified plugin-config leaf, plus their standard base64 and percent-encoded forms — replacing each with `[REDACTED]`. Everything else the validator said stays visible, so a proxy typo still reports as a proxy typo on a bundle-loaded apply. `basicauth[].username` and `mtls_auth[].identity` are identities rather than secrets and are left readable. Credentials shorter than 8 bytes cannot be substring-replaced without corrupting the surrounding diagnostic; if one of those is echoed back, the whole stream is withheld instead. That is the only remaining case where diagnostics are suppressed.
 - **Unresolved placeholders are validated through stand-ins.** A run with no credential bundle (any fork PR) would otherwise hand `${gh-env-secret:alloc=generate}` — 30 characters — to a validator that requires `jwt` and `hmac_auth` secrets to be at least 32. Instead the temp spec gets a deterministic, obviously fake `gitforgeops-validation-standin-<64 hex>` derived from the credential's slot path (and `hmac_sha256:<64 hex>` for a `basicauth` `password_hash`), so CI grades the repository's structure rather than the placeholder literal. Stand-ins exist only inside the 0600 file handed to `ferrum-edge validate`: they are never exported, applied, delivered, or written to state, and `export --materialize` still refuses to run while any slot is unresolved.
@@ -796,6 +797,97 @@ Notes:
 - Backups contain unredacted consumer credentials and raw plugin configuration. Import replaces every string credential leaf—including custom credential types—and every schema- or heuristic-classified sensitive plugin-config string with `${gh-env-secret:alloc=require}` before staging any resource file. `basicauth[].username` and `mtls_auth[].identity` are the exception: they are the public halves of their credentials, cannot be generated, and a resource file that cannot say which login or certificate it means is worse than useless, so they are kept verbatim. For a plugin this build does not recognize there is no schema to classify by, so only the key/URL heuristics run; everything they do not flag stays in the imported file and is named in a loud per-plugin review notice at the end of the run, because brokering `mode: strict` would replace it with a placeholder nobody can seed. When any live secret is present, `--credential-bundle-output PRIVATE_PATH` is mandatory. It atomically writes the exact live values under their canonical broker slots, shards them into `FERRUM_CREDS_BUNDLE*` objects under the same 40 KiB policy as allocation, forces mode 0600 on Unix, and refuses any path inside the resource tree or another Git worktree. The migration bundle is published before the redacted tree, so a later publication failure cannot discard the only captured copy.
 - Treat both the source backup and migration bundle as plaintext secrets. To verify locally without copying values into an environment variable, set `FERRUM_CREDS_JSON_FILE=/secure/path/migration.json` and run `gitforgeops plan`. To seed GitHub, set each top-level `FERRUM_CREDS_BUNDLE*` object as the JSON value of the same-named GitHub Environment Secret (for example, `jq -c '.FERRUM_CREDS_BUNDLE' migration.json | gh secret set FERRUM_CREDS_BUNDLE --env production`). Confirm the redacted config resolves without drift, then securely remove the local artifacts according to your storage policy.
 - `import` writes per-resource YAML for the four gateway kinds only; API specs and gateway trust bundles present in the source backup are reported as skipped rather than silently dropped, because they are managed through `/api-specs` and `/gateway-trust-bundles`, not through this repo. Unknown future top-level backup sections are also named explicitly. Present `counts` / `resource_counts` objects are validated against the decoded document before publication so a truncated-but-parseable backup cannot become an incomplete desired tree. That enforcement is scoped to `import`, which turns a document into permanent repository state: on live reads (`diff`, `plan`, `apply`, drift-check) a seal that disagrees is printed as a warning and discarded, so a gateway that omits `counts.upstreams` or a cached export that elides `api_specs` cannot take down every command over metadata no decision is made from.
+
+## Adopting an existing gateway
+
+`import` turns a running gateway (or a flat backup file) into a resource tree.
+It is a one-time migration, and it never writes a live credential byte into the
+tree: every secret is replaced with `${gh-env-secret:alloc=require}` and the
+real values go to a separate private bundle. The steps below assume an
+api-mode gateway; substitute `--from-file backup.yaml` for step 2 to adopt an
+exported document instead.
+
+**1. Import into an empty scratch directory, not into `resources/`.**
+`--output-dir` is required and the destination must be empty — the tree is
+staged and published as one directory rename, so a failure halfway through
+leaves nothing behind to clean up. `resources/` already contains this repo's
+`_example.yaml` files, so it is never a valid destination.
+
+```bash
+mkdir -p /secure/scratch
+export FERRUM_GATEWAY_URL=https://gateway.internal:8081
+export FERRUM_ADMIN_JWT_SECRET=...            # >= 32 chars, matches the gateway
+export FERRUM_NAMESPACE=ferrum                # one namespace per run, required
+
+gitforgeops import --from-api \
+  --output-dir /secure/scratch/ferrum \
+  --credential-bundle-output /secure/scratch/migration.json
+```
+
+`--credential-bundle-output` is mandatory whenever the source contains any live
+secret. It is written mode 0600, must live outside the resource tree and every
+Git worktree, and is published *before* the redacted tree so a later failure
+cannot destroy the only captured copy. Treat both the backup and this file as
+plaintext secrets.
+
+**2. Read what the import reported.** Three things end up on screen and matter:
+
+- Skipped sections — API specs and gateway trust bundles are managed through
+  `/api-specs` and `/gateway-trust-bundles`, not this repo, and spec-owned
+  resources (`api_spec_id` set) are deliberately not adopted.
+- The count of redacted credential and plugin-config values. Each one is a slot
+  you must seed before the first apply.
+- The custom-plugin review warning, if any. For a plugin this build does not
+  recognize there is no schema to classify config by, so only the key/URL
+  heuristics ran; the warning names every string leaf they did not flag. Read
+  them, and move any that is actually a credential into the broker by hand.
+
+**3. Review the tree, then move it into place.** The scratch directory holds
+`<namespace>/{proxies,consumers,upstreams,plugins}/*.yaml` plus
+`.gitforgeops-import.json` at its root — a deterministic, machine-readable
+inventory of source and version metadata, validated count seals, written and
+skipped totals, namespaces, and unsupported sections. It contains no resource
+bodies and no credential-derived values, and it is safe (and useful) to commit
+alongside the resources.
+
+```bash
+git checkout -b feature/adopt-ferrum-namespace
+cp -R /secure/scratch/ferrum resources/ferrum
+cp /secure/scratch/ferrum/.gitforgeops-import.json resources/ferrum/
+git add resources/ferrum
+```
+
+**4. Seed the credential bundle before applying.** The migration bundle is
+already sharded into `FERRUM_CREDS_BUNDLE*` objects under the same 40 KiB
+policy allocation uses, so each top-level key becomes a GitHub Environment
+Secret of the same name in the environment that owns this gateway:
+
+```bash
+for shard in $(jq -r 'keys[]' /secure/scratch/migration.json); do
+  jq -c --arg s "$shard" '.[$s]' /secure/scratch/migration.json \
+    | gh secret set "$shard" --env production
+done
+```
+
+**5. Verify locally, then apply.** Point the CLI at the bundle by *path* rather
+than pasting it into an environment variable, and confirm the redacted tree
+resolves to no drift:
+
+```bash
+FERRUM_CREDS_JSON_FILE=/secure/scratch/migration.json gitforgeops plan --env production
+```
+
+A clean plan means every placeholder resolved and the desired tree matches the
+live gateway. Open the PR; the post-merge apply workflow reads the same secrets
+from the GitHub Environment. Once that apply succeeds, securely delete
+`/secure/scratch` — the backup and the migration bundle both — according to
+your storage policy.
+
+**Note on ownership.** A freshly adopted namespace starts in `shared` mode with
+an empty state file, so the first `diff` reports every live resource as
+*unmanaged* until the first apply records them. That is expected; do not switch
+to `exclusive` (or `full_replace`) until the tree has applied cleanly at least
+once.
 
 ## PR review output
 
