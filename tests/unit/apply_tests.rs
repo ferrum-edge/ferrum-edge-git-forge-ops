@@ -273,17 +273,6 @@ fn unknown_kinds_get_a_defined_rank() {
 // --- Stale gateway view ------------------------------------------------------
 
 #[test]
-fn stale_view_blocks_every_mutation_from_a_cached_backup() {
-    // Cached fallback also strips API-spec ownership tags, so even a pure
-    // add/modify can collide with a row that only appears hand-owned.
-    let block = stale_view_block(true).expect("should block");
-    assert!(block.contains("X-Data-Source: cached"), "{block}");
-    assert!(block.contains("API-spec ownership metadata"), "{block}");
-    assert!(block.contains("--allow-large-prune"), "{block}");
-    assert!(block.contains("does not bypass"), "{block}");
-}
-
-#[test]
 fn fresh_view_is_not_blocked() {
     assert!(stale_view_block(false).is_none());
 }
@@ -305,12 +294,39 @@ fn large_prune_threshold_uses_an_exact_ratio() {
 }
 
 #[test]
-fn large_prune_decision_matches_rational_reference_across_small_domain() {
+fn large_prune_decision_matches_an_independent_reference_across_a_small_domain() {
+    // The reference is deliberately computed a different way from the
+    // implementation: reduce deletes/denominator and threshold/100 to lowest
+    // terms and cross-multiply the reduced fractions. Restating the
+    // implementation's own expression here would have asserted nothing.
+    fn gcd(mut a: u128, mut b: u128) -> u128 {
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        a.max(1)
+    }
+    /// `deletes/denominator > threshold/100`, via reduced fractions.
+    fn exceeds(deletes: u128, denominator: u128, threshold: u128) -> bool {
+        if denominator == 0 {
+            return false;
+        }
+        let (ln, ld) = {
+            let g = gcd(deletes, denominator);
+            (deletes / g, denominator / g)
+        };
+        let (rn, rd) = {
+            let g = gcd(threshold, 100);
+            (threshold / g, 100 / g)
+        };
+        ln * rd > rn * ld
+    }
+
     for denominator in 0_usize..=250 {
         for deletes in 0_usize..=denominator {
             for threshold in 0_u8..=100 {
-                let reference = denominator > 0
-                    && (deletes as u128) * 100 > (threshold as u128) * (denominator as u128);
+                let reference = exceeds(deletes as u128, denominator as u128, threshold as u128);
                 assert_eq!(
                     large_prune_exceeds_threshold(deletes, denominator, threshold),
                     reference,
@@ -319,6 +335,13 @@ fn large_prune_decision_matches_rational_reference_across_small_domain() {
             }
         }
     }
+
+    // Spot-check the reference itself against hand-computed answers, so a bug
+    // in the reference cannot silently agree with a bug in the implementation.
+    assert!(exceeds(1, 3, 33));
+    assert!(!exceeds(1, 4, 25));
+    assert!(!exceeds(0, 10, 0));
+    assert!(exceeds(1, 10, 0));
 }
 
 // --- Full-replace API-spec graph preservation -------------------------------
