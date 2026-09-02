@@ -121,6 +121,29 @@ impl AllowedBackendDomainsRule {
         (valid, invalid)
     }
 
+    /// The nonblank dial destinations pinned by a `dns_override` value, or
+    /// `None` when the field is unset, blank, or lists only blank segments.
+    fn dns_override_pins(value: Option<&str>) -> Option<Vec<&str>> {
+        let pins: Vec<&str> = value?
+            .split(',')
+            .map(str::trim)
+            .filter(|destination| !destination.is_empty())
+            .collect();
+        if pins.is_empty() {
+            None
+        } else {
+            Some(pins)
+        }
+    }
+
+    fn quoted(destinations: &[&str]) -> String {
+        destinations
+            .iter()
+            .map(|destination| format!("'{destination}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn url_destination_host(address: &str) -> Option<String> {
         let parsed = reqwest::Url::parse(address).ok()?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -260,12 +283,46 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 overridden_by: None,
             });
         }
-        let allowed_dns_override_addresses =
+        // A DNS pin is a dial address, not a name to resolve, so it must be an
+        // exact IP literal in both modes. Without a dedicated list the rule
+        // falls back to the IP-literal entries of `allowed_domains` (plus an
+        // explicit `*` catch-all); DNS-name entries never authorize a pin.
+        let allowed_dns_override_addresses: Vec<String> =
             if self.config.allowed_dns_override_addresses.is_empty() {
-                &allowed_domains
+                allowed_domains
+                    .iter()
+                    .filter(|entry| {
+                        entry.as_str() == "*" || Self::parse_ip_literal(entry).is_some()
+                    })
+                    .cloned()
+                    .collect()
             } else {
-                &configured_dns_override_addresses
+                configured_dns_override_addresses
             };
+        let declares_dns_override_pin = cfg
+            .proxies
+            .iter()
+            .any(|proxy| Self::dns_override_pins(proxy.dns_override.as_deref()).is_some());
+        if declares_dns_override_pin
+            && self.config.allowed_dns_override_addresses.is_empty()
+            && allowed_dns_override_addresses.is_empty()
+        {
+            findings.push(PolicyFinding {
+                rule_id: self.rule_id().to_string(),
+                severity: crate::policy::Severity::Error,
+                kind: "PolicyConfig".to_string(),
+                id: self.rule_id().to_string(),
+                namespace: "global".to_string(),
+                message:
+                    "dns_override pins are declared but allowed_dns_override_addresses is empty and allowed_domains has no IP literal entry, so every pin is rejected"
+                        .to_string(),
+                remediation: Some(
+                    "Add each exact DNS-pin IP to allowed_dns_override_addresses"
+                        .to_string(),
+                ),
+                overridden_by: None,
+            });
+        }
 
         let mut upstream_key_counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         for upstream in &cfg.upstreams {
@@ -504,20 +561,34 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                 });
             }
 
-            if let Some(dns_override) = proxy
-                .dns_override
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                let disallowed: Vec<&str> = dns_override
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|destination| !destination.is_empty())
-                    .filter(|destination| {
-                        !Self::is_allowed(destination, allowed_dns_override_addresses)
-                    })
-                    .collect();
+            if let Some(pins) = Self::dns_override_pins(proxy.dns_override.as_deref()) {
+                let mut not_ip_literals = Vec::new();
+                let mut disallowed = Vec::new();
+                for destination in pins {
+                    if Self::parse_ip_literal(&Self::normalize_domain(destination)).is_none() {
+                        not_ip_literals.push(destination);
+                    } else if !Self::is_allowed(destination, &allowed_dns_override_addresses) {
+                        disallowed.push(destination);
+                    }
+                }
+                if !not_ip_literals.is_empty() {
+                    findings.push(PolicyFinding {
+                        rule_id: self.rule_id().to_string(),
+                        severity: self.config.severity,
+                        kind: "Proxy".to_string(),
+                        id: proxy.id.clone(),
+                        namespace: proxy.namespace.clone(),
+                        message: format!(
+                            "dns_override contains dial destination(s) that are not IP literals: {}",
+                            Self::quoted(&not_ip_literals)
+                        ),
+                        remediation: Some(
+                            "Pin dns_override to exact IPv4 or IPv6 literals; a name still resolves at runtime and cannot be checked here"
+                                .to_string(),
+                        ),
+                        overridden_by: None,
+                    });
+                }
                 if !disallowed.is_empty() {
                     findings.push(PolicyFinding {
                         rule_id: self.rule_id().to_string(),
@@ -527,11 +598,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                         namespace: proxy.namespace.clone(),
                         message: format!(
                             "dns_override contains effective dial destination(s) outside the configured DNS override list: {}",
-                            disallowed
-                                .iter()
-                                .map(|destination| format!("'{destination}'"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            Self::quoted(&disallowed)
                         ),
                         remediation: Some(
                             "Remove the disallowed dns_override destinations or add each exact IP to allowed_dns_override_addresses"
@@ -554,6 +621,11 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                     .as_deref()
                     .is_none_or(|host| !Self::is_allowed(host, allowed_control_plane_addresses))
                 {
+                    // `consul.address` accepts `https://user:password@host`, and
+                    // this finding is printed to PR comments, step summaries and
+                    // logs. Report only the parsed destination host so userinfo
+                    // credentials never leave the process.
+                    let reported_host = consul_host.as_deref().unwrap_or("<unparseable>");
                     findings.push(PolicyFinding {
                         rule_id: self.rule_id().to_string(),
                         severity: self.config.severity,
@@ -561,8 +633,7 @@ impl PolicyCheck for AllowedBackendDomainsRule {
                         id: upstream.id.clone(),
                         namespace: upstream.namespace.clone(),
                         message: format!(
-                            "Consul discovery address='{}' has an invalid or disallowed control-plane destination ({allowed_control_planes})",
-                            consul.address
+                            "Consul discovery address host='{reported_host}' is an invalid or disallowed control-plane destination ({allowed_control_planes})"
                         ),
                         remediation: Some(format!(
                             "Use an http(s) Consul address whose host matches one of these control-plane addresses: {allowed_control_planes}"

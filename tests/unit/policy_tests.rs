@@ -992,11 +992,17 @@ fn allowed_backend_domains_checks_dns_override_as_a_dial_destination() {
         ..Default::default()
     };
 
+    // The allowlist carries no IP literal, so the pin is rejected and the
+    // unusable fallback is reported as its own configuration finding.
     let findings = evaluate_policies(&cfg, &policies);
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].kind, "Proxy");
-    assert_eq!(findings[0].id, "pinned-backend");
-    assert!(findings[0].message.contains("'203.0.113.10'"));
+    assert_eq!(findings.len(), 2, "{findings:#?}");
+    assert_eq!(findings[0].kind, "PolicyConfig");
+    assert!(findings[0]
+        .message
+        .contains("allowed_domains has no IP literal entry"));
+    assert_eq!(findings[1].kind, "Proxy");
+    assert_eq!(findings[1].id, "pinned-backend");
+    assert!(findings[1].message.contains("'203.0.113.10'"));
 }
 
 #[test]
@@ -1237,7 +1243,9 @@ fn allowed_backend_domains_reports_malformed_entries_in_a_mixed_allowlist() {
 fn allowed_backend_domains_checks_each_comma_separated_dns_override() {
     let mut p = proxy("resolver-list", BackendScheme::Https, 30_000, true);
     p.backend_host = "api.svc.cluster.local".to_string();
-    p.dns_override = Some("10.0.0.1,10.0.0.2".to_string());
+    // The disallowed pin is last, so a rule that only checked the first
+    // segment would report nothing.
+    p.dns_override = Some("10.0.0.1,10.0.0.2,203.0.113.9".to_string());
     let cfg = GatewayConfig {
         proxies: vec![p],
         ..Default::default()
@@ -1259,7 +1267,12 @@ fn allowed_backend_domains_checks_each_comma_separated_dns_override() {
         ..Default::default()
     };
 
-    assert!(evaluate_policies(&cfg, &policies).is_empty());
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].id, "resolver-list");
+    assert!(findings[0].message.contains("'203.0.113.9'"));
+    assert!(!findings[0].message.contains("'10.0.0.1'"));
+    assert!(!findings[0].message.contains("'10.0.0.2'"));
 }
 
 #[test]
@@ -1379,6 +1392,323 @@ fn malformed_dns_override_allowances_are_blocking_configuration_errors() {
     assert!(findings[1].message.contains("dns_override"));
 }
 
+fn dns_override_policies(
+    allowed_domains: Vec<String>,
+    allowed_dns_override_addresses: Vec<String>,
+) -> PolicyConfig {
+    PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains,
+                allowed_dns_override_addresses,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn dns_override_pins_must_be_ip_literals_with_a_dedicated_allowlist() {
+    let mut p = proxy("name-pin", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("resolver.svc.cluster.local".to_string());
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = dns_override_policies(
+        vec!["*.svc.cluster.local".to_string()],
+        vec!["10.0.0.1".to_string()],
+    );
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].kind, "Proxy");
+    assert_eq!(findings[0].id, "name-pin");
+    assert!(findings[0].message.contains("not IP literals"));
+    assert!(findings[0].message.contains("'resolver.svc.cluster.local'"));
+}
+
+#[test]
+fn dns_override_pins_must_be_ip_literals_when_falling_back_to_allowed_domains() {
+    // A name pin used to pass here purely because `allowed_domains` listed a
+    // matching DNS suffix, while an IP pin — the only thing a resolver
+    // override can usefully hold — was rejected.
+    let mut p = proxy("name-pin", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("resolver.svc.cluster.local".to_string());
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = dns_override_policies(
+        vec!["*.svc.cluster.local".to_string(), "10.0.0.1".to_string()],
+        vec![],
+    );
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].id, "name-pin");
+    assert!(findings[0].message.contains("not IP literals"));
+}
+
+#[test]
+fn dns_override_fallback_ignores_dns_name_entries_in_allowed_domains() {
+    let mut p = proxy("ip-pin", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("10.0.0.1".to_string());
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        ..Default::default()
+    };
+    let policies = dns_override_policies(
+        vec!["*.svc.cluster.local".to_string(), "10.0.0.2".to_string()],
+        vec![],
+    );
+
+    // `10.0.0.2` is a usable fallback entry, so the fallback is not reported
+    // as unusable — only the pin that misses it.
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].kind, "Proxy");
+    assert!(findings[0].message.contains("'10.0.0.1'"));
+}
+
+#[test]
+fn dns_override_fallback_without_ip_entries_is_a_configuration_finding() {
+    let mut p = proxy("ip-pin", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("10.0.0.1".to_string());
+    let policies = dns_override_policies(vec!["*.svc.cluster.local".to_string()], vec![]);
+
+    let findings = evaluate_policies(
+        &GatewayConfig {
+            proxies: vec![p],
+            ..Default::default()
+        },
+        &policies,
+    );
+    assert_eq!(findings.len(), 2, "{findings:#?}");
+    assert_eq!(findings[0].kind, "PolicyConfig");
+    assert_eq!(findings[0].severity, Severity::Error);
+    assert!(findings[0]
+        .message
+        .contains("allowed_domains has no IP literal entry"));
+    assert!(findings[0]
+        .remediation
+        .as_deref()
+        .unwrap_or_default()
+        .contains("allowed_dns_override_addresses"));
+    assert_eq!(findings[1].kind, "Proxy");
+}
+
+#[test]
+fn dns_override_fallback_stays_silent_without_any_pin() {
+    let mut p = proxy("no-pin", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    let policies = dns_override_policies(vec!["*.svc.cluster.local".to_string()], vec![]);
+
+    assert!(evaluate_policies(
+        &GatewayConfig {
+            proxies: vec![p],
+            ..Default::default()
+        },
+        &policies,
+    )
+    .is_empty());
+}
+
+#[test]
+fn dns_override_fallback_accepts_the_bare_wildcard_catch_all() {
+    let mut p = proxy("catch-all-pin", BackendScheme::Https, 30_000, true);
+    p.backend_host = "api.svc.cluster.local".to_string();
+    p.dns_override = Some("10.0.0.1".to_string());
+    let policies = dns_override_policies(vec!["*".to_string()], vec![]);
+
+    assert!(evaluate_policies(
+        &GatewayConfig {
+            proxies: vec![p],
+            ..Default::default()
+        },
+        &policies,
+    )
+    .is_empty());
+}
+
+#[test]
+fn consul_control_plane_findings_never_print_userinfo_credentials() {
+    const PASSWORD: &str = "sup3r-secret-token";
+    for (address, expected_host) in [
+        (
+            format!("https://svc:{PASSWORD}@attacker.invalid:8501"),
+            "attacker.invalid",
+        ),
+        (
+            format!("ftp://svc:{PASSWORD}@consul.control.internal:8501"),
+            "<unparseable>",
+        ),
+    ] {
+        let mut discovered_upstream = upstream("consul-pool", vec![]);
+        discovered_upstream.service_discovery = Some(consul_service_discovery(&address));
+        let cfg = GatewayConfig {
+            upstreams: vec![discovered_upstream],
+            ..Default::default()
+        };
+        let policies = PolicyConfig {
+            policies: PolicyRules {
+                allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                    enabled: true,
+                    severity: Severity::Error,
+                    allowed_domains: vec!["*.svc.cluster.local".to_string()],
+                    allowed_service_discovery_control_plane_addresses: vec![
+                        "consul.control.internal".to_string(),
+                    ],
+                    allowed_service_discovery_upstreams: vec![UpstreamAllowance {
+                        namespace: "ferrum".to_string(),
+                        id: "consul-pool".to_string(),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let findings = evaluate_policies(&cfg, &policies);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert!(findings[0].message.contains(expected_host), "{findings:#?}");
+        for text in [
+            findings[0].message.as_str(),
+            findings[0].remediation.as_deref().unwrap_or_default(),
+        ] {
+            assert!(!text.contains(PASSWORD), "credential leaked into: {text}");
+            assert!(!text.contains("svc:"), "userinfo leaked into: {text}");
+            assert!(
+                !text.contains(address.as_str()),
+                "raw address leaked into: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shipped_resource_examples_pass_the_backend_allowlist_when_uncommented() {
+    use gitforgeops::config::assembler::assemble;
+    use gitforgeops::config::loader::load_resources;
+    use tempfile::TempDir;
+
+    // What a fork actually does: rename the file and uncomment it. The proxy
+    // example must therefore name a real upstream and must not smuggle a
+    // placeholder backend host alongside `upstream_id`.
+    let uncommented = |path: &str| {
+        let text = std::fs::read_to_string(path).expect("shipped example exists");
+        text.lines()
+            .map(|line| {
+                line.strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line)
+            })
+            .skip_while(|line| !line.starts_with("kind:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let workspace = TempDir::new().unwrap();
+    for kind in ["proxies", "upstreams"] {
+        let dir = workspace.path().join("resources/ferrum").join(kind);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("example.yaml"),
+            uncommented(&format!("resources/ferrum/{kind}/_example.yaml")),
+        )
+        .unwrap();
+    }
+
+    let resources = load_resources(&workspace.path().join("resources")).unwrap();
+    let assembled = assemble(resources).unwrap();
+    let proxy = &assembled.gateway.proxies[0];
+    assert_eq!(proxy.upstream_id.as_deref(), Some("upstream-api-cluster"));
+    assert!(
+        proxy.backend_host.trim().is_empty(),
+        "an upstream-backed example must not carry a placeholder backend_host"
+    );
+    assert!(assembled
+        .gateway
+        .upstreams
+        .iter()
+        .any(|upstream| upstream.id == "upstream-api-cluster"));
+
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_backend_domains: AllowedBackendDomainsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_domains: vec!["*.internal".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&assembled.gateway, &policies);
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
+fn upstream_allowance_rejects_unknown_fields() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let document = |identity: &str| {
+        format!(
+            r#"version: 1
+policies:
+  allowed_backend_domains:
+    enabled: true
+    allowed_domains: ["*.svc.cluster.local"]
+    allowed_service_discovery_upstreams:
+{identity}
+"#
+        )
+    };
+
+    let mut accepted = NamedTempFile::new().unwrap();
+    write!(
+        accepted,
+        "{}",
+        document("      - namespace: platform\n        id: kubernetes-services")
+    )
+    .unwrap();
+    let loaded = load_policies_from_path(accepted.path())
+        .expect("a well-formed acknowledgment parses")
+        .expect("the file exists");
+    assert_eq!(
+        loaded
+            .policies
+            .allowed_backend_domains
+            .allowed_service_discovery_upstreams
+            .len(),
+        1
+    );
+
+    // A typo must fail loudly: silently dropping it would leave `namespace`
+    // empty and acknowledge an upstream nobody named.
+    let mut rejected = NamedTempFile::new().unwrap();
+    write!(
+        rejected,
+        "{}",
+        document("      - nmespace: platform\n        id: kubernetes-services")
+    )
+    .unwrap();
+    let err = load_policies_from_path(rejected.path()).unwrap_err();
+    assert!(err.to_string().contains("nmespace"), "{err}");
+}
+
 #[test]
 fn allowed_backend_domains_reports_an_empty_enabled_allowlist() {
     let policies = PolicyConfig {
@@ -1470,18 +1800,19 @@ fn malformed_consul_control_plane_allowances_are_blocking_configuration_errors()
 
 #[test]
 fn allowed_backend_domains_normalizes_internationalized_hosts_to_punycode() {
+    // The allowlist entry is already punycode and the destinations are not, so
+    // the match only holds if the rule normalizes before comparing.
     let mut direct = proxy("idn", BackendScheme::Https, 30_000, true);
-    direct.backend_host = "api.münchen.example".to_string();
-    let mut discovered_upstream = upstream("consul-idn", vec![]);
-    discovered_upstream.service_discovery = Some(consul_service_discovery(
-        "https://consul.münchen.example:8501",
-    ));
+    direct.backend_host = "münchen.example".to_string();
+    let mut discovered_upstream = upstream("consul-idn", vec![target("münchen.example")]);
+    discovered_upstream.service_discovery =
+        Some(consul_service_discovery("https://münchen.example:8501"));
     let policies = PolicyConfig {
         policies: PolicyRules {
             allowed_backend_domains: AllowedBackendDomainsRuleConfig {
                 enabled: true,
                 severity: Severity::Error,
-                allowed_domains: vec!["*.münchen.example".to_string()],
+                allowed_domains: vec!["xn--mnchen-3ya.example".to_string()],
                 allowed_service_discovery_upstreams: vec![UpstreamAllowance {
                     namespace: "ferrum".to_string(),
                     id: "consul-idn".to_string(),
@@ -1731,8 +2062,10 @@ fn allowed_backend_domains_checks_dns_override_with_routable_upstream() {
     };
 
     let findings = evaluate_policies(&cfg, &policies);
-    assert_eq!(findings.len(), 1);
-    assert!(findings[0].message.contains("'203.0.113.10'"));
+    assert_eq!(findings.len(), 2, "{findings:#?}");
+    assert_eq!(findings[0].kind, "PolicyConfig");
+    assert_eq!(findings[1].id, "upstream-with-pin");
+    assert!(findings[1].message.contains("'203.0.113.10'"));
 }
 
 #[test]

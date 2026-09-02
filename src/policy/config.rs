@@ -122,7 +122,10 @@ pub struct AllowedProxyPluginsRuleConfig {
     pub allowed_plugin_names: Vec<String>,
 }
 
+/// An exact `(namespace, id)` acknowledgment that weakens a destination check,
+/// so a typo must fail loudly instead of silently acknowledging nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamAllowance {
     pub namespace: String,
     pub id: String,
@@ -142,8 +145,9 @@ pub struct AllowedBackendDomainsRuleConfig {
     #[serde(default)]
     pub allowed_service_discovery_upstreams: Vec<UpstreamAllowance>,
     /// Hosts or IP literals allowed for statically configured service-discovery
-    /// control planes such as `consul.address`. When empty, the rule falls back
-    /// to `allowed_domains` for backward compatibility.
+    /// control planes such as `consul.address`. When empty, control-plane hosts
+    /// are checked against `allowed_domains`, which also permits those hosts as
+    /// direct data-plane destinations; keep a dedicated list to avoid that.
     #[serde(default)]
     pub allowed_service_discovery_control_plane_addresses: Vec<String>,
     /// Upstreams that intentionally live outside this repository's desired
@@ -152,8 +156,10 @@ pub struct AllowedBackendDomainsRuleConfig {
     /// constrained by an equivalent external egress control.
     #[serde(default)]
     pub allowed_external_upstreams: Vec<UpstreamAllowance>,
-    /// Exact IP literals allowed as per-proxy DNS pins. When empty, the rule
-    /// falls back to `allowed_domains` for backward compatibility.
+    /// Exact IP literals allowed as per-proxy DNS pins. A pin must be an IP
+    /// literal either way; when this list is empty the rule checks pins against
+    /// the IP-literal entries of `allowed_domains` (plus a bare `*` catch-all),
+    /// and reports a configuration finding when there are none.
     #[serde(default)]
     pub allowed_dns_override_addresses: Vec<String>,
 }
