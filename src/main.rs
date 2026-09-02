@@ -1493,14 +1493,30 @@ async fn cmd_apply(
             // Recover any create whose non-idempotent POST may have committed
             // before a prior process died. Pending rows are not deletion
             // authority: an exact desired row remains pending until the API
-            // target asserts ownership with an idempotent PUT. If the
-            // declaration disappeared while a row is live, reconciliation
-            // fails closed instead of guessing who created it.
+            // target asserts ownership with an idempotent PUT. A row that is
+            // live but no longer declared is forgotten and handed back to the
+            // ordinary ownership rules for the run's mode — the journal must
+            // never be able to wedge an environment, because CI is the only
+            // writer of `.state/<env>.json` and `state-guard.yml` blocks the
+            // hand edit that a fail-closed arm would demand.
+            let pending_scope = if matches!(
+                resolved.apply_strategy,
+                gitforgeops::config::ApplyStrategy::FullReplace
+            ) {
+                gitforgeops::state::PendingCreateScope::FullReplace
+            } else if matches!(resolved.ownership.mode, OwnershipMode::Shared) {
+                gitforgeops::state::PendingCreateScope::Shared
+            } else {
+                gitforgeops::state::PendingCreateScope::Exclusive
+            };
             let reconciled_pending =
-                state.reconcile_pending_creates(&desired, &actual_by_namespace)?;
+                state.reconcile_pending_creates(&desired, &actual_by_namespace, pending_scope);
+            for warning in &reconciled_pending.warnings {
+                eprintln!("Warning: {warning}");
+            }
             let reconciled_absent =
                 state.reconcile_absent_managed_resources(&desired, &actual_by_namespace);
-            if reconciled_pending + reconciled_absent > 0 {
+            if reconciled_pending.changed() || reconciled_absent > 0 {
                 state.save()?;
             }
             let managed = previously_managed(&resolved, &state);
@@ -1639,9 +1655,17 @@ async fn cmd_apply(
             // Write-ahead journal for non-idempotent creates. This must be
             // durable before the first POST, but it deliberately does not
             // grant deletion authority. A later authoritative backup either
-            // leads to an idempotent ownership assertion, leaves the pending
-            // Add retryable, or blocks if ownership is ambiguous.
-            if state.reserve_adds(&diffs, &desired)? > 0 {
+            // leads to an idempotent ownership assertion or leaves the pending
+            // Add retryable.
+            //
+            // `full_replace` is exempt: `/restore` is atomic per namespace and
+            // never consumes the journal, so writing keys there only creates
+            // entries a later run has to clean up.
+            if !matches!(
+                resolved.apply_strategy,
+                gitforgeops::config::ApplyStrategy::FullReplace
+            ) && state.reserve_adds(&diffs, &desired)? > 0
+            {
                 state.save()?;
             }
 
