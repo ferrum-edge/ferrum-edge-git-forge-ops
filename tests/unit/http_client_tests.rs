@@ -922,10 +922,31 @@ fn backup_extras() -> BackupExtras {
 }
 
 #[test]
-fn restore_body_rejects_nonempty_api_specs_and_never_replays_trust_bundles() {
+fn restore_body_carries_the_api_spec_section_and_never_replays_trust_bundles() {
+    // ferrum-edge validates `api_specs.items` against the tagged rows in the
+    // same payload and rejects either half on its own, so the section has to
+    // travel with the spec-owned graph the caller merged into the config.
     let extras = backup_extras();
+    let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
+    assert_eq!(
+        body.get("api_specs"),
+        extras.api_specs.as_ref(),
+        "the live section must be forwarded verbatim"
+    );
+    assert!(
+        body.get("gateway_trust_bundles").is_none(),
+        "an absent trust section preserves the live roots without a lost-update window"
+    );
+}
+
+#[test]
+fn restore_body_rejects_a_malformed_api_spec_section() {
+    let extras = BackupExtras {
+        api_specs: Some(serde_json::json!({"section_version": "2"})),
+        ..Default::default()
+    };
     let error = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap_err();
-    assert!(error.to_string().contains("conditional restore revision"));
+    assert!(error.to_string().contains("`items` array"), "{error}");
 }
 
 #[test]
@@ -1006,6 +1027,87 @@ fn backup_snapshot_parses_the_full_envelope() {
         Some(serde_json::json!([]))
     );
     assert!(snapshot.config.proxies.is_empty());
+}
+
+/// A realistic, complete `GET /backup` body: every top-level section
+/// ferrum-edge's `BackupPayload` can emit, populated the way a namespace with
+/// both repo-owned and API-spec-owned resources actually looks.
+const FULL_BACKUP: &str = include_str!("../fixtures/backup/full-backup.json");
+
+#[test]
+fn a_complete_gateway_backup_has_no_unsupported_sections() {
+    // `KNOWN_TOP_LEVEL` is what decides whether full replace is possible at
+    // all, and it fails closed. Pin it to a whole real envelope so a section
+    // added to the companion's `BackupPayload` shows up here as a red test
+    // rather than as a refused `full_replace` in somebody's pipeline.
+    let snapshot = BackupSnapshot::from_body(FULL_BACKUP).expect("fixture parses");
+
+    assert!(
+        snapshot.extras.unsupported_sections.is_empty(),
+        "unrecognized backup section(s): {:?}",
+        snapshot.extras.unsupported_sections
+    );
+
+    assert_eq!(snapshot.ferrum_version.as_deref(), Some("2.9.1"));
+    assert_eq!(snapshot.source.as_deref(), Some("database"));
+    assert!(!snapshot.cached);
+
+    assert_eq!(snapshot.config.proxies.len(), 2);
+    assert_eq!(snapshot.config.consumers.len(), 1);
+    assert_eq!(snapshot.config.plugin_configs.len(), 2);
+    assert_eq!(snapshot.config.upstreams.len(), 2);
+    assert_eq!(snapshot.extras.api_spec_count(), 1);
+    assert_eq!(snapshot.extras.trust_bundle_count(), 1);
+
+    // The ownership tags are what full replace has to carry through; losing
+    // them in the permissive schema would silently hand the spec importer's
+    // rows to the prune path.
+    assert_eq!(
+        snapshot
+            .config
+            .proxies
+            .iter()
+            .filter_map(|proxy| proxy.api_spec_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["spec-orders"]
+    );
+    assert_eq!(
+        snapshot
+            .config
+            .upstreams
+            .iter()
+            .filter_map(|upstream| upstream.api_spec_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["spec-orders"]
+    );
+    assert_eq!(
+        snapshot
+            .config
+            .plugin_configs
+            .iter()
+            .filter_map(|plugin| plugin.api_spec_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["spec-orders"]
+    );
+}
+
+#[test]
+fn a_complete_gateway_backup_round_trips_into_a_restore_body() {
+    let snapshot = BackupSnapshot::from_body(FULL_BACKUP).expect("fixture parses");
+    let body = build_restore_body(&snapshot.config, &snapshot.extras, false).unwrap();
+
+    // Every section `/restore` accepts, and nothing it does not.
+    assert_eq!(body["api_specs"]["items"][0]["id"], "spec-orders");
+    assert!(body.get("gateway_trust_bundles").is_none());
+    for section in [
+        "version",
+        "proxies",
+        "consumers",
+        "plugin_configs",
+        "upstreams",
+    ] {
+        assert!(body.get(section).is_some(), "missing {section}");
+    }
 }
 
 #[test]

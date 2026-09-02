@@ -519,13 +519,33 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
 
 /// Build one restore body without mutating the gateway.
 ///
-/// Trust bundles are intentionally absent: Ferrum Edge defines absence as a
-/// no-op, which is the only way an unrelated config restore cannot roll back a
-/// concurrent trust rotation. API specs have no comparable revision token. An
-/// empty/absent authoritative section is safe to omit because the gateway's
-/// existing-spec guard catches a spec created after our backup; a non-empty
-/// section cannot be replayed safely, so full replacement fails closed until
-/// the gateway exposes conditional restore semantics.
+/// `POST /restore` validates the API-spec ownership graph *as one unit* before
+/// it deletes anything (ferrum-edge `src/admin/backup.rs`,
+/// `validate_restore_api_specs_section_with_total_limit`): every
+/// `api_specs.items` entry must name an owning proxy that is present in the
+/// same payload and carries the matching `api_spec_id`, and every tagged
+/// proxy/upstream/plugin config must name a spec that is present in
+/// `api_specs.items`. Restore re-creates the spec documents verbatim after the
+/// config resources and never re-extracts resources from them, so carrying the
+/// live graph through cannot duplicate rows. A payload that omits one half of
+/// the graph is a `400` — which is exactly what a desired-only body is for a
+/// namespace with an ingested spec.
+///
+/// So the non-destructive path sends the repository's desired rows *plus* the
+/// authoritative live spec-owned rows, and hands the live `api_specs` section
+/// back for [`http_client::build_restore_body`] to splice in.
+///
+/// Two deliberate omissions:
+///
+/// - **An empty `api_specs` section is not sent.** The gateway answers `409`
+///   when a payload without the section targets a namespace that holds specs,
+///   which is the only thing that catches a spec created between our backup
+///   and the restore. Sending `items: []` is defined as an intentional wipe
+///   and would silently delete it instead.
+/// - **`gateway_trust_bundles` is never sent.** The gateway defines an absent
+///   section as "leave trust exactly as it is", so omitting it preserves the
+///   live roots without the lost-update window that replaying a possibly-stale
+///   snapshot would open.
 fn prepare_full_replace(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
@@ -534,6 +554,10 @@ fn prepare_full_replace(
     options: &ApplyOptions,
 ) -> crate::error::Result<PreparedFullReplace> {
     if options.confirm_api_spec_deletion {
+        // Deliberate destruction of the spec graph: desired rows only, with
+        // `confirm_api_spec_deletion=true` on the query so the gateway's
+        // existing-spec guard stands down. Trust bundles still stay absent, so
+        // the namespace's roots survive the wipe.
         return Ok(PreparedFullReplace {
             config: desired.clone(),
             extras: BackupExtras::default(),
@@ -543,17 +567,14 @@ fn prepare_full_replace(
     // Validate both directions even for an empty/absent section so dangling
     // ownership tags cannot be stripped accidentally by treating a malformed
     // snapshot as legacy data.
-    let merged = preserve_spec_owned_graph(desired, actual, live_extras, namespace)?;
-    if parse_api_spec_owners(live_extras, namespace)?.is_empty() {
-        return Ok(PreparedFullReplace {
-            config: merged,
-            extras: BackupExtras::default(),
-        });
-    }
-
-    Err(crate::error::Error::Config(format!(
-        "refusing full_replace for namespace `{namespace}`: the namespace contains API specs and the gateway does not expose a conditional restore revision. Replaying a prior `api_specs` snapshot could overwrite a concurrent spec update. Use incremental apply, or pass --confirm-api-spec-deletion only when deleting the complete spec ownership graph is intentional"
-    )))
+    let config = preserve_spec_owned_graph(desired, actual, live_extras, namespace)?;
+    Ok(PreparedFullReplace {
+        config,
+        extras: BackupExtras {
+            api_specs: live_extras.api_specs.clone(),
+            ..BackupExtras::default()
+        },
+    })
 }
 
 async fn apply_full_replace(

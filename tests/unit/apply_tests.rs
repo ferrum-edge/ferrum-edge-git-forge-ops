@@ -367,8 +367,10 @@ fn spec_extras(ids: &[&str]) -> gitforgeops::http_client::BackupExtras {
     }
 }
 
-#[test]
-fn full_replace_preserves_complete_spec_owned_resource_graph() {
+/// Repo-owned desired rows plus the live spec-owned graph they must be
+/// restored alongside: one API spec `spec-a` owning proxy `spec-proxy`,
+/// upstream `spec-upstream` and plugin config `spec-plugin`.
+fn spec_owned_graph() -> (GatewayConfig, GatewayConfig) {
     let desired = GatewayConfig {
         upstreams: vec![upstream("repo-upstream", "team-alpha")],
         ..Default::default()
@@ -383,7 +385,7 @@ fn full_replace_preserves_complete_spec_owned_resource_graph() {
         });
     let actual = GatewayConfig {
         proxies: vec![spec_proxy],
-        upstreams: vec![spec_upstream.clone()],
+        upstreams: vec![spec_upstream],
         plugin_configs: vec![plugin_config(
             "spec-plugin",
             "team-alpha",
@@ -392,6 +394,12 @@ fn full_replace_preserves_complete_spec_owned_resource_graph() {
         )],
         ..Default::default()
     };
+    (desired, actual)
+}
+
+#[test]
+fn merging_the_spec_owned_graph_keeps_repo_rows_authoritative() {
+    let (desired, actual) = spec_owned_graph();
 
     let merged =
         preserve_spec_owned_graph(&desired, &actual, &spec_extras(&["spec-a"]), "team-alpha")
@@ -1217,6 +1225,15 @@ async fn cached_backup_blocks_all_apply_mutations_before_the_first_write() {
         matches!(error, gitforgeops::error::Error::StaleGatewayView(_)),
         "{error:?}"
     );
+    // The wording is the operator's only clue about why an apply that looks
+    // routine refused, so assert it where it is actually produced.
+    let message = error.to_string();
+    assert!(message.contains("X-Data-Source: cached"), "{message}");
+    assert!(message.contains("API-spec ownership metadata"), "{message}");
+    assert!(
+        message.contains("--allow-large-prune") && message.contains("does not bypass"),
+        "the one override an operator would reach for must be ruled out: {message}"
+    );
     let requests = requests.lock().unwrap();
     assert!(
         requests.iter().all(|request| {
@@ -1227,30 +1244,14 @@ async fn cached_backup_blocks_all_apply_mutations_before_the_first_write() {
 }
 
 #[tokio::test]
-async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revision() {
-    let desired = GatewayConfig {
-        upstreams: vec![upstream("repo-upstream", "team-alpha")],
-        ..Default::default()
-    };
-    let mut spec_upstream = upstream("spec-upstream", "team-alpha");
-    spec_upstream.api_spec_id = Some("spec-a".to_string());
-    let mut spec_proxy = proxy("spec-proxy", "team-alpha", Some("spec-a"));
-    spec_proxy
-        .plugins
-        .push(gitforgeops::config::schema::PluginAssociation {
-            plugin_config_id: "spec-plugin".to_string(),
-        });
-    let actual = GatewayConfig {
-        proxies: vec![spec_proxy],
-        upstreams: vec![spec_upstream],
-        plugin_configs: vec![plugin_config(
-            "spec-plugin",
-            "team-alpha",
-            "spec-proxy",
-            Some("spec-a"),
-        )],
-        ..Default::default()
-    };
+async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
+    // Issue #71. `/restore` validates the ownership graph as one unit: an
+    // `api_specs` document whose owning proxy is missing, or a tagged row
+    // whose spec is missing, is a 400 before anything is deleted. So the body
+    // has to carry the repo's desired rows AND the live spec-owned rows AND
+    // the live `api_specs` section. Restore never re-extracts resources from
+    // the documents, so nothing is duplicated by carrying both.
+    let (desired, actual) = spec_owned_graph();
     let extras = spec_extras(&["spec-a"]);
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
@@ -1263,7 +1264,7 @@ async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revisio
     ]);
     let client = stub_client(url);
 
-    let error = apply_api(
+    let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
@@ -1276,19 +1277,104 @@ async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revisio
         },
     )
     .await
-    .unwrap_err();
+    .expect("a namespace with API specs must be restorable");
+
+    assert_eq!(
+        result.created, 1,
+        "only the repo-owned row counts as applied; preserved spec rows are not this repo's"
+    );
+    assert_eq!(result.fully_replaced_namespaces, vec!["team-alpha"]);
+
+    let restore = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.contains("POST /restore?confirm=true"))
+        .cloned()
+        .expect("restore request");
+    let body: serde_json::Value =
+        serde_json::from_str(restore.split_once("\r\n\r\n").expect("request body").1)
+            .expect("restore body is JSON");
 
     assert!(
-        error.to_string().contains("conditional restore revision"),
-        "{error}"
+        !restore.contains("confirm_api_spec_deletion"),
+        "preservation must not use the destructive opt-in: {restore}"
     );
+
+    let ids = |section: &str| {
+        body[section]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|value| value["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids("upstreams"), vec!["repo-upstream", "spec-upstream"]);
+    assert_eq!(ids("proxies"), vec!["spec-proxy"]);
+    assert_eq!(ids("plugin_configs"), vec!["spec-plugin"]);
+
+    // Every tagged row names a spec that is present in `api_specs.items`, and
+    // that spec's owning proxy is present and carries the tag — the exact two
+    // directions ferrum-edge's restore validator checks.
+    assert_eq!(body["api_specs"]["items"][0]["id"], "spec-a");
+    assert_eq!(body["api_specs"]["items"][0]["proxy_id"], "spec-proxy");
+    for section in ["proxies", "upstreams", "plugin_configs"] {
+        for row in body[section].as_array().into_iter().flatten() {
+            if let Some(tag) = row["api_spec_id"].as_str() {
+                assert_eq!(tag, "spec-a", "{section}: {row}");
+            }
+        }
+    }
+
+    assert!(
+        !restore.contains("gateway_trust_bundles"),
+        "an absent trust section preserves the live roots: {restore}"
+    );
+}
+
+#[tokio::test]
+async fn full_replace_refuses_an_incomplete_spec_owned_graph_before_mutating() {
+    // The preservation path is only safe while the graph can be proven whole.
+    // A spec document whose tagged rows are missing from the same
+    // authoritative backup means the view is incomplete, not that the rows
+    // should be deleted.
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let error = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            spec_extras(&["spec-a"]),
+        )])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("spec-a"), "{error}");
     assert!(
         requests
             .lock()
             .unwrap()
             .iter()
             .all(|request| !request.contains("POST /restore")),
-        "a stale API-spec graph must never be replayed"
+        "an unprovable graph must never reach /restore"
     );
 }
 
