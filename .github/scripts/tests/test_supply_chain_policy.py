@@ -635,6 +635,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ".github/workflows",
             ".github/scripts/check_supply_chain.py",
             ".github/scripts/install-ferrum-edge.sh",
+            ".github/scripts/refresh-ferrum-edge-pin.sh",
             ".github/ferrum-edge-checksums.txt",
             ".github/CODEOWNERS",
             "Dockerfile",
