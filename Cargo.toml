@@ -20,7 +20,10 @@ thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 walkdir = "2"
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# Only HS256 signing is used. The aws-lc provider avoids pulling the RustCrypto
+# RSA implementation into the admin-token path; RSA remains solely behind
+# `age`'s SSH-recipient support (see docs/dependency-security.md).
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 base64 = "0.23"

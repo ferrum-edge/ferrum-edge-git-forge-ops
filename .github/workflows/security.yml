@@ -153,12 +153,11 @@ jobs:
           fi
           cargo audit --version
 
-      - name: cargo audit
-        run: |
-          # RUSTSEC-2023-0071 is an unfixed transitive rsa advisory. Keep
-          # auditing everything else while upstream works through a fixed
-          # release path for the direct dependencies that currently pull rsa in.
-          cargo audit --ignore RUSTSEC-2023-0071
+      - name: Test audit policy gate
+        run: python3 .github/scripts/tests/test_check_cargo_audit.py
+
+      - name: Enforce cargo audit policy
+        run: python3 .github/scripts/check_cargo_audit.py
 
   codeql:
     runs-on: ubuntu-24.04
