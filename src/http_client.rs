@@ -60,6 +60,15 @@ impl AdminClient {
     /// rejects outright — and, worse, which a gateway *not* running it accepts
     /// for every namespace. [`AdminClient::new_scoped`] is the only public
     /// door, so a new call site has to say what it is allowed to touch.
+    ///
+    /// Transport security is already settled by the time this runs:
+    /// [`crate::config::env::validate_gateway_transport`] has proved
+    /// `env.gateway_url` is `https://` (or a deliberately opted-in local
+    /// `http://`), carries no embedded credentials, and — under
+    /// `GITHUB_ACTIONS` — that no insecure opt-in is aimed at a non-loopback
+    /// host. Every request method below therefore inherits an HTTPS-by-policy
+    /// base URL, which is what makes the admin JWT and the resolved consumer
+    /// credentials in these bodies safe to send.
     fn new(env: &EnvConfig) -> crate::error::Result<Self> {
         let gateway_url = env
             .gateway_url
@@ -89,6 +98,10 @@ impl AdminClient {
             // destructive body against a different authority or path.
             .redirect(reqwest::redirect::Policy::none());
 
+        // Dev-only, and gated well before here: `FERRUM_TLS_NO_VERIFY` warns
+        // loudly on every run and is refused under `GITHUB_ACTIONS` for any
+        // gateway host that is not loopback. A private CA belongs in
+        // `FERRUM_GATEWAY_CA_CERT` (below) instead of here.
         if env.tls_no_verify {
             builder = builder.danger_accept_invalid_certs(true);
         }

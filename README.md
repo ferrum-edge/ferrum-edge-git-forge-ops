@@ -842,7 +842,7 @@ Only three kinds of configuration source exist:
 
 | Secret | Required | Description |
 |---|---|---|
-| `FERRUM_GATEWAY_URL` | yes (api mode) | Admin API base URL |
+| `FERRUM_GATEWAY_URL` | yes (api mode) | Admin API base URL. **Must be `https://`** — see [Transport security](#transport-security). |
 | `FERRUM_ADMIN_JWT_SECRET` | yes (api mode) | HS256 secret for minting admin JWTs; min 32 chars |
 | `FERRUM_ADMIN_JWT_ISSUER` | no (default `ferrum-edge`) | `iss` claim; must equal the gateway's own issuer or every call is 401 |
 | `FERRUM_ADMIN_JWT_ROLE` | no (default `admin`) | `role` claim; `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only |
@@ -867,6 +867,41 @@ The two values must match exactly; the issuer is compared as an opaque string.
 
 Minted tokens also carry an `ns` claim listing the namespaces the run actually touches (from `FERRUM_NAMESPACE`, refined to an exclusive environment's namespace list where one applies). It is consulted only by gateways running with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`; elsewhere it is inert, and it is omitted entirely when the scope is "all namespaces", which is what a non-tenancy gateway expects.
 
+### Transport security
+
+Every admin API call carries the admin JWT in an `Authorization` header, and an
+`apply` carries resolved consumer credentials in the request body. So the
+transport is a security control, and gitforgeops settles it at startup — in
+`load_env_config()`, before any HTTP client is constructed — rather than one
+request at a time:
+
+- **`FERRUM_GATEWAY_URL` must be `https://`.** An `http://` URL is refused
+  unless `FERRUM_ALLOW_INSECURE_HTTP=true` says so explicitly. Every other
+  scheme (`ftp://`, `file://`, `ws://`, …) is refused unconditionally, as is
+  any URL embedding `user:password@` credentials — put the admin secret in
+  `FERRUM_ADMIN_JWT_SECRET`, and note that a rejected URL carrying an `@` is
+  never echoed back into the error, because these errors land in CI logs.
+- **The two insecure opt-ins are laptop switches.** `FERRUM_ALLOW_INSECURE_HTTP`
+  (no TLS at all) and `FERRUM_TLS_NO_VERIFY` (TLS that accepts any
+  certificate, so an interceptor is indistinguishable from the gateway) are
+  independent of each other. Each prints a loud stderr banner once per run,
+  and each is **refused when `GITHUB_ACTIONS=true` unless the gateway host is
+  loopback** — `localhost`, `127.0.0.0/8`, or `::1`. A CI run reaching a real
+  gateway does it over verified TLS; a private CA goes in
+  `FERRUM_GATEWAY_CA_CERT`, not behind a disabled check. A name that merely
+  resolves to a loopback address does not qualify: DNS is not a trust
+  boundary.
+- **GitHub API calls are always `https://api.github.com`.** The host is
+  compiled in, not configurable, so PR comments, override checks, credential
+  delivery, and Environment-secret writes have no cleartext path to
+  misconfigure.
+
+Consequently the `rust/cleartext-transmission` sites CodeQL reports in
+`src/http_client.rs` — one per request method, all of them reading the same
+operator-supplied base URL — are HTTPS-by-policy: the only way to reach them
+over cleartext is an explicit opt-in that CI refuses for anything but the
+runner's own machine.
+
 ### GitHub Actions variables used by bundled workflows
 
 | Variable | Default | Description |
@@ -889,7 +924,9 @@ scheduled default-branch settings audit. See
 Absent or blank runtime values use the documented defaults. Present values are
 validated before repository loading, credential access, client construction,
 or file output: unknown modes/strategies/roles, invalid booleans, malformed or
-overflowing integers, and zero/negative timeout or JWT TTL values are errors.
+overflowing integers, zero/negative timeout or JWT TTL values, and a
+`FERRUM_GATEWAY_URL` that is malformed, non-`https://`, or credential-bearing
+are errors.
 Mode and boolean names are trimmed and case-insensitive; accepted booleans are
 `true`, `false`, `1`, and `0`.
 
@@ -911,7 +948,7 @@ The `release` workflow also pushes to GHCR using the built-in `GITHUB_TOKEN` —
 See `.env.example`. Essentials for running `gitforgeops` on your laptop:
 
 - `FERRUM_ENV=<name>` — pick an environment from `.gitforgeops/config.yaml`
-- `FERRUM_GATEWAY_URL` + `FERRUM_ADMIN_JWT_SECRET` — connect to a live gateway
+- `FERRUM_GATEWAY_URL` + `FERRUM_ADMIN_JWT_SECRET` — connect to a live gateway (the URL must be `https://` unless `FERRUM_ALLOW_INSECURE_HTTP=true`)
 - `FERRUM_CREDS_JSON_FILE` — preferred path to a JSON file containing `FERRUM_CREDS_BUNDLE*` values
 - `FERRUM_CREDS_JSON` — inline equivalent for small local apply tests
 
@@ -931,7 +968,8 @@ Runtime variables supported by the binary include:
 | `FERRUM_ADMIN_JWT_AUDIENCE` | — | `aud` claim; emitted only when set. |
 | `FERRUM_ADMIN_JWT_TTL_SECS` | `3600` | Admin token lifetime. |
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validation binary path. |
-| `FERRUM_TLS_NO_VERIFY` | `false` | Skip TLS verification for gateway HTTP calls. Dev only. |
+| `FERRUM_TLS_NO_VERIFY` | `false` | Accept any gateway TLS certificate. Dev only: warns loudly, and is refused under `GITHUB_ACTIONS` for a non-loopback host. See [Transport security](#transport-security). |
+| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Permit a cleartext `http://` `FERRUM_GATEWAY_URL`. Dev only: warns loudly, and is refused under `GITHUB_ACTIONS` for a non-loopback host. See [Transport security](#transport-security). |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for the Admin API. |
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end Admin API request timeout. Raise for large `/backup` or slow `/restore`. |
 | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for GitHub API calls. |

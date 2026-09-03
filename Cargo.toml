@@ -26,6 +26,10 @@ walkdir = "2"
 # `age`'s SSH-recipient support (see docs/dependency-security.md).
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# Already in the tree as a `reqwest` dependency. Taken directly so
+# `FERRUM_GATEWAY_URL` is checked for scheme, host, and embedded credentials by
+# the same parser the HTTP client uses, rather than by hand-rolled string work.
+url = "2"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 base64 = "0.23"
 uuid = { version = "1", features = ["v4"] }
