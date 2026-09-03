@@ -636,14 +636,14 @@ fn redacted_transport_error_never_reaches_the_rendered_comment() {
     let published = redact_comparison_error(&leaky);
     let comment = comment_with_comparison_error(&published);
 
-    for secret in [
+    for gateway_fragment in [
         "secret-host.internal",
         "9443",
         "https://secret-host.internal:9443/backup",
     ] {
         assert!(
-            !comment.contains(secret),
-            "rendered comment leaked {secret:?}:\n{comment}"
+            !comment.contains(gateway_fragment),
+            "rendered comment leaked a gateway identity fragment:\n{comment}"
         );
     }
     // Nothing URL-shaped at all, and the reviewer is still told where to look.
