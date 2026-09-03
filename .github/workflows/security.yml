@@ -47,26 +47,6 @@ jobs:
           path: trusted-supply-chain
           persist-credentials: false
 
-      - name: Check out immutable policy bootstrap
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # PR #87 adds the checker itself, so its protected base cannot supply
-          # it. This already-reviewed commit of the same PR is a one-time
-          # immutable fallback; after merge the default-branch copy always wins.
-          #
-          # Re-pin this whenever the policy changes while `main` still lacks the
-          # checker: the fallback runs the OLD policy against the NEW tree, so
-          # it must stay at or after the commit that last reshaped the policy
-          # (validator digest allowlist, `state-guard.yml` on
-          # `pull_request_target`, ...) or it rejects the very tree it guards.
-          # `test_immutable_bootstrap_checker_accepts_the_current_policy` is
-          # what catches a stale pin.
-          ref: 521cca0fdd75dde4c113031ff8a1d0f941779d2e
-          path: bootstrap-supply-chain
-          persist-credentials: false
-
       - name: Check immutable workflow and container references
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -80,11 +60,12 @@ jobs:
             fi
             # Execute policy code from the protected default branch while
             # pointing it at the candidate tree. The global assignments keep
-            # the first bootstrap compatible with the pre-`--root` checker.
+            # the runner compatible with a pre-`--root` checker.
+            #
+            # There is no fallback. The one-time pinned bootstrap existed only
+            # while `main` did not yet carry this checker; once it does, a
+            # fallback can only run an older policy against a newer tree.
             CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py
-            if [ ! -f "$CHECKER" ]; then
-              CHECKER=bootstrap-supply-chain/.github/scripts/check_supply_chain.py
-            fi
             [ -f "$CHECKER" ] || { echo "Trusted supply-chain checker is unavailable." >&2; exit 1; }
             python3 - "$CHECKER" "$GITHUB_WORKSPACE" <<'PY'
           import importlib.util

@@ -148,6 +148,20 @@ PR live review. The manual workflows also check `github.ref == refs/heads/main`,
 but environment branch policy is the non-bypassable boundary because a workflow
 definition on an unprotected branch could remove an in-file condition.
 
+Credential-broker bundles are the one secret family the workflows enumerate.
+No workflow reads the whole `secrets` context — `${{ toJSON(secrets) }}` would
+hand a bundle-loading step the admin JWT signing key and the state-writer App
+private key as well, and GitHub holds public-repository runs that read it for
+manual approval. Instead each privileged workflow binds
+`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15` by name, which caps an
+environment at `MAX_BUNDLE_SHARDS` = 16 shards (~7,000 credential slots). A
+shard beyond that would be written but never read back, so `apply` and
+`rotate` refuse to create one. Raising the ceiling means editing
+`MAX_BUNDLE_SHARDS` in `src/secrets/bundle.rs` and
+`.github/scripts/credential_bundles.py` and extending the bindings in all four
+workflows; `.github/scripts/check_supply_chain.py` fails the build if they
+disagree.
+
 ## 4. Restrict GitHub Actions
 
 In **Settings → Actions → General**:
@@ -173,6 +187,22 @@ a full 40-hex commit SHA by both repository policy and CI.
 Repository policy is backed by `.github/scripts/check_supply_chain.py`, which
 fails CI on tag-based action references, floating runner releases, unpinned
 container bases, missing Rust version pins, or disabled release attestations.
+
+It also rejects any workflow expression that reaches the whole `secrets`
+context (`toJSON(secrets)`, a bare `${{ secrets }}`, `secrets: inherit`).
+GitHub holds public-repository runs that read the whole context for manual
+approval, and the credential broker never needs more than the
+`FERRUM_CREDS_BUNDLE[_N]` shards, which the privileged workflows bind by name.
+
+The `security-supply-chain-policy` check always runs the **protected
+branch's** copy of the checker against the candidate tree, so a pull request
+cannot weaken the policy that judges it. The flip side: a pull request that
+changes the checker *and* the workflow shape it governs fails its own policy
+check exactly once, because the old policy is judging the new shape. Prefer
+landing such changes as expand/contract pairs (accept both shapes, migrate,
+then reject the old shape). When that is impractical, a maintainer reviews
+the red check, confirms every violation is the intended migration, and merges
+with a ruleset bypass; the next run on `main` judges with the new policy.
 
 ## 5. Enable settings-drift monitoring
 

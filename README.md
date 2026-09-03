@@ -525,9 +525,29 @@ Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `
 - Each bundle is a JSON object: `{ "<slot>": "<value>", ... }`.
 - Single bundle holds ~440 credentials at 48 KB GitHub secret cap.
 - Auto-sharded by deterministic hash when any bundle approaches 40 KB.
-- GitHub's 100-secrets-per-env limit × ~440 slots/bundle = **~44,000 credentials per environment** before you hit any ceiling.
+- **Shard ceiling: 16** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15`) × ~440 slots/bundle = **~7,000 credentials per environment**. `apply` and `rotate` refuse to create shard 16 rather than writing a secret nothing reads back.
 
-The bundled workflows read all matching secrets via `${{ toJSON(secrets) }}` and pass them through a fail-closed loader: the outer inventory, exact `FERRUM_CREDS_BUNDLE[_N]` names, each inner JSON object, and every string slot/value are validated before a new mode-0600 runner file is published as `FERRUM_CREDS_JSON_FILE`. Malformed inventories never degrade to an empty bundle (which could otherwise trigger duplicate allocation/rotation). The binary still supports inline `FERRUM_CREDS_JSON` for local testing, but the file form is preferred because large multi-shard bundles can exceed OS environment-block limits.
+#### "Load credential bundles"
+
+Each privileged workflow (`apply-on-merge.yml`, `drift-check.yml`, `materialize-file.yml`, `rotate.yml`) binds every bundle secret **by name**:
+
+```yaml
+        env:
+          FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}
+          FERRUM_CREDS_BUNDLE_1: ${{ secrets.FERRUM_CREDS_BUNDLE_1 }}
+          # … through FERRUM_CREDS_BUNDLE_15
+```
+
+It used to read `${{ toJSON(secrets) }}` instead. That handed the step every secret the environment holds — the admin JWT signing key, the state-writer App private key, the registry token — to pull out a handful of bundle values, and since GitHub's [2026-07-28 change](https://github.blog/changelog/2026-07-28-github-actions-holds-potentially-malicious-workflows-for-approval/) a public-repository run that reads the whole secrets context is **held for manual approval** before it may start.
+
+Binding by name means the shard list is finite. The ceiling is `MAX_BUNDLE_SHARDS`, declared twice and cross-checked by `.github/scripts/check_supply_chain.py`:
+
+- `MAX_BUNDLE_SHARDS` in `src/secrets/bundle.rs` — the allocator refuses to grow past it;
+- `MAX_BUNDLE_SHARDS` in `.github/scripts/credential_bundles.py` — the loader reads exactly those env vars.
+
+**Adding capacity means raising both constants and adding the matching `FERRUM_CREDS_BUNDLE_<N>` lines to all four workflows.** The supply-chain check fails the build if any of the three drift apart.
+
+The loader is fail-closed: a blank binding means "unset", every populated value must parse as a JSON object of string slots to string values, and a bundle secret named outside the bound range is an error rather than a silent drop (dropping it would make the next apply re-allocate every slot it holds). The validated payload is written to a fresh mode-0600 runner file under `$RUNNER_TEMP` and its path exported as `FERRUM_CREDS_JSON_FILE`; no secret bytes reach the log. The binary still supports inline `FERRUM_CREDS_JSON` for local testing, but the file form is preferred because large multi-shard bundles can exceed OS environment-block limits.
 
 ### Allocation, writing, and delivery
 
@@ -679,7 +699,7 @@ Practical limits you should know about:
 | Environments per repo | ~100 (soft) | Each needs its own GitHub Environment; workflow matrix spreads to parallel jobs. GitHub Actions caps concurrent jobs at 20 on free public, 60+ on paid tiers. |
 | Namespaces per environment | Unbounded | Handled by the gateway; repo just groups them. |
 | Resources per apply | Unbounded in file mode; gateway-limited in API mode. | Incremental mode fetches `/backup` once per namespace and diffs locally. |
-| Consumer credential slots per env | ~44,000 | 100 env secrets × ~440 slots/bundle. Not a soft limit you will hit. |
+| Consumer credential slots per env | ~7,000 | `MAX_BUNDLE_SHARDS` = 16 env secrets × ~440 slots/bundle. Raise the constant in `src/secrets/bundle.rs` *and* `.github/scripts/credential_bundles.py`, then extend the `FERRUM_CREDS_BUNDLE_<N>` bindings in the four privileged workflows. |
 | Policy rules | Unbounded | Each adds ~50 µs per apply at 1k resources. |
 | Apply wall-clock time | Dominated by `/backup` fetch + per-resource API writes. | Roughly O(changed resources) in incremental mode. `full_replace` is constant time but bigger blast radius. |
 | Credential bundle write concurrency | Serialized per env via `concurrency: ferrum-apply-${{ matrix.environment }}`. | Within an env, two apply/rotate runs never interleave. Across envs they parallelize. |
@@ -816,7 +836,7 @@ Only three kinds of configuration source exist:
 | `FERRUM_GATEWAY_CLIENT_CERT` | no | Client cert for mTLS (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_KEY` | no | Client key for mTLS (base64 PEM, required if cert is set) |
 | `FERRUM_GH_PROVISIONER_TOKEN` | no (required for allocate/rotate) | GitHub App installation token or PAT with `Secrets: write` + `Environments: write` |
-| `FERRUM_CREDS_BUNDLE[_N]` | managed by broker | Credential bundles — **you generally never touch these by hand** |
+| `FERRUM_CREDS_BUNDLE[_N]` | managed by broker | Credential bundles, shards `0..15` — **you generally never touch these by hand**. The workflows bind each shard by name, so `_16` and above are never read; see [Storage: bundled environment secrets](#storage-bundled-environment-secrets) |
 
 #### Migrating from older gitforgeops
 
