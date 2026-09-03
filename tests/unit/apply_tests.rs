@@ -68,6 +68,7 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
     let path = tmp.path().join("nested/resources.yaml");
     let config = GatewayConfig {
         proxies: vec![Proxy {
+            extra: Default::default(),
             id: "p1".to_string(),
             name: None,
             namespace: "ferrum".to_string(),

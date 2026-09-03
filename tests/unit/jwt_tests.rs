@@ -164,6 +164,17 @@ fn mint_jwt_honours_ttl_override_and_rejects_nonpositive() {
 }
 
 #[test]
+fn mint_jwt_rejects_a_ttl_that_overflows_the_expiration_timestamp() {
+    let options = JwtOptions {
+        ttl_secs: i64::MAX,
+        ..JwtOptions::default()
+    };
+    let error = mint_jwt(SECRET, &options).unwrap_err().to_string();
+    assert!(error.contains("too large"), "{error}");
+    assert!(error.contains("FERRUM_ADMIN_JWT_TTL_SECS"), "{error}");
+}
+
+#[test]
 fn jwt_options_from_env_picks_up_configuration() {
     let env = EnvConfig {
         admin_jwt_issuer: "gw".to_string(),

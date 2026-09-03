@@ -122,9 +122,18 @@ fn load_repo_config() -> Result<Option<RepoConfig>, Box<dyn std::error::Error>> 
 fn resolve_runtime(
     explicit_env: Option<&str>,
 ) -> Result<(EnvConfig, ResolvedEnv, Option<RepoConfig>), Box<dyn std::error::Error>> {
-    let env_config = config::load_env_config();
+    let env_config = config::load_env_config()?;
     let repo = load_repo_config()?;
     let resolved = resolve_env(repo.as_ref(), &env_config, explicit_env)?;
+    // Up front, before any resource file is read: a configured overlay that is
+    // not in the tree is a repository mistake, and the error should name the
+    // environment and the file that selected it rather than surfacing from the
+    // middle of the assembly pipeline.
+    config::validate_overlay_selection(
+        &resolved,
+        repo.as_ref(),
+        &PathBuf::from(config::OVERLAYS_ROOT),
+    )?;
     Ok((env_config, resolved, repo))
 }
 
@@ -135,15 +144,21 @@ fn resolve_runtime(
 /// `validate`, `plan`, `export` and file-mode `apply` also act on `.mesh`.
 fn load_and_assemble_all(
     resolved: &ResolvedEnv,
+    env_config: &EnvConfig,
 ) -> Result<config::AssembledOutput, Box<dyn std::error::Error>> {
+    // Fail-closed unless the operator explicitly set
+    // FERRUM_ALLOW_UNKNOWN_FIELDS. The policy is resolved once, here, and
+    // threaded down rather than read from the process environment inside the
+    // parse loop.
+    let load_options = config::LoadOptions {
+        allow_unknown_fields: env_config.allow_unknown_fields,
+    };
     let resources_dir = PathBuf::from("./resources");
-    let mut resources = config::load_resources(&resources_dir)?;
+    let mut resources = config::load_resources_with_options(&resources_dir, load_options)?;
 
     if let Some(ref overlay_name) = resolved.overlay {
-        let overlay_dir = PathBuf::from("./overlays").join(overlay_name);
-        if overlay_dir.is_dir() {
-            config::apply_overlay(&mut resources, &overlay_dir)?;
-        }
+        let overlay_dir = PathBuf::from(config::OVERLAYS_ROOT).join(overlay_name);
+        config::apply_overlay_with_options(&mut resources, &overlay_dir, load_options)?;
     }
 
     // The namespace filter is applied to mesh fragments during assembly (a
@@ -171,8 +186,9 @@ fn load_and_assemble_all(
 /// `rotate` have nothing to do with it.
 fn load_and_assemble_for(
     resolved: &ResolvedEnv,
+    env_config: &EnvConfig,
 ) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
-    Ok(load_and_assemble_all(resolved)?.gateway)
+    Ok(load_and_assemble_all(resolved, env_config)?.gateway)
 }
 
 fn load_credential_bundles(
@@ -730,10 +746,9 @@ fn mesh_summary_line(mesh: &config::MeshConfigSpec) -> String {
 /// Print one document's plan-time validation verdict and return whether it
 /// counts as passing.
 ///
-/// A missing `ferrum-edge` binary is SKIPPED-not-failed, matching the
-/// pre-existing behavior: `plan` is a preview and should still show the diff
-/// on a machine without the gateway binary installed. `apply` treats the same
-/// condition as fatal.
+/// Failure to start or execute `ferrum-edge` is an ERROR, not a successful
+/// skip. A plan is a launch safety signal and must fail closed when the
+/// authoritative validator did not run.
 fn report_plan_validation(
     label: &str,
     result: &Result<validate::ValidationResult, gitforgeops::error::Error>,
@@ -749,8 +764,8 @@ fn report_plan_validation(
             r.success
         }
         Err(e) => {
-            println!("{label}: SKIPPED ({e})");
-            true
+            println!("{label}: ERROR ({e})");
+            false
         }
     }
 }
@@ -760,7 +775,7 @@ fn cmd_validate(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
     let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
@@ -817,7 +832,7 @@ async fn cmd_export(
     }
 
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
 
     if materialize {
@@ -923,7 +938,7 @@ async fn cmd_diff(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
     enforce_exclusive_scope(&resolved, &desired)?;
     let _ = resolve_credentials(&mut desired, &env_config)?;
     let bundle_loaded = credential_bundle_loaded(&env_config);
@@ -1045,7 +1060,7 @@ async fn cmd_diff(
 
 async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
     // Plan must see the same scope/validation errors as apply would hit, so
@@ -1245,7 +1260,7 @@ async fn cmd_apply(
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let assembled = load_and_assemble_all(&resolved)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
 
@@ -1984,7 +1999,7 @@ async fn cmd_review(
         .into());
     }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved)?;
+    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
     // apply would produce.
@@ -1997,9 +2012,25 @@ async fn cmd_review(
     let bundle_loaded = credential_bundle_loaded(&env_config);
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
-    let (validation_ok, validation_output) = match &val_result {
-        Ok(r) => (r.success, format!("{}{}", r.stdout, r.stderr)),
-        Err(e) => (false, format!("Validation could not run: {}", e)),
+    let (validation_status, validation_output, validation_execution_error) = match &val_result {
+        Ok(r) if r.success => (
+            review::ReviewValidationStatus::Passed,
+            format!("{}{}", r.stdout, r.stderr),
+            None,
+        ),
+        Ok(r) => (
+            review::ReviewValidationStatus::Rejected,
+            format!("{}{}", r.stdout, r.stderr),
+            None,
+        ),
+        Err(e) => {
+            let message = format!("Validator execution error: {e}");
+            (
+                review::ReviewValidationStatus::ExecutionError,
+                message,
+                Some(e.to_string()),
+            )
+        }
     };
 
     let state = StateFile::load(&resolved.name)?;
@@ -2112,13 +2143,14 @@ async fn cmd_review(
         None => (Vec::new(), None, None),
     };
 
-    let ownership_note = format!(
-        "Environment: `{}` · Ownership: `{:?}` · Strategy: `{:?}`",
-        resolved.name, resolved.ownership.mode, resolved.apply_strategy
+    let ownership_note = review::environment_header(
+        &resolved.name,
+        &format!("{:?}", resolved.ownership.mode),
+        &format!("{:?}", resolved.apply_strategy),
     );
 
-    let comment = review::build_review_comment_v2(
-        validation_ok,
+    let comment = review::build_review_comment_v2_with_status(
+        validation_status,
         &validation_output,
         &diffs,
         &breaking,
@@ -2178,6 +2210,9 @@ async fn cmd_review(
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
 
     let _ = !secret_report.results.is_empty();
+    if let Some(error) = validation_execution_error {
+        return Err(format!("validator execution failed during review: {error}").into());
+    }
     Ok(())
 }
 
@@ -2266,7 +2301,7 @@ async fn cmd_rotate(
         );
     }
 
-    let desired_for_check = load_and_assemble_for(&resolved)?;
+    let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
 
     // Preflight 1b: in exclusive mode, the same ownership-scope rules
     // apply/diff/plan/review enforce must apply here too. A manual rotate
@@ -2455,7 +2490,7 @@ async fn push_rotated_consumer_to_gateway(
         return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
     }
 
-    let mut desired = load_and_assemble_for(resolved)?;
+    let mut desired = load_and_assemble_for(resolved, env_config)?;
     let merged = secrets::merge_bundles(per_shard);
     // `rotate_and_deliver` just wrote the fresh value into the bundle; this
     // resolve picks it up for the consumer being pushed to the gateway.

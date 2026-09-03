@@ -47,7 +47,7 @@ fn env_config_jwt_claim_defaults_match_the_gateway() {
     let _guard = env_guard();
     clear_env();
 
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     // The gateway's own defaults: iss `ferrum-edge`, no audience, TTL at the
     // 3600s max. Role must be `admin` — /backup, /restore, /batch and consumer
     // CRUD are all admin-only.
@@ -69,7 +69,7 @@ fn env_config_jwt_claim_overrides() {
     std::env::set_var("FERRUM_ADMIN_JWT_AUDIENCE", "ferrum-admin");
     std::env::set_var("FERRUM_ADMIN_JWT_TTL_SECS", "600");
 
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.admin_jwt_issuer, "my-gateway");
     assert_eq!(config.admin_jwt_role, "operator");
     assert_eq!(config.admin_jwt_audience.as_deref(), Some("ferrum-admin"));
@@ -88,12 +88,12 @@ fn env_config_treats_blank_jwt_vars_as_unset() {
     // rejects any token that carries the claim at all.
     std::env::set_var("FERRUM_ADMIN_JWT_AUDIENCE", "  ");
     std::env::set_var("FERRUM_ADMIN_JWT_ISSUER", "");
-    std::env::set_var("FERRUM_ADMIN_JWT_TTL_SECS", "0");
+    std::env::set_var("FERRUM_ADMIN_JWT_TTL_SECS", "  ");
 
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert!(config.admin_jwt_audience.is_none());
     assert_eq!(config.admin_jwt_issuer, "ferrum-edge");
-    // A non-positive TTL would serialize as `exp <= iat` and be rejected.
+    // Blank is absent and retains the documented default.
     assert_eq!(config.admin_jwt_ttl_secs, 3600);
 
     clear_env();
@@ -116,7 +116,7 @@ fn env_config_treats_blank_secret_backed_vars_as_unset() {
     std::env::set_var("FERRUM_GATEWAY_CLIENT_CERT", "");
     std::env::set_var("FERRUM_GATEWAY_CLIENT_KEY", "");
 
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert!(config.gateway_url.is_none());
     assert!(config.admin_jwt_secret.is_none());
     assert!(config.namespace_filter.is_none());
@@ -137,20 +137,20 @@ fn mesh_file_output_path_defaults_and_overrides() {
     clear_env();
 
     assert_eq!(
-        load_env_config().mesh_file_output_path,
+        load_env_config().unwrap().mesh_file_output_path,
         "./assembled/mesh.yaml"
     );
 
     std::env::set_var("FERRUM_MESH_FILE_OUTPUT_PATH", "   ");
     assert_eq!(
-        load_env_config().mesh_file_output_path,
+        load_env_config().unwrap().mesh_file_output_path,
         "./assembled/mesh.yaml",
         "a blank value must not produce an empty output path"
     );
 
     std::env::set_var("FERRUM_MESH_FILE_OUTPUT_PATH", "/srv/mesh/slice.yaml");
     assert_eq!(
-        load_env_config().mesh_file_output_path,
+        load_env_config().unwrap().mesh_file_output_path,
         "/srv/mesh/slice.yaml"
     );
 
@@ -162,7 +162,7 @@ fn env_config_defaults_and_overrides() {
     let _guard = env_guard();
     clear_env();
 
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert!(config.gateway_url.is_none());
     assert!(config.admin_jwt_secret.is_none());
     assert!(config.namespace_filter.is_none());
@@ -175,23 +175,23 @@ fn env_config_defaults_and_overrides() {
     assert!(!config.tls_no_verify);
 
     std::env::set_var("FERRUM_GATEWAY_MODE", "file");
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_mode, GatewayMode::File);
 
     std::env::set_var("FERRUM_GATEWAY_MODE", "api");
     std::env::set_var("FERRUM_APPLY_STRATEGY", "full_replace");
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_mode, GatewayMode::Api);
     assert_eq!(config.apply_strategy, ApplyStrategy::FullReplace);
 
     std::env::set_var("FERRUM_TLS_NO_VERIFY", "true");
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert!(config.tls_no_verify);
 
     std::env::set_var("FERRUM_GATEWAY_URL", "https://gw:9000");
     std::env::set_var("FERRUM_ADMIN_JWT_SECRET", "secret123");
     std::env::set_var("FERRUM_NAMESPACE", "team-alpha");
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_url.as_deref(), Some("https://gw:9000"));
     assert_eq!(config.admin_jwt_secret.as_deref(), Some("secret123"));
     assert_eq!(config.namespace_filter.as_deref(), Some("team-alpha"));
@@ -204,7 +204,7 @@ fn env_config_timeout_defaults_and_overrides() {
     let _guard = env_guard();
     clear_env();
 
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_connect_timeout_secs, 10);
     assert_eq!(config.gateway_request_timeout_secs, 60);
     assert_eq!(config.github_connect_timeout_secs, 10);
@@ -214,18 +214,20 @@ fn env_config_timeout_defaults_and_overrides() {
     std::env::set_var("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "120");
     std::env::set_var("FERRUM_GITHUB_CONNECT_TIMEOUT_SECS", "7");
     std::env::set_var("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", "45");
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_connect_timeout_secs, 5);
     assert_eq!(config.gateway_request_timeout_secs, 120);
     assert_eq!(config.github_connect_timeout_secs, 7);
     assert_eq!(config.github_request_timeout_secs, 45);
 
-    // Non-numeric value falls back to default.
+    // Present malformed values fail closed and name the exact variable.
     std::env::set_var("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", "not-a-number");
     std::env::set_var("FERRUM_GITHUB_CONNECT_TIMEOUT_SECS", "bogus");
-    let config = load_env_config();
-    assert_eq!(config.gateway_connect_timeout_secs, 10);
-    assert_eq!(config.github_connect_timeout_secs, 10);
+    let error = load_env_config().unwrap_err().to_string();
+    assert!(
+        error.contains("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS"),
+        "{error}"
+    );
 
     clear_env();
 }
@@ -235,21 +237,65 @@ fn env_config_max_retries_defaults_and_overrides() {
     let _guard = env_guard();
     clear_env();
 
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_max_retries, 3);
 
     std::env::set_var("FERRUM_GATEWAY_MAX_RETRIES", "0");
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_max_retries, 0);
 
     std::env::set_var("FERRUM_GATEWAY_MAX_RETRIES", "7");
-    let config = load_env_config();
+    let config = load_env_config().unwrap();
     assert_eq!(config.gateway_max_retries, 7);
 
-    // Non-numeric falls back to default.
+    // Non-numeric is a configuration error, never a silent retry-policy
+    // change.
     std::env::set_var("FERRUM_GATEWAY_MAX_RETRIES", "many");
-    let config = load_env_config();
-    assert_eq!(config.gateway_max_retries, 3);
+    let error = load_env_config().unwrap_err().to_string();
+    assert!(error.contains("FERRUM_GATEWAY_MAX_RETRIES"), "{error}");
+
+    clear_env();
+}
+
+#[test]
+fn env_config_rejects_invalid_modes_booleans_and_positive_numbers() {
+    let _guard = env_guard();
+    clear_env();
+
+    for (variable, value) in [
+        ("FERRUM_GATEWAY_MODE", "fiel"),
+        ("FERRUM_APPLY_STRATEGY", "full-replcae"),
+        ("FERRUM_TLS_NO_VERIFY", "tru"),
+        ("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", "0"),
+        ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "-1"),
+        ("FERRUM_ADMIN_JWT_TTL_SECS", "0"),
+        ("FERRUM_GATEWAY_MAX_RETRIES", "4294967296"),
+        ("FERRUM_ADMIN_JWT_ROLE", "superuser"),
+    ] {
+        clear_env();
+        std::env::set_var(variable, value);
+        let error = load_env_config().unwrap_err().to_string();
+        assert!(error.contains(variable), "{variable}={value:?}: {error}");
+        assert!(error.contains(value), "{variable}={value:?}: {error}");
+    }
+
+    clear_env();
+}
+
+#[test]
+fn env_config_accepts_documented_normalization_and_blank_defaults() {
+    let _guard = env_guard();
+    clear_env();
+
+    std::env::set_var("FERRUM_GATEWAY_MODE", "  FiLe ");
+    std::env::set_var("FERRUM_APPLY_STRATEGY", " FULL_REPLACE ");
+    std::env::set_var("FERRUM_TLS_NO_VERIFY", " FALSE ");
+    std::env::set_var("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "   ");
+    let config = load_env_config().unwrap();
+    assert_eq!(config.gateway_mode, GatewayMode::File);
+    assert_eq!(config.apply_strategy, ApplyStrategy::FullReplace);
+    assert!(!config.tls_no_verify);
+    assert_eq!(config.gateway_request_timeout_secs, 60);
 
     clear_env();
 }

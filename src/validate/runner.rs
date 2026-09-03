@@ -286,10 +286,32 @@ fn run_validate_command(
         stderr = SUPPRESSED_NOTICE.to_string();
     }
 
+    // ferrum-edge validate's public contract is 0 for accepted input and 1
+    // for schema rejection. Any other code (including -1 for termination by
+    // signal) means the validator itself failed; treating that as an ordinary
+    // rejected document would hide a broken release gate.
+    if !matches!(exit_code, 0 | 1) {
+        return Err(crate::error::Error::ValidateProcess {
+            code: exit_code,
+            stderr: bounded_process_diagnostic(&stderr),
+        });
+    }
+
     Ok(ValidationResult {
         success: output.status.success(),
         stdout,
         stderr,
         exit_code,
     })
+}
+
+fn bounded_process_diagnostic(diagnostic: &str) -> String {
+    const MAX_CHARS: usize = 4_000;
+    let mut chars = diagnostic.chars();
+    let bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}\n[validator diagnostic truncated]")
+    } else {
+        bounded
+    }
 }

@@ -681,8 +681,8 @@ fn parse_index_segment(piece: &str) -> Option<usize> {
 /// already has an `EnvConfig` in hand) don't have to go through the process
 /// environment. `main.rs` calls the two-argument forms, whose signatures stay
 /// stable.
-fn current_gateway_mode() -> GatewayMode {
-    crate::config::load_env_config().gateway_mode
+fn current_gateway_mode() -> crate::error::Result<GatewayMode> {
+    Ok(crate::config::load_env_config()?.gateway_mode)
 }
 
 /// Walk consumers and produce a [`ResolveReport`] **without mutating** `cfg`.
@@ -695,7 +695,7 @@ pub fn report_secrets(
     cfg: &crate::config::GatewayConfig,
     bundle: &CredentialBundle,
 ) -> crate::error::Result<ResolveReport> {
-    report_secrets_with_mode(cfg, bundle, current_gateway_mode())
+    report_secrets_with_mode(cfg, bundle, current_gateway_mode()?)
 }
 
 /// [`report_secrets`] that never fails on a *generation constraint*.
@@ -723,7 +723,7 @@ pub fn report_secrets_lenient(
     report_secrets_with_mode_inner(
         cfg,
         bundle,
-        current_gateway_mode(),
+        current_gateway_mode()?,
         ConstraintMode::ReportOnly,
     )
 }
@@ -806,7 +806,7 @@ pub fn resolve_secrets(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
 ) -> crate::error::Result<ResolveReport> {
-    resolve_secrets_with_mode(cfg, bundle, current_gateway_mode())
+    resolve_secrets_with_mode(cfg, bundle, current_gateway_mode()?)
 }
 
 /// [`resolve_secrets`] with the gateway mode supplied explicitly.

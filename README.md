@@ -63,6 +63,8 @@ overlays/                        # environment-specific deep-merge fragments
     ferrum/mesh/core.yaml        # matches the mesh fragment by file name
   production/
     ferrum/proxies/my-api.yaml
+  sandbox/                       # every overlay a config.yaml environment
+                                 # selects must exist, even if it is empty
 
 assembled/                       # file-mode output (gateway doc + mesh doc)
   staging.yaml
@@ -89,6 +91,74 @@ overlays can narrow lists such as `allowed_methods`, `hosts`,
 `allowed_ws_origins`, and `acl_groups`; `spec.plugins` and `spec.targets` are
 additive and merge by item identity, as are a mesh fragment's `spec.workloads`
 (by `spiffe_id`) and `spec.services` (by `name` + `namespace`).
+
+Input loading is fail-closed and deterministic. A selected overlay must exist —
+the check runs before any resource file is read and names the environment, the
+overlay, and the file that declared the selection;
+every resource/overlay path is sorted before parsing; walker errors propagate;
+symlinks anywhere in `resources/` or the selected overlay are rejected; and
+duplicate overlay targets name both source files instead of depending on
+filesystem order. Gateway overlay fragments require `kind` and `spec.id`;
+mesh fragments use an explicit `id` or their non-empty filename stem. Enabled
+configuration files must use lowercase `.yaml` or `.yml`. Files beginning with
+`_` are intentionally disabled, and only `README`, `README.md`, `.gitkeep`,
+and the generated `.gitforgeops-import.json` inventory are accepted as
+non-configuration files inside declarative trees; spellings
+such as `.YAML`, `.yam`, or `.yaml.bak` fail instead of disappearing from the
+desired inventory. `.DS_Store`, `Thumbs.db` and `desktop.ini` are the one
+exception: they are skipped in silence, because a file manager re-creates them
+the moment someone opens the folder and no commit can remove them for good.
+The trusted-review archive applies the same rules — the same two lists — before
+it crosses the privileged data boundary.
+
+### Supported fields, and what happens to unsupported ones
+
+The typed companion schema rejects unknown wrapper, resource, and nested object
+keys before assembly, reporting the source file and full YAML path. This
+prevents a typo such as `spec.plguins` from disappearing before the
+authoritative `ferrum-edge validate` pass. Deliberately opaque values remain
+lossless and forward-compatible: arbitrary plugin `config`, consumer
+credential maps, and per-item mesh resource objects are preserved verbatim.
+
+Rejection is authoritative, which has a cost: a **gateway release that adds a
+field** is unusable until gitforgeops ships a matching release. Set
+`FERRUM_ALLOW_UNKNOWN_FIELDS=true` to unblock that. Unknown **top-level**
+`spec` fields on `Proxy`, `Upstream`, `Consumer` and `PluginConfig` are then
+kept verbatim and travel through overlay merge, `export`, `diff` and `apply`
+untouched, so the gateway — which is the real schema — decides whether they are
+valid. Each affected file gets a `Warning:` on stderr naming every field kept
+(never on stdout, which carries the exported YAML document).
+
+Three limits are deliberate:
+
+* **Nested unknown fields stay fatal in both modes.** Carrying them would mean
+  opening every nested struct to silent acceptance, which is the bug the strict
+  loader exists to prevent.
+* **Fail-closed is the default.** The flag is for unblocking a version skew,
+  not for running on indefinitely; upgrade gitforgeops when a release catches
+  up.
+* **A field only the gateway carries is not drift.** If a newer gateway returns
+  a field this client does not model and your repository does not declare,
+  `diff` ignores it — reporting it would mean permanent drift that no `apply`
+  could clear. Declaring a field in your YAML is how the repository takes
+  ownership of it.
+
+`gitforgeops import` is the one place an unmodelled field reaches your tree
+without you typing it: a resource imported from a newer gateway is written out
+complete, so a later `validate` names the field instead of losing it. Either
+upgrade gitforgeops, set the flag, or delete the field from the imported YAML.
+
+Two further input rules follow from the same "no silent rewrites" principle:
+
+* **YAML merge keys (`<<:`) and anchors-as-merge are not supported.** Merging
+  is opt-in in the YAML library and gitforgeops does not opt in, so `<<` stays
+  an ordinary key and is reported as unknown field `.spec.<<` rather than
+  silently doing nothing. Repeat the fields, or use an overlay.
+* **Opaque islands are JSON-shaped, which means string keys only.** Plugin
+  `config`, consumer credential entries and mesh items round-trip verbatim
+  through a JSON representation, so a non-string YAML key (`404:`, `true:`) is
+  rejected with the path of the mapping it appears in rather than being quietly
+  stringified to `"404"`.
 
 ### Proxy backend scheme
 
@@ -140,6 +210,13 @@ default_environment: staging
 ```
 
 The environment names here must match the GitHub Environments you've set up in repo settings and use `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (one safe state/artifact path component). Set `live_review: false` on file-mode environments (or any environment without a live Admin API); the protected matrix excludes them before a GitHub Environment approval is requested. Trusted live review, apply, drift, rotate, and materialize bind `environment: ${{ matrix.environment }}` or `environment: ${{ inputs.environment }}` so GitHub can enforce reviewers/branch policies and inject scoped secrets. `validate-pr.yml` deliberately has no environment binding at all: PR-built code never receives gateway credentials. Fork PRs get static validation only; the privileged `workflow_run` resolves their metadata but skips every build, artifact, and Environment-bound step before any privileged input is prepared.
+
+Repository and policy configuration are closed, versioned contracts. Both
+`.gitforgeops/config.yaml` and `.gitforgeops/policies.yaml` currently accept
+exactly `version: 1`; future versions and unknown keys at any typed level fail
+with the source path and offending key. This is intentionally stricter than
+the Ferrum Edge resource mirror, whose documented free-form plugin,
+credential, and mesh-item values remain forward-compatible.
 
 ## Ownership modes
 
@@ -760,6 +837,13 @@ verify the exact bypass actor. The repository-level
 scheduled default-branch settings audit. See
 [GitHub launch controls](docs/github-launch-controls.md).
 
+Absent or blank runtime values use the documented defaults. Present values are
+validated before repository loading, credential access, client construction,
+or file output: unknown modes/strategies/roles, invalid booleans, malformed or
+overflowing integers, and zero/negative timeout or JWT TTL values are errors.
+Mode and boolean names are trimmed and case-insensitive; accepted booleans are
+`true`, `false`, `1`, and `0`.
+
 ### Docker Hub secrets (upstream maintainers / forks publishing their own image only)
 
 **Forks don't need these.** The `release` workflow is gated; forks consume the already-published `ferrumedge/ferrum-edge-git-forge-ops` image and skip the build.
@@ -788,6 +872,7 @@ Runtime variables supported by the binary include:
 |---|---|---|
 | `FERRUM_ENV` | — | Environment selected from `.gitforgeops/config.yaml`; overridden by global `--env`. |
 | `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all namespaces. |
+| `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown **top-level** `spec` fields verbatim instead of rejecting them, for a gateway newer than this release. Nested unknown fields stay fatal either way. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones). |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Legacy/env-driven strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
 | `FERRUM_OVERLAY` | — | Legacy overlay selector used only without repo config/env selection. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode output path. Bundled file-mode apply sets this to `assembled/<env>.yaml`. |
@@ -803,6 +888,12 @@ Runtime variables supported by the binary include:
 | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for GitHub API calls. |
 | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` | `30` | End-to-end GitHub API request timeout. |
 | `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Retries connection-establishment errors and transient responses for reads/idempotent writes; create/batch POST responses are never replayed. `0` disables retries. |
+
+`plan` and `review` fail closed if the validator cannot be started or executed.
+Plan prints `Validation: ERROR` and exits nonzero; review renders
+`Validation: ERROR` with a bounded diagnostic before returning nonzero. A
+schema rejection remains `FAILED`, and only a completed successful validation
+is `PASSED`.
 
 ## CLI reference
 

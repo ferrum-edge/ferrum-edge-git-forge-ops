@@ -56,6 +56,7 @@ fn consumer_config(credentials: serde_json::Value) -> gitforgeops::config::schem
 
     GatewayConfig {
         consumers: vec![Consumer {
+            extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
@@ -90,28 +91,57 @@ fn resolved_credentials_are_redacted_but_other_diagnostics_survive() {
             &ECHO_SPEC_WITH_PROXY_ERROR.replace("exit 1", &format!("exit {exit_code}")),
         );
 
-        let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
-        assert!(!result.success);
-        assert!(
-            !result.stdout.contains(secret),
-            "validator stdout exposed a credential fixture"
-        );
-        assert!(
-            !result.stderr.contains(secret),
-            "validator stderr exposed a credential fixture"
-        );
-        assert!(
-            result.stdout.contains("[REDACTED]"),
-            "the credential should be replaced in place, not dropped: {}",
-            result.stdout
-        );
-        assert!(
-            result.stderr.contains("unknown field `listen_path_typo`"),
-            "an unrelated schema diagnostic must stay visible: {}",
-            result.stderr
-        );
-        // The consumer id still identifies which resource failed.
-        assert!(result.stdout.contains("app"), "{}", result.stdout);
+        // Exit 1 is a completed schema rejection and comes back as a
+        // `ValidationResult`; any other code is an execution failure and comes
+        // back as `Error::ValidateProcess`. Redaction has already run in both
+        // cases, so neither carries the secret and both keep the unrelated
+        // diagnostic.
+        match run_validation(&config, validator.to_str().unwrap()) {
+            Ok(result) => {
+                assert_eq!(exit_code, 1);
+                assert!(!result.success);
+                assert!(
+                    !result.stdout.contains(secret),
+                    "validator stdout exposed a credential fixture"
+                );
+                assert!(
+                    !result.stderr.contains(secret),
+                    "validator stderr exposed a credential fixture"
+                );
+                assert!(
+                    result.stdout.contains("[REDACTED]"),
+                    "the credential should be replaced in place, not dropped: {}",
+                    result.stdout
+                );
+                assert!(
+                    result.stderr.contains("unknown field `listen_path_typo`"),
+                    "an unrelated schema diagnostic must stay visible: {}",
+                    result.stderr
+                );
+                // The consumer id still identifies which resource failed.
+                assert!(result.stdout.contains("app"), "{}", result.stdout);
+            }
+            Err(error) => {
+                assert_eq!(exit_code, 2);
+                let message = error.to_string();
+                assert!(
+                    message.contains("exited with code 2"),
+                    "an abnormal exit must be reported as an execution error: {message}"
+                );
+                assert!(
+                    !message.contains(secret),
+                    "validator execution error exposed a credential fixture"
+                );
+                assert!(
+                    message.contains("[REDACTED]"),
+                    "the credential should be replaced in place, not dropped: {message}"
+                );
+                assert!(
+                    message.contains("unknown field `listen_path_typo`"),
+                    "an unrelated schema diagnostic must stay visible: {message}"
+                );
+            }
+        }
     }
 }
 
@@ -176,6 +206,7 @@ fn resolved_plugin_config_secrets_are_redacted() {
     let secret = "honeycomb-team-key-must-not-be-echoed";
     let config = GatewayConfig {
         plugin_configs: vec![PluginConfig {
+            extra: Default::default(),
             id: "otel".to_string(),
             plugin_name: "otel_tracing".to_string(),
             namespace: "ferrum".to_string(),
@@ -373,6 +404,7 @@ fn consumer_config_for_standins(
 
     GatewayConfig {
         consumers: vec![Consumer {
+            extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
@@ -456,6 +488,46 @@ fn env_scrub_targets_only_ferrum_variables() {
 fn env_scrub_keeps_the_child_environment_usable() {
     let scrubbed = scrubbed_env_names(["PATH", "HOME", "LANG", "SSL_CERT_FILE"]);
     assert!(scrubbed.is_empty(), "{scrubbed:?}");
+}
+
+#[cfg(unix)]
+fn executable_validator(exit_code: i32) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("ferrum-edge-test-validator");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf '%s\\n' validator-diagnostic >&2\nexit {exit_code}\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    temp
+}
+
+#[cfg(unix)]
+#[test]
+fn validator_exit_one_is_a_completed_schema_rejection() {
+    let temp = executable_validator(1);
+    let path = temp.path().join("ferrum-edge-test-validator");
+
+    let result = run_validation(&Default::default(), path.to_str().unwrap()).unwrap();
+    assert!(!result.success);
+    assert_eq!(result.exit_code, 1);
+    assert!(result.stderr.contains("validator-diagnostic"));
+}
+
+#[cfg(unix)]
+#[test]
+fn abnormal_validator_exit_is_an_execution_error() {
+    let temp = executable_validator(2);
+    let path = temp.path().join("ferrum-edge-test-validator");
+
+    let error = run_validation(&Default::default(), path.to_str().unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exited with code 2"), "{error}");
+    assert!(error.contains("validator-diagnostic"), "{error}");
 }
 
 /// A mesh document is validated in a different ferrum-edge mode than a gateway
