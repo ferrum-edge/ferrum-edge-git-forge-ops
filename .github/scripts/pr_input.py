@@ -23,6 +23,18 @@ MAX_CHANGED_PATHS = 10_000
 MAX_LIVE_REVIEW_TARGETS = 256
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+# Kept byte-identical to NON_CONFIG_FILES / OS_ARTIFACT_FILES in
+# src/config/strict.rs (and IMPORT_MANIFEST_FILENAME in src/import/mod.rs).
+# Both gate the same resources/ and overlays/ trees on either side of the
+# trusted-review boundary, so a file the Rust loader skips must not fail here
+# and vice versa. tests/test_pr_input.py cross-checks them against the source.
+NON_CONFIG_FILES = {"README", "README.md", ".gitkeep", ".gitforgeops-import.json"}
+# OS/file-browser droppings: skipped silently, since there is nothing for an
+# author to fix and Finder re-creates .DS_Store on sight. Anything
+# config-shaped stays fatal.
+OS_ARTIFACT_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+
 class InputError(RuntimeError):
     pass
 
@@ -49,9 +61,23 @@ def _normalize_member_name(name: str) -> tuple[str, str]:
 def _is_allowed_file(relative: str) -> bool:
     path = PurePosixPath(relative)
     return (
-        len(path.parts) >= 3
+        len(path.parts) >= 2
         and path.parts[0] in {"resources", "overlays"}
         and path.suffix in {".yaml", ".yml"}
+    )
+
+
+def _is_declarative_tree_file(relative: str) -> bool:
+    parts = PurePosixPath(relative).parts
+    return len(parts) >= 2 and parts[0] in {"resources", "overlays"}
+
+
+def _is_ignored_declarative_file(relative: str) -> bool:
+    name = PurePosixPath(relative).name
+    return (
+        name.startswith("_")
+        or name in NON_CONFIG_FILES
+        or name in OS_ARTIFACT_FILES
     )
 
 
@@ -128,6 +154,22 @@ def prepare(archive: Path, output: Path, head_sha: str) -> dict[str, object]:
             if protected and not (member.isdir() or member.isfile()):
                 raise InputError(
                     f"special files are forbidden in declarative input: {relative}"
+                )
+            if (
+                member.isfile()
+                and _is_declarative_tree_file(relative)
+                and not _is_allowed_file(relative)
+            ):
+                if _is_ignored_declarative_file(relative):
+                    continue
+                raise InputError(
+                    "unsupported file in declarative input: "
+                    f"{relative} (configuration must use lowercase .yaml or .yml; "
+                    "intentionally disabled files must start with '_'; non-configuration "
+                    "files are limited to README, README.md, .gitkeep, "
+                    ".gitforgeops-import.json, or an OS artifact: "
+                    + ", ".join(sorted(OS_ARTIFACT_FILES))
+                    + ")"
                 )
             if not _is_allowed_file(relative):
                 continue

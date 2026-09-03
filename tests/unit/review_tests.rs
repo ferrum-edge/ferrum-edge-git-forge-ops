@@ -7,9 +7,11 @@ use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::review::comment_status_is_retryable;
 use gitforgeops::review::enforce_comment_delivery;
+use gitforgeops::review::enforce_required_comment_delivery;
 use gitforgeops::review::live_comparison_precondition_error;
 use gitforgeops::review::pr_comment::{
-    build_review_comment, build_review_comment_v2, render_spec_owned,
+    build_review_comment, build_review_comment_v2, build_review_comment_with_status,
+    render_spec_owned, ReviewValidationStatus, MAX_REVIEW_COMMENT_BYTES,
 };
 use gitforgeops::review::{
     enforce_live_comparison, redact_comparison_error, stale_live_view_error, STALE_LIVE_VIEW_REASON,
@@ -29,6 +31,57 @@ fn review_comment_shows_validation_fail() {
 }
 
 #[test]
+fn review_comment_renders_validator_execution_failure_as_error_never_passed() {
+    let comment = build_review_comment_with_status(
+        ReviewValidationStatus::ExecutionError,
+        "Validator execution error: binary not found",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+    assert!(comment.contains("Validation: ERROR"), "{comment}");
+    assert!(comment.contains("binary not found"), "{comment}");
+    assert!(!comment.contains("Validation: PASSED"), "{comment}");
+}
+
+#[test]
+fn review_comment_contains_backticks_in_validator_output_safely() {
+    let comment = build_review_comment_with_status(
+        ReviewValidationStatus::ExecutionError,
+        "bad value ```\n### injected heading",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("````\nbad value ```"), "{comment}");
+    assert!(comment.contains("injected heading\n````"), "{comment}");
+}
+
+#[test]
+fn review_comment_bounds_validator_output() {
+    let comment = build_review_comment_with_status(
+        ReviewValidationStatus::Rejected,
+        &"x".repeat(20_000),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(
+        comment.contains("[validator output truncated]"),
+        "{comment}"
+    );
+    assert!(comment.len() < 13_000, "{}", comment.len());
+}
+
+#[test]
 fn review_comment_includes_changes_table() {
     let diffs = vec![ResourceDiff {
         action: DiffAction::Add,
@@ -43,6 +96,51 @@ fn review_comment_includes_changes_table() {
 }
 
 #[test]
+fn review_comment_escapes_untrusted_fields_outside_validator_output() {
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Proxy".to_string(),
+        id: "row` | forged |\n### Fake pass".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![],
+    }];
+    let comment = build_review_comment(
+        true,
+        "",
+        &diffs,
+        &[],
+        &[],
+        &[],
+        Some("gateway failed\n### Forged heading @reviewers <img src=x>"),
+    );
+
+    assert!(!comment.contains("\n### Forged heading"), "{comment}");
+    assert!(!comment.contains("@reviewers"), "{comment}");
+    assert!(!comment.contains("| forged |"), "{comment}");
+    assert!(comment.contains("&#64;reviewers"), "{comment}");
+    assert!(comment.contains("&lt;img src=x&gt;"), "{comment}");
+}
+
+#[test]
+fn review_comment_preserves_table_cell_escape_after_an_input_backslash() {
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Proxy".to_string(),
+        id: r"left\|forged-cell".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![],
+    }];
+
+    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    assert!(comment.contains(r"left\\\|forged-cell"), "{comment}");
+    let change_row = comment
+        .lines()
+        .find(|line| line.contains("forged-cell"))
+        .expect("change row");
+    assert_eq!(change_row.matches('|').count(), 6, "{change_row}");
+}
+
+#[test]
 fn review_comment_includes_breaking_changes() {
     let breaking = vec![BreakingChange {
         kind: "Proxy".to_string(),
@@ -50,7 +148,7 @@ fn review_comment_includes_breaking_changes() {
         reason: "listen_path changed".to_string(),
     }];
     let comment = build_review_comment(true, "", &[], &breaking, &[], &[], None);
-    assert!(comment.contains("listen_path changed"));
+    assert!(comment.contains("listen\\_path changed"));
     assert!(comment.contains("Breaking"));
 }
 
@@ -379,6 +477,125 @@ fn review_comment_v2_omits_spec_owned_section_when_empty() {
     );
 
     assert!(!comment.contains("Spec-owned"), "{comment}");
+}
+
+#[test]
+fn review_comment_is_utf8_safe_bounded_and_reports_omissions() {
+    let diffs = (0..1_000)
+        .map(|index| ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "Consumer".to_string(),
+            id: format!("consumer-{index}-{}", "界".repeat(300)),
+            namespace: "tenant".to_string(),
+            details: (0..40)
+                .map(|field| FieldChange {
+                    field: format!("credentials.field-{field}"),
+                    old_value: "old".to_string(),
+                    new_value: "new".to_string(),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let validation = format!("error before embedded fence ``` {}", "診".repeat(10_000));
+
+    let comment = build_review_comment_v2(
+        false,
+        &validation,
+        &diffs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some("Environment: `production`"),
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(
+        comment.len() <= MAX_REVIEW_COMMENT_BYTES,
+        "{}",
+        comment.len()
+    );
+    assert!(comment.is_char_boundary(comment.len()));
+    assert!(comment.contains("omitted"), "{comment}");
+    assert!(
+        comment.contains("````\nerror before embedded fence ```"),
+        "validator-controlled backticks must remain inside a longer fence: {comment}"
+    );
+    assert!(
+        comment.contains("\n````\n\n"),
+        "validation fence must close cleanly: {comment}"
+    );
+}
+
+#[test]
+fn trusted_review_requires_comment_delivery_after_fallback() {
+    assert!(enforce_required_comment_delivery(false, "HTTP 403").is_ok());
+    let error = enforce_required_comment_delivery(true, "HTTP 403").unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("required PR comment"), "{message}");
+    assert!(message.contains("HTTP 403"), "{message}");
+}
+
+/// gitforgeops' own banner is markdown, not content. Escaping it turned
+/// ``Environment: `default` `` into a line rendering literal backslashes.
+#[test]
+fn review_comment_environment_header_renders_as_markdown_not_escaped_text() {
+    use gitforgeops::review::environment_header;
+
+    let header = environment_header("default", "Shared", "Incremental");
+    assert_eq!(
+        header,
+        "Environment: `default` · Ownership: `Shared` · Strategy: `Incremental`"
+    );
+
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some(&header),
+        &ResolveReport::default(),
+        true,
+    );
+    let first_line = comment.lines().next().unwrap();
+    assert_eq!(
+        first_line,
+        "Environment: `default` · Ownership: `Shared` · Strategy: `Incremental`"
+    );
+    assert!(
+        !comment.contains("\\`"),
+        "the header must not be escaped: {comment}"
+    );
+}
+
+/// The three values are still operator input, so each is fenced individually
+/// rather than trusted into the line.
+#[test]
+fn review_comment_environment_header_fences_hostile_environment_names() {
+    use gitforgeops::review::environment_header;
+
+    let header = environment_header("`rm -rf`\n## injected", "Shared", "Incremental");
+    assert!(!header.contains('\n'), "line breaks flattened: {header}");
+    assert!(
+        !header.contains("## injected\n"),
+        "an injected heading cannot start a line: {header}"
+    );
+    assert!(header.starts_with("Environment: "), "{header}");
+    assert!(header.contains("Ownership: `Shared`"), "{header}");
 }
 
 // --- Live-comparison failures must never publish the gateway URL -----------

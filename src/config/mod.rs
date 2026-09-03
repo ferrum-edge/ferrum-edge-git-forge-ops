@@ -4,17 +4,23 @@ pub mod loader;
 pub mod repo_config;
 pub mod resolved;
 pub mod schema;
+mod strict;
 
 pub use assembler::{
-    apply_overlay, assemble, assemble_with_namespace_filter, merge_mesh_fragments, AssembledOutput,
+    apply_overlay, apply_overlay_with_options, assemble, assemble_with_namespace_filter,
+    merge_mesh_fragments, AssembledOutput,
 };
 pub use env::{load_env_config, ApplyStrategy, EnvConfig, GatewayMode};
-pub use loader::load_resources;
+pub use loader::{load_resources, load_resources_with_options};
 pub use repo_config::{
     EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
 };
-pub use resolved::{resolve_env, validate_env_name_is_safe_path_component, ResolvedEnv};
-pub use schema::{GatewayConfig, MeshConfigSpec, Resource};
+pub use resolved::{
+    resolve_env, validate_env_name_is_safe_path_component, validate_overlay_selection, ResolvedEnv,
+    OVERLAYS_ROOT,
+};
+pub use schema::{GatewayConfig, MeshConfigSpec, PassthroughFields, Resource};
+pub use strict::LoadOptions;
 
 use std::collections::BTreeSet;
 

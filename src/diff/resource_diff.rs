@@ -1,6 +1,71 @@
 use std::collections::HashSet;
 
+use crate::config::schema::PassthroughFields;
 use crate::config::GatewayConfig;
+
+/// Exclude only unresolved broker-controlled leaves from a live comparison
+/// when the caller has no secret bundle and cannot materialize desired slots.
+///
+/// Matching Consumer credentials and PluginConfig config values are aligned
+/// leaf-by-leaf. Literal siblings, extra live entries, shape differences,
+/// adds/deletes, and every nonsecret field remain visible, so review loses no
+/// actionable drift signal beyond exact values it cannot authoritatively know.
+pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut GatewayConfig) {
+    for live in &mut actual.consumers {
+        if let Some(expected) = desired
+            .consumers
+            .iter()
+            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+        {
+            for (credential_type, desired_value) in &expected.credentials {
+                if let Some(live_value) = live.credentials.get_mut(credential_type) {
+                    mask_placeholder_leaves(desired_value, live_value);
+                }
+            }
+        }
+    }
+
+    for live in &mut actual.plugin_configs {
+        if let Some(expected) = desired
+            .plugin_configs
+            .iter()
+            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+        {
+            mask_placeholder_leaves(&expected.config, &mut live.config);
+        }
+    }
+}
+
+fn mask_placeholder_leaves(desired: &serde_json::Value, live: &mut serde_json::Value) {
+    match (desired, live) {
+        (serde_json::Value::String(expected), serde_json::Value::String(actual))
+            if matches!(crate::secrets::parse_placeholder(expected), Some(Ok(_))) =>
+        {
+            *actual = expected.clone();
+        }
+        (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+            for (key, expected_child) in expected {
+                if let Some(actual_child) = actual.get_mut(key) {
+                    mask_placeholder_leaves(expected_child, actual_child);
+                }
+            }
+        }
+        (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+            for (expected_child, actual_child) in expected.iter().zip(actual.iter_mut()) {
+                mask_placeholder_leaves(expected_child, actual_child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Diff fields whose values must never be rendered verbatim to stdout/logs.
+pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
+    matches!(
+        (kind, field),
+        ("Consumer", "credentials") | ("PluginConfig", "config")
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffAction {
@@ -278,7 +343,7 @@ struct CollectionContext<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn diff_collection<T: serde::Serialize>(
+fn diff_collection<T: serde::Serialize + PassthroughFields>(
     desired: &[T],
     actual: &[T],
     kind: &str,
@@ -312,7 +377,7 @@ fn diff_collection<T: serde::Serialize>(
                     });
                     continue;
                 }
-                let details = compare_fields(desired_res, actual_res);
+                let details = compare_fields(*desired_res, *actual_res);
                 if !details.is_empty() {
                     result.diffs.push(ResourceDiff {
                         action: DiffAction::Modify,
@@ -403,7 +468,22 @@ fn diff_collection<T: serde::Serialize>(
     }
 }
 
-fn compare_fields<T: serde::Serialize>(desired: &T, actual: &T) -> Vec<FieldChange> {
+/// Field-level delta between one desired and one live resource.
+///
+/// Unknown top-level fields (`config::schema::PassthroughFields`) are part of
+/// the comparison in one direction only. A key the *repo* declares is compared
+/// like any other field: declaring it is how a repo takes ownership of it, and
+/// export/apply push it. A key that only the *live* resource carries — a field
+/// a newer gateway invented that this client does not model and the repo never
+/// named — is skipped. Reporting it would turn every gateway upgrade into
+/// permanent, unfixable drift on every resource: `apply` cannot clear it (the
+/// gateway re-adds its own field) and `drift-check --exit-on-drift` would never
+/// go green again. Same rule as unmanaged resources: what the repo never
+/// claimed, the repo does not reconcile.
+fn compare_fields<T: serde::Serialize + PassthroughFields>(
+    desired: &T,
+    actual: &T,
+) -> Vec<FieldChange> {
     let desired_val = serde_json::to_value(desired).unwrap_or_default();
     let actual_val = serde_json::to_value(actual).unwrap_or_default();
 
@@ -431,6 +511,10 @@ fn compare_fields<T: serde::Serialize>(desired: &T, actual: &T) -> Vec<FieldChan
 
         for (key, a_val) in a_map {
             if key == "created_at" || key == "updated_at" {
+                continue;
+            }
+            // Live-only unmodelled field the repo never declared — not drift.
+            if actual.passthrough().contains_key(key) && !desired.passthrough().contains_key(key) {
                 continue;
             }
             if !d_map.contains_key(key) {

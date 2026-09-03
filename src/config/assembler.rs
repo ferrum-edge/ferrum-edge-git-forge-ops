@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
 use super::schema::{BackendScheme, GatewayConfig, MeshConfigSpec, Resource};
+use super::strict::{self, LoadOptions};
 
 /// Everything one load+assemble pass produces.
 ///
@@ -449,8 +450,44 @@ pub fn apply_overlay(
     base: &mut [(String, Resource)],
     overlay_dir: &Path,
 ) -> crate::error::Result<()> {
-    if !overlay_dir.is_dir() {
-        return Ok(());
+    apply_overlay_with_options(base, overlay_dir, LoadOptions::STRICT)
+}
+
+/// [`apply_overlay`] with an explicit unknown-field policy.
+///
+/// The merged document is re-validated through the strict loader, so an overlay
+/// is free to *set* an unknown top-level field (or override one the base
+/// declared) on exactly the same terms as the base tree.
+pub fn apply_overlay_with_options(
+    base: &mut [(String, Resource)],
+    overlay_dir: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<()> {
+    let root_metadata = match std::fs::symlink_metadata(overlay_dir) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(crate::error::Error::Config(format!(
+                "configured overlay directory does not exist or is not a directory: {}",
+                overlay_dir.display()
+            )));
+        }
+        Err(source) => {
+            return Err(crate::error::Error::FileRead {
+                path: overlay_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if root_metadata.file_type().is_symlink() {
+        return Err(crate::error::Error::ConfigSymlink(
+            overlay_dir.to_path_buf(),
+        ));
+    }
+    if !root_metadata.is_dir() {
+        return Err(crate::error::Error::Config(format!(
+            "configured overlay directory does not exist or is not a directory: {}",
+            overlay_dir.display()
+        )));
     }
 
     let mut base_index = HashMap::new();
@@ -466,11 +503,15 @@ pub fn apply_overlay(
 
     let overlay_fragments = load_overlay_fragments(overlay_dir)?;
 
+    let mut overlay_targets: HashMap<ResourceKey, PathBuf> = HashMap::new();
     for overlay in overlay_fragments {
         let overlay_id = overlay_fragment_id(&overlay);
 
         if overlay_id.is_empty() {
-            continue;
+            return Err(crate::error::Error::Config(format!(
+                "overlay file {} must identify a non-empty resource id (gateway kinds use `spec.id`; mesh fragments use top-level `id` or a non-empty file stem)",
+                overlay.path.display()
+            )));
         }
 
         // A mesh fragment's namespace is its directory, full stop — there is
@@ -486,6 +527,16 @@ pub fn apply_overlay(
             namespace: overlay_ns,
             id: overlay_id,
         };
+        if let Some(previous) = overlay_targets.insert(overlay_key.clone(), overlay.path.clone()) {
+            return Err(crate::error::Error::Config(format!(
+                "duplicate overlay target {}/{}/{} in {} and {}",
+                overlay_key.namespace,
+                overlay_key.kind,
+                overlay_key.id,
+                previous.display(),
+                overlay.path.display()
+            )));
+        }
 
         match base_index
             .get(&overlay_key)
@@ -496,7 +547,7 @@ pub fn apply_overlay(
                 let base_value = serde_json::to_value(&*base_resource)?;
                 let merged =
                     deep_merge_values(base_value, overlay.value, &mut Vec::new(), overlay.kind);
-                *base_resource = serde_json::from_value(merged)?;
+                *base_resource = strict::resource_from_json_value(merged, &overlay.path, options)?;
 
                 if *base_ns == "ferrum" && overlay_key.namespace != "ferrum" {
                     *base_ns = overlay_key.namespace;
@@ -508,7 +559,7 @@ pub fn apply_overlay(
                         "{}/{}/{}",
                         overlay_key.namespace, overlay_key.kind, overlay_key.id
                     ),
-                    path: overlay_dir.to_path_buf(),
+                    path: overlay.path,
                 });
             }
         }
@@ -525,6 +576,7 @@ struct OverlayFragment {
     /// File stem, used as the fragment id for kinds whose documents carry no
     /// `spec.id` (mesh).
     stem: String,
+    path: PathBuf,
     value: serde_json::Value,
 }
 
@@ -563,54 +615,111 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
             path: overlay_dir.to_path_buf(),
             source,
         })?;
+    let mut namespace_entries = namespace_entries
+        .map(|entry| {
+            entry.map_err(|source| crate::error::Error::FileRead {
+                path: overlay_dir.to_path_buf(),
+                source,
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    namespace_entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for ns_entry in namespace_entries {
-        let ns_entry = ns_entry.map_err(|source| crate::error::Error::FileRead {
-            path: overlay_dir.to_path_buf(),
-            source,
-        })?;
-
         let ns_path = ns_entry.path();
-        if !ns_path.is_dir() {
+        let ns_type = ns_entry
+            .file_type()
+            .map_err(|source| crate::error::Error::FileRead {
+                path: ns_path.clone(),
+                source,
+            })?;
+        if ns_type.is_symlink() {
+            return Err(crate::error::Error::ConfigSymlink(ns_path));
+        }
+        if !ns_type.is_dir() {
+            if ns_type.is_file() {
+                if strict::enabled_yaml_file(&ns_path, "overlay tree")? {
+                    return Err(crate::error::Error::Config(format!(
+                        "YAML file is outside a namespace directory in overlay tree: {}",
+                        ns_path.display()
+                    )));
+                }
+            } else {
+                return Err(crate::error::Error::Config(format!(
+                    "special filesystem entry is forbidden in overlay tree: {}",
+                    ns_path.display()
+                )));
+            }
             continue;
         }
 
         let namespace = ns_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("ferrum")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "overlay namespace directory is not valid UTF-8 or is empty: {}",
+                    ns_path.display()
+                ))
+            })?
             .to_string();
 
-        for (subdir, kind) in [
-            ("proxies", "Proxy"),
-            ("consumers", "Consumer"),
-            ("upstreams", "Upstream"),
-            ("plugins", "PluginConfig"),
-            ("mesh", "MeshConfig"),
-        ] {
+        strict::validate_namespace_tree(&ns_path, "overlay tree")?;
+
+        for (subdir, kind) in strict::RESOURCE_SUBDIRECTORIES {
             let subdir_path = ns_path.join(subdir);
-            if !subdir_path.is_dir() {
-                continue;
+            let subdir_metadata = match std::fs::symlink_metadata(&subdir_path) {
+                Ok(metadata) => metadata,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(crate::error::Error::FileRead {
+                        path: subdir_path,
+                        source,
+                    })
+                }
+            };
+            if subdir_metadata.file_type().is_symlink() {
+                return Err(crate::error::Error::ConfigSymlink(subdir_path));
+            }
+            if !subdir_metadata.is_dir() {
+                return Err(crate::error::Error::ConfigNotDirectory(subdir_path));
             }
 
-            for entry in WalkDir::new(&subdir_path)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
+            let mut paths = Vec::new();
+            for entry in WalkDir::new(&subdir_path).follow_links(false) {
+                let entry = entry.map_err(|source| {
+                    let path = source
+                        .path()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| subdir_path.clone());
+                    crate::error::Error::WalkDir { path, source }
+                })?;
                 let path = entry.path();
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext != "yaml" && ext != "yml" {
+                if entry.file_type().is_symlink() {
+                    return Err(crate::error::Error::ConfigSymlink(path.to_path_buf()));
+                }
+                if !entry.file_type().is_file() {
+                    if !entry.file_type().is_dir() {
+                        return Err(crate::error::Error::Config(format!(
+                            "special filesystem entry is forbidden in overlay tree: {}",
+                            path.display()
+                        )));
+                    }
                     continue;
                 }
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if file_name.starts_with('_') {
+                if !strict::enabled_yaml_file(path, "overlay tree")? {
                     continue;
                 }
 
-                let contents = std::fs::read_to_string(path).map_err(|source| {
+                paths.push(path.to_path_buf());
+            }
+            paths.sort();
+
+            for path in paths {
+                let contents = std::fs::read_to_string(&path).map_err(|source| {
                     crate::error::Error::FileRead {
-                        path: path.to_path_buf(),
+                        path: path.clone(),
                         source,
                     }
                 })?;
@@ -619,20 +728,52 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
                 let yaml_value: serde_yaml::Value =
                     serde_yaml::from_str(&contents).map_err(|source| {
                         crate::error::Error::YamlParse {
-                            path: path.to_path_buf(),
+                            path: path.clone(),
                             source,
                         }
                     })?;
+                strict::reject_non_string_keys(&yaml_value, &path)?;
                 let json_value: serde_json::Value =
                     serde_json::to_value(yaml_value).map_err(crate::error::Error::SerdeJson)?;
-                if let Some(declared_kind) = json_value.get("kind").and_then(|v| v.as_str()) {
-                    if declared_kind != kind {
-                        return Err(crate::error::Error::Config(format!(
-                            "overlay file {} declares kind {declared_kind:?} but is under {subdir}/ ({kind})",
+                let object = json_value.as_object().ok_or_else(|| {
+                    crate::error::Error::Config(format!(
+                        "overlay file {} must contain a YAML object",
+                        path.display()
+                    ))
+                })?;
+                let declared_kind = object
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        crate::error::Error::Config(format!(
+                            "overlay file {} must declare string field `kind: {kind}`",
                             path.display()
-                        )));
-                    }
+                        ))
+                    })?;
+                if declared_kind != kind {
+                    return Err(crate::error::Error::Config(format!(
+                        "overlay file {} declares kind {declared_kind:?} but is under {subdir}/ ({kind})",
+                        path.display()
+                    )));
                 }
+                if !object.get("spec").is_some_and(serde_json::Value::is_object) {
+                    return Err(crate::error::Error::Config(format!(
+                        "overlay file {} must contain an object field `spec`",
+                        path.display()
+                    )));
+                }
+                let allowed_wrapper_keys: &[&str] = if kind == "MeshConfig" {
+                    &["kind", "id", "spec"]
+                } else {
+                    &["kind", "spec"]
+                };
+                strict::reject_unknown_paths(
+                    &path,
+                    object
+                        .keys()
+                        .filter(|key| !allowed_wrapper_keys.contains(&key.as_str()))
+                        .map(|key| format!(".{key}")),
+                )?;
 
                 results.push(OverlayFragment {
                     namespace: namespace.clone(),
@@ -642,6 +783,7 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
                         .and_then(|stem| stem.to_str())
                         .unwrap_or_default()
                         .to_string(),
+                    path,
                     value: json_value,
                 });
             }

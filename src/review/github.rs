@@ -5,8 +5,29 @@ use crate::config::EnvConfig;
 
 const MAX_COMMENT_RETRIES: u32 = 2;
 
+/// Which GitHub comment-POST failures are worth another attempt.
+///
+/// Only the transient-by-contract statuses: a request timeout, a rate-limit
+/// or secondary-limit rejection, and an explicit "unavailable". Everything
+/// else — 401/403 (bad token), 404 (wrong repo or PR), 422 (body rejected) —
+/// is deterministic and retrying only delays the fallback path.
 pub fn comment_status_is_retryable(status: u16) -> bool {
     matches!(status, 408 | 429 | 503)
+}
+
+/// Promote a PR-comment delivery failure to a trusted-review failure after
+/// the caller has written its step-summary/stdout fallback. Secretless and
+/// fork reviews intentionally retain best-effort delivery.
+pub fn enforce_required_comment_delivery(
+    require_live: bool,
+    delivery_error: &str,
+) -> crate::error::Result<()> {
+    if require_live {
+        return Err(crate::error::Error::Config(format!(
+            "trusted live review could not post its required PR comment: {delivery_error}"
+        )));
+    }
+    Ok(())
 }
 
 pub async fn post_pr_comment(
@@ -29,9 +50,15 @@ pub async fn post_pr_comment(
     // Same-shape bounds as the admin client: connect + total request.
     // Keeps `gitforgeops review --pr N` from hanging forever if GitHub's
     // API is slow or unreachable.
+    //
+    // Redirects are refused outright: `reqwest` replays the `Authorization`
+    // header on a same-host redirect, and a 3xx off `POST .../comments` is
+    // never a legitimate GitHub response, so following one would only ever
+    // hand the token somewhere it was not minted for.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
@@ -55,7 +82,10 @@ pub async fn post_pr_comment(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .map(|seconds| Duration::from_secs(seconds.min(30)));
-        if status < 400 {
+        // Only a 2xx is delivery. With redirects disabled a 3xx arrives here
+        // as an un-followed response with no comment created, so it must fail
+        // loudly rather than read as success.
+        if (200..=299).contains(&status) {
             return Ok(());
         }
         let resp_body = resp

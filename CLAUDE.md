@@ -23,7 +23,8 @@ gitforgeops diff [--exit-on-drift]                        # Compare desired vs l
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
-gitforgeops import --from-api | --from-file PATH [--output-dir DIR]  # --from-api is a flag, not a value
+gitforgeops import --from-api | --from-file PATH --output-dir DIR \
+  [--credential-bundle-output PRIVATE_PATH]               # --output-dir required + must be empty; API import requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -57,8 +58,12 @@ overlay YAML, copies environment/policy routing from the protected branch, and
 runs a trusted binary with `FERRUM_NAMESPACE` set to one protected-branch
 resource namespace per job, intersected with the environment's protected
 namespace scope. `review --require-live` fails that job when comparison is
-unavailable. Environments with `live_review: false` are removed before the
-Environment-bound matrix, which is required for file mode. Fork PRs and new/remapped namespaces never enter the privileged
+unavailable or its required PR comment cannot be delivered. Review markdown is
+bounded below GitHub's API limit, and unresolved credential values are excluded
+from live comparison when no bundle is available without hiding other Consumer
+fields. Environments with `live_review: false` are removed before the
+Environment-bound matrix, which is required for file mode. Fork PRs and
+new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in
 `rust-toolchain.toml`; external Actions use full commit SHAs.
 
@@ -88,6 +93,27 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               mesh doc → FERRUM_MESH_FILE_OUTPUT_PATH)
 ```
 
+Two things happen at the `validate` hand-off that exist nowhere else in the
+pipeline, both because resolution has already run by then:
+
+- `validate::with_validation_standins` replaces credential leaves that are
+  *still* `${gh-env-secret:…}` placeholders with a deterministic fake
+  (`gitforgeops-validation-standin-<64 hex>`, or `hmac_sha256:<64 hex>` for a
+  `basicauth` `password_hash`) derived from the slot path. `${gh-env-secret:alloc=generate}`
+  is 30 characters and ferrum-edge's floor for `jwt`/`hmac_auth` is 32, so a
+  bundle-less fork PR would otherwise fail on the placeholder rather than on
+  the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
+  no other output path ever sees a stand-in.
+- `secrets::SecretScrubber` collects every non-placeholder Consumer credential
+  leaf (minus the identity fields `basicauth[].username` /
+  `mtls_auth[].identity`) and every `sensitive_string_paths` plugin-config
+  leaf, and removes those exact byte sequences — plus their base64 and
+  percent-encoded forms — from the validator child's stdout/stderr, replacing
+  each with `[REDACTED]`. Non-credential diagnostics stay intact. Blanket
+  suppression survives only as a fallback for a secret shorter than
+  `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced without
+  mangling the report.
+
 ### Gateway Modes
 
 - **api** — push to admin REST (POST creates, PUT updates, DELETE removes, POST `/batch` for pure-add namespaces, or POST `/restore` for full-replace)
@@ -98,11 +124,17 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 ### Apply Strategies
 
 - **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → proxy → plugin config, then deletes in reverse). Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to per-resource creates on 501.
-- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a multi-namespace exclusive env can partial-fail if namespace N's restore errors after namespace N-1's succeeded, and the aggregate error enumerates both). The live `api_specs` / `gateway_trust_bundles` sections are read from `/backup` and carried through the restore verbatim unless `--confirm-api-spec-deletion` is passed — a bare restore reads as "delete every API spec in this namespace" and the gateway answers 409.
+- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. The body carries the repo's desired rows **plus the complete live spec-owned graph**: `/restore` validates `api_specs.items` against the tagged proxies/upstreams/plugin configs in the same payload and rejects either half on its own, and it re-creates the documents verbatim rather than re-extracting resources from them, so carrying both cannot duplicate rows. An **empty** spec section and all `gateway_trust_bundles` are omitted instead — the gateway reads `items: []` as an intentional wipe but an absent section as "count the live specs and answer 409", and an absent trust section as "leave trust exactly as it is", so omission is what preserves a concurrent update. `--confirm-api-spec-deletion` is the only path that drops the graph (trust bundles still survive). A graph that cannot be proven complete, a repo/spec ID conflict, cached data, or an unfamiliar top-level backup section fails before mutation.
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
-A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks prune computation unless `--allow-large-prune` acknowledges the stale view. After apply, a best-effort `GET /cluster` prints a convergence line.
+A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate.
+
+Create and batch POST error responses are never retried blindly. An ambiguous outcome is reconciled through an authoritative (non-cached) backup, and the readback has three severities (`LiveMatch`): the **exact** row live → an idempotent PUT declares repository ownership and the create is recorded; the row **absent** → the write provably did not commit, so it is an ordinary per-resource error and the rest of the run continues; the row **present but different**, or no usable verification at all → a run-stopping `AmbiguousMutation`. `resource_values_match` is a subset test (desired ⊆ live, minus server timestamps) so a gateway-populated optional does not read as a foreign row.
+
+A separate write-ahead `pending_creates` journal closes the process-crash window without granting deletion authority: exact evidence triggers that PUT, an absent row stays retryable. A live row whose declaration disappeared is **forgotten with a warning** and handed to the ordinary rules for the mode — shared reports it as unmanaged and never deletes it, exclusive prunes it under the large-prune guard, full_replace does not journal at all. Nothing here may fail closed: CI is the only writer of `.state/<env>.json` and `state-guard.yml` blocks the hand edit a wedged journal would demand. The journal survives a process crash, because `apply-on-merge.yml` commits state with `if: !cancelled()`; it does **not** survive workflow cancellation or runner loss, which leaves the row live and unjournaled for the next run's ordinary diff to pick up.
+
+After apply, a best-effort `GET /cluster` prints a convergence line.
 
 ### Mesh config
 
@@ -111,7 +143,7 @@ A `GET /health` preflight runs before the first mutation so a read-only plane fa
 ### Namespace Handling
 
 - Directory-inferred: `resources/<ns>/…` → resource `namespace: <ns>` unless the spec overrides with a non-default value.
-- `FERRUM_NAMESPACE` filters everything (load, diff, apply, import). When unset, all namespaces round-trip.
+- `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
 
 ### Multi-Environment (repo config)
@@ -173,7 +205,11 @@ removes a namespace's last resource orphans it on the gateway forever.
 of `namespace:Kind:id` keys from the state file. `Some(set)` = shared mode,
 `None` = exclusive. Large-prune guard refuses applies that would delete more
 than `ownership.large_prune_threshold_percent` of the managed set unless
-`--allow-large-prune` is passed.
+`--allow-large-prune` is passed. Pending-create keys widen recovery namespace
+scope but are excluded from this set until a successful idempotent update
+asserts repository ownership. Before that ratio is computed, authoritative
+backup evidence removes managed keys absent from both desired and live state so
+externally deleted rows cannot dilute the denominator forever.
 
 #### Spec-owned tier
 
@@ -189,7 +225,11 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
 - Never emitted as a Modify. If the repo also declares the same
   `(namespace, kind, id)`, that is reported as a **conflict**
   (`DiffResult::spec_conflicts()`): two owners writing one row, and the spec
-  importer wins on its next run.
+  importer wins on its next run. A conflict takes the whole **namespace** out
+  of the run (`apply::spec_owned_conflict_block`) — skipping just the row and
+  exiting green would falsely report convergence — but only that namespace:
+  every other one still reconciles, and the reason lands in
+  `ApplyResult::errors` so the run exits non-zero with the conflict named.
 - Never emitted as a Delete, except in **exclusive** mode with
   `apply --confirm-api-spec-deletion` (`DiffOptions::prune_spec_owned`).
   Otherwise apply skips them with a per-resource message and counts them in
@@ -200,8 +240,10 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
   `ownership.drift_report`: a repo fighting the spec importer is a correctness
   problem, not drift noise.
 
-The same flag also drives `full_replace`, where `/restore` would otherwise wipe
-the namespace's `api_specs` section (see Apply Strategies).
+`full_replace` does not delete the graph either: the restore body carries the
+live spec-owned rows and the live `api_specs` section through unchanged, which
+is what the gateway's restore validator requires. `--confirm-api-spec-deletion`
+is the only path that drops them (see Apply Strategies).
 
 ### Policy framework
 
@@ -214,6 +256,14 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `forbid_tls_verify_disabled`, `allowed_proxy_plugins`, `allowed_backend_domains`,
 `waf_enforcement`, `require_ai_guardrails`, `rate_limit_completeness`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
+
+Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
+is schema-first for the 82 builtins and heuristics-only for anything else: a
+non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
+flag, and the leaves they did not flag come back as
+`ImportResult::unbrokered_plugin_config` for a loud per-plugin review notice.
+`basicauth[].username` and `mtls_auth[].identity` are never brokered in either
+path (`resolver::is_identity_credential_leaf`).
 
 Plugin-name knowledge lives in `src/plugin_catalog.rs` (82 builtins, retired and
 reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
@@ -290,26 +340,29 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 - `src/main.rs` — async Tokio entry, command dispatch
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
-- `src/config/` — `schema.rs` (permissive serde mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and `MeshConfigSpec`), `loader.rs` (walks `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (overlay deep-merge via `serde_json::Value`, `merge_mesh_fragments`, `normalize_consumer_credentials`), `env.rs` (process-env vars), `repo_config.rs` (`.gitforgeops/config.yaml`), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
+- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization), `env.rs` (strict process-env parsing), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs`, `best_practice.rs`
-- `src/apply/` — `api_target.rs` (incremental + full_replace, dependency ordering, `/batch` fast path, ownership-aware delete filter, spec-owned skip messages), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
+- `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
-- `src/policy/` — `config.rs` (yaml + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
-- `src/secrets/` — `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
-- `src/http_client.rs` — `AdminClient` wrapping reqwest; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + `classify_retry` (408/429/5xx retry, 501 and `applied:false` never), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
-- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
+- `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
+- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
+- `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
+- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
-- `src/import/` — `from_api.rs` (walks namespaces, pulls `/backup`), `from_file.rs`, `mod.rs::split_config` (emits per-resource YAML; reports skipped `api_specs` / trust-bundle sections instead of dropping them silently)
-- `src/state.rs` — `.state/<env>.json` tracks applied hashes, credential metadata, shard count, override history
+- `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections)
+- `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/error.rs` — unified `Error` enum via `thiserror`
 
 ### Key Design Principles
 
-1. **Permissive schema** — Serde types mirror Ferrum Edge but accept unknown fields. The gateway (via `validate`) is the authoritative schema.
+1. **Fail-closed typed schema, explicit opaque islands** — wrapper/resource/nested keys unknown to this companion version are rejected with source file + YAML path before lossy re-serialization. Intentionally free-form plugin `config`, credential maps, and per-item mesh values round-trip unchanged to the authoritative gateway validator.
+   The one escape hatch is `FERRUM_ALLOW_UNKNOWN_FIELDS=true` (`config::LoadOptions`, threaded from `main` — never read from the process env inside the parse path): unknown **top-level** `spec` fields land in a `#[serde(flatten)]` `extra: BTreeMap` (`schema::PassthroughFields`) and flow through overlay merge → export → diff → apply verbatim, with one `Warning:` per file on **stderr** (stdout carries the exported YAML). Nested unknowns stay fatal in both modes — `serde_ignored` still sees them, because `flatten` only intercepts keys the struct did not claim. A pass-through key present only on the *live* side is not drift (`compare_fields` skips it); declaring a key in the repo is how the repo takes ownership of it.
+   Two corollaries of the same no-silent-rewrites rule: YAML merge keys (`<<:`) are unsupported and surface as unknown field `.spec.<<`, and opaque islands are **JSON-shaped**, so a non-string YAML mapping key is rejected (`strict::reject_non_string_keys`) rather than stringified.
+   Deterministic output depends on this too: every map serialized into the exported document or an API body is a `BTreeMap`. `HashMap` re-seeds `RandomState` per instance, so the same input would export different bytes every run.
 2. **Path-component sanitization** — resource `namespace` and `id` flow into filesystem paths during `import`. `import::safe_path_component` rejects `..`, `/`, `\`, null bytes, and empty strings before `Path::join` to prevent traversal.
-3. **Deterministic state hashes** — resources hash through `serde_json::Value` first (BTreeMap-backed in default builds) so `HashMap` field ordering doesn't produce false-positive drift in `.state/<env>.json`.
+3. **No public credential oracles** — the state ledger stores only managed-resource keys plus a constant marker and non-secret credential delivery metadata. It never hashes resolved Consumers or credential values.
 4. **Namespace-scoped operations** — every API call, diff entry, and breaking-change lookup keys on `(namespace, id)`, never `id` alone.
 5. **Partial-failure visibility** — incremental apply reports per-resource errors via `ApplyResult`; failures don't abort the whole run.
 
@@ -323,25 +376,29 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_ADMIN_JWT_ROLE` (default `admin`) — `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only
 - `FERRUM_ADMIN_JWT_AUDIENCE` (default unset) — `aud` is emitted only when set; a gateway with no audience rejects tokens carrying it
 - `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`) — must be within the gateway's `FERRUM_ADMIN_JWT_MAX_TTL`
-- `FERRUM_NAMESPACE` (filter; default = all namespaces)
+- `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace)
+- `FERRUM_ALLOW_UNKNOWN_FIELDS` (default `false`) — keep unknown top-level `spec` fields verbatim instead of rejecting them; nested unknowns stay fatal. For a gateway newer than this release.
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)
-- `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge)
+- `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge; a configured missing directory is fatal — `resolved::validate_overlay_selection` reports it up front naming the environment, the overlay and the declaring file)
 - `FERRUM_EDGE_BINARY_PATH` (default `ferrum-edge` on `$PATH`)
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)
 - `FERRUM_MESH_FILE_OUTPUT_PATH` (default `./assembled/mesh.yaml`) — standalone `{version, mesh}` document; separate file from the gateway doc, written by `export` and file-mode `apply` whenever the repo declares any `MeshConfig`
-- `FERRUM_TLS_NO_VERIFY` (dev only)
+- `FERRUM_TLS_NO_VERIFY` (dev only; accepted values `true|false|1|0`)
 - `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` — base64-encoded PEM. mTLS requires BOTH cert and key; setting only one is rejected.
 - `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` (default `10`) — TCP/TLS handshake cap
 - `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` (default `60`) — end-to-end request cap; raise for large `/backup` or slow `/restore`
 - `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` (default `10`) — same shape, for `gitforgeops review --pr N`
 - `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` (default `30`) — GitHub API call is small; 30s is plenty
-- `FERRUM_GATEWAY_MAX_RETRIES` (default `3`) — retries on connect errors, 408, 429, 500/502/503/504; exponential backoff 500ms·2^n capped at 8s, or `Retry-After` (capped 30s) when present. NOT retried: timeouts (ambiguous state), 501, `applied:false` bodies, `/restore` 500 with `rollback: incomplete|unknown_outcome`.
+- `FERRUM_GATEWAY_MAX_RETRIES` (default `3`) — retries connection-establishment failures and transient responses for reads/idempotent PUT/DELETE calls; exponential backoff 500ms·2^n capped at 8s, or `Retry-After` (capped 30s). Create/batch POST responses are never retried; restore retries only an explicit `503 failure_class=connectivity` pre-commit failure.
+
+Absent/blank env values use defaults; every present invalid enum, boolean, or integer fails before loading resources or credentials. `plan` / `review` treat validator execution failure as `ERROR` and return nonzero, never as a passed/skipped validation.
 
 ## Testing
 
 - `tests/unit_tests.rs` is the single integration test binary; submodules live under `tests/unit/*.rs` and register in `tests/unit/mod.rs`.
-- Fixtures under `tests/fixtures/` (`simple-config/`, `overlay-test/`).
+- Fixtures under `tests/fixtures/` (`simple-config/`, `overlay-test/`, `companion-schema/`).
+- `companion-schema/` holds one file per kind populating **every** field mirrored in `src/config/schema.rs`. `tests/unit/companion_schema_tests.rs` loads it strictly, assembles it, round-trips it through export, and — by reading the struct definitions out of `schema.rs` — fails when a newly mirrored field is not exercised there. Add new mirrored fields to that fixture in the same PR.
 - New test file: create `tests/unit/<name>.rs` AND add `mod <name>;` to `tests/unit/mod.rs`.
 - `tempfile` crate for filesystem tests.
 - No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking.

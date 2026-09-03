@@ -52,23 +52,36 @@ pub enum Commands {
         auto_approve: bool,
         /// Allow apply even when the plan would delete more than
         /// `ownership.large_prune_threshold_percent` of managed resources.
-        /// Also acknowledges pruning from a stale (cached) gateway view.
+        /// Does not bypass the stale (cached) gateway-view safety gate.
         #[arg(long)]
         allow_large_prune: bool,
-        /// `full_replace` only: delete the namespace's API specs instead of
-        /// carrying them through the restore untouched. Destructive — API
-        /// specs are managed via the admin API and have no representation in
-        /// this repo, so without this flag `apply` preserves them.
+        /// Allow deleting API-spec-owned rows. In `full_replace`, drops the
+        /// namespace's API specs instead of carrying their graph through; in
+        /// exclusive incremental mode, permits pruning tagged resources.
+        /// Destructive: without this flag `apply` preserves them.
         #[arg(long)]
         confirm_api_spec_deletion: bool,
     },
     Import {
+        /// Import one API namespace. Requires FERRUM_NAMESPACE or an
+        /// environment namespace filter so claim-scoped gateways cannot
+        /// mistake an unauthorized empty namespace listing for success.
         #[arg(long, conflicts_with = "from_file")]
         from_api: bool,
         #[arg(long, conflicts_with = "from_api")]
         from_file: Option<String>,
-        #[arg(long, default_value = "./resources")]
+        /// Destination for the imported resource tree. Required and with no
+        /// default: `import` refuses a non-empty destination, and this repo
+        /// ships `_example.yaml` files under `resources/`, so a `./resources`
+        /// default could only ever fail. Import into an empty scratch
+        /// directory, review it, then move the tree into `resources/`.
+        #[arg(long, value_name = "DIR")]
         output_dir: String,
+        /// Required when the source contains credentials. Writes canonical
+        /// slot-to-value bundles atomically at mode 0600; must be outside the
+        /// imported resource tree and every Git worktree.
+        #[arg(long, value_name = "PATH")]
+        credential_bundle_output: Option<String>,
     },
     Review {
         #[arg(long)]

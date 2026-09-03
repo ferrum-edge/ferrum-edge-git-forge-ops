@@ -16,6 +16,41 @@ struct SshKey {
     key: String,
 }
 
+/// Age-encrypt bytes for a parsed SSH recipient.
+///
+/// Kept separate from GitHub key discovery so the supported Ed25519 and RSA
+/// public-recipient paths can be exercised without network access. This
+/// operation uses only public key material; gitforgeops never accepts an SSH
+/// private key and never performs RSA signing or decryption.
+pub fn encrypt_for_ssh_recipient(
+    recipient: &Recipient,
+    value: &[u8],
+) -> crate::error::Result<String> {
+    let recipients: [&dyn age::Recipient; 1] = [recipient];
+    let encryptor = age::Encryptor::with_recipients(recipients.into_iter())
+        .map_err(|e| crate::error::Error::Config(format!("age encryptor init: {e}")))?;
+
+    let mut out = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(
+            age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor)
+                .map_err(|e| crate::error::Error::HttpClient(format!("age armor: {e}")))?,
+        )
+        .map_err(|e| crate::error::Error::HttpClient(format!("age wrap: {e}")))?;
+    writer
+        .write_all(value)
+        .map_err(|e| crate::error::Error::HttpClient(format!("age write: {e}")))?;
+    let armored = writer
+        .finish()
+        .map_err(|e| crate::error::Error::HttpClient(format!("age finish: {e}")))?;
+    armored
+        .finish()
+        .map_err(|e| crate::error::Error::HttpClient(format!("age armor finish: {e}")))?;
+
+    String::from_utf8(out)
+        .map_err(|e| crate::error::Error::HttpClient(format!("age output was not UTF-8: {e}")))
+}
+
 /// Fetch the PR author's SSH public keys from GitHub and age-encrypt `value`
 /// to the first compatible key.
 ///
@@ -58,28 +93,7 @@ pub async fn deliver_to_author(
 
         let fingerprint = fingerprint_for(trimmed).unwrap_or_else(|| "unknown".to_string());
 
-        let recipients: [&dyn age::Recipient; 1] = [&recipient];
-        let encryptor = age::Encryptor::with_recipients(recipients.into_iter())
-            .map_err(|e| crate::error::Error::Config(format!("age encryptor init: {e}")))?;
-
-        let mut out = Vec::new();
-        let mut writer = encryptor
-            .wrap_output(
-                age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor)
-                    .map_err(|e| crate::error::Error::HttpClient(format!("age armor: {e}")))?,
-            )
-            .map_err(|e| crate::error::Error::HttpClient(format!("age wrap: {e}")))?;
-        writer
-            .write_all(value)
-            .map_err(|e| crate::error::Error::HttpClient(format!("age write: {e}")))?;
-        let armored = writer
-            .finish()
-            .map_err(|e| crate::error::Error::HttpClient(format!("age finish: {e}")))?;
-        armored
-            .finish()
-            .map_err(|e| crate::error::Error::HttpClient(format!("age armor finish: {e}")))?;
-
-        let encoded = String::from_utf8(out).unwrap_or_default();
+        let encoded = encrypt_for_ssh_recipient(&recipient, value)?;
         return Ok(Some(DeliveryResult {
             login: login.to_string(),
             key_fingerprint: fingerprint,

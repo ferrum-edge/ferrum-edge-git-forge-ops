@@ -5,8 +5,7 @@ use rand::Rng;
 use reqwest::Client;
 
 use super::bundle::{
-    bundle_hash, merge_bundles, reserve_shard, serialize_bundle, shard_secret_name,
-    CredentialBundle,
+    merge_bundles, reserve_shard, serialize_bundle, shard_secret_name, CredentialBundle,
 };
 use super::delivery::{deliver_to_author, DeliveryResult};
 use super::github_api::{fetch_public_key, put_environment_secret};
@@ -28,7 +27,6 @@ pub struct AllocatedSlot {
 #[derive(Debug, Clone, Default)]
 pub struct AllocateOutcome {
     pub allocated: Vec<AllocatedSlot>,
-    pub bundle_hashes: BTreeMap<u32, String>,
     pub shard_count: u32,
 }
 
@@ -38,8 +36,17 @@ pub struct AllocateOutcome {
 /// their credentials even though later shards failed.
 #[derive(Debug)]
 pub struct AllocationFailure {
-    pub source: crate::error::Error,
+    pub source: Box<crate::error::Error>,
     pub partial: AllocateOutcome,
+}
+
+impl AllocationFailure {
+    fn with_partial(source: crate::error::Error, partial: AllocateOutcome) -> Self {
+        Self {
+            source: Box::new(source),
+            partial,
+        }
+    }
 }
 
 impl std::fmt::Display for AllocationFailure {
@@ -50,16 +57,13 @@ impl std::fmt::Display for AllocationFailure {
 
 impl std::error::Error for AllocationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        Some(self.source.as_ref())
     }
 }
 
 impl From<crate::error::Error> for AllocationFailure {
     fn from(source: crate::error::Error) -> Self {
-        Self {
-            source,
-            partial: AllocateOutcome::default(),
-        }
+        Self::with_partial(source, AllocateOutcome::default())
     }
 }
 
@@ -111,10 +115,7 @@ pub async fn allocate_and_deliver(
 
     let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
         .await
-        .map_err(|e| AllocationFailure {
-            source: e,
-            partial: outcome.clone(),
-        })?;
+        .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
     // Phase 1: plan shard assignments, generate values, and encrypt delivery
     // ciphertexts. No GitHub writes and no mutation of `shards` yet.
@@ -148,10 +149,7 @@ pub async fn allocate_and_deliver(
             candidate.placeholder.length_bytes,
             report.credential_type_for(&candidate.slot),
         )
-        .map_err(|source| AllocationFailure {
-            source,
-            partial: outcome.clone(),
-        })?;
+        .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
         // `reserve_shard` prefers the shard the slot already lives on. If we
         // ran pick_shard after `shard_count` has grown, the hash-based target
@@ -168,10 +166,7 @@ pub async fn allocate_and_deliver(
             shard_count,
             "allocating",
         )
-        .map_err(|source| AllocationFailure {
-            source,
-            partial: outcome.clone(),
-        })?;
+        .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
         // Encrypt delivery BEFORE any GitHub write. If recipient has no
         // compatible SSH key, we abort phase 1 — nothing has been
@@ -180,21 +175,19 @@ pub async fn allocate_and_deliver(
         let delivered = if let Some(login) = pr_author {
             match deliver_to_author(client, login, value.as_bytes())
                 .await
-                .map_err(|e| AllocationFailure {
-                    source: e,
-                    partial: outcome.clone(),
-                })? {
+                .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?
+            {
                 Some(d) => Some(d),
                 None => {
-                    return Err(AllocationFailure {
-                        source: crate::error::Error::Config(format!(
+                    return Err(AllocationFailure::with_partial(
+                        crate::error::Error::Config(format!(
                             "Refusing to allocate credential slot '{}': recipient @{} has no compatible SSH public key on GitHub. \
                              Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys, then retry. \
                              To allocate without delivery, unset the recipient (no GITFORGEOPS_ACTOR).",
                             candidate.slot, login
                         )),
-                        partial: outcome.clone(),
-                    });
+                        outcome.clone(),
+                    ));
                 }
             }
         } else {
@@ -239,10 +232,7 @@ pub async fn allocate_and_deliver(
             Ok(s) => s,
             Err(e) => {
                 outcome.shard_count = *shard_count;
-                return Err(AllocationFailure {
-                    source: e,
-                    partial: outcome,
-                });
+                return Err(AllocationFailure::with_partial(e, outcome));
             }
         };
         let secret_name = shard_secret_name(shard);
@@ -260,7 +250,6 @@ pub async fn allocate_and_deliver(
         {
             Ok(()) => {
                 shards.insert(shard, shard_bundle.clone());
-                let hash = bundle_hash(&shard_bundle);
                 for p in batch {
                     outcome.allocated.push(AllocatedSlot {
                         slot: p.slot,
@@ -270,14 +259,10 @@ pub async fn allocate_and_deliver(
                         delivered: p.delivered,
                     });
                 }
-                outcome.bundle_hashes.insert(shard, hash);
             }
             Err(e) => {
                 outcome.shard_count = *shard_count;
-                return Err(AllocationFailure {
-                    source: e,
-                    partial: outcome,
-                });
+                return Err(AllocationFailure::with_partial(e, outcome));
             }
         }
     }
@@ -311,18 +296,12 @@ pub async fn rotate_and_deliver(
     // Validate the requested length against the credential type BEFORE the
     // GitHub round-trip, so `rotate --credential jwt/secret` with an
     // undersized `len=` fails without touching the environment's secrets.
-    let value =
-        generate_credential_value(slot, length_bytes).map_err(|source| AllocationFailure {
-            source,
-            partial: partial.clone(),
-        })?;
+    let value = generate_credential_value(slot, length_bytes)
+        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
     let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
         .await
-        .map_err(|source| AllocationFailure {
-            source,
-            partial: partial.clone(),
-        })?;
+        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
     // Encrypt delivery BEFORE the PUT. If the recipient has no compatible
     // SSH key (or the API fails), we bail with a hard error and the
@@ -332,20 +311,18 @@ pub async fn rotate_and_deliver(
     let delivered = if let Some(login) = recipient_login {
         match deliver_to_author(client, login, value.as_bytes())
             .await
-            .map_err(|source| AllocationFailure {
-                source,
-                partial: partial.clone(),
-            })? {
+            .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?
+        {
             Some(d) => Some(d),
             None => {
-                return Err(AllocationFailure {
-                    source: crate::error::Error::Config(format!(
+                return Err(AllocationFailure::with_partial(
+                    crate::error::Error::Config(format!(
                         "Refusing to rotate slot '{slot}': recipient @{login} has no compatible SSH public key on GitHub. \
                          Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys, then retry. \
                          To rotate without delivery, re-run without --recipient."
                     )),
                     partial,
-                });
+                ));
             }
         }
     } else {
@@ -356,21 +333,14 @@ pub async fn rotate_and_deliver(
     // rather than PUTting a FERRUM_CREDS_BUNDLE_<N> that no workflow binds:
     // the write would succeed at the GitHub API and then be invisible to
     // every later run.
-    let target_shard =
-        reserve_shard(slot, value.len(), shards, shard_count, "rotating").map_err(|source| {
-            AllocationFailure {
-                source,
-                partial: partial.clone(),
-            }
-        })?;
+    let target_shard = reserve_shard(slot, value.len(), shards, shard_count, "rotating")
+        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
     let bundle = shards.get(&target_shard).cloned().unwrap_or_default();
     let mut staged_bundle = bundle;
     staged_bundle.insert(slot.to_string(), value.clone());
-    let serialized = serialize_bundle(&staged_bundle).map_err(|source| AllocationFailure {
-        source,
-        partial: partial.clone(),
-    })?;
+    let serialized = serialize_bundle(&staged_bundle)
+        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
     let secret_name = shard_secret_name(target_shard);
     let allocated = AllocatedSlot {
         slot: slot.to_string(),
@@ -390,7 +360,7 @@ pub async fn rotate_and_deliver(
         provisioner_token,
     )
     .await
-    .map_err(|source| AllocationFailure { source, partial })?;
+    .map_err(|source| AllocationFailure::with_partial(source, partial))?;
 
     shards.insert(target_shard, staged_bundle);
     Ok(allocated)

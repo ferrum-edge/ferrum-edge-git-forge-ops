@@ -86,11 +86,228 @@ fn overlay_merges_fields() {
 }
 
 #[test]
-fn overlay_nonexistent_dir_is_noop() {
+fn configured_overlay_nonexistent_dir_is_an_error() {
     let mut resources = load_resources(&fixtures_dir()).unwrap();
-    let original_len = resources.len();
-    apply_overlay(&mut resources, &PathBuf::from("/nonexistent")).unwrap();
-    assert_eq!(resources.len(), original_len);
+    let error = apply_overlay(&mut resources, &PathBuf::from("/nonexistent"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("configured overlay directory"), "{error}");
+    assert!(error.contains("/nonexistent"), "{error}");
+}
+
+#[test]
+fn overlay_rejects_a_known_resource_directory_that_is_a_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let namespace = temp.path().join("team-alpha");
+    std::fs::create_dir_all(&namespace).unwrap();
+    let bad_path = namespace.join("proxies");
+    std::fs::write(&bad_path, "not a directory").unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    assert!(error.contains(&bad_path.display().to_string()), "{error}");
+}
+
+#[test]
+fn overlay_rejects_unknown_resource_directories_and_misplaced_yaml() {
+    for (relative, reported_relative) in [
+        ("team-alpha/proxys/shared.yaml", "team-alpha/proxys"),
+        ("team-alpha/shared.yaml", "team-alpha/shared.yaml"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "kind: Proxy\nspec:\n  id: shared\n  backend_host: changed.internal\n",
+        )
+        .unwrap();
+        let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+        let error = apply_overlay(&mut resources, temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&temp.path().join(reported_relative).display().to_string()),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn overlay_rejects_yaml_outside_a_namespace_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("shared.yaml");
+    std::fs::write(
+        &path,
+        "kind: Proxy\nspec:\n  id: shared\n  backend_host: changed.internal\n",
+    )
+    .unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(error.contains("namespace directory"), "{error}");
+}
+
+#[test]
+fn overlay_rejects_unsupported_files_in_declarative_directories() {
+    for name in ["shared.YAML", "shared.yam", "shared.yaml.bak", "notes.txt"] {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("team-alpha/proxies");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(name);
+        std::fs::write(
+            &path,
+            "kind: Proxy\nspec:\n  id: shared\n  backend_host: changed.internal\n",
+        )
+        .unwrap();
+        let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+        let error = apply_overlay(&mut resources, temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported file"), "{name}: {error}");
+        assert!(
+            error.contains(&path.display().to_string()),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn overlay_allows_explicit_documentation_and_disabled_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("README.md"), "overlay documentation").unwrap();
+    std::fs::write(directory.join(".gitkeep"), "").unwrap();
+    std::fs::write(directory.join("_shared.yaml.bak"), "intentionally disabled").unwrap();
+    std::fs::write(
+        directory.join("shared.yaml"),
+        "kind: Proxy\nspec:\n  id: shared\n  backend_host: changed.internal\n",
+    )
+    .unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    apply_overlay(&mut resources, temp.path()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_rejects_a_symlinked_overlay_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = temp.path().join("overlay");
+    symlink(&real, &link).unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, &link)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("symbolic links"), "{error}");
+    assert!(error.contains(&link.display().to_string()), "{error}");
+}
+
+#[test]
+fn overlay_requires_kind_and_resource_id() {
+    for (body, expected) in [
+        ("spec:\n  id: shared\n", "must declare string field `kind"),
+        (
+            "kind: Proxy\nspec:\n  backend_host: changed.internal\n",
+            "must identify a non-empty resource id",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let overlay_path = temp.path().join("team-alpha/proxies");
+        std::fs::create_dir_all(&overlay_path).unwrap();
+        let source = overlay_path.join("bad.yaml");
+        std::fs::write(&source, body).unwrap();
+        let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+        let error = apply_overlay(&mut resources, temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "expected {expected}: {error}");
+        assert!(error.contains(&source.display().to_string()), "{error}");
+    }
+}
+
+#[test]
+fn duplicate_overlay_target_is_rejected_with_both_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let overlay_path = temp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&overlay_path).unwrap();
+    let first = overlay_path.join("a.yaml");
+    let second = overlay_path.join("z.yaml");
+    for (path, host) in [(&second, "second.internal"), (&first, "first.internal")] {
+        std::fs::write(
+            path,
+            format!("kind: Proxy\nspec:\n  id: shared\n  backend_host: {host}\n"),
+        )
+        .unwrap();
+    }
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("duplicate overlay target"), "{error}");
+    assert!(error.contains(&first.display().to_string()), "{error}");
+    assert!(error.contains(&second.display().to_string()), "{error}");
+}
+
+#[test]
+fn overlay_unknown_fields_fail_with_overlay_source_and_full_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let overlay_path = temp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&overlay_path).unwrap();
+    let source = overlay_path.join("shared.yaml");
+    std::fs::write(
+        &source,
+        "kind: Proxy\nspec:\n  id: shared\n  backedn_host: typo.internal\n",
+    )
+    .unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&source.display().to_string()), "{error}");
+    assert!(error.contains("spec.backedn_host"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_rejects_symlinked_files_without_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside.yaml");
+    std::fs::write(
+        &outside,
+        "kind: Proxy\nspec:\n  id: shared\n  backend_host: outside.internal\n",
+    )
+    .unwrap();
+    let overlay_path = temp.path().join("overlays/team-alpha/proxies");
+    std::fs::create_dir_all(&overlay_path).unwrap();
+    let link = overlay_path.join("escape.yaml");
+    symlink(&outside, &link).unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, &temp.path().join("overlays"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("symbolic links"), "{error}");
+    assert!(error.contains(&link.display().to_string()), "{error}");
 }
 
 #[test]
@@ -378,6 +595,7 @@ fn make_proxy(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Proxy {
         spec: Proxy {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: "ferrum".to_string(),
@@ -441,6 +659,7 @@ fn make_consumer(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Consumer {
         spec: Consumer {
+            extra: Default::default(),
             id: id.to_string(),
             username: id.to_string(),
             namespace: "ferrum".to_string(),
@@ -457,6 +676,7 @@ fn make_upstream(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Upstream {
         spec: Upstream {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: "ferrum".to_string(),
@@ -502,9 +722,10 @@ fn consumer_config_with_credentials(
     use gitforgeops::config::schema::Consumer;
 
     let mut cfg = gitforgeops::config::GatewayConfig::default();
-    let map: std::collections::HashMap<String, serde_json::Value> =
+    let map: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_value(credentials).unwrap();
     cfg.consumers.push(Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),

@@ -117,11 +117,16 @@ pub fn mint_jwt(secret: &str, options: &JwtOptions) -> crate::error::Result<Stri
     } else {
         DEFAULT_JWT_TTL_SECS
     };
+    let exp = now.checked_add(ttl).ok_or_else(|| {
+        crate::error::Error::Config(format!(
+            "FERRUM_ADMIN_JWT_TTL_SECS value {ttl} is too large to form a valid expiration timestamp"
+        ))
+    })?;
 
     let claims = Claims {
         iss: options.issuer.clone(),
         sub: options.subject.clone(),
-        exp: now + ttl,
+        exp,
         iat: now,
         nbf: now,
         jti: Uuid::new_v4().to_string(),
