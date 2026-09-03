@@ -96,7 +96,7 @@ jobs:
               context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
               bucket
             }) as $checks
-            | ($required | all(. as $wanted; any($checks[]; .context == $wanted and .bucket == "pass")))
+            | ($required | all(.[] as $wanted; any($checks[]; .context == $wanted and .bucket == "pass")))
           ' "$checks_file" >/dev/null || {
             echo "::error::The merged PR is missing one or more successful launch-required checks."
             cat "$checks_file"
