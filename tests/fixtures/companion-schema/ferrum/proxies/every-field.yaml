@@ -1,0 +1,87 @@
+# Every field mirrored on `config::schema::Proxy`, including the nested
+# circuit-breaker, retry and L4 stream-match structures. See ../../README.md
+# for the two deliberate omissions (`api_spec_id`, `extra`).
+kind: Proxy
+spec:
+  id: every-field-proxy
+  name: Every Field Proxy
+  namespace: ferrum
+  hosts:
+    - api.example.test
+    - api-alt.example.test
+  listen_path: /every
+  backend_scheme: https
+  backend_host: backend.example.test
+  backend_port: 8443
+  backend_path: /v1
+  strip_listen_path: false
+  preserve_host_header: true
+  backend_connect_timeout_ms: 4000
+  backend_read_timeout_ms: 25000
+  backend_write_timeout_ms: 26000
+  backend_tls_client_cert_path: /etc/ferrum/tls/client.crt
+  backend_tls_client_key_path: /etc/ferrum/tls/client.key
+  backend_tls_verify_server_cert: true
+  backend_tls_server_ca_cert_path: /etc/ferrum/tls/ca.crt
+  dns_override: 10.0.0.42
+  dns_cache_ttl_seconds: 120
+  auth_mode: multi
+  plugins:
+    - plugin_config_id: every-field-plugin
+  pool_idle_timeout_seconds: 90
+  pool_enable_http_keep_alive: true
+  pool_enable_http2: true
+  pool_tcp_keepalive_seconds: 45
+  pool_http2_keep_alive_interval_seconds: 30
+  pool_http2_keep_alive_timeout_seconds: 15
+  pool_http2_initial_stream_window_size: 1048576
+  pool_http2_initial_connection_window_size: 2097152
+  pool_http2_adaptive_window: true
+  pool_http2_max_frame_size: 32768
+  pool_http2_max_concurrent_streams: 250
+  pool_http3_connections_per_backend: 2
+  pool_max_requests_per_connection: 1000
+  upstream_id: every-field-upstream
+  upstream_subset: canary
+  circuit_breaker:
+    failure_threshold: 7
+    success_threshold: 4
+    timeout_seconds: 45
+    failure_status_codes: [500, 502, 503, 504, 429]
+    half_open_max_requests: 2
+    trip_on_connection_errors: true
+  retry:
+    max_retries: 2
+    retryable_status_codes: [502, 503]
+    retryable_methods: [GET, HEAD, OPTIONS]
+    backoff:
+      exponential:
+        base_ms: 100
+        max_ms: 4000
+    retry_on_connect_failure: true
+  response_body_mode: buffer
+  # `listen_port` makes this a stream proxy as far as the companion is
+  # concerned (`plugin_catalog::is_stream_proxy`), which is why the stream-only
+  # fields below are meaningful here.
+  listen_port: 15443
+  frontend_tls: true
+  passthrough: false
+  udp_idle_timeout_seconds: 75
+  udp_max_response_amplification_factor: 3.5
+  tcp_idle_timeout_seconds: 600
+  websocket_idle_timeout_seconds: 300
+  stream_proxy_protocol: true
+  backend_proxy_protocol: v2
+  stream_match:
+    arms:
+      - source_labels:
+          app: checkout
+          tier: frontend
+        source_namespace: ferrum
+        source_subnets: ["10.0.0.0/8"]
+        destination_subnets: ["10.1.0.0/16"]
+        gateways: ["mesh", "ferrum/ingress"]
+  allowed_methods: [GET, POST, PUT]
+  allowed_ws_origins: ["https://app.example.test"]
+  created_at: "2024-01-01T00:00:00Z"
+  updated_at: "2024-01-02T00:00:00Z"

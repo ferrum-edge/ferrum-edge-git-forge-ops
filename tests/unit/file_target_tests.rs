@@ -1,4 +1,4 @@
-use gitforgeops::apply::{apply_file, render_file_yaml};
+use gitforgeops::apply::{apply_file, publish_private_export, render_file_yaml};
 use gitforgeops::config::GatewayConfig;
 
 /// Fixture is built through serde rather than struct literals so it stays
@@ -187,6 +187,37 @@ fn republish_preserves_destination_permissions() {
     assert_eq!(mode, 0o640, "mode was {mode:o}");
 }
 
+#[cfg(unix)]
+#[test]
+fn private_export_forces_owner_only_permissions_on_create_and_replace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("materialized.yaml");
+    let path_str = path.to_str().expect("utf-8 path");
+
+    publish_private_export(path_str, b"secret-one").expect("first publish");
+    let first_mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(first_mode, 0o600, "mode was {first_mode:o}");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("make old destination broad");
+    publish_private_export(path_str, b"secret-two").expect("secure replacement");
+
+    let second_mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(second_mode, 0o600, "mode was {second_mode:o}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"secret-two");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
 /// The two documents are published side by side and must not contaminate each
 /// other: the gateway file keeps its `resource_counts` seal and gains no
 /// `mesh:` key, and the mesh file carries neither the seal nor any gateway
@@ -240,4 +271,58 @@ fn mesh_republish_preserves_destination_permissions() {
         .mode()
         & 0o777;
     assert_eq!(mode, 0o640, "mode was {mode:o}");
+}
+
+/// F8: `gitforgeops export --output /dev/null` (and the same for a pipe or a
+/// terminal) has to work. The atomic path cannot serve it — the temp file
+/// would have to be created in `/dev`, which an unprivileged process cannot
+/// do, and the rename would replace the device node with a regular file — so
+/// an existing non-regular destination is written directly.
+#[cfg(unix)]
+#[test]
+fn export_to_a_non_regular_destination_is_written_directly() {
+    use gitforgeops::apply::publish_export;
+
+    publish_export("/dev/null", b"discarded artifact").expect("public export to /dev/null");
+    publish_private_export("/dev/null", b"discarded secret").expect("private export to /dev/null");
+
+    // The device node is still a device node.
+    let metadata = std::fs::metadata("/dev/null").unwrap();
+    assert!(
+        !metadata.is_file(),
+        "/dev/null was replaced by a regular file"
+    );
+}
+
+/// A destination that does not exist yet still takes the atomic path, and a
+/// destination that exists as an ordinary file still gets replaced by rename.
+#[cfg(unix)]
+#[test]
+fn regular_destinations_keep_the_atomic_publish_path() {
+    use gitforgeops::apply::publish_export;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("export.yaml");
+    let path_str = path.to_str().unwrap();
+
+    publish_export(path_str, b"first").expect("create");
+    assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+    publish_export(path_str, b"second").expect("replace");
+    assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".gitforgeops-")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
 }

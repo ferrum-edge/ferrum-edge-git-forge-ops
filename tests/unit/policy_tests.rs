@@ -11,6 +11,7 @@ use gitforgeops::policy::{evaluate_policies, Severity};
 
 fn proxy(id: &str, protocol: BackendScheme, read_timeout: u64, tls_verify: bool) -> Proxy {
     Proxy {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: "ferrum".to_string(),
@@ -71,6 +72,7 @@ fn proxy(id: &str, protocol: BackendScheme, read_timeout: u64, tls_verify: bool)
 
 fn plugin_config(id: &str, plugin_name: &str, namespace: &str) -> PluginConfig {
     PluginConfig {
+        extra: Default::default(),
         id: id.to_string(),
         namespace: namespace.to_string(),
         plugin_name: plugin_name.to_string(),
@@ -88,6 +90,7 @@ fn plugin_config(id: &str, plugin_name: &str, namespace: &str) -> PluginConfig {
 
 fn upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
     Upstream {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: "ferrum".to_string(),
@@ -398,6 +401,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
     // plugins don't actually authenticate traffic.
     let p = proxy("p1", BackendScheme::Https, 30_000, true);
     let disabled_auth = PluginConfig {
+        extra: Default::default(),
         id: "jwt-disabled".to_string(),
         namespace: "ferrum".to_string(),
         plugin_name: "jwt".to_string(),
@@ -437,6 +441,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
 
     // Same setup but plugin enabled — policy should be satisfied.
     let enabled_auth = PluginConfig {
+        extra: Default::default(),
         id: "jwt-on".to_string(),
         namespace: "ferrum".to_string(),
         plugin_name: "jwt".to_string(),
@@ -467,6 +472,7 @@ fn require_auth_plugin_uses_explicit_allowlist() {
     use gitforgeops::config::schema::{PluginConfig, PluginScope};
 
     let make_plugin = |id: &str, name: &str| PluginConfig {
+        extra: Default::default(),
         id: id.to_string(),
         namespace: "ferrum".to_string(),
         plugin_name: name.to_string(),
@@ -570,6 +576,7 @@ fn forbid_tls_verify_disabled_covers_upstreams() {
     // proxy-only scan lets an upstream set tls_verify=false and bypass.
     use gitforgeops::config::schema::{LoadBalancerAlgorithm, Upstream};
     let upstream_insecure = Upstream {
+        extra: Default::default(),
         id: "api-pool".to_string(),
         name: None,
         namespace: "ferrum".to_string(),
@@ -721,6 +728,63 @@ overrides:
     assert!(err.to_string().contains("admin"));
 }
 
+#[test]
+fn policy_config_rejects_unknown_fields_at_every_owned_level() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let cases = [
+        ("future_top_level", "version: 1\nfuture_top_level: true\n"),
+        (
+            "future_rule",
+            "version: 1\npolicies:\n  future_rule:\n    enabled: true\n",
+        ),
+        (
+            "enabeld",
+            "version: 1\npolicies:\n  backend_scheme:\n    enabeld: true\n",
+        ),
+        (
+            "maximum",
+            "version: 1\npolicies:\n  proxy_timeout_bands:\n    read_timeout_ms:\n      maximum: 1000\n",
+        ),
+        (
+            "allow_triage",
+            "version: 1\noverrides:\n  allow_triage: true\n",
+        ),
+    ];
+
+    for (unknown, yaml) in cases {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+        let error = load_policies_from_path(file.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(unknown), "{message}");
+        assert!(
+            message.contains(&file.path().display().to_string()),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn policy_config_rejects_unsupported_versions() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(b"version: 2\n").unwrap();
+    let error = load_policies_from_path(file.path()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("version 2"), "{message}");
+    assert!(message.contains("expected version 1"), "{message}");
+    assert!(
+        message.contains(&file.path().display().to_string()),
+        "{message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Plugin catalog + scope merge
 // ---------------------------------------------------------------------------
@@ -733,6 +797,7 @@ fn catalog_plugin(
     config: serde_json::Value,
 ) -> PluginConfig {
     PluginConfig {
+        extra: Default::default(),
         id: id.to_string(),
         namespace: "ferrum".to_string(),
         plugin_name: name.to_string(),

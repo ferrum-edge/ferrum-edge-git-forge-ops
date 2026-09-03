@@ -3,18 +3,67 @@ use gitforgeops::cli::{Cli, Commands, EnvsFormat, ValidateFormat};
 
 #[test]
 fn cli_import_from_api_is_a_flag() {
-    let cli = Cli::try_parse_from(["gitforgeops", "import", "--from-api"]).unwrap();
+    let cli = Cli::try_parse_from([
+        "gitforgeops",
+        "import",
+        "--from-api",
+        "--output-dir",
+        "/tmp/scratch-import",
+    ])
+    .unwrap();
 
     match cli.command {
         Commands::Import {
             from_api,
             from_file,
             output_dir,
+            credential_bundle_output,
         } => {
             assert!(from_api);
             assert!(from_file.is_none());
-            assert_eq!(output_dir, "./resources");
+            assert_eq!(output_dir, "/tmp/scratch-import");
+            assert!(credential_bundle_output.is_none());
         }
+        _ => panic!("expected import command"),
+    }
+}
+
+/// F3: the old `./resources` default could never succeed — import refuses a
+/// non-empty destination and this repo ships `_example.yaml` files there — so
+/// the destination has to be named.
+#[test]
+fn cli_requires_an_explicit_import_output_dir() {
+    let err = match Cli::try_parse_from(["gitforgeops", "import", "--from-api"]) {
+        Err(err) => err,
+        Ok(_) => panic!("expected a missing --output-dir parse error"),
+    };
+
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    assert!(err.to_string().contains("--output-dir"), "{err}");
+}
+
+#[test]
+fn cli_accepts_a_private_import_bundle_path() {
+    let cli = Cli::try_parse_from([
+        "gitforgeops",
+        "import",
+        "--from-file",
+        "backup.yaml",
+        "--output-dir",
+        "/tmp/scratch-import",
+        "--credential-bundle-output",
+        "/tmp/migration.json",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::Import {
+            credential_bundle_output,
+            ..
+        } => assert_eq!(
+            credential_bundle_output.as_deref(),
+            Some("/tmp/migration.json")
+        ),
         _ => panic!("expected import command"),
     }
 }
@@ -54,8 +103,33 @@ fn cli_accepts_documented_format_values() {
 
     let envs = Cli::try_parse_from(["gitforgeops", "envs", "--format", "text"]).unwrap();
     match envs.command {
-        Commands::Envs { format } => assert!(matches!(format, EnvsFormat::Text)),
+        Commands::Envs {
+            format,
+            include_scopes,
+        } => {
+            assert!(matches!(format, EnvsFormat::Text));
+            assert!(!include_scopes);
+        }
         _ => panic!("expected envs command"),
+    }
+
+    let scoped = Cli::try_parse_from([
+        "gitforgeops",
+        "envs",
+        "--format",
+        "json",
+        "--include-scopes",
+    ])
+    .unwrap();
+    match scoped.command {
+        Commands::Envs { include_scopes, .. } => assert!(include_scopes),
+        _ => panic!("expected envs command"),
+    }
+
+    let review = Cli::try_parse_from(["gitforgeops", "review", "--require-live"]).unwrap();
+    match review.command {
+        Commands::Review { require_live, .. } => assert!(require_live),
+        _ => panic!("expected review command"),
     }
 }
 

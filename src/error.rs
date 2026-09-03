@@ -14,6 +14,21 @@ pub enum Error {
         source: serde_yaml::Error,
     },
 
+    #[error("unknown configuration field(s) in {path}: {fields}")]
+    UnknownFields { path: PathBuf, fields: String },
+
+    #[error("failed to traverse configuration tree at {path}: {source}")]
+    WalkDir {
+        path: PathBuf,
+        source: walkdir::Error,
+    },
+
+    #[error("symbolic links are not allowed in configuration trees: {0}")]
+    ConfigSymlink(PathBuf),
+
+    #[error("configuration path exists but is not a directory: {0}")]
+    ConfigNotDirectory(PathBuf),
+
     #[error("unknown resource kind {kind:?} in {path}")]
     UnknownKind { kind: String, path: PathBuf },
 
@@ -70,13 +85,26 @@ pub enum Error {
     )]
     RestoreNeedsManualRecovery(String),
 
+    /// A newer gateway returned a top-level backup section this client cannot
+    /// safely carry through `/restore`. Omitting it could destroy data owned by
+    /// that newer capability, so full-replace must stop before mutation.
+    #[error("full-replace source is incomplete for this client: {0}")]
+    UnsupportedBackupSections(String),
+
     /// A write was durably committed but is not live yet (`applied: false`).
     /// Retrying would re-apply it; the caller must reconcile instead.
     #[error("write committed, awaiting reload ({reason}): {message}")]
     CommittedNotLive { reason: String, message: String },
 
+    /// A non-idempotent POST may have committed even though the client did
+    /// not receive a success response, and an authoritative follow-up read
+    /// could not prove the exact desired resource set is live. Blind replay
+    /// could duplicate the operation, so the run stops for reconciliation.
+    #[error("ambiguous mutation outcome — no automatic replay was attempted: {0}")]
+    AmbiguousMutation(String),
+
     /// `GET /backup` served the in-memory snapshot instead of the database, so
-    /// the live view may be stale and prune computation unsafe.
+    /// the live view may be stale and ownership metadata is incomplete.
     #[error("{0}")]
     StaleGatewayView(String),
 

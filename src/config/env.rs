@@ -60,6 +60,17 @@ pub struct EnvConfig {
     pub admin_jwt_ttl_secs: i64,
     /// Only process resources for this namespace.
     pub namespace_filter: Option<String>,
+    /// Carry unknown **top-level** `spec` fields verbatim instead of rejecting
+    /// them (default `false`, fail-closed).
+    ///
+    /// The typed mirror in `config::schema` is authoritative-by-rejection so a
+    /// misspelled field cannot silently drop out of desired state. That makes a
+    /// gateway release which adds a field an outage until gitforgeops ships a
+    /// matching release; this is the escape hatch. Unknown top-level fields are
+    /// kept in `PassthroughFields` and passed through export/diff/apply for the
+    /// gateway — the authoritative schema — to judge, with a loud per-file
+    /// warning on stderr. Nested unknown fields stay hard errors either way.
+    pub allow_unknown_fields: bool,
     /// How to interact with the gateway.
     pub gateway_mode: GatewayMode,
     /// How to apply config changes.
@@ -137,6 +148,7 @@ impl Default for EnvConfig {
             admin_jwt_audience: None,
             admin_jwt_ttl_secs: DEFAULT_JWT_TTL_SECS,
             namespace_filter: None,
+            allow_unknown_fields: false,
             gateway_mode: GatewayMode::default(),
             apply_strategy: ApplyStrategy::default(),
             overlay: None,
@@ -173,6 +185,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_ADMIN_JWT_AUDIENCE`  | `admin_jwt_audience` | `None` (claim omitted)         |
 /// | `FERRUM_ADMIN_JWT_TTL_SECS`  | `admin_jwt_ttl_secs` | `3600`                         |
 /// | `FERRUM_NAMESPACE`           | `namespace_filter` | `None`                           |
+/// | `FERRUM_ALLOW_UNKNOWN_FIELDS`| `allow_unknown_fields` | `false` (unknown fields are rejected) |
 /// | `FERRUM_GATEWAY_MODE`        | `gateway_mode`     | `api`                            |
 /// | `FERRUM_APPLY_STRATEGY`      | `apply_strategy`   | `incremental`                    |
 /// | `FERRUM_OVERLAY`             | `overlay`          | `None`                           |
@@ -194,8 +207,34 @@ impl Default for EnvConfig {
 /// | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS`  | `github_connect_timeout_secs`  | `10`        |
 /// | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`  | `github_request_timeout_secs`  | `30`        |
 /// | `FERRUM_GATEWAY_MAX_RETRIES`          | `gateway_max_retries`          | `3`         |
-pub fn load_env_config() -> EnvConfig {
-    EnvConfig {
+pub fn load_env_config() -> crate::error::Result<EnvConfig> {
+    let gateway_mode = match normalized_env("FERRUM_GATEWAY_MODE").as_deref() {
+        None | Some("api") => GatewayMode::Api,
+        Some("file") => GatewayMode::File,
+        Some(value) => return Err(invalid_env("FERRUM_GATEWAY_MODE", value, "api or file")),
+    };
+    let apply_strategy = match normalized_env("FERRUM_APPLY_STRATEGY").as_deref() {
+        None | Some("incremental") => ApplyStrategy::Incremental,
+        Some("full_replace") => ApplyStrategy::FullReplace,
+        Some(value) => {
+            return Err(invalid_env(
+                "FERRUM_APPLY_STRATEGY",
+                value,
+                "incremental or full_replace",
+            ))
+        }
+    };
+    let admin_jwt_role =
+        non_empty_env("FERRUM_ADMIN_JWT_ROLE").unwrap_or_else(|| DEFAULT_JWT_ROLE.to_string());
+    if !matches!(admin_jwt_role.as_str(), "viewer" | "operator" | "admin") {
+        return Err(invalid_env(
+            "FERRUM_ADMIN_JWT_ROLE",
+            &admin_jwt_role,
+            "viewer, operator, or admin",
+        ));
+    }
+
+    Ok(EnvConfig {
         // Blank-as-unset matters for every var CI feeds from a `${{ secrets.* }}`
         // expression: an unconfigured GitHub secret interpolates to "", and
         // Some("") would produce misleading downstream errors ("secret too
@@ -204,27 +243,16 @@ pub fn load_env_config() -> EnvConfig {
         admin_jwt_secret: non_empty_env("FERRUM_ADMIN_JWT_SECRET"),
         admin_jwt_issuer: non_empty_env("FERRUM_ADMIN_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),
-        admin_jwt_role: non_empty_env("FERRUM_ADMIN_JWT_ROLE")
-            .unwrap_or_else(|| DEFAULT_JWT_ROLE.to_string()),
+        admin_jwt_role,
         admin_jwt_audience: non_empty_env("FERRUM_ADMIN_JWT_AUDIENCE"),
-        admin_jwt_ttl_secs: parse_i64_env("FERRUM_ADMIN_JWT_TTL_SECS", DEFAULT_JWT_TTL_SECS),
+        admin_jwt_ttl_secs: parse_positive_i64_env(
+            "FERRUM_ADMIN_JWT_TTL_SECS",
+            DEFAULT_JWT_TTL_SECS,
+        )?,
         namespace_filter: non_empty_env("FERRUM_NAMESPACE"),
-        gateway_mode: match env::var("FERRUM_GATEWAY_MODE")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "file" => GatewayMode::File,
-            _ => GatewayMode::Api,
-        },
-        apply_strategy: match env::var("FERRUM_APPLY_STRATEGY")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "full_replace" => ApplyStrategy::FullReplace,
-            _ => ApplyStrategy::Incremental,
-        },
+        allow_unknown_fields: parse_bool_env("FERRUM_ALLOW_UNKNOWN_FIELDS", false)?,
+        gateway_mode,
+        apply_strategy,
         overlay: non_empty_env("FERRUM_OVERLAY"),
         env_name: non_empty_env("FERRUM_ENV"),
         github_repository: non_empty_env("GITHUB_REPOSITORY"),
@@ -232,24 +260,34 @@ pub fn load_env_config() -> EnvConfig {
         github_provisioner_token: non_empty_env("FERRUM_GH_PROVISIONER_TOKEN"),
         creds_bundle_json: non_empty_env("FERRUM_CREDS_JSON"),
         creds_bundle_json_file: non_empty_env("FERRUM_CREDS_JSON_FILE"),
-        file_output_path: env::var("FERRUM_FILE_OUTPUT_PATH")
-            .unwrap_or_else(|_| "./assembled/resources.yaml".to_string()),
+        file_output_path: non_empty_env("FERRUM_FILE_OUTPUT_PATH")
+            .unwrap_or_else(|| "./assembled/resources.yaml".to_string()),
         mesh_file_output_path: non_empty_env("FERRUM_MESH_FILE_OUTPUT_PATH")
             .unwrap_or_else(|| DEFAULT_MESH_FILE_OUTPUT_PATH.to_string()),
-        edge_binary_path: env::var("FERRUM_EDGE_BINARY_PATH")
-            .unwrap_or_else(|_| "ferrum-edge".to_string()),
-        tls_no_verify: env::var("FERRUM_TLS_NO_VERIFY")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
+        edge_binary_path: non_empty_env("FERRUM_EDGE_BINARY_PATH")
+            .unwrap_or_else(|| "ferrum-edge".to_string()),
+        tls_no_verify: parse_bool_env("FERRUM_TLS_NO_VERIFY", false)?,
         ca_cert: non_empty_env("FERRUM_GATEWAY_CA_CERT"),
         client_cert: non_empty_env("FERRUM_GATEWAY_CLIENT_CERT"),
         client_key: non_empty_env("FERRUM_GATEWAY_CLIENT_KEY"),
-        gateway_connect_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS", 10),
-        gateway_request_timeout_secs: parse_timeout_env("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", 60),
-        github_connect_timeout_secs: parse_timeout_env("FERRUM_GITHUB_CONNECT_TIMEOUT_SECS", 10),
-        github_request_timeout_secs: parse_timeout_env("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", 30),
-        gateway_max_retries: parse_u32_env("FERRUM_GATEWAY_MAX_RETRIES", 3),
-    }
+        gateway_connect_timeout_secs: parse_positive_u64_env(
+            "FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS",
+            10,
+        )?,
+        gateway_request_timeout_secs: parse_positive_u64_env(
+            "FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS",
+            60,
+        )?,
+        github_connect_timeout_secs: parse_positive_u64_env(
+            "FERRUM_GITHUB_CONNECT_TIMEOUT_SECS",
+            10,
+        )?,
+        github_request_timeout_secs: parse_positive_u64_env(
+            "FERRUM_GITHUB_REQUEST_TIMEOUT_SECS",
+            30,
+        )?,
+        gateway_max_retries: parse_u32_env("FERRUM_GATEWAY_MAX_RETRIES", 3)?,
+    })
 }
 
 /// Where the standalone `{version, mesh}` document lands when
@@ -276,24 +314,52 @@ fn non_empty_env(var: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn parse_i64_env(var: &str, default: i64) -> i64 {
-    env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
+fn normalized_env(var: &str) -> Option<String> {
+    non_empty_env(var).map(|value| value.to_ascii_lowercase())
 }
 
-fn parse_timeout_env(var: &str, default_secs: u64) -> u64 {
-    env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(default_secs)
+fn parse_bool_env(var: &str, default: bool) -> crate::error::Result<bool> {
+    match normalized_env(var).as_deref() {
+        None => Ok(default),
+        Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(value) => Err(invalid_env(var, value, "true, false, 1, or 0")),
+    }
 }
 
-fn parse_u32_env(var: &str, default: u32) -> u32 {
-    env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(default)
+fn parse_positive_i64_env(var: &str, default: i64) -> crate::error::Result<i64> {
+    match non_empty_env(var) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|parsed| *parsed > 0)
+            .ok_or_else(|| invalid_env(var, &value, "a positive base-10 integer")),
+    }
+}
+
+fn parse_positive_u64_env(var: &str, default: u64) -> crate::error::Result<u64> {
+    match non_empty_env(var) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|parsed| *parsed > 0)
+            .ok_or_else(|| invalid_env(var, &value, "a positive base-10 integer")),
+    }
+}
+
+fn parse_u32_env(var: &str, default: u32) -> crate::error::Result<u32> {
+    match non_empty_env(var) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u32>()
+            .map_err(|_| invalid_env(var, &value, "a base-10 integer in 0..=4294967295")),
+    }
+}
+
+fn invalid_env(var: &str, value: &str, accepted: &str) -> crate::error::Error {
+    crate::error::Error::Config(format!(
+        "invalid {var} value {value:?}; expected {accepted} (unset or blank uses the documented default)"
+    ))
 }

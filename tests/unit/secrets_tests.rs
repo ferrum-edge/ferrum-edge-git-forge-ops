@@ -6,6 +6,28 @@ use gitforgeops::secrets::{
     load_bundles_from_env, parse_placeholder, resolve_secrets, PlaceholderAlloc, SlotStatus,
 };
 
+const TEST_ED25519_PUBLIC_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJb/uPnYEeAChxZ067A7P02MTEz2XC9PmkknEGctaIuN";
+const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
+
+#[test]
+fn credential_delivery_encrypts_for_supported_ssh_recipient_types() {
+    use age::ssh::Recipient;
+    use gitforgeops::secrets::delivery::encrypt_for_ssh_recipient;
+
+    for public_key in [TEST_ED25519_PUBLIC_KEY, TEST_RSA_PUBLIC_KEY] {
+        let recipient = public_key
+            .parse::<Recipient>()
+            .expect("fixture should be a supported SSH recipient");
+        let armored = encrypt_for_ssh_recipient(&recipient, b"credential-value")
+            .expect("public-recipient encryption should succeed");
+
+        assert!(armored.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
+        assert!(armored.ends_with("-----END AGE ENCRYPTED FILE-----\n"));
+        assert!(!armored.contains("credential-value"));
+    }
+}
+
 #[test]
 fn parse_placeholder_recognizes_valid_syntax() {
     let p = parse_placeholder("${gh-env-secret:alloc=generate}")
@@ -221,6 +243,7 @@ fn pick_shard_returns_none_only_when_all_shards_full() {
 fn resolver_replaces_known_slot_and_reports_resolved() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -252,6 +275,7 @@ fn resolver_replaces_known_slot_and_reports_resolved() {
 fn resolver_reports_missing_required() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -282,6 +306,7 @@ fn report_secrets_does_not_mutate_config() {
 
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -324,6 +349,7 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
     // and is safe to commit.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -362,6 +388,7 @@ fn resolver_replaces_rotate_placeholder_with_bundle_value() {
     // something apply/diff does automatically.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -404,6 +431,7 @@ fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
     // first-apply generate.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -429,6 +457,7 @@ fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
 fn resolver_reports_needs_allocation_for_generate() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -457,6 +486,7 @@ fn flat_and_nested_credentials_produce_distinct_slots() {
     // two components.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -500,6 +530,7 @@ fn flat_and_nested_credentials_produce_distinct_slots() {
 fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -550,6 +581,7 @@ fn slot_components_escape_slash_and_tilde_in_names() {
     // keep the encoding injective.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "weird/id".to_string(),
         username: "weird/id".to_string(),
         namespace: "ns~with~tilde".to_string(),
@@ -580,6 +612,7 @@ fn object_key_with_bracket_distinct_from_array_index() {
     // a placeholder at index 0 produce distinct slots.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -665,6 +698,7 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
     fn config_with_credential(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
         let mut cfg = GatewayConfig::default();
         let mut consumer = Consumer {
+            extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
             namespace: "ferrum".to_string(),
@@ -803,6 +837,7 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
 fn consumer_with(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),

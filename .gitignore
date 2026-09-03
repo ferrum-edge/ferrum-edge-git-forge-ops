@@ -4,6 +4,8 @@ target/
 **/*.rs.bk
 *.pdb
 **/mutants.out*/
+__pycache__/
+*.py[cod]
 
 # Python validator artifacts
 __pycache__/
@@ -27,3 +29,12 @@ __pycache__/
 *.swp
 *.swo
 *~
+
+# OS and editor artifacts. The Rust loader and .github/scripts/pr_input.py both
+# skip these inside resources/ and overlays/ instead of failing the tree, but
+# they should never reach a commit in the first place.
+.DS_Store
+Thumbs.db
+desktop.ini
+*.orig
+*.rej

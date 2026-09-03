@@ -1,7 +1,10 @@
 use std::sync::Mutex;
 
-use gitforgeops::diff::resource_diff::{state_key, state_key_namespace};
-use gitforgeops::state::StateFile;
+use std::collections::BTreeMap;
+
+use gitforgeops::config::schema::GatewayConfig;
+use gitforgeops::diff::resource_diff::{state_key, state_key_namespace, DiffAction, ResourceDiff};
+use gitforgeops::state::{PendingCreateScope, StateFile};
 use tempfile::TempDir;
 
 // Process-wide lock — tests in this file all mutate CWD, and cargo runs tests
@@ -17,6 +20,31 @@ fn with_cwd<F: FnOnce()>(dir: &std::path::Path, f: F) {
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
+}
+
+#[test]
+fn partial_apply_keeps_the_previous_last_applied_metadata() {
+    let mut state = StateFile {
+        last_applied_at: Some("2026-08-01T00:00:00Z".to_string()),
+        last_applied_commit: Some("previous-clean-commit".to_string()),
+        ..StateFile::default()
+    };
+
+    state.stamp_last_applied_if_clean(false);
+    assert_eq!(
+        state.last_applied_at.as_deref(),
+        Some("2026-08-01T00:00:00Z")
+    );
+    assert_eq!(
+        state.last_applied_commit.as_deref(),
+        Some("previous-clean-commit")
+    );
+
+    state.stamp_last_applied_if_clean(true);
+    assert_ne!(
+        state.last_applied_at.as_deref(),
+        Some("2026-08-01T00:00:00Z")
+    );
 }
 
 #[test]
@@ -53,6 +81,7 @@ fn scoped_record_preserves_entries_outside_scope() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: ns.to_string(),
@@ -141,6 +170,328 @@ fn scoped_record_preserves_entries_outside_scope() {
     assert_eq!(
         state.resources.get(&platform_key),
         Some(&"sha256:B".to_string())
+    );
+}
+
+#[test]
+fn write_ahead_add_reservation_survives_before_gateway_success_is_recorded() {
+    use gitforgeops::apply::AppliedOp;
+    use gitforgeops::config::schema::{GatewayConfig, Upstream};
+
+    let desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
+            "id": "new-upstream",
+            "namespace": "ferrum",
+            "targets": [{"host": "127.0.0.1", "port": 8080}]
+        }))
+        .unwrap()],
+        ..GatewayConfig::default()
+    };
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Upstream".to_string(),
+        id: "new-upstream".to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }];
+    let mut state = StateFile::default();
+    let key = state_key("ferrum", "Upstream", "new-upstream");
+
+    assert_eq!(state.reserve_adds(&diffs, &desired).unwrap(), 1);
+    assert!(state.pending_creates.contains(&key));
+    assert!(
+        !state.previously_managed_keys().contains(&key),
+        "a pending request must not grant deletion authority"
+    );
+
+    state
+        .record_op(
+            &AppliedOp {
+                kind: "Upstream".to_string(),
+                namespace: "ferrum".to_string(),
+                id: "new-upstream".to_string(),
+                action: DiffAction::Add,
+            },
+            &desired,
+        )
+        .unwrap();
+    assert!(!state.pending_creates.contains(&key));
+    assert!(state.previously_managed_keys().contains(&key));
+}
+
+#[test]
+fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
+    use gitforgeops::config::schema::Upstream;
+
+    let desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
+            "id": "new-upstream",
+            "namespace": "ferrum",
+            "targets": [{"host": "127.0.0.1", "port": 8080}]
+        }))
+        .unwrap()],
+        ..GatewayConfig::default()
+    };
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Upstream".to_string(),
+        id: "new-upstream".to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }];
+    let key = state_key("ferrum", "Upstream", "new-upstream");
+    let mut state = StateFile::default();
+    state.reserve_adds(&diffs, &desired).unwrap();
+
+    let mut exact_live = desired.clone();
+    exact_live.upstreams[0].created_at += chrono::Duration::seconds(5);
+    exact_live.upstreams[0].updated_at += chrono::Duration::seconds(5);
+    let actual = BTreeMap::from([("ferrum".to_string(), exact_live)]);
+
+    assert_eq!(
+        state
+            .reconcile_pending_creates(&desired, &actual, PendingCreateScope::Shared)
+            .forgotten,
+        0
+    );
+    assert!(state.pending_creates.contains(&key));
+    assert!(!state.previously_managed_keys().contains(&key));
+}
+
+#[test]
+fn pending_create_stays_unmanaged_until_live_evidence_matches() {
+    use gitforgeops::config::schema::Upstream;
+
+    let desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
+            "id": "new-upstream",
+            "namespace": "ferrum",
+            "targets": [{"host": "127.0.0.1", "port": 8080}]
+        }))
+        .unwrap()],
+        ..GatewayConfig::default()
+    };
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Upstream".to_string(),
+        id: "new-upstream".to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }];
+    let key = state_key("ferrum", "Upstream", "new-upstream");
+    let mut state = StateFile::default();
+    state.reserve_adds(&diffs, &desired).unwrap();
+
+    let actual = BTreeMap::from([("ferrum".to_string(), GatewayConfig::default())]);
+    assert_eq!(
+        state
+            .reconcile_pending_creates(&desired, &actual, PendingCreateScope::Shared)
+            .forgotten,
+        0
+    );
+    assert!(state.pending_creates.contains(&key));
+    assert!(!state.previously_managed_keys().contains(&key));
+}
+
+#[test]
+fn pending_create_without_desired_or_live_row_is_cleared() {
+    use gitforgeops::config::schema::Upstream;
+
+    let original_desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
+            "id": "new-upstream",
+            "namespace": "ferrum",
+            "targets": [{"host": "127.0.0.1", "port": 8080}]
+        }))
+        .unwrap()],
+        ..GatewayConfig::default()
+    };
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Upstream".to_string(),
+        id: "new-upstream".to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }];
+    let key = state_key("ferrum", "Upstream", "new-upstream");
+    let mut state = StateFile::default();
+    state.reserve_adds(&diffs, &original_desired).unwrap();
+
+    let empty = GatewayConfig::default();
+    let actual = BTreeMap::from([("ferrum".to_string(), empty.clone())]);
+    assert_eq!(
+        state
+            .reconcile_pending_creates(&empty, &actual, PendingCreateScope::Shared)
+            .forgotten,
+        1
+    );
+    assert!(!state.pending_creates.contains(&key));
+    assert!(!state.previously_managed_keys().contains(&key));
+}
+
+/// Build a state file with one journaled pending create whose desired
+/// declaration has since been removed, while the row is still live.
+fn undeclared_live_pending_row() -> (StateFile, String, BTreeMap<String, GatewayConfig>) {
+    use gitforgeops::config::schema::Upstream;
+
+    let original_desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
+            "id": "new-upstream",
+            "namespace": "ferrum",
+            "targets": [{"host": "127.0.0.1", "port": 8080}]
+        }))
+        .unwrap()],
+        ..GatewayConfig::default()
+    };
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Upstream".to_string(),
+        id: "new-upstream".to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }];
+    let key = state_key("ferrum", "Upstream", "new-upstream");
+    let mut state = StateFile::default();
+    state.reserve_adds(&diffs, &original_desired).unwrap();
+    let actual = BTreeMap::from([("ferrum".to_string(), original_desired)]);
+    (state, key, actual)
+}
+
+#[test]
+fn shared_mode_forgets_an_undeclared_live_pending_row_and_warns() {
+    // The old behaviour returned Err before any namespace was touched, for
+    // every mode and strategy, and told the operator to hand-edit `.state` —
+    // which `state-guard.yml` blocks. Nothing may wedge here.
+    let (mut state, key, actual) = undeclared_live_pending_row();
+
+    let report = state.reconcile_pending_creates(
+        &GatewayConfig::default(),
+        &actual,
+        PendingCreateScope::Shared,
+    );
+
+    assert_eq!(report.forgotten, 1);
+    assert!(!state.pending_creates.contains(&key));
+    assert!(
+        !state.previously_managed_keys().contains(&key),
+        "forgetting the journal entry must never grant deletion authority"
+    );
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    let warning = &report.warnings[0];
+    assert!(warning.contains("new-upstream"), "{warning}");
+    assert!(warning.contains("UNMANAGED"), "{warning}");
+    assert!(warning.contains("will not delete it"), "{warning}");
+}
+
+#[test]
+fn exclusive_mode_forgets_an_undeclared_live_pending_row_for_the_prune_path() {
+    let (mut state, key, actual) = undeclared_live_pending_row();
+
+    let report = state.reconcile_pending_creates(
+        &GatewayConfig::default(),
+        &actual,
+        PendingCreateScope::Exclusive,
+    );
+
+    assert_eq!(report.forgotten, 1);
+    assert!(!state.pending_creates.contains(&key));
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("large-prune guard"),
+        "{}",
+        report.warnings[0]
+    );
+}
+
+#[test]
+fn full_replace_forgets_every_pending_key_without_warning() {
+    // `/restore` replaces the namespace atomically and never consults the
+    // journal, so a leftover key is noise, not a decision.
+    let (mut state, key, actual) = undeclared_live_pending_row();
+
+    let report = state.reconcile_pending_creates(
+        &GatewayConfig::default(),
+        &actual,
+        PendingCreateScope::FullReplace,
+    );
+
+    assert_eq!(report.forgotten, 1);
+    assert!(!state.pending_creates.contains(&key));
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+#[test]
+fn full_replace_forgets_a_still_declared_pending_key_too() {
+    use gitforgeops::config::schema::Upstream;
+
+    let desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value::<Upstream>(serde_json::json!({
+            "id": "new-upstream",
+            "namespace": "ferrum",
+            "targets": [{"host": "127.0.0.1", "port": 8080}]
+        }))
+        .unwrap()],
+        ..GatewayConfig::default()
+    };
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Upstream".to_string(),
+        id: "new-upstream".to_string(),
+        namespace: "ferrum".to_string(),
+        details: Vec::new(),
+    }];
+    let mut state = StateFile::default();
+    state.reserve_adds(&diffs, &desired).unwrap();
+    let actual = BTreeMap::from([("ferrum".to_string(), desired.clone())]);
+
+    let report =
+        state.reconcile_pending_creates(&desired, &actual, PendingCreateScope::FullReplace);
+
+    assert_eq!(report.forgotten, 1);
+    assert!(state.pending_creates.is_empty());
+}
+
+#[test]
+fn a_pending_key_outside_the_read_scope_is_left_alone_in_every_mode() {
+    // A namespace filter means we have no authoritative view of that
+    // namespace. Forgetting the key there would lose the crash-recovery
+    // record it exists for.
+    let (mut state, key, _) = undeclared_live_pending_row();
+    let out_of_scope: BTreeMap<String, GatewayConfig> = BTreeMap::new();
+
+    for scope in [
+        PendingCreateScope::Shared,
+        PendingCreateScope::Exclusive,
+        PendingCreateScope::FullReplace,
+    ] {
+        let report =
+            state.reconcile_pending_creates(&GatewayConfig::default(), &out_of_scope, scope);
+        assert_eq!(report.forgotten, 0, "{scope:?}");
+        assert!(state.pending_creates.contains(&key), "{scope:?}");
+    }
+}
+
+#[test]
+fn authoritative_absence_removes_stale_managed_denominator_entries() {
+    let stale_key = state_key("ferrum", "Upstream", "already-gone");
+    let outside_scope_key = state_key("platform", "Upstream", "not-read");
+    let mut state = StateFile::default();
+    state
+        .resources
+        .insert(stale_key.clone(), "sha256:stale".to_string());
+    state
+        .resources
+        .insert(outside_scope_key.clone(), "sha256:keep".to_string());
+    let actual = BTreeMap::from([("ferrum".to_string(), GatewayConfig::default())]);
+
+    assert_eq!(
+        state.reconcile_absent_managed_resources(&GatewayConfig::default(), &actual),
+        1
+    );
+    assert!(!state.resources.contains_key(&stale_key));
+    assert_eq!(
+        state.resources.get(&outside_scope_key),
+        Some(&"sha256:keep".to_string())
     );
 }
 
@@ -266,22 +617,141 @@ fn state_file_records_credential_metadata() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
         let mut state = StateFile::load("staging").unwrap();
-        state.record_credential(
-            "ferrum/app/api_key",
-            0,
-            "secretvalue",
-            Some("alice"),
-            Some("42"),
-        );
+        state.record_credential("ferrum/app/api_key", 0, Some("alice"), Some("42"));
         state.save().unwrap();
 
         let reloaded = StateFile::load("staging").unwrap();
         let meta = reloaded.credentials.get("ferrum/app/api_key").unwrap();
         assert_eq!(meta.delivered_to.as_deref(), Some("alice"));
         assert_eq!(meta.delivered_run_id.as_deref(), Some("42"));
-        assert_eq!(meta.sha256_prefix.len(), 16);
-        // Prefix should not reveal the value.
-        assert_ne!(meta.sha256_prefix, "secretvalue");
+        let serialized = serde_json::to_string(&reloaded).unwrap();
+        assert!(!serialized.contains("sha256_prefix"));
+        assert!(!serialized.contains("secretvalue"));
+    });
+}
+
+#[test]
+fn public_state_is_identical_when_only_a_consumer_secret_changes() {
+    use gitforgeops::config::schema::GatewayConfig;
+
+    fn config(secret: &str) -> GatewayConfig {
+        serde_yaml::from_str(&format!(
+            r#"
+consumers:
+  - id: app
+    username: app
+    namespace: ferrum
+    credentials:
+      keyauth:
+        - key: {secret}
+"#
+        ))
+        .unwrap()
+    }
+
+    let key = state_key("ferrum", "Consumer", "app");
+    let mut first = StateFile::default();
+    first.record(&config("first-low-entropy-secret"), &["ferrum".to_string()]);
+    let mut second = StateFile::default();
+    second.record(
+        &config("different-low-entropy-secret"),
+        &["ferrum".to_string()],
+    );
+
+    assert_eq!(first.resources.get(&key), Some(&"managed:v1".to_string()));
+    assert_eq!(first.resources, second.resources);
+    assert!(!serde_json::to_string(&first)
+        .unwrap()
+        .contains("first-low-entropy-secret"));
+}
+
+#[test]
+fn loading_v2_state_sanitizes_legacy_hash_oracles_on_next_save() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let key = state_key("ferrum", "Consumer", "app");
+        let old = serde_json::json!({
+            "version": 2,
+            "environment": "production",
+            "last_applied_at": null,
+            "last_applied_commit": null,
+            "resources": {key.clone(): "sha256:consumer-secret-oracle"},
+            "credentials": {
+                "ferrum/app/keyauth/key": {
+                    "slot": "ferrum/app/keyauth/key",
+                    "shard": 0,
+                    "last_rotated": "2026-01-01T00:00:00Z",
+                    "sha256_prefix": "deadbeefdeadbeef"
+                }
+            },
+            "credential_bundle_versions": {"0": "sha256:bundle-oracle"},
+            "credential_shard_count": 1,
+            "overrides": []
+        });
+        std::fs::write(
+            ".state/production.json",
+            serde_json::to_string_pretty(&old).unwrap(),
+        )
+        .unwrap();
+
+        let state = StateFile::load("production").unwrap();
+        assert_eq!(state.version, 3);
+        assert_eq!(state.resources.get(&key), Some(&"managed:v1".to_string()));
+        state.save().unwrap();
+
+        let rewritten = std::fs::read_to_string(".state/production.json").unwrap();
+        assert!(!rewritten.contains("sha256_prefix"), "{rewritten}");
+        assert!(
+            !rewritten.contains("credential_bundle_versions"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("secret-oracle"), "{rewritten}");
+        assert!(!rewritten.contains("bundle-oracle"), "{rewritten}");
+    });
+}
+
+#[test]
+fn state_load_rejects_future_versions_instead_of_downgrading_them() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let state = serde_json::json!({
+            "version": 99,
+            "environment": "production",
+            "resources": {}
+        });
+        std::fs::write(
+            ".state/production.json",
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        let error = StateFile::load("production").unwrap_err().to_string();
+        assert!(error.contains("unsupported version 99"), "{error}");
+    });
+}
+
+#[test]
+fn state_save_sanitizes_manually_inserted_resource_hashes() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let mut state = StateFile {
+            environment: "production".to_string(),
+            ..StateFile::default()
+        };
+        state.resources.insert(
+            state_key("ferrum", "Consumer", "app"),
+            "sha256:credential-derived-oracle".to_string(),
+        );
+        state.save().unwrap();
+
+        let persisted = std::fs::read_to_string(".state/production.json").unwrap();
+        assert!(
+            !persisted.contains("credential-derived-oracle"),
+            "{persisted}"
+        );
+        assert!(persisted.contains("managed:v1"), "{persisted}");
     });
 }
 
@@ -304,6 +774,7 @@ fn record_op_preserves_state_for_failed_delete() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            extra: Default::default(),
             id: id.to_string(),
             name: None,
             namespace: ns.to_string(),
@@ -432,7 +903,7 @@ fn record_op_preserves_state_for_failed_delete() {
         "successful Delete must remove the key from state"
     );
 
-    // Successful Modify on a Consumer should refresh the hash and not
+    // Successful Modify on a Consumer should install the safe marker and not
     // touch other namespaces.
     let mut state3 = StateFile::default();
     let other_key = state_key("platform", "Consumer", "other");
@@ -444,6 +915,7 @@ fn record_op_preserves_state_for_failed_delete() {
         .resources
         .insert(app_key.clone(), "sha256:STALE".to_string());
     let consumer = Consumer {
+        extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
         namespace: "ferrum".to_string(),
@@ -468,10 +940,10 @@ fn record_op_preserves_state_for_failed_delete() {
             &cfg,
         )
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         state3.resources.get(&app_key),
-        Some(&"sha256:STALE".to_string()),
-        "Modify must refresh the hash"
+        Some(&"managed:v1".to_string()),
+        "Modify must install the non-secret ownership marker"
     );
     assert_eq!(
         state3.resources.get(&other_key),

@@ -1,0 +1,407 @@
+name: GitForgeOps Trusted PR Live Review
+
+# `workflow_run` loads this workflow definition from the protected default
+# branch, never from the pull request. The triggering PR workflow receives no
+# environment secrets. This workflow fetches the exact reviewed head as an
+# archive, copies only bounded resource/overlay YAML into a manifest-backed
+# artifact, then runs a binary and environment configuration from a pinned
+# default-branch commit with a namespace-scoped admin token. Fork and
+# non-declarative PRs stop before any Environment is bound.
+on:
+  workflow_run:
+    workflows: [GitForgeOps PR Static Validation]
+    types: [completed]
+
+# Keyed on the reviewed head, not the PR: two different commits are two
+# different reviews and both should run, but a re-run (or a duplicated
+# workflow_run delivery) for the SAME commit would otherwise race its
+# predecessor for the environment approval and the PR comment.
+concurrency:
+  group: trusted-pr-review-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+      head_sha: ${{ steps.metadata.outputs.head_sha }}
+      pr_number: ${{ steps.metadata.outputs.pr_number }}
+      trusted_sha: ${{ steps.metadata.outputs.trusted_sha }}
+      privileged: ${{ steps.metadata.outputs.privileged }}
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      binary_artifact_name: ${{ steps.metadata.outputs.binary_artifact_name }}
+      trusted_binary_sha256: ${{ steps.trusted-binary.outputs.sha256 }}
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Validate workflow-run metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          EXPECTED_WORKFLOW_PATH: .github/workflows/validate-pr.yml
+        run: |
+          set -euo pipefail
+          [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid head SHA" >&2; exit 1; }
+
+          # `workflow_run.workflows:` matches on the workflow's *display name*,
+          # which is just a `name:` line any workflow file may carry. Resolve
+          # the triggering run and require its definition path, so a new or
+          # renamed workflow cannot impersonate static validation and hand this
+          # privileged job a head SHA of its choosing.
+          run_path=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.path')
+          [ "$run_path" = "$EXPECTED_WORKFLOW_PATH" ] || {
+            echo "Triggering run is '${run_path}', not ${EXPECTED_WORKFLOW_PATH}." >&2
+            exit 1
+          }
+          trusted_sha=$(git -C trusted rev-parse HEAD)
+          if [ "$EVENT_HEAD_REPO" != "$REPO" ]; then
+            {
+              echo "head_sha=$EVENT_HEAD_SHA"
+              echo "trusted_sha=$trusted_sha"
+              echo "privileged=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "Fork PR: static validation is complete; privileged live review is disabled."
+            exit 0
+          fi
+
+          # workflow_run.pull_requests is observably empty for some PR runs.
+          # Resolve from the exact triggering commit and require one open,
+          # matching-source PR whose current head is still that commit.
+          matches='[]'
+          match_count=0
+          for attempt in 1 2 3 4 5; do
+            if associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp); then
+              matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" '
+                [.[][]
+                  | select(.state == "open")
+                  | select(.head.sha == $sha)
+                  | select(.head.repo.full_name == $head_repo)
+                  | select(.base.ref == $base)]
+              ' <<< "$associated")
+              match_count=$(jq 'length' <<< "$matches")
+              [ "$match_count" -eq 1 ] && break
+            fi
+            echo "PR association is not yet available and unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
+          [ "$match_count" -eq 1 ] || { echo "Expected one open PR for workflow head; found $match_count." >&2; exit 1; }
+          event_pr=$(jq -r '.[0].number' <<< "$matches")
+          [[ "$event_pr" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid resolved PR number" >&2; exit 1; }
+
+          current=$(gh api "repos/${REPO}/pulls/${event_pr}")
+          current_sha=$(jq -r '.head.sha' <<< "$current")
+          current_repo=$(jq -r '.head.repo.full_name' <<< "$current")
+          current_base=$(jq -r '.base.ref' <<< "$current")
+          current_base_sha=$(jq -r '.base.sha' <<< "$current")
+          declared_changed=$(jq -r '.changed_files' <<< "$current")
+          [ "$current_sha" = "$EVENT_HEAD_SHA" ] || { echo "PR head changed after static validation; wait for the new run." >&2; exit 1; }
+          [ "$current_repo" = "$EVENT_HEAD_REPO" ] || { echo "PR source repository changed." >&2; exit 1; }
+          [ "$current_base" = "$DEFAULT_BRANCH" ] || { echo "PR no longer targets the protected default branch." >&2; exit 1; }
+
+          pages_file=$(mktemp)
+          trap 'rm -f "$pages_file"' EXIT
+          gh api "repos/${REPO}/pulls/${event_pr}/files?per_page=100" \
+            --paginate --slurp > "$pages_file"
+          [[ "$declared_changed" =~ ^[0-9]+$ ]] || { echo "Invalid changed-file count" >&2; exit 1; }
+          current_after=$(gh api "repos/${REPO}/pulls/${event_pr}")
+          [ "$(jq -r '.head.sha' <<< "$current_after")" = "$current_sha" ] && \
+          [ "$(jq -r '.base.sha' <<< "$current_after")" = "$current_base_sha" ] && \
+          [ "$(jq -r '.base.ref' <<< "$current_after")" = "$current_base" ] && \
+          [ "$(jq -r '.changed_files' <<< "$current_after")" = "$declared_changed" ] || {
+            echo "PR file metadata changed during trusted classification; wait for the new run." >&2
+            exit 1
+          }
+          classification=$(python3 trusted/.github/scripts/changed_files.py \
+            "$pages_file" "$declared_changed" declarative)
+          [ "$(jq -r '.complete' <<< "$classification")" = true ] || {
+            echo "Changed-file pagination was incomplete; trusted review fails closed." >&2
+            exit 1
+          }
+          relevant=$(jq -r '.matches' <<< "$classification")
+          umask 077
+          jq -c '.matched_paths' <<< "$classification" > "$RUNNER_TEMP/trusted-changed-paths.json"
+          same_repo=false
+          [ "$EVENT_HEAD_REPO" = "$REPO" ] && same_repo=true
+          privileged=false
+          [ "$same_repo" = true ] && [ "$relevant" = true ] && privileged=true
+
+          artifact_name="trusted-pr-input-${RUN_ID}-${RUN_ATTEMPT}"
+          binary_artifact_name="trusted-gitforgeops-${RUN_ID}-${RUN_ATTEMPT}"
+          {
+            echo "pr_number=$event_pr"
+            echo "head_sha=$EVENT_HEAD_SHA"
+            echo "trusted_sha=$trusted_sha"
+            echo "privileged=$privileged"
+            echo "artifact_name=$artifact_name"
+            echo "binary_artifact_name=$binary_artifact_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download exact PR source archive as untrusted data
+        if: steps.metadata.outputs.privileged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.metadata.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --retry 3 --retry-connrefused \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${REPO}/tarball/${HEAD_SHA}" \
+            --output "$RUNNER_TEMP/pr-source.tar.gz"
+
+      - name: Sanitize declarative PR input
+        if: steps.metadata.outputs.privileged == 'true'
+        run: |
+          python3 trusted/.github/scripts/pr_input.py prepare \
+            "$RUNNER_TEMP/pr-source.tar.gz" pr-input \
+            "${{ steps.metadata.outputs.head_sha }}"
+
+      - name: Install Rust toolchain
+        if: steps.metadata.outputs.privileged == 'true'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache trusted build
+        if: steps.metadata.outputs.privileged == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            trusted/target
+          key: ${{ runner.os }}-trusted-pr-${{ hashFiles('trusted/Cargo.lock') }}
+
+      - name: Build trusted gitforgeops
+        if: steps.metadata.outputs.privileged == 'true'
+        run: cargo build --release --locked --manifest-path trusted/Cargo.toml
+
+      - name: Record trusted binary digest
+        if: steps.metadata.outputs.privileged == 'true'
+        id: trusted-binary
+        run: |
+          set -euo pipefail
+          sha256=$(sha256sum trusted/target/release/gitforgeops | awk '{print $1}')
+          [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid trusted binary digest" >&2; exit 1; }
+          echo "Trusted gitforgeops SHA-256: $sha256"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload trusted binary
+        if: steps.metadata.outputs.privileged == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.metadata.outputs.binary_artifact_name }}
+          path: trusted/target/release/gitforgeops
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enumerate trusted environment and namespace targets
+        if: steps.metadata.outputs.privileged == 'true'
+        id: targets
+        run: |
+          set -euo pipefail
+          scopes=$(cd trusted && ./target/release/gitforgeops envs \
+            --format json --include-scopes | jq -c .)
+
+          # Privileged review never consumes PR-authored environment or policy
+          # configuration. It binds only protected-branch environments and
+          # protected-branch resource namespace directories, intersected with
+          # the current and previous resource/overlay paths from the stable PR
+          # file snapshot. FERRUM_NAMESPACE later narrows both desired loading
+          # and the JWT `ns` claim, so an untrusted YAML namespace override
+          # cannot turn live review into a cross-namespace read primitive. New
+          # namespaces receive static validation only until their directory is
+          # trusted on main. Protected config-only changes remain static-only
+          # because privileged review replaces candidate `.gitforgeops` files.
+          targets=$(python3 trusted/.github/scripts/pr_input.py targets \
+            trusted "$scopes" "$RUNNER_TEMP/trusted-changed-paths.json")
+          echo "Trusted source SHA: ${{ steps.metadata.outputs.trusted_sha }}"
+          echo "Live-review targets: $targets"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+      - name: Upload sanitized input
+        if: steps.metadata.outputs.privileged == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: pr-input
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  live-review:
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.privileged == 'true' &&
+      needs.prepare.outputs.targets != '[]' &&
+      needs.prepare.outputs.targets != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.targets) }}
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Check out exact trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare.outputs.trusted_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Download sanitized input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.prepare.outputs.artifact_name }}
+          path: review-input
+
+      - name: Download exact trusted binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.prepare.outputs.binary_artifact_name }}
+          path: review-bin
+
+      - name: Verify trusted binary digest
+        id: binary
+        env:
+          EXPECTED_SHA256: ${{ needs.prepare.outputs.trusted_binary_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid expected binary digest" >&2; exit 1; }
+          printf '%s  %s\n' "$EXPECTED_SHA256" review-bin/gitforgeops | sha256sum --check --strict
+          chmod 0755 review-bin/gitforgeops
+
+      - name: Verify manifest, paths, types, sizes, and hashes
+        id: verify
+        run: |
+          python3 trusted/.github/scripts/pr_input.py verify \
+            review-input "${{ needs.prepare.outputs.head_sha }}"
+
+      - name: Revalidate PR head after environment approval
+        id: current-head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          EXPECTED_BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          current_sha=$(jq -r '.head.sha' <<< "$current")
+          current_base=$(jq -r '.base.ref' <<< "$current")
+          [ "$current_sha" = "$EXPECTED_HEAD_SHA" ] || {
+            echo "PR head changed while live review awaited approval; refusing stale review." >&2
+            exit 1
+          }
+          [ "$current_base" = "$EXPECTED_BASE_BRANCH" ] || {
+            echo "PR base changed while live review awaited approval; refusing review outside the protected default branch." >&2
+            exit 1
+          }
+
+      - name: Add trusted environment and policy configuration
+        id: trusted-config
+        run: |
+          set -euo pipefail
+          [ ! -L trusted/.gitforgeops ] || {
+            echo "Trusted .gitforgeops directory must not be a symlink." >&2
+            exit 1
+          }
+          install -d -m 0700 review-input/.gitforgeops
+          for name in config.yaml policies.yaml; do
+            source="trusted/.gitforgeops/$name"
+            [ -e "$source" ] || continue
+            if [ -L "$source" ] || [ ! -f "$source" ]; then
+              echo "Trusted configuration path must be a regular file: $source" >&2
+              exit 1
+            fi
+            install -m 0600 "$source" "review-input/.gitforgeops/$name"
+          done
+
+      - name: Add trusted ownership state for this environment
+        id: trusted-state
+        env:
+          INPUT_ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          [ ! -L trusted/.state ] || {
+            echo "Trusted .state directory must not be a symlink." >&2
+            exit 1
+          }
+          state="trusted/.state/${INPUT_ENVIRONMENT}.json"
+          if [ -L "$state" ]; then
+            echo "Trusted state path must not be a symlink: $state" >&2
+            exit 1
+          fi
+          if [ -f "$state" ]; then
+            install -d -m 0700 review-input/.state
+            install -m 0600 "$state" "review-input/.state/${INPUT_ENVIRONMENT}.json"
+          fi
+
+      - name: Download verified ferrum-edge binary
+        id: validator
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bash trusted/.github/scripts/install-ferrum-edge.sh
+
+      - name: Validate with trusted binary
+        id: validation
+        working-directory: review-input
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
+          FERRUM_NAMESPACE: ${{ matrix.namespace }}
+        run: ../review-bin/gitforgeops validate --format github-annotations
+
+      - name: Post trusted live review
+        if: >-
+          always() &&
+          steps.verify.outcome == 'success' &&
+          steps.binary.outcome == 'success' &&
+          steps.current-head.outcome == 'success' &&
+          steps.trusted-config.outcome == 'success' &&
+          steps.trusted-state.outcome == 'success' &&
+          steps.validator.outcome == 'success'
+        working-directory: review-input
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
+          FERRUM_NAMESPACE: ${{ matrix.namespace }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITFORGEOPS_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
+          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+          FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
+          FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+        run: >-
+          ../review-bin/gitforgeops review
+          --pr "$GITFORGEOPS_PR_NUMBER"
+          --require-live

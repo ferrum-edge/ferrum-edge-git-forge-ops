@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::GatewayConfig;
+use crate::secrets::SecretScrubber;
 
 /// Result of running `ferrum-edge validate`.
 ///
@@ -148,12 +149,28 @@ fn private_temp_file(
 /// placeholders *before* validating — the document on disk can contain live
 /// consumer credentials and must never land in a world-readable shared temp
 /// file under a guessable name.
+///
+/// The same resolution is why the child's output is passed through a
+/// [`SecretScrubber`] built from `config`: `ferrum-edge validate` quotes the
+/// document it was handed, so on a bundle-loaded run every credential in a
+/// diagnostic is a live value. Only those exact byte sequences are replaced
+/// with `[REDACTED]`; every other diagnostic — the proxy typo that actually
+/// failed the run — is returned intact.
+///
+/// Credential leaves that are *still* placeholders (no bundle loaded, as on a
+/// fork PR) are replaced with [`crate::validate::validation_standin`] values
+/// in the temp spec only, so shape checks such as ferrum-edge's 32-character
+/// `jwt`/`hmac_auth` floor grade the repo's structure instead of failing on
+/// the 30-character placeholder literal.
 pub fn run_validation(
     config: &GatewayConfig,
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
-    let yaml = serde_yaml::to_string(config)?;
-    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path)
+    let scrubber = SecretScrubber::from_gateway_config(config);
+    // Stand-ins are fabricated here and go no further than `spec_file` below.
+    let standins = crate::validate::standin::with_validation_standins(config);
+    let yaml = serde_yaml::to_string(standins.as_ref().unwrap_or(config))?;
+    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, &scrubber)
 }
 
 /// Validate the standalone mesh document with
@@ -173,16 +190,38 @@ pub fn run_mesh_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let yaml = crate::apply::render_mesh_yaml(mesh)?;
-    run_validate_command(MESH_VALIDATE_MODE, &yaml, binary_path)
+    // A mesh document carries no brokered credential material — the
+    // gh-env-secret broker walks consumer credentials and plugin config, and
+    // neither exists in a mesh slice — so there is nothing to redact and
+    // every diagnostic is printed verbatim.
+    run_validate_command(
+        MESH_VALIDATE_MODE,
+        &yaml,
+        binary_path,
+        &SecretScrubber::default(),
+    )
 }
+
+/// Emitted in place of the validator's own output when, and only when,
+/// redaction provably failed. See [`crate::secrets::MIN_SCRUB_LENGTH`]: a
+/// credential shorter than the substring-replacement floor cannot be removed
+/// from a diagnostic without corrupting it, so the diagnostic goes instead.
+const SUPPRESSED_NOTICE: &str = "Validator diagnostics were withheld: a credential value survived redaction, so the output could not be shown without leaking it. Credentials shorter than 8 bytes cannot be redacted from a diagnostic without mangling it — lengthen the credential, or move the literal value into the ${gh-env-secret:...} broker.\n";
 
 /// Shared body of [`run_validation`] and [`run_mesh_validation`]: locate the
 /// binary, write `yaml` to a private temp file, and run `validate` in `mode`
 /// with a scrubbed environment and pinned settings.
+///
+/// `scrubber` holds the secret byte sequences to remove from the child's
+/// stdout and stderr before either is returned. Everything else the validator
+/// said — schema errors on proxies, upstreams, plugins, the lot — survives,
+/// which is the whole point: a bundle-loaded apply run must still be able to
+/// report a proxy typo.
 fn run_validate_command(
     mode: &str,
     yaml: &str,
     binary_path: &str,
+    scrubber: &SecretScrubber,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
     let which_result = Command::new("which").arg(binary_path).output();
@@ -236,8 +275,27 @@ fn run_validate_command(
     let output = output?;
 
     let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut stdout = scrubber.scrub(&String::from_utf8_lossy(&output.stdout));
+    let mut stderr = scrubber.scrub(&String::from_utf8_lossy(&output.stderr));
+
+    // Last resort. Substring replacement removes every secret at or above
+    // `MIN_SCRUB_LENGTH`, so reaching here means a credential too short to
+    // replace safely was echoed back. Drop the stream rather than print it.
+    if scrubber.leaks(&stdout) || scrubber.leaks(&stderr) {
+        stdout = String::new();
+        stderr = SUPPRESSED_NOTICE.to_string();
+    }
+
+    // ferrum-edge validate's public contract is 0 for accepted input and 1
+    // for schema rejection. Any other code (including -1 for termination by
+    // signal) means the validator itself failed; treating that as an ordinary
+    // rejected document would hide a broken release gate.
+    if !matches!(exit_code, 0 | 1) {
+        return Err(crate::error::Error::ValidateProcess {
+            code: exit_code,
+            stderr: bounded_process_diagnostic(&stderr),
+        });
+    }
 
     Ok(ValidationResult {
         success: output.status.success(),
@@ -245,4 +303,15 @@ fn run_validate_command(
         stderr,
         exit_code,
     })
+}
+
+fn bounded_process_diagnostic(diagnostic: &str) -> String {
+    const MAX_CHARS: usize = 4_000;
+    let mut chars = diagnostic.chars();
+    let bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}\n[validator diagnostic truncated]")
+    } else {
+        bounded
+    }
 }

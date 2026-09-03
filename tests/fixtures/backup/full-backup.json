@@ -1,0 +1,131 @@
+{
+  "version": "1",
+  "ferrum_version": "2.9.1",
+  "exported_at": "2026-08-24T10:30:00+00:00",
+  "source": "database",
+  "counts": {
+    "proxies": 2,
+    "consumers": 1,
+    "plugin_configs": 2,
+    "upstreams": 2,
+    "api_specs": 1,
+    "gateway_trust_bundles": 1
+  },
+  "proxies": [
+    {
+      "id": "repo-proxy",
+      "namespace": "team-alpha",
+      "listen_path": "/repo",
+      "backend_host": "repo.internal",
+      "backend_port": 8080,
+      "backend_scheme": "http",
+      "upstream_id": "repo-upstream",
+      "plugins": [{ "plugin_config_id": "repo-plugin" }],
+      "created_at": "2026-08-01T00:00:00Z",
+      "updated_at": "2026-08-20T00:00:00Z"
+    },
+    {
+      "id": "spec-proxy",
+      "namespace": "team-alpha",
+      "listen_path": "/orders",
+      "backend_host": "orders.internal",
+      "backend_port": 8443,
+      "backend_scheme": "https",
+      "upstream_id": "spec-upstream",
+      "api_spec_id": "spec-orders",
+      "plugins": [{ "plugin_config_id": "spec-plugin" }],
+      "created_at": "2026-08-02T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    }
+  ],
+  "consumers": [
+    {
+      "id": "partner-a",
+      "username": "partner-a",
+      "namespace": "team-alpha",
+      "credentials": {
+        "keyauth": [{ "key": "sk-live-partner-a" }]
+      },
+      "acl_groups": ["partners"],
+      "created_at": "2026-08-03T00:00:00Z",
+      "updated_at": "2026-08-22T00:00:00Z"
+    }
+  ],
+  "plugin_configs": [
+    {
+      "id": "repo-plugin",
+      "namespace": "team-alpha",
+      "plugin_name": "cors",
+      "scope": "proxy",
+      "proxy_id": "repo-proxy",
+      "config": { "allowed_origins": ["https://example.test"] },
+      "created_at": "2026-08-04T00:00:00Z",
+      "updated_at": "2026-08-23T00:00:00Z"
+    },
+    {
+      "id": "spec-plugin",
+      "namespace": "team-alpha",
+      "plugin_name": "request_validator",
+      "scope": "proxy",
+      "proxy_id": "spec-proxy",
+      "api_spec_id": "spec-orders",
+      "config": { "validate_request_body": true },
+      "created_at": "2026-08-05T00:00:00Z",
+      "updated_at": "2026-08-23T00:00:00Z"
+    }
+  ],
+  "upstreams": [
+    {
+      "id": "repo-upstream",
+      "namespace": "team-alpha",
+      "targets": [{ "host": "10.0.0.1", "port": 8080 }],
+      "created_at": "2026-08-06T00:00:00Z",
+      "updated_at": "2026-08-23T00:00:00Z"
+    },
+    {
+      "id": "spec-upstream",
+      "namespace": "team-alpha",
+      "api_spec_id": "spec-orders",
+      "targets": [{ "host": "10.0.0.2", "port": 8443 }],
+      "created_at": "2026-08-07T00:00:00Z",
+      "updated_at": "2026-08-23T00:00:00Z"
+    }
+  ],
+  "api_specs": {
+    "section_version": "2",
+    "items": [
+      {
+        "id": "spec-orders",
+        "namespace": "team-alpha",
+        "proxy_id": "spec-proxy",
+        "spec_version": "3.0.3",
+        "spec_format": "json",
+        "spec_content_base64": "H4sIAAAAAAAAAytOLSpLLSrOzM9TslIqSCwqzs1MzVOyUlAqzUsuyczPUyjJVygtBgD2C24qJgAAAA==",
+        "content_encoding": "gzip",
+        "uncompressed_size": 42,
+        "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "title": "Orders API",
+        "info_version": "1.4.0",
+        "description": "Partner order intake",
+        "contact_name": "Platform",
+        "contact_email": "platform@example.test",
+        "license_name": "Proprietary",
+        "tags": ["orders"],
+        "server_urls": ["https://orders.example.test"],
+        "operation_count": 7,
+        "resource_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "external_ref_snapshot_base64": null,
+        "external_ref_digest": null,
+        "created_at": "2026-08-08T00:00:00Z",
+        "updated_at": "2026-08-23T00:00:00Z"
+      }
+    ]
+  },
+  "gateway_trust_bundles": [
+    {
+      "namespace": "team-alpha",
+      "revision": 7,
+      "updated_at": "2026-08-23T00:00:00Z"
+    }
+  ]
+}
