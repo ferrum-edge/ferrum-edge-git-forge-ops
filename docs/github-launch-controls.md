@@ -170,6 +170,7 @@ In **Settings → Actions → General**:
 - disable **Allow GitHub Actions to create and approve pull requests**;
 - allow GitHub-owned Actions, disallow the blanket "verified creators" switch,
   and set the third-party patterns to exactly:
+  - `aquasecurity/setup-trivy@*`
   - `aquasecurity/trivy-action@*`
   - `docker/build-push-action@*`
   - `docker/login-action@*`
