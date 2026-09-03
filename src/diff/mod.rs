@@ -11,4 +11,7 @@ pub use resource_diff::{
     DiffAction, DiffOptions, DiffResult, FieldChange, OwnershipScope, ResourceDiff,
     SpecOwnedResource, UnmanagedResource,
 };
-pub use security::{audit_security, audit_security_with_policy, SecurityFinding};
+pub use security::{
+    audit_security, audit_security_with_policy, security_blockers, SecurityFinding,
+    BLOCKING_SEVERITY,
+};

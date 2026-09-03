@@ -1341,9 +1341,12 @@ fn lenient_and_strict_agree_when_no_constraint_is_violated() {
 
 // --- Array slot-identity hazards (G3) ---------------------------------------
 
-/// Entry *position* is the slot identity, so a multi-entry credential array
-/// cannot be reordered or shortened safely. The resolver cannot rename slots
-/// retroactively without orphaning every existing allocation, so it warns.
+/// Entry *position* is the slot identity, so a multi-entry credential array is
+/// order-sensitive. A reorder or a prepend is nonetheless invisible from the
+/// document — array length, bundle keys and every slot status are identical to
+/// steady state — so this stays an advisory. Making it fatal would refuse
+/// every multi-entry brokered credential forever; the fatal case is the one
+/// with evidence (see the shrink test below).
 #[test]
 fn multi_entry_credential_array_warns_that_order_is_identity() {
     use gitforgeops::secrets::report_secrets;
@@ -1369,6 +1372,36 @@ fn multi_entry_credential_array_warns_that_order_is_identity() {
         "the warning must point at the safe operation: {:?}",
         report.warnings
     );
+    assert!(
+        report.slot_remaps.is_empty(),
+        "an empty bundle stores nothing that could be remapped: {:?}",
+        report.slot_remaps
+    );
+}
+
+/// The steady state that must keep resolving. Both slots are allocated and
+/// every one still has an entry, so nothing has been reassigned — only the
+/// positional advisory fires.
+#[test]
+fn steady_multi_entry_credential_array_still_resolves() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE), entry("key", GENERATE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), "a".to_string());
+    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "b".to_string());
+
+    let report = report_secrets(&cfg, &bundle).unwrap();
+
+    assert!(
+        report.slot_remaps.is_empty(),
+        "a stable multi-entry array must never block apply: {:?}",
+        report.slot_remaps
+    );
+    assert!(!report.warnings.is_empty(), "the advisory still applies");
 }
 
 #[test]
@@ -1388,11 +1421,13 @@ fn single_entry_credential_array_raises_no_warning() {
     );
 }
 
-/// The array shrank: the bundle still holds `[1]`, but there is no entry 1 any
-/// more. That value is unreferenced, and re-growing the array would hand it to
-/// whatever entry lands at index 1 next.
+/// Two entries, both allocated, then entry 0 is deleted. The survivor shifts
+/// into the elided slot and inherits the deleted entry's live value, while
+/// `[1]` is orphaned in the bundle where the next grow would resurrect it.
+/// Resolution refuses: a warning in a CI log is not a control over a live
+/// credential.
 #[test]
-fn shrunk_credential_array_warns_about_the_orphaned_slot() {
+fn shrunk_credential_array_refuses_the_orphaned_slot_remap() {
     use gitforgeops::secrets::report_secrets;
 
     let cfg = consumer_with(
@@ -1406,16 +1441,115 @@ fn shrunk_credential_array_warns_about_the_orphaned_slot() {
         "retired-but-still-stored".to_string(),
     );
 
-    let report = report_secrets(&cfg, &bundle).unwrap();
+    let err = report_secrets(&cfg, &bundle)
+        .expect_err("a shrink that reassigns a stored slot must not resolve")
+        .to_string();
 
     assert!(
-        report
-            .warnings
-            .iter()
-            .any(|w| w.contains("ferrum/app/keyauth/[1]/key") && w.contains("orphaned")),
-        "expected an orphaned-slot warning naming the slot, got {:?}",
-        report.warnings
+        err.contains("ferrum/app/keyauth/[1]/key") && err.contains("orphaned"),
+        "the refusal must name the slot: {err}"
     );
+    assert!(
+        err.contains("rotate"),
+        "the refusal must point at the safe operation: {err}"
+    );
+    assert!(
+        err.contains("--allow-credential-slot-remap"),
+        "the refusal must name its opt-in: {err}"
+    );
+    // Slot names are structural; stored values are not. Neither may leak.
+    assert!(
+        !err.contains("retired-but-still-stored") && !err.contains("live"),
+        "a refusal must never echo bundle values: {err}"
+    );
+}
+
+/// The documented shrink-then-rotate sequence, explicitly acknowledged. The
+/// hazard is still recorded and rendered — it is just no longer terminal.
+#[test]
+fn allowed_slot_remap_downgrades_the_shrink_refusal_to_a_report() {
+    use gitforgeops::secrets::{report_secrets_with_options, ResolveOptions};
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/[1]/key".to_string(),
+        "retired".to_string(),
+    );
+
+    let report =
+        report_secrets_with_options(&cfg, &bundle, ResolveOptions::allowing_slot_remap(true))
+            .expect("--allow-credential-slot-remap accepts the reassignment");
+
+    assert_eq!(
+        report.slot_remaps.len(),
+        1,
+        "the hazard must still be reported: {:?}",
+        report.slot_remaps
+    );
+    assert!(report.slot_remaps[0].contains("ferrum/app/keyauth/[1]/key"));
+    // Resolution still did its job.
+    assert_eq!(report.results.len(), 1);
+}
+
+/// `resolve_secrets` and `report_secrets` must reach the same verdict — the
+/// mutating api-mode path cannot be laxer than the file-mode reporting one.
+#[test]
+fn resolve_secrets_refuses_the_same_shrink_report_secrets_refuses() {
+    use gitforgeops::secrets::resolve_secrets;
+
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
+    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "old".to_string());
+
+    assert!(
+        resolve_secrets(&mut cfg, &bundle).is_err(),
+        "resolve must refuse what report refuses"
+    );
+}
+
+/// The common case. One entry, one slot, nothing stored beyond it — no
+/// positional advisory and nothing to remap.
+#[test]
+fn single_entry_placeholder_consumer_still_resolves() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
+
+    let report = report_secrets(&cfg, &bundle).expect("single-entry arrays are the common case");
+
+    assert_eq!(report.results.len(), 1);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+}
+
+/// A shrink with nothing stored for the vacated index cannot have remapped
+/// anything, so it stays non-fatal — the fence is evidence, not array length.
+#[test]
+fn shrink_without_a_stored_value_for_the_lost_index_is_not_fatal() {
+    use gitforgeops::secrets::report_secrets;
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", GENERATE)]),
+    );
+
+    let report = report_secrets(&cfg, &BTreeMap::new()).expect("nothing stored, nothing remapped");
+
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
 }
 
 #[test]
@@ -1437,6 +1571,38 @@ fn matching_bundle_slots_raise_no_orphan_warning() {
         "every stored slot still has an entry: {:?}",
         report.warnings
     );
+    assert!(
+        report.slot_remaps.is_empty(),
+        "every stored slot still has an entry: {:?}",
+        report.slot_remaps
+    );
+}
+
+/// The slot-addressed rotation the refusal points at must remain reachable:
+/// while both entries still exist, addressing `[1]` is an ordinary resolve
+/// with no remap in sight. This is the "rotate before you delete" half of the
+/// documented sequence.
+#[test]
+fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
+    use gitforgeops::secrets::{report_secrets, slot_path};
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![entry("key", REQUIRE), entry("key", REQUIRE)]),
+    );
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), "a".to_string());
+    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "b".to_string());
+
+    let report = report_secrets(&cfg, &bundle).expect("rotation preflight must not be blocked");
+
+    let target = slot_path("ferrum", "app", "keyauth/[1]/key");
+    assert!(
+        report.results.iter().any(|r| r.slot == target),
+        "rotate --credential keyauth/[1]/key must still find its slot: {:?}",
+        report.results.iter().map(|r| &r.slot).collect::<Vec<_>>()
+    );
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
 }
 
 // --- Structured credential type plumbing (G7) -------------------------------

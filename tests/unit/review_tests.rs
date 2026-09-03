@@ -946,6 +946,110 @@ fn trusted_review_requires_comment_delivery_after_fallback() {
     assert!(message.contains("HTTP 403"), "{message}");
 }
 
+#[test]
+fn review_comment_renders_credential_slot_remaps_as_blocking() {
+    // Rendered from the report alone, with no declared slots: the whole point
+    // of the finding is that the *bundle* still holds a value the repository
+    // stopped declaring, so a section gated on declared slots would hide the
+    // shrink-to-nothing case.
+    let mut report = ResolveReport::default();
+    report.slot_remaps.push(
+        "credential slot 'ferrum/app/keyauth/[1]/key' is orphaned: the credential bundle still \
+         holds a value for it"
+            .to_string(),
+    );
+
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &report,
+        true,
+    );
+
+    assert!(
+        comment.contains("### Credential Slot Remaps"),
+        "expected the remap section: {comment}"
+    );
+    assert!(
+        comment.contains("ferrum/app/keyauth/\\[1\\]/key"),
+        "the slot must be named (markdown-escaped): {comment}"
+    );
+    assert!(
+        comment.contains("**Apply is blocked.**"),
+        "the reviewer must see that this is terminal: {comment}"
+    );
+    assert!(
+        comment.contains("--allow-credential-slot-remap"),
+        "the opt-in must be named: {comment}"
+    );
+}
+
+#[test]
+fn review_comment_omits_the_remap_section_when_there_are_none() {
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(!comment.contains("Credential Slot Remaps"), "{comment}");
+}
+
+#[test]
+fn review_comment_marks_error_severity_security_findings_as_blocking() {
+    let findings = vec![
+        SecurityFinding {
+            severity: "error".to_string(),
+            kind: "Consumer".to_string(),
+            id: "app".to_string(),
+            namespace: "ferrum".to_string(),
+            message: "Literal credential in 'keyauth[0].key' on consumer app".to_string(),
+        },
+        SecurityFinding {
+            severity: "warning".to_string(),
+            kind: "Proxy".to_string(),
+            id: "p1".to_string(),
+            namespace: "ferrum".to_string(),
+            message: "No auth plugin attached".to_string(),
+        },
+    ];
+
+    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+
+    assert!(
+        comment.contains("**Apply is blocked** by 1 error-severity security finding"),
+        "the comment must state apply's verdict: {comment}"
+    );
+    assert!(comment.contains("gh-env-secret"), "{comment}");
+
+    // A warning-only audit is advice, not a blocker.
+    let advisory = build_review_comment(true, "", &[], &[], &findings[1..], &[], None);
+    assert!(!advisory.contains("Apply is blocked"), "{advisory}");
+}
+
 /// gitforgeops' own banner is markdown, not content. Escaping it turned
 /// ``Environment: `default` `` into a line rendering literal backslashes.
 #[test]

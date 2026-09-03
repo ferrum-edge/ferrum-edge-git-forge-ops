@@ -216,6 +216,22 @@ fn build_review_comment_inner(
         }
         append_omitted_list_item(&mut md, security.len(), "security finding");
         md.push('\n');
+        // The reviewer's copy of apply's verdict. `cmd_apply` refuses on
+        // exactly this set (see `diff::security_blockers`), so a comment that
+        // listed the findings without saying they are terminal would read as
+        // advice on a PR that cannot be merged-and-applied.
+        let blocking = security
+            .iter()
+            .filter(|finding| finding.severity == crate::diff::security::BLOCKING_SEVERITY)
+            .count();
+        if blocking > 0 {
+            md.push_str(&format!(
+                "> **Apply is blocked** by {blocking} error-severity security finding(s). \
+                 Consumer credentials must be committed as `${{gh-env-secret:...}}` placeholders — \
+                 a literal value in repository YAML is a committed secret, and applying it \
+                 publishes it to the gateway.\n\n"
+            ));
+        }
     }
 
     if !best_practices.is_empty() {
@@ -730,6 +746,29 @@ pub fn build_review_comment_v2_with_status(
                 bounded_markdown_text(reason)
             ));
         }
+    }
+
+    // Slot remaps are rendered even when the config declares no placeholder
+    // slots at all: the whole point of the finding is that the *bundle* still
+    // holds a value the repository stopped declaring, so gating it on
+    // `secrets.results` would hide exactly the shrink-to-nothing case.
+    if !secrets.slot_remaps.is_empty() {
+        md.push_str("### Credential Slot Remaps\n\n");
+        md.push_str(
+            "A credential array changed shape in a way that reassigns a stored broker slot. \
+             Slot identity is the entry's array index, so the entry that shifted into a vacated \
+             index has inherited a credential that was meant to be retired.\n\n",
+        );
+        for remap in secrets.slot_remaps.iter().take(MAX_SECTION_ITEMS) {
+            md.push_str(&format!("- {}\n", bounded_markdown_text(remap)));
+        }
+        append_omitted_list_item(&mut md, secrets.slot_remaps.len(), "slot remap");
+        md.push('\n');
+        md.push_str(
+            "> **Apply is blocked.** Rotate the affected slot in place \
+             (`gitforgeops rotate --credential <type>/[N]/<key>`) before removing the entry, or \
+             re-run with `--allow-credential-slot-remap` to accept the reassignment.\n\n",
+        );
     }
 
     if !secrets.results.is_empty() {

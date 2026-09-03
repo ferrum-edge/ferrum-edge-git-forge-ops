@@ -25,6 +25,12 @@ use gitforgeops::validate;
 async fn main() {
     let cli = cli::Cli::parse();
     let explicit_env = cli.env.clone();
+    // `--allow-credential-slot-remap` downgrades the credential-slot-remap
+    // refusal to a report. The reporting commands (`diff`, `plan`, `review`)
+    // always resolve in reporting mode so they can render the hazard
+    // themselves; `plan` then supplies its own non-zero exit.
+    let resolve_options =
+        secrets::ResolveOptions::allowing_slot_remap(cli.allow_credential_slot_remap);
 
     let result = match cli.command {
         cli::Commands::Validate { format } => {
@@ -40,13 +46,16 @@ async fn main() {
                 materialize,
                 encrypt_to.as_deref(),
                 explicit_env.as_deref(),
+                resolve_options,
             )
             .await
         }
         cli::Commands::Diff { exit_on_drift } => {
             cmd_diff(exit_on_drift, explicit_env.as_deref()).await
         }
-        cli::Commands::Plan {} => cmd_plan(explicit_env.as_deref()).await,
+        cli::Commands::Plan {} => {
+            cmd_plan(explicit_env.as_deref(), cli.allow_credential_slot_remap).await
+        }
         cli::Commands::Apply {
             auto_approve,
             allow_large_prune,
@@ -57,6 +66,7 @@ async fn main() {
                 allow_large_prune,
                 confirm_api_spec_deletion,
                 explicit_env.as_deref(),
+                resolve_options,
             )
             .await
         }
@@ -94,6 +104,7 @@ async fn main() {
                 namespace.as_deref(),
                 recipient.as_deref(),
                 explicit_env.as_deref(),
+                resolve_options,
             )
             .await
         }
@@ -231,12 +242,25 @@ fn load_credential_bundles(
 /// (and fail `drift-check.yml --exit-on-drift`). Rotation is now always
 /// explicit via `gitforgeops rotate`, so there's no two-pass allocate-then-
 /// replace dance to preserve.
+///
+/// Credential-slot remaps are *reported* rather than raised here. These
+/// callers exist to render a picture of the repository: aborting mid-walk
+/// would replace a diff, a plan or a PR comment with one error line, and the
+/// hazard would be the only thing the reviewer could not see in context. Each
+/// caller decides what the report means — `plan` exits non-zero, `review`
+/// renders it as blocking, `diff` keeps reporting drift. The refusal itself
+/// belongs to the mutating paths (`apply`, `export --materialize`, `rotate`),
+/// which resolve with the operator's own [`secrets::ResolveOptions`].
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
 ) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
     let (bundle, _) = load_credential_bundles(env_config)?;
-    Ok(secrets::resolve_secrets(cfg, &bundle)?)
+    Ok(secrets::resolve_secrets_with_options(
+        cfg,
+        &bundle,
+        secrets::ResolveOptions::allowing_slot_remap(true),
+    )?)
 }
 
 /// Is a credential bundle available to this invocation?
@@ -498,6 +522,7 @@ async fn allocate_if_needed(
     report: &secrets::ResolveReport,
     per_shard: &mut BTreeMap<u32, secrets::CredentialBundle>,
     shard_count: &mut u32,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<Option<secrets::AllocateOutcome>, Box<dyn std::error::Error>> {
     if report.needs_allocation().is_empty() {
         return Ok(None);
@@ -552,7 +577,7 @@ async fn allocate_if_needed(
     // (first-apply generate OR first-apply rotate). Already-allocated
     // placeholders were resolved in the initial `resolve_secrets` pass.
     let merged = secrets::merge_bundles(per_shard);
-    let _ = secrets::resolve_secrets(desired, &merged)?;
+    let _ = secrets::resolve_secrets_with_options(desired, &merged, resolve_options)?;
 
     Ok(Some(outcome))
 }
@@ -702,6 +727,43 @@ fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
     println!();
 }
 
+/// Reserved rule id recorded in the state file's override ledger when a
+/// maintainer overrides the pre-resolve security audit.
+///
+/// Policy findings carry their own `rule_id`; the audit is one gate rather
+/// than a registry of rules, so a bypass of it is recorded under a single id
+/// that cannot collide with a policy rule (`.` is not used in rule ids).
+const SECURITY_AUDIT_RULE_ID: &str = "diff.security";
+
+/// Print the pre-resolve security audit for `apply`, blockers first.
+///
+/// Written to stderr rather than stdout: `apply`'s stdout carries the change
+/// list an operator (or a workflow step summary) reads back, and a refusal has
+/// to survive being piped away from it.
+fn print_security_findings(findings: &[diff::SecurityFinding]) {
+    if findings.is_empty() {
+        return;
+    }
+    eprintln!("=== Security Findings ===");
+    let blockers = diff::security_blockers(findings);
+    for finding in &blockers {
+        eprintln!(
+            "  [{}] {} {} ({}): {}",
+            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+        );
+    }
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.severity != diff::BLOCKING_SEVERITY)
+    {
+        eprintln!(
+            "  [{}] {} {} ({}): {}",
+            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+        );
+    }
+    eprintln!();
+}
+
 /// Best-effort post-apply convergence line. Never fails an apply — a gateway
 /// that cannot answer `GET /cluster` (older build, DP/CP not in play, network
 /// blip) produces one "unavailable" line and nothing else.
@@ -814,6 +876,7 @@ async fn cmd_export(
     materialize: bool,
     encrypt_to: Option<&str>,
     explicit_env: Option<&str>,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if encrypt_to.is_some() && !materialize {
         return Err(
@@ -848,7 +911,8 @@ async fn cmd_export(
         // classification, since that classification is computed against the
         // PRE-resolve bundle snapshot.
         let (bundle, _) = load_credential_bundles(&env_config)?;
-        let _ = secrets::resolve_secrets(&mut gateway_config, &bundle)?;
+        let _ =
+            secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, resolve_options)?;
         let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
         if !remaining.results.is_empty() {
             return Err(format!(
@@ -1058,7 +1122,10 @@ async fn cmd_diff(
     Ok(())
 }
 
-async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_plan(
+    explicit_env: Option<&str>,
+    allow_credential_slot_remap: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
@@ -1117,6 +1184,28 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
                 "Unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from the live diff because no secret bundle is available; literal siblings, extra entries, shape changes, and nonsecret fields are still compared.\n"
             );
         }
+    }
+
+    // A shrunk credential array reassigns a stored broker slot. `apply` and
+    // `rotate` refuse it outright; plan prints it here and carries it into the
+    // exit code, so the preview an operator reads matches what apply will do.
+    let remap_blocked = !secret_report.slot_remaps.is_empty() && !allow_credential_slot_remap;
+    if !secret_report.slot_remaps.is_empty() {
+        println!("=== Credential Slot Remaps ===");
+        for remap in &secret_report.slot_remaps {
+            println!("  {remap}");
+        }
+        if remap_blocked {
+            println!(
+                "\n{} slot reassignment(s) block apply. Rotate the affected slot in place before \
+                 removing the entry, or re-run with --allow-credential-slot-remap to accept the \
+                 reassignment.",
+                secret_report.slot_remaps.len()
+            );
+        } else {
+            println!("\nAccepted via --allow-credential-slot-remap.");
+        }
+        println!();
     }
 
     let state = StateFile::load(&resolved.name)?;
@@ -1210,10 +1299,22 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
     }
 
     // security_findings was computed pre-resolve above; reuse it here.
+    let security_blockers = diff::security_blockers(&security_findings);
+    let security_blocked = !security_blockers.is_empty();
     if !security_findings.is_empty() {
         println!("=== Security Findings ===");
         for sf in &security_findings {
             println!("  [{}] {} {}: {}", sf.severity, sf.kind, sf.id, sf.message);
+        }
+        if security_blocked {
+            // Same set `apply` refuses on, so the preview and the post-merge
+            // apply cannot disagree about whether this repo is applyable.
+            println!(
+                "\n{} error-severity finding(s) block apply. Consumer credentials belong in the \
+                 broker as ${{gh-env-secret:...}} placeholders; a literal value in repository YAML \
+                 is a committed secret.",
+                security_blockers.len()
+            );
         }
         println!();
     }
@@ -1246,7 +1347,12 @@ async fn cmd_plan(explicit_env: Option<&str>) -> Result<(), Box<dyn std::error::
         }
     }
 
-    if !validation_ok {
+    // Plan's exit code is the preview's verdict: nonzero for anything that
+    // would stop `apply`. Schema validation, the error-severity security audit
+    // and an unacknowledged credential-slot remap are all in that set, and all
+    // have already been printed in full above — the exit code carries no
+    // information the operator has not seen.
+    if !validation_ok || security_blocked || remap_blocked {
         process::exit(1);
     }
 
@@ -1258,6 +1364,7 @@ async fn cmd_apply(
     allow_large_prune: bool,
     confirm_api_spec_deletion: bool,
     explicit_env: Option<&str>,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
@@ -1267,6 +1374,79 @@ async fn cmd_apply(
     // Exclusive ownership: enforce namespace scope before anything else so the
     // operator fails fast on a misconfigured resource, not deep in apply.
     enforce_exclusive_scope(&resolved, &desired)?;
+
+    // Literal consumer credentials block apply; they are not an advisory.
+    //
+    // The audit must see the UNRESOLVED document. `check_literal_credentials`
+    // calls any credential string that is not a `${gh-env-secret:...}`
+    // placeholder a committed secret, so auditing after resolution would flag
+    // every correctly brokered value and miss nothing else. Running it here —
+    // before the state lock, before the credential bundle is read, and before
+    // any gateway call, health preflight, credential allocation or file
+    // publish — is what makes it impossible for an apply to publish a secret
+    // that was committed to the repository.
+    let policy_cfg = policy::load_policies()?;
+    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    print_security_findings(&security_findings);
+    let security_blocked = !diff::security_blockers(&security_findings).is_empty();
+
+    // One override decision serves both fail-closed reporters: the same PR
+    // label, added by the same sufficiently-permissioned account, clears the
+    // security audit and the policy rules. Resolved once so apply makes at
+    // most one round trip, and only when something could actually be
+    // overridden.
+    let override_cfg = policy_cfg
+        .as_ref()
+        .map(|cfg| cfg.overrides.clone())
+        .unwrap_or_default();
+    let override_decision = if security_blocked || policy_cfg.is_some() {
+        match resolve_pr_number(&env_config).await {
+            Some(pr) => Some(policy::check_override(&env_config, &override_cfg, pr).await?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let override_approver = override_decision
+        .as_ref()
+        .filter(|decision| decision.active)
+        .and_then(|decision| decision.approver.clone());
+
+    // Overridden rule ids are captured as they are cleared and written into
+    // state after apply, so an audit can see which blocking findings were
+    // bypassed and by whom.
+    let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
+
+    if security_blocked {
+        let blocker_count = diff::security_blockers(&security_findings).len();
+        match &override_approver {
+            Some(approver) => {
+                eprintln!(
+                    "{blocker_count} error-severity security finding(s) overridden by @{approver}; continuing."
+                );
+                overridden_for_audit.push((SECURITY_AUDIT_RULE_ID.to_string(), approver.clone()));
+            }
+            None => {
+                eprintln!(
+                    "Refusing to apply: {blocker_count} error-severity security finding(s) listed above. \
+                     Consumer credentials belong in the broker as ${{gh-env-secret:...}} placeholders; a literal \
+                     value in repository YAML is a committed secret and applying it publishes it to the gateway. \
+                     To override, add the '{}' label to the PR from an account with '{}' permission.",
+                    override_cfg.require_label, override_cfg.required_permission
+                );
+                match &override_decision {
+                    Some(decision) if !decision.active => {
+                        eprintln!("(override inactive: {})", decision.reason)
+                    }
+                    Some(_) => {}
+                    None => {
+                        eprintln!("(no PR associated with this commit; overrides not evaluated)")
+                    }
+                }
+                return Err("unresolved security findings".into());
+            }
+        }
+    }
 
     let _state_lock = StateFile::lock(&resolved.name)?;
     let mut state = StateFile::load(&resolved.name)?;
@@ -1288,8 +1468,12 @@ async fn cmd_apply(
     let mut shard_count = state.credential_shard_count.max(1);
     let initial_bundle = secrets::merge_bundles(&per_shard);
     let secret_report = match env_config.gateway_mode {
-        GatewayMode::File => secrets::report_secrets(&desired, &initial_bundle)?,
-        GatewayMode::Api => secrets::resolve_secrets(&mut desired, &initial_bundle)?,
+        GatewayMode::File => {
+            secrets::report_secrets_with_options(&desired, &initial_bundle, resolve_options)?
+        }
+        GatewayMode::Api => {
+            secrets::resolve_secrets_with_options(&mut desired, &initial_bundle, resolve_options)?
+        }
     };
 
     // Missing required credentials → fail fast before we touch the gateway.
@@ -1337,29 +1521,20 @@ async fn cmd_apply(
         }
     }
 
-    // Policy enforcement (with optional override). Overridden rule_ids are
-    // captured here and written into state after a successful apply so audits
-    // can see which blocking findings were bypassed by whom.
-    let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
-    if let Some(policy_cfg) = policy::load_policies()? {
-        let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
-        let pr_number = resolve_pr_number(&env_config).await;
-        let override_decision = if let Some(pr) = pr_number {
-            let d = policy::check_override(&env_config, &policy_cfg.overrides, pr).await?;
-            policy::github_override::apply_override(&mut findings, &d);
-            Some(d)
-        } else {
-            None
-        };
-
+    // Policy enforcement, sharing the override decision resolved before the
+    // security gate. Overridden rule_ids are captured here and written into
+    // state after a successful apply so audits can see which blocking findings
+    // were bypassed by whom.
+    if let Some(policy_cfg) = &policy_cfg {
+        let mut findings = policy::evaluate_policies(&desired, policy_cfg);
         if let Some(d) = &override_decision {
-            if d.active {
-                if let Some(approver) = &d.approver {
-                    for f in &findings {
-                        if f.overridden_by.is_some() {
-                            overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
-                        }
-                    }
+            policy::github_override::apply_override(&mut findings, d);
+        }
+
+        if let Some(approver) = &override_approver {
+            for f in &findings {
+                if f.overridden_by.is_some() {
+                    overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
                 }
             }
         }
@@ -1663,6 +1838,7 @@ async fn cmd_apply(
                 &secret_report,
                 &mut per_shard,
                 &mut shard_count,
+                resolve_options,
             )
             .await?;
 
@@ -1839,6 +2015,7 @@ async fn cmd_apply(
                 &secret_report,
                 &mut per_shard,
                 &mut shard_count,
+                resolve_options,
             )
             .await?;
 
@@ -2262,6 +2439,7 @@ async fn cmd_rotate(
     namespace: Option<&str>,
     recipient: Option<&str>,
     explicit_env: Option<&str>,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
 
@@ -2366,7 +2544,7 @@ async fn cmd_rotate(
         let mut shim_bundle = current_bundle.clone();
         shim_bundle.insert(slot.clone(), "__rotate-preflight-shim__".to_string());
         single.consumers.push(c.clone());
-        let _ = secrets::resolve_secrets(&mut single, &shim_bundle)?;
+        let _ = secrets::resolve_secrets_with_options(&mut single, &shim_bundle, resolve_options)?;
         c = single.consumers.remove(0);
         let mut remaining_cfg = gitforgeops::config::GatewayConfig::default();
         remaining_cfg.consumers.push(c);
@@ -2435,8 +2613,15 @@ async fn cmd_rotate(
     }
 
     // Now push to the gateway.
-    let push_status =
-        push_rotated_consumer_to_gateway(&env_config, &resolved, &per_shard, ns, consumer).await;
+    let push_status = push_rotated_consumer_to_gateway(
+        &env_config,
+        &resolved,
+        &per_shard,
+        ns,
+        consumer,
+        resolve_options,
+    )
+    .await;
 
     // Persist rotation state ONLY on full success. Saving before the gateway
     // push check would claim the rotation completed even when the gateway
@@ -2485,6 +2670,7 @@ async fn push_rotated_consumer_to_gateway(
     per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
     namespace: &str,
     consumer_id: &str,
+    resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !matches!(env_config.gateway_mode, GatewayMode::Api) {
         return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
@@ -2493,8 +2679,10 @@ async fn push_rotated_consumer_to_gateway(
     let mut desired = load_and_assemble_for(resolved, env_config)?;
     let merged = secrets::merge_bundles(per_shard);
     // `rotate_and_deliver` just wrote the fresh value into the bundle; this
-    // resolve picks it up for the consumer being pushed to the gateway.
-    let _ = secrets::resolve_secrets(&mut desired, &merged)?;
+    // resolve picks it up for the consumer being pushed to the gateway. The
+    // operator's slot-remap policy applies here too, so an acknowledged
+    // shrink does not clear the shim resolve only to fail on the push.
+    let _ = secrets::resolve_secrets_with_options(&mut desired, &merged, resolve_options)?;
 
     let consumer = desired
         .consumers
