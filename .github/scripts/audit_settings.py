@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 
 ALLOWED_ACTION_PATTERNS = {
+    "aquasecurity/setup-trivy@*",
     "aquasecurity/trivy-action@*",
     "docker/build-push-action@*",
     "docker/login-action@*",
