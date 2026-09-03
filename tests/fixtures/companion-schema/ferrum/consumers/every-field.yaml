@@ -1,0 +1,31 @@
+# Every field mirrored on `config::schema::Consumer`, with all five credential
+# types ferrum-edge recognizes, each in the canonical array-of-entries form.
+#
+# Every secret value is a `${gh-env-secret:...}` broker placeholder. A literal
+# credential must never appear in a repository tree, fixtures included.
+kind: Consumer
+spec:
+  id: every-field-consumer
+  username: every-field
+  namespace: ferrum
+  custom_id: crm-00042
+  credentials:
+    basicauth:
+      - username: every-field
+        password_hash: "${gh-env-secret:alloc=require}"
+    keyauth:
+      - key: "${gh-env-secret:alloc=require}"
+    jwt:
+      - key: every-field-issuer
+        secret: "${gh-env-secret:alloc=require}"
+        algorithm: HS256
+    hmac_auth:
+      - username: every-field
+        secret: "${gh-env-secret:alloc=require}"
+    mtls_auth:
+      - subject_dn: "CN=every-field,O=Example,C=US"
+  acl_groups:
+    - partners
+    - beta
+  created_at: "2024-01-01T00:00:00Z"
+  updated_at: "2024-01-02T00:00:00Z"

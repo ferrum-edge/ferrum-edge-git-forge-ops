@@ -7,6 +7,7 @@ use super::Severity;
 pub const POLICY_CONFIG_PATH: &str = ".gitforgeops/policies.yaml";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TimeoutBand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<u64>,
@@ -15,6 +16,7 @@ pub struct TimeoutBand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TimeoutBandsRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -29,6 +31,7 @@ pub struct TimeoutBandsRuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BackendSchemeRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -39,6 +42,7 @@ pub struct BackendSchemeRuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequireAuthPluginRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -105,6 +109,7 @@ pub fn is_default_auth_plugin_name(plugin_name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ForbidTlsVerifyDisabledRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -113,6 +118,7 @@ pub struct ForbidTlsVerifyDisabledRuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedProxyPluginsRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -132,6 +138,7 @@ pub struct UpstreamAllowance {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedBackendDomainsRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -166,6 +173,7 @@ pub struct AllowedBackendDomainsRuleConfig {
 
 /// `waf_enforcement` — a WAF that is attached but not blocking.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WafEnforcementRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -186,6 +194,7 @@ fn default_ai_guardrail_names() -> Vec<String> {
 
 /// `require_ai_guardrails` — AI routes must carry a content guardrail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequireAiGuardrailsRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -208,6 +217,7 @@ impl Default for RequireAiGuardrailsRuleConfig {
 
 /// `rate_limit_completeness` — a rate limiter that declares no usable budget.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitCompletenessRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -217,6 +227,7 @@ pub struct RateLimitCompletenessRuleConfig {
 
 /// `plugin_name_is_known` — the name must be one the gateway will load.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PluginNameIsKnownRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -234,6 +245,7 @@ pub struct PluginNameIsKnownRuleConfig {
 
 /// `priority_override_range` — the gateway accepts 0..=10000.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PriorityOverrideRangeRuleConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -242,6 +254,7 @@ pub struct PriorityOverrideRangeRuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRules {
     #[serde(default)]
     pub proxy_timeout_bands: TimeoutBandsRuleConfig,
@@ -268,6 +281,7 @@ pub struct PolicyRules {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverrideConfig {
     /// Label on the PR that flags an override request.
     #[serde(default = "default_override_label")]
@@ -345,6 +359,7 @@ impl Default for OverrideConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -367,6 +382,13 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
         return Ok(None);
     }
     let loaded = load_raw(path)?;
+    if loaded.version != 1 {
+        return Err(crate::error::Error::Config(format!(
+            "unsupported policy config version {} in {}; expected version 1",
+            loaded.version,
+            path.display()
+        )));
+    }
     validate_overrides(&loaded.overrides)?;
     Ok(Some(loaded))
 }

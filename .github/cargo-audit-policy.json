@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "exceptions": [
+    {
+      "kind": "vulnerability",
+      "advisory": "RUSTSEC-2023-0071",
+      "package": "rsa",
+      "version": "0.9.10",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "reachability": "age-encryption-only",
+      "owner": "@jeremyjpj0916",
+      "review_by": "2026-11-30",
+      "rationale": "age 0.12.1 requires rsa 0.9 for SSH-RSA recipient compatibility and no patched stable rsa release is available. gitforgeops only parses RSA public keys and encrypts locally; it never accepts an RSA private key or exposes RSA signing/decryption timing to a remote observer.",
+      "affected_call_paths": [
+        "gitforgeops -> age 0.12.1 (ssh feature) -> rsa 0.9.10",
+        "src/secrets/delivery.rs: age::ssh::Recipient public-key encryption"
+      ],
+      "compensating_controls": [
+        "RSA use is limited to local encryption with public recipient material; the vulnerable private-key operations are unreachable.",
+        "age rejects SSH-RSA recipient keys smaller than 2048 bits, and gitforgeops parses public recipient material only.",
+        "CI pins the age feature declaration and the gitforgeops -> age -> rsa dependency path, and rejects unreviewed `age::` references under `src/` outside the encryption-only delivery module. This is a syntactic source scan; it does not cover tests, build scripts, or re-exports.",
+        "The exact package, version, and advisory must match this policy and CI rejects stale or expired exceptions."
+      ],
+      "upstream": "https://github.com/RustCrypto/RSA/issues/19"
+    }
+  ]
+}

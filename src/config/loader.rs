@@ -3,6 +3,7 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 use super::schema::Resource;
+use super::strict::{self, LoadOptions};
 
 /// Walk `resources/<namespace>/` directories and parse each `.yaml`/`.yml` file
 /// as a `Resource`. Returns `(namespace, Resource)` pairs.
@@ -29,7 +30,37 @@ use super::schema::Resource;
 /// entry. A mesh fragment with no explicit `id` is named after its file stem
 /// so overlays have something stable to target.
 pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String, Resource)>> {
-    if !resources_dir.is_dir() {
+    load_resources_with_options(resources_dir, LoadOptions::STRICT)
+}
+
+/// [`load_resources`] with an explicit unknown-field policy.
+///
+/// `main` passes the policy derived from `FERRUM_ALLOW_UNKNOWN_FIELDS`; every
+/// other caller gets the fail-closed default from [`load_resources`].
+pub fn load_resources_with_options(
+    resources_dir: &Path,
+    options: LoadOptions,
+) -> crate::error::Result<Vec<(String, Resource)>> {
+    let root_metadata = match std::fs::symlink_metadata(resources_dir) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(crate::error::Error::NoResourcesDir(
+                resources_dir.to_path_buf(),
+            ));
+        }
+        Err(source) => {
+            return Err(crate::error::Error::FileRead {
+                path: resources_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if root_metadata.file_type().is_symlink() {
+        return Err(crate::error::Error::ConfigSymlink(
+            resources_dir.to_path_buf(),
+        ));
+    }
+    if !root_metadata.is_dir() {
         return Err(crate::error::Error::NoResourcesDir(
             resources_dir.to_path_buf(),
         ));
@@ -43,63 +74,125 @@ pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String,
             path: resources_dir.to_path_buf(),
             source,
         })?;
+    let mut namespace_entries = namespace_entries
+        .map(|entry| {
+            entry.map_err(|source| crate::error::Error::FileRead {
+                path: resources_dir.to_path_buf(),
+                source,
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    namespace_entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for ns_entry in namespace_entries {
-        let ns_entry = ns_entry.map_err(|source| crate::error::Error::FileRead {
-            path: resources_dir.to_path_buf(),
-            source,
-        })?;
-
         let ns_path = ns_entry.path();
-        if !ns_path.is_dir() {
+        let ns_type = ns_entry
+            .file_type()
+            .map_err(|source| crate::error::Error::FileRead {
+                path: ns_path.clone(),
+                source,
+            })?;
+        if ns_type.is_symlink() {
+            return Err(crate::error::Error::ConfigSymlink(ns_path));
+        }
+        if !ns_type.is_dir() {
+            if ns_type.is_file() {
+                if strict::enabled_yaml_file(&ns_path, "resource tree")? {
+                    return Err(crate::error::Error::Config(format!(
+                        "YAML file is outside a namespace directory in resource tree: {}",
+                        ns_path.display()
+                    )));
+                }
+            } else {
+                return Err(crate::error::Error::Config(format!(
+                    "special filesystem entry is forbidden in resource tree: {}",
+                    ns_path.display()
+                )));
+            }
             continue;
         }
 
         let namespace = ns_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("ferrum")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "resource namespace directory is not valid UTF-8 or is empty: {}",
+                    ns_path.display()
+                ))
+            })?
             .to_string();
 
+        strict::validate_namespace_tree(&ns_path, "resource tree")?;
+
         // Walk subdirectories: proxies/, consumers/, upstreams/, plugins/, mesh/
-        for subdir in &["proxies", "consumers", "upstreams", "plugins", "mesh"] {
+        for (subdir, expected_kind) in strict::RESOURCE_SUBDIRECTORIES {
             let subdir_path = ns_path.join(subdir);
-            if !subdir_path.is_dir() {
-                continue;
+            let subdir_metadata = match std::fs::symlink_metadata(&subdir_path) {
+                Ok(metadata) => metadata,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(crate::error::Error::FileRead {
+                        path: subdir_path,
+                        source,
+                    })
+                }
+            };
+            if subdir_metadata.file_type().is_symlink() {
+                return Err(crate::error::Error::ConfigSymlink(subdir_path));
+            }
+            if !subdir_metadata.is_dir() {
+                return Err(crate::error::Error::ConfigNotDirectory(subdir_path));
             }
 
-            for entry in WalkDir::new(&subdir_path)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
+            let mut paths = Vec::new();
+            for entry in WalkDir::new(&subdir_path).follow_links(false) {
+                let entry = entry.map_err(|source| {
+                    let path = source
+                        .path()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| subdir_path.clone());
+                    crate::error::Error::WalkDir { path, source }
+                })?;
                 let path = entry.path();
-
-                // Only process .yaml/.yml files
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext != "yaml" && ext != "yml" {
+                if entry.file_type().is_symlink() {
+                    return Err(crate::error::Error::ConfigSymlink(path.to_path_buf()));
+                }
+                if !entry.file_type().is_file() {
+                    if !entry.file_type().is_dir() {
+                        return Err(crate::error::Error::Config(format!(
+                            "special filesystem entry is forbidden in resource tree: {}",
+                            path.display()
+                        )));
+                    }
                     continue;
                 }
 
-                // Skip files starting with _
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if file_name.starts_with('_') {
+                if !strict::enabled_yaml_file(path, "resource tree")? {
                     continue;
                 }
 
-                let contents = std::fs::read_to_string(path).map_err(|source| {
+                paths.push(path.to_path_buf());
+            }
+            paths.sort();
+
+            for path in paths {
+                let contents = std::fs::read_to_string(&path).map_err(|source| {
                     crate::error::Error::FileRead {
-                        path: path.to_path_buf(),
+                        path: path.clone(),
                         source,
                     }
                 })?;
 
-                let mut resource: Resource = serde_yaml::from_str(&contents).map_err(|source| {
-                    crate::error::Error::YamlParse {
-                        path: path.to_path_buf(),
-                        source,
-                    }
-                })?;
+                let mut resource = strict::resource_from_yaml(&contents, &path, options)?;
+                let declared_kind = strict::resource_kind(&resource);
+                if declared_kind != expected_kind {
+                    return Err(crate::error::Error::Config(format!(
+                        "resource file {} declares kind {declared_kind:?} but is under {subdir}/ ({expected_kind})",
+                        path.display()
+                    )));
+                }
 
                 // Mesh fragments have no id inside the mesh schema, so an
                 // unnamed one takes the file stem. Overlays match on that

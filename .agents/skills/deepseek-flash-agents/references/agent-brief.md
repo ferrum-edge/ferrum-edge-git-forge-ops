@@ -11,7 +11,7 @@ Complete the implementation and assigned validation yourself in this session. Do
 analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
 handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
 agent-dispatch skill or script in the environment, including `qwen-agents`, `deepseek-pro-agents`,
-`deepseek-flash-agents`, `opencode-agents`, `grok-agents`, `sol-agents`, `opus-agents`,
+`deepseek-flash-agents`, `opencode-laguna-agents`, `grok-agents`, `sol-agents`, `opus-agents`,
 `fable-agents`, `composer-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers,
 or Claude CLI workers. Do not spawn nested workers. The orchestrator chose this session's model
 deliberately. If a skill registry entry is stale or unavailable, ignore it and continue with this
@@ -43,9 +43,10 @@ explicitly assigns that operation.
 
 ## Engineering rules
 
-- Follow all repository invariants, especially no undocumented `.unwrap()` or `.expect()` in
-  production, no proxy-path panics, hostile-input validation, fail-closed security behavior,
-  OpenAPI parity, env/config documentation parity, and hot-path allocation and locking limits.
+- Follow all repository invariants, especially no `.unwrap()` in production paths, no `.expect()`
+  unless failure is a genuine bug, path-component traversal rejection, namespace-scoped
+  `(namespace, kind, id)` identity, deterministic state hashes, permissive schema mirroring, and
+  fail-closed ownership and secret handling.
 - Add tests in the external test suites preferred by `AGENTS.md`; do not add inline source tests
   merely for convenience.
 - Keep edits surgical. Do not rewrite unrelated changes or clean up neighboring code without
@@ -55,14 +56,17 @@ explicitly assigns that operation.
 
 ## Validation and host discipline
 
-Multiple workers may share the host. Do not run `cargo build`, `cargo test`, or `cargo clippy`
-unless the dispatch prompt explicitly assigns local compilation or an ambiguity cannot be resolved
-by inspection. Remote CI is the normal validator for a parallel fleet.
+Multiple workers may share the host. Leave `CARGO_TARGET_DIR` unset and run validation sequentially
+inside this worktree. Before every commit, including documentation or metadata commits, run the
+mandatory repository gate:
 
-- Rust changes: run `cargo fmt --all`, then `cargo fmt --all -- --check`.
-- Docs-only or metadata-only changes: run `git diff --check`.
-- If a targeted build or test is necessary, run it sequentially in this worktree, leave
-  `CARGO_TARGET_DIR` unset, and report the exact command and result.
+- `cargo fmt --all`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --test unit_tests`
+
+Run additional focused tests and changed-surface policy checks when relevant, and report every
+exact command and result. This repository has no standing known-flake allowlist; investigate every
+red check before considering a rerun.
 
 ## Finish and report
 
@@ -82,12 +86,8 @@ and report, exit; the controller owns post-push CI and review monitoring.
    in the top-level review body. Verify each finding against the code, fix valid ones, and rebut
    false positives with file-and-line evidence.
 6. When CI diagnosis is assigned, inspect every red check's logs. Fix deterministic failures;
-   rerun only demonstrated infrastructure outages or known flakes.
+   rerun only demonstrated external infrastructure outages.
 7. Never merge, delete the worktree, or delete the branch.
-
-Known historical Ferrum Edge Git Forge Ops flakes include the gRPC-to-gRPC RST 502 test, native H3 gRPC
-streaming scripted-backend races, H3 WebSocket parallel QUIC startup panics, and stream-listener
-reload races. Prefer log evidence over folklore when deciding whether to rerun.
 
 ## Final report
 

@@ -9,7 +9,7 @@ usage() {
     '                         [--fast]' \
     '                         [--name NAME]' \
     '' \
-    'Runs the standalone `cursor-agent` CLI in print mode against composer-2.5.' \
+    'Runs the standalone cursor-agent CLI in print mode against composer-2.5.' \
     'Note: --effort is accepted for CLI parity with sibling agent skills but is' \
     'ignored. Composer 2.5 publishes no reasoning tiers.' >&2
 }

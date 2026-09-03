@@ -1,5 +1,12 @@
+use std::path::Path;
+
 use super::env::{ApplyStrategy, EnvConfig};
-use super::repo_config::{EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig};
+use super::repo_config::{
+    EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
+};
+
+/// Directory the overlay tree lives in, relative to the repository root.
+pub const OVERLAYS_ROOT: &str = "./overlays";
 
 /// Fully-resolved runtime settings for a single command invocation.
 ///
@@ -146,6 +153,58 @@ pub fn resolve_env(
     // env vars without going through that check.
     resolved.validate()?;
     Ok(resolved)
+}
+
+/// Fail before any resource is read when the selected environment names an
+/// overlay directory the repository does not ship.
+///
+/// `assembler::apply_overlay` already refuses a missing overlay directory, but
+/// it only names the path — an operator who copied
+/// `.gitforgeops/config.example.yaml` and lost `overlays/sandbox/` gets a
+/// mid-pipeline error that mentions neither the environment that selected it
+/// nor the file that declared the selection. Since every command that touches
+/// the resource tree resolves an environment first, checking here turns that
+/// into one up-front message naming all three.
+///
+/// A `None` overlay (the common case) is a no-op: only a *configured* overlay
+/// has to exist.
+pub fn validate_overlay_selection(
+    resolved: &ResolvedEnv,
+    repo: Option<&RepoConfig>,
+    overlays_root: &Path,
+) -> crate::error::Result<()> {
+    let Some(overlay) = resolved.overlay.as_deref() else {
+        return Ok(());
+    };
+
+    let overlay_dir = overlays_root.join(overlay);
+    if overlay_dir.is_dir() {
+        return Ok(());
+    }
+
+    // Repo config wins over `FERRUM_OVERLAY` in `merge`, so the selection came
+    // from the config file exactly when that file names this same overlay for
+    // this environment.
+    let declared_in_repo_config = repo
+        .and_then(|repo| repo.environment(&resolved.name))
+        .and_then(|env| env.overlay.as_deref())
+        == Some(overlay);
+    let source = if declared_in_repo_config {
+        format!(
+            "declared by environment '{}' in {REPO_CONFIG_PATH}",
+            resolved.name
+        )
+    } else {
+        "selected by FERRUM_OVERLAY".to_string()
+    };
+
+    Err(crate::error::Error::Config(format!(
+        "environment '{}' selects overlay '{overlay}', which does not exist: expected a directory at {} ({source}). \
+         Create it — an empty `{}/<namespace>/proxies/.gitkeep` is enough for git to track it — or drop the overlay from that environment.",
+        resolved.name,
+        overlay_dir.display(),
+        overlay_dir.display(),
+    )))
 }
 
 fn merge(name: String, env: &EnvironmentConfig, env_config: &EnvConfig) -> ResolvedEnv {

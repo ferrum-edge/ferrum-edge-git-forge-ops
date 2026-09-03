@@ -3,6 +3,16 @@ name: Release
 on:
   push:
     branches: [main]
+    # `apply-on-merge.yml` and `rotate.yml` push the ownership ledger (and, in
+    # file mode, the assembled documents) straight to `main` as the state-writer
+    # App. Those commits contain no build input, so rebuilding and republishing
+    # the image for them wastes a multi-platform build and moves the `latest`
+    # tag for no reason. They used to carry `[skip ci]`, which suppressed every
+    # workflow indiscriminately, including the required checks; scoping the
+    # exclusion to the paths CI actually should ignore is the narrower fix.
+    paths-ignore:
+      - '.state/**'
+      - 'assembled/**'
     tags: ['v*']
 
 concurrency:
@@ -10,6 +20,89 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  authorize-release:
+    name: Require a checked, merged pull request
+    if: github.event.repository.fork == false || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+    steps:
+      - name: Verify the published commit passed every required check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          pulls_file=$(mktemp)
+          checks_file=$(mktemp)
+          trap 'rm -f "$pulls_file" "$checks_file"' EXIT
+
+          pr=
+          for attempt in 1 2 3 4 5; do
+            if gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
+              --paginate --slurp > "$pulls_file" &&
+              pr=$(jq -er --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" '
+                if type != "array" or any(.[]; type != "array") then
+                  error("invalid commit-to-PR response")
+                else
+                  ([
+                    .[][]
+                    | select(
+                        .state == "closed" and
+                        .base.ref == $branch and
+                        (.merged_at | type) == "string" and
+                        (.number | type) == "number"
+                      )
+                  ] | unique_by(.number)) as $candidates
+                  | ([$candidates[] | select(.merge_commit_sha == $sha)]) as $exact
+                  | (if ($exact | length) > 0 then $exact else $candidates end)
+                  | if length == 1 then .[0].number
+                    else error("release commit must map to exactly one merged PR")
+                    end
+                end
+              ' "$pulls_file"); then
+              break
+            fi
+            pr=
+            echo "Release merge association is not yet available and unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
+          [ -n "$pr" ] || {
+            echo "::error::Release commit could not be mapped to exactly one merged PR."
+            exit 1
+          }
+
+          status=0
+          gh pr checks "$pr" --repo "$REPO" --required \
+            --json bucket,name,workflow > "$checks_file" || status=$?
+          [ "$status" -eq 0 ] || {
+            echo "::error::Required checks for merged PR #${pr} are not all passing."
+            cat "$checks_file"
+            exit 1
+          }
+
+          jq -e --argjson required '[
+            "Rust CI / rust-ci-check",
+            "Security / security-cargo-audit",
+            "Security / security-supply-chain-policy",
+            "GitForgeOps State Guard / state-guard-reject-state-edits",
+            "GitForgeOps PR Static Validation / gitforgeops-required-static-validation"
+          ]' '
+            map({
+              context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
+              bucket
+            }) as $checks
+            | ($required | all(. as $wanted; any($checks[]; .context == $wanted and .bucket == "pass")))
+          ' "$checks_file" >/dev/null || {
+            echo "::error::The merged PR is missing one or more successful launch-required checks."
+            cat "$checks_file"
+            exit 1
+          }
+
   docker:
     name: Build and push Docker image
     # Only run on the upstream repo by default. Forks consume the
@@ -18,15 +111,19 @@ jobs:
     # variable `GITFORGEOPS_RELEASE_ENABLED=true` and pointing
     # `DOCKERHUB_IMAGE` at a namespace it can push to (GHCR always
     # derives from `github.repository`, so no override needed there).
+    needs: authorize-release
     if: github.event.repository.fork == false || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Ensure release tag points to main
         if: startsWith(github.ref, 'refs/tags/v')
@@ -37,22 +134,27 @@ jobs:
             exit 1
           fi
 
+      - name: Verify and record immutable build inputs
+        run: >-
+          python3 .github/scripts/check_supply_chain.py
+          --write-manifest supply-chain-inputs.json
+
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -60,7 +162,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: |
             ${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
@@ -73,7 +175,8 @@ jobs:
             type=raw,value=main-{{sha}},enable={{is_default_branch}}
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -82,4 +185,58 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false
+          provenance: mode=max
+          sbom: true
+
+      - name: Publish signed GHCR build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # `docker/build-push-action` publishes ONE manifest digest to BOTH
+      # registries, so the step above covers those exact bytes — but an
+      # attestation is bound to its `subject-name`, and a consumer pulling
+      # `docker.io/<image>` verifies against that name. Without this second
+      # subject, `gh attestation verify oci://docker.io/...` finds nothing and
+      # the Docker Hub image is effectively unattested.
+      #
+      # `push-to-registry` is deliberately off here. The attestation is
+      # recorded in GitHub's attestation store, which `gh attestation verify`
+      # consults for an image in any registry, so verification works either
+      # way; writing it into Docker Hub's referrers instead would make every
+      # release depend on a third-party registry's referrers support, and a
+      # failure there would land after the image was already pushed. GHCR
+      # keeps `push-to-registry: true` because it is this project's primary
+      # distribution point and is known to support it.
+      #
+      # DOCKERHUB_IMAGE is documented as `owner/name`; the registry host is
+      # added here because an attestation subject must be fully qualified.
+      - name: Publish signed Docker Hub build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: docker.io/${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+
+      - name: Bind image digest into build-input record
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          path = Path("supply-chain-inputs.json")
+          manifest = json.loads(path.read_text())
+          manifest["published_image_digest"] = os.environ["IMAGE_DIGEST"]
+          path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Upload immutable build-input record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: supply-chain-inputs-${{ github.sha }}
+          path: supply-chain-inputs.json
+          if-no-files-found: error
+          retention-days: 90

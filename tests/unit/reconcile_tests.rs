@@ -16,6 +16,7 @@ use gitforgeops::state::StateFile;
 
 fn proxy(id: &str, namespace: &str) -> Proxy {
     Proxy {
+        extra: Default::default(),
         id: id.to_string(),
         name: None,
         namespace: namespace.to_string(),
@@ -138,6 +139,26 @@ fn shared_mode_unions_declared_and_previously_managed_without_duplicates() {
             "foo".to_string(),
             "platform".to_string()
         ]
+    );
+}
+
+#[test]
+fn shared_mode_keeps_pending_create_namespaces_in_recovery_scope() {
+    let resolved = env(OwnershipMode::Shared, None);
+    let mut state = StateFile::default();
+    state
+        .pending_creates
+        .insert(state_key("pending-only", "Proxy", "possibly-created"));
+
+    assert_eq!(
+        resolved_namespaces(&resolved, &GatewayConfig::default(), &state),
+        vec!["pending-only".to_string()]
+    );
+    assert!(
+        !previously_managed(&resolved, &state)
+            .unwrap()
+            .contains(&state_key("pending-only", "Proxy", "possibly-created")),
+        "recovery scope must not become deletion authority"
     );
 }
 

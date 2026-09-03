@@ -95,11 +95,15 @@ for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or
 Omit it for every other run, including continuations unless they remain within the same explicit
 request. Record the selected mode beside each worker.
 
-The launcher pins `claude-opus-5[1m]`, clears environment variables that can override effort,
-context, or thinking, omits fallback models, enables verbose text output, and closes stdin at the
-prompt file's EOF. It passes `fastMode: false` by default so user-level settings cannot enable Fast
-implicitly, and passes `fastMode: true` only with `--fast`. Pass `--model 'opus[1m]'` only for an
-explicit rolling-latest request. Delete the temporary prompt after the worker finishes.
+The launcher pins `claude-opus-5[1m]`, clears environment variables that can override the provider,
+authentication, model, effort, context, or thinking, omits fallback models, enables verbose text
+output, and closes stdin at the prompt file's EOF. It passes `fastMode: false` by default so
+user-level settings cannot enable Fast implicitly, and passes `fastMode: true` only with `--fast`.
+Pass `--model 'opus[1m]'` only for an explicit rolling-latest request. Delete the temporary prompt
+after the worker finishes.
+
+This skill is intentionally Codex-orchestrator-only. Claude-side sessions already have native
+Claude workers, so `.claude/skills/` does not mirror this wrapper.
 
 Start every worker in its own long-lived execution session and retain the exact session handle
 or PID. Prefer one tool call per worker so completions and failures remain attributable. Never
@@ -155,11 +159,11 @@ actionable work appears. Do not add a review trigger unless the controller expli
 3. On completion, verify the claims relevant to the prompt, such as the branch, pushed head, PR,
    requested validation, and any explicitly assigned review or CI actions.
 4. Fetch `origin/main` and independently inspect `git diff origin/main...HEAD` in the worker's
-   worktree. Use a three-dot diff. Review fail-closed behavior, hot paths, docs/spec parity,
-   production panics, tests, and scope creep.
-5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only demonstrated
-   infrastructure failures or known flakes, and dispatch bounded repair work for deterministic
-   failures.
+   worktree. Use a three-dot diff. Review ownership and secret fail-closed behavior, namespace
+   scoping, schema/documentation parity, production panics, tests, and scope creep.
+5. Own post-push review and CI monitoring. Diagnose red checks from logs, rerun only external
+   infrastructure outages proven by the failing job's logs, and dispatch bounded repair work for
+   deterministic failures.
 6. If a worker dies, inspect its worktree and remote branch before relaunching. Preserve valid
    commits or intentional WIP, write a compact state snapshot, and launch a continuation round at
    the same effort unless the evidence justifies escalation.

@@ -111,8 +111,35 @@ pub fn apply_mesh_file(mesh: &MeshConfigSpec, output_path: &str) -> crate::error
     publish_document(output_path, render_mesh_yaml(mesh)?.as_bytes())
 }
 
+/// Atomically publish arbitrary export bytes with ordinary artifact
+/// permissions. Used for placeholder-only YAML and age-encrypted output.
+pub fn publish_export(output_path: &str, bytes: &[u8]) -> crate::error::Result<()> {
+    publish_document_with_permissions(output_path, bytes, PublicationPermissions::Regular)
+}
+
+/// Atomically publish a plaintext materialized export. The payload contains
+/// live consumer credentials, so its mode is forced to owner-read/write even
+/// when replacing a more broadly-readable destination.
+pub fn publish_private_export(output_path: &str, bytes: &[u8]) -> crate::error::Result<()> {
+    publish_document_with_permissions(output_path, bytes, PublicationPermissions::Private)
+}
+
 /// Create the destination directory and atomically publish `bytes` into it.
 fn publish_document(output_path: &str, bytes: &[u8]) -> crate::error::Result<()> {
+    publish_document_with_permissions(output_path, bytes, PublicationPermissions::Regular)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublicationPermissions {
+    Regular,
+    Private,
+}
+
+fn publish_document_with_permissions(
+    output_path: &str,
+    bytes: &[u8],
+    permissions: PublicationPermissions,
+) -> crate::error::Result<()> {
     let path = Path::new(output_path);
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -120,7 +147,7 @@ fn publish_document(output_path: &str, bytes: &[u8]) -> crate::error::Result<()>
     };
     std::fs::create_dir_all(parent)?;
 
-    write_atomically(path, parent, bytes)
+    write_atomically(path, parent, bytes, permissions)
 }
 
 /// Publish `bytes` at `path` with write-temp → fsync → `rename(2)`.
@@ -136,7 +163,24 @@ fn publish_document(output_path: &str, bytes: &[u8]) -> crate::error::Result<()>
 /// The temp file is created in the destination's own directory so the rename
 /// never crosses a filesystem boundary, and it is removed on drop if any step
 /// before the rename fails.
-fn write_atomically(path: &Path, parent: &Path, bytes: &[u8]) -> crate::error::Result<()> {
+///
+/// A destination that already exists and is **not a regular file** — the
+/// canonical cases being `gitforgeops export --output /dev/null` and a named
+/// pipe — takes the direct-write path instead. Atomic replacement is not
+/// merely unnecessary there, it is impossible: `rename(2)` onto `/dev/null`
+/// would replace the device node with a regular file, and the temp file has to
+/// be created in `/dev` first, which an unprivileged process cannot do. What
+/// the caller asked for is a write to that object, so write to it.
+fn write_atomically(
+    path: &Path,
+    parent: &Path,
+    bytes: &[u8],
+    permissions: PublicationPermissions,
+) -> crate::error::Result<()> {
+    if destination_needs_direct_write(path) {
+        return write_directly(path, bytes);
+    }
+
     let mut temp = tempfile::Builder::new()
         .prefix(".gitforgeops-")
         .suffix(".tmp")
@@ -148,19 +192,73 @@ fn write_atomically(path: &Path, parent: &Path, bytes: &[u8]) -> crate::error::R
     // still only in the page cache can survive a crash as an empty file.
     temp.as_file().sync_all()?;
 
-    apply_destination_permissions(path, temp.path())?;
+    apply_destination_permissions(path, temp.path(), permissions)?;
 
     temp.persist(path)
         .map_err(|err| crate::error::Error::Io(err.error))?;
 
-    // Make the directory entry itself durable. Best-effort: a filesystem that
-    // refuses to open a directory for this is not a reason to fail a
-    // successful publish.
-    #[cfg(unix)]
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    sync_parent_directory(parent, permissions)?;
 
+    Ok(())
+}
+
+/// True when the destination exists and is something other than a regular
+/// file. A missing destination is a regular-file publication (the atomic
+/// path); a directory is left to the direct write, which fails with a clear
+/// `Is a directory` rather than a puzzling rename error.
+fn destination_needs_direct_write(path: &Path) -> bool {
+    // Follows symlinks deliberately: `--output /dev/stdout` is usually a
+    // symlink to a device, and what matters is what it points at.
+    std::fs::metadata(path).is_ok_and(|meta| !meta.is_file())
+}
+
+/// Write straight to an existing non-regular destination. No temp file, no
+/// rename, and no permission adjustment — the caller does not own the mode of
+/// a device node or a pipe, and forcing 0600 on `/dev/null` would be both
+/// futile and rude.
+fn write_directly(path: &Path, bytes: &[u8]) -> crate::error::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    // A device or pipe has no durability to speak of and several of them
+    // reject `fsync` outright; a failure here must not turn a completed write
+    // into an error.
+    let _ = file.sync_all();
+    Ok(())
+}
+
+/// Make the new directory entry durable after a rename.
+///
+/// Fatal only for a [`PublicationPermissions::Private`] publication — a
+/// materialized export of live credentials, where "the file is on disk" has to
+/// be true rather than likely. For an ordinary artifact, a filesystem that
+/// refuses to sync a directory (some network and container filesystems do,
+/// with `EINVAL`) is not a reason to fail a publication whose bytes are
+/// already written and renamed into place; warn instead.
+#[cfg(unix)]
+fn sync_parent_directory(
+    parent: &Path,
+    permissions: PublicationPermissions,
+) -> crate::error::Result<()> {
+    let synced = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    match (synced, permissions) {
+        (Ok(()), _) => Ok(()),
+        (Err(source), PublicationPermissions::Private) => Err(crate::error::Error::Io(source)),
+        (Err(source), PublicationPermissions::Regular) => {
+            eprintln!(
+                "Warning: published {} but could not fsync its directory ({source}); the file is written and renamed into place, but its directory entry may not survive a host crash.",
+                parent.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(
+    _parent: &Path,
+    _permissions: PublicationPermissions,
+) -> crate::error::Result<()> {
     Ok(())
 }
 
@@ -172,18 +270,29 @@ fn write_atomically(path: &Path, parent: &Path, bytes: &[u8]) -> crate::error::R
 /// to 0644 — what the previous `std::fs::write` produced under a default
 /// umask.
 #[cfg(unix)]
-fn apply_destination_permissions(dest: &Path, temp: &Path) -> crate::error::Result<()> {
+fn apply_destination_permissions(
+    dest: &Path,
+    temp: &Path,
+    policy: PublicationPermissions,
+) -> crate::error::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mode = match std::fs::metadata(dest) {
-        Ok(meta) => meta.permissions().mode() & 0o777,
-        Err(_) => 0o644,
+    let mode = match policy {
+        PublicationPermissions::Private => 0o600,
+        PublicationPermissions::Regular => match std::fs::metadata(dest) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(_) => 0o644,
+        },
     };
     std::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn apply_destination_permissions(_dest: &Path, _temp: &Path) -> crate::error::Result<()> {
+fn apply_destination_permissions(
+    _dest: &Path,
+    _temp: &Path,
+    _policy: PublicationPermissions,
+) -> crate::error::Result<()> {
     Ok(())
 }

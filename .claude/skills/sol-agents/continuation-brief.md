@@ -3,8 +3,8 @@
 You are working an EXISTING PR: either resuming one whose previous agent died mid-loop
 (model-capacity outage) or running a fix round on findings handed to you by the orchestrator.
 All rules of `agent-brief.md` — the file sitting NEXT TO this one in the same skill directory
-(the orchestrator's prompt gives you its absolute path) — apply: no local builds/tests
-(`cargo fmt --all` only), one `@codex review` per round, never merge, final report. Do NOT
+(the orchestrator's prompt gives you its absolute path) — apply: mandatory local validation,
+one `@codex review` per round, never merge, final report. Do NOT
 create a new worktree or branch — work in the existing worktree given in your prompt (the
 branch is checked out there).
 
@@ -30,9 +30,8 @@ Resume procedure, in order:
    latest push (if so, a re-trigger is needed AFTER you finish fixes).
 4. Triage CI: `gh pr checks <PR>`. For each failure, read the log
    (`gh run view <id> --log-failed` or the jobs API). Failures whose log shows
-   "cargo fetch failed ... likely a crates.io/registry outage" are stale outage artifacts —
-   rerun them (`gh run rerun <id> --failed`). Known-flake list is in the main brief. Anything
-   else: fix for real.
+   "cargo fetch failed ... likely a crates.io/registry outage" may be external outage artifacts —
+   verify that diagnosis before rerunning them. Anything else must be fixed for real.
 5. Then continue the normal loop: verify each unresolved codex finding in code, fix or rebut
    with evidence, fmt, commit, push, post exactly ONE `@codex review` summarizing dispositions,
    wait/poll, repeat until codex is clean AND CI is green. Report final state.

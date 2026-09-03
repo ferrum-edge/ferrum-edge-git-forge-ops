@@ -33,7 +33,7 @@ nested workers. The orchestrator selected this model and reasoning effort delibe
 - For assigned review work, identify unresolved findings, prior replies, the reviewed head SHA, and
   the latest push time. Check review-trigger timing only when the prompt assigns that action.
 - When CI repair is assigned, run `gh pr checks` and inspect logs for every red check.
-  Separate deterministic failures from demonstrated infrastructure outages or known flakes.
+  Rerun only external infrastructure outages proven by the failing job's logs.
 - Treat a previous worker's report as a lead, not evidence. Verify every material claim.
 
 ## Continue the round
