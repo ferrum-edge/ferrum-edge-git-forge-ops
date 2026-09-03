@@ -183,14 +183,12 @@ and verifies Actions permissions, the active `main` and release tag rulesets,
 required checks, the exact state-writer App bypass, and every environment's
 reviewer/self-review/branch policy.
 
-It runs weekly on a schedule **and** on `workflow_dispatch`. The manual trigger
-is not a convenience: GitHub disables a scheduled workflow after 60 days with
-no repository activity, and it does so silently. A settings audit that has been
-switched off reports no drift, which is indistinguishable from no drift
-existing — so on a quiet repository, dispatch it by hand periodically, or
-re-enable the schedule from the Actions tab. A dispatch may select any ref, so
-the job's first step refuses to run from anything but the protected default
-branch, before the administration-read token is bound to a step.
+It runs weekly on a schedule. Keep `workflow_dispatch` disabled: a manual run
+can select a branch-controlled workflow definition, which could access the
+repository-level audit token after removing any in-workflow ref check. GitHub
+disables scheduled workflows after 60 days with no repository activity, so on
+a quiet repository re-enable the schedule from the Actions tab and confirm the
+next scheduled run completes.
 
 You can run the same audit locally without exposing the token to Actions:
 

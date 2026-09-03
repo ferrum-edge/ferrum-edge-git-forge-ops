@@ -548,32 +548,19 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("ignore ledger-only commits" in item for item in violations), violations
         )
 
-    def test_settings_audit_is_dispatchable_behind_a_ref_preflight(self):
+    def test_settings_audit_rejects_branch_selectable_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/settings-audit.yml"
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
-                    "  workflow_dispatch:\n", ""
+                    "  schedule:\n", "  workflow_dispatch:\n  schedule:\n"
                 ),
                 encoding="utf-8",
             )
             violations = self._violations(root)
         self.assertTrue(
-            any("dispatchable audit is missing" in item for item in violations),
-            violations,
-        )
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = self._mirror_repo(Path(directory))
-            path = root / ".github/workflows/settings-audit.yml"
-            text = path.read_text(encoding="utf-8")
-            start = text.index("      - name: Require protected default branch")
-            end = text.index("      - name: Check out protected default branch")
-            path.write_text(text[:start] + text[end:] + text[start:end], encoding="utf-8")
-            violations = self._violations(root)
-        self.assertTrue(
-            any("before the audit token is bound" in item for item in violations),
+            any("workflow_dispatch must stay disabled" in item for item in violations),
             violations,
         )
 

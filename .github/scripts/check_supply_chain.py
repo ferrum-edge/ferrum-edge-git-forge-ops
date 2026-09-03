@@ -537,28 +537,21 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     settings_audit = (workflows / "settings-audit.yml").read_text(encoding="utf-8")
-    # GitHub disables scheduled workflows after 60 days of repository
-    # inactivity, and an audit that has silently stopped reports no drift at
-    # all. Manual dispatch is the recovery path, and it may select any ref, so
-    # it carries the same protected-branch preflight the other manual workflows
-    # use before the administration-read token is bound.
+    # A dispatch may load its definition from a selected branch. An in-workflow
+    # ref check is not a security boundary because that branch can remove it
+    # and use the repository-level audit token directly.
+    if "workflow_dispatch" in settings_audit:
+        violations.append(
+            "settings-audit.yml: workflow_dispatch must stay disabled while the audit uses a repository secret"
+        )
     for required in (
-        "  workflow_dispatch:",
-        "- name: Require protected default branch",
-        "SOURCE_REF: ${{ github.ref }}",
-        "EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}",
+        "  schedule:",
         "STATE_WRITER_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}",
     ):
         if required not in settings_audit:
             violations.append(
-                f"settings-audit.yml: dispatchable audit is missing {required!r}"
+                f"settings-audit.yml: scheduled audit is missing {required!r}"
             )
-    if settings_audit.find("- name: Require protected default branch") > settings_audit.find(
-        "GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}"
-    ):
-        violations.append(
-            "settings-audit.yml: the ref preflight must run before the audit token is bound"
-        )
 
     for rename_sensitive_workflow, trusted_invocation, expected_count in (
         (

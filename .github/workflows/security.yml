@@ -63,7 +63,7 @@ jobs:
           # `pull_request_target`, ...) or it rejects the very tree it guards.
           # `test_immutable_bootstrap_checker_accepts_the_current_policy` is
           # what catches a stale pin.
-          ref: 521cca0fdd75dde4c113031ff8a1d0f941779d2e
+          ref: 31294ea7fb816cbcdf2d85beda22a43b74c9fafd
           path: bootstrap-supply-chain
           persist-credentials: false
 
