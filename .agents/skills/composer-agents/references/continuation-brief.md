@@ -17,7 +17,8 @@ workers. Do not spawn nested workers. The orchestrator selected this model delib
 
 ## Reconstruct state before editing
 
-1. Run `pwd`, `git rev-parse --show-toplevel`, `git status --short --branch`,
+1. Change directory from Cursor's private control workspace to the exact absolute worktree in the
+   dispatch prompt. Then run `pwd`, `git rev-parse --show-toplevel`, `git status --short --branch`,
    `git log --oneline -8`, and `git log @{u}..HEAD` when an upstream exists.
 2. Verify the expected branch and current head SHA from the dispatch prompt. If the head moved,
    inspect why and report the mismatch before changing anything.

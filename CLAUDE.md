@@ -386,6 +386,12 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 
 ## Development Guidelines
 
+Repository-local agent skills, Claude rules, and their dispatchers are guarded by
+`agent-setup-policy.yml`. The workflow runs trusted default-branch validation over candidate
+content on every PR, has only read access, and cancels stale runs per PR. Requiring
+`Agent Setup Policy / validate-trusted-policy` and code-owner review is what prevents a candidate
+from weakening its own validator; forks do not inherit those repository settings automatically.
+
 - **No `.unwrap()` in production code paths** — use `?`, `.unwrap_or()`, or explicit match.
 - **No `.expect()` except where failure is a genuine bug** (e.g. `serde_json::to_string` on a static `Value`).
 - Return `crate::error::Error` variants via `?`; prefer descriptive variants over `Config(String)` when the category is clear.
@@ -397,7 +403,9 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 1. `cargo fmt --all` clean
 2. `cargo clippy --all-targets -- -D warnings` clean
 3. `cargo test --test unit_tests` passes
-4. No `.unwrap()` / `.expect()` in prod code
-5. New env var → `.env.example` + `env.rs` doc block
-6. Schema change → unit test in `tests/unit/schema_tests.rs`
-7. Commit messages in imperative mood; branches `feature/…`, `fix/…`, `claude/…`
+4. Agent/rule changes → `python3 .github/scripts/check_agent_setup.py` and
+   `python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'`
+5. No `.unwrap()` / `.expect()` in prod code
+6. New env var → `.env.example` + `env.rs` doc block
+7. Schema change → unit test in `tests/unit/schema_tests.rs`
+8. Commit messages in imperative mood; branches `feature/…`, `fix/…`, `claude/…`
