@@ -2188,7 +2188,7 @@ async fn cmd_review(
                         "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {e}"
                     );
                     write_review_to_step_summary(&comment)?;
-                    print!("{}", comment);
+                    print!("{}", review::markdown_comment_for_terminal(&comment));
                     // Recorded rather than raised here: when the live
                     // comparison also failed, that is the root cause and has
                     // to be the reported one, and its gate only runs below.
@@ -2199,7 +2199,7 @@ async fn cmd_review(
             }
         }
         None => {
-            print!("{}", comment);
+            print!("{}", review::markdown_comment_for_terminal(&comment));
         }
     }
 
