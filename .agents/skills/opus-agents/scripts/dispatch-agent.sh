@@ -115,22 +115,11 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   printf 'Launch path must be the git worktree root: %s\n' "$physical_root" >&2
   exit 2
 fi
+require_linked_worktree "$physical_root"
+acquire_worktree_dispatch_lock "$physical_root"
 
 cd "$physical_worktree"
-
-unset CLAUDE_CODE_EFFORT_LEVEL
-unset CLAUDE_CODE_DISABLE_1M_CONTEXT
-unset CLAUDE_CODE_DISABLE_THINKING
-unset MAX_THINKING_TOKENS
-unset ANTHROPIC_MODEL
-unset ANTHROPIC_SMALL_FAST_MODEL
-unset ANTHROPIC_DEFAULT_OPUS_MODEL
-unset ANTHROPIC_DEFAULT_SONNET_MODEL
-unset ANTHROPIC_DEFAULT_HAIKU_MODEL
-unset CLAUDE_CODE_SUBAGENT_MODEL
-unset ANTHROPIC_BASE_URL
-unset ANTHROPIC_AUTH_TOKEN
-unset ANTHROPIC_API_KEY
+isolate_claude_provider
 
 fast_settings='{"fastMode":false}'
 if [[ "$fast" == 'true' ]]; then
@@ -140,11 +129,11 @@ fi
 printf '[opus-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s\n' \
   "$model" "$effort" "$fast" "$physical_worktree" "$claude_bin" >&2
 
-exec "$claude_bin" -p \
+run_dispatch_child "$prompt_file" "$claude_bin" -p \
   --model "$model" \
   --effort "$effort" \
+  --setting-sources '' \
   --settings "$fast_settings" \
   --permission-mode bypassPermissions \
   --output-format text \
-  --verbose \
-  < "$prompt_file"
+  --verbose

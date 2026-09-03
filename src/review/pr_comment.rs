@@ -16,6 +16,35 @@ const MAX_INLINE_BYTES: usize = 512;
 const MAX_VALIDATION_BYTES: usize = 8_192;
 const TRUNCATION_NOTICE_RESERVE: usize = 256;
 
+/// Characters that carry no visible meaning in a review comment but can
+/// misrepresent one: C0/C1 controls (terminal escapes among them), the bidi
+/// overrides and isolates, zero-width and word joiners, the soft hyphen, the
+/// byte-order mark, and the Unicode line/paragraph separators — which end a
+/// line for some renderers while surviving a `\n`-based flattening.
+///
+/// A tab is exempt: it is ordinary layout in validator output and in resource
+/// identifiers, and replacing it mangles the text without removing any
+/// spoofing risk. Callers that must keep real line breaks (fenced validator
+/// output) exempt `\n` themselves; the inline callers map `\r`/`\n` to a
+/// space before consulting this predicate.
+fn is_unsafe_format_character(character: char) -> bool {
+    (character.is_control() && character != '\t')
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+        )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewValidationStatus {
     Passed,
@@ -104,6 +133,9 @@ fn build_review_comment_inner(
 
     if let Some(reason) = comparison_error {
         md.push_str("### Changes: Skipped\n\n");
+        // The label keeps the untrusted reason off column zero, where an
+        // unescaped list bullet or setext underline would still open a block.
+        md.push_str("_Reason:_ ");
         md.push_str(&bounded_markdown_text(reason));
         md.push_str("\n\n");
     } else if !diffs.is_empty() {
@@ -148,6 +180,7 @@ fn build_review_comment_inner(
 
     if let Some(reason) = comparison_error {
         md.push_str("### Breaking Changes: Skipped\n\n");
+        md.push_str("_Reason:_ ");
         md.push_str(&bounded_markdown_text(reason));
         md.push_str("\n\n");
     } else if !breaking.is_empty() {
@@ -217,9 +250,21 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (&str, usize) {
 
 /// Keep one hostile or runaway validator diagnostic from consuming GitHub's
 /// entire comment limit. The dynamic fence prevents repository-controlled
-/// backticks from terminating the code block.
+/// backticks from terminating the code block, and the scrub keeps terminal
+/// escapes and bidi overrides out of a block that is otherwise rendered
+/// verbatim. Line feeds and tabs survive — they are the diagnostic's layout.
 fn bounded_validation_output(output: &str) -> String {
-    let (bounded, omitted) = truncate_utf8(output, MAX_VALIDATION_BYTES);
+    let scrubbed: String = output
+        .chars()
+        .map(|character| {
+            if character != '\n' && is_unsafe_format_character(character) {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let (bounded, omitted) = truncate_utf8(&scrubbed, MAX_VALIDATION_BYTES);
     if omitted > 0 {
         format!("{bounded}\n[validator output truncated]\n[{omitted} UTF-8 byte(s) omitted]")
     } else {
@@ -237,17 +282,29 @@ fn markdown_fence(output: &str) -> String {
 }
 
 /// Render untrusted prose without letting it open a Markdown block, table
-/// cell, link, HTML tag, or GitHub mention. Newlines are flattened because
-/// every caller places the value inside an existing paragraph/list/table row.
+/// cell, link, HTML tag, GitHub mention, or autolink. Newlines are flattened
+/// because every caller places the value inside an existing paragraph, list
+/// item, or table row.
+///
+/// Two escaping styles, deliberately: HTML entities where a backslash escape
+/// would not help, and a backslash before the ASCII punctuation CommonMark
+/// lets one neutralize. `@` kills user mentions and the email autolink; `:`
+/// and `.` kill GFM's extended autolinks (`https://evil.example` needs the
+/// colon, `www.evil.example` needs a dotted domain), so untrusted text can
+/// never publish a clickable destination. Entities render as the original
+/// character, so the reader still sees the message the tool wrote.
 fn escape_markdown_text(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
             '\r' | '\n' => escaped.push(' '),
+            _ if is_unsafe_format_character(character) => escaped.push('\u{fffd}'),
             '&' => escaped.push_str("&amp;"),
             '<' => escaped.push_str("&lt;"),
             '>' => escaped.push_str("&gt;"),
             '@' => escaped.push_str("&#64;"),
+            ':' => escaped.push_str("&#58;"),
+            '.' => escaped.push_str("&#46;"),
             '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '#' | '|' | '!' => {
                 escaped.push('\\');
                 escaped.push(character);
@@ -258,22 +315,47 @@ fn escape_markdown_text(value: &str) -> String {
     escaped
 }
 
+/// Surrounding whitespace is trimmed before escaping: four leading spaces at
+/// the start of a line open an indented code block, and a value that is only
+/// whitespace or only scrubbed formatting characters would otherwise render
+/// as a hole in the sentence.
 fn bounded_markdown_text(value: &str) -> String {
-    let (bounded, omitted) = truncate_utf8(value, MAX_INLINE_BYTES);
+    let (bounded, omitted) = truncate_utf8(value.trim(), MAX_INLINE_BYTES);
     let mut escaped = escape_markdown_text(bounded);
     if omitted > 0 {
         escaped.push('…');
     }
-    escaped
+    if escaped.is_empty() {
+        "(none)".to_string()
+    } else {
+        escaped
+    }
 }
 
 /// Dynamic inline-code fence for untrusted identifiers. A pipe is escaped for
 /// GFM table parsing, and line breaks are flattened so an identifier cannot
 /// terminate its surrounding list or row.
 fn inline_code(value: &str) -> String {
-    let value = value
+    let value: String = value
         .replace("\r\n", " ")
-        .replace(['\r', '\n'], " ")
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '\r' | '\n' => ' ',
+            // Bidi overrides and zero-width characters survive a code span,
+            // so an identifier could still be displayed as one it is not.
+            _ if is_unsafe_format_character(character) => '\u{fffd}',
+            _ => character,
+        })
+        .collect();
+    // An empty code span renders as an adjacent pair of backticks, which
+    // swallows the text between it and the next one.
+    let value = if value.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        value
+    };
+    let value = value
         // GFM's table parser processes backslash escapes before deciding
         // whether a pipe ends the cell. Escape caller-supplied backslashes
         // first so an input `\|` cannot consume the escape we add for `|`.
@@ -321,6 +403,92 @@ fn bounded_inline_code(value: &str) -> String {
     } else {
         inline_code(bounded)
     }
+}
+
+/// Undo, for terminal display, exactly the escaping `escape_markdown_text`
+/// applied.
+///
+/// The published comment is Markdown: GitHub renders `&#46;` back as `.` and
+/// `\_` back as `_`, but a terminal shows both literally, so `plan`/`review`
+/// stdout would read as escaped noise. Entities are decoded before the
+/// backslash escapes, and `&amp;` last of all, so a decoded `&` can never
+/// combine with the text after it into a second entity — the transform is the
+/// exact inverse, and an input that literally contained `&#46;` still prints
+/// as `&#46;`.
+///
+/// Fenced blocks are left alone. Validator output is placed in them verbatim,
+/// never escaped, so decoding there would rewrite the tool's own text — and a
+/// literal ``&#96;&#96;&#96;`` inside one would decode into a fence that
+/// terminates the block early.
+pub fn markdown_comment_for_terminal(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    let mut open_fence: Option<usize> = None;
+    for line in value.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let fence_run = markdown_fence_run(content);
+        match (open_fence, fence_run) {
+            (None, Some(run)) if !content.trim_start()[run..].contains('`') => {
+                open_fence = Some(run);
+                rendered.push_str(line);
+            }
+            (Some(open), Some(run))
+                if run >= open && content.trim_start()[run..].trim().is_empty() =>
+            {
+                open_fence = None;
+                rendered.push_str(line);
+            }
+            (Some(_), _) => rendered.push_str(line),
+            (None, _) => rendered.push_str(&decode_markdown_escapes(line)),
+        }
+    }
+    rendered
+}
+
+/// Length of a line's leading backtick run when the line is a fence marker.
+fn markdown_fence_run(line: &str) -> Option<usize> {
+    let run = line
+        .trim_start()
+        .chars()
+        .take_while(|character| *character == '`')
+        .count();
+    (run >= 3).then_some(run)
+}
+
+fn decode_markdown_escapes(value: &str) -> String {
+    let decoded = value
+        .replace("&#64;", "@")
+        .replace("&#58;", ":")
+        .replace("&#46;", ".")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        // Last: an `&` decoded any earlier could form one of the sequences
+        // above out of text that was never an entity.
+        .replace("&amp;", "&");
+
+    let mut rendered = String::with_capacity(decoded.len());
+    let mut characters = decoded.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            rendered.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some(escaped)
+                if matches!(
+                    escaped,
+                    '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '#' | '|' | '!'
+                ) =>
+            {
+                rendered.push(escaped)
+            }
+            Some(other) => {
+                rendered.push('\\');
+                rendered.push(other);
+            }
+            None => rendered.push('\\'),
+        }
+    }
+    rendered
 }
 
 fn append_omitted_list_item(md: &mut String, total: usize, label: &str) {

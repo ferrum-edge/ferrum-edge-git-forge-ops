@@ -17,6 +17,27 @@ USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+NAMED_SECRET = re.compile(r"\bsecrets\.[A-Za-z_][A-Za-z0-9_]*")
+WHOLE_SECRETS = re.compile(r"\bsecrets\b")
+BUNDLE_SECRET_PREFIX = "FERRUM_CREDS_BUNDLE"
+BUNDLE_BINDING = re.compile(
+    r"^\s+(" + BUNDLE_SECRET_PREFIX + r"(?:_\d+)?)\s*:\s*\$\{\{\s*secrets\.("
+    + BUNDLE_SECRET_PREFIX
+    + r"(?:_\d+)?)\s*\}\}\s*$",
+    re.MULTILINE,
+)
+RUST_SHARD_LIMIT = re.compile(
+    r"^pub const MAX_BUNDLE_SHARDS\s*:\s*u32\s*=\s*(\d+)\s*;", re.MULTILINE
+)
+LOADER_SHARD_LIMIT = re.compile(r"^MAX_BUNDLE_SHARDS\s*=\s*(\d+)\s*$", re.MULTILINE)
+BUNDLE_LOADER_STEP = "Load credential bundles"
+PRIVILEGED_WORKFLOWS = (
+    "apply-on-merge.yml",
+    "drift-check.yml",
+    "materialize-file.yml",
+    "rotate.yml",
+)
 
 
 def action_files(root: Path) -> list[Path]:
@@ -29,6 +50,123 @@ def action_files(root: Path) -> list[Path]:
             *(root / ".github" / "actions").glob("**/action.yaml"),
         }
     )
+
+
+def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
+    """Every `secrets` reference must name exactly one secret.
+
+    `${{ toJSON(secrets) }}`, `${{ fromJSON(toJSON(secrets)) }}` and a bare
+    `${{ secrets }}` hand a step every secret the environment holds — the admin
+    JWT signing key, the state-writer App private key and the registry token
+    alongside the credential bundles — to read a handful of values. Since
+    GitHub's 2026-07-28 change, a public-repository run that reads the whole
+    secrets context is also held for manual approval before it may start, so
+    the privileged workflows silently stop reconciling.
+
+    `secrets['NAME']` is rejected with them: it is one variable substitution
+    away from an indexed walk over the whole context, and no workflow here
+    needs a dynamic secret name.
+    """
+    violations: list[str] = []
+    seen: set[str] = set()
+    for expression in EXPRESSION.finditer(text):
+        if not WHOLE_SECRETS.search(NAMED_SECRET.sub("", expression.group(1))):
+            continue
+        leak = " ".join(expression.group(0).split())
+        if leak in seen:
+            continue
+        seen.add(leak)
+        violations.append(
+            f"{workflow}: only `secrets.<NAME>` may be referenced, not {leak!r}"
+        )
+    if re.search(r"^\s*secrets\s*:\s*inherit\s*$", text, re.MULTILINE):
+        violations.append(
+            f"{workflow}: a called workflow must not inherit the whole secrets context"
+        )
+    return violations
+
+
+def credential_shard_limit(root: Path) -> tuple[int | None, list[str]]:
+    """Read the bundle-shard ceiling from Rust and from the loader, and pair them.
+
+    The workflows bind each `FERRUM_CREDS_BUNDLE[_N]` secret by name because
+    there is no safe way to enumerate the `secrets` context, so the shard count
+    is a constant that lives in three places at once. Returns the agreed limit,
+    or `None` when the sources disagree (the violations say which).
+    """
+    violations: list[str] = []
+    limits: dict[str, int | None] = {}
+    for label, relative, pattern in (
+        ("src/secrets/bundle.rs", Path("src/secrets/bundle.rs"), RUST_SHARD_LIMIT),
+        (
+            ".github/scripts/credential_bundles.py",
+            Path(".github/scripts/credential_bundles.py"),
+            LOADER_SHARD_LIMIT,
+        ),
+    ):
+        path = root / relative
+        match = (
+            pattern.search(path.read_text(encoding="utf-8")) if path.is_file() else None
+        )
+        limits[label] = int(match.group(1)) if match else None
+        if limits[label] is None:
+            violations.append(f"{label}: MAX_BUNDLE_SHARDS must be declared here")
+    rust_limit = limits["src/secrets/bundle.rs"]
+    loader_limit = limits[".github/scripts/credential_bundles.py"]
+    if rust_limit is not None and loader_limit is not None and rust_limit != loader_limit:
+        violations.append(
+            f"MAX_BUNDLE_SHARDS disagrees: src/secrets/bundle.rs says {rust_limit}, "
+            f".github/scripts/credential_bundles.py says {loader_limit}"
+        )
+        return None, violations
+    if rust_limit is not None and rust_limit < 1:
+        violations.append("MAX_BUNDLE_SHARDS must allow at least one bundle shard")
+        return None, violations
+    return (rust_limit if rust_limit == loader_limit else None), violations
+
+
+def named_step(text: str, step_name: str) -> str | None:
+    marker = f"      - name: {step_name}\n"
+    start = text.find(marker)
+    if start < 0:
+        return None
+    end = text.find("\n      - name: ", start + len(marker))
+    return text[start:] if end < 0 else text[start:end]
+
+
+def credential_bundle_binding_violations(
+    workflow: str, text: str, limit: int | None
+) -> list[str]:
+    """The bundle loader must receive exactly the shards the ceiling allows.
+
+    A missing binding is a shard the loader never sees, so the binary reads the
+    slots it holds as unallocated and mints duplicates. A binding past the
+    ceiling is a shard the allocator refuses to create, so it can only be dead
+    configuration that suggests capacity the Rust side will not use.
+    """
+    step = named_step(text, BUNDLE_LOADER_STEP)
+    if step is None:
+        return [f"{workflow}: a {BUNDLE_LOADER_STEP!r} step is required"]
+    if limit is None:
+        return []
+    expected = [BUNDLE_SECRET_PREFIX] + [
+        f"{BUNDLE_SECRET_PREFIX}_{shard}" for shard in range(1, limit)
+    ]
+    bound = dict(BUNDLE_BINDING.findall(step))
+    violations: list[str] = []
+    missing = [name for name in expected if bound.get(name) != name]
+    if missing:
+        violations.append(
+            f"{workflow}: {BUNDLE_LOADER_STEP!r} must bind every bundle shard secret to an "
+            f"env var of the same name; missing or mismatched: {', '.join(missing)}"
+        )
+    extra = sorted(set(bound) - set(expected))
+    if extra:
+        violations.append(
+            f"{workflow}: {BUNDLE_LOADER_STEP!r} binds shards beyond MAX_BUNDLE_SHARDS "
+            f"({limit}): {', '.join(extra)}"
+        )
+    return violations
 
 
 def trusted_classifier_violations(
@@ -315,6 +453,14 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
         violations.append(
             "security.yml: the protected default-branch policy checker must be selected exactly once"
         )
+    # The one-time pinned bootstrap covered the window where `main` did not yet
+    # carry this checker. Now that it does, any fallback can only substitute an
+    # older policy for the protected one — which is how a policy change that
+    # the current tree depends on gets silently un-enforced.
+    if "bootstrap-supply-chain" in text:
+        violations.append(
+            "security.yml: the trusted policy checker must come only from the protected default branch"
+        )
     if "path: trusted-supply-chain" in text and (
         "ref: ${{ github.event.pull_request.base.sha }}" in text
     ):
@@ -392,6 +538,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         violations.extend(
             rust_toolchain_violations(str(workflow.relative_to(root)), text)
+        )
+        violations.extend(
+            whole_secrets_context_violations(str(workflow.relative_to(root)), text)
         )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
@@ -493,12 +642,10 @@ def main(argv: list[str] | None = None) -> int:
             )
     violations.extend(unconfigured_repo_skip_violations(apply_workflow))
 
-    for privileged_workflow in (
-        "apply-on-merge.yml",
-        "drift-check.yml",
-        "materialize-file.yml",
-        "rotate.yml",
-    ):
+    shard_limit, shard_limit_violations = credential_shard_limit(root)
+    violations.extend(shard_limit_violations)
+
+    for privileged_workflow in PRIVILEGED_WORKFLOWS:
         text = (workflows / privileged_workflow).read_text(encoding="utf-8")
         if (
             privileged_workflow != "apply-on-merge.yml"
@@ -516,12 +663,17 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"{privileged_workflow}: malformed credential bundles must not fail open"
             )
-        # `${{ toJSON(secrets) }}` spills every environment secret to disk.
+        # The loader reads enumerated env bindings, so every shard the Rust
+        # allocator may create has to be bound here by name. Cross-checked
+        # against MAX_BUNDLE_SHARDS on both sides.
+        violations.extend(
+            credential_bundle_binding_violations(privileged_workflow, text, shard_limit)
+        )
         # $RUNNER_TEMP is wiped with the workspace; a bare `mktemp` lands in a
         # /tmp that self-hosted runners share between jobs and never clean.
-        if 'all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")' not in text:
+        if '"${RUNNER_TEMP:-/tmp}/ferrum-creds-' not in text:
             violations.append(
-                f"{privileged_workflow}: the whole-secrets spill must be created under $RUNNER_TEMP"
+                f"{privileged_workflow}: the resolved credential file must live under $RUNNER_TEMP"
             )
         if "[skip ci]" in text:
             violations.append(

@@ -17,49 +17,35 @@ SPEC.loader.exec_module(check_supply_chain)
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
-    def test_immutable_bootstrap_checker_accepts_the_current_policy(self):
+    def test_trusted_policy_checker_has_no_stale_bootstrap_fallback(self):
+        # A one-time commit-pinned bootstrap covered the window where `main`
+        # did not yet carry this checker. `main` carries it now, so a fallback
+        # can only substitute an OLDER policy for the protected one — exactly
+        # what happens when a tree legitimately changes something the old
+        # policy still demands.
         workflow = (ROOT / ".github/workflows/security.yml").read_text(
             encoding="utf-8"
         )
-        match = re.search(
-            r"name: Check out immutable policy bootstrap.*?ref: ([0-9a-f]{40})",
-            workflow,
-            flags=re.DOTALL,
+        self.assertNotIn("bootstrap-supply-chain", workflow)
+        self.assertEqual(
+            check_supply_chain.trusted_supply_chain_policy_violations(workflow), []
         )
-        self.assertIsNotNone(match, "security workflow must pin a bootstrap commit")
-        bootstrap_sha = match.group(1)
-        checked_out = (
-            ROOT / "bootstrap-supply-chain/.github/scripts/check_supply_chain.py"
-        )
-        if checked_out.is_file() and not checked_out.is_symlink():
-            bootstrap_source = checked_out.read_text(encoding="utf-8")
-        else:
-            shown = subprocess.run(
-                [
-                    "git",
-                    "show",
-                    f"{bootstrap_sha}:.github/scripts/check_supply_chain.py",
-                ],
-                cwd=ROOT,
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-            if shown.returncode != 0:
-                self.skipTest("immutable bootstrap commit is unavailable in this checkout")
-            bootstrap_source = shown.stdout
 
-        with tempfile.TemporaryDirectory() as directory:
-            checker = Path(directory) / "check_supply_chain.py"
-            checker.write_text(bootstrap_source, encoding="utf-8")
-            result = subprocess.run(
-                [sys.executable, str(checker), "--root", str(ROOT)],
-                cwd=ROOT,
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with_fallback = workflow.replace(
+            "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py\n",
+            "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py\n"
+            "            if [ ! -f \"$CHECKER\" ]; then\n"
+            "              CHECKER=bootstrap-supply-chain/.github/scripts/check_supply_chain.py\n"
+            "            fi\n",
+            1,
+        )
+        violations = check_supply_chain.trusted_supply_chain_policy_violations(
+            with_fallback
+        )
+        self.assertTrue(
+            any("only from the protected default branch" in item for item in violations),
+            violations,
+        )
 
     def test_root_override_checks_the_selected_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -307,9 +293,10 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertTrue(any("minted after" in item for item in violations))
 
     def test_every_whole_secrets_context_form_is_rejected(self):
-        # `secrets.NAME` and `secrets['NAME']` were caught, but the whole-context
-        # forms — which hand over EVERY environment secret at once, and are what
-        # the privileged workflows actually use — slipped through.
+        # `secrets.NAME` and `secrets['NAME']` were caught in validate-pr.yml,
+        # but the whole-context forms — which hand over EVERY environment
+        # secret at once — were allowed everywhere else, which is where the
+        # privileged workflows actually used them.
         pattern = re.compile(r"\$\{\{[^}]*\bsecrets\b")
         for leak in (
             "${{ toJSON(secrets) }}",
@@ -325,6 +312,156 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "${{ vars.GITFORGEOPS_STATE_APP_ID }}",
         ):
             self.assertNotRegex(benign, pattern)
+
+    def test_only_named_secret_references_survive_in_any_workflow(self):
+        # validate-pr.yml must receive NO secrets; every other workflow may
+        # read `secrets.<NAME>` and nothing broader.
+        for leak in (
+            "        run: echo '${{ toJSON(secrets) }}'",
+            "        run: echo '${{ fromJSON(toJSON(secrets)) }}'",
+            "        run: echo '${{ secrets }}'",
+            "          URL: ${{ secrets['FERRUM_GATEWAY_URL'] }}",
+            "          KEY: ${{ toJSON(secrets.FERRUM_GATEWAY_URL) }}${{ secrets }}",
+        ):
+            with self.subTest(leak=leak):
+                self.assertTrue(
+                    check_supply_chain.whole_secrets_context_violations(
+                        "sample.yml", leak
+                    ),
+                    leak,
+                )
+        benign = "\n".join(
+            [
+                "# the whole secrets context never reaches this job",
+                "          URL: ${{ secrets.FERRUM_GATEWAY_URL }}",
+                "          KEY: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}",
+                "          APP: ${{ vars.GITFORGEOPS_STATE_APP_ID }}",
+                "          TOKEN: ${{ github.token }}",
+                "        if: ${{ secrets.FERRUM_GATEWAY_URL != '' }}",
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.whole_secrets_context_violations("sample.yml", benign), []
+        )
+        self.assertTrue(
+            check_supply_chain.whole_secrets_context_violations(
+                "sample.yml", "    secrets: inherit\n"
+            )
+        )
+
+    def test_no_workflow_dumps_the_whole_secrets_context(self):
+        # Guard the wiring, not just the helper: a leak in a workflow that is
+        # not validate-pr.yml used to pass the whole policy run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/rust-ci.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "    steps:",
+                    "    steps:\n      - run: echo '${{ toJSON(secrets) }}'",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("only `secrets.<NAME>`" in item for item in violations), violations
+        )
+
+    def test_credential_bundle_shards_are_bound_by_name_up_to_the_rust_ceiling(self):
+        limit, limit_violations = check_supply_chain.credential_shard_limit(ROOT)
+        self.assertEqual(limit_violations, [])
+        self.assertIsNotNone(limit)
+        step = "\n".join(
+            ["      - name: Load credential bundles", "        env:"]
+            + [
+                f"          {name}: ${{{{ secrets.{name} }}}}"
+                for name in ["FERRUM_CREDS_BUNDLE"]
+                + [f"FERRUM_CREDS_BUNDLE_{shard}" for shard in range(1, limit)]
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.credential_bundle_binding_violations(
+                "sample.yml", step + "\n", limit
+            ),
+            [],
+        )
+
+        dropped = step.replace(
+            f"          FERRUM_CREDS_BUNDLE_{limit - 1}: "
+            f"${{{{ secrets.FERRUM_CREDS_BUNDLE_{limit - 1} }}}}\n",
+            "",
+        ).replace(
+            f"\n          FERRUM_CREDS_BUNDLE_{limit - 1}: "
+            f"${{{{ secrets.FERRUM_CREDS_BUNDLE_{limit - 1} }}}}",
+            "",
+        )
+        violations = check_supply_chain.credential_bundle_binding_violations(
+            "sample.yml", dropped + "\n", limit
+        )
+        self.assertTrue(
+            any("missing or mismatched" in item for item in violations), violations
+        )
+
+        beyond = (
+            step
+            + f"\n          FERRUM_CREDS_BUNDLE_{limit}: "
+            + f"${{{{ secrets.FERRUM_CREDS_BUNDLE_{limit} }}}}\n"
+        )
+        violations = check_supply_chain.credential_bundle_binding_violations(
+            "sample.yml", beyond, limit
+        )
+        self.assertTrue(
+            any("beyond MAX_BUNDLE_SHARDS" in item for item in violations), violations
+        )
+
+        self.assertTrue(
+            check_supply_chain.credential_bundle_binding_violations(
+                "sample.yml", "      - name: Something else\n", limit
+            )
+        )
+
+    def test_shard_ceiling_must_agree_between_rust_and_the_loader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            loader = root / ".github/scripts/credential_bundles.py"
+            text = loader.read_text(encoding="utf-8")
+            limit = int(
+                re.search(r"^MAX_BUNDLE_SHARDS = (\d+)$", text, re.MULTILINE).group(1)
+            )
+            loader.write_text(
+                text.replace(
+                    f"MAX_BUNDLE_SHARDS = {limit}",
+                    f"MAX_BUNDLE_SHARDS = {limit + 1}",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("MAX_BUNDLE_SHARDS disagrees" in item for item in violations), violations
+        )
+
+    def test_privileged_workflows_must_bind_every_declared_shard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "          FERRUM_CREDS_BUNDLE_9: ${{ secrets.FERRUM_CREDS_BUNDLE_9 }}\n",
+                    "",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "must bind every bundle shard secret" in item and "FERRUM_CREDS_BUNDLE_9" in item
+                for item in violations
+            ),
+            violations,
+        )
 
     def test_validate_pr_rejects_the_whole_secrets_context(self):
         # Guard the wiring, not just the regex: the real workflow text is run
@@ -503,14 +640,16 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("[skip ci]" in item for item in violations), violations
         )
 
-    def test_whole_secrets_spill_must_live_under_runner_temp(self):
+    def test_resolved_credential_file_must_live_under_runner_temp(self):
+        # A bare `mktemp` lands in a /tmp that self-hosted runners share
+        # between jobs and never clean.
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/drift-check.yml"
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
-                    'all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")',
-                    "all_secrets=$(mktemp)",
+                    'creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-',
+                    'creds_file="/tmp/ferrum-creds-',
                 ),
                 encoding="utf-8",
             )
@@ -634,6 +773,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         for relative in (
             ".github/workflows",
             ".github/scripts/check_supply_chain.py",
+            ".github/scripts/credential_bundles.py",
             ".github/scripts/install-ferrum-edge.sh",
             ".github/scripts/refresh-ferrum-edge-pin.sh",
             ".github/ferrum-edge-checksums.txt",
@@ -641,6 +781,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "Dockerfile",
             ".dockerignore",
             "rust-toolchain.toml",
+            "src/secrets/bundle.rs",
         ):
             source = ROOT / relative
             destination = root / relative

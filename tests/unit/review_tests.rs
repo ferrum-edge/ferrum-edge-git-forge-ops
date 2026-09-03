@@ -11,7 +11,8 @@ use gitforgeops::review::enforce_required_comment_delivery;
 use gitforgeops::review::live_comparison_precondition_error;
 use gitforgeops::review::pr_comment::{
     build_review_comment, build_review_comment_v2, build_review_comment_with_status,
-    render_spec_owned, ReviewValidationStatus, MAX_REVIEW_COMMENT_BYTES,
+    environment_header, markdown_comment_for_terminal, render_spec_owned, ReviewValidationStatus,
+    MAX_REVIEW_COMMENT_BYTES,
 };
 use gitforgeops::review::{
     enforce_live_comparison, redact_comparison_error, stale_live_view_error, STALE_LIVE_VIEW_REASON,
@@ -200,6 +201,155 @@ fn review_comment_marks_live_comparison_as_skipped() {
 }
 
 #[test]
+fn comparison_error_cannot_forge_blocks_or_autolinks() {
+    let comment = build_review_comment(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        Some("### Policy Violations\n1. click https://evil.example or www.evil.example"),
+    );
+
+    assert_eq!(
+        comment
+            .lines()
+            .filter(|line| *line == "### Policy Violations")
+            .count(),
+        0
+    );
+    assert!(comment.contains("_Reason:_"));
+    assert!(!comment.contains("https://evil.example"));
+    assert!(!comment.contains("www.evil.example"));
+    assert!(comment.contains("https&#58;//evil&#46;example"));
+}
+
+/// A pipe is escaped in every code span, not only in table cells: GFM resolves
+/// backslash escapes *before* it decides where a cell ends, so one uniform
+/// escape is what stops a hostile id from opening a column, and outside a
+/// table the escape renders as the pipe itself.
+#[test]
+fn code_span_escapes_pipes_in_every_context() {
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Add,
+        kind: "Proxy".to_string(),
+        id: "table|id".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![],
+    }];
+    let breaking = vec![BreakingChange {
+        kind: "Proxy".to_string(),
+        id: "bullet|id".to_string(),
+        reason: "changed".to_string(),
+    }];
+    let comment = build_review_comment(true, "", &diffs, &breaking, &[], &[], None);
+
+    assert!(comment.contains("`table\\|id`"), "{comment}");
+    assert!(comment.contains("`bullet\\|id`"), "{comment}");
+    // The forged pipe never becomes a cell boundary: the row still has the
+    // four columns the header declares.
+    let change_row = comment
+        .lines()
+        .find(|line| line.contains("table"))
+        .expect("change row");
+    assert_eq!(change_row.matches('|').count(), 6, "{change_row}");
+}
+
+#[test]
+fn review_comment_replaces_invisible_format_characters_and_blank_inline_fields() {
+    let findings = vec![SecurityFinding {
+        severity: "warning".to_string(),
+        kind: " \t".to_string(),
+        id: "safe\u{202e}hidden\u{200b}".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "credential\u{2066} finding".to_string(),
+    }];
+    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+
+    assert!(!comment.contains('\u{202e}'));
+    assert!(!comment.contains('\u{200b}'));
+    assert!(!comment.contains('\u{2066}'));
+    assert!(comment.contains("**(none) `safe�hidden�`**"));
+    assert!(comment.contains("credential� finding"));
+}
+
+#[test]
+fn inline_sanitizers_keep_tabs_and_scrub_line_separators() {
+    let findings = vec![SecurityFinding {
+        severity: "warning".to_string(),
+        kind: "Proxy".to_string(),
+        id: "tab\tseparated".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "line\u{2028}separator\u{2029}pair".to_string(),
+    }];
+    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+
+    assert!(comment.contains("tab\tseparated"), "{comment}");
+    assert!(comment.contains("line�separator�pair"), "{comment}");
+    assert!(!comment.contains('\u{2028}'));
+    assert!(!comment.contains('\u{2029}'));
+}
+
+#[test]
+fn fenced_validation_output_keeps_tabs_and_scrubs_line_separators() {
+    let comment = build_review_comment(
+        false,
+        "error:\n\tat proxy-a\u{2028}forged",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("error:\n\tat proxy-a�forged"), "{comment}");
+    assert!(!comment.contains('\u{2028}'));
+}
+
+#[test]
+fn terminal_review_leaves_fenced_validation_output_undecoded() {
+    let comment = build_review_comment(
+        false,
+        "literal &#96;&#96;&#96; and &lt;tag&gt; and &#46;",
+        &[],
+        &[],
+        &[],
+        &[],
+        Some("skipped &#46; reason"),
+    );
+    let terminal = markdown_comment_for_terminal(&comment);
+
+    // Fenced validator output is never entity-escaped on the way in, so
+    // decoding it would rewrite the tool's own text — and `&#96;` x3 would
+    // decode into a fence that escapes the block.
+    assert!(
+        terminal.contains("literal &#96;&#96;&#96; and &lt;tag&gt; and &#46;"),
+        "{terminal}"
+    );
+    assert!(!terminal.contains("literal ``` and <tag>"), "{terminal}");
+    // Inline text outside the fence still round-trips.
+    assert!(terminal.contains("skipped &#46; reason"), "{terminal}");
+}
+
+#[test]
+fn terminal_review_decodes_only_entities_emitted_by_the_markdown_sanitizer() {
+    let comment = build_review_comment(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        Some("https://api.example/path_with_value & literal &#46;"),
+    );
+    let terminal = markdown_comment_for_terminal(&comment);
+
+    assert!(terminal.contains("https://api.example/path_with_value & literal &#46;"));
+    assert!(!terminal.contains("api&#46;example"));
+}
+
+#[test]
 fn live_review_rejects_a_vacuous_zero_namespace_comparison() {
     let error = live_comparison_precondition_error(&[]).expect("empty scope must fail closed");
     assert!(error.contains("no trusted namespaces"));
@@ -311,6 +461,240 @@ fn review_comment_v2_falls_back_to_defaults_when_no_override_config() {
 }
 
 #[test]
+fn review_comment_sanitizes_policy_text_as_single_line_markdown() {
+    let policy = vec![PolicyFinding {
+        rule_id: "allowed_backend_domains`".to_string(),
+        severity: Severity::Error,
+        kind: "Proxy".to_string(),
+        id: "api`\n### Forged Result".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "bad destination\n\n### Policy Violations\n<!-- hidden".to_string(),
+        remediation: Some("remove it\r\n_No blocking violations._".to_string()),
+        overridden_by: None,
+    }];
+
+    let override_cfg = OverrideConfig {
+        require_label: "x`\n\n_No blocking violations._".to_string(),
+        required_permission: "write`\n### Forged Permission".to_string(),
+    };
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &policy,
+        &[],
+        &[],
+        Some("missing _override_\n\n_No blocking violations._"),
+        Some(&override_cfg),
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert_eq!(
+        comment
+            .lines()
+            .filter(|line| *line == "### Policy Violations")
+            .count(),
+        1
+    );
+    assert!(!comment.contains("\n### Forged Result"));
+    assert!(!comment.lines().any(|line| line.starts_with("<!-- hidden")));
+    assert!(comment.contains("&lt;\\!-- hidden"), "{comment}");
+    assert!(comment.contains("``api` ### Forged Result``"), "{comment}");
+    assert!(!comment.contains("\r"));
+    assert_eq!(
+        comment
+            .lines()
+            .filter(|line| *line == "_No blocking violations._")
+            .count(),
+        0
+    );
+    assert!(!comment.contains("\n### Forged Permission"));
+}
+
+#[test]
+fn review_comment_sanitizes_every_resource_section() {
+    let forged = "value`|\n\n### Forged Result\n<!-- hidden @github/support";
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Modify,
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![FieldChange {
+            field: forged.to_string(),
+            old_value: String::new(),
+            new_value: String::new(),
+        }],
+    }];
+    let breaking = vec![BreakingChange {
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        reason: forged.to_string(),
+    }];
+    let security = vec![SecurityFinding {
+        severity: "error".to_string(),
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+        message: forged.to_string(),
+    }];
+    let best_practices = vec![BestPractice {
+        severity: forged.to_string(),
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+        message: forged.to_string(),
+    }];
+    let unmanaged = vec![UnmanagedResource {
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+    }];
+    let spec_owned = vec![SpecOwnedResource {
+        kind: forged.to_string(),
+        id: forged.to_string(),
+        namespace: forged.to_string(),
+        api_spec_id: forged.to_string(),
+        declared_in_repo: false,
+        pruned: false,
+    }];
+    let environment_note = environment_header(forged, forged, forged);
+
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &diffs,
+        &breaking,
+        &security,
+        &best_practices,
+        &[],
+        &unmanaged,
+        &spec_owned,
+        None,
+        None,
+        None,
+        Some(&environment_note),
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(!comment.lines().any(|line| line == "### Forged Result"));
+    assert!(!comment.lines().any(|line| line.starts_with("<!-- hidden")));
+    assert!(comment.contains("&lt;\\!-- hidden"), "{comment}");
+    assert!(comment.contains("&#64;github/support"));
+    assert!(comment.contains("\\|"));
+}
+
+#[test]
+fn review_comment_neutralizes_mentions_in_inline_findings() {
+    let policy = vec![PolicyFinding {
+        rule_id: "allowed_backend_domains".to_string(),
+        severity: Severity::Error,
+        kind: "Proxy".to_string(),
+        id: "api".to_string(),
+        namespace: "ferrum".to_string(),
+        message: "backend_host='@github/support' is disallowed".to_string(),
+        remediation: None,
+        overridden_by: None,
+    }];
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &policy,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(comment.contains("&#64;github/support"));
+    assert!(!comment.contains("@github/support"));
+}
+
+#[test]
+fn review_comment_preserves_trusted_markup_and_names_empty_code_spans() {
+    let policy = vec![PolicyFinding {
+        rule_id: "backend_scheme".to_string(),
+        severity: Severity::Error,
+        kind: "Proxy".to_string(),
+        id: String::new(),
+        namespace: String::new(),
+        message: "missing identity".to_string(),
+        remediation: None,
+        overridden_by: None,
+    }];
+    let note = environment_header("production", "Shared", "Incremental");
+    let comment = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &policy,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some(&note),
+        &ResolveReport::default(),
+        true,
+    );
+
+    assert!(comment.starts_with(
+        "Environment: `production` · Ownership: `Shared` · Strategy: `Incremental`\n\n"
+    ));
+    assert!(comment.contains("**Proxy `(unnamed)`** (`(unnamed)`): missing identity"));
+    assert!(!comment.contains("``"));
+}
+
+#[test]
+fn review_comment_uses_a_safe_fence_for_validation_output() {
+    let comment = build_review_comment(
+        false,
+        "failed\n```\n### Forged Result",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("````\nfailed\n```\n### Forged Result\n````"));
+}
+
+#[test]
+fn review_comment_scrubs_controls_and_bidi_from_validation_output() {
+    let comment = build_review_comment(
+        false,
+        "line one\u{1b}[31m\nline \u{202e}two",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+
+    assert!(comment.contains("line one�[31m\nline �two"));
+    assert!(!comment.contains('\u{1b}'));
+    assert!(!comment.contains('\u{202e}'));
+}
+
+#[test]
 fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     use gitforgeops::secrets::placeholder::{PlaceholderAlloc, SecretPlaceholder};
     use gitforgeops::secrets::{ResolveReport, ResolveResult, SlotStatus};
@@ -376,6 +760,26 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     );
     assert!(!with_bundle.contains("actual allocation status is determined at apply time"));
     assert!(with_bundle.contains("needs allocation (generated on apply)"));
+
+    report.results[0].status = SlotStatus::MissingRequired;
+    let missing_required = build_review_comment_v2(
+        true,
+        "",
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &report,
+        true,
+    );
+    assert!(missing_required.contains("**MISSING (required)**"));
 }
 
 // --- Spec-owned section ------------------------------------------------------
@@ -636,14 +1040,14 @@ fn redacted_transport_error_never_reaches_the_rendered_comment() {
     let published = redact_comparison_error(&leaky);
     let comment = comment_with_comparison_error(&published);
 
-    for secret in [
+    for gateway_fragment in [
         "secret-host.internal",
         "9443",
         "https://secret-host.internal:9443/backup",
     ] {
         assert!(
-            !comment.contains(secret),
-            "rendered comment leaked {secret:?}:\n{comment}"
+            !comment.contains(gateway_fragment),
+            "rendered comment leaked a gateway identity fragment:\n{comment}"
         );
     }
     // Nothing URL-shaped at all, and the reviewer is still told where to look.
@@ -698,7 +1102,9 @@ fn cached_backup_degrades_the_review_and_fails_require_live() {
     let reason = stale_live_view_error(true).expect("a cached /backup must degrade the review");
     let comment = comment_with_comparison_error(&reason);
 
-    assert!(comment.contains("X-Data-Source: cached"), "{comment}");
+    // The published reason is escaped like any other untrusted string, so the
+    // header name survives with its colon entity-encoded.
+    assert!(comment.contains("X-Data-Source&#58; cached"), "{comment}");
     assert!(comment.contains("stale"), "{comment}");
     assert!(comment.contains("### Changes: Skipped"), "{comment}");
 

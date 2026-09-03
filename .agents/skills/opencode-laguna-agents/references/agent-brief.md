@@ -49,6 +49,9 @@ explicitly assigns that operation.
   fail-closed ownership and secret handling.
 - Add tests in the external test suites preferred by `AGENTS.md`; do not add inline source tests
   merely for convenience.
+- Register every new `tests/unit/<name>.rs` module in `tests/unit/mod.rs`.
+- For every new `FERRUM_*` variable, update `EnvConfig`, `load_env_config()`, `.env.example`, and
+  the environment-variable documentation in `src/config/env.rs`.
 - Keep edits surgical. Do not rewrite unrelated changes or clean up neighboring code without
   task-specific justification.
 - Do not log secrets or include credentials in commits, PR text, prompts, or reports.
@@ -62,6 +65,11 @@ mandatory repository gate:
 - `cargo fmt --all`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --test unit_tests`
+- `git diff --check`
+
+When agent setup, shell dispatchers, or workflows change, also run
+`python3 .github/scripts/check_agent_setup.py`, `actionlint`, and `shellcheck` on every changed
+dispatcher.
 
 Run additional focused tests and changed-surface policy checks when relevant, and report every
 exact command and result. This repository has no standing known-flake allowlist; investigate every

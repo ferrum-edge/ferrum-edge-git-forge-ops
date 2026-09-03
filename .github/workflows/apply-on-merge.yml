@@ -162,27 +162,46 @@ jobs:
 
       - name: Load credential bundles
         id: load-bundles
-        # Write the filtered FERRUM_CREDS_BUNDLE* payload to a file on the
-        # runner and pass the PATH to the binary via FERRUM_CREDS_JSON_FILE.
-        # The earlier env-var pipeline hit OS env-block limits at scale
-        # (100 shards × ~48 KB = multi-MB) — $GITHUB_ENV materializes into
-        # the next step's process environment, where kernel caps would
-        # truncate the payload. File path has no practical size bound.
-        # Kept under $RUNNER_TEMP so GitHub Actions cleans it up when the
-        # runner is recycled.
+        # Bind every credential-bundle Environment Secret by NAME. The previous
+        # `toJSON(secrets)` spill handed this step the whole environment — admin
+        # JWT signing key, state-writer App private key, registry token — just to
+        # pull out a few bundle values, and since GitHub's 2026-07-28 change a
+        # public-repository run that reads the whole secrets context is held for
+        # manual approval before it may start.
+        #
+        # The list is finite by construction: shards 0..15, matching
+        # MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in
+        # .github/scripts/credential_bundles.py (16 x ~440 ~= 7,000 slots).
+        # Adding capacity means raising both constants and extending this block
+        # in all four privileged workflows; check_supply_chain.py fails the
+        # build when they drift apart.
+        #
+        # The loader writes the filtered payload to a file and the binary reads
+        # the PATH from FERRUM_CREDS_JSON_FILE: $GITHUB_ENV materializes into
+        # the next step's process environment, where kernel env-block caps can
+        # truncate a large multi-shard payload. Kept under $RUNNER_TEMP so
+        # GitHub Actions cleans it up when the runner is recycled.
+        env:
+          FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}
+          FERRUM_CREDS_BUNDLE_1: ${{ secrets.FERRUM_CREDS_BUNDLE_1 }}
+          FERRUM_CREDS_BUNDLE_2: ${{ secrets.FERRUM_CREDS_BUNDLE_2 }}
+          FERRUM_CREDS_BUNDLE_3: ${{ secrets.FERRUM_CREDS_BUNDLE_3 }}
+          FERRUM_CREDS_BUNDLE_4: ${{ secrets.FERRUM_CREDS_BUNDLE_4 }}
+          FERRUM_CREDS_BUNDLE_5: ${{ secrets.FERRUM_CREDS_BUNDLE_5 }}
+          FERRUM_CREDS_BUNDLE_6: ${{ secrets.FERRUM_CREDS_BUNDLE_6 }}
+          FERRUM_CREDS_BUNDLE_7: ${{ secrets.FERRUM_CREDS_BUNDLE_7 }}
+          FERRUM_CREDS_BUNDLE_8: ${{ secrets.FERRUM_CREDS_BUNDLE_8 }}
+          FERRUM_CREDS_BUNDLE_9: ${{ secrets.FERRUM_CREDS_BUNDLE_9 }}
+          FERRUM_CREDS_BUNDLE_10: ${{ secrets.FERRUM_CREDS_BUNDLE_10 }}
+          FERRUM_CREDS_BUNDLE_11: ${{ secrets.FERRUM_CREDS_BUNDLE_11 }}
+          FERRUM_CREDS_BUNDLE_12: ${{ secrets.FERRUM_CREDS_BUNDLE_12 }}
+          FERRUM_CREDS_BUNDLE_13: ${{ secrets.FERRUM_CREDS_BUNDLE_13 }}
+          FERRUM_CREDS_BUNDLE_14: ${{ secrets.FERRUM_CREDS_BUNDLE_14 }}
+          FERRUM_CREDS_BUNDLE_15: ${{ secrets.FERRUM_CREDS_BUNDLE_15 }}
         run: |
           set -euo pipefail
-          # Keep the whole-secrets spill under $RUNNER_TEMP, which GitHub wipes
-          # with the workspace. A bare `mktemp` lands in /tmp, which a
-          # self-hosted runner shares between jobs and does not clean.
-          all_secrets=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
-          trap 'rm -f "$all_secrets"' EXIT
-          cat > "$all_secrets" <<'SECRETS_EOF'
-          ${{ toJSON(secrets) }}
-          SECRETS_EOF
-
           creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
-          python3 .github/scripts/credential_bundles.py "$all_secrets" "$creds_file"
+          python3 .github/scripts/credential_bundles.py "$creds_file"
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Validate

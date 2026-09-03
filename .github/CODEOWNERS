@@ -1,9 +1,6 @@
 # Require a repository administrator to review changes to launch trust
 # boundaries. The main ruleset must enable `require_code_owner_review` for
 # this file to become an enforced control.
-/.github/workflows/ @jeremyjpj0916
-/.github/scripts/ @jeremyjpj0916
-/.github/CODEOWNERS @jeremyjpj0916
 /.github/ferrum-edge-checksums.txt @jeremyjpj0916
 /.gitforgeops/ @jeremyjpj0916
 /.state/ @jeremyjpj0916
@@ -17,3 +14,17 @@
 /src/state.rs @jeremyjpj0916
 /src/reconcile.rs @jeremyjpj0916
 /src/secrets/ @jeremyjpj0916
+# Repository settings must require "Agent Setup Policy / validate-trusted-policy"
+# and enable required review from code owners for these entries. They stay the
+# final rules so no later pattern can override them.
+/.github/CODEOWNERS @jeremyjpj0916
+/.github/workflows/agent-setup-ci.yml @jeremyjpj0916
+/.github/workflows/agent-setup-policy.yml @jeremyjpj0916
+/.github/scripts/check_agent_setup.py @jeremyjpj0916
+/.github/scripts/tests/test_agent_setup.py @jeremyjpj0916
+/.agents/ @jeremyjpj0916
+/.claude/ @jeremyjpj0916
+/CLAUDE.md @jeremyjpj0916
+/AGENTS.md @jeremyjpj0916
+/.github/workflows/ @jeremyjpj0916
+/.github/scripts/ @jeremyjpj0916

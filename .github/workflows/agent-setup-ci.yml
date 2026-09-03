@@ -2,6 +2,7 @@ name: Agent Setup CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
     paths:
@@ -10,9 +11,15 @@ on:
       - '.github/scripts/check_agent_setup.py'
       - '.github/scripts/tests/test_agent_setup.py'
       - '.github/workflows/agent-setup-ci.yml'
+      - '.github/workflows/agent-setup-policy.yml'
+      - '.github/CODEOWNERS'
 
 permissions:
   contents: read
+
+concurrency:
+  group: agent-setup-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
@@ -26,19 +33,21 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: .agent-setup-base
           persist-credentials: false
 
       - name: Validate agent setup
         run: |
           set -euo pipefail
-          validator=.github/scripts/check_agent_setup.py
-          if [[ "${{ github.event_name }}" == pull_request ]] && \
-             [[ -f .agent-setup-base/.github/scripts/check_agent_setup.py ]]; then
+          if [[ "${{ github.event_name }}" == pull_request ]]; then
             validator=.agent-setup-base/.github/scripts/check_agent_setup.py
+            [[ -f "$validator" ]] || {
+              echo "Trusted default-branch validator is unavailable; refusing candidate bootstrap." >&2
+              exit 1
+            }
           else
-            echo "Trusted base validator is unavailable; using the candidate validator for bootstrap."
+            validator=.github/scripts/check_agent_setup.py
           fi
           python3 "$validator" --root "$GITHUB_WORKSPACE"
 

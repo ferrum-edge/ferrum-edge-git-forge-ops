@@ -5,7 +5,7 @@ use rand::Rng;
 use reqwest::Client;
 
 use super::bundle::{
-    merge_bundles, pick_shard, serialize_bundle, shard_secret_name, CredentialBundle,
+    merge_bundles, reserve_shard, serialize_bundle, shard_secret_name, CredentialBundle,
 };
 use super::delivery::{deliver_to_author, DeliveryResult};
 use super::github_api::{fetch_public_key, put_environment_secret};
@@ -151,40 +151,22 @@ pub async fn allocate_and_deliver(
         )
         .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
-        // Prefer the shard the slot already lives on. If we ran pick_shard
-        // after `shard_count` has grown, the hash-based target could differ
-        // from the slot's current shard — we'd write the fresh value to
-        // shard N while a stale copy lingers on shard M. Because
+        // `reserve_shard` prefers the shard the slot already lives on. If we
+        // ran pick_shard after `shard_count` has grown, the hash-based target
+        // could differ from the slot's current shard — we'd write the fresh
+        // value to shard N while a stale copy lingers on shard M. Because
         // `merge_bundles` iterates shards in ascending order, whichever copy
         // sits on the higher shard index wins; that can silently revert to a
-        // stale value.
-        let existing_shard = staged
-            .iter()
-            .find_map(|(s, bundle)| bundle.contains_key(&candidate.slot).then_some(*s));
-
-        let shard = match existing_shard {
-            Some(s) => s,
-            None => loop {
-                if *shard_count == 0 {
-                    *shard_count = 1;
-                }
-                match pick_shard(&candidate.slot, value.len(), &staged, *shard_count) {
-                    Some(s) => break s,
-                    None => {
-                        *shard_count += 1;
-                        if *shard_count > 100 {
-                            return Err(AllocationFailure::with_partial(
-                                crate::error::Error::Config(
-                                    "credential bundle shards exceeded 100 (GitHub env secret limit)"
-                                        .to_string(),
-                                ),
-                                outcome.clone(),
-                            ));
-                        }
-                    }
-                }
-            },
-        };
+        // stale value. It also refuses to grow past MAX_BUNDLE_SHARDS, which
+        // is the count of bundle secrets the workflows bind by name.
+        let shard = reserve_shard(
+            &candidate.slot,
+            value.len(),
+            &staged,
+            shard_count,
+            "allocating",
+        )
+        .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
         // Encrypt delivery BEFORE any GitHub write. If recipient has no
         // compatible SSH key, we abort phase 1 — nothing has been
@@ -347,43 +329,12 @@ pub async fn rotate_and_deliver(
         None
     };
 
-    // Find current shard if present.
-    let current_shard = shards.iter().find_map(|(s, bundle)| {
-        if bundle.contains_key(slot) {
-            Some(*s)
-        } else {
-            None
-        }
-    });
-
-    let target_shard = match current_shard {
-        Some(s) => s,
-        None => loop {
-            if *shard_count == 0 {
-                *shard_count = 1;
-            }
-            match pick_shard(slot, value.len(), shards, *shard_count) {
-                Some(s) => break s,
-                None => {
-                    // Mirror allocate_and_deliver's cap. Without this, a
-                    // deeply sharded env that can't fit another slot would
-                    // keep incrementing and eventually try to PUT
-                    // FERRUM_CREDS_BUNDLE_100+, failing late at the GitHub
-                    // API instead of up front with a clear config error.
-                    *shard_count += 1;
-                    if *shard_count > 100 {
-                        return Err(AllocationFailure::with_partial(
-                            crate::error::Error::Config(
-                                "credential bundle shards exceeded 100 (GitHub env secret limit) during rotate"
-                                    .to_string(),
-                            ),
-                            partial,
-                        ));
-                    }
-                }
-            }
-        },
-    };
+    // Keep the slot on the shard it already occupies, and refuse up front
+    // rather than PUTting a FERRUM_CREDS_BUNDLE_<N> that no workflow binds:
+    // the write would succeed at the GitHub API and then be invisible to
+    // every later run.
+    let target_shard = reserve_shard(slot, value.len(), shards, shard_count, "rotating")
+        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
     let bundle = shards.get(&target_shard).cloned().unwrap_or_default();
     let mut staged_bundle = bundle;

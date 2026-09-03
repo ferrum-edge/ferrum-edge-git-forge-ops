@@ -145,6 +145,9 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   printf 'Launch path must be the git worktree root: %s\n' "$physical_root" >&2
   exit 2
 fi
+require_linked_worktree "$physical_root"
+acquire_worktree_dispatch_lock "$physical_root"
+isolate_opencode_provider
 
 # Resolve the operator's own opencode install. Conductor's bundled ACP-provider
 # copy under agent-binaries/acp-providers/opencode is deliberately NOT a fallback:
@@ -161,8 +164,8 @@ printf '[deepseek-pro-agents] dispatch model=%s worktree=%s bin=%s\n' \
 
 # `run` reads the prompt from stdin; --auto bypasses permission prompts (worktree
 # isolation is the safety boundary); --agent build selects the write-enabled agent.
-exec "$opencode_bin" run \
+run_dispatch_child "$prompt_file" "$opencode_bin" run \
+  --pure \
   --model "$model" \
   --agent build \
-  --auto \
-  < "$prompt_file"
+  --auto

@@ -125,6 +125,8 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
   printf 'Launch path must be the git worktree root: %s\n' "$physical_root" >&2
   exit 2
 fi
+require_linked_worktree "$physical_root"
+acquire_worktree_dispatch_lock "$physical_root"
 
 # Auth: cursor-agent reads CURSOR_API_KEY from the environment when it is
 # exported, and otherwise uses the CLI's own stored login (`cursor-agent status`).
@@ -138,8 +140,10 @@ if [[ -n "${CURSOR_API_KEY:-}" ]]; then
 else
   auth_source='cursor-agent login'
 fi
+isolate_cursor_provider
+prepare_cursor_control_workspace
 
-cd "$physical_worktree"
+cd "$cursor_control_workspace"
 
 printf '[grok-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s auth=%s%s\n' \
   "$model" "$effort" "$fast" "$physical_worktree" "$cursor_bin" "$auth_source" \
@@ -149,11 +153,15 @@ printf '[grok-agents] dispatch model=%s effort=%s fast=%s worktree=%s bin=%s aut
 # --force:  no per-command approval prompts; worktree isolation is the boundary.
 # --trust:  accept the freshly created worktree as a trusted directory, which the
 #           trust gate otherwise blocks on in a non-TTY.
-exec "$cursor_bin" \
+# --workspace + --add-dir: the empty control workspace prevents automatic
+#           project-rule loading while making the locked target worktree
+#           available. Cursor still needs normal host/network access for build,
+#           GitHub, and git gates; worktree isolation is not a host sandbox.
+run_dispatch_child "$prompt_file" "$cursor_bin" \
   --print \
   --force \
   --trust \
   --model "$model" \
   --output-format text \
-  --workspace "$physical_worktree" \
-  < "$prompt_file"
+  --workspace "$cursor_control_workspace" \
+  --add-dir "$physical_worktree"

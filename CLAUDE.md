@@ -297,14 +297,33 @@ gateway's own secret); a bundle value of `[REDACTED]` is refused.
 
 Storage: one or more GitHub Environment Secrets named `FERRUM_CREDS_BUNDLE[_N]`,
 each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
-auto-sharded by fnv-style hash when a bundle approaches 40 KB. The apply
-workflow's "Load credential bundles" step collects all matching secrets via
-`${{ toJSON(secrets) }}`, writes the filtered payload to a runner-local file,
-strictly validates the outer inventory, reserved shard names, and every inner
-string-to-string map, writes a new 0600 file without following/overwriting a
-destination, and exports the path as `FERRUM_CREDS_JSON_FILE`. Malformed input
-fails closed rather than becoming an empty bundle. Inline `FERRUM_CREDS_JSON`
-is still supported for small local tests.
+auto-sharded by fnv-style hash when a bundle approaches 40 KB.
+
+The shard layout is capped at `MAX_BUNDLE_SHARDS = 16` (shards 0..15,
+~7,000 slots). The cap exists because the privileged workflows'
+"Load credential bundles" step binds every bundle secret **by name**
+(`FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}`, …
+`FERRUM_CREDS_BUNDLE_15`) rather than dumping the whole `secrets` context: a
+`toJSON(secrets)` spill hands the step the admin JWT signing key, the
+state-writer App private key and the registry token to read a handful of bundle
+values, and since GitHub's 2026-07-28 change it also makes public-repository
+runs wait for manual approval. `bundle::reserve_shard` refuses to create shard
+16 with an actionable error instead of PUTting a secret nothing reads back.
+Adding capacity means raising `MAX_BUNDLE_SHARDS` in **both**
+`src/secrets/bundle.rs` and `.github/scripts/credential_bundles.py` and adding
+the matching `FERRUM_CREDS_BUNDLE_<N>` bindings to `apply-on-merge.yml`,
+`drift-check.yml`, `materialize-file.yml` and `rotate.yml`;
+`.github/scripts/check_supply_chain.py` cross-checks all three and fails the
+build on drift. Reads stay uncapped so a repo sharded under an older ceiling
+still resolves its existing slots.
+
+`credential_bundles.py` reads those enumerated env vars (blank = unset),
+validates every populated value as a JSON object of string slots to string
+values, rejects a bundle name outside the bound range instead of dropping it,
+writes a new 0600 file without following/overwriting a destination, and the
+step exports the path as `FERRUM_CREDS_JSON_FILE`. Malformed input fails closed
+rather than becoming an empty bundle. Inline `FERRUM_CREDS_JSON` is still
+supported for small local tests.
 
 Allocation (first apply, or rotation): generate random value → libsodium
 `crypto_box_seal` to the env's public key → PUT to
@@ -326,7 +345,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
-- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
+- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
 - `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
@@ -387,6 +406,12 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 
 ## Development Guidelines
 
+Repository-local agent skills, Claude rules, and their dispatchers are guarded by
+`agent-setup-policy.yml`. The workflow runs trusted default-branch validation over candidate
+content on every PR, has only read access, and cancels stale runs per PR. Requiring
+`Agent Setup Policy / validate-trusted-policy` and code-owner review is what prevents a candidate
+from weakening its own validator; forks do not inherit those repository settings automatically.
+
 - **No `.unwrap()` in production code paths** — use `?`, `.unwrap_or()`, or explicit match.
 - **No `.expect()` except where failure is a genuine bug** (e.g. `serde_json::to_string` on a static `Value`).
 - Return `crate::error::Error` variants via `?`; prefer descriptive variants over `Config(String)` when the category is clear.
@@ -398,7 +423,9 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 1. `cargo fmt --all` clean
 2. `cargo clippy --all-targets -- -D warnings` clean
 3. `cargo test --test unit_tests` passes
-4. No `.unwrap()` / `.expect()` in prod code
-5. New env var → `.env.example` + `env.rs` doc block
-6. Schema change → unit test in `tests/unit/schema_tests.rs`
-7. Commit messages in imperative mood; branches `feature/…`, `fix/…`, `claude/…`
+4. Agent/rule changes → `python3 .github/scripts/check_agent_setup.py` and
+   `python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'`
+5. No `.unwrap()` / `.expect()` in prod code
+6. New env var → `.env.example` + `env.rs` doc block
+7. Schema change → unit test in `tests/unit/schema_tests.rs`
+8. Commit messages in imperative mood; branches `feature/…`, `fix/…`, `claude/…`
