@@ -75,6 +75,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
         secure = "\n".join(
             [
                 "if: github.event_name == 'pull_request'",
+                "name: Check out immutable policy bootstrap",
+                "name: Check out trusted supply-chain policy",
                 "ref: ${{ github.event.repository.default_branch }}",
                 "path: trusted-supply-chain",
                 "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
@@ -100,6 +102,21 @@ class SupplyChainPolicyTests(unittest.TestCase):
         )
         self.assertTrue(any("missing" in item for item in violations))
         self.assertTrue(any("unprotected PR base" in item for item in violations))
+
+        reversed_checkouts = secure.replace(
+            "name: Check out immutable policy bootstrap",
+            "name: temporary checkout placeholder",
+        ).replace(
+            "name: Check out trusted supply-chain policy",
+            "name: Check out immutable policy bootstrap",
+        ).replace(
+            "name: temporary checkout placeholder",
+            "name: Check out trusted supply-chain policy",
+        )
+        violations = check_supply_chain.trusted_supply_chain_policy_violations(
+            reversed_checkouts
+        )
+        self.assertTrue(any("must run after" in item for item in violations))
 
     def test_pr_trigger_must_rerun_on_retarget_and_target_main(self):
         secure = """on:

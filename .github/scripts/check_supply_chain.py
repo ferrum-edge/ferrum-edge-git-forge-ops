@@ -321,6 +321,12 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
         violations.append(
             "security.yml: an unprotected PR base SHA must not supply the policy checker"
         )
+    bootstrap_checkout = text.find("name: Check out immutable policy bootstrap")
+    trusted_checkout = text.find("name: Check out trusted supply-chain policy")
+    if bootstrap_checkout < 0 or trusted_checkout < bootstrap_checkout:
+        violations.append(
+            "security.yml: the protected default-branch policy checkout must run after the bootstrap checkout"
+        )
     return violations
 
 
