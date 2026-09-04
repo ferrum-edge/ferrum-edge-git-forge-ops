@@ -147,6 +147,21 @@ class SupplyChainPolicyTests(unittest.TestCase):
         )
         self.assertTrue(any("every validator download step" in item for item in violations))
 
+    def test_validate_pr_uses_trusted_installer_with_candidate_allowlist(self):
+        workflow = (ROOT / ".github/workflows/validate-pr.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.untrusted_pr_installer_violations(workflow), []
+        )
+        insecure = workflow.replace(
+            "bash trusted-validator/.github/scripts/install-ferrum-edge.sh",
+            "bash .github/scripts/install-ferrum-edge.sh",
+            1,
+        )
+        violations = check_supply_chain.untrusted_pr_installer_violations(insecure)
+        self.assertTrue(any("authenticated validator install" in item for item in violations))
+
     def test_candidate_branch_classifier_fails_even_when_trusted_text_remains(self):
         text = """
 ref: ${{ github.event.repository.default_branch }}

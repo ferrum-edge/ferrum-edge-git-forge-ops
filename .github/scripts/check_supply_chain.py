@@ -372,6 +372,27 @@ def installer_step_auth_violations(workflow: str, text: str) -> list[str]:
     return []
 
 
+def untrusted_pr_installer_violations(text: str) -> list[str]:
+    """Keep the PR token out of scripts supplied by the candidate checkout."""
+    required = (
+        "- name: Check out trusted validator installer",
+        "ref: ${{ github.event.repository.default_branch }}",
+        "path: trusted-validator",
+        "bash trusted-validator/.github/scripts/install-ferrum-edge.sh",
+        ".github/ferrum-edge-checksums.txt",
+    )
+    violations = [
+        f"validate-pr.yml: authenticated validator install is missing {item!r}"
+        for item in required
+        if item not in text
+    ]
+    if "bash .github/scripts/install-ferrum-edge.sh" in text:
+        violations.append(
+            "validate-pr.yml: candidate-checkout installer must not receive the GitHub token"
+        )
+    return violations
+
+
 def allowlisted_validator_digests(text: str) -> list[str]:
     """Return every approved validator digest, in file order."""
     digests: list[str] = []
@@ -930,6 +951,8 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(
             installer_step_auth_violations(workflow_name, workflow_text)
         )
+        if workflow_name == "validate-pr.yml":
+            violations.extend(untrusted_pr_installer_violations(workflow_text))
     violations.extend(
         validator_locator_violations(
             [workflow.read_text(encoding="utf-8") for workflow in checked_action_files]

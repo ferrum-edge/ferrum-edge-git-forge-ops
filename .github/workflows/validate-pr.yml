@@ -138,6 +138,13 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out trusted validator installer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted-validator
+          persist-credentials: false
+
       - name: Download verified ferrum-edge binary
         env:
           # The installer resolves the upstream asset by name and refuses to
@@ -145,7 +152,9 @@ jobs:
           # .github/ferrum-edge-checksums.txt allowlist.
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          bash .github/scripts/install-ferrum-edge.sh
+          bash trusted-validator/.github/scripts/install-ferrum-edge.sh \
+            "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge" \
+            .github/ferrum-edge-checksums.txt
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
