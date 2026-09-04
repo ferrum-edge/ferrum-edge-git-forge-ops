@@ -330,11 +330,11 @@ Storage: one or more GitHub Environment Secrets named `FERRUM_CREDS_BUNDLE[_N]`,
 each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
 auto-sharded by fnv-style hash when a bundle approaches 40 KB.
 
-The shard layout is capped at `MAX_BUNDLE_SHARDS = 16` (shards 0..15,
-~7,000 slots). The cap exists because the privileged workflows'
+The shard layout is capped at `MAX_BUNDLE_SHARDS = 100` (shards 0..99,
+~44,000 slots). The cap exists because the privileged workflows'
 "Load credential bundles" step binds every bundle secret **by name**
 (`FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}`, …
-`FERRUM_CREDS_BUNDLE_15`) rather than dumping the whole `secrets` context: a
+`FERRUM_CREDS_BUNDLE_99`) rather than dumping the whole `secrets` context: a
 `toJSON(secrets)` spill hands the step the admin JWT signing key, the
 state-writer App private key and the registry token to read a handful of bundle
 values, and since GitHub's 2026-07-28 change it also makes public-repository

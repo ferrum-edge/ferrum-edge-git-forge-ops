@@ -11,7 +11,7 @@ pub const BUNDLE_SECRET_PREFIX: &str = "FERRUM_CREDS_BUNDLE";
 
 /// How many `FERRUM_CREDS_BUNDLE[_N]` Environment Secrets the credential
 /// broker may ever occupy. Valid shard indices are `0..MAX_BUNDLE_SHARDS`,
-/// i.e. `FERRUM_CREDS_BUNDLE` through `FERRUM_CREDS_BUNDLE_15`.
+/// i.e. `FERRUM_CREDS_BUNDLE` through `FERRUM_CREDS_BUNDLE_99`.
 ///
 /// The ceiling exists because the privileged workflows bind every shard secret
 /// **by name**. GitHub offers no way to enumerate an environment's secrets
@@ -19,7 +19,7 @@ pub const BUNDLE_SECRET_PREFIX: &str = "FERRUM_CREDS_BUNDLE";
 /// key, the state-writer App private key and the registry token alongside the
 /// bundles — and, since GitHub's 2026-07-28 change, makes public-repository
 /// runs wait for manual approval. So the list of bundle secrets is finite and
-/// this constant is its length: 16 shards x ~440 slots ~= 7,000 credential
+/// this constant is its length: 100 shards x ~440 slots ~= 44,000 credential
 /// slots.
 ///
 /// Raising it means changing all of these together, which
@@ -33,7 +33,7 @@ pub const BUNDLE_SECRET_PREFIX: &str = "FERRUM_CREDS_BUNDLE";
 /// Reading is deliberately unbounded: `load_bundles_from_env` still accepts any
 /// shard index so a repository that allocated beyond an older, higher ceiling
 /// keeps resolving its existing slots.
-pub const MAX_BUNDLE_SHARDS: u32 = 16;
+pub const MAX_BUNDLE_SHARDS: u32 = 100;
 
 /// A single shard's credential map. Keys are slot paths
 /// (`<namespace>/<id>/<cred_key>`), values are plaintext secret material.
@@ -188,7 +188,7 @@ pub fn pick_shard(
 /// revert a freshly rotated value.
 ///
 /// Refuses to create a shard index at or beyond [`MAX_BUNDLE_SHARDS`]: the
-/// workflows bind each shard secret by name, so a `FERRUM_CREDS_BUNDLE_16`
+/// workflows bind each shard secret by name, so a `FERRUM_CREDS_BUNDLE_100`
 /// would be written to GitHub and then never read back, and the next run would
 /// re-allocate every slot it holds.
 pub fn reserve_shard(

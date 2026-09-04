@@ -154,8 +154,8 @@ No workflow reads the whole `secrets` context — `${{ toJSON(secrets) }}` would
 hand a bundle-loading step the admin JWT signing key and the state-writer App
 private key as well, and GitHub holds public-repository runs that read it for
 manual approval. Instead each privileged workflow binds
-`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15` by name, which caps an
-environment at `MAX_BUNDLE_SHARDS` = 16 shards (~7,000 credential slots). A
+`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_99` by name, which caps an
+environment at `MAX_BUNDLE_SHARDS` = 100 shards (~44,000 credential slots). A
 shard beyond that would be written but never read back, so `apply` and
 `rotate` refuse to create one. Raising the ceiling means editing
 `MAX_BUNDLE_SHARDS` in `src/secrets/bundle.rs` and

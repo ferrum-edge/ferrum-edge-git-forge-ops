@@ -35,7 +35,7 @@ BUNDLE_SECRET_PREFIX = "FERRUM_CREDS_BUNDLE"
 
 # Keep in lockstep with MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and with the
 # FERRUM_CREDS_BUNDLE_<N> env bindings in the privileged workflows.
-MAX_BUNDLE_SHARDS = 16
+MAX_BUNDLE_SHARDS = 100
 
 BUNDLE_NAME = re.compile(rf"^{BUNDLE_SECRET_PREFIX}(?:_[0-9]+)?$")
 

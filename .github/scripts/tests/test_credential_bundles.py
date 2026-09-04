@@ -26,13 +26,16 @@ class CredentialBundleTests(unittest.TestCase):
             environ = {
                 "FERRUM_ADMIN_JWT_SECRET": "must-not-be-collected",
                 "FERRUM_CREDS_BUNDLE": first,
-                "FERRUM_CREDS_BUNDLE_1": second,
+                f"FERRUM_CREDS_BUNDLE_{credential_bundles.MAX_BUNDLE_SHARDS - 1}": second,
             }
 
             self.assertEqual(credential_bundles.extract(environ, destination), 2)
             self.assertEqual(
                 json.loads(destination.read_text()),
-                {"FERRUM_CREDS_BUNDLE": first, "FERRUM_CREDS_BUNDLE_1": second},
+                {
+                    "FERRUM_CREDS_BUNDLE": first,
+                    f"FERRUM_CREDS_BUNDLE_{credential_bundles.MAX_BUNDLE_SHARDS - 1}": second,
+                },
             )
             if os.name == "posix":
                 self.assertEqual(destination.stat().st_mode & 0o777, 0o600)

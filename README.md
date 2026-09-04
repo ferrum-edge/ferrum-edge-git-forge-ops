@@ -541,7 +541,7 @@ Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `
 - Each bundle is a JSON object: `{ "<slot>": "<value>", ... }`.
 - Single bundle holds ~440 credentials at 48 KB GitHub secret cap.
 - Auto-sharded by deterministic hash when any bundle approaches 40 KB.
-- **Shard ceiling: 16** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15`) × ~440 slots/bundle = **~7,000 credentials per environment**. `apply` and `rotate` refuse to create shard 16 rather than writing a secret nothing reads back.
+- **Shard ceiling: 100** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_99`) × ~440 slots/bundle = **~44,000 credentials per environment**. `apply` and `rotate` refuse to create shard 100 rather than writing a secret nothing reads back.
 
 #### "Load credential bundles"
 
@@ -551,7 +551,7 @@ Each privileged workflow (`apply-on-merge.yml`, `drift-check.yml`, `materialize-
         env:
           FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}
           FERRUM_CREDS_BUNDLE_1: ${{ secrets.FERRUM_CREDS_BUNDLE_1 }}
-          # … through FERRUM_CREDS_BUNDLE_15
+          # … through FERRUM_CREDS_BUNDLE_99
 ```
 
 It used to read `${{ toJSON(secrets) }}` instead. That handed the step every secret the environment holds — the admin JWT signing key, the state-writer App private key, the registry token — to pull out a handful of bundle values, and since GitHub's [2026-07-28 change](https://github.blog/changelog/2026-07-28-github-actions-holds-potentially-malicious-workflows-for-approval/) a public-repository run that reads the whole secrets context is **held for manual approval** before it may start.
@@ -715,7 +715,7 @@ Practical limits you should know about:
 | Environments per repo | ~100 (soft) | Each needs its own GitHub Environment; workflow matrix spreads to parallel jobs. GitHub Actions caps concurrent jobs at 20 on free public, 60+ on paid tiers. |
 | Namespaces per environment | Unbounded | Handled by the gateway; repo just groups them. |
 | Resources per apply | Unbounded in file mode; gateway-limited in API mode. | Incremental mode fetches `/backup` once per namespace and diffs locally. |
-| Consumer credential slots per env | ~7,000 | `MAX_BUNDLE_SHARDS` = 16 env secrets × ~440 slots/bundle. Raise the constant in `src/secrets/bundle.rs` *and* `.github/scripts/credential_bundles.py`, then extend the `FERRUM_CREDS_BUNDLE_<N>` bindings in the four privileged workflows. |
+| Consumer credential slots per env | ~44,000 | `MAX_BUNDLE_SHARDS` = 100 env secrets × ~440 slots/bundle. Raise the constant in `src/secrets/bundle.rs` *and* `.github/scripts/credential_bundles.py`, then extend the `FERRUM_CREDS_BUNDLE_<N>` bindings in the four privileged workflows. |
 | Policy rules | Unbounded | Each adds ~50 µs per apply at 1k resources. |
 | Apply wall-clock time | Dominated by `/backup` fetch + per-resource API writes. | Roughly O(changed resources) in incremental mode. `full_replace` is constant time but bigger blast radius. |
 | Credential bundle write concurrency | Serialized per env via `concurrency: ferrum-apply-${{ matrix.environment }}`. | Within an env, two apply/rotate runs never interleave. Across envs they parallelize. |
@@ -852,7 +852,7 @@ Only three kinds of configuration source exist:
 | `FERRUM_GATEWAY_CLIENT_CERT` | no | Client cert for mTLS (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_KEY` | no | Client key for mTLS (base64 PEM, required if cert is set) |
 | `FERRUM_GH_PROVISIONER_TOKEN` | no (required for allocate/rotate) | GitHub App installation token or PAT with `Secrets: write` + `Environments: write` |
-| `FERRUM_CREDS_BUNDLE[_N]` | managed by broker | Credential bundles, shards `0..15` — **you generally never touch these by hand**. The workflows bind each shard by name, so `_16` and above are never read; see [Storage: bundled environment secrets](#storage-bundled-environment-secrets) |
+| `FERRUM_CREDS_BUNDLE[_N]` | managed by broker | Credential bundles, shards `0..99` — **you generally never touch these by hand**. The workflows bind each shard by name, so `_100` and above are never read; see [Storage: bundled environment secrets](#storage-bundled-environment-secrets) |
 
 #### Migrating from older gitforgeops
 

@@ -169,9 +169,9 @@ jobs:
         # public-repository run that reads the whole secrets context is held for
         # manual approval before it may start.
         #
-        # The list is finite by construction: shards 0..15, matching
+        # The list is finite by construction: shards 0..99, matching
         # MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in
-        # .github/scripts/credential_bundles.py (16 x ~440 ~= 7,000 slots).
+        # .github/scripts/credential_bundles.py (100 x ~440 ~= 44,000 slots).
         # Adding capacity means raising both constants and extending this block
         # in all four privileged workflows; check_supply_chain.py fails the
         # build when they drift apart.
@@ -198,6 +198,90 @@ jobs:
           FERRUM_CREDS_BUNDLE_13: ${{ secrets.FERRUM_CREDS_BUNDLE_13 }}
           FERRUM_CREDS_BUNDLE_14: ${{ secrets.FERRUM_CREDS_BUNDLE_14 }}
           FERRUM_CREDS_BUNDLE_15: ${{ secrets.FERRUM_CREDS_BUNDLE_15 }}
+          FERRUM_CREDS_BUNDLE_16: ${{ secrets.FERRUM_CREDS_BUNDLE_16 }}
+          FERRUM_CREDS_BUNDLE_17: ${{ secrets.FERRUM_CREDS_BUNDLE_17 }}
+          FERRUM_CREDS_BUNDLE_18: ${{ secrets.FERRUM_CREDS_BUNDLE_18 }}
+          FERRUM_CREDS_BUNDLE_19: ${{ secrets.FERRUM_CREDS_BUNDLE_19 }}
+          FERRUM_CREDS_BUNDLE_20: ${{ secrets.FERRUM_CREDS_BUNDLE_20 }}
+          FERRUM_CREDS_BUNDLE_21: ${{ secrets.FERRUM_CREDS_BUNDLE_21 }}
+          FERRUM_CREDS_BUNDLE_22: ${{ secrets.FERRUM_CREDS_BUNDLE_22 }}
+          FERRUM_CREDS_BUNDLE_23: ${{ secrets.FERRUM_CREDS_BUNDLE_23 }}
+          FERRUM_CREDS_BUNDLE_24: ${{ secrets.FERRUM_CREDS_BUNDLE_24 }}
+          FERRUM_CREDS_BUNDLE_25: ${{ secrets.FERRUM_CREDS_BUNDLE_25 }}
+          FERRUM_CREDS_BUNDLE_26: ${{ secrets.FERRUM_CREDS_BUNDLE_26 }}
+          FERRUM_CREDS_BUNDLE_27: ${{ secrets.FERRUM_CREDS_BUNDLE_27 }}
+          FERRUM_CREDS_BUNDLE_28: ${{ secrets.FERRUM_CREDS_BUNDLE_28 }}
+          FERRUM_CREDS_BUNDLE_29: ${{ secrets.FERRUM_CREDS_BUNDLE_29 }}
+          FERRUM_CREDS_BUNDLE_30: ${{ secrets.FERRUM_CREDS_BUNDLE_30 }}
+          FERRUM_CREDS_BUNDLE_31: ${{ secrets.FERRUM_CREDS_BUNDLE_31 }}
+          FERRUM_CREDS_BUNDLE_32: ${{ secrets.FERRUM_CREDS_BUNDLE_32 }}
+          FERRUM_CREDS_BUNDLE_33: ${{ secrets.FERRUM_CREDS_BUNDLE_33 }}
+          FERRUM_CREDS_BUNDLE_34: ${{ secrets.FERRUM_CREDS_BUNDLE_34 }}
+          FERRUM_CREDS_BUNDLE_35: ${{ secrets.FERRUM_CREDS_BUNDLE_35 }}
+          FERRUM_CREDS_BUNDLE_36: ${{ secrets.FERRUM_CREDS_BUNDLE_36 }}
+          FERRUM_CREDS_BUNDLE_37: ${{ secrets.FERRUM_CREDS_BUNDLE_37 }}
+          FERRUM_CREDS_BUNDLE_38: ${{ secrets.FERRUM_CREDS_BUNDLE_38 }}
+          FERRUM_CREDS_BUNDLE_39: ${{ secrets.FERRUM_CREDS_BUNDLE_39 }}
+          FERRUM_CREDS_BUNDLE_40: ${{ secrets.FERRUM_CREDS_BUNDLE_40 }}
+          FERRUM_CREDS_BUNDLE_41: ${{ secrets.FERRUM_CREDS_BUNDLE_41 }}
+          FERRUM_CREDS_BUNDLE_42: ${{ secrets.FERRUM_CREDS_BUNDLE_42 }}
+          FERRUM_CREDS_BUNDLE_43: ${{ secrets.FERRUM_CREDS_BUNDLE_43 }}
+          FERRUM_CREDS_BUNDLE_44: ${{ secrets.FERRUM_CREDS_BUNDLE_44 }}
+          FERRUM_CREDS_BUNDLE_45: ${{ secrets.FERRUM_CREDS_BUNDLE_45 }}
+          FERRUM_CREDS_BUNDLE_46: ${{ secrets.FERRUM_CREDS_BUNDLE_46 }}
+          FERRUM_CREDS_BUNDLE_47: ${{ secrets.FERRUM_CREDS_BUNDLE_47 }}
+          FERRUM_CREDS_BUNDLE_48: ${{ secrets.FERRUM_CREDS_BUNDLE_48 }}
+          FERRUM_CREDS_BUNDLE_49: ${{ secrets.FERRUM_CREDS_BUNDLE_49 }}
+          FERRUM_CREDS_BUNDLE_50: ${{ secrets.FERRUM_CREDS_BUNDLE_50 }}
+          FERRUM_CREDS_BUNDLE_51: ${{ secrets.FERRUM_CREDS_BUNDLE_51 }}
+          FERRUM_CREDS_BUNDLE_52: ${{ secrets.FERRUM_CREDS_BUNDLE_52 }}
+          FERRUM_CREDS_BUNDLE_53: ${{ secrets.FERRUM_CREDS_BUNDLE_53 }}
+          FERRUM_CREDS_BUNDLE_54: ${{ secrets.FERRUM_CREDS_BUNDLE_54 }}
+          FERRUM_CREDS_BUNDLE_55: ${{ secrets.FERRUM_CREDS_BUNDLE_55 }}
+          FERRUM_CREDS_BUNDLE_56: ${{ secrets.FERRUM_CREDS_BUNDLE_56 }}
+          FERRUM_CREDS_BUNDLE_57: ${{ secrets.FERRUM_CREDS_BUNDLE_57 }}
+          FERRUM_CREDS_BUNDLE_58: ${{ secrets.FERRUM_CREDS_BUNDLE_58 }}
+          FERRUM_CREDS_BUNDLE_59: ${{ secrets.FERRUM_CREDS_BUNDLE_59 }}
+          FERRUM_CREDS_BUNDLE_60: ${{ secrets.FERRUM_CREDS_BUNDLE_60 }}
+          FERRUM_CREDS_BUNDLE_61: ${{ secrets.FERRUM_CREDS_BUNDLE_61 }}
+          FERRUM_CREDS_BUNDLE_62: ${{ secrets.FERRUM_CREDS_BUNDLE_62 }}
+          FERRUM_CREDS_BUNDLE_63: ${{ secrets.FERRUM_CREDS_BUNDLE_63 }}
+          FERRUM_CREDS_BUNDLE_64: ${{ secrets.FERRUM_CREDS_BUNDLE_64 }}
+          FERRUM_CREDS_BUNDLE_65: ${{ secrets.FERRUM_CREDS_BUNDLE_65 }}
+          FERRUM_CREDS_BUNDLE_66: ${{ secrets.FERRUM_CREDS_BUNDLE_66 }}
+          FERRUM_CREDS_BUNDLE_67: ${{ secrets.FERRUM_CREDS_BUNDLE_67 }}
+          FERRUM_CREDS_BUNDLE_68: ${{ secrets.FERRUM_CREDS_BUNDLE_68 }}
+          FERRUM_CREDS_BUNDLE_69: ${{ secrets.FERRUM_CREDS_BUNDLE_69 }}
+          FERRUM_CREDS_BUNDLE_70: ${{ secrets.FERRUM_CREDS_BUNDLE_70 }}
+          FERRUM_CREDS_BUNDLE_71: ${{ secrets.FERRUM_CREDS_BUNDLE_71 }}
+          FERRUM_CREDS_BUNDLE_72: ${{ secrets.FERRUM_CREDS_BUNDLE_72 }}
+          FERRUM_CREDS_BUNDLE_73: ${{ secrets.FERRUM_CREDS_BUNDLE_73 }}
+          FERRUM_CREDS_BUNDLE_74: ${{ secrets.FERRUM_CREDS_BUNDLE_74 }}
+          FERRUM_CREDS_BUNDLE_75: ${{ secrets.FERRUM_CREDS_BUNDLE_75 }}
+          FERRUM_CREDS_BUNDLE_76: ${{ secrets.FERRUM_CREDS_BUNDLE_76 }}
+          FERRUM_CREDS_BUNDLE_77: ${{ secrets.FERRUM_CREDS_BUNDLE_77 }}
+          FERRUM_CREDS_BUNDLE_78: ${{ secrets.FERRUM_CREDS_BUNDLE_78 }}
+          FERRUM_CREDS_BUNDLE_79: ${{ secrets.FERRUM_CREDS_BUNDLE_79 }}
+          FERRUM_CREDS_BUNDLE_80: ${{ secrets.FERRUM_CREDS_BUNDLE_80 }}
+          FERRUM_CREDS_BUNDLE_81: ${{ secrets.FERRUM_CREDS_BUNDLE_81 }}
+          FERRUM_CREDS_BUNDLE_82: ${{ secrets.FERRUM_CREDS_BUNDLE_82 }}
+          FERRUM_CREDS_BUNDLE_83: ${{ secrets.FERRUM_CREDS_BUNDLE_83 }}
+          FERRUM_CREDS_BUNDLE_84: ${{ secrets.FERRUM_CREDS_BUNDLE_84 }}
+          FERRUM_CREDS_BUNDLE_85: ${{ secrets.FERRUM_CREDS_BUNDLE_85 }}
+          FERRUM_CREDS_BUNDLE_86: ${{ secrets.FERRUM_CREDS_BUNDLE_86 }}
+          FERRUM_CREDS_BUNDLE_87: ${{ secrets.FERRUM_CREDS_BUNDLE_87 }}
+          FERRUM_CREDS_BUNDLE_88: ${{ secrets.FERRUM_CREDS_BUNDLE_88 }}
+          FERRUM_CREDS_BUNDLE_89: ${{ secrets.FERRUM_CREDS_BUNDLE_89 }}
+          FERRUM_CREDS_BUNDLE_90: ${{ secrets.FERRUM_CREDS_BUNDLE_90 }}
+          FERRUM_CREDS_BUNDLE_91: ${{ secrets.FERRUM_CREDS_BUNDLE_91 }}
+          FERRUM_CREDS_BUNDLE_92: ${{ secrets.FERRUM_CREDS_BUNDLE_92 }}
+          FERRUM_CREDS_BUNDLE_93: ${{ secrets.FERRUM_CREDS_BUNDLE_93 }}
+          FERRUM_CREDS_BUNDLE_94: ${{ secrets.FERRUM_CREDS_BUNDLE_94 }}
+          FERRUM_CREDS_BUNDLE_95: ${{ secrets.FERRUM_CREDS_BUNDLE_95 }}
+          FERRUM_CREDS_BUNDLE_96: ${{ secrets.FERRUM_CREDS_BUNDLE_96 }}
+          FERRUM_CREDS_BUNDLE_97: ${{ secrets.FERRUM_CREDS_BUNDLE_97 }}
+          FERRUM_CREDS_BUNDLE_98: ${{ secrets.FERRUM_CREDS_BUNDLE_98 }}
+          FERRUM_CREDS_BUNDLE_99: ${{ secrets.FERRUM_CREDS_BUNDLE_99 }}
         run: |
           set -euo pipefail
           creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
