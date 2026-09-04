@@ -150,12 +150,11 @@ fn private_temp_file(
 /// consumer credentials and must never land in a world-readable shared temp
 /// file under a guessable name.
 ///
-/// The same resolution is why the child's output is passed through a
-/// [`SecretScrubber`] built from `config`: `ferrum-edge validate` quotes the
-/// document it was handed, so on a bundle-loaded run every credential in a
-/// diagnostic is a live value. Only those exact byte sequences are replaced
-/// with `[REDACTED]`; every other diagnostic — the proxy typo that actually
-/// failed the run — is returned intact.
+/// The same resolution is why the child's output is withheld whenever a
+/// [`SecretScrubber`] built from `config` finds secret material. The validator
+/// is free to quote, escape, split, or otherwise transform the document it was
+/// handed, so substring replacement cannot prove that arbitrary diagnostics
+/// are safe to publish. Placeholder-only documents still retain diagnostics.
 ///
 /// Credential leaves that are *still* placeholders (no bundle loaded, as on a
 /// fork PR) are replaced with [`crate::validate::validation_standin`] values
@@ -202,21 +201,17 @@ pub fn run_mesh_validation(
     )
 }
 
-/// Emitted in place of the validator's own output when, and only when,
-/// redaction provably failed. See [`crate::secrets::MIN_SCRUB_LENGTH`]: a
-/// credential shorter than the substring-replacement floor cannot be removed
-/// from a diagnostic without corrupting it, so the diagnostic goes instead.
-const SUPPRESSED_NOTICE: &str = "Validator diagnostics were withheld: a credential value survived redaction, so the output could not be shown without leaking it. Credentials shorter than 8 bytes cannot be redacted from a diagnostic without mangling it — lengthen the credential, or move the literal value into the ${gh-env-secret:...} broker.\n";
+/// Emitted in place of untrusted validator output when the input contains any
+/// resolved or literal secret material.
+const SUPPRESSED_NOTICE: &str = "Validator diagnostics were withheld because the validated configuration contains credential material. Re-run validation without resolved secrets to view detailed diagnostics safely.\n";
 
 /// Shared body of [`run_validation`] and [`run_mesh_validation`]: locate the
 /// binary, write `yaml` to a private temp file, and run `validate` in `mode`
 /// with a scrubbed environment and pinned settings.
 ///
-/// `scrubber` holds the secret byte sequences to remove from the child's
-/// stdout and stderr before either is returned. Everything else the validator
-/// said — schema errors on proxies, upstreams, plugins, the lot — survives,
-/// which is the whole point: a bundle-loaded apply run must still be able to
-/// report a proxy typo.
+/// `scrubber` records whether the input contains secret material. When it does,
+/// the complete untrusted output is withheld because exact-value redaction
+/// cannot cover serialization changes or partial/transformed secret values.
 fn run_validate_command(
     mode: &str,
     yaml: &str,
@@ -275,16 +270,14 @@ fn run_validate_command(
     let output = output?;
 
     let exit_code = output.status.code().unwrap_or(-1);
-    let mut stdout = scrubber.scrub(&String::from_utf8_lossy(&output.stdout));
-    let mut stderr = scrubber.scrub(&String::from_utf8_lossy(&output.stderr));
-
-    // Last resort. Substring replacement removes every secret at or above
-    // `MIN_SCRUB_LENGTH`, so reaching here means a credential too short to
-    // replace safely was echoed back. Drop the stream rather than print it.
-    if scrubber.leaks(&stdout) || scrubber.leaks(&stderr) {
-        stdout = String::new();
-        stderr = SUPPRESSED_NOTICE.to_string();
-    }
+    let (stdout, stderr) = if scrubber.is_empty() {
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    } else {
+        (String::new(), SUPPRESSED_NOTICE.to_string())
+    };
 
     // ferrum-edge validate's public contract is 0 for accepted input and 1
     // for schema rejection. Any other code (including -1 for termination by

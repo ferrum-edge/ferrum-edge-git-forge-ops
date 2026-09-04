@@ -7,15 +7,12 @@
 //! loaded *every* credential is a literal, so a plain proxy typo would print
 //! nothing but "diagnostics were suppressed".
 //!
-//! [`SecretScrubber`] takes the other route. It enumerates the exact byte
-//! sequences that are secret — every value the resolver substituted from the
-//! bundle plus every literal secret leaf committed in the repo — and removes
-//! only those from the child's output, leaving every non-credential
-//! diagnostic intact.
+//! [`SecretScrubber`] detects whether the validator input contains secret
+//! material. Callers must withhold the complete untrusted output when it does:
+//! exact-string replacement cannot cover escaped, split, normalized, or
+//! otherwise transformed representations of a secret.
 
 use std::collections::BTreeSet;
-
-use base64::Engine;
 
 use crate::config::GatewayConfig;
 
@@ -23,34 +20,12 @@ use super::placeholder::parse_placeholder;
 use super::plugin_config::{sensitive_string_paths, value_at};
 use super::resolver::is_identity_credential_leaf;
 
-/// Text substituted for every secret occurrence.
-pub const REDACTION: &str = "[REDACTED]";
-
-/// Shortest secret value that is removed by substring replacement.
-///
-/// A three-byte credential such as `dev` occurs inside ordinary words, so
-/// scrubbing it would replace unrelated text and turn a readable schema error
-/// into `pro[REDACTED]uction: unknown field`. Eight bytes is short enough that
-/// no real credential is meant to be below it and long enough that a
-/// collision with prose is a curiosity rather than the norm.
-///
-/// Values below the threshold are **not** exempt from protection: they are
-/// still checked verbatim by [`SecretScrubber::leaks`], and a hit there makes
-/// the caller fall back to suppressing the stream entirely. The threshold only
-/// chooses which of the two protections applies, never whether one applies.
-pub const MIN_SCRUB_LENGTH: usize = 8;
-
-/// The secret byte sequences to remove from a child process's output.
+/// Secret material detected in a validator input.
 ///
 /// Build one with [`SecretScrubber::from_gateway_config`] *after* credential
 /// resolution, so the resolved values are the ones in hand.
 #[derive(Debug, Clone, Default)]
 pub struct SecretScrubber {
-    /// Every byte sequence replaced by [`REDACTION`], longest first so a
-    /// value nested inside another is not left half-redacted.
-    needles: Vec<String>,
-    /// The raw secret values, including those below [`MIN_SCRUB_LENGTH`].
-    /// Used only by [`SecretScrubber::leaks`].
     values: Vec<String>,
 }
 
@@ -79,33 +54,7 @@ impl SecretScrubber {
     }
 
     fn from_values(values: BTreeSet<String>) -> Self {
-        let mut needles = BTreeSet::new();
-        for value in &values {
-            if value.len() < MIN_SCRUB_LENGTH {
-                continue;
-            }
-            needles.insert(value.clone());
-            // Cheap re-encodings a validator might echo instead of the raw
-            // bytes: a value carried through a URL or copied out of a
-            // base64-wrapped payload. Anything more exotic (compression,
-            // hashing) is out of reach and is covered by `leaks` instead.
-            needles.insert(base64::engine::general_purpose::STANDARD.encode(value.as_bytes()));
-            needles
-                .insert(base64::engine::general_purpose::STANDARD_NO_PAD.encode(value.as_bytes()));
-            let encoded = percent_encoded(value);
-            if encoded != *value {
-                needles.insert(encoded);
-            }
-        }
-
-        let mut needles: Vec<String> = needles.into_iter().collect();
-        // Longest first: replacing a short needle that is a substring of a
-        // longer secret would otherwise leave the rest of the longer value in
-        // place around a `[REDACTED]` marker.
-        needles.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-
         Self {
-            needles,
             values: values.into_iter().collect(),
         }
     }
@@ -113,29 +62,6 @@ impl SecretScrubber {
     /// True when the config carried no secret material at all.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
-    }
-
-    /// Replace every known secret sequence in `text` with [`REDACTION`].
-    pub fn scrub(&self, text: &str) -> String {
-        let mut scrubbed = text.to_string();
-        for needle in &self.needles {
-            if scrubbed.contains(needle.as_str()) {
-                scrubbed = scrubbed.replace(needle.as_str(), REDACTION);
-            }
-        }
-        scrubbed
-    }
-
-    /// True when any secret value is still present verbatim.
-    ///
-    /// Checked against the raw values including the ones below
-    /// [`MIN_SCRUB_LENGTH`], so a credential too short to substring-replace
-    /// still forces the caller into last-resort suppression rather than
-    /// through an unredacted stream.
-    pub fn leaks(&self, text: &str) -> bool {
-        self.values
-            .iter()
-            .any(|value| text.contains(value.as_str()))
     }
 }
 
@@ -194,18 +120,4 @@ fn record_secret(text: &str, out: &mut BTreeSet<String>) {
         return;
     }
     out.insert(text.to_string());
-}
-
-/// Percent-encode every byte outside RFC 3986's unreserved set.
-fn percent_encoded(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(*byte as char)
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
 }

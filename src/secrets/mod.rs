@@ -24,4 +24,4 @@ pub use resolver::{
     SlotStatus, UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER, MAX_CREDENTIAL_VALUE_CHARS,
     MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS, REDACTED_SENTINEL,
 };
-pub use scrubber::{SecretScrubber, MIN_SCRUB_LENGTH, REDACTION};
+pub use scrubber::SecretScrubber;

@@ -113,15 +113,13 @@ pipeline, both because resolution has already run by then:
   bundle-less fork PR would otherwise fail on the placeholder rather than on
   the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
   no other output path ever sees a stand-in.
-- `secrets::SecretScrubber` collects every non-placeholder Consumer credential
+- `secrets::SecretScrubber` detects every non-placeholder Consumer credential
   leaf (minus the identity fields `basicauth[].username` /
   `mtls_auth[].identity`) and every `sensitive_string_paths` plugin-config
-  leaf, and removes those exact byte sequences — plus their base64 and
-  percent-encoded forms — from the validator child's stdout/stderr, replacing
-  each with `[REDACTED]`. Non-credential diagnostics stay intact. Blanket
-  suppression survives only as a fallback for a secret shorter than
-  `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced without
-  mangling the report.
+  leaf. When any such secret is present, validator stdout/stderr is withheld
+  fail-closed: the external validator may quote, split, escape, or transform a
+  value, so exact-string redaction cannot prove arbitrary diagnostics safe.
+  Placeholder-only validation retains detailed diagnostics.
 
 ### Gateway Modes
 

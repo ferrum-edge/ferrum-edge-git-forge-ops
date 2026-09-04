@@ -75,11 +75,11 @@ fn consumer_config(credentials: serde_json::Value) -> gitforgeops::config::schem
     }
 }
 
-/// F1: a resolved (or literal) consumer credential is redacted from the
-/// validator's diagnostics, and everything else the validator said survives.
+/// Any resolved (or literal) consumer credential makes validator diagnostics
+/// unsafe because the child may transform or partially quote the value.
 #[cfg(unix)]
 #[test]
-fn resolved_credentials_are_redacted_but_other_diagnostics_survive() {
+fn resolved_credentials_suppress_untrusted_validator_diagnostics() {
     let secret = "launch-secret-that-must-never-reach-diagnostics";
     let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
 
@@ -91,11 +91,6 @@ fn resolved_credentials_are_redacted_but_other_diagnostics_survive() {
             &ECHO_SPEC_WITH_PROXY_ERROR.replace("exit 1", &format!("exit {exit_code}")),
         );
 
-        // Exit 1 is a completed schema rejection and comes back as a
-        // `ValidationResult`; any other code is an execution failure and comes
-        // back as `Error::ValidateProcess`. Redaction has already run in both
-        // cases, so neither carries the secret and both keep the unrelated
-        // diagnostic.
         match run_validation(&config, validator.to_str().unwrap()) {
             Ok(result) => {
                 assert_eq!(exit_code, 1);
@@ -108,18 +103,9 @@ fn resolved_credentials_are_redacted_but_other_diagnostics_survive() {
                     !result.stderr.contains(secret),
                     "validator stderr exposed a credential fixture"
                 );
-                assert!(
-                    result.stdout.contains("[REDACTED]"),
-                    "the credential should be replaced in place, not dropped: {}",
-                    result.stdout
-                );
-                assert!(
-                    result.stderr.contains("unknown field `listen_path_typo`"),
-                    "an unrelated schema diagnostic must stay visible: {}",
-                    result.stderr
-                );
-                // The consumer id still identifies which resource failed.
-                assert!(result.stdout.contains("app"), "{}", result.stdout);
+                assert!(result.stdout.is_empty(), "{}", result.stdout);
+                assert!(result.stderr.contains("diagnostics were withheld"));
+                assert!(!result.stderr.contains("listen_path_typo"));
             }
             Err(error) => {
                 assert_eq!(exit_code, 2);
@@ -132,24 +118,18 @@ fn resolved_credentials_are_redacted_but_other_diagnostics_survive() {
                     !message.contains(secret),
                     "validator execution error exposed a credential fixture"
                 );
-                assert!(
-                    message.contains("[REDACTED]"),
-                    "the credential should be replaced in place, not dropped: {message}"
-                );
-                assert!(
-                    message.contains("unknown field `listen_path_typo`"),
-                    "an unrelated schema diagnostic must stay visible: {message}"
-                );
+                assert!(message.contains("diagnostics were withheld"), "{message}");
+                assert!(!message.contains("listen_path_typo"), "{message}");
             }
         }
     }
 }
 
-/// F1: the fixture repo commits a literal `keyauth.key`. That used to blank
-/// the whole stream on every fork PR; now only the key is redacted.
+/// Literal credentials receive the same fail-closed treatment as resolved
+/// bundle values.
 #[cfg(unix)]
 #[test]
-fn literal_fixture_credentials_do_not_blank_the_diagnostics() {
+fn literal_fixture_credentials_suppress_diagnostics() {
     let config =
         consumer_config(serde_json::json!({"keyauth": [{"key": "alice-secret-key-12345"}]}));
     let dir = tempfile::tempdir().unwrap();
@@ -162,15 +142,12 @@ fn literal_fixture_credentials_do_not_blank_the_diagnostics() {
         "{}",
         result.stderr
     );
-    assert!(
-        result.stderr.contains("unknown field `listen_path_typo`"),
-        "{}",
-        result.stderr
-    );
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
+    assert!(result.stderr.contains("diagnostics were withheld"));
 }
 
-/// F1: `basicauth[].username` and `mtls_auth[].identity` are identities, not
-/// secrets, so a diagnostic naming them stays readable.
+/// Identity fields alone are safe, but a sibling password makes the complete
+/// child stream untrusted.
 #[cfg(unix)]
 #[test]
 fn credential_identity_fields_are_not_redacted() {
@@ -183,12 +160,7 @@ fn credential_identity_fields_are_not_redacted() {
 
     let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
 
-    assert!(result.stdout.contains("alice-login"), "{}", result.stdout);
-    assert!(
-        result.stdout.contains("CN=alice.example.internal"),
-        "{}",
-        result.stdout
-    );
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
     assert!(
         !result.stdout.contains("alice-password-value"),
         "{}",
@@ -196,8 +168,7 @@ fn credential_identity_fields_are_not_redacted() {
     );
 }
 
-/// F2: plugin-config secrets brokered by this release are scrubbed too, while
-/// the plugin's non-sensitive settings stay visible.
+/// Plugin-config secrets also suppress the complete untrusted stream.
 #[cfg(unix)]
 #[test]
 fn resolved_plugin_config_secrets_are_redacted() {
@@ -232,15 +203,11 @@ fn resolved_plugin_config_secrets_are_redacted() {
 
     assert!(!result.stdout.contains(secret), "{}", result.stdout);
     assert!(!result.stderr.contains(secret), "{}", result.stderr);
-    assert!(result.stdout.contains("sample_rate"), "{}", result.stdout);
-    assert!(
-        result.stderr.contains("unknown field `listen_path_typo`"),
-        "{}",
-        result.stderr
-    );
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
+    assert!(result.stderr.contains("diagnostics were withheld"));
 }
 
-/// A base64-wrapped echo of the credential is removed too.
+/// Transformed output is withheld without trying to enumerate encodings.
 #[cfg(unix)]
 #[test]
 fn common_encodings_of_a_secret_are_redacted() {
@@ -259,7 +226,8 @@ fn common_encodings_of_a_secret_are_redacted() {
     let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
 
     assert!(!result.stdout.contains(&encoded), "{}", result.stdout);
-    assert_eq!(result.stdout, "token=[REDACTED]\n");
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
+    assert!(result.stderr.contains("diagnostics were withheld"));
 }
 
 /// Last-resort suppression: a credential too short to substring-replace
@@ -277,11 +245,26 @@ fn a_secret_below_the_scrub_floor_falls_back_to_suppression() {
     assert!(!result.stdout.contains("hunter2"), "{}", result.stdout);
     assert!(!result.stderr.contains("hunter2"), "{}", result.stderr);
     assert_eq!(result.stdout, "");
+    assert!(result.stderr.contains("diagnostics were withheld"));
+}
+
+#[cfg(unix)]
+#[test]
+fn multiline_secret_serialization_cannot_escape_suppression() {
+    let secret = "-----BEGIN PRIVATE KEY-----\nprivate-key-body\n-----END PRIVATE KEY-----";
+    let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
     assert!(
-        result.stderr.contains("survived redaction"),
+        !result.stderr.contains("private-key-body"),
         "{}",
         result.stderr
     );
+    assert!(result.stderr.contains("diagnostics were withheld"));
 }
 
 #[cfg(unix)]
@@ -343,11 +326,10 @@ exit 0
     let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
 
     assert!(result.success, "{}{}", result.stdout, result.stderr);
-    assert!(
-        result.stdout.contains(VALIDATION_STANDIN_PREFIX),
-        "the stand-in must be obviously fake: {}",
-        result.stdout
-    );
+    // `jwt.key` is credential material too, so a successful validator may not
+    // use its output as an oracle for the stand-in or any sibling value.
+    assert!(result.stdout.is_empty(), "{}", result.stdout);
+    assert!(result.stderr.contains("diagnostics were withheld"));
 }
 
 /// Stand-ins live only in the validator's temp spec: nothing else in the
