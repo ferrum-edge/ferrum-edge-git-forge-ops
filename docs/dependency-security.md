@@ -4,6 +4,13 @@ The `Security` workflow runs `cargo audit` through
 `.github/scripts/check_cargo_audit.py` on every pull request, on pushes to
 `main` that touch build inputs, and on the weekly schedule.
 
+For pull requests, the workflow executes the checker, its tests, and the
+exception policy from a separate checkout of the protected default branch,
+while `--source-root` points the audit and reachability checks at the candidate
+tree. A pull request therefore cannot approve its own dependency finding by
+weakening the checker or adding an exception; changes to the gate take effect
+only after they have been reviewed and merged.
+
 The gate fails on `vulnerability`, `unsound`, and `yanked` findings unless an
 exact finding is recorded in `.github/cargo-audit-policy.json`. Every other
 `cargo audit` bucket — `unmaintained`, `notice`, and any bucket a future
