@@ -273,8 +273,8 @@ fn mesh_republish_preserves_destination_permissions() {
     assert_eq!(mode, 0o640, "mode was {mode:o}");
 }
 
-/// F8: `gitforgeops export --output /dev/null` (and the same for a pipe or a
-/// terminal) has to work. The atomic path cannot serve it — the temp file
+/// F8: an ordinary `gitforgeops export --output /dev/null` (and the same for a
+/// pipe or terminal) has to work. The atomic path cannot serve it — the temp file
 /// would have to be created in `/dev`, which an unprivileged process cannot
 /// do, and the rename would replace the device node with a regular file — so
 /// an existing non-regular destination is written directly.
@@ -284,7 +284,6 @@ fn export_to_a_non_regular_destination_is_written_directly() {
     use gitforgeops::apply::publish_export;
 
     publish_export("/dev/null", b"discarded artifact").expect("public export to /dev/null");
-    publish_private_export("/dev/null", b"discarded secret").expect("private export to /dev/null");
 
     // The device node is still a device node.
     let metadata = std::fs::metadata("/dev/null").unwrap();
@@ -292,6 +291,23 @@ fn export_to_a_non_regular_destination_is_written_directly() {
         !metadata.is_file(),
         "/dev/null was replaced by a regular file"
     );
+}
+
+/// Private exports contain plaintext credentials and must never be streamed
+/// into a pre-existing device, terminal, or named pipe.
+#[cfg(unix)]
+#[test]
+fn private_export_rejects_a_non_regular_destination() {
+    let error = publish_private_export("/dev/null", b"discarded secret")
+        .expect_err("private export to a device must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("private export destination /dev/null must be a regular file"),
+        "unexpected error: {error}"
+    );
+    assert!(!std::fs::metadata("/dev/null").unwrap().is_file());
 }
 
 /// A destination that does not exist yet still takes the atomic path, and a
