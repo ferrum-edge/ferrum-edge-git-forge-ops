@@ -133,7 +133,7 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 ### Apply Strategies
 
 - **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → proxy → plugin config, then deletes in reverse). Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to per-resource creates on 501.
-- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. The body carries the repo's desired rows **plus the complete live spec-owned graph**: `/restore` validates `api_specs.items` against the tagged proxies/upstreams/plugin configs in the same payload and rejects either half on its own, and it re-creates the documents verbatim rather than re-extracting resources from them, so carrying both cannot duplicate rows. An **empty** spec section and all `gateway_trust_bundles` are omitted instead — the gateway reads `items: []` as an intentional wipe but an absent section as "count the live specs and answer 409", and an absent trust section as "leave trust exactly as it is", so omission is what preserves a concurrent update. `--confirm-api-spec-deletion` is the only path that drops the graph (trust bundles still survive). A graph that cannot be proven complete, a repo/spec ID conflict, cached data, or an unfamiliar top-level backup section fails before mutation.
+- **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. Namespaces containing API specs fail closed because the gateway has no conditional restore revision; replaying the required spec document and its owned graph could overwrite a concurrent spec update. Empty spec sections and all `gateway_trust_bundles` are omitted so the gateway can guard newly created specs and preserve concurrent trust updates. `--confirm-api-spec-deletion` is the only path that drops the graph (trust bundles still survive). A graph that cannot be proven complete, a repo/spec ID conflict, cached data, or an unfamiliar top-level backup section fails before mutation.
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
@@ -249,10 +249,10 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
   `ownership.drift_report`: a repo fighting the spec importer is a correctness
   problem, not drift noise.
 
-`full_replace` does not delete the graph either: the restore body carries the
-live spec-owned rows and the live `api_specs` section through unchanged, which
-is what the gateway's restore validator requires. `--confirm-api-spec-deletion`
-is the only path that drops them (see Apply Strategies).
+`full_replace` fails closed for namespaces containing API specs because the
+gateway has no conditional restore revision. Use incremental apply to preserve
+the graph; `--confirm-api-spec-deletion` is the explicit destructive path (see
+Apply Strategies).
 
 ### Policy framework
 

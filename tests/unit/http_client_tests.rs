@@ -943,20 +943,11 @@ fn backup_extras() -> BackupExtras {
 }
 
 #[test]
-fn restore_body_carries_the_api_spec_section_and_never_replays_trust_bundles() {
-    // ferrum-edge validates `api_specs.items` against the tagged rows in the
-    // same payload and rejects either half on its own, so the section has to
-    // travel with the spec-owned graph the caller merged into the config.
-    let extras = backup_extras();
-    let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
-    assert_eq!(
-        body.get("api_specs"),
-        extras.api_specs.as_ref(),
-        "the live section must be forwarded verbatim"
-    );
+fn restore_body_rejects_nonempty_api_specs_and_never_replays_trust_bundles() {
+    let error = build_restore_body(&GatewayConfig::default(), &backup_extras(), false).unwrap_err();
     assert!(
-        body.get("gateway_trust_bundles").is_none(),
-        "an absent trust section preserves the live roots without a lost-update window"
+        error.to_string().contains("conditional restore revision"),
+        "{error}"
     );
 }
 
@@ -1350,22 +1341,13 @@ fn a_complete_gateway_backup_has_no_unsupported_sections() {
 }
 
 #[test]
-fn a_complete_gateway_backup_round_trips_into_a_restore_body() {
+fn a_complete_gateway_backup_cannot_be_replayed_without_a_revision_guard() {
     let snapshot = BackupSnapshot::from_body(FULL_BACKUP).expect("fixture parses");
-    let body = build_restore_body(&snapshot.config, &snapshot.extras, false).unwrap();
-
-    // Every section `/restore` accepts, and nothing it does not.
-    assert_eq!(body["api_specs"]["items"][0]["id"], "spec-orders");
-    assert!(body.get("gateway_trust_bundles").is_none());
-    for section in [
-        "version",
-        "proxies",
-        "consumers",
-        "plugin_configs",
-        "upstreams",
-    ] {
-        assert!(body.get(section).is_some(), "missing {section}");
-    }
+    let error = build_restore_body(&snapshot.config, &snapshot.extras, false).unwrap_err();
+    assert!(
+        error.to_string().contains("conditional restore revision"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -453,8 +453,8 @@ impl AdminClient {
 
     /// Replace a namespace's configuration atomically.
     ///
-    /// `extras` carries a concurrency-safe `api_specs` section when one can be
-    /// proven safe. Gateway trust bundles are deliberately never replayed by
+    /// `extras` is validated defensively before restore. Gateway trust bundles
+    /// and non-empty API spec snapshots are deliberately never replayed by
     /// GitOps: an absent section is a server-side no-op, so a trust rotation
     /// that races an otherwise unrelated restore cannot be rolled back.
     pub async fn post_restore(
@@ -1557,19 +1557,16 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// spliced in as opaque values rather than being modeled on `GatewayConfig` —
 /// that struct mirrors what this tool manages, and API specs are not it.
 ///
-/// The `api_specs` section travels with the spec-owned rows the caller already
-/// merged into `config`: the gateway validates the two halves against each
-/// other and rejects either one on its own. An **empty** section is
-/// deliberately dropped instead of forwarded — the gateway reads `items: []`
-/// as an intentional wipe, whereas an absent section makes it count the
-/// namespace's live specs and answer `409` if any exist, which is the only
-/// guard against a spec created after our backup was taken.
+/// A non-empty `api_specs` snapshot is rejected because the gateway has no
+/// conditional restore revision. Replaying it could overwrite a spec update
+/// made after the snapshot was read. An empty section is omitted so the
+/// gateway's existing-spec guard can catch a concurrently created spec.
 pub fn build_restore_body(
     config: &GatewayConfig,
     extras: &BackupExtras,
     confirm_api_spec_deletion: bool,
 ) -> crate::error::Result<serde_json::Value> {
-    let mut body = serde_json::to_value(config)?;
+    let body = serde_json::to_value(config)?;
     if !body.is_object() {
         return Err(crate::error::Error::Config(
             "gateway config did not serialize as a JSON object".to_string(),
@@ -1587,9 +1584,11 @@ pub fn build_restore_body(
                             .to_string(),
                     )
                 })?;
-            let carry = !items.is_empty();
-            if let (true, Some(map)) = (carry, body.as_object_mut()) {
-                map.insert("api_specs".to_string(), api_specs.clone());
+            if !items.is_empty() {
+                return Err(crate::error::Error::Config(
+                    "refusing restore with a non-empty `api_specs` snapshot: the gateway does not expose a conditional restore revision, so replay could overwrite a concurrent spec update"
+                        .to_string(),
+                ));
             }
         }
     }

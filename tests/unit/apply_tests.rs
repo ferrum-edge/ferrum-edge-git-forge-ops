@@ -1400,13 +1400,7 @@ async fn cached_backup_blocks_all_apply_mutations_before_the_first_write() {
 }
 
 #[tokio::test]
-async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
-    // Issue #71. `/restore` validates the ownership graph as one unit: an
-    // `api_specs` document whose owning proxy is missing, or a tagged row
-    // whose spec is missing, is a 400 before anything is deleted. So the body
-    // has to carry the repo's desired rows AND the live spec-owned rows AND
-    // the live `api_specs` section. Restore never re-extracts resources from
-    // the documents, so nothing is duplicated by carrying both.
+async fn full_replace_refuses_nonempty_specs_without_conditional_restore_revision() {
     let (desired, actual) = spec_owned_graph();
     let extras = spec_extras(&["spec-a"]);
     let (url, requests) = spawn_recording_gateway(vec![
@@ -1420,7 +1414,7 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
     ]);
     let client = stub_client(url);
 
-    let result = apply_api(
+    let error = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
@@ -1433,58 +1427,19 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
         },
     )
     .await
-    .expect("a namespace with API specs must be restorable");
-
-    assert_eq!(
-        result.created, 1,
-        "only the repo-owned row counts as applied; preserved spec rows are not this repo's"
-    );
-    assert_eq!(result.fully_replaced_namespaces, vec!["team-alpha"]);
-
-    let restore = requests
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|request| request.contains("POST /restore?confirm=true"))
-        .cloned()
-        .expect("restore request");
-    let body: serde_json::Value =
-        serde_json::from_str(restore.split_once("\r\n\r\n").expect("request body").1)
-            .expect("restore body is JSON");
+    .unwrap_err();
 
     assert!(
-        !restore.contains("confirm_api_spec_deletion"),
-        "preservation must not use the destructive opt-in: {restore}"
+        error.to_string().contains("conditional restore revision"),
+        "{error}"
     );
-
-    let ids = |section: &str| {
-        body[section]
-            .as_array()
-            .unwrap_or(&Vec::new())
+    assert!(
+        requests
+            .lock()
+            .unwrap()
             .iter()
-            .filter_map(|value| value["id"].as_str().map(str::to_string))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(ids("upstreams"), vec!["repo-upstream", "spec-upstream"]);
-    assert_eq!(ids("proxies"), vec!["spec-proxy"]);
-    assert_eq!(ids("plugin_configs"), vec!["spec-plugin"]);
-
-    // Every tagged row names a spec that is present in `api_specs.items`, and
-    // that spec's owning proxy is present and carries the tag — the exact two
-    // directions ferrum-edge's restore validator checks.
-    assert_eq!(body["api_specs"]["items"][0]["id"], "spec-a");
-    assert_eq!(body["api_specs"]["items"][0]["proxy_id"], "spec-proxy");
-    for section in ["proxies", "upstreams", "plugin_configs"] {
-        for row in body[section].as_array().into_iter().flatten() {
-            if let Some(tag) = row["api_spec_id"].as_str() {
-                assert_eq!(tag, "spec-a", "{section}: {row}");
-            }
-        }
-    }
-
-    assert!(
-        !restore.contains("gateway_trust_bundles"),
-        "an absent trust section preserves the live roots: {restore}"
+            .all(|request| !request.contains("POST /restore")),
+        "a stale API-spec graph must never be replayed"
     );
 }
 
