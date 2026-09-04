@@ -377,6 +377,7 @@ pub(crate) fn split_config_with_inventory(
     require_credential_bundle: bool,
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
+    reject_import_passthrough_fields(&safe_config)?;
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
     let unbrokered_plugin_config = plugin_capture.unbrokered;
@@ -507,6 +508,46 @@ pub(crate) fn split_config_with_inventory(
     publish_import_tree(output_dir, planned_writes)?;
 
     Ok(result)
+}
+
+/// Refuse fields whose sensitivity this version cannot classify before any
+/// import output (including a migration bundle) is planned or published.
+fn reject_import_passthrough_fields(config: &GatewayConfig) -> crate::error::Result<()> {
+    let unknown = config
+        .proxies
+        .iter()
+        .filter(|resource| resource.api_spec_id.is_none())
+        .map(|resource| ("Proxy", resource.id.as_str(), &resource.extra))
+        .chain(
+            config
+                .consumers
+                .iter()
+                .map(|resource| ("Consumer", resource.id.as_str(), &resource.extra)),
+        )
+        .chain(
+            config
+                .upstreams
+                .iter()
+                .filter(|resource| resource.api_spec_id.is_none())
+                .map(|resource| ("Upstream", resource.id.as_str(), &resource.extra)),
+        )
+        .chain(
+            config
+                .plugin_configs
+                .iter()
+                .filter(|resource| resource.api_spec_id.is_none())
+                .map(|resource| ("PluginConfig", resource.id.as_str(), &resource.extra)),
+        )
+        .find(|(_, _, extra)| !extra.is_empty());
+
+    if let Some((kind, id, extra)) = unknown {
+        let fields = extra.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(crate::error::Error::Config(format!(
+            "cannot safely import {kind} '{id}': unrecognized top-level field(s) [{fields}] may contain secrets; upgrade gitforgeops to a version that classifies them"
+        )));
+    }
+
+    Ok(())
 }
 
 fn serialize_resource_yaml(resource: &Resource) -> crate::error::Result<String> {

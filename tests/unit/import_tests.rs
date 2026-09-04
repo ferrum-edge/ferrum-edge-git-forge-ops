@@ -106,6 +106,32 @@ fn split_config_produces_loadable_files() {
 }
 
 #[test]
+fn file_import_rejects_passthrough_fields_without_publishing_them() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let mut config = make_test_config();
+    config.consumers[0].extra.insert(
+        "future_access_token".to_string(),
+        serde_json::json!("plaintext-secret-that-must-not-be-published"),
+    );
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let error = gitforgeops::import::from_file::import_from_file(&backup_path, &output, None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("Consumer 'consumer-test'"), "{error}");
+    assert!(error.contains("future_access_token"), "{error}");
+    assert!(!error.contains("plaintext-secret"), "{error}");
+    assert!(
+        !output.exists(),
+        "a rejected import must not publish an output tree"
+    );
+}
+
+#[test]
 fn split_config_empty_config() {
     let tmp = tempfile::tempdir().unwrap();
     let config = GatewayConfig::default();
