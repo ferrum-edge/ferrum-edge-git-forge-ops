@@ -200,12 +200,8 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 pub(crate) struct PluginConfigClassification {
     /// Leaves import must move into the private broker bundle.
     pub sensitive: Vec<Vec<ConfigPathComponent>>,
-    /// Leaves of a **non-builtin** plugin that the heuristics did not flag, so
-    /// they stay in the committed resource file as written. Always empty for a
-    /// builtin plugin, whose schema-declared rules are authoritative.
-    ///
-    /// These are what the operator has to review by hand: gitforgeops has no
-    /// schema for the plugin and cannot tell a tuning knob from an API key.
+    /// Leaves that import could not safely classify. Currently empty because
+    /// unknown plugin schemas are handled fail-closed.
     pub unbrokered: Vec<Vec<ConfigPathComponent>>,
 }
 
@@ -219,14 +215,8 @@ pub(crate) struct PluginConfigClassification {
 /// * **A builtin plugin.** Its schema-declared rules
 ///   ([`rules_for`]) plus the conservative key/URL heuristics decide, and the
 ///   result is authoritative: nothing is left for review.
-/// * **A non-builtin (custom, future, or renamed) plugin.** Only the
-///   heuristics apply. Brokering *every* string leaf, which is what this used
-///   to do, means a plugin whose config is `{"mode": "strict"}` has `strict`
-///   captured into a GitHub Environment Secret and replaced with
-///   `${gh-env-secret:alloc=require}` — the imported repo then cannot be
-///   applied until someone hand-seeds a slot for the word "strict", and the
-///   resource file no longer says what the plugin does. The unflagged leaves
-///   are returned in `unbrokered` so the operator reviews them instead.
+/// * **A non-builtin (custom, future, or renamed) plugin.** There is no schema
+///   that can prove any string is safe to commit, so every string is brokered.
 pub(crate) fn classify_plugin_config(
     plugin_name: &str,
     config: &Value,
@@ -243,13 +233,10 @@ pub(crate) fn classify_plugin_config(
     }
 
     if !is_builtin(plugin_name) {
-        collect_heuristic_paths(config, &root, &mut sensitive);
-        let mut all = BTreeSet::new();
-        collect_string_paths(config, &root, &mut all);
-        let unbrokered = all.difference(&sensitive).cloned().collect();
+        collect_string_paths(config, &root, &mut sensitive);
         return PluginConfigClassification {
             sensitive: sensitive.into_iter().collect(),
-            unbrokered,
+            unbrokered: Vec::new(),
         };
     }
 
@@ -534,12 +521,10 @@ mod tests {
         assert!(paths.contains(&"producer_config.future.vendor.property".to_string()));
     }
 
-    /// A non-builtin plugin brokers only what the sensitivity heuristics
-    /// flag. Everything else stays in the committed file and is reported for
-    /// review, because gitforgeops has no schema to judge it by and capturing
-    /// `mode: strict` into a GitHub Environment Secret helps nobody.
+    /// A non-builtin plugin has no schema that can prove a string is safe, so
+    /// every string leaf is brokered rather than risking plaintext import.
     #[test]
-    fn custom_plugins_broker_only_heuristic_matches_and_report_the_rest() {
+    fn custom_plugins_broker_every_string_leaf() {
         let classification = classify_plugin_config(
             "custom_enterprise_plugin",
             &serde_json::json!({
@@ -553,12 +538,15 @@ mod tests {
 
         assert_eq!(
             dotted(classification.sensitive),
-            vec!["api_key", "callback", "headers.x-vendor-auth"]
+            vec![
+                "api_key",
+                "callback",
+                "headers.x-vendor-auth",
+                "mode",
+                "nested.[0]"
+            ]
         );
-        assert_eq!(
-            dotted(classification.unbrokered),
-            vec!["mode", "nested.[0]"]
-        );
+        assert!(classification.unbrokered.is_empty());
     }
 
     /// A config that is not an object has no keys to judge, so it still fails

@@ -463,13 +463,10 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
     assert_eq!(assembled.plugin_configs[0].config, original_plugin_config);
 }
 
-/// F5: a plugin this build does not know has no schema to classify it by, so
-/// only the key/URL sensitivity heuristics run. What they flag is brokered;
-/// what they do not is left in the committed file and named in a review
-/// notice, because capturing `mode: strict` into a GitHub Environment Secret
-/// makes the imported repo unappliable without telling anyone why.
+/// F5: a plugin this build does not know has no schema that can prove a string
+/// is safe to commit, so every string is brokered fail-closed.
 #[test]
-fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
+fn custom_plugin_import_brokers_every_string_leaf() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
     let destination_parent = tempfile::tempdir().unwrap();
@@ -483,6 +480,7 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         namespace: "ferrum".to_string(),
         config: serde_json::json!({
             "mode": "strict",
+            "auth": "Bearer live-vendor-credential",
             "opaque": {"value": "probably-a-tuning-knob"},
             "api_key": "live-vendor-key",
             "headers": {"x-vendor-auth": "live-vendor-header"}
@@ -502,23 +500,20 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
             .unwrap();
 
-    assert_eq!(result.redacted_plugin_config_values, 2);
+    assert_eq!(result.redacted_plugin_config_values, 5);
     let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/custom.yaml")).unwrap();
     assert!(!plugin_yaml.contains("live-vendor-key"), "{plugin_yaml}");
     assert!(!plugin_yaml.contains("live-vendor-header"), "{plugin_yaml}");
-    // The plugin still says what it does.
-    assert!(plugin_yaml.contains("strict"), "{plugin_yaml}");
     assert!(
-        plugin_yaml.contains("probably-a-tuning-knob"),
+        !plugin_yaml.contains("live-vendor-credential"),
         "{plugin_yaml}"
     );
-
-    let notice = result.custom_plugin_review_notice().expect("review notice");
-    assert!(notice.contains("WARNING"), "{notice}");
-    assert!(notice.contains("plugin_name=enterprise_custom"), "{notice}");
-    assert!(notice.contains("mode"), "{notice}");
-    assert!(notice.contains("opaque.value"), "{notice}");
-    assert!(!notice.contains("api_key"), "{notice}");
+    assert!(!plugin_yaml.contains("strict"), "{plugin_yaml}");
+    assert!(
+        !plugin_yaml.contains("probably-a-tuning-knob"),
+        "{plugin_yaml}"
+    );
+    assert!(result.custom_plugin_review_notice().is_none());
 }
 
 /// A builtin plugin's schema rules are authoritative, so there is nothing for

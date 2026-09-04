@@ -267,10 +267,9 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
 
 Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
-is schema-first for the 82 builtins and heuristics-only for anything else: a
-non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
-flag, and the leaves they did not flag come back as
-`ImportResult::unbrokered_plugin_config` for a loud per-plugin review notice.
+is schema-first for the 82 builtins and fail-closed for anything else: every
+string leaf in a non-builtin plugin is brokered because no known schema can
+prove that it is safe to commit.
 `basicauth[].username` and `mtls_auth[].identity` are never brokered in either
 path (`resolver::is_identity_credential_leaf`).
 
