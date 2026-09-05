@@ -46,7 +46,7 @@ by design and will report red on `main` until the settings behind them exist:
 | Workflow | Red until | Section |
 | --- | --- | --- |
 | `Release` | the `main` ruleset declares required checks — `gh pr checks --required` exits non-zero with "no required checks reported", so every push to `main` fails the publication gate | [§2](#2-protect-main-with-an-active-ruleset) |
-| `GitHub Settings Audit` | `SETTINGS_AUDIT_TOKEN` exists, plus repository variable `GITFORGEOPS_STATE_APP_ID` (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template) | [§1](#1-create-the-state-writer-github-app), [§5](#5-enable-settings-drift-monitoring) |
+| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, plus repository variable `GITFORGEOPS_STATE_APP_ID` (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template) | [§1](#1-create-the-state-writer-github-app), [§5](#5-enable-settings-drift-monitoring) |
 
 That is the intended behaviour: neither workflow may assume a control it
 cannot verify. Configure §1-§5 first and neither is ever red.
@@ -171,12 +171,20 @@ The synthetic local `default` environment is never eligible for trusted live
 review in any of those paths.
 
 Delete every GitHub Environment that `.gitforgeops/config.yaml` does not
-declare — including the `default` environment GitHub creates on some
-repositories. The settings audit walks `GET /repos/{repo}/environments` and
-holds *every* listed environment to the reviewer and branch-policy rules below,
-so one forgotten unprotected environment keeps the audit red forever. An
-environment nothing deploys to is also a standing invitation to store
-credentials somewhere no workflow guard covers.
+declare — with one exception, `settings-audit` (§5), which holds the
+administration-read audit token and no gateway credential. Delete the rest,
+including the `default` environment GitHub creates on some repositories. The
+settings audit walks `GET /repos/{repo}/environments` and holds *every* listed
+environment to the reviewer and branch-policy rules below, so one forgotten
+unprotected environment keeps the audit red forever. An environment nothing
+deploys to is also a standing invitation to store credentials somewhere no
+workflow guard covers.
+
+`settings-audit` is exempt from the reviewer and self-review rules alone, and
+only because it deploys nothing: a required reviewer there would park every
+scheduled audit in "waiting for approval", which is precisely the silently
+stopped audit §5 is designed to avoid. Its branch policy *is* audited, and it
+does not count towards the at-least-one-protected-environment requirement.
 
 For every environment listed in `.gitforgeops/config.yaml` — the bootstrap
 script reads that file and creates each one when given `--reviewer LOGIN` or
@@ -292,12 +300,37 @@ with a ruleset bypass; the next run on `main` judges with the new policy.
 
 ## 5. Enable settings-drift monitoring
 
-Create a fine-grained PAT or read-only GitHub App token with
-**Administration: read** and store it as repository secret
-`SETTINGS_AUDIT_TOKEN`. `settings-audit.yml` runs only from the default branch
-and verifies Actions permissions, the active `main` and release tag rulesets,
-required checks, the exact state-writer App bypass, and every environment's
-reviewer/self-review/branch policy.
+Create a GitHub Environment named **`settings-audit`** with deployment
+branches limited to **protected branches** (or an exact custom rule for `main`)
+and **no required reviewer**. Then create a fine-grained PAT or read-only GitHub
+App token with **Administration: read** and store it as a secret *of that
+environment*:
+
+```bash
+gh secret set SETTINGS_AUDIT_TOKEN --repo owner/repo --env settings-audit
+```
+
+It is deliberately **not** a repository secret. A repository secret is released
+to whatever workflow definition a dispatched ref carries, so any branch a
+write-access collaborator can push was a path to an administration-read token.
+`settings-audit.yml` binds `environment: settings-audit`, and GitHub refuses to
+release that environment's secrets to a job running from a ref the branch policy
+does not admit — before a single step executes. The in-file
+"Require protected default branch" preflight stays as the readable, fail-loud
+half of the same rule.
+
+The environment carries no reviewer on purpose: it deploys nothing, and a
+required reviewer would hold every weekly run in "waiting for approval" —
+producing exactly the silently stopped audit described below.
+`audit_settings.py` waives the reviewer and self-review rules for this one name,
+still audits its branch policy, and does not let it satisfy the
+at-least-one-protected-environment requirement. `bootstrap_repo_settings.py`
+creates it on every repository, template copies included.
+
+`settings-audit.yml` runs only from the default branch and verifies Actions
+permissions, the active `main` and release tag rulesets, required checks, the
+exact state-writer App bypass, the presence of the `settings-audit` environment,
+and every environment's reviewer/self-review/branch policy.
 
 It runs weekly on a schedule **and** on `workflow_dispatch`. The manual trigger
 is not a convenience: GitHub disables a scheduled workflow after 60 days with

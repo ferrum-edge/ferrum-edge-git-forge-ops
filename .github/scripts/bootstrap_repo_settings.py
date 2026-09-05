@@ -40,6 +40,7 @@ from audit_settings import (  # noqa: E402  (the path bootstrap above must run f
     ALLOWED_ACTION_PATTERNS,
     RELEASE_TAG_PATTERN,
     REQUIRED_STATUS_CHECKS,
+    SETTINGS_AUDIT_ENVIRONMENT,
 )
 
 CREATE = "CREATE"
@@ -73,7 +74,14 @@ OVERRIDE_LABELS = (
 )
 
 # Printed as the manual remainder. Values never pass through this script.
-REPOSITORY_SECRETS = ("SETTINGS_AUDIT_TOKEN",)
+# `SETTINGS_AUDIT_TOKEN` is deliberately NOT a repository secret: it reads
+# repository administration settings, and a repository secret is released to any
+# branch a collaborator can push and dispatch. It lives in the `settings-audit`
+# environment, whose branch policy admits only the protected default branch.
+AUDIT_TOKEN_SECRET = (
+    "SETTINGS_AUDIT_TOKEN",
+    "fine-grained PAT or App token with Administration: read",
+)
 ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_URL", "required for api mode; must be an https:// URL"),
     ("FERRUM_ADMIN_JWT_SECRET", "required for api mode; at least 32 characters"),
@@ -788,6 +796,62 @@ def environment_reviewers(detail: dict) -> tuple[list[dict], bool]:
     return reviewers, prevents
 
 
+def step_audit_token_environment(api: GitHubApi, repo: str) -> list[Step]:
+    """Create the environment that fences the administration-read audit token.
+
+    `settings-audit.yml` binds it, so the token is released only to a job whose
+    ref the environment's deployment-branch policy admits. Created on every
+    repository, template included: a template still runs the settings audit.
+
+    No reviewer, deliberately. This environment deploys nothing, and a required
+    reviewer would hold every weekly run in "waiting for approval" — the
+    silently-stopped audit the schedule-plus-dispatch design exists to prevent.
+    `audit_settings.py` waives the reviewer rule for exactly this name.
+    """
+    encoded = quote(SETTINGS_AUDIT_ENVIRONMENT, safe="")
+    detail = optional_get(api, f"repos/{repo}/environments/{encoded}")
+    body = {
+        "wait_timer": 0,
+        "reviewers": [],
+        "deployment_branch_policy": {
+            "protected_branches": True,
+            "custom_branch_policies": False,
+        },
+    }
+    target = f"environment {SETTINGS_AUDIT_ENVIRONMENT}"
+    summary = "audit token only, protected branches only, no reviewer"
+    if detail is None:
+        return [
+            Step(
+                CREATE,
+                target,
+                summary,
+                ["environment: <absent> -> present"],
+                [("PUT", f"repos/{repo}/environments/{encoded}", body)],
+            )
+        ]
+    policy = detail.get("deployment_branch_policy") or {}
+    current_reviewers, _ = environment_reviewers(detail)
+    details = field_differences(
+        {
+            # A reviewer added here by hand would park every scheduled audit in
+            # "waiting for approval" — reported as drift, and removed by the PUT.
+            "reviewers": len(current_reviewers),
+            "deployment_branch_policy.protected_branches": policy.get("protected_branches") is True,
+        },
+        {"reviewers": 0, "deployment_branch_policy.protected_branches": True},
+    )
+    return [
+        Step(
+            UNCHANGED if not details else UPDATE,
+            target,
+            summary,
+            details,
+            [] if not details else [("PUT", f"repos/{repo}/environments/{encoded}", body)],
+        )
+    ]
+
+
 def step_environments(
     api: GitHubApi, repo: str, environments: list[str], reviewers: list[dict]
 ) -> list[Step]:
@@ -915,6 +979,18 @@ def build_plan(api: GitHubApi, args) -> Plan:
         )
     )
     plan.steps.extend(step_labels(api, repo))
+    # Created on every repository, template included: the settings audit runs
+    # there too, and its administration-read token has to be fenced to the
+    # protected branch by an environment rather than left as a repository secret
+    # that any pushable branch could dispatch its way to.
+    plan.steps.extend(step_audit_token_environment(api, repo))
+    if SETTINGS_AUDIT_ENVIRONMENT in environments:
+        plan.warnings.append(
+            f"A deployment environment is named {SETTINGS_AUDIT_ENVIRONMENT!r}, "
+            "which collides with the environment that fences the audit token. "
+            "The settings audit waives the reviewer requirement for that name, "
+            "so rename the deployment environment in .gitforgeops/config.yaml."
+        )
 
     if args.template_repo:
         plan.notes.append("")
@@ -953,12 +1029,22 @@ def secret_remainder(repo: str, environments: list[str], template_repo: bool) ->
         "Secrets are not set by this script and never pass through it. Run these "
         "yourself and paste each value at the prompt:",
     ]
-    for name in REPOSITORY_SECRETS:
-        lines.append(f"  gh secret set {name} --repo {repo}")
+    audit_name, audit_note = AUDIT_TOKEN_SECRET
+    lines.append(f"  # environment {SETTINGS_AUDIT_ENVIRONMENT}")
+    lines.append(
+        f"  gh secret set {audit_name} --repo {repo} "
+        f"--env {SETTINGS_AUDIT_ENVIRONMENT}   # {audit_note}"
+    )
+    lines.append(
+        f"  # Not a repository secret: a repository secret is released to any "
+        f"branch a collaborator can push and dispatch. The "
+        f"{SETTINGS_AUDIT_ENVIRONMENT} environment's branch policy is what keeps "
+        "the administration-read token on the protected default branch."
+    )
     if template_repo:
         lines.append(
-            "  (a template repository needs no environment secrets: nothing on it "
-            "applies to a gateway)"
+            "  (a template repository needs no other environment secrets: nothing "
+            "on it applies to a gateway)"
         )
         return lines
     if not environments:

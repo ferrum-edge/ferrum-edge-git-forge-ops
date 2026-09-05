@@ -952,6 +952,60 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_audit_token_is_fenced_by_its_own_environment(self):
+        # As a repository secret the administration-read token was released to
+        # whatever definition a dispatched ref carried, so any branch a
+        # collaborator can push was a path to it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/settings-audit.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "    environment: settings-audit\n", "", 1
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("environment: settings-audit" in item for item in violations),
+            violations,
+        )
+
+    def test_no_other_workflow_may_read_the_audit_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}\n",
+                    "          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}\n"
+                    "          GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "audit token" in item and "drift-check.yml" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_the_audit_environment_binding_precedes_the_token(self):
+        # Job-level `environment:` gates the whole job, so the binding must be
+        # part of the same job that reads the token — not a later addition
+        # somewhere the secret is already in scope.
+        workflow = (ROOT / ".github/workflows/settings-audit.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            workflow.index("    environment: settings-audit\n"),
+            workflow.index("GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}"),
+        )
+        self.assertEqual(workflow.count("secrets.SETTINGS_AUDIT_TOKEN"), 1)
+
     def test_trusted_review_pins_the_triggering_workflow_definition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))

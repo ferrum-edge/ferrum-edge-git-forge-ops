@@ -80,7 +80,8 @@ order — deep detail for each control lives in
    settings baseline — Actions permissions and the third-party allowlist,
    read-only workflow tokens, secret scanning and push protection, private
    vulnerability reporting, Dependabot alerts and security updates, the `main`
-   and `release-tags` rulesets, the two labels, and your deployment environments.
+   and `release-tags` rulesets, the two labels, the `settings-audit` environment
+   that fences the audit token, and your deployment environments.
    It is idempotent and **prints a plan without writing** unless you pass
    `--apply`, so run it as often as you like:
 
@@ -150,8 +151,11 @@ order — deep detail for each control lives in
    an exact custom rule for `main`). Re-running step 5 with `--reviewer` /
    `--reviewer-team` does all three and reads the environment list straight out
    of `.gitforgeops/config.yaml`. Delete every GitHub Environment the config does
-   *not* declare, including the `default` one GitHub creates on some repositories:
-   the settings audit holds **every** listed environment to these rules.
+   *not* declare — except `settings-audit` from step 11, which holds the
+   administration-read audit token and no gateway credential — including the
+   `default` one GitHub creates on some repositories: the settings audit holds
+   **every** listed environment to these rules (waiving only the reviewer rules
+   for `settings-audit`, which deploys nothing).
 
 9. **Add the per-environment secrets.** Settings → Environments → *name* →
    Environment secrets, or `gh secret set NAME --env <name>`:
@@ -191,14 +195,29 @@ order — deep detail for each control lives in
     need; `severity: error` blocks `apply` until a write-permission user adds the
     override label. See [Policy framework](#policy-framework-gitforgeopspoliciesyaml).
 
-11. **Add `SETTINGS_AUDIT_TOKEN`.** A fine-grained PAT or read-only App token with
-    **Administration: read**, stored as a *repository* secret. `settings-audit.yml`
-    runs weekly from the default branch and re-checks everything step 5 applied;
-    without the token it fails closed.
+11. **Add `SETTINGS_AUDIT_TOKEN` to the `settings-audit` environment.** A
+    fine-grained PAT or read-only App token with **Administration: read**, stored
+    as a secret of the dedicated `settings-audit` environment — *not* as a
+    repository secret. Step 5 creates that environment (on template copies too),
+    with deployment branches limited to protected branches and no reviewer.
 
     ```bash
-    gh secret set SETTINGS_AUDIT_TOKEN --repo acme/gateway-config
+    gh secret set SETTINGS_AUDIT_TOKEN --repo acme/gateway-config --env settings-audit
     ```
+
+    | Secret | Scope | Notes |
+    |---|---|---|
+    | `SETTINGS_AUDIT_TOKEN` | environment `settings-audit` | Administration: read, nothing else |
+
+    A repository secret is released to whatever workflow definition a dispatched
+    ref carries, so any branch a write-access collaborator can push would be a
+    path to an administration-read token. `settings-audit.yml` binds
+    `environment: settings-audit`, and GitHub refuses to release that
+    environment's secrets to a job on a ref its branch policy does not admit.
+    The environment has no reviewer on purpose: it deploys nothing, and a
+    reviewer would park every weekly run in "waiting for approval". The audit
+    runs weekly from the default branch and re-checks everything step 5 applied
+    — including that this environment exists; without the token it fails closed.
 
 12. **Take on the validator pin refresh.** `.github/ferrum-edge-checksums.txt`
     lists the SHA-256 of every approved `ferrum-edge` build, and the installer
@@ -1189,9 +1208,10 @@ Every deployment environment also needs `GITFORGEOPS_STATE_APP_ID` and
 `GITFORGEOPS_STATE_APP_PRIVATE_KEY` for the contents-only App that commits the
 ownership ledger through the protected branch ruleset. Set repository variable
 `GITFORGEOPS_STATE_APP_ID` to that same numeric ID so the scheduled audit can
-verify the exact bypass actor. The repository-level
-`SETTINGS_AUDIT_TOKEN` needs Administration: read and is used only by the
-scheduled default-branch settings audit. See
+verify the exact bypass actor. `SETTINGS_AUDIT_TOKEN` needs Administration: read
+and lives in its own `settings-audit` environment — never as a repository
+secret, which any dispatchable branch could reach — where only the protected
+default branch can be handed it. See
 [GitHub launch controls](docs/github-launch-controls.md).
 
 Absent or blank runtime values use the documented defaults. Present values are

@@ -61,6 +61,11 @@ ADMIN_API_WORKFLOWS = (
 )
 STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
+# The administration-read settings-audit token lives in its own environment, so
+# a dispatch from an unprotected ref cannot receive it. Kept in step with
+# audit_settings.SETTINGS_AUDIT_ENVIRONMENT and bootstrap_repo_settings.py.
+SETTINGS_AUDIT_ENVIRONMENT_BINDING = "\n    environment: settings-audit\n"
+SETTINGS_AUDIT_TOKEN_REFERENCE = "secrets.SETTINGS_AUDIT_TOKEN"
 FRESH_HEAD_STEP = "Refresh protected branch and reject stale deployments"
 # The checkout that feeds a privileged reconcile has to name the branch, not
 # the triggering event's commit, and has to carry enough history for the
@@ -905,6 +910,27 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     settings_audit = (workflows / "settings-audit.yml").read_text(encoding="utf-8")
+    # The audit token reads repository administration settings. As a repository
+    # secret it was released to whatever workflow definition a dispatched ref
+    # carried, so any branch a write-access collaborator can push was a path to
+    # it. A dedicated environment whose deployment-branch policy admits only the
+    # protected default branch is the non-bypassable fence: GitHub refuses to
+    # release the secret to a job on any other ref, before a step runs. The
+    # in-file ref preflight stays as the readable half of the same rule.
+    if SETTINGS_AUDIT_ENVIRONMENT_BINDING not in settings_audit:
+        violations.append(
+            "settings-audit.yml: the audit job must bind "
+            f"{SETTINGS_AUDIT_ENVIRONMENT_BINDING.strip()!r} so the "
+            "administration-read token is fenced to the protected default branch"
+        )
+    for workflow in checked_action_files:
+        if workflow.name == "settings-audit.yml":
+            continue
+        if SETTINGS_AUDIT_TOKEN_REFERENCE in workflow.read_text(encoding="utf-8"):
+            violations.append(
+                f"{workflow.relative_to(root)}: the administration-read audit token "
+                "may be read only by the environment-bound settings audit"
+            )
     # GitHub disables scheduled workflows after 60 days of repository
     # inactivity, and an audit that has silently stopped reports no drift at
     # all. Manual dispatch is the recovery path, and it may select any ref, so
