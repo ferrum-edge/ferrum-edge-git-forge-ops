@@ -254,6 +254,12 @@ struct PreparedApply {
 struct PreparedFullReplace {
     config: GatewayConfig,
     extras: BackupExtras,
+    /// The live API-spec documents this payload will replay, keyed by spec id,
+    /// as they read at prepare time. Re-checked immediately before `/restore`
+    /// so a spec written in between is not silently rolled back or deleted.
+    /// Empty when the payload carries no `api_specs` section, which is the
+    /// case the gateway's own existing-spec `409` already guards.
+    spec_snapshot: BTreeMap<String, serde_json::Value>,
 }
 
 /// Run every deterministic and remote write-capability preflight without
@@ -593,6 +599,13 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
 ///   section as "leave trust exactly as it is", so omitting it preserves the
 ///   live roots without the lost-update window that replaying a possibly-stale
 ///   snapshot would open.
+///
+/// Carrying the `api_specs` section *does* open that lost-update window, and
+/// the gateway offers no precondition that would close it. The section is
+/// therefore recorded here and re-verified by
+/// [`ensure_spec_snapshot_is_current`] immediately before the POST, which
+/// narrows the exposure from the whole prepare phase to one round-trip. See
+/// that function for why the window cannot be eliminated outright.
 fn prepare_full_replace(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
@@ -608,6 +621,11 @@ fn prepare_full_replace(
         return Ok(PreparedFullReplace {
             config: desired.clone(),
             extras: BackupExtras::default(),
+            // Nothing is replayed on this path: the payload carries no
+            // `api_specs` section and the operator has asked for whatever
+            // specs the namespace holds to be deleted, so there is no prior
+            // read whose staleness could matter.
+            spec_snapshot: BTreeMap::new(),
         });
     }
 
@@ -621,6 +639,7 @@ fn prepare_full_replace(
             api_specs: live_extras.api_specs.clone(),
             ..BackupExtras::default()
         },
+        spec_snapshot: api_spec_documents(live_extras, namespace)?,
     })
 }
 
@@ -631,6 +650,7 @@ async fn apply_full_replace(
     desired: &GatewayConfig,
     options: &ApplyOptions,
 ) -> crate::error::Result<ApplyResult> {
+    ensure_spec_snapshot_is_current(client, namespace, &prepared.spec_snapshot).await?;
     client
         .post_restore(
             &prepared.config,
@@ -652,6 +672,114 @@ async fn apply_full_replace(
         fully_replaced_namespaces: vec![namespace.to_string()],
         ..Default::default()
     })
+}
+
+/// Re-read the namespace's API-spec documents and refuse the restore if any of
+/// them changed since the payload was built.
+///
+/// `POST /restore` with a non-empty `api_specs` section is a wipe-and-reinsert,
+/// not a merge: the gateway deletes every spec in the namespace and re-creates
+/// exactly the items in the payload (ferrum-edge `src/admin/mod.rs`, restore
+/// handler → `db.delete_all_resources` then `batch_insert_api_specs`). So a
+/// spec updated after our `/backup` is rolled back to the snapshot version,
+/// and a spec *created* after it is deleted outright — silently, because
+/// `confirm_api_spec_deletion` is only consulted when the section is absent.
+///
+/// The admin API exposes no precondition a client could attach to close that
+/// window: `/backup` returns no `ETag` or revision, `/restore` accepts no
+/// `If-Match` and answers no `412`, and its payload type does not
+/// `deny_unknown_fields`, so an invented `if_revision` key would be silently
+/// dropped rather than rejected. Detection is therefore client-side, and the
+/// window can only be narrowed, not closed: `/restore` and every `/api-specs`
+/// write take the same namespace config-admission lock, but nothing holds it
+/// across two separate client calls.
+///
+/// Narrowing it is still the difference that matters. Without this, the
+/// payload is built once during `prepare_apply` and can sit unsent through
+/// every *other* namespace's backup read, the `/health` preflight, and each
+/// preceding namespace's restore — minutes, on a multi-namespace environment.
+/// With it, the exposure is one round-trip.
+///
+/// Comparison is by spec id against the whole document each `/backup` returned.
+/// `updated_at` deliberately is *not* the key: restore writes the payload's
+/// timestamps verbatim, so a competing restore can move `updated_at` backwards
+/// and produce an ABA that a timestamp check would miss. Comparing the
+/// documents catches a content change (`content_hash`), a regenerated resource
+/// bundle (`resource_hash`), and an added or removed spec alike.
+async fn ensure_spec_snapshot_is_current(
+    client: &AdminClient,
+    namespace: &str,
+    expected: &BTreeMap<String, serde_json::Value>,
+) -> crate::error::Result<()> {
+    if expected.is_empty() {
+        // No `api_specs` section travels with this payload, so there is
+        // nothing to replay. An absent section makes the gateway count the
+        // namespace's live specs and answer 409 if any appeared, which is a
+        // server-side guard strictly better than anything measured here.
+        return Ok(());
+    }
+
+    let snapshot = client.get_backup_snapshot(namespace).await?;
+    if snapshot.cached {
+        return Err(crate::error::Error::StaleGatewayView(stale_view_message()));
+    }
+    let current = api_spec_documents(&snapshot.extras, namespace)?;
+    if current == *expected {
+        return Ok(());
+    }
+
+    let mut changes = Vec::new();
+    for (id, document) in expected {
+        match current.get(id) {
+            None => changes.push(format!("`{id}` was deleted")),
+            Some(live) if live != document => changes.push(format!("`{id}` was modified")),
+            Some(_) => {}
+        }
+    }
+    for id in current.keys() {
+        if !expected.contains_key(id) {
+            changes.push(format!("`{id}` was created"));
+        }
+    }
+
+    Err(crate::error::Error::ApiSpecsAtRisk(format!(
+        "refusing full_replace for namespace `{namespace}`: its API specs changed while this apply was preparing ({}). \
+         `/restore` replaces the namespace's spec documents with the ones in the payload, so proceeding would roll that change back \
+         or delete a spec created since. Re-run the apply so the payload is built from the current state.",
+        changes.join(", ")
+    )))
+}
+
+/// The live API-spec documents keyed by id, with the same identity rules
+/// [`parse_api_spec_owners`] enforces so a malformed section fails closed in
+/// both places rather than comparing as "unchanged".
+fn api_spec_documents(
+    extras: &BackupExtras,
+    namespace: &str,
+) -> crate::error::Result<BTreeMap<String, serde_json::Value>> {
+    let owners = parse_api_spec_owners(extras, namespace)?;
+    if owners.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let items = extras
+        .api_specs
+        .as_ref()
+        .and_then(|section| section.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            crate::error::Error::Config(
+                "refusing full_replace: backup `api_specs` is not an object with an `items` array; the ownership graph cannot be proven complete"
+                    .to_string(),
+            )
+        })?;
+    let mut documents = BTreeMap::new();
+    for item in items {
+        let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        documents.insert(id.to_string(), item.clone());
+    }
+    Ok(documents)
 }
 
 fn ensure_restore_sections_supported(
