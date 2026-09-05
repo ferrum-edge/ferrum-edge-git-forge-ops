@@ -687,6 +687,45 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("ignore ledger-only commits" in item for item in violations), violations
         )
 
+    def test_release_gate_must_name_upstream_rather_than_test_for_a_fork(self):
+        # A "Use this template" copy is not a fork, so a fork test would let
+        # every customer repository try to publish the upstream image.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'"
+                    " || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'",
+                    "if: github.event.repository.fork == false"
+                    " || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'",
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("never publishes" in item for item in violations), violations
+        )
+        self.assertTrue(
+            any("does not distinguish a template copy" in item for item in violations),
+            violations,
+        )
+
+    def test_release_gate_must_cover_both_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            text = path.read_text(encoding="utf-8")
+            gate = (
+                "    if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'"
+                " || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'\n"
+            )
+            path.write_text(text.replace(gate, "", 1), encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("never publishes" in item for item in violations), violations
+        )
+
     def test_settings_audit_is_dispatchable_behind_a_ref_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))

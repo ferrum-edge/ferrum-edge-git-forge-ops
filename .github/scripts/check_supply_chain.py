@@ -613,6 +613,24 @@ def main(argv: list[str] | None = None) -> int:
             )
     if "tags: ['v*']" not in release_push_body:
         violations.append("release.yml: push trigger must keep publishing release tags")
+    # This repository is a template customers copy. A copy is not a fork, so
+    # `github.event.repository.fork == false` is true on it, and gating on that
+    # would have every customer repository attempt a Docker Hub publish to the
+    # upstream namespace on its first push to `main`. Both release jobs must
+    # name the upstream repository, or an explicit opt-in variable.
+    release_gate = (
+        "if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'"
+        " || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'"
+    )
+    if release.count(release_gate) != 2:
+        violations.append(
+            "release.yml: both release jobs must be gated on the upstream repository "
+            "or GITFORGEOPS_RELEASE_ENABLED, so a template copy never publishes"
+        )
+    if re.search(r"^\s*if: .*repository\.fork", release, re.MULTILINE):
+        violations.append(
+            "release.yml: a fork test does not distinguish a template copy from upstream"
+        )
     for required in (
         "authorize-release:",
         "needs: authorize-release",
