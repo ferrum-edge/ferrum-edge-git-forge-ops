@@ -126,6 +126,8 @@ pub fn audit_security_with_policy(
     // proxy that delegates to an upstream dials through the upstream's
     // settings — scanning proxies alone leaves that bypass unreported.
     for upstream in &config.upstreams {
+        check_literal_service_discovery_secrets(upstream, &mut findings);
+
         if !upstream.backend_tls_verify_server_cert {
             findings.push(SecurityFinding::warning(
                 "Upstream",
@@ -440,6 +442,36 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
             ns,
             format!(
                 "{name} plugin {id} in namespace {ns} carries a trigger — authentication only runs when the predicate matches, leaving the remaining requests public; drop the trigger unless the exemption is intended"
+            ),
+        ));
+    }
+}
+
+/// A modeled `Upstream.service_discovery` secret that is not a broker
+/// placeholder is a credential committed to the repository, and `apply` would
+/// publish it to the gateway. Blocking, exactly like a literal consumer
+/// credential.
+///
+/// Only the classified leaves are checked: `consul.address` and
+/// `service_name` identify the control plane and the service, are meant to be
+/// authored literally, and are covered by the `allowed_backend_domains`
+/// policy instead. The finding names the field, never the value.
+fn check_literal_service_discovery_secrets(
+    upstream: &crate::config::schema::Upstream,
+    findings: &mut Vec<SecurityFinding>,
+) {
+    for (field, value) in crate::secrets::service_discovery::present_secrets(upstream) {
+        if value.starts_with("${") {
+            continue;
+        }
+        let path = crate::secrets::service_discovery::render_path(field.path);
+        findings.push(SecurityFinding::error(
+            "Upstream",
+            &upstream.id,
+            &upstream.namespace,
+            format!(
+                "Literal service-discovery secret in 'service_discovery.{path}' on upstream {} in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                upstream.id, upstream.namespace
             ),
         ));
     }

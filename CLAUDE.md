@@ -33,7 +33,9 @@ gitforgeops plan                                          # Validate + diff + br
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
-  [--credential-bundle-output PRIVATE_PATH]               # --output-dir required + must be empty; API import requires an explicit namespace filter
+  [--credential-bundle-output PRIVATE_PATH] \
+  [--allow-plaintext-plugin-config PLUGIN_NAME]           # --output-dir required + must be empty; API import requires an explicit namespace filter;
+                                                          # --allow-plaintext-plugin-config is repeatable, exact plugin_name
 gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -95,8 +97,16 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               credentials into the canonical array form)
   → secrets::resolve_secrets (replace ${gh-env-secret:...} placeholders in-memory
                               from FERRUM_CREDS_JSON_FILE or FERRUM_CREDS_JSON,
+                              across consumer credentials, plugin config and the
+                              modeled Upstream.service_discovery secrets;
                               never written back to disk)
   → policy::evaluate_policies
+  → validate::standin        (validator input ONLY: unresolved placeholders in
+                              consumer credentials and plugin config become
+                              shape-aware fakes — 64-hex token, hmac_sha256:
+                              digest, or `<scheme>://…standin.invalid/<hash>`
+                              for endpoint-typed plugin fields; never exported,
+                              applied, delivered, or written to state)
   → validate / export / diff / plan / apply / review / rotate
                              (gateway doc → FERRUM_FILE_OUTPUT_PATH,
                               mesh doc → FERRUM_MESH_FILE_OUTPUT_PATH)
@@ -319,7 +329,13 @@ Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_p
 is schema-first for the 82 builtins and heuristics-only for anything else: a
 non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
 flag, and the leaves they did not flag come back as
-`ImportResult::unbrokered_plugin_config` for a loud per-plugin review notice.
+`ImportResult::unbrokered_plugin_config`. Those **fail the import**
+(`import::enforce_plaintext_plugin_config_allowance`) unless the operator
+passes `--allow-plaintext-plugin-config <plugin_name>` (repeatable, exact
+match), in which case they are written literally and listed in a per-plugin
+review notice. The refusal names the plugin id, `plugin_name` and every
+unclassified path, echoes no values, and writes nothing — not the tree, not
+the migration bundle. `apply` / `plan` are untouched by this gate.
 `basicauth[].username` and `mtls_auth[].identity` are never brokered in either
 path (`resolver::is_identity_credential_leaf`).
 
@@ -424,6 +440,28 @@ preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
 label + repo permission), resolved once and shared by both gates.
 
+#### Secrets outside `Consumer.credentials`
+
+Two other places in a gateway document hold brokered secrets, each with a
+reserved slot kind in the third component (the `@` prefix keeps them out of the
+credential-type keyspace):
+
+- `PluginConfig.config` → `<ns>/<plugin-id>/@plugin-config/config/<path>`,
+  classified by `src/secrets/plugin_config.rs`.
+- `Upstream.service_discovery` → `<ns>/<upstream-id>/@service-discovery/<path>`,
+  e.g. `ferrum/orders/@service-discovery/consul/token`. The modeled secret
+  leaves live in one table,
+  `src/secrets/service_discovery.rs::SD_SECRET_FIELDS`, which import capture,
+  resolution, diff redaction, validator scrubbing and the literal-credential
+  audit all read. Today it holds `consul.token` only: `consul.address` /
+  `service_name` / `datacenter` / `tag` are identity, and `dns_sd` /
+  `kubernetes` / `mesh` carry no secret-bearing field. A field marked
+  `generatable: false` (the Consul token — only the Consul cluster mints one)
+  refuses `alloc=generate` at resolve time. `diff` redacts these leaves
+  individually: `is_sensitive_diff_field` stays whole-field and deliberately
+  does *not* list `service_discovery`, so control-plane address and
+  service-name drift stay reviewable.
+
 Storage: one or more GitHub Environment Secrets named `FERRUM_CREDS_BUNDLE[_N]`,
 each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
 auto-sharded by fnv-style hash when a bundle approaches 40 KB.
@@ -474,9 +512,9 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
-- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
+- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output, plus the fail-closed policy — `is_reencoding_hazard` values withhold the stream outright, single-line re-encodings (base64/percent/JSON-escape/single-quoted YAML) are matched as needles, and a surviving `FRAGMENT_SCAN_LENGTH`-byte run that is not also in the scrubbed document withholds; `scrub_streams` is the one decision point), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `service_discovery.rs` (modeled `Upstream.service_discovery` secret table + slot derivation), `resolver.rs` (walks consumers, plugin config and service discovery, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
-- `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
+- `src/validate/` — `standin.rs` (validator-only stand-ins for unresolved broker placeholders; URL shapes for endpoint-typed plugin fields via `secrets::plugin_config::{endpoint_paths, endpoint_scheme}`), `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections)
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal

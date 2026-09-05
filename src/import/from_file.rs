@@ -6,10 +6,14 @@ use crate::import::{
     ImportSourceMetadata,
 };
 
+/// `allow_plaintext_plugin_config` lists `plugin_name`s whose unclassifiable
+/// config strings the operator has reviewed and accepted as plaintext; see
+/// [`split_config_with_inventory`].
 pub fn import_from_file(
     file_path: &Path,
     output_dir: &Path,
     credential_bundle_output: Option<&Path>,
+    allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
     if let Some(bundle_path) = credential_bundle_output {
         validate_migration_bundle_source(bundle_path, file_path)?;
@@ -41,6 +45,7 @@ pub fn import_from_file(
         },
         credential_bundle_output,
         true,
+        allow_plaintext_plugin_config,
     )
 }
 

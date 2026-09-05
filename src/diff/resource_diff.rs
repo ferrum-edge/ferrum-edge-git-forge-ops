@@ -34,6 +34,45 @@ pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut Ga
             mask_placeholder_leaves(&expected.config, &mut live.config);
         }
     }
+
+    // The modeled `Upstream.service_discovery` secrets are brokered exactly
+    // like the two above, so a bundle-less run compares an unresolvable
+    // placeholder against the gateway's real token and would report permanent
+    // drift on a credential nobody touched. Only the classified leaves are
+    // aligned; `consul.address`, `service_name`, `datacenter` and `tag` stay
+    // authoritative.
+    for live in &mut actual.upstreams {
+        let Some(expected) = desired
+            .upstreams
+            .iter()
+            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+        else {
+            continue;
+        };
+        let (Some(expected_sd), Some(live_sd)) = (
+            expected.service_discovery.as_ref(),
+            live.service_discovery.as_mut(),
+        ) else {
+            continue;
+        };
+        for field in crate::secrets::service_discovery::SD_SECRET_FIELDS {
+            let Some(placeholder) =
+                crate::secrets::service_discovery::secret_leaf(expected_sd, field.path)
+            else {
+                continue;
+            };
+            if !matches!(crate::secrets::parse_placeholder(placeholder), Some(Ok(_))) {
+                continue;
+            }
+            if let Some(slot) =
+                crate::secrets::service_discovery::secret_leaf_mut(live_sd, field.path)
+            {
+                if slot.is_some() {
+                    *slot = Some(placeholder.clone());
+                }
+            }
+        }
+    }
 }
 
 fn mask_placeholder_leaves(desired: &serde_json::Value, live: &mut serde_json::Value) {
@@ -60,11 +99,81 @@ fn mask_placeholder_leaves(desired: &serde_json::Value, live: &mut serde_json::V
 }
 
 /// Diff fields whose values must never be rendered verbatim to stdout/logs.
+///
+/// Whole-field suppression, for the two fields that are secret material
+/// through and through. A field that merely *contains* a modeled secret leaf
+/// is not listed here — it is redacted leaf-by-leaf by
+/// [`redact_sensitive_leaves`] so the reviewable half stays reviewable.
 pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
     matches!(
         (kind, field),
         ("Consumer", "credentials") | ("PluginConfig", "config")
     )
+}
+
+/// Replace the modeled secret leaves inside an otherwise reviewable field
+/// change with [`crate::secrets::REDACTION`].
+///
+/// `Upstream.service_discovery` carries a provider credential (the Consul ACL
+/// token) next to the fields that say what is being discovered. Suppressing
+/// the whole field the way [`is_sensitive_diff_field`] does would hide a
+/// control-plane address or service-name change — exactly the drift a reviewer
+/// is there to catch — so only the classified leaves are replaced.
+///
+/// A well-formed `${gh-env-secret:…}` placeholder is repository data and stays
+/// legible, matching the validator scrubber's rule: a reviewer needs to see
+/// that a field is brokered.
+fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
+    if kind != "Upstream" {
+        return;
+    }
+    for change in changes
+        .iter_mut()
+        .filter(|c| c.field == "service_discovery")
+    {
+        for side in [&mut change.old_value, &mut change.new_value] {
+            if let Some(redacted) = redact_service_discovery_json(side) {
+                *side = redacted;
+            }
+        }
+    }
+}
+
+/// Redact the modeled secret leaves of one serialized `service_discovery`
+/// value, or `None` when nothing needed replacing (or the text is not the
+/// JSON object we expect, in which case it is left to the caller — the field
+/// is `null` on adds and deletes).
+fn redact_service_discovery_json(serialized: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(serialized).ok()?;
+    let mut redacted = false;
+    for field in crate::secrets::service_discovery::SD_SECRET_FIELDS {
+        let Some(serde_json::Value::String(leaf)) = json_leaf_mut(&mut value, field.path) else {
+            continue;
+        };
+        if matches!(crate::secrets::parse_placeholder(leaf), Some(Ok(_))) {
+            continue;
+        }
+        *leaf = crate::secrets::REDACTION.to_string();
+        redacted = true;
+    }
+    if !redacted {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+/// Resolve an object path in a JSON document, or `None` if any segment is
+/// missing or not an object. Never returns an intermediate node: a partial
+/// match must not be mistaken for the leaf.
+fn json_leaf_mut<'a>(
+    value: &'a mut serde_json::Value,
+    path: &[&str],
+) -> Option<&'a mut serde_json::Value> {
+    let mut cursor = value;
+    for part in path {
+        cursor = cursor.as_object_mut()?.get_mut(*part)?;
+    }
+    Some(cursor)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,7 +486,12 @@ fn diff_collection<T: serde::Serialize + PassthroughFields>(
                     });
                     continue;
                 }
-                let details = compare_fields(*desired_res, *actual_res);
+                let mut details = compare_fields(*desired_res, *actual_res);
+                // Redact at construction, not at print time: a `FieldChange`
+                // is rendered by plan/diff stdout *and* by the PR comment, and
+                // a secret that never enters the struct cannot be forgotten by
+                // one of them.
+                redact_sensitive_leaves(kind, &mut details);
                 if !details.is_empty() {
                     result.diffs.push(ResourceDiff {
                         action: DiffAction::Modify,

@@ -76,12 +76,14 @@ async fn main() {
             from_file,
             output_dir,
             credential_bundle_output,
+            allow_plaintext_plugin_config,
         } => {
             cmd_import(
                 from_api,
                 from_file.as_deref(),
                 &output_dir,
                 credential_bundle_output.as_deref(),
+                &allow_plaintext_plugin_config,
                 explicit_env.as_deref(),
             )
             .await
@@ -2250,6 +2252,7 @@ async fn cmd_import(
     from_file: Option<&str>,
     output_dir: &str,
     credential_bundle_output: Option<&str>,
+    allow_plaintext_plugin_config: &[String],
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_path = PathBuf::from(output_dir);
@@ -2274,6 +2277,7 @@ async fn cmd_import(
             &output_path,
             Some(namespace),
             credential_bundle_path.as_deref(),
+            allow_plaintext_plugin_config,
         )
         .await?
     } else if let Some(file_path) = from_file {
@@ -2281,6 +2285,7 @@ async fn cmd_import(
             &PathBuf::from(file_path),
             &output_path,
             credential_bundle_path.as_deref(),
+            allow_plaintext_plugin_config,
         )?
     } else {
         eprintln!("Specify --from-api or --from-file <PATH>");

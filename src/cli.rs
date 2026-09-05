@@ -96,6 +96,17 @@ pub enum Commands {
         /// imported resource tree and every Git worktree.
         #[arg(long, value_name = "PATH")]
         credential_bundle_output: Option<String>,
+        /// Accept unclassifiable plaintext config for this plugin, by exact
+        /// `plugin_name`. Repeatable.
+        ///
+        /// gitforgeops has no schema for a plugin it does not recognize, so
+        /// only the key/URL sensitivity heuristics run over its config; a
+        /// vendor field they do not flag would otherwise be committed to Git
+        /// as written. Without this flag such an import fails, naming every
+        /// unclassified path. Pass the plugin name once you have read that
+        /// list and confirmed none of it is a credential.
+        #[arg(long, value_name = "PLUGIN_NAME")]
+        allow_plaintext_plugin_config: Vec<String>,
     },
     Review {
         #[arg(long)]

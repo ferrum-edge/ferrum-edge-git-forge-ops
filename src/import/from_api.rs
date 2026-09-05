@@ -6,11 +6,15 @@ use crate::import::{
     split_config_with_inventory, ImportInventory, ImportResult, ImportSourceMetadata,
 };
 
+/// `allow_plaintext_plugin_config` lists `plugin_name`s whose unclassifiable
+/// config strings the operator has reviewed and accepted as plaintext; see
+/// [`split_config_with_inventory`].
 pub async fn import_from_api(
     client: &AdminClient,
     output_dir: &Path,
     namespace_filter: Option<&str>,
     credential_bundle_output: Option<&Path>,
+    allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
     let mut namespaces = match namespace_filter {
         Some(namespace) => vec![namespace.to_string()],
@@ -93,6 +97,7 @@ pub async fn import_from_api(
         },
         credential_bundle_output,
         true,
+        allow_plaintext_plugin_config,
     )
 }
 
