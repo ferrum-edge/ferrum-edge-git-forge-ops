@@ -470,6 +470,58 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
     return violations
 
 
+def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
+    """The dependency gate must run `main`'s checker against `main`'s exceptions.
+
+    Under `on: pull_request` this workflow file is itself supplied by the pull
+    request's head, so without this assertion one commit could add a
+    cargo-audit exception *and* delete the trusted checkout that stops the
+    exception from counting — and the gate would report success. The trusted
+    supply-chain runner reads the candidate's copy of `security.yml`, which is
+    the only place an assertion about it can be enforced.
+
+    Push and schedule runs keep executing the tree's own checker: there is no
+    untrusted author there, and pinning them to the default branch would stop
+    a merged policy change from ever taking effect.
+    """
+    violations: list[str] = []
+
+    checkout = named_step(text, "Check out trusted cargo-audit policy")
+    if checkout is None:
+        violations.append(
+            "security.yml: the cargo-audit gate must check out the protected default branch"
+        )
+    else:
+        for required in (
+            "if: github.event_name == 'pull_request'",
+            "ref: ${{ github.event.repository.default_branch }}",
+            "path: trusted-cargo-audit",
+        ):
+            if required not in checkout:
+                violations.append(
+                    f"security.yml: trusted cargo-audit checkout is missing {required!r}"
+                )
+
+    for required in (
+        "python3 trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
+        "python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py",
+        "--policy trusted-cargo-audit/.github/cargo-audit-policy.json",
+        '--source-root "$GITHUB_WORKSPACE"',
+    ):
+        if required not in text:
+            violations.append(
+                f"security.yml: trusted cargo-audit policy runner is missing {required!r}"
+            )
+
+    # The findings must still be computed against the candidate's own
+    # dependency graph; only the checker and the exception list are pinned.
+    if "--policy .github/cargo-audit-policy.json" in text:
+        violations.append(
+            "security.yml: a pull request must not supply its own cargo-audit exception policy"
+        )
+    return violations
+
+
 def state_writer_token_violations(
     workflow: str, text: str, commit_step: str
 ) -> list[str]:
@@ -769,11 +821,9 @@ def main(argv: list[str] | None = None) -> int:
             (workflows / "state-guard.yml").read_text(encoding="utf-8")
         )
     )
-    violations.extend(
-        trusted_supply_chain_policy_violations(
-            (workflows / "security.yml").read_text(encoding="utf-8")
-        )
-    )
+    security_workflow = (workflows / "security.yml").read_text(encoding="utf-8")
+    violations.extend(trusted_supply_chain_policy_violations(security_workflow))
+    violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     if 'result=$(python3 "$helper"' not in state_guard:
         violations.append(

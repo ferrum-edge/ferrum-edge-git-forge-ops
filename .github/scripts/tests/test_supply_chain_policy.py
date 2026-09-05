@@ -47,6 +47,57 @@ class SupplyChainPolicyTests(unittest.TestCase):
             violations,
         )
 
+    def test_cargo_audit_gate_runs_the_default_branch_checker_and_policy(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.trusted_cargo_audit_policy_violations(workflow), []
+        )
+
+        # Deleting the trusted checkout is how a pull request would put its own
+        # checker and its own exception list back in charge of the gate.
+        without_checkout = workflow.replace(
+            "      - name: Check out trusted cargo-audit policy\n", "", 1
+        )
+        self.assertNotEqual(workflow, without_checkout)
+        violations = check_supply_chain.trusted_cargo_audit_policy_violations(
+            without_checkout
+        )
+        self.assertTrue(
+            any("protected default branch" in item for item in violations), violations
+        )
+
+        # So is pointing the trusted checker at the candidate's exception file.
+        self_approving = workflow.replace(
+            "--policy trusted-cargo-audit/.github/cargo-audit-policy.json",
+            "--policy .github/cargo-audit-policy.json",
+            1,
+        )
+        violations = check_supply_chain.trusted_cargo_audit_policy_violations(
+            self_approving
+        )
+        self.assertTrue(
+            any(
+                "must not supply its own cargo-audit exception policy" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_cargo_audit_gate_still_measures_the_candidate_dependency_graph(self):
+        # Pinning the checker must not pin what it audits: --source-root has to
+        # stay on the pull request's own tree or the gate would report on main.
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        detached = workflow.replace('--source-root "$GITHUB_WORKSPACE"', "", 1)
+        self.assertNotEqual(workflow, detached)
+        violations = check_supply_chain.trusted_cargo_audit_policy_violations(detached)
+        self.assertTrue(
+            any("--source-root" in item for item in violations), violations
+        )
+
     def test_root_override_checks_the_selected_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
