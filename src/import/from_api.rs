@@ -3,17 +3,21 @@ use std::path::Path;
 use crate::config::GatewayConfig;
 use crate::http_client::AdminClient;
 use crate::import::{
-    split_config_with_inventory, ImportInventory, ImportResult, ImportSourceMetadata,
+    split_config_with_inventory, ImportInventory, ImportPassthroughPolicy, ImportResult,
+    ImportSourceMetadata,
 };
 
-/// `allow_plaintext_plugin_config` lists `plugin_name`s whose unclassifiable
-/// config strings the operator has reviewed and accepted as plaintext; see
-/// [`split_config_with_inventory`].
+/// `passthrough_policy` carries the `--accept-unknown-field` acknowledgements
+/// and `FERRUM_ALLOW_UNKNOWN_FIELDS`; `allow_plaintext_plugin_config` lists
+/// `plugin_name`s whose unclassifiable config strings the operator has
+/// reviewed and accepted as plaintext. Both are enforced before anything is
+/// staged; see [`split_config_with_inventory`].
 pub async fn import_from_api(
     client: &AdminClient,
     output_dir: &Path,
     namespace_filter: Option<&str>,
     credential_bundle_output: Option<&Path>,
+    passthrough_policy: &ImportPassthroughPolicy,
     allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
     let mut namespaces = match namespace_filter {
@@ -97,6 +101,7 @@ pub async fn import_from_api(
         },
         credential_bundle_output,
         true,
+        passthrough_policy,
         allow_plaintext_plugin_config,
     )
 }

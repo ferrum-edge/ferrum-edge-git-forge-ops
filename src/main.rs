@@ -76,6 +76,7 @@ async fn main() {
             from_file,
             output_dir,
             credential_bundle_output,
+            accept_unknown_field,
             allow_plaintext_plugin_config,
         } => {
             cmd_import(
@@ -83,6 +84,7 @@ async fn main() {
                 from_file.as_deref(),
                 &output_dir,
                 credential_bundle_output.as_deref(),
+                &accept_unknown_field,
                 &allow_plaintext_plugin_config,
                 explicit_env.as_deref(),
             )
@@ -2252,12 +2254,19 @@ async fn cmd_import(
     from_file: Option<&str>,
     output_dir: &str,
     credential_bundle_output: Option<&str>,
+    accept_unknown_field: &[String],
     allow_plaintext_plugin_config: &[String],
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output_path = PathBuf::from(output_dir);
     let credential_bundle_path = credential_bundle_output.map(PathBuf::from);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    // Resolved here with every other policy read, so the import path itself
+    // stays free of process-environment access.
+    let passthrough_policy = import::ImportPassthroughPolicy {
+        allow_unknown_fields: env_config.allow_unknown_fields,
+        acknowledged: accept_unknown_field.iter().cloned().collect(),
+    };
 
     let result = if from_api {
         // On a namespace-claim gateway, an unscoped discovery token gets an
@@ -2277,6 +2286,7 @@ async fn cmd_import(
             &output_path,
             Some(namespace),
             credential_bundle_path.as_deref(),
+            &passthrough_policy,
             allow_plaintext_plugin_config,
         )
         .await?
@@ -2285,6 +2295,7 @@ async fn cmd_import(
             &PathBuf::from(file_path),
             &output_path,
             credential_bundle_path.as_deref(),
+            &passthrough_policy,
             allow_plaintext_plugin_config,
         )?
     } else {
@@ -2314,6 +2325,9 @@ async fn cmd_import(
     }
     // Loud and last, so it is the final thing on screen: these are the values
     // gitforgeops could not classify and a human has to.
+    if let Some(notice) = result.acknowledged_passthrough_notice() {
+        eprintln!("{notice}");
+    }
     if let Some(notice) = result.custom_plugin_review_notice() {
         eprintln!("{notice}");
     }

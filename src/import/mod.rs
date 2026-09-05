@@ -140,6 +140,14 @@ pub struct ImportResult {
     /// judge. Nothing downstream keys on it.
     #[serde(skip)]
     pub unbrokered_plugin_config: Vec<UnbrokeredPluginConfig>,
+
+    /// `Kind id: field, field` for every resource carrying an unmodelled
+    /// top-level field the operator acknowledged with `--accept-unknown-field`.
+    /// Surfaced by [`ImportResult::acknowledged_passthrough_notice`]. Kept out
+    /// of the manifest for the same reason as `unbrokered_plugin_config`: it is
+    /// a transient review prompt, not an inventory of what was imported.
+    #[serde(skip)]
+    pub acknowledged_passthrough: Vec<String>,
 }
 
 impl ImportResult {
@@ -265,6 +273,22 @@ impl ImportResult {
         Some(notice)
     }
 
+    /// Loud review list for unmodelled top-level fields carried into the tree
+    /// under `--accept-unknown-field`.
+    ///
+    /// The acknowledgement asserts these are not credentials. It is an
+    /// assertion, not a check — nothing in this build can verify it — so name
+    /// every field that relied on it before the tree is committed.
+    pub fn acknowledged_passthrough_notice(&self) -> Option<String> {
+        if self.acknowledged_passthrough.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "WARNING: these resources carry top-level fields this build does not model. They were written verbatim because `--accept-unknown-field` acknowledged them; gitforgeops did not and cannot check whether any of them is a credential. Read them before committing:\n  {}",
+            self.acknowledged_passthrough.join("\n  ")
+        ))
+    }
+
     /// Bounded one-line source provenance suitable for CLI output. The same
     /// data is persisted in full in the machine-readable import manifest.
     pub fn source_metadata_notice(&self) -> Option<String> {
@@ -379,6 +403,15 @@ fn diagnostic_metadata(value: &str) -> String {
 /// counted in [`ImportResult::skipped_spec_owned`] instead, and surfaced by
 /// [`ImportResult::unmanaged_sections_notice`].
 ///
+/// # Unmodelled resource fields fail closed
+///
+/// A top-level field this build's typed mirror does not model is carried
+/// through `extra` and would be written into the tree verbatim, where the
+/// credential broker never sees it. This entry point refuses every such field:
+/// it applies [`ImportPassthroughPolicy::strict`]. The CLI's
+/// `--accept-unknown-field <NAME>` (with `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
+/// is the documented way to accept one after reading the source.
+///
 /// # Unrecognized plugins fail closed
 ///
 /// A plugin this build has no schema for is classified by the key/URL
@@ -396,23 +429,34 @@ pub fn split_config(
         ImportInventory::default(),
         None,
         false,
+        &ImportPassthroughPolicy::strict(),
         &[],
     )
 }
 
+/// Two operator acknowledgements gate this path, and both are evaluated
+/// before a single file is staged.
+///
+/// `passthrough_policy` governs top-level resource fields this build does not
+/// model (`--accept-unknown-field` plus `FERRUM_ALLOW_UNKNOWN_FIELDS`); an
+/// unacknowledged one aborts the whole import.
+///
 /// `allow_plaintext_plugin_config` holds exact `plugin_name`s whose
 /// heuristically-unclassifiable config strings the operator has reviewed and
 /// accepted as plaintext (`--allow-plaintext-plugin-config`). Any other plugin
-/// with such a string aborts the import before a single file is staged.
+/// with such a string aborts the import too.
 pub(crate) fn split_config_with_inventory(
     config: &GatewayConfig,
     output_dir: &Path,
     inventory: ImportInventory,
     credential_bundle_output: Option<&Path>,
     require_credential_bundle: bool,
+    passthrough_policy: &ImportPassthroughPolicy,
     allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
+    reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
+    let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
     let captured_discovery = capture_and_redact_import_service_discovery_secrets(&mut safe_config)?;
@@ -447,6 +491,7 @@ pub(crate) fn split_config_with_inventory(
         redacted_plugin_config_values: plugin_config_count,
         redacted_service_discovery_values: service_discovery_count,
         unbrokered_plugin_config,
+        acknowledged_passthrough,
         ..ImportResult::default()
     };
     if require_credential_bundle
@@ -556,6 +601,151 @@ pub(crate) fn split_config_with_inventory(
     publish_import_tree(output_dir, planned_writes)?;
 
     Ok(result)
+}
+
+/// What `import` does with unknown top-level resource fields.
+///
+/// A gateway newer than this build returns fields the typed mirror does not
+/// model. On the *load* path they are governed by `FERRUM_ALLOW_UNKNOWN_FIELDS`
+/// and carried verbatim, because the operator wrote them and knows what they
+/// are. Import is the opposite situation: the values come from the gateway,
+/// nobody has read them, and the secret broker only redacts fields it models —
+/// so an unmodelled `future_access_token` would be written into a resource
+/// file and committed in plaintext. Import therefore fails closed by default
+/// and needs a per-field acknowledgement to proceed.
+#[derive(Debug, Clone, Default)]
+pub struct ImportPassthroughPolicy {
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS`. Required alongside an acknowledgement:
+    /// without it the strict loader rejects the very tree import just wrote,
+    /// so importing the field could only ever produce an unusable repo.
+    pub allow_unknown_fields: bool,
+    /// `--accept-unknown-field NAME`, repeatable. Names the operator has
+    /// reviewed and asserts are not credentials. Deliberately not implied by
+    /// `FERRUM_ALLOW_UNKNOWN_FIELDS`: that flag says "gitforgeops does not
+    /// model this", which is not a statement about secrecy.
+    pub acknowledged: BTreeSet<String>,
+}
+
+impl ImportPassthroughPolicy {
+    /// Fail closed on everything. The default for library callers.
+    pub fn strict() -> Self {
+        Self::default()
+    }
+}
+
+/// Every importable resource paired with its unknown top-level fields.
+///
+/// Spec-owned proxies, upstreams and plugin configs are excluded because they
+/// are skipped rather than written; consumers carry no `api_spec_id`.
+fn passthrough_fields(config: &GatewayConfig) -> Vec<(&'static str, &str, Vec<&str>)> {
+    config
+        .proxies
+        .iter()
+        .filter(|resource| resource.api_spec_id.is_none())
+        .map(|resource| ("Proxy", resource.id.as_str(), &resource.extra))
+        .chain(
+            config
+                .consumers
+                .iter()
+                .map(|resource| ("Consumer", resource.id.as_str(), &resource.extra)),
+        )
+        .chain(
+            config
+                .upstreams
+                .iter()
+                .filter(|resource| resource.api_spec_id.is_none())
+                .map(|resource| ("Upstream", resource.id.as_str(), &resource.extra)),
+        )
+        .chain(
+            config
+                .plugin_configs
+                .iter()
+                .filter(|resource| resource.api_spec_id.is_none())
+                .map(|resource| ("PluginConfig", resource.id.as_str(), &resource.extra)),
+        )
+        .filter(|(_, _, extra)| !extra.is_empty())
+        .map(|(kind, id, extra)| {
+            (
+                kind,
+                id,
+                extra.keys().map(String::as_str).collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+/// Refuse fields whose sensitivity this version cannot classify, before any
+/// import output (including a migration bundle) is planned or published.
+///
+/// Field *names* are reported; values never are. A name that has not been
+/// acknowledged is refused outright — this build cannot tell a display label
+/// from a bearer token, and the broker will not redact what it does not model,
+/// so writing it would commit a possible credential to Git.
+fn reject_import_passthrough_fields(
+    config: &GatewayConfig,
+    policy: &ImportPassthroughPolicy,
+) -> crate::error::Result<()> {
+    let carried = passthrough_fields(config);
+    if carried.is_empty() {
+        return Ok(());
+    }
+
+    let mut unacknowledged: BTreeSet<&str> = BTreeSet::new();
+    let mut offender: Option<(&str, &str)> = None;
+    for (kind, id, fields) in &carried {
+        for field in fields {
+            if !policy.acknowledged.contains(*field) {
+                unacknowledged.insert(field);
+                offender.get_or_insert((kind, id));
+            }
+        }
+    }
+
+    if let Some((kind, id)) = offender {
+        let names = unacknowledged
+            .iter()
+            .map(|field| diagnostic_metadata(field))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(crate::error::Error::Config(format!(
+            "cannot safely import {kind} '{}': this build does not model the top-level field(s) [{names}], \
+             so the credential broker cannot tell whether they hold secrets and would write them into the \
+             resource tree verbatim. Upgrade gitforgeops to a version that models them, or — after reading \
+             the source and confirming they are not credentials — re-run with \
+             `--accept-unknown-field <NAME>` for each and FERRUM_ALLOW_UNKNOWN_FIELDS=true.",
+            diagnostic_metadata(id)
+        )));
+    }
+
+    if !policy.allow_unknown_fields {
+        return Err(crate::error::Error::Config(
+            "every unmodelled field in this source is acknowledged, but FERRUM_ALLOW_UNKNOWN_FIELDS is not set. \
+             The strict loader would reject the resource files this import is about to write, so the tree \
+             could not be validated or applied. Set FERRUM_ALLOW_UNKNOWN_FIELDS=true and re-run."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Human-readable list of the acknowledged unmodelled fields that were carried
+/// into the tree, so they are reviewed before the import is committed.
+fn acknowledged_passthrough_review(config: &GatewayConfig) -> Vec<String> {
+    passthrough_fields(config)
+        .into_iter()
+        .map(|(kind, id, fields)| {
+            format!(
+                "{kind} {}: {}",
+                diagnostic_metadata(id),
+                fields
+                    .iter()
+                    .map(|field| diagnostic_metadata(field))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect()
 }
 
 /// Longest per-plugin path list rendered in a notice or a refusal. A crafted

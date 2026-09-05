@@ -2,17 +2,20 @@ use std::path::Path;
 
 use crate::http_client::BackupSnapshot;
 use crate::import::{
-    split_config_with_inventory, validate_migration_bundle_source, ImportInventory, ImportResult,
-    ImportSourceMetadata,
+    split_config_with_inventory, validate_migration_bundle_source, ImportInventory,
+    ImportPassthroughPolicy, ImportResult, ImportSourceMetadata,
 };
 
-/// `allow_plaintext_plugin_config` lists `plugin_name`s whose unclassifiable
-/// config strings the operator has reviewed and accepted as plaintext; see
-/// [`split_config_with_inventory`].
+/// `passthrough_policy` carries the `--accept-unknown-field` acknowledgements
+/// and `FERRUM_ALLOW_UNKNOWN_FIELDS`; `allow_plaintext_plugin_config` lists
+/// `plugin_name`s whose unclassifiable config strings the operator has
+/// reviewed and accepted as plaintext. Both are enforced before anything is
+/// staged; see [`split_config_with_inventory`].
 pub fn import_from_file(
     file_path: &Path,
     output_dir: &Path,
     credential_bundle_output: Option<&Path>,
+    passthrough_policy: &ImportPassthroughPolicy,
     allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
     if let Some(bundle_path) = credential_bundle_output {
@@ -45,6 +48,7 @@ pub fn import_from_file(
         },
         credential_bundle_output,
         true,
+        passthrough_policy,
         allow_plaintext_plugin_config,
     )
 }

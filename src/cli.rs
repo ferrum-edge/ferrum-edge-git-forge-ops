@@ -96,6 +96,15 @@ pub enum Commands {
         /// imported resource tree and every Git worktree.
         #[arg(long, value_name = "PATH")]
         credential_bundle_output: Option<String>,
+        /// Acknowledge one top-level resource field this build does not model,
+        /// so import may write it into the tree verbatim. Repeatable. Import
+        /// otherwise refuses such a field: the credential broker only redacts
+        /// what it models, so an unmodelled value could be a secret committed
+        /// in plaintext. Read the source and confirm the field is not a
+        /// credential first. Requires FERRUM_ALLOW_UNKNOWN_FIELDS=true, without
+        /// which the strict loader would reject the files import just wrote.
+        #[arg(long, value_name = "NAME")]
+        accept_unknown_field: Vec<String>,
         /// Accept unclassifiable plaintext config for this plugin, by exact
         /// `plugin_name`. Repeatable.
         ///
