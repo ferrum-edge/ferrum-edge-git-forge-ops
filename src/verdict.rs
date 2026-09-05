@@ -1,23 +1,39 @@
 //! The verdicts the preview commands report through their exit codes.
 //!
-//! [`apply_blockers`] is every fail-closed gate `apply` refuses on that is
-//! decidable *without* a gateway. It is pure and total so the rule and the
-//! process behaviour cannot drift apart: `plan` evaluates the whole set and
-//! exits non-zero on any of them, while `apply` enforces the same per-class
-//! predicates one at a time, in the order that preserves its own fail-fast
-//! guarantees (the security audit must refuse before the credential bundle is
-//! read, the required-slot check before the first gateway call, and so on).
-//! Sharing the predicates rather than the control flow is what keeps a clean
-//! `plan` from promising an `apply` that deterministically refuses.
+//! Two of them, both pure and total so the rule and the process behaviour
+//! cannot drift apart:
+//!
+//! * [`apply_blockers`] — every fail-closed gate `apply` refuses on that is
+//!   decidable *without* a gateway. `plan` evaluates the whole set and exits
+//!   non-zero on any of them; `apply` enforces the same per-class predicates
+//!   one at a time, in the order that preserves its own fail-fast guarantees
+//!   (the security audit must refuse before the credential bundle is read, the
+//!   required-slot check before the first gateway call, and so on). Sharing
+//!   the predicates rather than the control flow is what keeps a clean `plan`
+//!   from promising an `apply` that deterministically refuses.
+//! * [`DriftVerdict`] — what makes `diff --exit-on-drift` return
+//!   [`DRIFT_EXIT_CODE`].
 //!
 //! Gates that need a live gateway (large-prune threshold, stale-view block,
 //! per-resource apply failures) are deliberately **not** here: a preview
 //! cannot decide them offline, and pretending otherwise would make `plan`
 //! fail for reasons the operator cannot act on from the repository.
 
-use crate::diff::SecurityFinding;
+use crate::config::repo_config::DriftAlertOn;
+use crate::diff::{
+    DiffAction, ResourceDiff, SecurityFinding, SpecOwnedResource, UnmanagedResource,
+};
 use crate::policy::PolicyFinding;
 use crate::secrets::ResolveReport;
+
+/// Process exit code for `diff --exit-on-drift` when the live gateway and the
+/// repository disagree.
+///
+/// Distinct from `1` (which every command uses for an ordinary error) so a
+/// scheduled drift monitor can tell "the gateway drifted" from "the run
+/// failed". `drift-check.yml` treats any non-zero exit as a failed check, so
+/// the distinction is for humans and for anything that inspects `$?`.
+pub const DRIFT_EXIT_CODE: i32 = 2;
 
 /// One class of fail-closed refusal, decidable without a gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -200,4 +216,79 @@ pub fn blocker_summary(blockers: &[ApplyBlocker]) -> Option<String> {
         blockers.len(),
         classes.join(", ")
     ))
+}
+
+/// Which drift categories a `diff` run found.
+///
+/// The first three mirror `ownership.drift_alert_on`, so an operator can mute
+/// a noisy category. [`Self::spec_conflicts`] deliberately has no flag: a repo
+/// declaring a resource the gateway's OpenAPI spec importer owns is not drift
+/// noise but two owners writing one row, and `apply` refuses the namespace
+/// over it. Muting the unmanaged category must not mute that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriftVerdict {
+    /// A managed resource differs from, or is missing on, the gateway.
+    pub managed_modified: bool,
+    /// A managed resource would be deleted.
+    pub managed_deleted: bool,
+    /// The gateway holds resources this repo never applied.
+    pub unmanaged_added: bool,
+    /// A live `api_spec_id`-tagged resource is also declared in this repo.
+    pub spec_conflicts: bool,
+}
+
+impl DriftVerdict {
+    /// Classify one run's diff output against the environment's alert flags.
+    pub fn evaluate(
+        alert: &DriftAlertOn,
+        diffs: &[ResourceDiff],
+        unmanaged: &[UnmanagedResource],
+        spec_owned: &[SpecOwnedResource],
+    ) -> Self {
+        let modify_or_add = diffs
+            .iter()
+            .any(|d| matches!(d.action, DiffAction::Modify | DiffAction::Add));
+        let delete = diffs.iter().any(|d| matches!(d.action, DiffAction::Delete));
+        Self {
+            managed_modified: alert.managed_modified && modify_or_add,
+            managed_deleted: alert.managed_deleted && delete,
+            unmanaged_added: alert.unmanaged_added && !unmanaged.is_empty(),
+            // Informational spec-owned rows — ones the repo does not declare —
+            // are a stable steady state and stay non-blocking.
+            spec_conflicts: spec_owned.iter().any(|s| s.is_conflict()),
+        }
+    }
+
+    pub fn has_drift(&self) -> bool {
+        self.managed_modified || self.managed_deleted || self.unmanaged_added || self.spec_conflicts
+    }
+
+    /// `0` when in sync, [`DRIFT_EXIT_CODE`] otherwise. The only mapping;
+    /// `cmd_diff` calls this rather than writing `2` anywhere.
+    pub fn exit_code(&self) -> i32 {
+        if self.has_drift() {
+            DRIFT_EXIT_CODE
+        } else {
+            0
+        }
+    }
+
+    /// Human-readable category names for the verdict, for the line printed
+    /// before a non-zero exit.
+    pub fn reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        if self.managed_modified {
+            reasons.push("managed resources added or modified");
+        }
+        if self.managed_deleted {
+            reasons.push("managed resources deleted");
+        }
+        if self.unmanaged_added {
+            reasons.push("unmanaged resources on the gateway");
+        }
+        if self.spec_conflicts {
+            reasons.push("API-spec ownership conflicts");
+        }
+        reasons
+    }
 }

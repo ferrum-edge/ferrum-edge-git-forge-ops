@@ -1,11 +1,14 @@
-//! The shared apply-blocker verdict: what stops `apply`, and therefore what
-//! `plan` must exit non-zero on.
+//! The shared verdicts: what blocks `apply` (and therefore `plan`), and what
+//! makes `diff --exit-on-drift` return non-zero.
 //!
-//! Pure functions precisely so the rules can be asserted without a gateway, a
-//! repository checkout or a process; `apply_gate_tests.rs` covers the same
-//! rules end to end through the binary.
+//! These are pure functions precisely so the rules can be asserted without a
+//! gateway, a repository checkout or a process; `apply_gate_tests.rs` and
+//! `diff_exit_tests.rs` cover the same rules end to end through the binary.
 
-use gitforgeops::diff::SecurityFinding;
+use gitforgeops::config::repo_config::DriftAlertOn;
+use gitforgeops::diff::{
+    DiffAction, ResourceDiff, SecurityFinding, SpecOwnedResource, UnmanagedResource,
+};
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::secrets::{
     PlaceholderAlloc, ResolveReport, ResolveResult, SecretPlaceholder, SlotStatus,
@@ -13,6 +16,7 @@ use gitforgeops::secrets::{
 use gitforgeops::verdict::{
     apply_blockers, blocker_summary, policy_blocker, required_credentials_blocker,
     security_blocker, slot_remap_blocker, validation_blocker, ApplyGateInputs, BlockerKind,
+    DriftVerdict, DRIFT_EXIT_CODE,
 };
 
 fn security_finding(severity: &str) -> SecurityFinding {
@@ -240,4 +244,157 @@ fn every_blocker_class_is_reported_together_and_named_in_the_summary() {
         // Every class carries an operator-actionable remedy.
         assert!(!kind.remedy().is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Drift verdict
+// ---------------------------------------------------------------------------
+
+fn diff(action: DiffAction) -> ResourceDiff {
+    ResourceDiff {
+        action,
+        kind: "Proxy".to_string(),
+        id: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![],
+    }
+}
+
+fn unmanaged() -> UnmanagedResource {
+    UnmanagedResource {
+        kind: "Proxy".to_string(),
+        id: "legacy".to_string(),
+        namespace: "ferrum".to_string(),
+    }
+}
+
+fn spec_owned(declared_in_repo: bool) -> SpecOwnedResource {
+    SpecOwnedResource {
+        kind: "Proxy".to_string(),
+        id: "app".to_string(),
+        namespace: "ferrum".to_string(),
+        api_spec_id: "spec-1".to_string(),
+        declared_in_repo,
+        pruned: false,
+    }
+}
+
+/// Every alert category muted, which is the strictest possible setting for
+/// the flags a conflict must ignore.
+fn all_muted() -> DriftAlertOn {
+    DriftAlertOn {
+        managed_modified: false,
+        managed_deleted: false,
+        unmanaged_added: false,
+    }
+}
+
+/// The repository's effective default (`OwnershipConfig::default()`): alert on
+/// managed changes, stay quiet about unmanaged additions.
+///
+/// Spelled out rather than taken from `DriftAlertOn::default()`, whose derived
+/// all-false value is not what an environment without an explicit
+/// `drift_alert_on` block gets.
+fn defaults() -> DriftAlertOn {
+    DriftAlertOn {
+        managed_modified: true,
+        managed_deleted: true,
+        unmanaged_added: false,
+    }
+}
+
+#[test]
+fn an_in_sync_gateway_reports_no_drift() {
+    let verdict = DriftVerdict::evaluate(&defaults(), &[], &[], &[]);
+
+    assert!(!verdict.has_drift());
+    assert_eq!(verdict.exit_code(), 0);
+    assert!(verdict.reasons().is_empty());
+}
+
+#[test]
+fn a_spec_ownership_conflict_is_drift_even_with_identical_fields() {
+    // Issue-131 reproduction: the repo declares a row the gateway's OpenAPI
+    // spec importer owns. The diff engine suppresses the Modify, so there is
+    // no ordinary diff entry and no unmanaged resource — and the nightly
+    // monitor used to report success on a namespace apply refuses.
+    let verdict = DriftVerdict::evaluate(&defaults(), &[], &[], &[spec_owned(true)]);
+
+    assert!(verdict.spec_conflicts);
+    assert!(verdict.has_drift());
+    assert_eq!(verdict.exit_code(), DRIFT_EXIT_CODE);
+    assert_eq!(verdict.exit_code(), 2, "the documented drift exit code");
+    assert!(
+        verdict
+            .reasons()
+            .iter()
+            .any(|r| r.contains("API-spec ownership")),
+        "{:?}",
+        verdict.reasons()
+    );
+}
+
+#[test]
+fn a_spec_conflict_ignores_the_drift_alert_flags() {
+    // `drift_alert_on` mutes categories an operator has decided are noise.
+    // Two owners writing one row is a correctness problem apply refuses over,
+    // so it deliberately has no flag to mute.
+    let verdict = DriftVerdict::evaluate(&all_muted(), &[], &[unmanaged()], &[spec_owned(true)]);
+
+    assert!(!verdict.unmanaged_added, "the muted category stays muted");
+    assert!(verdict.spec_conflicts);
+    assert_eq!(verdict.exit_code(), DRIFT_EXIT_CODE);
+}
+
+#[test]
+fn informational_spec_owned_rows_are_not_drift() {
+    // The repo does not declare these. Staying off them is a stable steady
+    // state, and calling it drift meant any gateway ingesting API specs could
+    // never report in sync.
+    let verdict = DriftVerdict::evaluate(&defaults(), &[], &[], &[spec_owned(false)]);
+
+    assert!(!verdict.spec_conflicts);
+    assert!(!verdict.has_drift());
+    assert_eq!(verdict.exit_code(), 0);
+}
+
+#[test]
+fn a_conflict_alongside_ordinary_drift_reports_both() {
+    let verdict = DriftVerdict::evaluate(
+        &defaults(),
+        &[diff(DiffAction::Modify), diff(DiffAction::Delete)],
+        &[],
+        &[spec_owned(true), spec_owned(false)],
+    );
+
+    assert!(verdict.managed_modified);
+    assert!(verdict.managed_deleted);
+    assert!(verdict.spec_conflicts);
+    assert_eq!(verdict.reasons().len(), 3, "{:?}", verdict.reasons());
+}
+
+#[test]
+fn ordinary_categories_still_honor_their_flags() {
+    let muted = DriftVerdict::evaluate(
+        &all_muted(),
+        &[diff(DiffAction::Add), diff(DiffAction::Delete)],
+        &[unmanaged()],
+        &[],
+    );
+    assert!(!muted.has_drift(), "{muted:?}");
+    assert_eq!(muted.exit_code(), 0);
+
+    let unmuted = DriftVerdict::evaluate(
+        &DriftAlertOn {
+            managed_modified: true,
+            managed_deleted: true,
+            unmanaged_added: true,
+        },
+        &[diff(DiffAction::Add)],
+        &[unmanaged()],
+        &[],
+    );
+    assert!(unmuted.managed_modified, "Add counts as modified-or-added");
+    assert!(unmuted.unmanaged_added);
+    assert_eq!(unmuted.exit_code(), DRIFT_EXIT_CODE);
 }

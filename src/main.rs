@@ -1104,20 +1104,23 @@ async fn cmd_diff(
     // Honor drift_alert_on flags so operators can selectively suppress
     // categories (e.g. a noisy staging env where only destructive changes
     // should alert). Only categories with their flag set contribute to the
-    // drift decision.
-    let alert = &resolved.ownership.drift_alert_on;
-    let managed_modify_or_add = diffs
-        .iter()
-        .any(|d| matches!(d.action, diff::DiffAction::Modify | diff::DiffAction::Add));
-    let managed_delete = diffs
-        .iter()
-        .any(|d| matches!(d.action, diff::DiffAction::Delete));
-    let has_drift = (alert.managed_modified && managed_modify_or_add)
-        || (alert.managed_deleted && managed_delete)
-        || (alert.unmanaged_added && !unmanaged.is_empty());
+    // drift decision — except an API-spec ownership conflict, which has no
+    // flag because `apply` blocks the namespace over it. See
+    // `gitforgeops::verdict::DriftVerdict`.
+    let drift = verdict::DriftVerdict::evaluate(
+        &resolved.ownership.drift_alert_on,
+        &diffs,
+        &unmanaged,
+        &spec_owned,
+    );
 
-    if exit_on_drift && has_drift {
-        process::exit(2);
+    if exit_on_drift && drift.has_drift() {
+        println!(
+            "Drift detected ({}); exiting {}.",
+            drift.reasons().join(", "),
+            verdict::DRIFT_EXIT_CODE
+        );
+        process::exit(drift.exit_code());
     }
 
     Ok(())

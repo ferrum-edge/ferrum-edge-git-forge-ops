@@ -160,6 +160,12 @@ jobs:
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Check drift
+        # Exit codes: 0 in sync, 2 drift, 1 the run itself failed (unreachable
+        # gateway, cached backup, bad configuration). The step fails the job on
+        # any non-zero exit, so both 1 and 2 surface — the distinction is for
+        # whoever reads the log. Drift includes API-spec ownership conflicts,
+        # which no `ownership.drift_alert_on` flag can mute because `apply`
+        # blocks the namespace over them.
         if: steps.deployment-mode.outputs.mode == 'api'
         env:
           FERRUM_ENV: ${{ matrix.environment }}
