@@ -15,7 +15,7 @@ pub enum OwnershipMode {
     Shared,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriftAlertOn {
     #[serde(default = "default_true")]
@@ -24,6 +24,21 @@ pub struct DriftAlertOn {
     pub managed_deleted: bool,
     #[serde(default)]
     pub unmanaged_added: bool,
+}
+
+// `#[serde(default)]` on the `drift_alert_on` field uses this impl when the
+// whole block is absent, so it must agree with the per-field serde defaults
+// above. A derived `Default` (all `false`) silently muted managed-modified
+// and managed-deleted alerts for every config that declared `ownership:`
+// without spelling out `drift_alert_on:`.
+impl Default for DriftAlertOn {
+    fn default() -> Self {
+        Self {
+            managed_modified: true,
+            managed_deleted: true,
+            unmanaged_added: false,
+        }
+    }
 }
 
 fn default_true() -> bool {
