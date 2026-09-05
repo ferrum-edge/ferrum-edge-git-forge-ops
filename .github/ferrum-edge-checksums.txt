@@ -15,3 +15,4 @@
 #   bash .github/scripts/refresh-ferrum-edge-pin.sh --append
 db496ec730d4ec6bf7c03eff21649ba859e236356d843c37da9700c28215dfdb  ferrum-edge-linux-x86_64  # 2026-09-02T03:02:29Z release latest
 fcc61174ddbc9a8b7669f3496c3c84e1cdfa7c7d0a9d1c3c3cc481f9b421c127  ferrum-edge-linux-x86_64  # 2026-09-02T21:24:55Z release latest
+cb797e2210d1f75b4c67f40ab41fe53b6ad98e0fbc830de09c7f2264abe9f59d  ferrum-edge-linux-x86_64  # 2026-09-05T03:37:48Z release latest

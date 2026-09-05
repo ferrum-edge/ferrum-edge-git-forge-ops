@@ -1,3 +1,12 @@
+# SET UP YOUR OWN COPY: replace @jeremyjpj0916 everywhere below with your own
+# maintainers — one or more `@user` handles, or `@org/team` slugs for an
+# organization. Every line must name the SAME set of owners, because
+# `.github/scripts/check_agent_setup.py` reads the expected set from the
+# `/.github/CODEOWNERS` rule near the bottom of this file and then requires
+# every other protected path to match it exactly. A one-line change here is
+# therefore visible on every protected path, and it needs a review from the
+# owners this file currently names.
+#
 # Require a repository administrator to review changes to launch trust
 # boundaries. The main ruleset must enable `require_code_owner_review` for
 # this file to become an enforced control.
