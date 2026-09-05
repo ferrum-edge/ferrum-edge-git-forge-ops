@@ -39,6 +39,17 @@ REQUIRED_STATUS_CHECKS = (
 
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 
+# `settings-audit.yml` binds this environment so its administration-read token
+# is released only to a job running from the protected default branch. It is
+# not a deployment target: nothing applies to a gateway through it and it holds
+# no gateway credential, so it is exempt from the reviewer and self-review rules
+# (a reviewer would park every scheduled run in "waiting for approval", which is
+# exactly the silently-stopped audit the workflow exists to prevent) and it does
+# not satisfy the at-least-one-protected-environment requirement. Its branch
+# policy is audited like any other environment's — that restriction is the whole
+# point of moving the token here.
+SETTINGS_AUDIT_ENVIRONMENT = "settings-audit"
+
 # A template repository is the copy customers clone from. It has no deployment
 # environments and no state-writer App, because nothing on it ever applies to a
 # gateway or commits an ownership ledger. Those two controls are therefore not
@@ -261,17 +272,28 @@ def audit_environment(audit: Audit, repo: str, environment: dict, branch: str) -
     rules = detail.get("protection_rules", [])
     reviewer_rules = [rule for rule in rules if rule.get("type") == "required_reviewers"]
     has_reviewers = any(rule.get("reviewers") for rule in reviewer_rules)
-    audit.require(
-        has_reviewers,
-        f"environment {name!r} must require at least one reviewer",
-    )
-    prevents_self_review = any(
-        rule.get("prevent_self_review") is True for rule in reviewer_rules
-    )
-    audit.require(
-        prevents_self_review,
-        f"environment {name!r} must prevent self-review",
-    )
+    # The settings-audit environment gates a read-only token, not a deployment.
+    # Requiring a reviewer there would hold every scheduled run for approval and
+    # produce the silently-stopped audit this whole control exists to prevent.
+    # Its branch policy is still audited below.
+    if name == SETTINGS_AUDIT_ENVIRONMENT:
+        audit.evidence.append(
+            f"environment {name}: reviewer rules waived (gates the "
+            "administration-read audit token, deploys nothing)"
+        )
+        has_reviewers = True
+    else:
+        audit.require(
+            has_reviewers,
+            f"environment {name!r} must require at least one reviewer",
+        )
+        prevents_self_review = any(
+            rule.get("prevent_self_review") is True for rule in reviewer_rules
+        )
+        audit.require(
+            prevents_self_review,
+            f"environment {name!r} must prevent self-review",
+        )
 
     policy = detail.get("deployment_branch_policy") or {}
     branch_limited = policy.get("protected_branches") is True
@@ -359,9 +381,26 @@ def run(
         for item in page.get("environments", [])
         if isinstance(item, dict)
     ]
+    names = {
+        item.get("name") for item in listed if isinstance(item.get("name"), str)
+    }
+    # A template repository has no deployment environment, but it still runs the
+    # settings audit, so it still needs the environment that holds the audit
+    # token — in both modes.
+    audit.require(
+        SETTINGS_AUDIT_ENVIRONMENT in names,
+        f"repository must define the {SETTINGS_AUDIT_ENVIRONMENT!r} environment; "
+        "settings-audit.yml binds it so the administration-read token is "
+        "released only to the protected default branch",
+        f"audit-token environment {SETTINGS_AUDIT_ENVIRONMENT} present",
+    )
     if not template_repo:
+        # The audit-token environment is not a deployment target, so it cannot
+        # be the one protected environment a deployment repository is required
+        # to have.
         audit.require(
-            bool(listed), "repository must define at least one protected environment"
+            bool(names - {SETTINGS_AUDIT_ENVIRONMENT}),
+            "repository must define at least one protected environment",
         )
     for environment in listed:
         audit_environment(audit, repo, environment, branch)

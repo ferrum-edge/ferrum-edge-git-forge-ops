@@ -170,6 +170,24 @@ Workflows run as a matrix over `gitforgeops envs --format json`, binding
 groups serialize per-env applies so two concurrent writes to the same
 environment never interleave.
 
+#### Freshness guard (the lock does not move the checkout)
+
+`ferrum-apply-<env>` serializes `apply-on-merge.yml` and `rotate.yml`, but
+`actions/checkout` still selects the *triggering* commit, so a queued run would
+reconcile against a `.state/<env>.json` that predates the ledger the run ahead
+of it publishes — and shared mode reads rows it never saw as "never managed".
+Both workflows therefore check out `ref: <default_branch>` with `fetch-depth: 0`
+and then, in a **`Refresh protected branch and reject stale deployments`** step
+that runs before any build or gateway call: re-fetch the branch, `git checkout
+--force -B <branch> refs/remotes/origin/<branch>` (stay on the branch — the
+ledger commit later pushes it), print the triggering SHA and the branch head,
+and fail closed unless `git merge-base --is-ancestor` puts the trigger inside
+that head. Binary, desired state and ledger then all come from one commit;
+`GITHUB_SHA` for the apply is that refreshed head, matching
+`state.last_applied_commit`. PR attribution (override label, credential
+recipient) stays on the triggering merge. `check_supply_chain.py::
+stale_deployment_guard_violations` enforces the shape and the step ordering.
+
 ### Ownership modes
 
 Configured per environment in repo config.
@@ -179,6 +197,32 @@ Configured per environment in repo config.
   *unmanaged* and left alone. `full_replace` is rejected in this mode.
 - **`exclusive`**: repo is authoritative for the listed `namespaces`. Unmanaged
   resources get pruned. Required for `full_replace`.
+
+#### Adoption of already-matching rows
+
+A declared resource identical to its live row yields no diff entry, so no
+operation would ever record ownership of it — the ledger stayed empty, the row
+sat outside the shared-mode delete fence, and removing it from the repo pruned
+nothing. `apply::api_target::adoption_candidates` / `adopt_matching_rows` close
+that: at the end of an incremental apply, every declared `(namespace, kind, id)`
+that is live, exactly as declared, untouched by an operation this run, absent
+from `ApplyOptions::managed_ledger`, and not `api_spec_id`-tagged is claimed and
+recorded (`ApplyResult::adopted`, replayed through `StateFile::record_op`).
+
+- **shared** issues the same idempotent PUT the pending-create recovery uses —
+  equality is not provenance. The PUT runs only against a *fresh* `GET /backup`,
+  so a row edited between diff and assertion is skipped with a per-resource
+  message (`ApplyResult::adoption_skipped`) instead of being overwritten.
+- **exclusive** records without any PUT (already authoritative; the entry keeps
+  the fence correct if the env is later switched to `shared`).
+- **file mode** is unchanged — `StateFile::record` stamps the whole desired set.
+- **full_replace** needs none: `record_full_replace` rebuilds the namespace.
+
+Never adopt from a cached (`X-Data-Source: cached`) backup — it clears
+`api_spec_id` tags — and never adopt a spec-owned row. A failed adoption PUT
+records nothing and lands in `ApplyResult::errors`. `apply` prints
+`adoption_summary_line` plus per-resource lines; the interactive preview lists
+`ADOPT <Kind> <id>` and no longer reports "No changes to apply."
 
 The state file is the trust boundary for both of those, and it is CI-authored:
 `apply-on-merge.yml` / `rotate.yml` commit `.state/<env>.json` back to `main`
@@ -373,7 +417,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
 - `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs`, `best_practice.rs`
-- `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
+- `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
 - `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
