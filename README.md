@@ -1,6 +1,6 @@
 # Ferrum Edge GitForgeOps
 
-GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge) gateway configuration via pull requests. Fork, configure, and get a full multi-environment pipeline: PR-based submission, policy-aware review, scoped apply, credential brokering, and drift monitoring — **without** leaving GitHub's free tier and **without** any third-party secret manager.
+GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge) gateway configuration via pull requests. This repository is a template: copy it, configure it, and get a full multi-environment pipeline — PR-based submission, policy-aware review, scoped apply, credential brokering, and drift monitoring — **without** leaving GitHub's free tier and **without** any third-party secret manager. Start at [Set up your own repository](#set-up-your-own-repository).
 
 ## Headline features
 
@@ -12,27 +12,244 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
 - **Drift detection with awareness of ownership** — scheduled comparisons surface changes on both sides, filtering the noise based on the env's configured mode.
 - **Free-tier only** — GitHub Secrets, GitHub Environments, GitHub Actions, GitHub API. No Vault, no AWS, no 1Password required.
 
-## Quick start
+## Set up your own repository
 
-1. Fork this repo.
-2. **Create a GitHub Environment per deployment target** (Settings → Environments → New). Name it whatever you want to call the environment — e.g. `staging`, `production`. Add its scoped secrets: `FERRUM_GATEWAY_URL`, `FERRUM_ADMIN_JWT_SECRET`, and any TLS material. Before launch, required reviewers, self-review prevention, and a protected-`main` deployment policy are mandatory; see step 6.
-3. **Declare those environments in `.gitforgeops/config.yaml`** — see `.gitforgeops/config.example.yaml`. The file carries overlay names and ownership modes; it does *not* carry any secret or URL.
-4. Add resources under `resources/<namespace>/{proxies,consumers,upstreams,plugins}/*.yaml` (and, for a service mesh, `resources/<namespace>/mesh/*.yaml`).
-5. **Create the two override labels** — they do not exist by default, and labels are not copied when you fork:
+This repository is a **template**. GitHub copies the files, never the settings:
+rulesets, Actions policy, environments, secrets, variables, and labels all stay
+behind, so every step below runs against *your* repository. Work through them in
+order — deep detail for each control lives in
+[GitHub launch controls](docs/github-launch-controls.md), which
+`bootstrap_repo_settings.py` (step 5) automates.
+
+1. **Create the repository from the template.** On the upstream repository page
+   choose **Use this template → Create a new repository**, or:
 
    ```bash
-   gh label create gitforgeops/policy-override --color B60205 --description "Bypass blocking policy violations on this PR (requires write permission)"
+   gh repo create acme/gateway-config \
+     --template ferrum-edge/ferrum-edge-git-forge-ops --private
    ```
+
+   A fork works too, but prefer the template: a fork's pull requests default to
+   targeting *this* upstream repository, and GitHub disables scheduled workflows
+   on forks — which silently switches off drift detection, the settings audit,
+   and the validator-pin canary.
+
+2. **Enable Actions and the scheduled workflows.** Settings → Actions → General
+   → **Allow all actions and reusable workflows** for now; step 5 narrows it to
+   the reviewed allowlist. Then open the **Actions** tab: a fork shows *"Workflows
+   aren't being run on this forked repository"* and needs
+   **I understand my workflows, go ahead and enable them** before
+   `drift-check.yml`, `settings-audit.yml`, and `validator-pin-canary.yml` will
+   run at all. A template copy starts enabled, but GitHub still disables
+   *schedules* after 60 days without repository activity, so re-enable them from
+   the Actions tab whenever the repository goes quiet.
+
+3. **Put your own maintainers in `.github/CODEOWNERS`.** Replace every
+   `@jeremyjpj0916` with your handles — one or more `@user`, or `@org/team` for
+   an organization. Every line must name the **same** set:
+   `.github/scripts/check_agent_setup.py` reads the expected owners from the
+   `/.github/CODEOWNERS` rule inside the file and then requires each protected
+   path to match it exactly, so the check stays as strong in your copy as it is
+   upstream, and changing it needs a review from the owners it currently names.
 
    ```bash
-   gh label create gitforgeops/state-override --color B60205 --description "Allow this PR to modify the CI-owned .state/ ledger"
+   sed -i '' 's/@jeremyjpj0916/@acme-platform-lead/g' .github/CODEOWNERS   # macOS; drop '' on Linux
+   python3 .github/scripts/check_agent_setup.py
    ```
 
-   Or Settings → Labels → New label. `policy-override` is the escape hatch for blocking policy rules ([Override flow](#override-flow-b2-label--permission)); `state-override` is the one for `state-guard.yml` ([State file trust model](#state-file-trust-model)). GitHub's triage role can apply labels, so neither flow trusts label presence: each checks the actor's current permission is `write`, `maintain`, or `admin`. State authorization succeeds only on the exact override-label webhook for the current head; every push or other PR transition requires a qualified maintainer to remove and reapply it. Rename `policy-override` freely — it is configurable via `overrides.require_label` in `.gitforgeops/policies.yaml`; the state label is intentionally exact.
-6. **Configure the mandatory GitHub launch controls.** Create the contents-only state-writer App, require the state guard and CI checks in an active `main` ruleset, protect release tags and every deployment environment, restrict Actions, and configure the scheduled settings audit. Follow [GitHub launch controls](docs/github-launch-controls.md) before adding production credentials. Forks do not inherit any of these settings.
-7. **Review the validator digest allowlist.** Nothing to configure: `.github/ferrum-edge-checksums.txt` lists the SHA-256 of every `ferrum-edge-linux-x86_64` build this repository has approved, and `install-ferrum-edge.sh` refuses to make the downloaded bytes executable unless their digest is on that list. Upstream republishes a rolling `latest` release, so the daily `validator-pin-canary.yml` opens a tracking issue with the exact line to add when a new build appears. See [Validator digest pinning](#validator-digest-pinning).
-8. Open a PR. The PR-built binary runs static validation without an environment or gateway secrets. A default-branch `workflow_run` then sanitizes only declarative YAML, builds and hashes the protected-branch binary once, waits for environment approval, and posts the live policy/drift/security review for same-repository PRs. Each live job is intersected with the environment's protected namespace scope and fails if comparison is unavailable. Fork PRs remain static-only.
-9. Merge. `apply-on-merge.yml` applies to each environment in parallel (per-env concurrency lock prevents clobbering) and uses the short-lived state-writer App token for its protected ledger commit.
+4. **Create the two override labels.** Labels are not copied by a template or a
+   fork, and both escape hatches key on an exact label name. Step 5 creates them
+   for you; by hand it is Settings → Labels → New label, or:
+
+   ```bash
+   gh label create gitforgeops/policy-override --color B60205 \
+     --description "Bypass blocking policy violations on this PR (requires write permission)"
+   gh label create gitforgeops/state-override --color B60205 \
+     --description "Allow this PR to modify the CI-owned .state/ ledger"
+   ```
+
+   `policy-override` releases blocking policy rules ([Override flow](#override-flow-b2-label--permission));
+   `state-override` releases `state-guard.yml` ([State file trust model](#state-file-trust-model)).
+   Neither trusts label presence alone — each re-checks that the actor's current
+   repository permission is `write`, `maintain`, or `admin`, because GitHub's
+   triage role can apply labels. Rename `policy-override` freely
+   (`overrides.require_label` in `.gitforgeops/policies.yaml`); the state label
+   is intentionally exact.
+
+5. **Apply the launch controls.** `bootstrap_repo_settings.py` writes the whole
+   settings baseline — Actions permissions and the third-party allowlist,
+   read-only workflow tokens, secret scanning and push protection, private
+   vulnerability reporting, Dependabot alerts and security updates, the `main`
+   and `release-tags` rulesets, the two labels, and your deployment environments.
+   It is idempotent and **prints a plan without writing** unless you pass
+   `--apply`, so run it as often as you like:
+
+   ```bash
+   export GH_TOKEN=$(gh auth token)          # an account with admin on the repo
+   python3 .github/scripts/bootstrap_repo_settings.py --repo acme/gateway-config
+   python3 .github/scripts/bootstrap_repo_settings.py --repo acme/gateway-config --apply
+   ```
+
+   Every control reports `CREATE`, `UPDATE` or `UNCHANGED`, with the exact field
+   difference under each `UPDATE`. Come back and re-run it after steps 6 and 7,
+   once you have an App id and a `.gitforgeops/config.yaml`:
+
+   ```bash
+   python3 .github/scripts/bootstrap_repo_settings.py --repo acme/gateway-config \
+     --state-writer-app-id 123456 --reviewer acme-sre-lead --reviewer-team acme/sre --apply
+   ```
+
+   It never accepts or prints a secret value; it ends by listing the exact
+   `gh secret set` commands left for you (steps 6, 9 and 11). To do all of this
+   by hand instead, follow [GitHub launch controls](docs/github-launch-controls.md)
+   §1–§5.
+
+6. **Create the state-writer GitHub App.** `apply-on-merge.yml` and `rotate.yml`
+   commit `.state/<env>.json` back to a protected `main`; a direct push by
+   `github-actions[bot]` is correctly rejected, so they mint a short-lived
+   installation token instead. Your account's (or your organization's)
+   Settings → Developer settings → GitHub Apps → **New GitHub App**, with
+   **Contents: read and write** as its only write permission, no webhook, and
+   repository access limited to this repository.
+   Install it, note the numeric **App ID**, and generate a private key. Then:
+
+   ```bash
+   gh variable set GITFORGEOPS_STATE_APP_ID --repo acme/gateway-config --body 123456
+   gh secret set GITFORGEOPS_STATE_APP_PRIVATE_KEY --repo acme/gateway-config \
+     --env production < app-private-key.pem        # repeat per environment
+   ```
+
+   Make the App the `main` ruleset's **sole always-on bypass** — passing
+   `--state-writer-app-id` in step 5 does exactly that. A solo maintainer has a
+   second problem: the ruleset requires an approving review and there is nobody
+   to give one. The workaround is a second bypass actor, the **Repository Admin**
+   role in `pull_request` mode (what step 5 configures when you omit the flag),
+   merging with `gh pr merge --admin`. The settings audit reports that as a
+   violation — it requires exactly one bypass actor, the App, in `always` mode —
+   so it is a deliberate, visible deviation, not a supported configuration. The
+   App itself is not optional either way: apply and rotate fail their preflight
+   without it.
+
+7. **Declare your environments in `.gitforgeops/config.yaml`.** Copy the example
+   and replace its entries with your real deployment targets. The file carries
+   overlay names, apply strategies, and ownership modes — never a URL, a secret
+   name, or a credential. Names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`
+   and must equal the GitHub Environment names in step 8. Set `live_review: false`
+   on any environment with no reachable Admin API.
+
+   ```bash
+   cp .gitforgeops/config.example.yaml .gitforgeops/config.yaml
+   ```
+
+   See [Repo configuration](#repo-configuration-gitforgeopsconfigyaml). Every
+   overlay an entry selects must exist under `overlays/`, even if it is empty.
+
+8. **Create one GitHub Environment per entry.** Settings → Environments → New
+   environment, then for each: at least one **required reviewer**, **prevent
+   self-review**, and deployment branches limited to **protected branches** (or
+   an exact custom rule for `main`). Re-running step 5 with `--reviewer` /
+   `--reviewer-team` does all three and reads the environment list straight out
+   of `.gitforgeops/config.yaml`. Delete every GitHub Environment the config does
+   *not* declare, including the `default` one GitHub creates on some repositories:
+   the settings audit holds **every** listed environment to these rules.
+
+9. **Add the per-environment secrets.** Settings → Environments → *name* →
+   Environment secrets, or `gh secret set NAME --env <name>`:
+
+   | Secret | Required | Notes |
+   |---|---|---|
+   | `FERRUM_GATEWAY_URL` | api mode | Must be `https://`; other schemes and `user:password@` URLs are refused at startup |
+   | `FERRUM_ADMIN_JWT_SECRET` | api mode | HS256 signing key, **at least 32 characters** |
+   | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | yes | From step 6 |
+   | `FERRUM_GH_PROVISIONER_TOKEN` | credential broker | App installation token, or a fine-grained PAT with `Secrets: write` + `Environments: write` |
+   | `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` | optional | base64 PEM; mTLS needs **both** cert and key |
+
+   You do **not** create `FERRUM_CREDS_BUNDLE[_N]`. The broker writes them itself:
+   the first apply that meets an `alloc=generate` (or `alloc=rotate`) placeholder
+   generates the value, libsodium-seals it, and `PUT`s the bundle to the
+   environment's secrets — which creates the secret if it is absent. That path
+   needs `FERRUM_GH_PROVISIONER_TOKEN`. The exception is `alloc=require`, which is
+   never generated: those values must already be in a bundle, which is what
+   `import --credential-bundle-output` produces when you adopt an existing
+   gateway. See [Credential broker](#credential-broker-gh-env-secret-placeholders).
+
+10. **Optionally add `.gitforgeops/policies.yaml`.** Every rule defaults to
+    `enabled: false`, so this file is only worth adding when you want to enforce
+    something — timeout bands, TLS-only backends, required auth plugins, WAF or
+    AI guardrails. Copy `.gitforgeops/policies.example.yaml` and turn on what you
+    need; `severity: error` blocks `apply` until a write-permission user adds the
+    override label. See [Policy framework](#policy-framework-gitforgeopspoliciesyaml).
+
+11. **Add `SETTINGS_AUDIT_TOKEN`.** A fine-grained PAT or read-only App token with
+    **Administration: read**, stored as a *repository* secret. `settings-audit.yml`
+    runs weekly from the default branch and re-checks everything step 5 applied;
+    without the token it fails closed.
+
+    ```bash
+    gh secret set SETTINGS_AUDIT_TOKEN --repo acme/gateway-config
+    ```
+
+12. **Take on the validator pin refresh.** `.github/ferrum-edge-checksums.txt`
+    lists the SHA-256 of every approved `ferrum-edge` build, and the installer
+    refuses to execute bytes that are not on it. Upstream republishes one rolling
+    `latest` release, so the pin goes stale on upstream's schedule.
+    `validator-pin-canary.yml` runs daily and opens (or updates) a single tracking
+    issue with the line to add. To refresh, review the upstream build, then
+    `bash .github/scripts/refresh-ferrum-edge-pin.sh --append` and merge through
+    normal CODEOWNER review — **keeping the previous line**, so in-flight pull
+    requests running the older binary stay green. See
+    [Validator digest pinning](#validator-digest-pinning).
+
+13. **Add resources and open the first pull request.** Files go under
+    `resources/<namespace>/{proxies,consumers,upstreams,plugins}/*.yaml`, plus
+    `resources/<namespace>/mesh/*.yaml` for a service mesh, with environment
+    deltas in `overlays/<name>/`. The PR-built binary runs static validation with
+    no environment binding and no gateway secret. A default-branch `workflow_run`
+    then sanitizes the declarative YAML, builds and hashes the protected-branch
+    binary, waits for environment approval, and posts the live review comment:
+    validation result, adds/modifies/deletes, breaking changes, security findings,
+    best-practice notes, unmanaged and spec-owned resources, policy violations,
+    and credential slot status. Pull requests from forks stay static-only. See
+    [PR review output](#pr-review-output).
+
+14. **Merge, and watch the first apply.** `apply-on-merge.yml` runs a matrix over
+    your environments, each binding its GitHub Environment (so reviewers and
+    branch policy apply), and serializes per-environment applies through a
+    concurrency group. The **first** apply has no `.state/<env>.json`, so in
+    `shared` mode every live resource counts as unmanaged: the run prints a loud
+    warning, adds and modifies what you declared, and deletes **nothing**. The
+    ledger it commits afterwards — as the state-writer App — is what makes later
+    deletions possible. See [First-apply behavior](#first-apply-behavior).
+
+15. **Optionally publish your own image.** `release.yml` publishes only on the
+    upstream repository, or where repository variable
+    `GITFORGEOPS_RELEASE_ENABLED=true` opts in. Everyone else consumes the
+    published image and skips the build. To publish your own, set that variable,
+    point `DOCKERHUB_IMAGE` at a namespace you can push to, and add the
+    `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repository secrets. See
+    [Publishing your own image](#publishing-your-own-image).
+
+16. **Verify the trust split.** Before connecting production, walk the seven
+    checks in
+    [GitHub launch controls §7](docs/github-launch-controls.md#7-verify-the-trust-split):
+    a same-repository PR gets secretless static validation, the trusted review is
+    environment-gated and namespace-scoped, a fork PR gets static review only, a
+    `build.rs` or a symlink cannot cross the artifact boundary, and an ordinary
+    direct push to `main` is rejected while the App's ledger commit is not.
+
+### Day-2 duties
+
+- **Refresh the validator pin** when the canary opens its issue (step 12).
+- **Merge the Dependabot pull requests.** They carry the Action, Rust crate, and
+  container base updates that `check_supply_chain.py` insists stay pinned.
+- **Watch the settings audit.** It runs weekly, but GitHub disables schedules on
+  a quiet repository — dispatch it by hand from the Actions tab now and then, or
+  re-run `bootstrap_repo_settings.py` without `--apply` to see the same drift as
+  a local diff.
+- **Rotate credentials deliberately.** Use the `rotate.yml` workflow rather than
+  editing or reordering a credential array; entry position is the broker's slot
+  identity. See [Rotation](#rotation) and
+  [Hazard: entry position is the slot identity](#hazard-entry-position-is-the-slot-identity).
 
 ## Repository layout
 
@@ -284,7 +501,7 @@ Both of those make sense only because the ledger is **CI-authored**. `apply-on-m
 That trust is enforced at the boundary, not inside the binary:
 
 - **`state-guard.yml` fails any PR that touches or renames a path from `.state/**`.** It runs on `pull_request_target`, so the guard executing is always the one `main` reviewed — under `pull_request` a single commit could both forge a ledger entry and delete the check that rejects it. That trigger is safe here only because the job never checks out the pull request: changed files, labels, and collaborator permission all come from `gh api`, and its one piece of executable logic is checked out from the default branch. A hand-edited ledger is a privilege escalation — forged entries name live resources as previously managed, and the next post-merge apply deletes them. GitHub caps changed-file enumeration at 3,000 entries, so observing 3,000 files is conservatively treated as incomplete rather than becoming a silent truncation. Deliberate repairs and intentionally reviewed oversized PRs need the exact `gitforgeops/state-override` label. Authorization succeeds only while processing that exact `labeled` webhook for the current head; every later push, retarget, reopen, or other configured PR event fails until a qualified maintainer removes and reapplies it. Re-running the same authorized label event remains bound to the same event actor and head. The guard queries that event actor's current permission, rejects triage/read/deleted/unknown actors and API ambiguity, and records actor, permission, authorized head, run ID, and attempt in the job summary. Push, label, and unlabel events rerun the check under per-PR concurrency so stale or removed authorization cannot leave an older successful run authoritative.
-- **`.state/*.json` is tracked in git; locks and temp files are not.** If you fork this repo, keep the `.gitignore` entries as shipped. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
+- **`.state/*.json` is tracked in git; locks and temp files are not.** Keep the `.gitignore` entries as shipped in your own copy. Ignoring `.state/` makes the workflows' `git add` a no-op, the ledger never lands on `main`, and every apply starts from an empty ledger — shared mode then treats the whole gateway as unmanaged and silently stops deleting anything.
 - **Apply runs post-merge only**, so a poisoned ledger has to survive review and land on `main` before it can act.
 - **The guard must be a required status check before launch.** The state-writer GitHub App is the sole ruleset bypass and receives only short-lived `Contents: write` installation tokens. See [GitHub launch controls](docs/github-launch-controls.md).
 
@@ -922,8 +1139,8 @@ runner's own machine.
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_GATEWAY_MODE` | `api` | `api` = push via Admin API, `file` = assemble flat YAML. Values are trimmed/case-folded; every other present value fails the workflow preflight before credentials or binaries are loaded. |
-| `GITFORGEOPS_RELEASE_ENABLED` | `false` (on forks) | Opt a fork into running the `release` workflow. Upstream always publishes regardless. |
-| `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Where the `release` workflow pushes on Docker Hub. Only matters if `GITFORGEOPS_RELEASE_ENABLED=true`. GHCR path is auto-derived from the repo. |
+| `GITFORGEOPS_RELEASE_ENABLED` | unset | Opt this repository into running the `release` workflow. It publishes unconditionally only on the upstream repository `ferrum-edge/ferrum-edge-git-forge-ops`; every template copy and fork needs this variable set to `true`. |
+| `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Where the `release` workflow pushes on Docker Hub. Only matters if `GITFORGEOPS_RELEASE_ENABLED=true`; point it at a namespace you can push to. GHCR path is auto-derived from the repo. |
 
 These are GitHub **Variables** because the workflow YAML reads them through `vars.*`. Runtime knobs such as `FERRUM_NAMESPACE`, `FERRUM_TLS_NO_VERIFY`, and timeout/retry settings are normal process environment variables; set them locally, or explicitly pass them through if you customize the bundled workflows.
 
@@ -945,11 +1162,11 @@ are errors.
 Mode and boolean names are trimmed and case-insensitive; accepted booleans are
 `true`, `false`, `1`, and `0`.
 
-### Docker Hub secrets (upstream maintainers / forks publishing their own image only)
+### Docker Hub secrets (only when publishing your own image)
 
-**Forks don't need these.** The `release` workflow is gated; forks consume the already-published `ferrumedge/ferrum-edge-git-forge-ops` image and skip the build.
+**You probably don't need these.** The `release` workflow runs unconditionally only on the upstream repository; a template copy or fork consumes the already-published `ferrumedge/ferrum-edge-git-forge-ops` image and skips the build entirely.
 
-Required only if you're the upstream maintainer, or if your fork has opted in via `GITFORGEOPS_RELEASE_ENABLED=true`:
+Required only if you're the upstream maintainer, or if your repository has opted in via `GITFORGEOPS_RELEASE_ENABLED=true`:
 
 | Secret | Description |
 |---|---|
@@ -1267,14 +1484,14 @@ it expires the security job fails on every run, so the gate warns 21 days
 ahead. See
 [Dependency security policy](docs/dependency-security.md).
 
-### Publishing your own fork's image
+### Publishing your own image
 
-If you'd rather not depend on the upstream image (air-gapped env, vendored build, divergent customizations), your fork can publish its own:
+If you'd rather not depend on the upstream image (air-gapped env, vendored build, divergent customizations), your repository can publish its own. Both `release.yml` jobs are gated on `github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'`, so nothing is published from a copy until you opt in — a "Use this template" copy is not a fork, and a fork test would have every customer repository attempt a push to the upstream Docker Hub namespace:
 
 1. Create a Docker Hub repo you can push to (e.g. `acme/ferrum-edge-git-forge-ops`).
 2. Set repo secrets `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN`.
 3. Set repo variables:
-   - `GITFORGEOPS_RELEASE_ENABLED=true` — opts the fork into running `release.yml`.
+   - `GITFORGEOPS_RELEASE_ENABLED=true` — opts this repository into running `release.yml`.
    - `DOCKERHUB_IMAGE=acme/ferrum-edge-git-forge-ops` — where to push on Docker Hub. GHCR path auto-derives from the repo.
 4. Push to `main` — `release.yml` builds + pushes to Docker Hub and GHCR.
 
