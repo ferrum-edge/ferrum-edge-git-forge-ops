@@ -7,10 +7,11 @@
 
 use std::collections::HashSet;
 
+use gitforgeops::apply::AppliedOp;
 use gitforgeops::config::repo_config::{OwnershipConfig, OwnershipMode};
 use gitforgeops::config::schema::{BackendScheme, GatewayConfig, Proxy};
 use gitforgeops::config::{ApplyStrategy, ResolvedEnv};
-use gitforgeops::diff::state_key;
+use gitforgeops::diff::{state_key, DiffAction};
 use gitforgeops::reconcile::{previously_managed, resolved_namespaces};
 use gitforgeops::state::StateFile;
 
@@ -106,6 +107,44 @@ fn desired_with(namespaces: &[&str]) -> GatewayConfig {
         cfg.proxies.push(proxy(&format!("p{i}"), ns));
     }
     cfg
+}
+
+/// Issue #129. Adoption is the only thing that puts an already-matching row
+/// into the ledger, and the ledger is what keeps its namespace reconcilable
+/// once the repository stops declaring anything there. Without the adoption
+/// record the namespace has no key at all, so removing its last resource file
+/// drops it out of scope and orphans the live row on the gateway forever.
+#[test]
+fn an_adopted_row_keeps_its_namespace_in_scope_after_the_last_declaration_goes() {
+    let resolved = env(OwnershipMode::Shared, None);
+    let declared = desired_with(&["foo"]);
+    let mut ledger = StateFile::default();
+
+    // Nothing declared and nothing recorded: `foo` is not reconciled at all.
+    assert!(resolved_namespaces(&resolved, &GatewayConfig::default(), &ledger).is_empty());
+
+    // The apply adopted `foo`'s already-matching proxy.
+    ledger
+        .record_op(
+            &AppliedOp {
+                kind: "Proxy".to_string(),
+                namespace: "foo".to_string(),
+                id: "p0".to_string(),
+                action: DiffAction::Modify,
+            },
+            &declared,
+        )
+        .expect("recording an adopted row");
+
+    // A later PR removes the file. The namespace stays in scope and the row is
+    // inside the delete fence, so the next apply prunes it.
+    assert_eq!(
+        resolved_namespaces(&resolved, &GatewayConfig::default(), &ledger),
+        vec!["foo".to_string()]
+    );
+    assert!(previously_managed(&resolved, &ledger)
+        .expect("shared mode has a fence")
+        .contains(&state_key("foo", "Proxy", "p0")));
 }
 
 /// The orphan-cleanup guarantee: a PR that removes the last resource from a

@@ -255,6 +255,21 @@ Choose this for production or regulated environments where git is the single sou
 
 In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. Adds enter the pending-create journal immediately before the first create POST and enter the ownership ledger only after a successful response, or after an exact authoritative readback followed by an idempotent PUT that declares the repository as the row's writer. A process failure therefore leaves a recoverable journal entry, never unproven deletion authority.
 
+A resource the repository declares that *already matches* its live row is the case a diff cannot express: there is nothing to add and nothing to modify, so no operation would ever have recorded ownership of it. Those rows are **adopted** instead, as an explicit step at the end of an incremental apply.
+
+### Adoption of already-matching resources
+
+An adoption candidate is a repository-declared `(namespace, kind, id)` that is live, byte-for-byte as declared, untouched by any operation in this run, absent from the ownership ledger, and not tagged `api_spec_id`. What happens next depends on the mode:
+
+- **`shared`** — the row is claimed with the same idempotent PUT the pending-create recovery uses. Equality is not provenance: an administrator may have created the identical row, and recording ownership on the strength of a match alone would hand the repository deletion authority over somebody else's resource. The PUT makes the repository the row's last writer, which is a claim the gateway acknowledged. Because that PUT overwrites the row, it is issued only against a **freshly re-read authoritative backup**; a row that changed between this run's diff and the assertion is skipped with a per-resource message and stays unclaimed, so a concurrent human edit is never silently reverted. The next apply reconciles it as an ordinary Modify.
+- **`exclusive`** — nothing is written. The repository is already authoritative for the namespace, so there is no claim to make; the ledger entry is recorded anyway, so the delete fence is correct if the environment is ever switched to `shared`.
+- **file mode** — unchanged: the atomic file write records the entire desired set.
+- **`full_replace`** — not applicable. `/restore` is atomic per namespace, and a successful restore rebuilds that namespace's ledger entries from `desired` wholesale.
+
+Adoption is reported: `apply` prints `Adopted N already-matching resource(s) into the ledger` plus one line per resource, and the interactive preview lists pending adoptions as `ADOPT <Kind> <id>` rather than reporting "No changes to apply."
+
+Two rules are never relaxed. **Nothing is adopted from a cached (`X-Data-Source: cached`) backup** — that view clears `api_spec_id` tags, so it cannot prove a row is not spec-owned. **Spec-owned rows are never adopted** in either mode: the `/api-specs` importer owns them, and putting one inside the delete fence would let the repository prune a row it must never touch. A failed adoption PUT records nothing and is reported as a per-resource error, so an unclaimed row can never look like a clean apply.
+
 ### State file trust model
 
 `.state/<env>.json` is the ownership ledger, and it is load-bearing twice over:
@@ -1109,6 +1124,17 @@ an empty state file, so the first `diff` reports every live resource as
 *unmanaged* until the first apply records them. That is expected; do not switch
 to `exclusive` (or `full_replace`) until the tree has applied cleanly at least
 once.
+
+An import produces a tree that matches the gateway exactly, so the first apply
+usually has an empty diff. It is still not a no-op: every declared row is
+claimed by the [adoption step](#adoption-of-already-matching-resources) with an
+idempotent PUT and written into `.state/<env>.json`, and the run prints
+`Adopted N already-matching resource(s) into the ledger`. Check that count
+against the import's written total before assuming the migration is finished —
+a row the confirmation read found changed, or one skipped as spec-owned, is
+*not* in the ledger, and shared mode will never prune it when you later delete
+its file. Rows skipped for either reason are named individually in the apply
+output.
 
 ## PR review output
 
