@@ -36,6 +36,12 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      # A template repository — the copy customers clone from — has no
+      # deployment environment and no state-writer App, because nothing on it
+      # applies to a gateway or commits an ownership ledger. Repository
+      # variable `GITFORGEOPS_TEMPLATE_REPO=true` drops exactly those two
+      # checks and leaves the rest of the baseline enforced; the audit says so
+      # in its own evidence output. A deployment repository must not set it.
       - name: Audit repository and deployment protections
         env:
           # Fine-grained PAT or GitHub App token with Administration: read.
@@ -44,13 +50,21 @@ jobs:
           REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           STATE_WRITER_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+          TEMPLATE_REPO: ${{ vars.GITFORGEOPS_TEMPLATE_REPO }}
         run: |
-          python3 .github/scripts/audit_settings.py \
-            --repo "$REPO" \
-            --branch "$DEFAULT_BRANCH" \
-            --state-writer-app-id "$STATE_WRITER_APP_ID" \
-            --required-check 'rust-ci-check' \
-            --required-check 'security-cargo-audit' \
-            --required-check 'security-supply-chain-policy' \
-            --required-check 'state-guard-reject-state-edits' \
+          set -euo pipefail
+          args=(
+            --repo "$REPO"
+            --branch "$DEFAULT_BRANCH"
+            --required-check 'rust-ci-check'
+            --required-check 'security-cargo-audit'
+            --required-check 'security-supply-chain-policy'
+            --required-check 'state-guard-reject-state-edits'
             --required-check 'gitforgeops-required-static-validation'
+          )
+          if [ "$(printf '%s' "${TEMPLATE_REPO:-}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+            args+=(--template-repo)
+          else
+            args+=(--state-writer-app-id "$STATE_WRITER_APP_ID")
+          fi
+          python3 .github/scripts/audit_settings.py "${args[@]}"
