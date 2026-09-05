@@ -88,7 +88,13 @@ def secure_responses():
             ],
         },
         "repos/acme/repo/environments?per_page=100": [
-            {"total_count": 1, "environments": [{"name": "production"}]}
+            {
+                "total_count": 2,
+                "environments": [
+                    {"name": "production"},
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+                ],
+            }
         ],
         "repos/acme/repo/environments/production": {
             "protection_rules": [
@@ -98,6 +104,16 @@ def secure_responses():
                     "reviewers": [{"type": "User", "reviewer": {"login": "maintainer"}}],
                 }
             ],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        },
+        # Fences the administration-read audit token to the protected branch.
+        # No reviewer: it deploys nothing, and one would stall every scheduled
+        # run in "waiting for approval".
+        f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}": {
+            "protection_rules": [],
             "deployment_branch_policy": {
                 "protected_branches": True,
                 "custom_branch_policies": False,
@@ -347,6 +363,84 @@ class SettingsAuditTests(unittest.TestCase):
         self.assertIn("exactly match", rendered)
 
 
+class AuditTokenEnvironmentTests(unittest.TestCase):
+    """`settings-audit` fences a read-only token; it is not a deployment target."""
+
+    def run_audit(self, responses):
+        with patch.object(
+            audit_settings,
+            "gh_json",
+            side_effect=lambda path, paginate=False: responses[path],
+        ):
+            return audit_settings.run(
+                "acme/repo", "main", REQUIRED_CHECKS, 99, "refs/tags/v*"
+            )
+
+    def test_a_reviewerless_audit_environment_passes(self):
+        audit = self.run_audit(secure_responses())
+        self.assertEqual(audit.violations, [])
+        rendered = "\n".join(audit.evidence)
+        self.assertIn("reviewer rules waived", rendered)
+
+    def test_a_missing_audit_environment_fails(self):
+        responses = secure_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {"total_count": 1, "environments": [{"name": "production"}]}
+        ]
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                audit_settings.SETTINGS_AUDIT_ENVIRONMENT in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_the_audit_environment_still_needs_a_branch_policy(self):
+        # The branch restriction is the entire reason the token moved here:
+        # without it a dispatch from any ref would receive it again.
+        responses = secure_responses()
+        responses[
+            f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}"
+        ] = {"protection_rules": [], "deployment_branch_policy": None}
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "restrict deployments" in item
+                and audit_settings.SETTINGS_AUDIT_ENVIRONMENT in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_the_audit_environment_alone_is_not_a_deployment_environment(self):
+        responses = secure_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {
+                "total_count": 1,
+                "environments": [
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT}
+                ],
+            }
+        ]
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "at least one protected environment" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_the_workflow_binds_the_environment_it_audits(self):
+        workflow = (
+            Path(__file__).parents[2] / "workflows" / "settings-audit.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            f"    environment: {audit_settings.SETTINGS_AUDIT_ENVIRONMENT}\n", workflow
+        )
+
+
 class TemplateRepositoryAuditTests(unittest.TestCase):
     """The upstream template has no state-writer App and no environments."""
 
@@ -357,8 +451,15 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
         responses["repos/acme/repo/rulesets/7"]["bypass_actors"] = [
             {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "pull_request"}
         ]
+        # A template has no deployment environment, but it still runs the
+        # settings audit, so it still needs the audit-token environment.
         responses["repos/acme/repo/environments?per_page=100"] = [
-            {"total_count": 0, "environments": []}
+            {
+                "total_count": 1,
+                "environments": [
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT}
+                ],
+            }
         ]
         return responses
 
@@ -409,7 +510,13 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
     def test_template_mode_still_audits_a_listed_environment(self):
         responses = self.template_responses()
         responses["repos/acme/repo/environments?per_page=100"] = [
-            {"total_count": 1, "environments": [{"name": "production"}]}
+            {
+                "total_count": 2,
+                "environments": [
+                    {"name": "production"},
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+                ],
+            }
         ]
         responses["repos/acme/repo/environments/production"] = {
             "protection_rules": [],
@@ -419,6 +526,22 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
         rendered = "\n".join(audit.violations)
         self.assertIn("require at least one reviewer", rendered)
         self.assertIn("prevent self-review", rendered)
+
+    def test_template_mode_still_requires_the_audit_token_environment(self):
+        # A template runs settings-audit.yml too, so the environment that
+        # fences its administration-read token is not optional there.
+        responses = self.template_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {"total_count": 0, "environments": []}
+        ]
+        audit = self.run_audit(responses, template_repo=True)
+        self.assertTrue(
+            any(
+                audit_settings.SETTINGS_AUDIT_ENVIRONMENT in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
 
 
 class SharedConstantTests(unittest.TestCase):

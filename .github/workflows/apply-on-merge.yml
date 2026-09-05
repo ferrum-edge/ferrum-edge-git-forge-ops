@@ -132,10 +132,66 @@ jobs:
             exit 1
           fi
 
+      # The concurrency group above serializes applies per environment, but
+      # `actions/checkout` still selects the commit that TRIGGERED the run. A
+      # merge queued behind a running apply therefore reconciled from a
+      # `.state/<env>.json` that predates the ledger the earlier run publishes
+      # — shared mode reads the rows it never saw as "never managed" and
+      # silently stops reconciling them — and re-running an old workflow
+      # replayed an old desired snapshot over newer configuration. Now that the
+      # lock is held, take the protected branch as it stands at this moment.
       - name: Check out protected main for apply
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.repository.default_branch }}
+          # `git merge-base --is-ancestor` below needs real history. A shallow
+          # clone cannot answer whether the triggering commit is still on the
+          # branch, and "cannot tell" would have to fail closed on every run.
+          fetch-depth: 0
           persist-credentials: false
+
+      # `actions/checkout` resolved the branch when *it* ran, which can be many
+      # minutes before the queue ahead of this job drains. Fetch the ref again,
+      # move onto whatever it points at now, and refuse to deploy a revision
+      # the protected branch no longer carries. Everything downstream — the
+      # gitforgeops binary, the desired resources, the ownership ledger — is
+      # then read from this one commit, so a stale run cannot roll newer
+      # configuration back and cannot reconcile against a superseded ledger.
+      - name: Refresh protected branch and reject stale deployments
+        id: freshness
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TRIGGER_SHA: ${{ github.sha }}
+          FETCH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TRIGGER_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Triggering commit is not a 40-hex object name."
+            exit 1
+          }
+          # The checkout deliberately persisted no credentials, so authenticate
+          # this one fetch with the job's read-only token and drop the header
+          # again on the way out.
+          auth=$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git fetch --no-tags --force origin \
+            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          fresh_head=$(git rev-parse "refs/remotes/origin/${DEFAULT_BRANCH}")
+          # Stay ON the branch rather than detaching: the state commit at the
+          # end of this job pushes it, and a detached HEAD has nothing to push.
+          git checkout --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/${DEFAULT_BRANCH}"
+          echo "Triggering commit: $TRIGGER_SHA"
+          echo "Protected ${DEFAULT_BRANCH} HEAD: $fresh_head"
+          git cat-file -e "${TRIGGER_SHA}^{commit}" 2>/dev/null || {
+            echo "::error::Triggering commit $TRIGGER_SHA is not reachable from ${DEFAULT_BRANCH} at $fresh_head; refusing to apply a revision the protected branch no longer carries."
+            exit 1
+          }
+          git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head" || {
+            echo "::error::Stale deployment: $TRIGGER_SHA is not an ancestor of ${DEFAULT_BRANCH} at $fresh_head. Re-run the apply for the current head instead."
+            exit 1
+          }
+          echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Download ferrum-edge binary
         env:
@@ -214,6 +270,12 @@ jobs:
       # age-encrypted credential delivery to the PR author. Using
       # ${{ github.actor }} for delivery would target the merger (or a bot),
       # not the contributor who actually requested the credential slot.
+      #
+      # Attribution stays keyed on the TRIGGERING merge, not on the refreshed
+      # head: this run exists because that merge landed, and its author is the
+      # one waiting for a credential. When the head has moved further ahead,
+      # each of those later merges also has its own apply run, with its own
+      # attribution and its own override label.
       - name: Derive PR metadata from merge commit
         id: pr
         env:
@@ -257,13 +319,30 @@ jobs:
           FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          # Optional JWT claim settings, documented as per-environment
+          # secrets. GitHub Environment Secrets are not process environment
+          # variables: unbound, the run always minted the default issuer, role
+          # and TTL with no audience, and a gateway configured otherwise
+          # answered 401 to every call. Blank is not "empty issuer" — the Rust
+          # env parser treats an empty or whitespace-only value as unset, so an
+          # environment that configures none of these keeps the documented
+          # defaults (`ferrum-edge`, `admin`, no `aud`, 3600s). Each must match
+          # the gateway's own configuration.
+          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
+          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
+          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}
+          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
           FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
+          # The revision actually applied, which is the refreshed protected
+          # head — not the commit that triggered the run. It is what the policy
+          # override audit trail records, and it matches `last_applied_commit`
+          # (a `git rev-parse HEAD` of this same checkout).
+          GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           # The merge association is resolved exactly before apply; generated
           # credentials are never delivered to an arbitrary first match or
@@ -300,7 +379,8 @@ jobs:
           FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
+          # The refreshed protected head, for the same reason as api mode.
+          GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}

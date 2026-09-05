@@ -20,6 +20,11 @@ bootstrap = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bootstrap
 SPEC.loader.exec_module(bootstrap)
 
+# `bootstrap_repo_settings.py` imports its baseline constants from the auditor,
+# so the writer and the scheduled check cannot drift apart. Reach the auditor
+# through that same import rather than loading a second copy.
+audit_settings = sys.modules["audit_settings"]
+
 REPO = "acme/repo"
 APP_ID = 99
 REVIEWER_ID = 4242
@@ -167,6 +172,19 @@ def configured_responses(
             "name": bootstrap.TEMPLATE_VARIABLE,
             "value": "true",
         }
+    # Present on every configured repository, template included: it fences the
+    # administration-read audit token to the protected branch, and holds no
+    # reviewer because it deploys nothing.
+    responses[
+        f"repos/{REPO}/environments/{bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"
+    ] = {
+        "name": bootstrap.SETTINGS_AUDIT_ENVIRONMENT,
+        "protection_rules": [],
+        "deployment_branch_policy": {
+            "protected_branches": True,
+            "custom_branch_policies": False,
+        },
+    }
     for name in environments:
         responses[f"repos/{REPO}/environments/{name}"] = {
             "name": name,
@@ -288,6 +306,7 @@ class IdempotencyTests(unittest.TestCase):
                 "release-tags ruleset",
                 "label gitforgeops/policy-override",
                 "label gitforgeops/state-override",
+                f"environment {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}",
             ],
         )
 
@@ -314,7 +333,14 @@ class PlanOutputTests(unittest.TestCase):
         self.assertIn("sha_pinning_required: false -> true", rendered)
         self.assertIn("UNCHANGED workflow token defaults", rendered)
         self.assertIn("Nothing was written. Re-run with --apply", rendered)
-        self.assertIn("gh secret set SETTINGS_AUDIT_TOKEN", rendered)
+        self.assertIn(
+            f"gh secret set SETTINGS_AUDIT_TOKEN --repo {REPO} "
+            f"--env {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}",
+            rendered,
+        )
+        self.assertNotIn(
+            f"gh secret set SETTINGS_AUDIT_TOKEN --repo {REPO}\n", rendered
+        )
 
     def test_ruleset_diff_names_the_missing_rule_and_the_stale_check_set(self):
         responses = configured_responses()
@@ -428,13 +454,26 @@ class TemplateModeTests(unittest.TestCase):
         self.assertEqual(
             recorded[f"variable {bootstrap.TEMPLATE_VARIABLE}"], bootstrap.CREATE
         )
-        self.assertFalse(
-            [target for target in recorded if target.startswith("environment ")]
+        self.assertEqual(
+            [target for target in recorded if target.startswith("environment ")],
+            [f"environment {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"],
+        )
+        # A template runs the settings audit, so it still gets the environment
+        # that fences the audit token; the fixture already has it, so the plan
+        # reports it unchanged rather than skipping it.
+        self.assertEqual(
+            recorded[f"environment {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"],
+            bootstrap.UNCHANGED,
         )
         rendered = "\n".join(plan.notes)
         self.assertIn("deployment environments are not created", rendered)
         self.assertIn("skip the state-writer App bypass", rendered)
-        self.assertIn("a template repository needs no environment secrets", rendered)
+        self.assertIn("a template repository needs no other environment secrets", rendered)
+        self.assertIn(
+            f"gh secret set SETTINGS_AUDIT_TOKEN --repo {REPO} "
+            f"--env {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}",
+            rendered,
+        )
 
     def test_template_mode_ignores_a_config_file_full_of_environments(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -444,8 +483,13 @@ class TemplateModeTests(unittest.TestCase):
             plan = bootstrap.build_plan(
                 api, namespace(template_repo=True, config=str(config))
             )
-        self.assertFalse(
-            [step for step in plan.steps if step.target.startswith("environment ")]
+        self.assertEqual(
+            [
+                step.target
+                for step in plan.steps
+                if step.target.startswith("environment ")
+            ],
+            [f"environment {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"],
         )
         self.assertEqual(
             actions(plan)[f"variable {bootstrap.TEMPLATE_VARIABLE}"],
@@ -483,7 +527,11 @@ class EnvironmentTests(unittest.TestCase):
                 api, namespace(config=str(config), reviewer=["octocat"])
             )
         created = [
-            step for step in plan.steps if step.target.startswith("environment ")
+            step
+            for step in plan.steps
+            if step.target.startswith("environment ")
+            and step.target
+            != f"environment {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"
         ]
         self.assertEqual(
             [step.target for step in created],
@@ -540,6 +588,94 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(
             any("No environments were resolved" in note for note in plan.notes),
             plan.notes,
+        )
+
+
+class AuditTokenEnvironmentTests(unittest.TestCase):
+    """`SETTINGS_AUDIT_TOKEN` is fenced by an environment, not a repo secret."""
+
+    def audit_step(self, plan):
+        return next(
+            step
+            for step in plan.steps
+            if step.target == f"environment {bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"
+        )
+
+    def test_an_unconfigured_repository_creates_it_with_a_branch_policy(self):
+        api = FakeApi({f"repos/{REPO}": {}, f"repos/{REPO}/rulesets?per_page=100": [[]]})
+        step = self.audit_step(bootstrap.build_plan(api, namespace()))
+        self.assertEqual(step.action, bootstrap.CREATE)
+        method, path, body = step.writes[0]
+        self.assertEqual(method, "PUT")
+        self.assertEqual(
+            path,
+            f"repos/{REPO}/environments/{bootstrap.SETTINGS_AUDIT_ENVIRONMENT}",
+        )
+        self.assertEqual(body["reviewers"], [])
+        self.assertEqual(
+            body["deployment_branch_policy"],
+            {"protected_branches": True, "custom_branch_policies": False},
+        )
+
+    def test_a_template_repository_gets_it_too(self):
+        api = FakeApi({f"repos/{REPO}": {}, f"repos/{REPO}/rulesets?per_page=100": [[]]})
+        plan = bootstrap.build_plan(
+            api, namespace(state_writer_app_id=None, template_repo=True)
+        )
+        self.assertEqual(self.audit_step(plan).action, bootstrap.CREATE)
+
+    def test_an_unrestricted_audit_environment_is_updated(self):
+        responses = configured_responses()
+        responses[
+            f"repos/{REPO}/environments/{bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"
+        ]["deployment_branch_policy"] = {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        }
+        step = self.audit_step(bootstrap.build_plan(FakeApi(responses), namespace()))
+        self.assertEqual(step.action, bootstrap.UPDATE)
+        self.assertIn(
+            "deployment_branch_policy.protected_branches: false -> true",
+            "\n".join(step.details),
+        )
+
+    def test_a_reviewer_on_the_audit_environment_is_reported_and_removed(self):
+        # A reviewer here holds every scheduled audit in "waiting for approval",
+        # which is the silently-stopped audit the schedule exists to avoid.
+        responses = configured_responses()
+        responses[
+            f"repos/{REPO}/environments/{bootstrap.SETTINGS_AUDIT_ENVIRONMENT}"
+        ]["protection_rules"] = [
+            {
+                "type": "required_reviewers",
+                "prevent_self_review": True,
+                "reviewers": [
+                    {"type": "User", "reviewer": {"id": REVIEWER_ID, "login": "octocat"}}
+                ],
+            }
+        ]
+        step = self.audit_step(bootstrap.build_plan(FakeApi(responses), namespace()))
+        self.assertEqual(step.action, bootstrap.UPDATE)
+        self.assertIn("reviewers: 1 -> 0", "\n".join(step.details))
+        self.assertEqual(step.writes[0][2]["reviewers"], [])
+
+    def test_a_colliding_deployment_environment_name_is_warned_about(self):
+        api = FakeApi(configured_responses())
+        plan = bootstrap.build_plan(
+            api,
+            namespace(
+                environment=[bootstrap.SETTINGS_AUDIT_ENVIRONMENT],
+                reviewer=["octocat"],
+            ),
+        )
+        self.assertTrue(
+            any("collides" in warning for warning in plan.warnings), plan.warnings
+        )
+
+    def test_the_audit_environment_name_is_shared_with_the_auditor(self):
+        self.assertEqual(
+            bootstrap.SETTINGS_AUDIT_ENVIRONMENT,
+            audit_settings.SETTINGS_AUDIT_ENVIRONMENT,
         )
 
 
