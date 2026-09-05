@@ -399,9 +399,12 @@ fn spec_extras_hashed(specs: &[(&str, &str)]) -> gitforgeops::http_client::Backu
     }
 }
 
-/// Render what `GET /backup` returns for a namespace: the flat config document
-/// with the opaque `api_specs` section spliced back in.
-fn backup_body(config: &GatewayConfig, extras: &gitforgeops::http_client::BackupExtras) -> String {
+/// [`backup_body`] with the opaque sections `GatewayConfig` does not model
+/// spliced back in, for the freshness re-read that reads `api_specs`.
+fn backup_body_with_extras(
+    config: &GatewayConfig,
+    extras: &gitforgeops::http_client::BackupExtras,
+) -> String {
     let mut body = serde_json::to_value(config).expect("config serializes");
     if let Some(map) = body.as_object_mut() {
         if let Some(api_specs) = extras.api_specs.as_ref() {
@@ -1445,7 +1448,7 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
         (
             "GET /backup".into(),
             200,
-            backup_body(&actual, &extras),
+            backup_body_with_extras(&actual, &extras),
             vec![],
         ),
     ]);
@@ -1549,7 +1552,7 @@ async fn full_replace_aborts_when_a_spec_changed_since_the_payload_was_built() {
         (
             "GET /backup".into(),
             200,
-            backup_body(&actual, &live),
+            backup_body_with_extras(&actual, &live),
             vec![],
         ),
     ]);
@@ -1601,7 +1604,7 @@ async fn full_replace_aborts_when_a_spec_was_created_since_the_payload_was_built
         (
             "GET /backup".into(),
             200,
-            backup_body(&actual, &live),
+            backup_body_with_extras(&actual, &live),
             vec![],
         ),
     ]);
