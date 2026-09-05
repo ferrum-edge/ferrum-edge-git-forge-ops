@@ -5,6 +5,39 @@ rulesets, environment reviewers, and repository Actions policy live in GitHub
 settings and cannot be activated by merging a pull request. Configure this
 baseline before connecting production credentials.
 
+This document is the specification for that baseline, and it is what
+`.github/scripts/bootstrap_repo_settings.py` applies: sections 1-5 describe, in
+prose, the same controls the script writes through the REST API. Run the script
+to get there quickly and repeatably — it is idempotent and prints a plan without
+writing unless `--apply` is passed — and read this document to understand what
+each control buys, or to configure it by hand. `.github/scripts/audit_settings.py`
+then re-checks the result on a schedule. All three share their constants, so the
+writer, the description, and the auditor cannot drift apart.
+
+```bash
+export GH_TOKEN=$(gh auth token)            # an account with admin on the repo
+python3 .github/scripts/bootstrap_repo_settings.py --repo owner/repo           # plan
+python3 .github/scripts/bootstrap_repo_settings.py --repo owner/repo --apply   # write
+```
+
+Secrets are the one thing the script will not touch: it neither accepts nor
+prints a secret value, and finishes by listing the `gh secret set` commands left
+to run.
+
+## Template repositories
+
+The upstream repository is the template customers copy, and a template has no
+deployment environment and no state-writer App, because nothing on it ever
+applies to a gateway or commits an ownership ledger. Set repository variable
+`GITFORGEOPS_TEMPLATE_REPO=true` there (or pass `--template-repo` to the
+bootstrap script, which sets it) and `settings-audit.yml` runs the audit with
+`--template-repo`: exactly two checks are dropped — the state-writer App bypass
+on the default-branch ruleset (section 1) and the "at least one protected
+environment" requirement (section 3) — and the audit names both in its own
+evidence output. Everything else stays enforced, including every environment
+that *is* listed. A deployment repository must leave the variable unset; the
+bootstrap script turns it back off if it finds it set there.
+
 ## 0. Do this before you merge
 
 Sections 1-5 are prerequisites, not follow-ups. Two workflows are fail-closed
@@ -13,7 +46,7 @@ by design and will report red on `main` until the settings behind them exist:
 | Workflow | Red until | Section |
 | --- | --- | --- |
 | `Release` | the `main` ruleset declares required checks — `gh pr checks --required` exits non-zero with "no required checks reported", so every push to `main` fails the publication gate | [§2](#2-protect-main-with-an-active-ruleset) |
-| `GitHub Settings Audit` | `SETTINGS_AUDIT_TOKEN` and repository variable `GITFORGEOPS_STATE_APP_ID` exist | [§1](#1-create-the-state-writer-github-app), [§5](#5-enable-settings-drift-monitoring) |
+| `GitHub Settings Audit` | `SETTINGS_AUDIT_TOKEN` exists, plus repository variable `GITFORGEOPS_STATE_APP_ID` (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template) | [§1](#1-create-the-state-writer-github-app), [§5](#5-enable-settings-drift-monitoring) |
 
 That is the intended behaviour: neither workflow may assume a control it
 cannot verify. Configure §1-§5 first and neither is ever red.
@@ -81,6 +114,9 @@ additional include or exclusion patterns. It must:
 - dismiss stale approvals when reviewable commits are pushed;
 - require branches to be tested against the latest `main` commit;
 - block deletion and non-fast-forward updates;
+- reject `[skip ci]` in commit messages (a `commit_message_pattern` rule with
+  `negate: true`), because that marker suppresses every workflow including the
+  required checks; `release.yml` uses `paths-ignore` for ledger commits instead;
 - require, at minimum, these exact GitHub Actions job names (ruleset contexts
   use the job name, not the `Workflow / job` PR display label):
   - `rust-ci-check`
@@ -91,6 +127,16 @@ additional include or exclusion patterns. It must:
 - contain exactly one bypass actor in any mode: the state-writer GitHub App,
   configured as an always-on bypass. Pull-request-only human/team bypasses are
   not permitted.
+
+A solo maintainer hits an obstacle here: the ruleset requires an approving
+review and there is nobody to give one. The workaround is a second bypass actor
+— the **Repository Admin** role in `pull_request` mode — merging with
+`gh pr merge --admin`. That is what `bootstrap_repo_settings.py` configures when
+`--state-writer-app-id` is omitted, and the audit reports it as a violation
+("must have exactly one bypass actor in any mode"). It is a deliberate, visible
+deviation rather than a supported configuration, and it does not remove the need
+for the App: `apply-on-merge.yml` and `rotate.yml` fail their preflight without
+`GITFORGEOPS_STATE_APP_ID` and `GITFORGEOPS_STATE_APP_PRIVATE_KEY`.
 
 Protect release tags (`v*`) with a tag ruleset that carries the `creation`,
 `update`, and `deletion` rules, and that names **at least one** bypass actor —
@@ -132,7 +178,9 @@ so one forgotten unprotected environment keeps the audit red forever. An
 environment nothing deploys to is also a standing invitation to store
 credentials somewhere no workflow guard covers.
 
-For every environment listed in `.gitforgeops/config.yaml`:
+For every environment listed in `.gitforgeops/config.yaml` — the bootstrap
+script reads that file and creates each one when given `--reviewer LOGIN` or
+`--reviewer-team org/slug`:
 
 - require at least one authorized reviewer;
 - prevent self-review;
@@ -207,6 +255,17 @@ In **Settings → Actions → General**:
   - `taiki-e/install-action@*`
 - enable **Require actions to be pinned to a full-length commit SHA**.
 
+### Repository security features
+
+The bootstrap script also enables, in the same pass, four settings the scheduled
+audit does not currently read back: **secret scanning**, **secret-scanning push
+protection**, **private vulnerability reporting**, and Dependabot's
+**vulnerability alerts** plus **automated security updates**. They are cheap,
+they are free on public repositories, and push protection in particular is the
+control that stops a gateway JWT secret from reaching a commit in the first
+place. Settings → Advanced Security, and Settings → Code security, if you would
+rather click.
+
 The repository patterns end in `@*` only because the settings API allowlist is
 repository-oriented. Every actual `uses:` reference is still required to carry
 a full 40-hex commit SHA by both repository policy and CI.
@@ -262,6 +321,11 @@ GH_TOKEN=<administration-read-token> python3 .github/scripts/audit_settings.py \
   --required-check 'state-guard-reject-state-edits' \
   --required-check 'gitforgeops-required-static-validation'
 ```
+
+`--required-check` may be omitted entirely; the five contexts above are the
+built-in default. On a template repository, swap `--state-writer-app-id` for
+`--template-repo` (the two are mutually exclusive: the flag is required unless
+template mode is on).
 
 The audit is intentionally fail-closed on missing token scope, API errors,
 pagination/response-shape changes, missing controls, or a non-App always-on
