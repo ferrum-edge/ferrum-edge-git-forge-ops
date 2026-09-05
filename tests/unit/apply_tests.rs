@@ -377,18 +377,41 @@ fn plugin_config(
 }
 
 fn spec_extras(ids: &[&str]) -> gitforgeops::http_client::BackupExtras {
+    spec_extras_hashed(&ids.iter().map(|id| (*id, "sha-1")).collect::<Vec<_>>())
+}
+
+/// `spec_extras` with an explicit `content_hash` per spec, so a test can make
+/// one document differ between two `/backup` reads the way a concurrent
+/// `PUT /api-specs/{id}` would.
+fn spec_extras_hashed(specs: &[(&str, &str)]) -> gitforgeops::http_client::BackupExtras {
     gitforgeops::http_client::BackupExtras {
         api_specs: Some(serde_json::json!({
             "section_version": "2",
-            "items": ids.iter().map(|id| serde_json::json!({
+            "items": specs.iter().map(|(id, content_hash)| serde_json::json!({
                 "id": id,
                 "namespace": "team-alpha",
-                "proxy_id": "spec-proxy"
+                "proxy_id": "spec-proxy",
+                "content_hash": content_hash,
             })).collect::<Vec<_>>(),
         })),
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
     }
+}
+
+/// Render what `GET /backup` returns for a namespace: the flat config document
+/// with the opaque `api_specs` section spliced back in.
+fn backup_body(config: &GatewayConfig, extras: &gitforgeops::http_client::BackupExtras) -> String {
+    let mut body = serde_json::to_value(config).expect("config serializes");
+    if let Some(map) = body.as_object_mut() {
+        if let Some(api_specs) = extras.api_specs.as_ref() {
+            map.insert("api_specs".to_string(), api_specs.clone());
+        }
+        if let Some(bundles) = extras.gateway_trust_bundles.as_ref() {
+            map.insert("gateway_trust_bundles".to_string(), bundles.clone());
+        }
+    }
+    serde_json::to_string(&body).expect("backup body")
 }
 
 /// Repo-owned desired rows plus the live spec-owned graph they must be
@@ -1417,6 +1440,14 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
             "{}".into(),
             vec![],
         ),
+        // The freshness re-read immediately before the restore. Unchanged,
+        // so the payload is still an accurate description of the namespace.
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&actual, &extras),
+            vec![],
+        ),
     ]);
     let client = stub_client(url);
 
@@ -1485,6 +1516,173 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
     assert!(
         !restore.contains("gateway_trust_bundles"),
         "an absent trust section preserves the live roots: {restore}"
+    );
+
+    // The spec section is only safe to replay because it was re-read directly
+    // before the POST; a payload built minutes earlier is not evidence.
+    let ordered = requests.lock().unwrap().clone();
+    let backup_at = ordered
+        .iter()
+        .position(|request| request.contains("GET /backup"))
+        .expect("freshness re-read");
+    let restore_at = ordered
+        .iter()
+        .position(|request| request.contains("POST /restore"))
+        .expect("restore");
+    assert!(
+        backup_at < restore_at,
+        "the spec snapshot must be re-verified before the restore: {ordered:?}"
+    );
+}
+
+/// A spec rewritten between the payload being built and the POST must abort
+/// the restore. `/restore` deletes every spec in the namespace and re-creates
+/// exactly what the payload carries, so proceeding would roll the newer
+/// document back to the one this run happened to read first.
+#[tokio::test]
+async fn full_replace_aborts_when_a_spec_changed_since_the_payload_was_built() {
+    let (desired, actual) = spec_owned_graph();
+    let prepared = spec_extras_hashed(&[("spec-a", "sha-1")]);
+    let live = spec_extras_hashed(&[("spec-a", "sha-2")]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&actual, &live),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), actual)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), prepared)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the abort is namespace-scoped, not a whole-run stop");
+
+    // Namespace-scoped: recorded so the run still exits non-zero through
+    // `into_result`, without taking every other namespace out of the apply.
+    assert!(result.fully_replaced_namespaces.is_empty());
+    let rendered = result.errors.join("\n");
+    assert!(rendered.contains("`spec-a` was modified"), "{rendered}");
+    assert!(result.into_result().is_err(), "the run must not exit green");
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("POST /restore")),
+        "a stale spec snapshot must never be replayed"
+    );
+}
+
+/// A spec created after the payload was built is the more destructive half of
+/// the same race: it is absent from `api_specs.items`, and a non-empty section
+/// makes the gateway delete every spec the payload does not name — without
+/// consulting `confirm_api_spec_deletion`, which it only reads when the
+/// section is absent entirely.
+#[tokio::test]
+async fn full_replace_aborts_when_a_spec_was_created_since_the_payload_was_built() {
+    let (desired, actual) = spec_owned_graph();
+    let prepared = spec_extras(&["spec-a"]);
+    let live = spec_extras(&["spec-a", "spec-b"]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&actual, &live),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), actual)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), prepared)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the abort is namespace-scoped, not a whole-run stop");
+
+    // Namespace-scoped: recorded so the run still exits non-zero through
+    // `into_result`, without taking every other namespace out of the apply.
+    assert!(result.fully_replaced_namespaces.is_empty());
+    let rendered = result.errors.join("\n");
+    assert!(rendered.contains("`spec-b` was created"), "{rendered}");
+    assert!(result.into_result().is_err(), "the run must not exit green");
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("POST /restore")),
+        "a snapshot that no longer describes the namespace must not be replayed"
+    );
+}
+
+/// A namespace with no API specs sends no `api_specs` section, so there is
+/// nothing to replay and no reason to pay for the extra round-trip. The
+/// gateway's own existing-spec `409` covers a spec created mid-run here.
+#[tokio::test]
+async fn full_replace_without_api_specs_does_not_re_read_the_backup() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("repo-upstream", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+
+    apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            gitforgeops::http_client::BackupExtras::default(),
+        )])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a namespace with no specs restores");
+
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("GET /backup")),
+        "no spec section travels, so nothing needs re-verifying"
     );
 }
 
