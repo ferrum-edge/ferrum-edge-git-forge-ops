@@ -1795,3 +1795,255 @@ fn pick_shard_never_targets_an_unbound_shard_index() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #126: `Upstream.service_discovery` carries a provider credential (the Consul
+// ACL token) that is returned verbatim by `GET /backup`. It is brokered like a
+// consumer credential end to end: captured by import, resolved from the
+// bundle, scrubbed out of validator diagnostics, and never generated.
+// ---------------------------------------------------------------------------
+
+/// Canonical slot for the one modeled service-discovery secret. Spelled out
+/// here rather than derived, so a change to the encoding has to be a
+/// deliberate edit of this constant (and of the README that documents it).
+const CONSUL_TOKEN_SLOT: &str = "ferrum/orders/@service-discovery/consul/token";
+
+fn upstream_with_consul_token(token: Option<&str>) -> gitforgeops::config::schema::Upstream {
+    use gitforgeops::config::schema::{
+        ConsulConfig, LoadBalancerAlgorithm, SdProvider, ServiceDiscoveryConfig, Upstream,
+    };
+
+    Upstream {
+        extra: Default::default(),
+        id: "orders".to_string(),
+        name: None,
+        namespace: "ferrum".to_string(),
+        targets: vec![],
+        algorithm: LoadBalancerAlgorithm::default(),
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: Some(ServiceDiscoveryConfig {
+            provider: SdProvider::Consul,
+            dns_sd: None,
+            kubernetes: None,
+            consul: Some(ConsulConfig {
+                address: "https://consul.example.test:8501".to_string(),
+                service_name: "orders".to_string(),
+                datacenter: None,
+                tag: None,
+                healthy_only: true,
+                token: token.map(str::to_string),
+                poll_interval_seconds: 30,
+            }),
+            mesh: None,
+            max_stale_seconds: None,
+            stale_policy: None,
+            default_weight: 100,
+        }),
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        subsets: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: vec![],
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn config_with_consul_token(token: Option<&str>) -> GatewayConfig {
+    GatewayConfig {
+        upstreams: vec![upstream_with_consul_token(token)],
+        ..GatewayConfig::default()
+    }
+}
+
+/// Import moves the live token into the private migration bundle under its
+/// canonical slot and leaves a `require` placeholder behind. The identity
+/// fields stay readable, or the imported file would no longer say which
+/// service it discovers.
+#[test]
+fn import_capture_brokers_the_consul_token_and_keeps_discovery_identity_readable() {
+    use gitforgeops::secrets::{
+        capture_and_redact_import_service_discovery_secrets, IMPORT_REQUIRED_PLACEHOLDER,
+    };
+
+    let mut cfg = config_with_consul_token(Some("SYNTHETIC-AUDIT-TOKEN"));
+    let captured = capture_and_redact_import_service_discovery_secrets(&mut cfg).unwrap();
+
+    assert_eq!(
+        captured.get(CONSUL_TOKEN_SLOT).map(String::as_str),
+        Some("SYNTHETIC-AUDIT-TOKEN")
+    );
+    assert_eq!(captured.len(), 1);
+
+    let consul = cfg.upstreams[0]
+        .service_discovery
+        .as_ref()
+        .and_then(|sd| sd.consul.as_ref())
+        .expect("consul block");
+    assert_eq!(consul.token.as_deref(), Some(IMPORT_REQUIRED_PLACEHOLDER));
+    assert_eq!(consul.address, "https://consul.example.test:8501");
+    assert_eq!(consul.service_name, "orders");
+}
+
+/// The round trip: the placeholder import wrote resolves back to the exact
+/// value import captured, from the same slot.
+#[test]
+fn consul_token_placeholder_resolves_from_the_captured_slot() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        capture_and_redact_import_service_discovery_secrets, resolve_secrets_with_mode, SlotStatus,
+    };
+
+    let mut imported = config_with_consul_token(Some("SYNTHETIC-AUDIT-TOKEN"));
+    let bundle = capture_and_redact_import_service_discovery_secrets(&mut imported).unwrap();
+
+    let report = resolve_secrets_with_mode(&mut imported, &bundle, GatewayMode::Api).unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].slot, CONSUL_TOKEN_SLOT);
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(
+        report.results[0].cred_key,
+        "@service-discovery/consul/token"
+    );
+    assert_eq!(
+        imported.upstreams[0]
+            .service_discovery
+            .as_ref()
+            .unwrap()
+            .consul
+            .as_ref()
+            .unwrap()
+            .token
+            .as_deref(),
+        Some("SYNTHETIC-AUDIT-TOKEN")
+    );
+}
+
+/// An unseeded `alloc=require` is reported, not silently left as a literal
+/// placeholder for the gateway to receive.
+#[test]
+fn missing_consul_token_slot_is_reported_as_missing_required() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode, SlotStatus};
+
+    let mut cfg = config_with_consul_token(Some(REQUIRE));
+    let report = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api).unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::MissingRequired);
+    assert_eq!(report.missing_required().len(), 1);
+}
+
+/// The broker cannot mint a Consul ACL token — only the Consul cluster can —
+/// so `alloc=generate` is refused at resolve time, before `apply` writes a
+/// GitHub Environment Secret holding a value that can never authenticate.
+#[test]
+fn consul_token_refuses_generation() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    let mut cfg = config_with_consul_token(Some(GENERATE));
+    let err = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api)
+        .expect_err("generating a Consul token must be refused");
+    let message = err.to_string();
+
+    assert!(message.contains(CONSUL_TOKEN_SLOT), "{message}");
+    assert!(message.contains("consul.token"), "{message}");
+    assert!(message.contains("alloc=require"), "{message}");
+}
+
+/// A slot that is already seeded resolves whatever the alloc mode says: the
+/// refusal above is about *allocating*, not about reading.
+#[test]
+fn seeded_consul_token_resolves_even_under_alloc_generate() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode, SlotStatus};
+
+    let mut cfg = config_with_consul_token(Some(GENERATE));
+    let bundle = BTreeMap::from([(CONSUL_TOKEN_SLOT.to_string(), "seeded-token".to_string())]);
+
+    let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::Api).unwrap();
+
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(
+        cfg.upstreams[0]
+            .service_discovery
+            .as_ref()
+            .unwrap()
+            .consul
+            .as_ref()
+            .unwrap()
+            .token
+            .as_deref(),
+        Some("seeded-token")
+    );
+}
+
+/// The validator is handed the resolved document, so its diagnostics can quote
+/// the token. The scrubber has to know about it — and must not blank out the
+/// control-plane address, which is what makes a diagnostic readable.
+#[test]
+fn scrubber_covers_the_resolved_consul_token_but_not_the_address() {
+    use gitforgeops::secrets::SecretScrubber;
+
+    let cfg = config_with_consul_token(Some("SYNTHETIC-AUDIT-TOKEN"));
+    let scrubber = SecretScrubber::from_gateway_config(&cfg);
+
+    assert!(!scrubber.is_empty());
+    let scrubbed = scrubber.scrub(
+        "error: consul https://consul.example.test:8501 rejected token SYNTHETIC-AUDIT-TOKEN",
+    );
+    assert!(!scrubbed.contains("SYNTHETIC-AUDIT-TOKEN"), "{scrubbed}");
+    assert!(
+        scrubbed.contains("https://consul.example.test:8501"),
+        "{scrubbed}"
+    );
+    assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+}
+
+/// An unresolved placeholder is repository data: leaving it visible is what
+/// lets an operator see that a field is brokered at all.
+#[test]
+fn scrubber_ignores_a_service_discovery_placeholder() {
+    use gitforgeops::secrets::SecretScrubber;
+
+    let cfg = config_with_consul_token(Some(REQUIRE));
+    assert!(SecretScrubber::from_gateway_config(&cfg).is_empty());
+}
+
+/// The pre-resolve audit blocks a token committed as a literal, and says
+/// nothing about the identity fields beside it.
+#[test]
+fn literal_consul_token_is_a_blocking_security_finding() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+
+    let cfg = config_with_consul_token(Some("SYNTHETIC-AUDIT-TOKEN"));
+    let findings = audit_security(&cfg);
+    let blockers = security_blockers(&findings);
+
+    let token_finding = blockers
+        .iter()
+        .find(|finding| finding.message.contains("service_discovery.consul.token"))
+        .expect("a literal Consul token must block apply");
+    assert_eq!(token_finding.kind, "Upstream");
+    assert_eq!(token_finding.id, "orders");
+    assert!(
+        !token_finding.message.contains("SYNTHETIC-AUDIT-TOKEN"),
+        "a finding must never echo the value: {}",
+        token_finding.message
+    );
+
+    // The placeholder form is the supported one and raises nothing.
+    let brokered = config_with_consul_token(Some(REQUIRE));
+    assert!(security_blockers(&audit_security(&brokered)).is_empty());
+
+    // An upstream with no discovery block at all is not a finding either.
+    let none = config_with_consul_token(None);
+    assert!(security_blockers(&audit_security(&none)).is_empty());
+}

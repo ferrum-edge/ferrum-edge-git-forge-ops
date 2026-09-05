@@ -95,6 +95,8 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               credentials into the canonical array form)
   → secrets::resolve_secrets (replace ${gh-env-secret:...} placeholders in-memory
                               from FERRUM_CREDS_JSON_FILE or FERRUM_CREDS_JSON,
+                              across consumer credentials, plugin config and the
+                              modeled Upstream.service_discovery secrets;
                               never written back to disk)
   → policy::evaluate_policies
   → validate / export / diff / plan / apply / review / rotate
@@ -326,6 +328,28 @@ preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
 label + repo permission), resolved once and shared by both gates.
 
+#### Secrets outside `Consumer.credentials`
+
+Two other places in a gateway document hold brokered secrets, each with a
+reserved slot kind in the third component (the `@` prefix keeps them out of the
+credential-type keyspace):
+
+- `PluginConfig.config` → `<ns>/<plugin-id>/@plugin-config/config/<path>`,
+  classified by `src/secrets/plugin_config.rs`.
+- `Upstream.service_discovery` → `<ns>/<upstream-id>/@service-discovery/<path>`,
+  e.g. `ferrum/orders/@service-discovery/consul/token`. The modeled secret
+  leaves live in one table,
+  `src/secrets/service_discovery.rs::SD_SECRET_FIELDS`, which import capture,
+  resolution, diff redaction, validator scrubbing and the literal-credential
+  audit all read. Today it holds `consul.token` only: `consul.address` /
+  `service_name` / `datacenter` / `tag` are identity, and `dns_sd` /
+  `kubernetes` / `mesh` carry no secret-bearing field. A field marked
+  `generatable: false` (the Consul token — only the Consul cluster mints one)
+  refuses `alloc=generate` at resolve time. `diff` redacts these leaves
+  individually: `is_sensitive_diff_field` stays whole-field and deliberately
+  does *not* list `service_discovery`, so control-plane address and
+  service-name drift stay reviewable.
+
 Storage: one or more GitHub Environment Secrets named `FERRUM_CREDS_BUNDLE[_N]`,
 each holding a JSON object of `slot → value`. Capacity ~440 slots per bundle,
 auto-sharded by fnv-style hash when a bundle approaches 40 KB.
@@ -376,7 +400,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
-- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `resolver.rs` (walks consumers, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
+- `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `service_discovery.rs` (modeled `Upstream.service_discovery` secret table + slot derivation), `resolver.rs` (walks consumers, plugin config and service discovery, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
 - `src/validate/` — `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API

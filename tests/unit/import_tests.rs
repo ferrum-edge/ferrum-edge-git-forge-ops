@@ -1351,3 +1351,167 @@ fn migration_bundle_paths_normalize_dotdot_under_a_missing_ancestor() {
 
     assert!(destination_parent.path().join("migration.json").exists());
 }
+
+// ---------------------------------------------------------------------------
+// #126: a Consul ACL token in `Upstream.service_discovery` is live secret
+// material in a backup. It must reach the private migration bundle and nothing
+// else — not the tree, not the manifest, not stdout.
+// ---------------------------------------------------------------------------
+
+fn consul_upstream(token: &str) -> Upstream {
+    Upstream {
+        extra: Default::default(),
+        id: "orders".to_string(),
+        name: None,
+        namespace: "ferrum".to_string(),
+        targets: vec![],
+        algorithm: LoadBalancerAlgorithm::default(),
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: Some(ServiceDiscoveryConfig {
+            provider: SdProvider::Consul,
+            dns_sd: None,
+            kubernetes: None,
+            consul: Some(ConsulConfig {
+                address: "https://consul.example.test:8501".to_string(),
+                service_name: "orders".to_string(),
+                datacenter: None,
+                tag: None,
+                healthy_only: true,
+                token: Some(token.to_string()),
+                poll_interval_seconds: 30,
+            }),
+            mesh: None,
+            max_stale_seconds: None,
+            stale_policy: None,
+            default_weight: 100,
+        }),
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        subsets: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: vec![],
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+#[test]
+fn file_import_brokers_a_consul_discovery_token() {
+    let token = "SYNTHETIC-AUDIT-TOKEN";
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.upstreams.push(consul_upstream(token));
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+            .unwrap();
+
+    assert_eq!(result.redacted_service_discovery_values, 1);
+
+    // The token is in the private bundle, under its canonical slot.
+    let raw_bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    let (merged, _) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
+    assert_eq!(
+        merged
+            .get("ferrum/orders/@service-discovery/consul/token")
+            .map(String::as_str),
+        Some(token)
+    );
+
+    // It is nowhere in the published tree, and the discovery identity is.
+    let upstream_yaml =
+        std::fs::read_to_string(output.join("ferrum/upstreams/orders.yaml")).unwrap();
+    assert!(!upstream_yaml.contains(token), "{upstream_yaml}");
+    assert!(
+        upstream_yaml.contains("${gh-env-secret:alloc=require}"),
+        "{upstream_yaml}"
+    );
+    assert!(
+        upstream_yaml.contains("consul.example.test"),
+        "{upstream_yaml}"
+    );
+    assert!(
+        upstream_yaml.contains("service_name: orders"),
+        "{upstream_yaml}"
+    );
+
+    // Nor in any other published file, including the manifest.
+    for entry in walk_files(&output) {
+        let body = std::fs::read_to_string(&entry).unwrap();
+        assert!(
+            !body.contains(token),
+            "{} leaked the token",
+            entry.display()
+        );
+    }
+
+    // Nor in anything printed to an operator.
+    let notice = result.unmanaged_sections_notice().expect("notice");
+    assert!(notice.contains("service-discovery secret"), "{notice}");
+    assert!(!notice.contains(token), "{notice}");
+}
+
+/// Whatever the source held, the imported tree resolves back to it from the
+/// migration bundle alone.
+#[test]
+fn imported_consul_token_resolves_from_the_migration_bundle() {
+    let token = "SYNTHETIC-AUDIT-TOKEN";
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.upstreams.push(consul_upstream(token));
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+    gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
+        .unwrap();
+
+    let raw_bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    let (merged, _) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
+    let resources = gitforgeops::config::load_resources(&output).unwrap();
+    let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
+    gitforgeops::secrets::resolve_secrets_with_mode(
+        &mut assembled,
+        &merged,
+        gitforgeops::config::GatewayMode::Api,
+    )
+    .unwrap();
+
+    let restored = assembled
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == "orders")
+        .and_then(|upstream| upstream.service_discovery.as_ref())
+        .and_then(|sd| sd.consul.as_ref())
+        .and_then(|consul| consul.token.as_deref());
+    assert_eq!(restored, Some(token));
+}
+
+/// Every regular file under `root`, recursively.
+fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}

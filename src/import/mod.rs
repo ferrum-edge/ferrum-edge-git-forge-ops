@@ -15,7 +15,8 @@ use crate::config::schema::{GatewayConfig, Resource};
 use crate::http_client::BackupSnapshot;
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
-    CredentialBundle, UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER,
+    capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
+    IMPORT_REQUIRED_PLACEHOLDER,
 };
 
 pub const IMPORT_MANIFEST_FILENAME: &str = ".gitforgeops-import.json";
@@ -121,6 +122,9 @@ pub struct ImportResult {
     /// placeholders. This includes schema-declared endpoints/header maps and
     /// fail-closed strings from custom plugin configs.
     pub redacted_plugin_config_values: usize,
+    /// Number of modeled `Upstream.service_discovery` secrets (the Consul ACL
+    /// token) replaced with broker placeholders.
+    pub redacted_service_discovery_values: usize,
     /// Future/unknown top-level backup sections that this build cannot import.
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
@@ -147,6 +151,7 @@ impl ImportResult {
             && self.skipped_spec_owned == 0
             && self.redacted_credential_values == 0
             && self.redacted_plugin_config_values == 0
+            && self.redacted_service_discovery_values == 0
             && self.unsupported_sections.is_empty()
         {
             return None;
@@ -187,6 +192,15 @@ impl ImportResult {
             notice.push_str(&format!(
                 "{} sensitive plugin config value(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
                 self.redacted_plugin_config_values
+            ));
+        }
+        if self.redacted_service_discovery_values > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} service-discovery secret(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
+                self.redacted_service_discovery_values
             ));
         }
         if !self.unsupported_sections.is_empty() {
@@ -379,14 +393,23 @@ pub(crate) fn split_config_with_inventory(
     let mut safe_config = config.clone();
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let captured_discovery = capture_and_redact_import_service_discovery_secrets(&mut safe_config)?;
     let unbrokered_plugin_config = plugin_capture.unbrokered;
     let credential_count = captured_credentials.len();
     let plugin_config_count = plugin_capture.captured.len();
+    let service_discovery_count = captured_discovery.len();
     let mut captured_secrets = captured_credentials;
     for (slot, value) in plugin_capture.captured {
         if captured_secrets.insert(slot.clone(), value).is_some() {
             return Err(crate::error::Error::Config(format!(
                 "secret slot '{slot}' is produced by both a consumer credential and plugin config"
+            )));
+        }
+    }
+    for (slot, value) in captured_discovery {
+        if captured_secrets.insert(slot.clone(), value).is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}' is produced by a service-discovery field and another resource"
             )));
         }
     }
@@ -397,6 +420,7 @@ pub(crate) fn split_config_with_inventory(
         sources: inventory.sources,
         redacted_credential_values: credential_count,
         redacted_plugin_config_values: plugin_config_count,
+        redacted_service_discovery_values: service_discovery_count,
         unbrokered_plugin_config,
         ..ImportResult::default()
     };

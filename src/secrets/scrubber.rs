@@ -71,10 +71,15 @@ impl SecretScrubber {
     ///   set `import` moves into the private bundle. A plugin secret such as
     ///   an `otel_tracing` `headers.x-honeycomb-team` value is resolved into
     ///   the validator input exactly like a consumer credential.
+    /// * **Service discovery** — the modeled secret leaves of
+    ///   `Upstream.service_discovery` ([`super::service_discovery`]), today the
+    ///   Consul ACL token. The validator is handed the resolved upstream, so
+    ///   an error quoting the discovery block quotes the token with it.
     pub fn from_gateway_config(config: &GatewayConfig) -> Self {
         let mut values = BTreeSet::new();
         collect_consumer_secrets(config, &mut values);
         collect_plugin_config_secrets(config, &mut values);
+        collect_service_discovery_secrets(config, &mut values);
         Self::from_values(values)
     }
 
@@ -182,6 +187,14 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut BTreeSet<Stri
             if let Some(serde_json::Value::String(text)) = value_at(&plugin.config, &path) {
                 record_secret(text, out);
             }
+        }
+    }
+}
+
+fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>) {
+    for upstream in &config.upstreams {
+        for (_field, value) in super::service_discovery::present_secrets(upstream) {
+            record_secret(value, out);
         }
     }
 }

@@ -1098,3 +1098,166 @@ fn spec_owned_upstream_declared_in_repo_suppresses_modify() {
     assert_eq!(conflicts[0].kind, "Upstream");
     assert_eq!(conflicts[0].id, "u-shared");
 }
+
+// ---------------------------------------------------------------------------
+// #126: the Consul ACL token inside `Upstream.service_discovery` is secret
+// material, but the block around it is exactly the drift a reviewer is there
+// to catch. Redaction is leaf-by-leaf, never field-wide.
+// ---------------------------------------------------------------------------
+
+fn upstream_with_consul(id: &str, address: &str, token: Option<&str>) -> Upstream {
+    let mut upstream = make_upstream(id, 0);
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Consul,
+        dns_sd: None,
+        kubernetes: None,
+        consul: Some(ConsulConfig {
+            address: address.to_string(),
+            service_name: "orders".to_string(),
+            datacenter: None,
+            tag: None,
+            healthy_only: true,
+            token: token.map(str::to_string),
+            poll_interval_seconds: 30,
+        }),
+        mesh: None,
+        max_stale_seconds: None,
+        stale_policy: None,
+        default_weight: 100,
+    });
+    upstream
+}
+
+#[test]
+fn service_discovery_diff_redacts_the_token_but_shows_the_address() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://consul.new.test:8501",
+            Some("DESIRED-SYNTHETIC-TOKEN"),
+        )],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://consul.old.test:8501",
+            Some("LIVE-SYNTHETIC-TOKEN"),
+        )],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    let change = diffs
+        .iter()
+        .flat_map(|diff| &diff.details)
+        .find(|change| change.field == "service_discovery")
+        .expect("the discovery block changed");
+
+    for side in [&change.old_value, &change.new_value] {
+        assert!(!side.contains("SYNTHETIC-TOKEN"), "{side}");
+        assert!(side.contains("[REDACTED]"), "{side}");
+    }
+    assert!(
+        change.old_value.contains("consul.old.test"),
+        "{}",
+        change.old_value
+    );
+    assert!(
+        change.new_value.contains("consul.new.test"),
+        "{}",
+        change.new_value
+    );
+    assert!(change.new_value.contains("orders"), "{}", change.new_value);
+
+    // Whole-field suppression stays reserved for the two fields that are
+    // secret through and through.
+    assert!(!is_sensitive_diff_field("Upstream", "service_discovery"));
+}
+
+/// A brokered field is legible on both sides: an unresolved placeholder is
+/// repository data, and a reviewer needs to see that the slot is brokered.
+#[test]
+fn service_discovery_diff_keeps_a_placeholder_visible() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://consul.new.test:8501",
+            Some("${gh-env-secret:alloc=require}"),
+        )],
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://consul.old.test:8501",
+            Some("${gh-env-secret:alloc=require}"),
+        )],
+        ..GatewayConfig::default()
+    };
+
+    let diffs = compute_diff(&desired, &actual);
+    let change = diffs
+        .iter()
+        .flat_map(|diff| &diff.details)
+        .find(|change| change.field == "service_discovery")
+        .expect("the address changed");
+
+    assert!(
+        change.new_value.contains("gh-env-secret"),
+        "{}",
+        change.new_value
+    );
+    assert!(
+        !change.new_value.contains("[REDACTED]"),
+        "{}",
+        change.new_value
+    );
+}
+
+/// Bundle-less review: an unresolvable placeholder must not read as drift
+/// against the gateway's real token, while the address still does.
+#[test]
+fn masking_aligns_the_discovery_token_only() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://consul.new.test:8501",
+            Some("${gh-env-secret:alloc=require}"),
+        )],
+        ..GatewayConfig::default()
+    };
+    let mut actual = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://consul.old.test:8501",
+            Some("LIVE-SYNTHETIC-TOKEN"),
+        )],
+        ..GatewayConfig::default()
+    };
+
+    mask_indeterminate_secret_values(&desired, &mut actual);
+
+    let consul = actual.upstreams[0]
+        .service_discovery
+        .as_ref()
+        .and_then(|sd| sd.consul.as_ref())
+        .expect("consul block");
+    assert_eq!(
+        consul.token.as_deref(),
+        Some("${gh-env-secret:alloc=require}")
+    );
+    assert_eq!(consul.address, "https://consul.old.test:8501");
+
+    let diffs = compute_diff(&desired, &actual);
+    let change = diffs
+        .iter()
+        .flat_map(|diff| &diff.details)
+        .find(|change| change.field == "service_discovery")
+        .expect("the address is still drift");
+    assert!(
+        change.old_value.contains("consul.old.test"),
+        "{}",
+        change.old_value
+    );
+}
