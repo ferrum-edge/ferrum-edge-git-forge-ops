@@ -19,6 +19,23 @@ permissions:
 jobs:
   protection-baseline:
     runs-on: ubuntu-24.04
+    # The audit token reads repository administration settings, so it must not
+    # be a plain repository secret: any branch a write-access collaborator can
+    # push is a branch they can dispatch, and a repository secret is handed to
+    # whatever workflow definition that ref carries. Binding a dedicated
+    # `settings-audit` environment whose deployment-branch policy admits only
+    # the protected default branch makes the boundary non-bypassable — GitHub
+    # refuses to release the environment's secrets to a job running from any
+    # other ref, before a single step executes. The in-file ref preflight below
+    # stays as the readable, fail-loud half of the same rule.
+    #
+    # This environment deploys nothing, so it deliberately has NO required
+    # reviewers: a reviewer here would park every weekly run in "waiting for
+    # approval", which is the silent-audit failure this workflow exists to
+    # avoid. `audit_settings.py` exempts it from the reviewer rule and excludes
+    # it from the at-least-one-deployment-environment requirement for the same
+    # reason.
+    environment: settings-audit
     steps:
       - name: Require protected default branch
         env:
