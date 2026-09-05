@@ -8,6 +8,7 @@ use crate::plugin_catalog::{
 };
 use crate::policy::config::default_auth_plugin_names;
 use crate::policy::PolicyConfig;
+use crate::secrets::resolver::is_identity_credential_leaf;
 
 #[derive(Debug, Clone)]
 pub struct SecurityFinding {
@@ -53,10 +54,13 @@ pub const BLOCKING_SEVERITY: &str = "error";
 /// and the post-merge apply never disagree.
 ///
 /// The load-bearing member is `check_literal_credentials`: a consumer
-/// credential string that is not a `${gh-env-secret:…}` placeholder is a
-/// secret committed to the repository, and applying it publishes it to the
-/// gateway. That is only true of the **pre-resolve** config — see
-/// [`audit_security_with_policy`].
+/// credential *secret* string that is not a `${gh-env-secret:…}` placeholder
+/// is a secret committed to the repository, and applying it publishes it to
+/// the gateway. That is only true of the **pre-resolve** config — see
+/// [`audit_security_with_policy`]. Credential *identities*
+/// (`basicauth[].username`, `mtls_auth[].identity`) are excluded: they are
+/// public halves the broker cannot generate, so blocking on them refused
+/// configurations this repo's own `import` produces.
 pub fn security_blockers(findings: &[SecurityFinding]) -> Vec<&SecurityFinding> {
     findings
         .iter()
@@ -77,8 +81,9 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
 /// (plus tolerated legacy spellings) are used.
 ///
 /// Must run **before** `secrets::resolve_secrets`: the literal-credential
-/// check treats any string that is not a `${...}` placeholder as a committed
-/// secret, so auditing a resolved config flags every allocated credential.
+/// check treats any secret string that is not a `${...}` placeholder as a
+/// committed secret, so auditing a resolved config flags every allocated
+/// credential.
 pub fn audit_security_with_policy(
     config: &GatewayConfig,
     policy: Option<&PolicyConfig>,
@@ -105,6 +110,8 @@ pub fn audit_security_with_policy(
                 &consumer.id,
                 &consumer.namespace,
                 cred_type,
+                cred_type,
+                None,
                 cred_value,
                 &mut findings,
             );
@@ -438,34 +445,83 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     }
 }
 
+/// Flag every literal (non-placeholder) secret string under one consumer
+/// credential type.
+///
+/// Two positions are tracked separately as the walk descends, and the
+/// distinction is the whole point of the function:
+///
+/// * `credential_type` is the **structural** top-level key of the credential
+///   map (`basicauth`, `mtls_auth`, `keyauth`, or a custom type). It never
+///   changes.
+/// * `leaf` is the enclosing object key of the string being classified
+///   (`None` for a bare string). An array index does not change which field a
+///   leaf is, so it carries through array recursion unchanged — the same rule
+///   [`crate::secrets::scrubber`] and the import capture walk follow.
+/// * `path` is the human-readable location for the diagnostic
+///   (`mtls_auth[0].identity`) and is not consulted for any decision.
+///
+/// Only `(credential_type, leaf)` decides the identity exemption, so
+/// `basicauth[0].username` is exempt while a custom credential type's
+/// `username` — which the broker would happily manage and the gateway has no
+/// public-half contract for — still blocks.
 fn check_literal_credentials(
     consumer_id: &str,
     namespace: &str,
-    cred_type: &str,
+    credential_type: &str,
+    path: &str,
+    leaf: Option<&str>,
     value: &serde_json::Value,
     findings: &mut Vec<SecurityFinding>,
 ) {
     match value {
         serde_json::Value::String(s) if !s.starts_with("${") => {
+            // `basicauth[].username` and `mtls_auth[].identity` are the public
+            // halves of their credentials: `import` deliberately preserves
+            // them verbatim, the broker refuses to generate them, and the
+            // scrubber leaves them readable so a diagnostic can still say
+            // which credential it is about. Calling them committed secrets
+            // blocked `apply` on the output of this repo's own importer.
+            // One classifier for all four call sites — see
+            // [`is_identity_credential_leaf`].
+            if is_identity_credential_leaf(credential_type, leaf) {
+                return;
+            }
             findings.push(SecurityFinding::error(
                 "Consumer",
                 consumer_id,
                 namespace,
                 format!(
-                    "Literal credential in '{cred_type}' on consumer {consumer_id} in namespace {namespace} (use ${{gh-env-secret:...}} for secrets)"
+                    "Literal credential in '{path}' on consumer {consumer_id} in namespace {namespace} (use ${{gh-env-secret:...}} for secrets)"
                 ),
             ));
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                let nested_path = format!("{cred_type}.{k}");
-                check_literal_credentials(consumer_id, namespace, &nested_path, v, findings);
+                let nested_path = format!("{path}.{k}");
+                check_literal_credentials(
+                    consumer_id,
+                    namespace,
+                    credential_type,
+                    &nested_path,
+                    Some(k.as_str()),
+                    v,
+                    findings,
+                );
             }
         }
         serde_json::Value::Array(arr) => {
             for (idx, item) in arr.iter().enumerate() {
-                let nested_path = format!("{cred_type}[{idx}]");
-                check_literal_credentials(consumer_id, namespace, &nested_path, item, findings);
+                let nested_path = format!("{path}[{idx}]");
+                check_literal_credentials(
+                    consumer_id,
+                    namespace,
+                    credential_type,
+                    &nested_path,
+                    leaf,
+                    item,
+                    findings,
+                );
             }
         }
         _ => {}
