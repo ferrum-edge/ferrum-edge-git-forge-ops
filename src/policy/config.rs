@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use super::Severity;
 
 pub const POLICY_CONFIG_PATH: &str = ".gitforgeops/policies.yaml";
+/// The only `.gitforgeops/policies.yaml` contract this release reads; it is
+/// both what an absent `version:` means and what the loader accepts.
+pub const POLICY_CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -280,24 +283,17 @@ pub struct PolicyRules {
     pub priority_override_range: PriorityOverrideRangeRuleConfig,
 }
 
+// Container-level `#[serde(default)]` fills a missing key from the `Default`
+// impl, which is therefore the only definition of these defaults (the
+// convention is explained in `config/repo_config.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct OverrideConfig {
     /// Label on the PR that flags an override request.
-    #[serde(default = "default_override_label")]
     pub require_label: String,
     /// Minimum repo permission required on the account that added the label.
     /// One of: `admin`, `maintain`, `write`.
-    #[serde(default = "default_required_permission")]
     pub required_permission: String,
-}
-
-fn default_override_label() -> String {
-    "gitforgeops/policy-override".to_string()
-}
-
-fn default_required_permission() -> String {
-    "write".to_string()
 }
 
 /// The set of repo-permission strings GitHub's API returns, ordered from
@@ -352,39 +348,28 @@ fn validate_overrides(cfg: &OverrideConfig) -> crate::error::Result<()> {
 impl Default for OverrideConfig {
     fn default() -> Self {
         Self {
-            require_label: default_override_label(),
-            required_permission: default_required_permission(),
+            require_label: "gitforgeops/policy-override".to_string(),
+            required_permission: "write".to_string(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
-    #[serde(default = "default_version")]
     pub version: u32,
-    #[serde(default)]
     pub policies: PolicyRules,
-    #[serde(default)]
     pub overrides: OverrideConfig,
 }
 
-// Hand-written so `PolicyConfig::default()` agrees with the serde field
-// defaults: a derived `Default` would give `version: 0`, which the loader
-// rejects, while an absent `version:` deserializes through
-// `default_version()`.
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            version: default_version(),
+            version: POLICY_CONFIG_VERSION,
             policies: PolicyRules::default(),
             overrides: OverrideConfig::default(),
         }
     }
-}
-
-fn default_version() -> u32 {
-    1
 }
 
 pub fn load_policies() -> crate::error::Result<Option<PolicyConfig>> {
@@ -396,11 +381,12 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
         return Ok(None);
     }
     let loaded = load_raw(path)?;
-    if loaded.version != 1 {
+    if loaded.version != POLICY_CONFIG_VERSION {
         return Err(crate::error::Error::Config(format!(
-            "unsupported policy config version {} in {}; expected version 1",
+            "unsupported policy config version {} in {}; expected version {}",
             loaded.version,
-            path.display()
+            path.display(),
+            POLICY_CONFIG_VERSION
         )));
     }
     validate_overrides(&loaded.overrides)?;

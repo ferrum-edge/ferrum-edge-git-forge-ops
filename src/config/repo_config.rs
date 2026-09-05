@@ -6,6 +6,9 @@ use super::env::ApplyStrategy;
 
 pub const REPO_CONFIG_PATH: &str = ".gitforgeops/config.yaml";
 pub const DEFAULT_LARGE_PRUNE_THRESHOLD_PERCENT: u8 = 25;
+/// The only `.gitforgeops/config.yaml` contract this release reads; it is
+/// both what an absent `version:` means and what `validate` accepts.
+pub const REPO_CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -15,53 +18,42 @@ pub enum OwnershipMode {
     Shared,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Every struct in this file carries container-level `#[serde(default)]`, so
+// a missing key is filled from the type's own `Default` impl. That impl is
+// the only definition of a field's default. A per-field
+// `#[serde(default = "...")]` would be a second one, and the two once
+// disagreed: a derived `Default` (all `false`) silently muted the
+// managed-modified and managed-deleted alerts for every config that declared
+// `ownership:` without spelling out `drift_alert_on:`.
+// `tests/unit/serde_default_tests.rs` asserts that `{}` deserializes to
+// `T::default()` for each of these types.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct DriftAlertOn {
-    #[serde(default = "default_true")]
     pub managed_modified: bool,
-    #[serde(default = "default_true")]
     pub managed_deleted: bool,
-    #[serde(default)]
     pub unmanaged_added: bool,
 }
 
-// `#[serde(default)]` on the `drift_alert_on` field uses this impl when the
-// whole block is absent, so it must agree with the per-field serde defaults
-// above. A derived `Default` (all `false`) silently muted managed-modified
-// and managed-deleted alerts for every config that declared `ownership:`
-// without spelling out `drift_alert_on:`.
 impl Default for DriftAlertOn {
     fn default() -> Self {
         Self {
-            managed_modified: default_true(),
-            managed_deleted: default_true(),
+            managed_modified: true,
+            managed_deleted: true,
             unmanaged_added: false,
         }
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct OwnershipConfig {
-    #[serde(default)]
     pub mode: OwnershipMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub namespaces: Option<Vec<String>>,
-    #[serde(default = "default_true")]
     pub drift_report: bool,
-    #[serde(default)]
     pub drift_alert_on: DriftAlertOn,
-    #[serde(default = "default_large_prune_threshold")]
     pub large_prune_threshold_percent: u8,
-}
-
-fn default_large_prune_threshold() -> u8 {
-    DEFAULT_LARGE_PRUNE_THRESHOLD_PERCENT
 }
 
 impl Default for OwnershipConfig {
@@ -77,18 +69,15 @@ impl Default for OwnershipConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct EnvironmentConfig {
     pub overlay: Option<String>,
     /// Whether protected `workflow_run` jobs should compare PR resources to
     /// a live Admin API. File-mode environments should set this to false.
-    #[serde(default = "default_true")]
     pub live_review: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace_filter: Option<String>,
-    #[serde(default)]
     pub apply_strategy: ApplyStrategy,
-    #[serde(default)]
     pub ownership: OwnershipConfig,
 }
 
@@ -105,23 +94,20 @@ impl Default for EnvironmentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
-    #[serde(default = "default_version")]
     pub version: u32,
-    #[serde(default)]
     pub environments: std::collections::BTreeMap<String, EnvironmentConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_environment: Option<String>,
 }
 
-// Hand-written for the same reason as `DriftAlertOn`: a derived `Default`
-// would give `version: 0`, which `validate` rejects, while an absent
-// `version:` deserializes through `default_version()`.
+// Serde's fill-in for absent keys, not a loadable config: `validate`
+// rejects the empty `environments` map this produces.
 impl Default for RepoConfig {
     fn default() -> Self {
         Self {
-            version: default_version(),
+            version: REPO_CONFIG_VERSION,
             environments: std::collections::BTreeMap::new(),
             default_environment: None,
         }
@@ -137,10 +123,6 @@ pub struct EnvironmentScope {
     /// explicit filter/ownership allowlist that the caller must intersect
     /// with those directories.
     pub namespaces: Option<Vec<String>>,
-}
-
-fn default_version() -> u32 {
-    1
 }
 
 impl RepoConfig {
@@ -199,11 +181,12 @@ impl RepoConfig {
     }
 
     fn validate(&self, path: &Path) -> crate::error::Result<()> {
-        if self.version != 1 {
+        if self.version != REPO_CONFIG_VERSION {
             return Err(crate::error::Error::Config(format!(
-                "unsupported repository config version {} in {}; expected version 1",
+                "unsupported repository config version {} in {}; expected version {}",
                 self.version,
-                path.display()
+                path.display(),
+                REPO_CONFIG_VERSION
             )));
         }
 

@@ -585,6 +585,7 @@ from weakening its own validator; forks do not inherit those repository settings
 - Return `crate::error::Error` variants via `?`; prefer descriptive variants over `Config(String)` when the category is clear.
 - New `FERRUM_*` env vars: add to `EnvConfig`, `load_env_config()`, `.env.example`, and doc block in `env.rs`.
 - Schema additions: mirror the Ferrum Edge struct, keep `#[serde(default)]` + `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields. Don't validate — ferrum-edge does.
+- Config structs with a hand-written `Default` (`config/repo_config.rs`, `OverrideConfig` / `PolicyConfig` in `policy/config.rs`) carry container-level `#[serde(default)]`, so the `Default` impl is the only definition of a field's default. Never add a per-field `#[serde(default = "…")]` beside one. `tests/unit/serde_default_tests.rs` asserts `{}` deserializes to `T::default()` for each such type. `StateFile` keeps required keys, so its `Default` routes each optional field through the same `default_*` fn its attribute names.
 
 ## PR Checklist
 

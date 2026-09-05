@@ -1,4 +1,4 @@
-use gitforgeops::config::repo_config::{DriftAlertOn, OwnershipMode, RepoConfig};
+use gitforgeops::config::repo_config::{OwnershipMode, RepoConfig};
 use gitforgeops::config::ApplyStrategy;
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -202,6 +202,8 @@ fn repo_config_drift_alert_defaults_survive_an_ownership_block_that_omits_them()
     // muted the managed-modified and managed-deleted alerts that the
     // no-`ownership:` case above still raised, so the nightly drift check
     // failed open for every environment that configured ownership at all.
+    // `serde_default_tests.rs` pins the absent-block / empty-block /
+    // `Default` agreement itself for every config type.
     let yaml = r#"
 environments:
   staging:
@@ -219,26 +221,6 @@ environments:
     assert!(alert.managed_modified);
     assert!(alert.managed_deleted);
     assert!(!alert.unmanaged_added);
-
-    // Every way of arriving at the defaults must agree: an absent block, an
-    // empty block, and `DriftAlertOn::default()`.
-    let empty_block: DriftAlertOn = serde_yaml::from_str("{}").unwrap();
-    let derived = DriftAlertOn::default();
-    for candidate in [&empty_block, &derived] {
-        assert_eq!(candidate.managed_modified, alert.managed_modified);
-        assert_eq!(candidate.managed_deleted, alert.managed_deleted);
-        assert_eq!(candidate.unmanaged_added, alert.unmanaged_added);
-    }
-}
-
-#[test]
-fn repo_config_default_matches_the_serde_version_default() {
-    // Same split, different type: a derived `Default` gave `version: 0`,
-    // which `validate` rejects, while an absent `version:` parses as 1.
-    let config = RepoConfig::default();
-    assert_eq!(config.version, 1);
-    assert!(config.environments.is_empty());
-    assert!(config.default_environment.is_none());
 }
 
 #[test]
