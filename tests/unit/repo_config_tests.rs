@@ -1,4 +1,4 @@
-use gitforgeops::config::repo_config::{OwnershipMode, RepoConfig};
+use gitforgeops::config::repo_config::{DriftAlertOn, OwnershipMode, RepoConfig};
 use gitforgeops::config::ApplyStrategy;
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -192,6 +192,53 @@ environments:
     assert!(alert.managed_modified);
     assert!(alert.managed_deleted);
     assert!(!alert.unmanaged_added);
+}
+
+#[test]
+fn repo_config_drift_alert_defaults_survive_an_ownership_block_that_omits_them() {
+    // Regression: `DriftAlertOn` used to derive `Default` (all false) while
+    // its serde field defaults said true/true/false. An `ownership:` block
+    // that omitted `drift_alert_on:` took the derived path and silently
+    // muted the managed-modified and managed-deleted alerts that the
+    // no-`ownership:` case above still raised, so the nightly drift check
+    // failed open for every environment that configured ownership at all.
+    let yaml = r#"
+environments:
+  staging:
+    overlay: staging
+    ownership:
+      mode: shared
+"#;
+    let file = write_repo_config(yaml);
+    let config = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+    let alert = &config
+        .environment("staging")
+        .unwrap()
+        .ownership
+        .drift_alert_on;
+    assert!(alert.managed_modified);
+    assert!(alert.managed_deleted);
+    assert!(!alert.unmanaged_added);
+
+    // Every way of arriving at the defaults must agree: an absent block, an
+    // empty block, and `DriftAlertOn::default()`.
+    let empty_block: DriftAlertOn = serde_yaml::from_str("{}").unwrap();
+    let derived = DriftAlertOn::default();
+    for candidate in [&empty_block, &derived] {
+        assert_eq!(candidate.managed_modified, alert.managed_modified);
+        assert_eq!(candidate.managed_deleted, alert.managed_deleted);
+        assert_eq!(candidate.unmanaged_added, alert.unmanaged_added);
+    }
+}
+
+#[test]
+fn repo_config_default_matches_the_serde_version_default() {
+    // Same split, different type: a derived `Default` gave `version: 0`,
+    // which `validate` rejects, while an absent `version:` parses as 1.
+    let config = RepoConfig::default();
+    assert_eq!(config.version, 1);
+    assert!(config.environments.is_empty());
+    assert!(config.default_environment.is_none());
 }
 
 #[test]
@@ -583,54 +630,4 @@ fn an_environment_without_an_overlay_is_never_checked() {
     let resolved = resolve_env(None, &EnvConfig::default(), None).unwrap();
     assert!(resolved.overlay.is_none());
     validate_overlay_selection(&resolved, None, std::path::Path::new("/nonexistent")).unwrap();
-}
-
-#[test]
-fn ownership_block_without_drift_alert_on_keeps_the_documented_alert_defaults() {
-    // Regression: `DriftAlertOn` derived `Default` (all false), so an
-    // `ownership:` block that omitted `drift_alert_on:` muted the
-    // managed-modified and managed-deleted alerts that the per-field serde
-    // defaults and the docs promise are on.
-    let yaml = r#"
-version: 1
-environments:
-  production:
-    ownership:
-      mode: shared
-"#;
-    let cfg: gitforgeops::config::repo_config::RepoConfig =
-        serde_yaml::from_str(yaml).expect("config parses");
-    let env = cfg
-        .environments
-        .get("production")
-        .expect("environment present");
-    let alerts = &env.ownership.drift_alert_on;
-    assert!(
-        alerts.managed_modified,
-        "managed_modified must default to true"
-    );
-    assert!(
-        alerts.managed_deleted,
-        "managed_deleted must default to true"
-    );
-    assert!(
-        !alerts.unmanaged_added,
-        "unmanaged_added must default to false"
-    );
-
-    let explicit: gitforgeops::config::repo_config::DriftAlertOn =
-        serde_yaml::from_str("{}").expect("empty block parses");
-    assert_eq!(
-        (
-            explicit.managed_modified,
-            explicit.managed_deleted,
-            explicit.unmanaged_added
-        ),
-        (
-            alerts.managed_modified,
-            alerts.managed_deleted,
-            alerts.unmanaged_added
-        ),
-        "an absent block and an empty block must agree"
-    );
 }

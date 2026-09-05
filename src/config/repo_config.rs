@@ -34,8 +34,8 @@ pub struct DriftAlertOn {
 impl Default for DriftAlertOn {
     fn default() -> Self {
         Self {
-            managed_modified: true,
-            managed_deleted: true,
+            managed_modified: default_true(),
+            managed_deleted: default_true(),
             unmanaged_added: false,
         }
     }
@@ -70,11 +70,7 @@ impl Default for OwnershipConfig {
             mode: OwnershipMode::default(),
             namespaces: None,
             drift_report: true,
-            drift_alert_on: DriftAlertOn {
-                managed_modified: true,
-                managed_deleted: true,
-                unmanaged_added: false,
-            },
+            drift_alert_on: DriftAlertOn::default(),
             large_prune_threshold_percent: DEFAULT_LARGE_PRUNE_THRESHOLD_PERCENT,
         }
     }
@@ -108,7 +104,7 @@ impl Default for EnvironmentConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     #[serde(default = "default_version")]
@@ -117,6 +113,19 @@ pub struct RepoConfig {
     pub environments: std::collections::BTreeMap<String, EnvironmentConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_environment: Option<String>,
+}
+
+// Hand-written for the same reason as `DriftAlertOn`: a derived `Default`
+// would give `version: 0`, which `validate` rejects, while an absent
+// `version:` deserializes through `default_version()`.
+impl Default for RepoConfig {
+    fn default() -> Self {
+        Self {
+            version: default_version(),
+            environments: std::collections::BTreeMap::new(),
+            default_environment: None,
+        }
+    }
 }
 
 /// Environment routing data safe to hand to CI matrix construction.

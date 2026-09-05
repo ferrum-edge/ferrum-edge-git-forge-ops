@@ -174,6 +174,13 @@ fn disabled_policy_produces_no_findings() {
 }
 
 #[test]
+fn policy_config_default_matches_the_serde_version_default() {
+    // A derived `Default` gave `version: 0`, which the loader rejects, while
+    // an absent `version:` parses as 1.
+    assert_eq!(PolicyConfig::default().version, 1);
+}
+
+#[test]
 fn timeout_band_upper_bound_triggers_error() {
     let cfg = GatewayConfig {
         proxies: vec![proxy("slow-one", BackendScheme::Https, 120_000, true)],

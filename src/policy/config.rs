@@ -358,7 +358,7 @@ impl Default for OverrideConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     #[serde(default = "default_version")]
@@ -367,6 +367,20 @@ pub struct PolicyConfig {
     pub policies: PolicyRules,
     #[serde(default)]
     pub overrides: OverrideConfig,
+}
+
+// Hand-written so `PolicyConfig::default()` agrees with the serde field
+// defaults: a derived `Default` would give `version: 0`, which the loader
+// rejects, while an absent `version:` deserializes through
+// `default_version()`.
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            version: default_version(),
+            policies: PolicyRules::default(),
+            overrides: OverrideConfig::default(),
+        }
+    }
 }
 
 fn default_version() -> u32 {
