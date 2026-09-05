@@ -24,6 +24,43 @@ ALLOWED_ACTION_PATTERNS = {
     "taiki-e/install-action@*",
 }
 
+# The launch-required status checks, spelled as ruleset contexts (the job name,
+# not the `Workflow / job` pull-request display label). `settings-audit.yml`
+# still passes them explicitly so a workflow diff shows what is enforced;
+# `bootstrap_repo_settings.py` imports this tuple to build the ruleset it
+# applies, so the writer and the auditor cannot drift apart.
+REQUIRED_STATUS_CHECKS = (
+    "rust-ci-check",
+    "security-cargo-audit",
+    "security-supply-chain-policy",
+    "state-guard-reject-state-edits",
+    "gitforgeops-required-static-validation",
+)
+
+RELEASE_TAG_PATTERN = "refs/tags/v*"
+
+# `settings-audit.yml` binds this environment so its administration-read token
+# is released only to a job running from the protected default branch. It is
+# not a deployment target: nothing applies to a gateway through it and it holds
+# no gateway credential, so it is exempt from the reviewer and self-review rules
+# (a reviewer would park every scheduled run in "waiting for approval", which is
+# exactly the silently-stopped audit the workflow exists to prevent) and it does
+# not satisfy the at-least-one-protected-environment requirement. Its branch
+# policy is audited like any other environment's — that restriction is the whole
+# point of moving the token here.
+SETTINGS_AUDIT_ENVIRONMENT = "settings-audit"
+
+# A template repository is the copy customers clone from. It has no deployment
+# environments and no state-writer App, because nothing on it ever applies to a
+# gateway or commits an ownership ledger. Those two controls are therefore not
+# audited there; everything else is.
+TEMPLATE_SKIPPED_CONTROLS = (
+    "template repository mode: state-writer App bypass on the default-branch "
+    "ruleset is not audited (a template never commits an ownership ledger)",
+    "template repository mode: the at-least-one-protected-environment "
+    "requirement is not audited (a template has no deployment target)",
+)
+
 
 @dataclass
 class Audit:
@@ -119,7 +156,8 @@ def audit_main_ruleset(
     audit: Audit,
     ruleset: dict,
     required_checks: set[str],
-    state_writer_app_id: int,
+    state_writer_app_id: int | None,
+    template_repo: bool = False,
 ) -> None:
     rules = {rule.get("type"): rule for rule in ruleset.get("rules", [])}
     for rule_type in ("deletion", "non_fast_forward", "pull_request", "required_status_checks"):
@@ -163,22 +201,23 @@ def audit_main_ruleset(
         f"required status checks: {sorted(configured_checks)}",
     )
 
-    bypasses = ruleset.get("bypass_actors", [])
-    audit.require(
-        len(bypasses) == 1,
-        "main ruleset must have exactly one bypass actor in any mode: the state-writer App",
-    )
-    if len(bypasses) == 1:
-        bypass = bypasses[0]
+    if not template_repo:
+        bypasses = ruleset.get("bypass_actors", [])
         audit.require(
-            bypass.get("actor_type") == "Integration"
-            and str(bypass.get("actor_id", "")) == str(state_writer_app_id),
-            "main ruleset bypass must be the configured state-writer App",
+            len(bypasses) == 1,
+            "main ruleset must have exactly one bypass actor in any mode: the state-writer App",
         )
-        audit.require(
-            bypass.get("bypass_mode") == "always",
-            "main ruleset state-writer App bypass must use always mode",
-        )
+        if len(bypasses) == 1:
+            bypass = bypasses[0]
+            audit.require(
+                bypass.get("actor_type") == "Integration"
+                and str(bypass.get("actor_id", "")) == str(state_writer_app_id),
+                "main ruleset bypass must be the configured state-writer App",
+            )
+            audit.require(
+                bypass.get("bypass_mode") == "always",
+                "main ruleset state-writer App bypass must use always mode",
+            )
     audit.evidence.append(
         f"active default-branch ruleset: {ruleset.get('name')} ({ruleset.get('id')})"
     )
@@ -233,17 +272,28 @@ def audit_environment(audit: Audit, repo: str, environment: dict, branch: str) -
     rules = detail.get("protection_rules", [])
     reviewer_rules = [rule for rule in rules if rule.get("type") == "required_reviewers"]
     has_reviewers = any(rule.get("reviewers") for rule in reviewer_rules)
-    audit.require(
-        has_reviewers,
-        f"environment {name!r} must require at least one reviewer",
-    )
-    prevents_self_review = any(
-        rule.get("prevent_self_review") is True for rule in reviewer_rules
-    )
-    audit.require(
-        prevents_self_review,
-        f"environment {name!r} must prevent self-review",
-    )
+    # The settings-audit environment gates a read-only token, not a deployment.
+    # Requiring a reviewer there would hold every scheduled run for approval and
+    # produce the silently-stopped audit this whole control exists to prevent.
+    # Its branch policy is still audited below.
+    if name == SETTINGS_AUDIT_ENVIRONMENT:
+        audit.evidence.append(
+            f"environment {name}: reviewer rules waived (gates the "
+            "administration-read audit token, deploys nothing)"
+        )
+        has_reviewers = True
+    else:
+        audit.require(
+            has_reviewers,
+            f"environment {name!r} must require at least one reviewer",
+        )
+        prevents_self_review = any(
+            rule.get("prevent_self_review") is True for rule in reviewer_rules
+        )
+        audit.require(
+            prevents_self_review,
+            f"environment {name!r} must prevent self-review",
+        )
 
     policy = detail.get("deployment_branch_policy") or {}
     branch_limited = policy.get("protected_branches") is True
@@ -274,10 +324,13 @@ def run(
     repo: str,
     branch: str,
     required_checks: set[str],
-    state_writer_app_id: int,
+    state_writer_app_id: int | None,
     release_tag_pattern: str,
+    template_repo: bool = False,
 ) -> Audit:
     audit = Audit()
+    if template_repo:
+        audit.evidence.extend(TEMPLATE_SKIPPED_CONTROLS)
     workflow = gh_json(f"repos/{repo}/actions/permissions/workflow")
     actions = gh_json(f"repos/{repo}/actions/permissions")
     selected = (
@@ -300,7 +353,7 @@ def run(
     )
     if len(matching) == 1:
         audit_main_ruleset(
-            audit, matching[0], required_checks, state_writer_app_id
+            audit, matching[0], required_checks, state_writer_app_id, template_repo
         )
 
     tag_matching = [
@@ -328,7 +381,27 @@ def run(
         for item in page.get("environments", [])
         if isinstance(item, dict)
     ]
-    audit.require(bool(listed), "repository must define at least one protected environment")
+    names = {
+        item.get("name") for item in listed if isinstance(item.get("name"), str)
+    }
+    # A template repository has no deployment environment, but it still runs the
+    # settings audit, so it still needs the environment that holds the audit
+    # token — in both modes.
+    audit.require(
+        SETTINGS_AUDIT_ENVIRONMENT in names,
+        f"repository must define the {SETTINGS_AUDIT_ENVIRONMENT!r} environment; "
+        "settings-audit.yml binds it so the administration-read token is "
+        "released only to the protected default branch",
+        f"audit-token environment {SETTINGS_AUDIT_ENVIRONMENT} present",
+    )
+    if not template_repo:
+        # The audit-token environment is not a deployment target, so it cannot
+        # be the one protected environment a deployment repository is required
+        # to have.
+        audit.require(
+            bool(names - {SETTINGS_AUDIT_ENVIRONMENT}),
+            "repository must define at least one protected environment",
+        )
     for environment in listed:
         audit_environment(audit, repo, environment, branch)
     return audit
@@ -339,9 +412,24 @@ def main() -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--branch", default="main")
     parser.add_argument("--required-check", action="append", default=[])
-    parser.add_argument("--state-writer-app-id", required=True, type=int)
-    parser.add_argument("--release-tag-pattern", default="refs/tags/v*")
+    parser.add_argument("--state-writer-app-id", type=int)
+    parser.add_argument("--release-tag-pattern", default=RELEASE_TAG_PATTERN)
+    parser.add_argument(
+        "--template-repo",
+        action="store_true",
+        help=(
+            "audit the template repository customers copy: skip the state-writer "
+            "App bypass and protected-environment requirements, audit everything else"
+        ),
+    )
     args = parser.parse_args()
+    required_checks = set(args.required_check) or set(REQUIRED_STATUS_CHECKS)
+    if args.state_writer_app_id is None and not args.template_repo:
+        print(
+            "settings audit requires --state-writer-app-id unless --template-repo is set",
+            file=sys.stderr,
+        )
+        return 1
     if not os.environ.get("GH_TOKEN"):
         print(
             "settings audit requires GH_TOKEN with read access to repository administration settings",
@@ -352,9 +440,10 @@ def main() -> int:
         audit = run(
             args.repo,
             args.branch,
-            set(args.required_check),
+            required_checks,
             args.state_writer_app_id,
             args.release_tag_pattern,
+            args.template_repo,
         )
     except (
         RuntimeError,

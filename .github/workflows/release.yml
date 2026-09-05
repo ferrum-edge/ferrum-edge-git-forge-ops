@@ -22,7 +22,13 @@ concurrency:
 jobs:
   authorize-release:
     name: Require a checked, merged pull request
-    if: github.event.repository.fork == false || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
+    # Publishing runs on the upstream repository, or wherever an owner has
+    # explicitly opted in. A `fork == false` test used to stand in for
+    # "upstream": it is also true of every copy made through "Use this
+    # template", so a customer's own repository would try to publish to the
+    # upstream Docker Hub namespace on its first push to `main` and fail.
+    # Naming the repository is the check that actually means upstream.
+    if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -105,14 +111,14 @@ jobs:
 
   docker:
     name: Build and push Docker image
-    # Only run on the upstream repo by default. Forks consume the
-    # already-published image and don't need to rebuild. A fork that
-    # wants to maintain its own image can opt in by setting repo
-    # variable `GITFORGEOPS_RELEASE_ENABLED=true` and pointing
+    # Only run on the upstream repo by default. Template copies and forks
+    # consume the already-published image and don't need to rebuild. A
+    # repository that wants to maintain its own image can opt in by setting
+    # repo variable `GITFORGEOPS_RELEASE_ENABLED=true` and pointing
     # `DOCKERHUB_IMAGE` at a namespace it can push to (GHCR always
     # derives from `github.repository`, so no override needed there).
     needs: authorize-release
-    if: github.event.repository.fork == false || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
+    if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

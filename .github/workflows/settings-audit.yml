@@ -19,6 +19,23 @@ permissions:
 jobs:
   protection-baseline:
     runs-on: ubuntu-24.04
+    # The audit token reads repository administration settings, so it must not
+    # be a plain repository secret: any branch a write-access collaborator can
+    # push is a branch they can dispatch, and a repository secret is handed to
+    # whatever workflow definition that ref carries. Binding a dedicated
+    # `settings-audit` environment whose deployment-branch policy admits only
+    # the protected default branch makes the boundary non-bypassable — GitHub
+    # refuses to release the environment's secrets to a job running from any
+    # other ref, before a single step executes. The in-file ref preflight below
+    # stays as the readable, fail-loud half of the same rule.
+    #
+    # This environment deploys nothing, so it deliberately has NO required
+    # reviewers: a reviewer here would park every weekly run in "waiting for
+    # approval", which is the silent-audit failure this workflow exists to
+    # avoid. `audit_settings.py` exempts it from the reviewer rule and excludes
+    # it from the at-least-one-deployment-environment requirement for the same
+    # reason.
+    environment: settings-audit
     steps:
       - name: Require protected default branch
         env:
@@ -36,6 +53,12 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      # A template repository — the copy customers clone from — has no
+      # deployment environment and no state-writer App, because nothing on it
+      # applies to a gateway or commits an ownership ledger. Repository
+      # variable `GITFORGEOPS_TEMPLATE_REPO=true` drops exactly those two
+      # checks and leaves the rest of the baseline enforced; the audit says so
+      # in its own evidence output. A deployment repository must not set it.
       - name: Audit repository and deployment protections
         env:
           # Fine-grained PAT or GitHub App token with Administration: read.
@@ -44,13 +67,21 @@ jobs:
           REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           STATE_WRITER_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+          TEMPLATE_REPO: ${{ vars.GITFORGEOPS_TEMPLATE_REPO }}
         run: |
-          python3 .github/scripts/audit_settings.py \
-            --repo "$REPO" \
-            --branch "$DEFAULT_BRANCH" \
-            --state-writer-app-id "$STATE_WRITER_APP_ID" \
-            --required-check 'rust-ci-check' \
-            --required-check 'security-cargo-audit' \
-            --required-check 'security-supply-chain-policy' \
-            --required-check 'state-guard-reject-state-edits' \
+          set -euo pipefail
+          args=(
+            --repo "$REPO"
+            --branch "$DEFAULT_BRANCH"
+            --required-check 'rust-ci-check'
+            --required-check 'security-cargo-audit'
+            --required-check 'security-supply-chain-policy'
+            --required-check 'state-guard-reject-state-edits'
             --required-check 'gitforgeops-required-static-validation'
+          )
+          if [ "$(printf '%s' "${TEMPLATE_REPO:-}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+            args+=(--template-repo)
+          else
+            args+=(--state-writer-app-id "$STATE_WRITER_APP_ID")
+          fi
+          python3 .github/scripts/audit_settings.py "${args[@]}"
