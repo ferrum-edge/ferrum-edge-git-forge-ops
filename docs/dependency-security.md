@@ -4,6 +4,44 @@ The `Security` workflow runs `cargo audit` through
 `.github/scripts/check_cargo_audit.py` on every pull request, on pushes to
 `main` that touch build inputs, and on the weekly schedule.
 
+## CI trust boundary
+
+For pull requests, the workflow executes the checker, its tests, and the
+exception policy from a separate checkout of the protected default branch,
+while `--source-root` points the audit and reachability checks at the candidate
+tree. A pull request therefore cannot approve its own dependency finding by
+weakening the checker or adding an exception. `check_supply_chain.py` asserts
+that this stays true: `security.yml` is itself supplied by the pull request
+head, so one commit could otherwise both add an exception and delete the
+trusted checkout that stops it from counting.
+
+Push and schedule runs keep executing the tree's own checker and policy. There
+is no untrusted author on those events, and pinning them to the default branch
+would stop a merged policy change from ever taking effect.
+
+### The expand/contract cost
+
+Pinning the policy to `main` means a pull request that *changes* the policy
+does not get the benefit of its own change. Both directions cost one extra
+merge:
+
+- **Adding an exception.** The PR that writes the new entry into
+  `.github/cargo-audit-policy.json` is still judged by `main`'s policy, which
+  does not have it, so `Security` stays red on that PR and it has to be merged
+  with the failing check acknowledged. Every later PR is green.
+- **Removing a dependency that has an exception.** A PR that drops the crate
+  *and* its policy entry is judged by `main`'s policy, which still names the
+  crate, so the reachability verifier reports `stale exception: <pkg>@<ver> is
+  no longer in the dependency graph` even though the PR already removed the
+  entry. Land the policy removal first, or merge with the failing check
+  acknowledged.
+
+This is the same cost the supply-chain policy already pays for the same
+reason, and it is the price of the gate not being self-approving. Do not
+"fix" either case by pointing `--policy` at the candidate tree — that is
+exactly the bypass the trusted checkout exists to close, and
+`check_supply_chain.py` rejects it.
+
 The gate fails on `vulnerability`, `unsound`, and `yanked` findings unless an
 exact finding is recorded in `.github/cargo-audit-policy.json`. Every other
 `cargo audit` bucket — `unmaintained`, `notice`, and any bucket a future
