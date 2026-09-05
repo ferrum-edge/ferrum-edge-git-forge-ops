@@ -1972,3 +1972,447 @@ async fn a_read_only_preflight_fails_before_any_mutation() {
 
     assert!(matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)));
 }
+
+// --- Shared-mode adoption of already-matching rows (issue #129) ---------------
+
+use gitforgeops::apply::{adoption_candidates, adoption_summary_line, AdoptionCandidate};
+use gitforgeops::config::schema::Consumer;
+use gitforgeops::state::StateFile;
+use std::collections::{BTreeSet, HashSet};
+
+fn consumer(id: &str, namespace: &str) -> Consumer {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "username": id,
+        "namespace": namespace,
+    }))
+    .expect("consumer fixture")
+}
+
+/// `apply_api` reads timestamps back through serde, so fixtures shared between
+/// the desired document and the stubbed backup have to be byte-identical.
+fn backup_body(config: &GatewayConfig) -> String {
+    serde_json::to_string(config).expect("backup body")
+}
+
+fn ledger_of(ops: &[gitforgeops::apply::AppliedOp], desired: &GatewayConfig) -> StateFile {
+    let mut state = StateFile::default();
+    for op in ops {
+        state.record_op(op, desired).expect("record adopted op");
+    }
+    state
+}
+
+fn candidate_ids(candidates: &[AdoptionCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|c| format!("{} {}", c.kind, c.id))
+        .collect()
+}
+
+#[tokio::test]
+async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
+    // Issue #129's reproduction. Two consumers imported from the gateway match
+    // it exactly, so the diff is empty and — before adoption — nothing ever
+    // recorded ownership. The ledger stayed `{}`, `old` sat outside the
+    // shared-mode delete fence, and removing it from the repo pruned nothing.
+    let live = GatewayConfig {
+        consumers: vec![
+            consumer("old", "team-alpha"),
+            consumer("keep", "team-alpha"),
+        ],
+        ..Default::default()
+    };
+    let desired = live.clone();
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("GET /backup".into(), 200, backup_body(&live), vec![]),
+    ]);
+    let client = stub_client(url);
+    let empty_fence: HashSet<String> = HashSet::new();
+
+    let first = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &empty_fence,
+        },
+        Some(&BTreeMap::from([("team-alpha".to_string(), live.clone())])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("an all-matching apply is a clean run");
+
+    assert_eq!(
+        (first.created, first.updated, first.deleted),
+        (0, 0, 0),
+        "adoption changes no gateway configuration"
+    );
+    assert_eq!(first.adopted.len(), 2, "{:?}", first.adopted);
+    assert!(first.adoption_skipped.is_empty(), "{first:?}");
+
+    {
+        let requests = requests.lock().expect("recorded requests");
+        for id in ["old", "keep"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.contains(&format!("PUT /consumers/{id}")))
+                    .count(),
+                1,
+                "each adopted row is claimed with exactly one idempotent PUT: {requests:?}"
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .all(|r| !r.contains("POST /consumers") && !r.contains("DELETE /consumers")),
+            "adoption creates and deletes nothing: {requests:?}"
+        );
+    }
+
+    // The ledger the next run reads.
+    let state = ledger_of(&first.adopted, &desired);
+    let managed = state.previously_managed_keys();
+    assert_eq!(managed.len(), 2, "{managed:?}");
+    assert!(managed.contains(&state_key("team-alpha", "Consumer", "old")));
+    assert!(managed.contains(&state_key("team-alpha", "Consumer", "keep")));
+
+    // Remove `old` from the repository. It is now inside the delete fence, so
+    // the second apply prunes it — and the large-prune guard has a denominator
+    // (the managed set) to measure the deletion against instead of the empty
+    // set that made it a no-op.
+    let desired_without_old = GatewayConfig {
+        consumers: vec![consumer("keep", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("GET /backup".into(), 200, backup_body(&live), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let second = apply_api(
+        &desired_without_old,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        Some(&BTreeMap::from([("team-alpha".to_string(), live.clone())])),
+        None,
+        &ApplyOptions {
+            managed_ledger: managed.iter().cloned().collect(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the prune is an ordinary shared-mode delete");
+
+    assert_eq!(second.deleted, 1);
+    assert_eq!(second.unmanaged_skipped, 0);
+    assert!(
+        second.adopted.is_empty(),
+        "`keep` is already in the ledger and must not be re-adopted: {:?}",
+        second.adopted
+    );
+    let requests = requests.lock().expect("recorded requests");
+    assert!(
+        requests.iter().any(|r| r.contains("DELETE /consumers/old")),
+        "{requests:?}"
+    );
+    assert!(
+        requests.iter().all(|r| !r.contains("PUT /consumers/keep")),
+        "a second run must not re-issue the ownership PUT: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_that_changed_between_diff_and_assertion_is_skipped_and_reported() {
+    // The adoption PUT overwrites the row. If an administrator edited it after
+    // this run's diff, claiming ownership would silently revert their change,
+    // so the confirmation read has to disagree loudly instead.
+    let desired = GatewayConfig {
+        consumers: vec![consumer("c1", "team-alpha")],
+        ..Default::default()
+    };
+    let mut edited = consumer("c1", "team-alpha");
+    edited.username = "edited-by-an-admin".to_string();
+    let confirmation = GatewayConfig {
+        consumers: vec![edited],
+        ..Default::default()
+    };
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&confirmation),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+    let empty_fence: HashSet<String> = HashSet::new();
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &empty_fence,
+        },
+        // The diff ran against a view in which the row still matched.
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            desired.clone(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("a skipped adoption is not a failure");
+
+    assert!(result.adopted.is_empty(), "{:?}", result.adopted);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.adoption_skipped.len(), 1, "{result:?}");
+    let message = &result.adoption_skipped[0];
+    assert!(message.contains("Consumer `c1`"), "{message}");
+    assert!(
+        message.contains("changed between this run's diff and the ownership assertion"),
+        "{message}"
+    );
+    let requests = requests.lock().expect("recorded requests");
+    assert!(
+        requests.iter().all(|r| !r.contains("PUT /consumers/c1")),
+        "the admin's edit must not be overwritten: {requests:?}"
+    );
+}
+
+#[test]
+fn spec_owned_rows_are_never_adopted() {
+    // The `/api-specs` importer owns these rows in both ownership modes.
+    // Adopting one would put a resource the repo must never delete inside the
+    // delete fence — and the live tag is the only thing that says so, since a
+    // repository declaration may never carry `api_spec_id` at all.
+    let desired = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", None)],
+        plugin_configs: vec![plugin_config("pc1", "team-alpha", "p1", None)],
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let mut spec_owned_upstream = upstream("u1", "team-alpha");
+    spec_owned_upstream.api_spec_id = Some("spec-a".to_string());
+    let actual = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", Some("spec-a"))],
+        plugin_configs: vec![plugin_config("pc1", "team-alpha", "p1", Some("spec-a"))],
+        upstreams: vec![spec_owned_upstream],
+        ..Default::default()
+    };
+
+    let candidates = adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new());
+    assert!(
+        candidates.is_empty(),
+        "no spec-owned row may be adopted: {:?}",
+        candidate_ids(&candidates)
+    );
+
+    // Control: the identical rows without the ownership tag are adoptable, so
+    // the exclusion above is the tag and not an unrelated mismatch.
+    let untagged = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", None)],
+        plugin_configs: vec![plugin_config("pc1", "team-alpha", "p1", None)],
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let candidates = adoption_candidates(&desired, &untagged, &BTreeSet::new(), &BTreeSet::new());
+    assert_eq!(
+        candidate_ids(&candidates),
+        vec!["Upstream u1", "Proxy p1", "PluginConfig pc1"]
+    );
+}
+
+#[test]
+fn adoption_skips_ledger_entries_and_rows_an_operation_already_covers() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha"), upstream("u2", "team-alpha")],
+        consumers: vec![consumer("c1", "team-alpha")],
+        ..Default::default()
+    };
+    let actual = desired.clone();
+
+    let managed = BTreeSet::from([state_key("team-alpha", "Upstream", "u1")]);
+    let handled = BTreeSet::from([state_key("team-alpha", "Consumer", "c1")]);
+    let candidates = adoption_candidates(&desired, &actual, &managed, &handled);
+    assert_eq!(candidate_ids(&candidates), vec!["Upstream u2"]);
+}
+
+#[test]
+fn a_row_absent_or_different_live_is_not_an_adoption_candidate() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha"), upstream("u2", "team-alpha")],
+        ..Default::default()
+    };
+    let mut different = upstream("u1", "team-alpha");
+    different.targets.clear();
+    let actual = GatewayConfig {
+        upstreams: vec![different],
+        ..Default::default()
+    };
+
+    // `u1` differs (ordinary Modify), `u2` is absent (ordinary Add).
+    let candidates = adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new());
+    assert!(candidates.is_empty(), "{:?}", candidate_ids(&candidates));
+}
+
+#[tokio::test]
+async fn a_cached_backup_blocks_adoption() {
+    // A cached backup clears `api_spec_id` tags, so it cannot prove a row is
+    // not spec-owned — the same reason it blocks every other mutation.
+    let desired = GatewayConfig {
+        consumers: vec![consumer("c1", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&desired),
+            vec![("X-Data-Source".into(), "cached".into())],
+        ),
+    ]);
+    let client = stub_client(url);
+    let empty_fence: HashSet<String> = HashSet::new();
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &empty_fence,
+        },
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            desired.clone(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("the run itself is clean; only the claim is withheld");
+
+    assert!(result.adopted.is_empty(), "{:?}", result.adopted);
+    assert_eq!(result.adoption_skipped.len(), 1, "{result:?}");
+    let message = &result.adoption_skipped[0];
+    assert!(message.contains("X-Data-Source: cached"), "{message}");
+    let requests = requests.lock().expect("recorded requests");
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.contains("PUT ") && !r.contains("POST ") && !r.contains("DELETE ")),
+        "nothing may be claimed from a cached view: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn exclusive_mode_records_adoption_without_a_put() {
+    // Exclusive ownership is already authoritative for the namespace, so there
+    // is nothing to assert. The ledger entry is still written, so the fence is
+    // correct if the environment is later switched to `shared`.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            desired.clone(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("exclusive adoption never touches the gateway");
+
+    assert_eq!(result.adopted.len(), 1);
+    assert_eq!(result.adopted[0].id, "u1");
+    assert!(result.adoption_skipped.is_empty(), "{result:?}");
+    let requests = requests.lock().expect("recorded requests");
+    assert!(
+        requests.iter().all(|r| r.contains("GET /health")),
+        "exclusive adoption issues no confirmation read and no PUT: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_adoption_put_is_reported_and_not_recorded() {
+    // Ownership is recorded only after the gateway acknowledges the claim.
+    // Silently continuing would leave the row outside the fence with nothing
+    // on screen saying so — which is exactly the failure mode being fixed.
+    let desired = GatewayConfig {
+        consumers: vec![consumer("c1", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, _requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("GET /backup".into(), 200, backup_body(&desired), vec![]),
+        (
+            "PUT /consumers/c1".into(),
+            500,
+            r#"{"error":"boom"}"#.into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+    let empty_fence: HashSet<String> = HashSet::new();
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &empty_fence,
+        },
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            desired.clone(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("a failed claim is an ordinary per-resource failure");
+
+    assert!(result.adopted.is_empty(), "{:?}", result.adopted);
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].contains("Consumer c1 adopt"),
+        "{:?}",
+        result.errors
+    );
+    assert!(
+        result.into_result().is_err(),
+        "an unclaimed row must not report a clean apply"
+    );
+}
+
+#[test]
+fn adoption_summary_line_is_silent_when_nothing_was_adopted() {
+    assert_eq!(adoption_summary_line(0), None);
+    assert_eq!(
+        adoption_summary_line(3).as_deref(),
+        Some("Adopted 3 already-matching resource(s) into the ledger")
+    );
+}
