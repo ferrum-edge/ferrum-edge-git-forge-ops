@@ -170,6 +170,24 @@ Workflows run as a matrix over `gitforgeops envs --format json`, binding
 groups serialize per-env applies so two concurrent writes to the same
 environment never interleave.
 
+#### Freshness guard (the lock does not move the checkout)
+
+`ferrum-apply-<env>` serializes `apply-on-merge.yml` and `rotate.yml`, but
+`actions/checkout` still selects the *triggering* commit, so a queued run would
+reconcile against a `.state/<env>.json` that predates the ledger the run ahead
+of it publishes — and shared mode reads rows it never saw as "never managed".
+Both workflows therefore check out `ref: <default_branch>` with `fetch-depth: 0`
+and then, in a **`Refresh protected branch and reject stale deployments`** step
+that runs before any build or gateway call: re-fetch the branch, `git checkout
+--force -B <branch> refs/remotes/origin/<branch>` (stay on the branch — the
+ledger commit later pushes it), print the triggering SHA and the branch head,
+and fail closed unless `git merge-base --is-ancestor` puts the trigger inside
+that head. Binary, desired state and ledger then all come from one commit;
+`GITHUB_SHA` for the apply is that refreshed head, matching
+`state.last_applied_commit`. PR attribution (override label, credential
+recipient) stays on the triggering merge. `check_supply_chain.py::
+stale_deployment_guard_violations` enforces the shape and the step ordering.
+
 ### Ownership modes
 
 Configured per environment in repo config.

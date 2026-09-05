@@ -38,6 +38,59 @@ PRIVILEGED_WORKFLOWS = (
     "materialize-file.yml",
     "rotate.yml",
 )
+FRESH_HEAD_STEP = "Refresh protected branch and reject stale deployments"
+# The checkout that feeds a privileged reconcile has to name the branch, not
+# the triggering event's commit, and has to carry enough history for the
+# ancestry test below to be answerable.
+FRESH_HEAD_CHECKOUT = (
+    "ref: ${{ github.event.repository.default_branch }}",
+    "fetch-depth: 0",
+    "persist-credentials: false",
+)
+# The guard itself: re-fetch under the lock, move onto the branch head, print
+# both revisions, and fail closed when the triggering commit is no longer part
+# of the branch.
+FRESH_HEAD_CONTROLS = (
+    "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    "TRIGGER_SHA: ${{ github.sha }}",
+    "git fetch --no-tags --force origin",
+    'fresh_head=$(git rev-parse "refs/remotes/origin/${DEFAULT_BRANCH}")',
+    'git checkout --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/${DEFAULT_BRANCH}"',
+    'echo "Triggering commit: $TRIGGER_SHA"',
+    'echo "Protected ${DEFAULT_BRANCH} HEAD: $fresh_head"',
+    'git cat-file -e "${TRIGGER_SHA}^{commit}"',
+    'git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head"',
+)
+# Per privileged reconciling workflow: the checkout step name, the job-level
+# markers that prove the environment lock is already held, and every step that
+# must not run before the freshness guard.
+FRESH_HEAD_WORKFLOWS = {
+    "apply-on-merge.yml": {
+        "checkout_step": "Check out protected main for apply",
+        "lock": (
+            "    environment: ${{ matrix.environment }}",
+            "      group: ferrum-apply-${{ matrix.environment }}",
+        ),
+        "gateway": (
+            "bash .github/scripts/install-ferrum-edge.sh",
+            "run: cargo install --path . --locked",
+            "- name: Load credential bundles",
+            "run: gitforgeops apply --auto-approve",
+        ),
+    },
+    "rotate.yml": {
+        "checkout_step": "Check out protected main for rotation",
+        "lock": (
+            "    environment: ${{ inputs.environment }}",
+            "      group: ferrum-apply-${{ inputs.environment }}",
+        ),
+        "gateway": (
+            "run: cargo install --path . --locked",
+            "- name: Load credential bundles",
+            "gitforgeops rotate \\",
+        ),
+    },
+}
 
 
 def action_files(root: Path) -> list[Path]:
@@ -166,6 +219,69 @@ def credential_bundle_binding_violations(
             f"{workflow}: {BUNDLE_LOADER_STEP!r} binds shards beyond MAX_BUNDLE_SHARDS "
             f"({limit}): {', '.join(extra)}"
         )
+    return violations
+
+
+def stale_deployment_guard_violations(
+    workflow: str, text: str, contract: dict
+) -> list[str]:
+    """A privileged reconcile must read the branch head it actually holds the lock for.
+
+    The concurrency group serializes applies per environment, but
+    `actions/checkout` selects the commit that TRIGGERED the run. A merge queued
+    behind a running apply therefore reconciles from a `.state/<env>.json` that
+    predates the ledger the earlier run publishes — shared mode reads the rows it
+    never saw as "never managed" and quietly stops reconciling them — and a
+    re-run of an old workflow replays an old desired snapshot over newer
+    configuration.
+
+    So the environment-bound job must, after the lock is held and before it
+    builds a binary or touches the gateway: re-fetch the protected branch, move
+    onto its current head, print both revisions, and fail closed unless the
+    triggering commit is still an ancestor of that head. Desired state, ledger
+    and binary then all come from the one commit.
+    """
+    violations: list[str] = []
+    checkout_step = contract["checkout_step"]
+    checkout = named_step(text, checkout_step)
+    if checkout is None:
+        violations.append(f"{workflow}: a {checkout_step!r} step is required")
+    else:
+        for required in FRESH_HEAD_CHECKOUT:
+            if required not in checkout:
+                violations.append(
+                    f"{workflow}: {checkout_step!r} must check out the protected "
+                    f"branch with enough history to test ancestry; missing {required!r}"
+                )
+    guard = named_step(text, FRESH_HEAD_STEP)
+    if guard is None:
+        return violations + [
+            f"{workflow}: a {FRESH_HEAD_STEP!r} step must refresh the protected "
+            "branch and reject a stale deployment before any gateway step"
+        ]
+    for required in FRESH_HEAD_CONTROLS:
+        if required not in guard:
+            violations.append(
+                f"{workflow}: {FRESH_HEAD_STEP!r} is missing {required!r}"
+            )
+    guard_index = text.find(f"      - name: {FRESH_HEAD_STEP}\n")
+    for marker in contract["lock"]:
+        marker_index = text.find(marker)
+        if not 0 <= marker_index < guard_index:
+            violations.append(
+                f"{workflow}: the freshness guard must run inside the "
+                f"environment-bound, serialized job; {marker!r} does not precede it"
+            )
+    for marker in contract["gateway"]:
+        # `rfind`: the enumerator job builds the binary too, and it is the
+        # privileged job's copy that has to come from the refreshed head.
+        marker_index = text.rfind(marker)
+        if not 0 <= guard_index < marker_index:
+            violations.append(
+                f"{workflow}: {marker!r} must not run before the freshness guard; "
+                "the binary, the desired state and the ledger all come from the "
+                "refreshed protected head"
+            )
     return violations
 
 
@@ -703,6 +819,15 @@ def main(argv: list[str] | None = None) -> int:
             state_writer_preflight_violations(
                 state_writer_workflow,
                 (workflows / state_writer_workflow).read_text(encoding="utf-8"),
+            )
+        )
+
+    for fresh_head_workflow, contract in FRESH_HEAD_WORKFLOWS.items():
+        violations.extend(
+            stale_deployment_guard_violations(
+                fresh_head_workflow,
+                (workflows / fresh_head_workflow).read_text(encoding="utf-8"),
+                contract,
             )
         )
 

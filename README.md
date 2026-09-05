@@ -1028,6 +1028,22 @@ Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-sid
 
 When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — one transactional, all-or-nothing call, chunked below the gateway's 1 MiB body cap. Any Modify or Delete in the set disqualifies it (`/batch` is create-only), and a 501 falls back to per-resource creates.
 
+#### Ordering between runs: the environment lock and the freshness guard
+
+Applies to one environment are serialized by a GitHub concurrency group (`ferrum-apply-<env>`), and `rotate.yml` shares that group — two writes to the same gateway never interleave. Serialization alone is not enough, though, because a queued run still *checked out* the commit that triggered it. So once the lock is held, `apply-on-merge.yml` and `rotate.yml` re-fetch the protected branch, move the working tree onto its **current** head, and print both revisions:
+
+```
+Triggering commit: 4f2c…
+Protected main HEAD: 9ab1…
+```
+
+Everything after that point — the `gitforgeops` binary it builds, the desired resources it assembles, and the `.state/<env>.json` it reconciles against — comes from that one commit. Two consequences worth knowing:
+
+- **Merges that queue up collapse safely.** Merge B queued behind A's apply used to read a ledger that predated A's state commit, see A's new rows as unmanaged, and stop reconciling them. Now B reconciles A's tree plus its own, against A's published ledger.
+- **A stale run is rejected, not silently replayed.** If the triggering commit is no longer an ancestor of the protected head (a re-run of an old workflow after the branch was rewritten, or a revision that was force-pushed away), the job fails before it builds a binary or contacts the gateway. Re-run the apply for the current head instead.
+
+Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author, because that is who is waiting for the slot. Every later merge has its own apply run with its own attribution.
+
 ### Post-apply convergence
 
 After an api-mode apply, gitforgeops makes a best-effort `GET /cluster` call and prints a one-line convergence summary: the gateway's mode, connected data-plane and mesh-node counts, the oldest `last_sync_at` among them, and a warning if any node reports `config_diverged`. On a DP-mode gateway it reports that node's view of its control plane instead; on a database/file-mode gateway there is no cluster to converge and it says so. Advisory only — a gateway that can't answer (older build, network hiccup) reports "unknown" and never fails the apply.
@@ -1039,6 +1055,9 @@ The merge commit is already on `main`, but config isn't (fully) applied. Re-run 
 1. Incremental mode re-fetches actual state via `GET /backup`, so already-applied resources are skipped.
 2. Full-replace mode is idempotent — `POST /restore` converges regardless of prior partial state.
 3. `.state/<env>.json` is an ownership manifest of the *last successful* apply; it never causes re-runs to skip work.
+4. The re-run reconciles the protected branch's **current** head, not the tree as it stood at the original merge — so a re-run started after later merges landed converges to the newest desired state rather than rolling it back. See [Ordering between runs](#ordering-between-runs-the-environment-lock-and-the-freshness-guard).
+
+The one way a re-run refuses to start is a `Stale deployment` error, which means the commit that triggered the original run is no longer an ancestor of `main` — the branch was rewritten under it. Nothing was mutated; trigger a fresh apply from the current head.
 
 Two failures are the exception — do **not** blindly re-run:
 

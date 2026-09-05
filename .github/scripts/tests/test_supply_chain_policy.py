@@ -625,6 +625,109 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("must be read from vars" in item for item in violations), violations
         )
 
+    def test_privileged_reconcile_must_refresh_the_protected_head(self):
+        # The concurrency group serializes per environment; it does not move
+        # the checkout. Dropping the freshness guard is exactly the bug: the
+        # queued run reconciles from a ledger the run ahead of it has already
+        # superseded.
+        for workflow in ("apply-on-merge.yml", "rotate.yml"):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                text = path.read_text(encoding="utf-8")
+                start = text.index(
+                    "      - name: Refresh protected branch and reject stale deployments"
+                )
+                end = text.index("      - name: ", start + 20)
+                path.write_text(text[:start] + text[end:], encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        "must refresh the protected branch" in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_freshness_guard_must_precede_every_gateway_step(self):
+        # A guard that runs after the binary is built and the bundles are
+        # loaded proves nothing: the build already came from the stale tree.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/rotate.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index(
+                "      - name: Refresh protected branch and reject stale deployments"
+            )
+            end = text.index("      - name: ", start + 20)
+            guard = text[start:end]
+            moved = text[:start] + text[end:]
+            anchor = moved.index("      - name: Rotate\n")
+            path.write_text(moved[:anchor] + guard + moved[anchor:], encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "must not run before the freshness guard" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_privileged_checkout_must_name_the_branch_with_full_history(self):
+        # `actions/checkout` with no `ref:` selects the triggering commit, and
+        # a shallow clone cannot answer the ancestry question at all.
+        for workflow, step in (
+            ("apply-on-merge.yml", "Check out protected main for apply"),
+            ("rotate.yml", "Check out protected main for rotation"),
+        ):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                text = path.read_text(encoding="utf-8")
+                # The privileged checkout is the only one in either file that
+                # names a ref or a depth; dropping both lines reproduces the
+                # event-SHA, shallow default.
+                self.assertEqual(
+                    text.count(
+                        "          ref: ${{ github.event.repository.default_branch }}\n"
+                    ),
+                    1,
+                )
+                path.write_text(
+                    text.replace(
+                        "          ref: ${{ github.event.repository.default_branch }}\n",
+                        "",
+                        1,
+                    ).replace("          fetch-depth: 0\n", "", 1),
+                    encoding="utf-8",
+                )
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        step in item and "protected branch with enough history" in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_freshness_guard_must_keep_its_ancestry_test(self):
+        # Refreshing the checkout without the ancestry test still lets a re-run
+        # of an old workflow deploy — it would simply deploy the new head under
+        # the old run's attribution, with no signal that it is stale.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index(
+                '          git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head" || {'
+            )
+            end = text.index('          echo "applied_sha=$fresh_head"', start)
+            path.write_text(text[:start] + text[end:], encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("merge-base --is-ancestor" in item for item in violations), violations
+        )
+
     def test_state_commits_must_not_suppress_required_checks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
