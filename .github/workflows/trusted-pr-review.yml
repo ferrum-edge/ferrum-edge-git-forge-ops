@@ -398,6 +398,12 @@ jobs:
           GITFORGEOPS_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          # Optional JWT claim settings; see apply-on-merge.yml for why they
+          # are bound explicitly and why blank means "unset", not "empty".
+          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
+          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
+          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}
+          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
