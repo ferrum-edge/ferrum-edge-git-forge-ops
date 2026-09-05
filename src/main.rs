@@ -20,6 +20,7 @@ use gitforgeops::review;
 use gitforgeops::secrets;
 use gitforgeops::state::StateFile;
 use gitforgeops::validate;
+use gitforgeops::verdict::{self, ApplyGateInputs};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -1189,7 +1190,8 @@ async fn cmd_plan(
     // A shrunk credential array reassigns a stored broker slot. `apply` and
     // `rotate` refuse it outright; plan prints it here and carries it into the
     // exit code, so the preview an operator reads matches what apply will do.
-    let remap_blocked = !secret_report.slot_remaps.is_empty() && !allow_credential_slot_remap;
+    let remap_blocked =
+        verdict::slot_remap_blocker(&secret_report, allow_credential_slot_remap).is_some();
     if !secret_report.slot_remaps.is_empty() {
         println!("=== Credential Slot Remaps ===");
         for remap in &secret_report.slot_remaps {
@@ -1298,28 +1300,79 @@ async fn cmd_plan(
         println!();
     }
 
+    let bp_findings = diff::check_best_practices(&desired);
+
+    // Policy findings are evaluated before they are printed, because the
+    // override decision they are printed *with* is the same one that decides
+    // whether they block. `apply` resolves that override once and shares it
+    // between the two fail-closed reporters; plan does the same so a preview
+    // and the post-merge apply cannot disagree.
+    let mut policy_findings = match &policy_cfg {
+        Some(cfg) => policy::evaluate_policies(&desired, cfg),
+        None => Vec::new(),
+    };
+    let security_overridable = verdict::security_blocker(&security_findings, false).is_some();
+    let policy_overridable = policy_findings.iter().any(|f| f.is_blocking());
+    let mut security_overridden = false;
+    let mut override_note: Option<String> = None;
+    if security_overridable || policy_overridable {
+        let override_cfg = policy_cfg
+            .as_ref()
+            .map(|cfg| cfg.overrides.clone())
+            .unwrap_or_default();
+        match resolve_pr_number(&env_config).await {
+            Some(pr) => match policy::check_override(&env_config, &override_cfg, pr).await {
+                Ok(decision) => {
+                    policy::github_override::apply_override(&mut policy_findings, &decision);
+                    security_overridden = decision.active;
+                    override_note = Some(match (&decision.active, &decision.approver) {
+                        (true, Some(approver)) => {
+                            format!("Blocking findings overridden by @{approver}.")
+                        }
+                        (true, None) => "Blocking findings overridden.".to_string(),
+                        (false, _) => format!("Override inactive: {}.", decision.reason),
+                    });
+                }
+                // Fail closed. An override that could not be verified is not
+                // an override, and turning an unreachable GitHub API into a
+                // clean plan is exactly the drift this verdict exists to
+                // prevent.
+                Err(e) => {
+                    override_note = Some(format!(
+                        "Override could not be evaluated ({e}); every blocking finding stands."
+                    ));
+                }
+            },
+            None => {
+                override_note = Some(
+                    "No PR is associated with this commit; overrides were not evaluated."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     // security_findings was computed pre-resolve above; reuse it here.
-    let security_blockers = diff::security_blockers(&security_findings);
-    let security_blocked = !security_blockers.is_empty();
+    let security_gate = verdict::security_blocker(&security_findings, security_overridden);
     if !security_findings.is_empty() {
         println!("=== Security Findings ===");
         for sf in &security_findings {
             println!("  [{}] {} {}: {}", sf.severity, sf.kind, sf.id, sf.message);
         }
-        if security_blocked {
+        if let Some(gate) = security_gate {
             // Same set `apply` refuses on, so the preview and the post-merge
             // apply cannot disagree about whether this repo is applyable.
             println!(
                 "\n{} error-severity finding(s) block apply. Consumer credentials belong in the \
                  broker as ${{gh-env-secret:...}} placeholders; a literal value in repository YAML \
-                 is a committed secret.",
-                security_blockers.len()
+                 is a committed secret. Identity halves (basicauth username, mtls_auth identity) \
+                 are not secrets and are not reported here.",
+                gate.count
             );
         }
         println!();
     }
 
-    let bp_findings = diff::check_best_practices(&desired);
     if !bp_findings.is_empty() {
         println!("=== Best Practice Recommendations ===");
         for bp in &bp_findings {
@@ -1328,31 +1381,53 @@ async fn cmd_plan(
         println!();
     }
 
-    if let Some(policy_cfg) = policy_cfg {
-        let policy_findings = policy::evaluate_policies(&desired, &policy_cfg);
-        if !policy_findings.is_empty() {
-            println!("=== Policy Violations ===");
-            for pf in &policy_findings {
-                println!(
-                    "  [{}] {}: {} {} ({}): {}",
-                    pf.severity.as_str(),
-                    pf.rule_id,
-                    pf.kind,
-                    pf.id,
-                    pf.namespace,
-                    pf.message
-                );
-            }
-            println!();
+    if !policy_findings.is_empty() {
+        println!("=== Policy Violations ===");
+        for pf in &policy_findings {
+            let overridden = match &pf.overridden_by {
+                Some(by) => format!(" (overridden by @{by})"),
+                None => String::new(),
+            };
+            println!(
+                "  [{}] {}: {} {} ({}): {}{}",
+                pf.severity.as_str(),
+                pf.rule_id,
+                pf.kind,
+                pf.id,
+                pf.namespace,
+                pf.message,
+                overridden
+            );
         }
+        println!();
     }
 
-    // Plan's exit code is the preview's verdict: nonzero for anything that
-    // would stop `apply`. Schema validation, the error-severity security audit
-    // and an unacknowledged credential-slot remap are all in that set, and all
-    // have already been printed in full above — the exit code carries no
-    // information the operator has not seen.
-    if !validation_ok || security_blocked || remap_blocked {
+    if let Some(note) = &override_note {
+        println!("=== Override ===");
+        println!("{note}\n");
+    }
+
+    // Plan's exit code is the preview's verdict: non-zero for everything that
+    // would stop `apply` and is decidable without a gateway. One shared
+    // computation with `apply` (see `gitforgeops::verdict`) so the two cannot
+    // drift — a plan that exits 0 for a repository apply deterministically
+    // refuses is the failure mode this replaces. Every blocker has already
+    // been printed in full above; the summary names the classes so a CI log
+    // says why the process failed without being re-read from the top.
+    let blockers = verdict::apply_blockers(ApplyGateInputs {
+        validation_ok,
+        security_findings: &security_findings,
+        security_overridden,
+        policy_findings: &policy_findings,
+        secret_report: &secret_report,
+        allow_credential_slot_remap,
+    });
+    if let Some(summary) = verdict::blocker_summary(&blockers) {
+        println!("=== Apply Blockers ===");
+        for blocker in &blockers {
+            println!("  {}", blocker.summary());
+        }
+        println!("\n{summary}");
         process::exit(1);
     }
 
@@ -1388,7 +1463,11 @@ async fn cmd_apply(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     print_security_findings(&security_findings);
-    let security_blocked = !diff::security_blockers(&security_findings).is_empty();
+    // The same predicate `plan` previews with. `apply` evaluates the override
+    // separately below (it needs the approver's name for the state ledger), so
+    // this asks the pre-override question.
+    let security_gate = verdict::security_blocker(&security_findings, false);
+    let security_blocked = security_gate.is_some();
 
     // One override decision serves both fail-closed reporters: the same PR
     // label, added by the same sufficiently-permissioned account, clears the
@@ -1417,8 +1496,8 @@ async fn cmd_apply(
     // bypassed and by whom.
     let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
 
-    if security_blocked {
-        let blocker_count = diff::security_blockers(&security_findings).len();
+    if let Some(gate) = security_gate {
+        let blocker_count = gate.count;
         match &override_approver {
             Some(approver) => {
                 eprintln!(
@@ -1477,8 +1556,10 @@ async fn cmd_apply(
     };
 
     // Missing required credentials → fail fast before we touch the gateway.
-    let missing = secret_report.missing_required();
-    if !missing.is_empty() {
+    // `plan` reports this class through the same predicate, so a repository
+    // that plans clean cannot refuse here.
+    if verdict::required_credentials_blocker(&secret_report).is_some() {
+        let missing = secret_report.missing_required();
         eprintln!(
             "Refusing to apply: {} required credential slot(s) have no value:",
             missing.len()
@@ -1490,7 +1571,7 @@ async fn cmd_apply(
     }
 
     let val_result = validate::run_validation(&desired, &env_config.edge_binary_path)?;
-    if !val_result.success {
+    if verdict::validation_blocker(val_result.success).is_some() {
         let formatted = validate::format_result(&val_result, validate::OutputFormat::Text);
         eprint!("{}", formatted);
         eprintln!("Refusing to apply because validation failed.");
@@ -1503,7 +1584,7 @@ async fn cmd_apply(
     // half-apply an environment.
     if let Some(mesh) = &desired_mesh {
         let mesh_result = validate::run_mesh_validation(mesh, &env_config.edge_binary_path)?;
-        if !mesh_result.success {
+        if verdict::validation_blocker(mesh_result.success).is_some() {
             let formatted = validate::format_result(&mesh_result, validate::OutputFormat::Text);
             eprint!("{}", formatted);
             eprintln!("Refusing to apply because mesh validation failed.");
@@ -1539,11 +1620,13 @@ async fn cmd_apply(
             }
         }
 
-        let blockers: Vec<_> = findings.iter().filter(|f| f.is_blocking()).collect();
-        if !blockers.is_empty() {
+        // Post-override findings, which is exactly what
+        // `verdict::policy_blocker` expects and what `plan` feeds it.
+        if let Some(gate) = verdict::policy_blocker(&findings) {
+            let blockers = findings.iter().filter(|f| f.is_blocking());
             eprintln!(
                 "Refusing to apply: {} unresolved policy violation(s):",
-                blockers.len()
+                gate.count
             );
             for b in blockers {
                 eprintln!("  [{}] {}: {}", b.severity.as_str(), b.rule_id, b.message);

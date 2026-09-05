@@ -284,6 +284,33 @@ Severity `error` blocks `apply` unless overridden. Override = PR label
 `overrides.required_permission` (default `write`). Implementation:
 `src/policy/github_override.rs::check_override`.
 
+### Apply blockers (`src/verdict.rs`)
+
+`apply_blockers` is every fail-closed gate `apply` refuses on that is decidable
+*without* a gateway, as `Vec<ApplyBlocker>` over five `BlockerKind`s:
+`Validation`, `Security`, `Policy`, `RequiredCredentials`, `SlotRemap`. `plan`
+evaluates the whole set, prints an `=== Apply Blockers ===` section (class,
+count, remedy) plus a summary line, and exits 1 when it is non-empty.
+`cmd_apply` calls the *same per-class predicates* (`security_blocker`,
+`policy_blocker`, `required_credentials_blocker`, `validation_blocker`) at its
+own gate points rather than the aggregate, because its ordering is
+load-bearing — the security audit has to refuse before the credential bundle is
+read, the required-slot check before the first gateway call. Sharing the
+predicates and not the control flow is the whole design.
+
+Rules that must not drift: warning severity never blocks; `alloc=generate`
+awaiting first-apply allocation is *not* a blocker (`missing_required()` is,
+`needs_allocation()` is not); `policy_findings` are fed **post-override**
+(`PolicyFinding::is_blocking` reads `overridden_by`). `plan` resolves the
+override through the same `resolve_pr_number` + `check_override` path `apply`
+uses, and fails closed — no PR, an inactive decision, or a GitHub error leaves
+every blocking finding standing. Gateway-dependent gates (large-prune,
+stale-view, per-resource write failures) are deliberately excluded: a preview
+cannot decide them.
+
+Adding a new fail-closed gate to `apply` means adding a `BlockerKind` here, or
+`plan` silently goes back to promising applies that refuse.
+
 ### Credential broker (in-GitHub, no third-party)
 
 Consumer credentials use placeholders like
@@ -397,6 +424,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
+- `src/verdict.rs` — `apply_blockers`: the offline fail-closed gates `plan` and `apply` share
 - `src/error.rs` — unified `Error` enum via `thiserror`
 
 ### Key Design Principles

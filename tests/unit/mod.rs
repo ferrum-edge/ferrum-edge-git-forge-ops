@@ -22,3 +22,4 @@ mod schema_tests;
 mod secrets_tests;
 mod state_tests;
 mod validate_tests;
+mod verdict_tests;
