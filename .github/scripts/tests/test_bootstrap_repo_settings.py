@@ -564,6 +564,15 @@ class WriteGuardTests(unittest.TestCase):
         self.assertEqual(api.writes, [])
         self.assertIn("(dry run)", buffer.getvalue())
 
+    def test_a_dry_run_client_refuses_to_execute_writes(self):
+        api = FakeApi(
+            {f"repos/{REPO}": {}, f"repos/{REPO}/rulesets?per_page=100": [[]]}
+        )
+        plan = bootstrap.build_plan(api, namespace())
+        with self.assertRaises(ValueError):
+            bootstrap.execute(api, plan)
+        self.assertEqual(api.writes, [])
+
     def test_apply_executes_exactly_the_planned_writes(self):
         api = FakeApi(
             {f"repos/{REPO}": {}, f"repos/{REPO}/rulesets?per_page=100": [[]]},

@@ -965,6 +965,10 @@ def secret_remainder(repo: str, environments: list[str], template_repo: bool) ->
 
 
 def execute(api: GitHubApi, plan: Plan) -> None:
+    # A second belt over `main`'s `--apply` check: a client built for a dry run
+    # never performs a write, whoever calls this.
+    if api.dry_run:
+        raise ValueError("refusing to write through a dry-run client")
     for step in plan.steps:
         if step.action in {UNCHANGED, BLOCKED}:
             continue
