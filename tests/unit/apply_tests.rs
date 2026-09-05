@@ -2394,6 +2394,80 @@ async fn a_row_that_changed_between_diff_and_assertion_is_skipped_and_reported()
 }
 
 #[test]
+fn a_live_only_field_prevents_adoption() {
+    let desired_proxy = proxy("p1", "team-alpha", None);
+    let mut live_proxy = desired_proxy.clone();
+    live_proxy.extra.insert(
+        "future_security_mode".to_string(),
+        serde_json::json!("enforced"),
+    );
+    let desired = GatewayConfig {
+        proxies: vec![desired_proxy],
+        ..Default::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![live_proxy],
+        ..Default::default()
+    };
+
+    let candidates = adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new());
+    assert!(
+        candidates.is_empty(),
+        "an ownership PUT must not erase a live-only field: {candidates:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_spec_owner_added_during_confirmation_prevents_adoption() {
+    let desired = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", None)],
+        ..Default::default()
+    };
+    let confirmation = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", Some("concurrent-spec-owner"))],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&confirmation),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+    let empty_fence: HashSet<String> = HashSet::new();
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &empty_fence,
+        },
+        Some(&BTreeMap::from([(
+            "team-alpha".to_string(),
+            desired.clone(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("a racing spec owner safely skips adoption");
+
+    assert!(result.adopted.is_empty(), "{result:?}");
+    assert_eq!(result.adoption_skipped.len(), 1, "{result:?}");
+    let requests = requests.lock().expect("recorded requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("PUT /proxies/p1")),
+        "the spec-owned row must not be overwritten: {requests:?}"
+    );
+}
+
+#[test]
 fn spec_owned_rows_are_never_adopted() {
     // The `/api-specs` importer owns these rows in both ownership modes.
     // Adopting one would put a resource the repo must never delete inside the

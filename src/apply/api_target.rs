@@ -1384,9 +1384,9 @@ pub struct AdoptionCandidate {
 ///   ownership modes; adopting one would put a row the repo must never delete
 ///   inside the delete fence.
 ///
-/// Equality is the same subset test the pending-create recovery uses: every key
-/// the repository serializes must be present and equal in the live row. It is
-/// not, on its own, ownership — see [`adopt_matching_rows`].
+/// Adoption requires strict equality (apart from server timestamps). Unlike
+/// pending-create recovery, an arbitrary pre-existing row may carry fields the
+/// repository does not own, and the ownership PUT must not erase them.
 pub fn adoption_candidates(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
@@ -1404,7 +1404,7 @@ pub fn adoption_candidates(
         if live_row_is_spec_owned(actual, kind, namespace, id) {
             return;
         }
-        if !resource.exact_desired_is_live(actual) {
+        if !resource.safe_to_overwrite(actual) {
             return;
         }
         candidates.push(AdoptionCandidate {
@@ -1570,7 +1570,13 @@ async fn adopt_matching_rows(
         let Some(resource) = resource else { continue };
 
         if let Some(confirmation) = &confirmation {
-            if !resource.exact_desired_is_live(confirmation) {
+            if live_row_is_spec_owned(
+                confirmation,
+                &candidate.kind,
+                &candidate.namespace,
+                &candidate.id,
+            ) || !resource.safe_to_overwrite(confirmation)
+            {
                 let message = format!(
                     "not adopting {} `{}`: the live row changed between this run's diff and the ownership assertion, so the repository is not overwriting it. The next apply reconciles it as an ordinary change.",
                     candidate.kind, candidate.id
@@ -1728,6 +1734,41 @@ impl<'a> CreateResource<'a> {
 
     fn exact_desired_is_live(self, actual: &GatewayConfig) -> bool {
         matches!(self.live_match(actual), LiveMatch::Exact)
+    }
+
+    /// Whether an adoption PUT can serialize this desired row without dropping
+    /// anything currently present on the gateway.
+    fn safe_to_overwrite(self, actual: &GatewayConfig) -> bool {
+        fn matches<T: serde::Serialize>(live: Option<&T>, desired: &T) -> bool {
+            live.is_some_and(|live| resource_values_equal(desired, live))
+        }
+
+        match self {
+            Self::Proxy(desired) => matches(
+                actual.proxies.iter().find(|candidate| {
+                    candidate.namespace == desired.namespace && candidate.id == desired.id
+                }),
+                desired,
+            ),
+            Self::Consumer(desired) => matches(
+                actual.consumers.iter().find(|candidate| {
+                    candidate.namespace == desired.namespace && candidate.id == desired.id
+                }),
+                desired,
+            ),
+            Self::Upstream(desired) => matches(
+                actual.upstreams.iter().find(|candidate| {
+                    candidate.namespace == desired.namespace && candidate.id == desired.id
+                }),
+                desired,
+            ),
+            Self::PluginConfig(desired) => matches(
+                actual.plugin_configs.iter().find(|candidate| {
+                    candidate.namespace == desired.namespace && candidate.id == desired.id
+                }),
+                desired,
+            ),
+        }
     }
 
     /// Classify what an authoritative backup says about this resource.
@@ -1920,6 +1961,20 @@ fn resource_values_match<T: serde::Serialize>(desired: &T, live: &T) -> bool {
         (Some(desired), Some(live)) => json_contains(&desired, &live),
         _ => false,
     }
+}
+
+/// Strict equality for adoption, ignoring only server-owned timestamps.
+fn resource_values_equal<T: serde::Serialize>(desired: &T, live: &T) -> bool {
+    fn without_server_timestamps<T: serde::Serialize>(value: &T) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(value).ok()?;
+        if let Some(map) = value.as_object_mut() {
+            map.remove("created_at");
+            map.remove("updated_at");
+        }
+        Some(value)
+    }
+
+    without_server_timestamps(desired) == without_server_timestamps(live)
 }
 
 /// `live` carries every key/value in `desired`, recursively.
