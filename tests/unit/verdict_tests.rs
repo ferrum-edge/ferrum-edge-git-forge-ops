@@ -289,18 +289,10 @@ fn all_muted() -> DriftAlertOn {
     }
 }
 
-/// The repository's effective default (`OwnershipConfig::default()`): alert on
-/// managed changes, stay quiet about unmanaged additions.
-///
-/// Spelled out rather than taken from `DriftAlertOn::default()`, whose derived
-/// all-false value is not what an environment without an explicit
-/// `drift_alert_on` block gets.
+/// The repository's effective default: alert on managed changes, stay quiet
+/// about unmanaged additions.
 fn defaults() -> DriftAlertOn {
-    DriftAlertOn {
-        managed_modified: true,
-        managed_deleted: true,
-        unmanaged_added: false,
-    }
+    DriftAlertOn::default()
 }
 
 #[test]
