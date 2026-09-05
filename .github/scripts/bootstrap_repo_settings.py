@@ -686,7 +686,7 @@ def step_dependabot(api: GitHubApi, repo: str) -> list[Step]:
     return steps
 
 
-def find_ruleset(api: GitHubApi, repo: str, name: str, target: str):
+def find_ruleset(api: GitHubApi, repo: str, desired: dict):
     summaries = api.get(f"repos/{repo}/rulesets?per_page=100", paginate=True)
     flattened = []
     for page in summaries if isinstance(summaries, list) else []:
@@ -694,27 +694,28 @@ def find_ruleset(api: GitHubApi, repo: str, name: str, target: str):
             flattened.extend(page)
         elif isinstance(page, dict):
             flattened.append(page)
-    by_target = None
     for summary in flattened:
         if not isinstance(summary, dict) or summary.get("id") is None:
             continue
         detail = api.get(f"repos/{repo}/rulesets/{summary['id']}")
         if not isinstance(detail, dict):
             continue
-        if detail.get("name") == name:
+        if (
+            detail.get("name") == desired["name"]
+            and detail.get("target") == desired["target"]
+            and detail.get("source_type") == "Repository"
+            and str(detail.get("source", "")).casefold() == repo.casefold()
+            and (detail.get("conditions") or {}).get("ref_name")
+            == desired["conditions"]["ref_name"]
+        ):
             return detail
-        if by_target is None and detail.get("target") == target:
-            by_target = detail
-    # A ruleset that already protects this ref under another name is updated in
-    # place rather than duplicated: two active rulesets on one ref are exactly
-    # what the settings audit refuses.
-    return by_target
+    return None
 
 
 def step_ruleset(
     api: GitHubApi, repo: str, name: str, target: str, desired: dict
 ) -> list[Step]:
-    current = find_ruleset(api, repo, name, target)
+    current = find_ruleset(api, repo, desired)
     if current is None:
         return [
             Step(
