@@ -33,7 +33,9 @@ gitforgeops plan                                          # Validate + diff + br
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
-  [--credential-bundle-output PRIVATE_PATH]               # --output-dir required + must be empty; API import requires an explicit namespace filter
+  [--credential-bundle-output PRIVATE_PATH] \
+  [--allow-plaintext-plugin-config PLUGIN_NAME]           # --output-dir required + must be empty; API import requires an explicit namespace filter;
+                                                          # --allow-plaintext-plugin-config is repeatable, exact plugin_name
 gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -278,7 +280,13 @@ Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_p
 is schema-first for the 82 builtins and heuristics-only for anything else: a
 non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
 flag, and the leaves they did not flag come back as
-`ImportResult::unbrokered_plugin_config` for a loud per-plugin review notice.
+`ImportResult::unbrokered_plugin_config`. Those **fail the import**
+(`import::enforce_plaintext_plugin_config_allowance`) unless the operator
+passes `--allow-plaintext-plugin-config <plugin_name>` (repeatable, exact
+match), in which case they are written literally and listed in a per-plugin
+review notice. The refusal names the plugin id, `plugin_name` and every
+unclassified path, echoes no values, and writes nothing — not the tree, not
+the migration bundle. `apply` / `plan` are untouched by this gate.
 `basicauth[].username` and `mtls_auth[].identity` are never brokered in either
 path (`resolver::is_identity_credential_leaf`).
 
