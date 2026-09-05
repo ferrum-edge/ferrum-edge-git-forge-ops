@@ -2,14 +2,15 @@ use std::path::Path;
 
 use crate::http_client::BackupSnapshot;
 use crate::import::{
-    split_config_with_inventory, validate_migration_bundle_source, ImportInventory, ImportResult,
-    ImportSourceMetadata,
+    split_config_with_inventory, validate_migration_bundle_source, ImportInventory,
+    ImportPassthroughPolicy, ImportResult, ImportSourceMetadata,
 };
 
 pub fn import_from_file(
     file_path: &Path,
     output_dir: &Path,
     credential_bundle_output: Option<&Path>,
+    passthrough_policy: &ImportPassthroughPolicy,
 ) -> crate::error::Result<ImportResult> {
     if let Some(bundle_path) = credential_bundle_output {
         validate_migration_bundle_source(bundle_path, file_path)?;
@@ -41,6 +42,7 @@ pub fn import_from_file(
         },
         credential_bundle_output,
         true,
+        passthrough_policy,
     )
 }
 

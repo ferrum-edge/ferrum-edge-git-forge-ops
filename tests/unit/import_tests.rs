@@ -1,5 +1,11 @@
 use gitforgeops::config::schema::*;
 use gitforgeops::import::split_config;
+
+/// Import's fail-closed default: no unmodelled top-level field is
+/// acknowledged, which is what every pre-existing case expects.
+fn strict_passthrough() -> gitforgeops::import::ImportPassthroughPolicy {
+    gitforgeops::import::ImportPassthroughPolicy::strict()
+}
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -118,9 +124,14 @@ fn file_import_rejects_passthrough_fields_without_publishing_them() {
     );
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
-    let error = gitforgeops::import::from_file::import_from_file(&backup_path, &output, None)
-        .unwrap_err()
-        .to_string();
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+    )
+    .unwrap_err()
+    .to_string();
 
     assert!(error.contains("Consumer 'consumer-test'"), "{error}");
     assert!(error.contains("future_access_token"), "{error}");
@@ -129,6 +140,138 @@ fn file_import_rejects_passthrough_fields_without_publishing_them() {
         !output.exists(),
         "a rejected import must not publish an output tree"
     );
+}
+
+/// The acknowledgement is per field *name*, so a source carrying a second,
+/// unreviewed field is still refused — and the refusal names only the field
+/// that was not acknowledged.
+#[test]
+fn acknowledging_one_field_does_not_admit_another() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let mut config = make_test_config();
+    config.consumers[0]
+        .extra
+        .insert("future_label".to_string(), serde_json::json!("team-a"));
+    config.consumers[0].extra.insert(
+        "future_access_token".to_string(),
+        serde_json::json!("plaintext-secret-that-must-not-be-published"),
+    );
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let policy = gitforgeops::import::ImportPassthroughPolicy {
+        allow_unknown_fields: true,
+        acknowledged: ["future_label".to_string()].into_iter().collect(),
+    };
+    let error =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy)
+            .unwrap_err()
+            .to_string();
+
+    assert!(error.contains("future_access_token"), "{error}");
+    assert!(
+        !error.contains("future_label"),
+        "an acknowledged field must not be reported: {error}"
+    );
+    assert!(!error.contains("plaintext-secret"), "{error}");
+    assert!(!output.exists(), "a rejected import must publish nothing");
+}
+
+/// Acknowledging a field without `FERRUM_ALLOW_UNKNOWN_FIELDS` would emit a
+/// tree the strict loader rejects, so it is refused rather than written.
+#[test]
+fn acknowledged_fields_still_need_the_passthrough_load_policy() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let mut config = make_test_config();
+    config.consumers[0]
+        .extra
+        .insert("future_label".to_string(), serde_json::json!("team-a"));
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let policy = gitforgeops::import::ImportPassthroughPolicy {
+        allow_unknown_fields: false,
+        acknowledged: ["future_label".to_string()].into_iter().collect(),
+    };
+    let error =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy)
+            .unwrap_err()
+            .to_string();
+
+    assert!(error.contains("FERRUM_ALLOW_UNKNOWN_FIELDS"), "{error}");
+    assert!(!output.exists(), "a rejected import must publish nothing");
+}
+
+/// With both halves in place the field is carried verbatim, the tree loads
+/// under the same policy that admitted it, and the operator is told which
+/// resources relied on the acknowledgement.
+#[test]
+fn acknowledged_passthrough_round_trips_and_is_reported_for_review() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let mut config = make_test_config();
+    config.consumers[0]
+        .extra
+        .insert("future_label".to_string(), serde_json::json!("team-a"));
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let policy = gitforgeops::import::ImportPassthroughPolicy {
+        allow_unknown_fields: true,
+        acknowledged: ["future_label".to_string()].into_iter().collect(),
+    };
+    let result =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy)
+            .expect("an acknowledged field imports");
+
+    let written =
+        std::fs::read_to_string(output.join("ferrum/consumers/consumer-test.yaml")).unwrap();
+    assert!(written.contains("future_label"), "{written}");
+
+    let notice = result
+        .acknowledged_passthrough_notice()
+        .expect("acknowledged fields must be surfaced for review");
+    assert!(notice.contains("Consumer consumer-test"), "{notice}");
+    assert!(notice.contains("future_label"), "{notice}");
+
+    // The emitted tree is only usable under the policy that admitted it, which
+    // is why the acknowledgement requires FERRUM_ALLOW_UNKNOWN_FIELDS.
+    gitforgeops::config::load_resources_with_options(
+        &output,
+        gitforgeops::config::LoadOptions::ALLOW_UNKNOWN_FIELDS,
+    )
+    .expect("the imported tree loads under the passthrough policy");
+    gitforgeops::config::load_resources(&output)
+        .expect_err("and is rejected by the strict loader, as documented");
+}
+
+/// A clean source pays nothing for the policy: no notice, no refusal.
+#[test]
+fn a_source_without_unmodelled_fields_reports_no_passthrough_review() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    std::fs::write(
+        &backup_path,
+        serde_yaml::to_string(&make_test_config()).unwrap(),
+    )
+    .unwrap();
+
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+    )
+    .expect("a modelled source imports under the fail-closed default");
+
+    assert!(result.acknowledged_passthrough_notice().is_none());
 }
 
 #[test]
@@ -222,9 +365,13 @@ fn import_from_file_roundtrip() {
     std::fs::write(&flat_file, yaml).unwrap();
 
     let tmp_import = tempfile::tempdir().unwrap();
-    let result =
-        gitforgeops::import::from_file::import_from_file(&flat_file, tmp_import.path(), None)
-            .unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &flat_file,
+        tmp_import.path(),
+        None,
+        &strict_passthrough(),
+    )
+    .unwrap();
     assert_eq!(result.proxies, 1);
     assert_eq!(result.consumers, 1);
 
@@ -251,9 +398,14 @@ fn file_import_requires_an_explicit_private_bundle_for_live_credentials() {
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
-    let error = gitforgeops::import::from_file::import_from_file(&backup_path, &output, None)
-        .unwrap_err()
-        .to_string();
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+    )
+    .unwrap_err()
+    .to_string();
 
     assert!(error.contains("--credential-bundle-output"), "{error}");
     assert!(!output.exists(), "no resource tree may be published");
@@ -272,8 +424,13 @@ fn file_import_preserves_existing_placeholders_without_a_migration_bundle() {
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
-    let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None).unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+    )
+    .unwrap();
 
     assert_eq!(result.redacted_credential_values, 0);
     let consumer =
@@ -337,9 +494,13 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
     let bundle_path = destination_parent.path().join("credential-migration.json");
-    let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
-            .unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+    )
+    .unwrap();
 
     assert_eq!(result.redacted_credential_values, 4);
     #[cfg(unix)]
@@ -443,9 +604,13 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
     let bundle_path = destination_parent.path().join("secret-migration.json");
-    let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
-            .unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+    )
+    .unwrap();
 
     assert_eq!(result.redacted_credential_values, 0);
     assert_eq!(result.redacted_plugin_config_values, 2);
@@ -524,9 +689,13 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
-    let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
-            .unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+    )
+    .unwrap();
 
     assert_eq!(result.redacted_plugin_config_values, 2);
     let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/custom.yaml")).unwrap();
@@ -577,9 +746,13 @@ fn builtin_plugin_import_raises_no_review_notice() {
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
-    let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
-            .unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+    )
+    .unwrap();
 
     assert_eq!(result.redacted_plugin_config_values, 2);
     assert!(result.custom_plugin_review_notice().is_none());
@@ -609,8 +782,13 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
-    let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None).unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+    )
+    .unwrap();
     assert_eq!(result.skipped_spec_owned, 1);
     assert_eq!(result.redacted_plugin_config_values, 0);
     assert!(!output.join("ferrum/plugins/spec-otel.yaml").exists());
@@ -636,8 +814,13 @@ fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
     let bundle_path = destination_parent.path().join("credential-migration.json");
-    gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
-        .unwrap();
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+    )
+    .unwrap();
 
     let raw = std::fs::read_to_string(&bundle_path).unwrap();
     let outer: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -676,6 +859,7 @@ fn credential_migration_bundle_must_stay_outside_the_resource_tree() {
         &backup_path,
         &output,
         Some(&unsafe_bundle),
+        &strict_passthrough(),
     )
     .unwrap_err()
     .to_string();
@@ -701,10 +885,14 @@ fn credential_migration_bundle_cannot_overwrite_its_source_backup() {
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
-    let error =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&backup_path))
-            .unwrap_err()
-            .to_string();
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&backup_path),
+        &strict_passthrough(),
+    )
+    .unwrap_err()
+    .to_string();
 
     assert!(
         error.contains("may not overwrite its source backup"),
@@ -735,6 +923,7 @@ fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
         &backup_path,
         &output,
         Some(&unsafe_bundle),
+        &strict_passthrough(),
     )
     .unwrap_err()
     .to_string();
@@ -1191,9 +1380,13 @@ fn file_import_parses_and_reports_the_full_backup_envelope() {
     std::fs::write(&backup_path, serde_yaml::to_string(&backup).unwrap()).unwrap();
 
     let output = tempfile::tempdir().unwrap();
-    let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, output.path(), None)
-            .unwrap();
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        output.path(),
+        None,
+        &strict_passthrough(),
+    )
+    .unwrap();
 
     assert_eq!(result.skipped_api_specs, 1);
     assert_eq!(result.skipped_trust_bundles, 1);
@@ -1271,6 +1464,7 @@ async fn api_import_rejects_cross_namespace_resources_before_writing() {
         output.path(),
         Some("ferrum"),
         None,
+        &strict_passthrough(),
     )
     .await
     .unwrap_err()
@@ -1318,6 +1512,7 @@ async fn api_import_refuses_cached_backup_before_writing() {
         output.path(),
         Some("ferrum"),
         None,
+        &strict_passthrough(),
     )
     .await
     .unwrap_err()
@@ -1372,8 +1567,13 @@ fn migration_bundle_paths_normalize_dotdot_under_a_missing_ancestor() {
         .join("..")
         .join("migration.json");
 
-    gitforgeops::import::from_file::import_from_file(&backup_path, &output, Some(&bundle_path))
-        .expect("a normalizable path must not be refused by the containment resolver");
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+    )
+    .expect("a normalizable path must not be refused by the containment resolver");
 
     assert!(destination_parent.path().join("migration.json").exists());
 }

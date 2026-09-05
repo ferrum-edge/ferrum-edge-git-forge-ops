@@ -3,7 +3,8 @@ use std::path::Path;
 use crate::config::GatewayConfig;
 use crate::http_client::AdminClient;
 use crate::import::{
-    split_config_with_inventory, ImportInventory, ImportResult, ImportSourceMetadata,
+    split_config_with_inventory, ImportInventory, ImportPassthroughPolicy, ImportResult,
+    ImportSourceMetadata,
 };
 
 pub async fn import_from_api(
@@ -11,6 +12,7 @@ pub async fn import_from_api(
     output_dir: &Path,
     namespace_filter: Option<&str>,
     credential_bundle_output: Option<&Path>,
+    passthrough_policy: &ImportPassthroughPolicy,
 ) -> crate::error::Result<ImportResult> {
     let mut namespaces = match namespace_filter {
         Some(namespace) => vec![namespace.to_string()],
@@ -93,6 +95,7 @@ pub async fn import_from_api(
         },
         credential_bundle_output,
         true,
+        passthrough_policy,
     )
 }
 

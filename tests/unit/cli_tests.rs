@@ -14,6 +14,7 @@ fn cli_import_from_api_is_a_flag() {
 
     match cli.command {
         Commands::Import {
+            accept_unknown_field: _,
             from_api,
             from_file,
             output_dir,

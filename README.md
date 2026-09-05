@@ -360,10 +360,24 @@ Three limits are deliberate:
   could clear. Declaring a field in your YAML is how the repository takes
   ownership of it.
 
-`gitforgeops import` is the one place an unmodelled field reaches your tree
-without you typing it: a resource imported from a newer gateway is written out
-complete, so a later `validate` names the field instead of losing it. Either
-upgrade gitforgeops, set the flag, or delete the field from the imported YAML.
+`gitforgeops import` is the one place an unmodelled field would reach your tree
+without you typing it, so it is the one place the rule inverts: **import refuses
+the field rather than writing it out.** On the load path you wrote the field and
+know what it is; on the import path the value came from the gateway, nobody has
+read it, and the credential broker only redacts leaves it models — so an
+unmodelled `future_access_token` would land in a resource file and be committed
+in plaintext. The refusal names the resource and the field names, never the
+values.
+
+Upgrading gitforgeops is the real fix. When you cannot wait, read the source,
+confirm the field is not a credential, and re-run with one
+`--accept-unknown-field <NAME>` per field plus `FERRUM_ALLOW_UNKNOWN_FIELDS=true`.
+Both are required and they say different things: the flag is your assertion that
+this specific field is not a secret, and the environment variable is what lets
+the strict loader read the files import is about to write. Every resource that
+relied on an acknowledgement is listed on stderr at the end of the import — the
+acknowledgement is an assertion nothing in this build can check, so read them
+before you commit.
 
 Two further input rules follow from the same "no silent rewrites" principle:
 
@@ -1210,7 +1224,8 @@ gitforgeops plan
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
 gitforgeops export [--output PATH] [--materialize] [--encrypt-to GH_LOGIN]
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
-  [--credential-bundle-output PRIVATE_PATH]      # --from-api requires an explicit namespace filter
+  [--credential-bundle-output PRIVATE_PATH] \
+  [--accept-unknown-field NAME]...               # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops rotate --consumer ID --credential KEY \
@@ -1220,6 +1235,7 @@ gitforgeops rotate --consumer ID --credential KEY \
 Notes:
 
 - `--from-api` is a flag, not a value: `gitforgeops import --from-api`. It conflicts with `--from-file`.
+- `--accept-unknown-field NAME` (repeatable) acknowledges one top-level resource field this build does not model, so import writes it verbatim instead of refusing. It also requires `FERRUM_ALLOW_UNKNOWN_FIELDS=true`, without which the tree import just wrote would be rejected by the strict loader on the very next `validate`. Acknowledgement is by field name and is your assertion that the field is not a credential; gitforgeops cannot verify it and names every resource that used one. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones).
 - `--output-dir` is required and has no default. `import` refuses a destination that is not empty, and this repo ships `_example.yaml` files under `resources/`, so importing straight into `resources/` can only fail. See [Adopting an existing gateway](#adopting-an-existing-gateway).
 - `--format github` is an alias for `github-annotations`.
 - **Validator diagnostics are redacted, not withheld.** `validate` / `plan` / `apply` resolve credentials before shelling out, so `ferrum-edge validate` quotes live secrets back in its errors. gitforgeops removes exactly those byte sequences — every resolved or literal Consumer credential leaf and every sensitivity-classified plugin-config leaf, plus their standard base64 and percent-encoded forms — replacing each with `[REDACTED]`. Everything else the validator said stays visible, so a proxy typo still reports as a proxy typo on a bundle-loaded apply. `basicauth[].username` and `mtls_auth[].identity` are identities rather than secrets and are left readable. Credentials shorter than 8 bytes cannot be substring-replaced without corrupting the surrounding diagnostic; if one of those is echoed back, the whole stream is withheld instead. That is the only remaining case where diagnostics are suppressed.
