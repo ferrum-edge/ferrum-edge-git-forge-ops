@@ -625,6 +625,203 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("must be read from vars" in item for item in violations), violations
         )
 
+    def test_admin_jwt_step_must_bind_every_documented_claim_setting(self):
+        secure = "\n".join(
+            [
+                "      - name: Apply",
+                "        env:",
+                "          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}",
+                "          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}",
+                "          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}",
+                "          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}",
+                "          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}",
+                "        run: gitforgeops apply --auto-approve",
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.admin_jwt_binding_violations("apply.yml", secure), []
+        )
+
+        for setting in check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS:
+            with self.subTest(setting=setting):
+                dropped = secure.replace(
+                    f"          {setting}: ${{{{ secrets.{setting} }}}}\n", "", 1
+                )
+                violations = check_supply_chain.admin_jwt_binding_violations(
+                    "apply.yml", dropped
+                )
+                self.assertTrue(
+                    any(
+                        "'Apply'" in item and setting in item for item in violations
+                    ),
+                    violations,
+                )
+
+        # A step that mints no token is not held to the rule.
+        unrelated = "      - name: Validate\n        run: gitforgeops validate\n"
+        self.assertEqual(
+            check_supply_chain.admin_jwt_binding_violations("apply.yml", unrelated), []
+        )
+
+    def test_every_api_workflow_binds_the_optional_jwt_settings(self):
+        # Source-of-truth check against the real workflows, not a synthetic
+        # fixture: this is the finding the issue reported.
+        for workflow in check_supply_chain.ADMIN_API_WORKFLOWS:
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn(check_supply_chain.ADMIN_JWT_SECRET_BINDING, text)
+                for setting in check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS:
+                    self.assertIn(f"{setting}: ${{{{ secrets.{setting} }}}}", text)
+                self.assertEqual(
+                    check_supply_chain.admin_jwt_binding_violations(workflow, text), []
+                )
+
+    def test_dropping_a_jwt_setting_from_a_real_workflow_fails_the_policy(self):
+        for workflow in ("drift-check.yml", "trusted-pr-review.yml"):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(
+                        "          FERRUM_ADMIN_JWT_AUDIENCE: "
+                        "${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}\n",
+                        "",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        "FERRUM_ADMIN_JWT_AUDIENCE" in item for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_an_api_workflow_that_binds_no_jwt_secret_at_all_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            text = path.read_text(encoding="utf-8")
+            for setting in (
+                "FERRUM_ADMIN_JWT_SECRET",
+                *check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS,
+            ):
+                text = text.replace(
+                    f"          {setting}: ${{{{ secrets.{setting} }}}}\n", "", 1
+                )
+            path.write_text(text, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("must bind" in item and "FERRUM_ADMIN_JWT_SECRET" in item for item in violations),
+            violations,
+        )
+
+    def test_privileged_reconcile_must_refresh_the_protected_head(self):
+        # The concurrency group serializes per environment; it does not move
+        # the checkout. Dropping the freshness guard is exactly the bug: the
+        # queued run reconciles from a ledger the run ahead of it has already
+        # superseded.
+        for workflow in ("apply-on-merge.yml", "rotate.yml"):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                text = path.read_text(encoding="utf-8")
+                start = text.index(
+                    "      - name: Refresh protected branch and reject stale deployments"
+                )
+                end = text.index("      - name: ", start + 20)
+                path.write_text(text[:start] + text[end:], encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        "must refresh the protected branch" in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_freshness_guard_must_precede_every_gateway_step(self):
+        # A guard that runs after the binary is built and the bundles are
+        # loaded proves nothing: the build already came from the stale tree.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/rotate.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index(
+                "      - name: Refresh protected branch and reject stale deployments"
+            )
+            end = text.index("      - name: ", start + 20)
+            guard = text[start:end]
+            moved = text[:start] + text[end:]
+            anchor = moved.index("      - name: Rotate\n")
+            path.write_text(moved[:anchor] + guard + moved[anchor:], encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "must not run before the freshness guard" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_privileged_checkout_must_name_the_branch_with_full_history(self):
+        # `actions/checkout` with no `ref:` selects the triggering commit, and
+        # a shallow clone cannot answer the ancestry question at all.
+        for workflow, step in (
+            ("apply-on-merge.yml", "Check out protected main for apply"),
+            ("rotate.yml", "Check out protected main for rotation"),
+        ):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                text = path.read_text(encoding="utf-8")
+                # The privileged checkout is the only one in either file that
+                # names a ref or a depth; dropping both lines reproduces the
+                # event-SHA, shallow default.
+                self.assertEqual(
+                    text.count(
+                        "          ref: ${{ github.event.repository.default_branch }}\n"
+                    ),
+                    1,
+                )
+                path.write_text(
+                    text.replace(
+                        "          ref: ${{ github.event.repository.default_branch }}\n",
+                        "",
+                        1,
+                    ).replace("          fetch-depth: 0\n", "", 1),
+                    encoding="utf-8",
+                )
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        step in item and "protected branch with enough history" in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_freshness_guard_must_keep_its_ancestry_test(self):
+        # Refreshing the checkout without the ancestry test still lets a re-run
+        # of an old workflow deploy — it would simply deploy the new head under
+        # the old run's attribution, with no signal that it is stale.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index(
+                '          git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head" || {'
+            )
+            end = text.index('          echo "applied_sha=$fresh_head"', start)
+            path.write_text(text[:start] + text[end:], encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("merge-base --is-ancestor" in item for item in violations), violations
+        )
+
     def test_state_commits_must_not_suppress_required_checks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
@@ -754,6 +951,60 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("before the audit token is bound" in item for item in violations),
             violations,
         )
+
+    def test_audit_token_is_fenced_by_its_own_environment(self):
+        # As a repository secret the administration-read token was released to
+        # whatever definition a dispatched ref carried, so any branch a
+        # collaborator can push was a path to it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/settings-audit.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "    environment: settings-audit\n", "", 1
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("environment: settings-audit" in item for item in violations),
+            violations,
+        )
+
+    def test_no_other_workflow_may_read_the_audit_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}\n",
+                    "          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}\n"
+                    "          GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "audit token" in item and "drift-check.yml" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_the_audit_environment_binding_precedes_the_token(self):
+        # Job-level `environment:` gates the whole job, so the binding must be
+        # part of the same job that reads the token — not a later addition
+        # somewhere the secret is already in scope.
+        workflow = (ROOT / ".github/workflows/settings-audit.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            workflow.index("    environment: settings-audit\n"),
+            workflow.index("GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}"),
+        )
+        self.assertEqual(workflow.count("secrets.SETTINGS_AUDIT_TOKEN"), 1)
 
     def test_trusted_review_pins_the_triggering_workflow_definition(self):
         with tempfile.TemporaryDirectory() as directory:

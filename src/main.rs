@@ -624,6 +624,25 @@ async fn load_namespace_pairs_for(
     Ok(pairs)
 }
 
+/// Every `namespace:Kind:id` the ownership ledger already lists as managed.
+fn ledger_keys(state: &StateFile) -> std::collections::BTreeSet<String> {
+    state.resources.keys().cloned().collect()
+}
+
+/// Keys an apply already has an operation for, and which adoption must
+/// therefore leave alone: every diff entry plus the pending-create ownership
+/// assertions.
+fn adoption_handled_keys(
+    diffs: &[diff::ResourceDiff],
+    state: &StateFile,
+) -> std::collections::BTreeSet<String> {
+    diffs
+        .iter()
+        .map(|d| diff::resource_diff::state_key(&d.namespace, &d.kind, &d.id))
+        .chain(state.pending_creates.iter().cloned())
+        .collect()
+}
+
 fn cached_namespace_names(namespace_pairs: &[NamespaceSnapshot]) -> Vec<String> {
     namespace_pairs
         .iter()
@@ -1593,6 +1612,12 @@ async fn cmd_apply(
     // below stamps everything from `desired` as managed (no per-op concept
     // — the file write is atomic, success means everything's recorded).
     let mut successful_ops: Vec<apply::AppliedOp> = Vec::new();
+    // Declared rows that already matched the gateway exactly and were claimed
+    // into the ledger by this run. Recorded exactly like a successful op — the
+    // whole point is that they become managed — but kept separate so the
+    // summary can say how many rows the repo took ownership of without
+    // changing anything.
+    let mut adopted_ops: Vec<apply::AppliedOp> = Vec::new();
     let mut fully_replaced: Vec<String> = Vec::new();
 
     match env_config.gateway_mode {
@@ -1632,8 +1657,28 @@ async fn cmd_apply(
                 }
                 let diffs = apply::order_diffs(diffs);
 
+                // Rows that already match live but were never claimed. They
+                // are not gateway changes, but the apply below does write to
+                // the ledger (and, in shared mode, issues an idempotent PUT),
+                // so a preview that called this "no changes" would understate
+                // the run.
+                let handled = adoption_handled_keys(&diffs, &state);
+                let managed_ledger = ledger_keys(&state);
+                let adoptions: Vec<apply::AdoptionCandidate> = namespace_pairs
+                    .iter()
+                    .flat_map(|pair| {
+                        apply::adoption_candidates(
+                            &pair.desired,
+                            &pair.actual,
+                            &managed_ledger,
+                            &handled,
+                        )
+                    })
+                    .collect();
+
                 if diffs.is_empty()
                     && unmanaged.is_empty()
+                    && adoptions.is_empty()
                     && !spec_owned_blocks_sync(&spec_owned)
                     && secret_report.needs_allocation().is_empty()
                 {
@@ -1651,6 +1696,15 @@ async fn cmd_apply(
                         diff::DiffAction::Delete => "DELETE",
                     };
                     println!("  {} {} {}", action, d.kind, d.id);
+                }
+                if !adoptions.is_empty() {
+                    println!(
+                        "\n{} already-matching resource(s) would be adopted into the ownership ledger:",
+                        adoptions.len()
+                    );
+                    for candidate in &adoptions {
+                        println!("  ADOPT {} {}", candidate.kind, candidate.id);
+                    }
                 }
                 if !unmanaged.is_empty() {
                     println!(
@@ -1724,6 +1778,7 @@ async fn cmd_apply(
                 &apply::ApplyOptions {
                     strategy: resolved.apply_strategy.clone(),
                     pending_create_assertions: state.pending_creates.clone(),
+                    managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
                 },
             )
@@ -1921,6 +1976,7 @@ async fn cmd_apply(
                 &apply::ApplyOptions {
                     strategy: resolved.apply_strategy.clone(),
                     pending_create_assertions: state.pending_creates.clone(),
+                    managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
                 },
             )
@@ -1936,10 +1992,14 @@ async fn cmd_apply(
                 raw.unmanaged_skipped,
                 raw.spec_owned_skipped
             );
+            if let Some(line) = apply::adoption_summary_line(raw.adopted.len()) {
+                println!("{line}");
+            }
 
             // Pull the per-op records out before `into_result()` consumes
             // `raw`. These drive the incremental state update below.
             successful_ops = std::mem::take(&mut raw.applied_incremental);
+            adopted_ops = std::mem::take(&mut raw.adopted);
             fully_replaced = std::mem::take(&mut raw.fully_replaced_namespaces);
 
             // Defer propagation: record state for the successful portion
@@ -2051,6 +2111,13 @@ async fn cmd_apply(
                 state.record_full_replace(ns, &desired);
             }
             for op in &successful_ops {
+                state.record_op(op, &desired)?;
+            }
+            // Adoption records ownership of rows nothing had to change. Without
+            // this, a resource that was already identical on the first apply
+            // never entered the ledger, so shared mode's delete fence never
+            // covered it and a later removal from the repository pruned nothing.
+            for op in &adopted_ops {
                 state.record_op(op, &desired)?;
             }
             state.stamp_last_applied_if_clean(deferred_apply_error.is_none());

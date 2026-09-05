@@ -31,6 +31,13 @@ pub struct ApplyOptions {
     /// Write-ahead create keys that still need an idempotent repository-owned
     /// PUT before they may enter the managed delete fence.
     pub pending_create_assertions: BTreeSet<String>,
+    /// Every `namespace:Kind:id` the ownership ledger already lists as managed.
+    ///
+    /// Read-only here, and used for exactly one decision: a repository-declared
+    /// row that is live, identical, and *absent* from this set produced no diff
+    /// operation, so nothing would ever have recorded ownership of it. Those
+    /// rows are adopted — see [`adoption_candidates`].
+    pub managed_ledger: BTreeSet<String>,
     /// `--confirm-api-spec-deletion`. Full replace may proceed against a
     /// namespace with API specs only with this explicit destructive opt-in;
     /// an exclusive incremental apply may prune live resources tagged with an
@@ -69,6 +76,20 @@ pub struct ApplyResult {
     /// Per-resource operations that succeeded in `apply_incremental`.
     /// Empty for `apply_full_replace` runs — see `fully_replaced_namespaces`.
     pub applied_incremental: Vec<AppliedOp>,
+    /// Repository-declared rows that already matched the live gateway exactly
+    /// and were claimed into the ownership ledger by this run.
+    ///
+    /// Kept separate from `applied_incremental` because they are not changes:
+    /// nothing about the gateway's configuration differs afterwards. The caller
+    /// records them the same way (`StateFile::record_op`), which is the whole
+    /// point — without it a resource that was identical on the first apply
+    /// never entered the shared-mode delete fence, and its later removal from
+    /// the repository was never pruned.
+    pub adopted: Vec<AppliedOp>,
+    /// Operator-facing reasons an adoption candidate was *not* claimed: a
+    /// cached backup, a failed confirmation read, or a row that changed between
+    /// the diff and the ownership assertion.
+    pub adoption_skipped: Vec<String>,
     /// Namespaces where `apply_full_replace` completed successfully.
     /// /restore is atomic per namespace, so on success the entire
     /// namespace's desired state is now live and state.resources for that
@@ -367,6 +388,10 @@ pub async fn apply_api(
         aggregate
             .applied_incremental
             .extend(namespace_result.applied_incremental);
+        aggregate.adopted.extend(namespace_result.adopted);
+        aggregate
+            .adoption_skipped
+            .extend(namespace_result.adoption_skipped);
         aggregate
             .fully_replaced_namespaces
             .extend(namespace_result.fully_replaced_namespaces);
@@ -1010,15 +1035,14 @@ async fn apply_incremental(
     // Pure-Add namespaces take the transactional bulk path. `POST /batch` is
     // create-only and all-or-nothing (never 207), so any Modify or Delete in
     // the set disqualifies it.
+    //
+    // The batch path replaces the per-resource loop, not the adoption step
+    // below it: a namespace whose *diff* is pure adds can still hold declared
+    // rows that already match live and have never been claimed.
+    let mut batched_result = None;
     if !diffs.is_empty() && diffs.iter().all(|d| matches!(d.action, DiffAction::Add)) {
         match try_batch_create(&diffs, &index, client, namespace).await? {
-            Some(batched) => {
-                return Ok(ApplyResult {
-                    unmanaged_skipped: result.unmanaged_skipped,
-                    spec_owned_skipped: result.spec_owned_skipped,
-                    ..batched
-                })
-            }
+            Some(batched) => batched_result = Some(batched),
             // 501: standalone-MongoDB gateway with no multi-document
             // transaction. Fall through to per-resource CRUD.
             None => eprintln!(
@@ -1026,6 +1050,29 @@ async fn apply_incremental(
                  falling back to per-resource creates."
             ),
         }
+    }
+
+    if let Some(batched) = batched_result {
+        result = ApplyResult {
+            unmanaged_skipped: result.unmanaged_skipped,
+            spec_owned_skipped: result.spec_owned_skipped,
+            ..batched
+        };
+        if result.fatal_error.is_none() {
+            adopt_matching_rows(
+                desired,
+                actual,
+                client,
+                namespace,
+                ownership_scope,
+                &index,
+                &diffs,
+                options,
+                &mut result,
+            )
+            .await;
+        }
+        return Ok(result);
     }
 
     for diff in &diffs {
@@ -1158,7 +1205,283 @@ async fn apply_incremental(
         }
     }
 
+    // Claim declared rows that were already identical. Per-resource failures
+    // above do not block this: an adoption candidate is by definition a row no
+    // operation touched, so a neighbour's failed update says nothing about it,
+    // and leaving it unclaimed is precisely the bug being fixed.
+    adopt_matching_rows(
+        desired,
+        actual,
+        client,
+        namespace,
+        ownership_scope,
+        &index,
+        &diffs,
+        options,
+        &mut result,
+    )
+    .await;
+
     Ok(result)
+}
+
+/// One repository-declared row that is already live, already identical, and
+/// absent from the ownership ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionCandidate {
+    pub kind: String,
+    pub namespace: String,
+    pub id: String,
+}
+
+/// The rows an apply would adopt: declared by the repository, live and exactly
+/// as declared, untouched by any operation this run, and not yet in the
+/// ownership ledger.
+///
+/// This closes the hole that made a documented adoption path silently fail. A
+/// declared resource identical to its live row produces no diff entry, so no
+/// operation ever recorded ownership of it — in shared mode it then sat outside
+/// the delete fence forever, and removing it from the repository pruned
+/// nothing. Its namespace could also drop out of `resolved_namespaces` entirely
+/// once the repo stopped declaring anything there, because no ledger key named
+/// it.
+///
+/// Two exclusions are load-bearing:
+///
+/// - **`handled`** — every key this run already has an operation for (including
+///   the pending-create ownership assertions). Those are recorded through
+///   `applied_incremental` when they succeed and must not be claimed twice, or
+///   claimed at all when they failed.
+/// - **API-spec-owned live rows.** The `/api-specs` importer owns them in both
+///   ownership modes; adopting one would put a row the repo must never delete
+///   inside the delete fence.
+///
+/// Equality is the same subset test the pending-create recovery uses: every key
+/// the repository serializes must be present and equal in the live row. It is
+/// not, on its own, ownership — see [`adopt_matching_rows`].
+pub fn adoption_candidates(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    managed_ledger: &BTreeSet<String>,
+    handled: &BTreeSet<String>,
+) -> Vec<AdoptionCandidate> {
+    let mut candidates = Vec::new();
+    let mut consider = |resource: CreateResource<'_>, namespace: &str| {
+        let kind = resource.kind();
+        let id = resource.id();
+        let key = state_key(namespace, kind, id);
+        if managed_ledger.contains(&key) || handled.contains(&key) {
+            return;
+        }
+        if live_row_is_spec_owned(actual, kind, namespace, id) {
+            return;
+        }
+        if !resource.exact_desired_is_live(actual) {
+            return;
+        }
+        candidates.push(AdoptionCandidate {
+            kind: kind.to_string(),
+            namespace: namespace.to_string(),
+            id: id.to_string(),
+        });
+    };
+
+    for resource in &desired.upstreams {
+        consider(CreateResource::Upstream(resource), &resource.namespace);
+    }
+    for resource in &desired.consumers {
+        consider(CreateResource::Consumer(resource), &resource.namespace);
+    }
+    for resource in &desired.proxies {
+        consider(CreateResource::Proxy(resource), &resource.namespace);
+    }
+    for resource in &desired.plugin_configs {
+        consider(CreateResource::PluginConfig(resource), &resource.namespace);
+    }
+
+    candidates
+}
+
+/// Does the live `(namespace, kind, id)` carry an `api_spec_id`? Consumers are
+/// never spec-provisioned, so they can never answer yes.
+fn live_row_is_spec_owned(actual: &GatewayConfig, kind: &str, namespace: &str, id: &str) -> bool {
+    let tagged = |candidate_ns: &str, candidate_id: &str, tag: Option<&String>| {
+        candidate_ns == namespace && candidate_id == id && tag.is_some()
+    };
+    match kind {
+        "Proxy" => actual
+            .proxies
+            .iter()
+            .any(|r| tagged(&r.namespace, &r.id, r.api_spec_id.as_ref())),
+        "Upstream" => actual
+            .upstreams
+            .iter()
+            .any(|r| tagged(&r.namespace, &r.id, r.api_spec_id.as_ref())),
+        "PluginConfig" => actual
+            .plugin_configs
+            .iter()
+            .any(|r| tagged(&r.namespace, &r.id, r.api_spec_id.as_ref())),
+        _ => false,
+    }
+}
+
+/// The one-line apply summary for an adoption pass, or `None` when nothing was
+/// adopted (in which case the run says nothing about adoption at all).
+pub fn adoption_summary_line(adopted: usize) -> Option<String> {
+    (adopted > 0).then(|| format!("Adopted {adopted} already-matching resource(s) into the ledger"))
+}
+
+/// Claim already-matching declared rows into the ownership ledger.
+///
+/// **Shared mode** issues the same idempotent PUT the pending-create recovery
+/// uses. Equality is not provenance: a row identical to the repository's
+/// declaration may have been created by an administrator, and recording
+/// ownership on the strength of equality alone would hand the repo deletion
+/// authority over somebody else's resource. The PUT makes the repository the
+/// row's last writer, which is a claim the gateway acknowledged.
+///
+/// Because that PUT overwrites the row, it is issued only against a *freshly
+/// re-read* authoritative backup: a human edit landing between this run's diff
+/// and this assertion would otherwise be silently reverted. A row that moved is
+/// skipped with a per-resource message and stays unclaimed; the next run sees
+/// it as an ordinary Modify.
+///
+/// **Exclusive mode** writes nothing. The repo is already authoritative for the
+/// namespace and does not need a claim; the ledger entry is recorded anyway so
+/// the fence is correct if the environment is ever switched to `shared`.
+///
+/// Nothing is adopted from a cached (`X-Data-Source: cached`) view in either
+/// mode: that backup clears `api_spec_id` tags, so it cannot prove a row is not
+/// spec-owned.
+#[allow(clippy::too_many_arguments)]
+async fn adopt_matching_rows(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    client: &AdminClient,
+    namespace: &str,
+    ownership_scope: OwnershipScope<'_>,
+    index: &DesiredIndex<'_>,
+    diffs: &[ResourceDiff],
+    options: &ApplyOptions,
+    result: &mut ApplyResult,
+) {
+    let handled: BTreeSet<String> = diffs
+        .iter()
+        .map(|d| state_key(&d.namespace, &d.kind, &d.id))
+        .chain(options.pending_create_assertions.iter().cloned())
+        .collect();
+    let candidates = adoption_candidates(desired, actual, &options.managed_ledger, &handled);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let skip_all = |result: &mut ApplyResult, reason: String| {
+        let message = format!(
+            "not adopting {} already-matching resource(s): {reason}",
+            candidates.len()
+        );
+        eprintln!("[{namespace}] {message}");
+        result
+            .adoption_skipped
+            .push(format!("[{namespace}] {message}"));
+    };
+
+    if client.served_from_cache() {
+        skip_all(
+            result,
+            "the gateway served /backup from its in-memory cache (X-Data-Source: cached), which clears API-spec ownership tags".to_string(),
+        );
+        return;
+    }
+
+    // Exclusive mode asserts nothing, so there is nothing to overwrite and no
+    // confirmation read to make.
+    let confirmation = match ownership_scope {
+        OwnershipScope::Exclusive => None,
+        OwnershipScope::Shared { .. } => match client.get_backup_snapshot(namespace).await {
+            Ok(snapshot) if snapshot.cached => {
+                skip_all(
+                    result,
+                    "the confirmation backup was served from cache (X-Data-Source: cached)"
+                        .to_string(),
+                );
+                return;
+            }
+            Ok(snapshot) => Some(snapshot.config),
+            Err(error) => {
+                skip_all(
+                    result,
+                    format!("the confirmation backup could not be read: {error}"),
+                );
+                return;
+            }
+        },
+    };
+
+    for candidate in &candidates {
+        let key = (candidate.namespace.as_str(), candidate.id.as_str());
+        let resource = match candidate.kind.as_str() {
+            "Proxy" => index.proxies.get(&key).copied().map(CreateResource::Proxy),
+            "Consumer" => index
+                .consumers
+                .get(&key)
+                .copied()
+                .map(CreateResource::Consumer),
+            "Upstream" => index
+                .upstreams
+                .get(&key)
+                .copied()
+                .map(CreateResource::Upstream),
+            "PluginConfig" => index
+                .plugin_configs
+                .get(&key)
+                .copied()
+                .map(CreateResource::PluginConfig),
+            _ => None,
+        };
+        let Some(resource) = resource else { continue };
+
+        if let Some(confirmation) = &confirmation {
+            if !resource.exact_desired_is_live(confirmation) {
+                let message = format!(
+                    "not adopting {} `{}`: the live row changed between this run's diff and the ownership assertion, so the repository is not overwriting it. The next apply reconciles it as an ordinary change.",
+                    candidate.kind, candidate.id
+                );
+                eprintln!("[{namespace}] {message}");
+                result
+                    .adoption_skipped
+                    .push(format!("[{namespace}] {message}"));
+                continue;
+            }
+            if let Err(error) = resource.assert_ownership(client, namespace).await {
+                eprintln!(
+                    "[{namespace}] failed to adopt {} `{}`: {error}",
+                    candidate.kind, candidate.id
+                );
+                result.errors.push(format!(
+                    "{} {} adopt: {error}",
+                    candidate.kind, candidate.id
+                ));
+                continue;
+            }
+            eprintln!(
+                "[{namespace}] adopted {} `{}` into the ownership ledger with an idempotent update",
+                candidate.kind, candidate.id
+            );
+        } else {
+            eprintln!(
+                "[{namespace}] adopted {} `{}` into the ownership ledger (exclusive ownership needs no assertion)",
+                candidate.kind, candidate.id
+            );
+        }
+
+        result.adopted.push(AppliedOp {
+            kind: candidate.kind.clone(),
+            namespace: candidate.namespace.clone(),
+            id: candidate.id.clone(),
+            action: DiffAction::Modify,
+        });
+    }
 }
 
 /// What a single successful admin call actually did.

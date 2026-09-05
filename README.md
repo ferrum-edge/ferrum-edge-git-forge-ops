@@ -80,7 +80,8 @@ order — deep detail for each control lives in
    settings baseline — Actions permissions and the third-party allowlist,
    read-only workflow tokens, secret scanning and push protection, private
    vulnerability reporting, Dependabot alerts and security updates, the `main`
-   and `release-tags` rulesets, the two labels, and your deployment environments.
+   and `release-tags` rulesets, the two labels, the `settings-audit` environment
+   that fences the audit token, and your deployment environments.
    It is idempotent and **prints a plan without writing** unless you pass
    `--apply`, so run it as often as you like:
 
@@ -150,8 +151,11 @@ order — deep detail for each control lives in
    an exact custom rule for `main`). Re-running step 5 with `--reviewer` /
    `--reviewer-team` does all three and reads the environment list straight out
    of `.gitforgeops/config.yaml`. Delete every GitHub Environment the config does
-   *not* declare, including the `default` one GitHub creates on some repositories:
-   the settings audit holds **every** listed environment to these rules.
+   *not* declare — except `settings-audit` from step 11, which holds the
+   administration-read audit token and no gateway credential — including the
+   `default` one GitHub creates on some repositories: the settings audit holds
+   **every** listed environment to these rules (waiving only the reviewer rules
+   for `settings-audit`, which deploys nothing).
 
 9. **Add the per-environment secrets.** Settings → Environments → *name* →
    Environment secrets, or `gh secret set NAME --env <name>`:
@@ -162,7 +166,18 @@ order — deep detail for each control lives in
    | `FERRUM_ADMIN_JWT_SECRET` | api mode | HS256 signing key, **at least 32 characters** |
    | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | yes | From step 6 |
    | `FERRUM_GH_PROVISIONER_TOKEN` | credential broker | App installation token, or a fine-grained PAT with `Secrets: write` + `Environments: write` |
+   | `FERRUM_ADMIN_JWT_ISSUER` | optional | `iss` claim, default `ferrum-edge` |
+   | `FERRUM_ADMIN_JWT_ROLE` | optional | `role` claim, default `admin` |
+   | `FERRUM_ADMIN_JWT_AUDIENCE` | optional | `aud` claim; emitted **only** when set |
+   | `FERRUM_ADMIN_JWT_TTL_SECS` | optional | Token lifetime, default `3600` |
    | `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` | optional | base64 PEM; mTLS needs **both** cert and key |
+
+   The four `FERRUM_ADMIN_JWT_*` claim settings are optional to *configure*, not
+   optional to get right: set one and it must equal what the gateway expects, or
+   every admin call is a `401`. Leave them unset and the defaults above apply —
+   the workflows bind all four, and a blank secret reads as unset, not as an
+   empty issuer or an empty audience. `apply`, `rotate`, `diff` (drift check),
+   and the trusted PR live review all mint tokens from them.
 
    You do **not** create `FERRUM_CREDS_BUNDLE[_N]`. The broker writes them itself:
    the first apply that meets an `alloc=generate` (or `alloc=rotate`) placeholder
@@ -180,14 +195,29 @@ order — deep detail for each control lives in
     need; `severity: error` blocks `apply` until a write-permission user adds the
     override label. See [Policy framework](#policy-framework-gitforgeopspoliciesyaml).
 
-11. **Add `SETTINGS_AUDIT_TOKEN`.** A fine-grained PAT or read-only App token with
-    **Administration: read**, stored as a *repository* secret. `settings-audit.yml`
-    runs weekly from the default branch and re-checks everything step 5 applied;
-    without the token it fails closed.
+11. **Add `SETTINGS_AUDIT_TOKEN` to the `settings-audit` environment.** A
+    fine-grained PAT or read-only App token with **Administration: read**, stored
+    as a secret of the dedicated `settings-audit` environment — *not* as a
+    repository secret. Step 5 creates that environment (on template copies too),
+    with deployment branches limited to protected branches and no reviewer.
 
     ```bash
-    gh secret set SETTINGS_AUDIT_TOKEN --repo acme/gateway-config
+    gh secret set SETTINGS_AUDIT_TOKEN --repo acme/gateway-config --env settings-audit
     ```
+
+    | Secret | Scope | Notes |
+    |---|---|---|
+    | `SETTINGS_AUDIT_TOKEN` | environment `settings-audit` | Administration: read, nothing else |
+
+    A repository secret is released to whatever workflow definition a dispatched
+    ref carries, so any branch a write-access collaborator can push would be a
+    path to an administration-read token. `settings-audit.yml` binds
+    `environment: settings-audit`, and GitHub refuses to release that
+    environment's secrets to a job on a ref its branch policy does not admit.
+    The environment has no reviewer on purpose: it deploys nothing, and a
+    reviewer would park every weekly run in "waiting for approval". The audit
+    runs weekly from the default branch and re-checks everything step 5 applied
+    — including that this environment exists; without the token it fails closed.
 
 12. **Take on the validator pin refresh.** `.github/ferrum-edge-checksums.txt`
     lists the SHA-256 of every approved `ferrum-edge` build, and the installer
@@ -471,6 +501,21 @@ Choose this for production or regulated environments where git is the single sou
 ### First-apply behavior
 
 In `shared` mode, the first apply (when `.state/<env>.json` doesn't yet exist) treats **all** gateway resources as unmanaged. A loud warning goes to the apply output; nothing is deleted. Adds enter the pending-create journal immediately before the first create POST and enter the ownership ledger only after a successful response, or after an exact authoritative readback followed by an idempotent PUT that declares the repository as the row's writer. A process failure therefore leaves a recoverable journal entry, never unproven deletion authority.
+
+A resource the repository declares that *already matches* its live row is the case a diff cannot express: there is nothing to add and nothing to modify, so no operation would ever have recorded ownership of it. Those rows are **adopted** instead, as an explicit step at the end of an incremental apply.
+
+### Adoption of already-matching resources
+
+An adoption candidate is a repository-declared `(namespace, kind, id)` that is live, byte-for-byte as declared, untouched by any operation in this run, absent from the ownership ledger, and not tagged `api_spec_id`. What happens next depends on the mode:
+
+- **`shared`** — the row is claimed with the same idempotent PUT the pending-create recovery uses. Equality is not provenance: an administrator may have created the identical row, and recording ownership on the strength of a match alone would hand the repository deletion authority over somebody else's resource. The PUT makes the repository the row's last writer, which is a claim the gateway acknowledged. Because that PUT overwrites the row, it is issued only against a **freshly re-read authoritative backup**; a row that changed between this run's diff and the assertion is skipped with a per-resource message and stays unclaimed, so a concurrent human edit is never silently reverted. The next apply reconciles it as an ordinary Modify.
+- **`exclusive`** — nothing is written. The repository is already authoritative for the namespace, so there is no claim to make; the ledger entry is recorded anyway, so the delete fence is correct if the environment is ever switched to `shared`.
+- **file mode** — unchanged: the atomic file write records the entire desired set.
+- **`full_replace`** — not applicable. `/restore` is atomic per namespace, and a successful restore rebuilds that namespace's ledger entries from `desired` wholesale.
+
+Adoption is reported: `apply` prints `Adopted N already-matching resource(s) into the ledger` plus one line per resource, and the interactive preview lists pending adoptions as `ADOPT <Kind> <id>` rather than reporting "No changes to apply."
+
+Two rules are never relaxed. **Nothing is adopted from a cached (`X-Data-Source: cached`) backup** — that view clears `api_spec_id` tags, so it cannot prove a row is not spec-owned. **Spec-owned rows are never adopted** in either mode: the `/api-specs` importer owns them, and putting one inside the delete fence would let the repository prune a row it must never touch. A failed adoption PUT records nothing and is reported as a per-resource error, so an unclaimed row can never look like a clean apply.
 
 ### State file trust model
 
@@ -1013,6 +1058,22 @@ Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-sid
 
 When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — one transactional, all-or-nothing call, chunked below the gateway's 1 MiB body cap. Any Modify or Delete in the set disqualifies it (`/batch` is create-only), and a 501 falls back to per-resource creates.
 
+#### Ordering between runs: the environment lock and the freshness guard
+
+Applies to one environment are serialized by a GitHub concurrency group (`ferrum-apply-<env>`), and `rotate.yml` shares that group — two writes to the same gateway never interleave. Serialization alone is not enough, though, because a queued run still *checked out* the commit that triggered it. So once the lock is held, `apply-on-merge.yml` and `rotate.yml` re-fetch the protected branch, move the working tree onto its **current** head, and print both revisions:
+
+```
+Triggering commit: 4f2c…
+Protected main HEAD: 9ab1…
+```
+
+Everything after that point — the `gitforgeops` binary it builds, the desired resources it assembles, and the `.state/<env>.json` it reconciles against — comes from that one commit. Two consequences worth knowing:
+
+- **Merges that queue up collapse safely.** Merge B queued behind A's apply used to read a ledger that predated A's state commit, see A's new rows as unmanaged, and stop reconciling them. Now B reconciles A's tree plus its own, against A's published ledger.
+- **A stale run is rejected, not silently replayed.** If the triggering commit is no longer an ancestor of the protected head (a re-run of an old workflow after the branch was rewritten, or a revision that was force-pushed away), the job fails before it builds a binary or contacts the gateway. Re-run the apply for the current head instead.
+
+Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author, because that is who is waiting for the slot. Every later merge has its own apply run with its own attribution.
+
 ### Post-apply convergence
 
 After an api-mode apply, gitforgeops makes a best-effort `GET /cluster` call and prints a one-line convergence summary: the gateway's mode, connected data-plane and mesh-node counts, the oldest `last_sync_at` among them, and a warning if any node reports `config_diverged`. On a DP-mode gateway it reports that node's view of its control plane instead; on a database/file-mode gateway there is no cluster to converge and it says so. Advisory only — a gateway that can't answer (older build, network hiccup) reports "unknown" and never fails the apply.
@@ -1024,6 +1085,9 @@ The merge commit is already on `main`, but config isn't (fully) applied. Re-run 
 1. Incremental mode re-fetches actual state via `GET /backup`, so already-applied resources are skipped.
 2. Full-replace mode is idempotent — `POST /restore` converges regardless of prior partial state.
 3. `.state/<env>.json` is an ownership manifest of the *last successful* apply; it never causes re-runs to skip work.
+4. The re-run reconciles the protected branch's **current** head, not the tree as it stood at the original merge — so a re-run started after later merges landed converges to the newest desired state rather than rolling it back. See [Ordering between runs](#ordering-between-runs-the-environment-lock-and-the-freshness-guard).
+
+The one way a re-run refuses to start is a `Stale deployment` error, which means the commit that triggered the original run is no longer an ancestor of `main` — the branch was rewritten under it. Nothing was mutated; trigger a fresh apply from the current head.
 
 Two failures are the exception — do **not** blindly re-run:
 
@@ -1061,15 +1125,26 @@ Only three kinds of configuration source exist:
 |---|---|---|
 | `FERRUM_GATEWAY_URL` | yes (api mode) | Admin API base URL. **Must be `https://`** — see [Transport security](#transport-security). |
 | `FERRUM_ADMIN_JWT_SECRET` | yes (api mode) | HS256 secret for minting admin JWTs; min 32 chars |
-| `FERRUM_ADMIN_JWT_ISSUER` | no (default `ferrum-edge`) | `iss` claim; must equal the gateway's own issuer or every call is 401 |
-| `FERRUM_ADMIN_JWT_ROLE` | no (default `admin`) | `role` claim; `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only |
-| `FERRUM_ADMIN_JWT_AUDIENCE` | no | `aud` claim, emitted **only** when set — a gateway with no configured audience rejects a token that carries one |
-| `FERRUM_ADMIN_JWT_TTL_SECS` | no (default `3600`) | Token lifetime; must sit inside the gateway's `FERRUM_ADMIN_JWT_MAX_TTL` |
+| `FERRUM_ADMIN_JWT_ISSUER` | optional (default `ferrum-edge`) | `iss` claim; must equal the gateway's own issuer or every call is 401 |
+| `FERRUM_ADMIN_JWT_ROLE` | optional (default `admin`) | `role` claim; `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only |
+| `FERRUM_ADMIN_JWT_AUDIENCE` | optional (default: no `aud`) | `aud` claim, emitted **only** when set — a gateway with no configured audience rejects a token that carries one |
+| `FERRUM_ADMIN_JWT_TTL_SECS` | optional (default `3600`) | Token lifetime; must sit inside the gateway's `FERRUM_ADMIN_JWT_MAX_TTL` |
 | `FERRUM_GATEWAY_CA_CERT` | no | Custom CA (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_CERT` | no | Client cert for mTLS (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_KEY` | no | Client key for mTLS (base64 PEM, required if cert is set) |
 | `FERRUM_GH_PROVISIONER_TOKEN` | no (required for allocate/rotate) | GitHub App installation token or PAT with `Secrets: write` + `Environments: write` |
 | `FERRUM_CREDS_BUNDLE[_N]` | managed by broker | Credential bundles, shards `0..15` — **you generally never touch these by hand**. The workflows bind each shard by name, so `_16` and above are never read; see [Storage: bundled environment secrets](#storage-bundled-environment-secrets) |
+
+The four `FERRUM_ADMIN_JWT_*` claim settings are optional to configure and
+mandatory to match: whatever you set here has to equal the gateway's own
+`FERRUM_ADMIN_JWT_ISSUER` / audience / role expectations and sit inside its
+`FERRUM_ADMIN_JWT_MAX_TTL`, or every admin call answers `401`. Every workflow
+that reaches the admin API — `apply-on-merge.yml`, `rotate.yml`,
+`drift-check.yml`, and the live half of `trusted-pr-review.yml` — binds all four
+from the selected GitHub Environment, and an unset (or blank) secret means
+"use the default", not "empty issuer" / "empty audience".
+`materialize-file.yml` binds none of them: it refuses to run outside file mode
+and never opens an admin connection.
 
 #### Migrating from older gitforgeops
 
@@ -1133,9 +1208,10 @@ Every deployment environment also needs `GITFORGEOPS_STATE_APP_ID` and
 `GITFORGEOPS_STATE_APP_PRIVATE_KEY` for the contents-only App that commits the
 ownership ledger through the protected branch ruleset. Set repository variable
 `GITFORGEOPS_STATE_APP_ID` to that same numeric ID so the scheduled audit can
-verify the exact bypass actor. The repository-level
-`SETTINGS_AUDIT_TOKEN` needs Administration: read and is used only by the
-scheduled default-branch settings audit. See
+verify the exact bypass actor. `SETTINGS_AUDIT_TOKEN` needs Administration: read
+and lives in its own `settings-audit` environment — never as a repository
+secret, which any dispatchable branch could reach — where only the protected
+default branch can be handed it. See
 [GitHub launch controls](docs/github-launch-controls.md).
 
 Absent or blank runtime values use the documented defaults. Present values are
@@ -1326,6 +1402,17 @@ an empty state file, so the first `diff` reports every live resource as
 *unmanaged* until the first apply records them. That is expected; do not switch
 to `exclusive` (or `full_replace`) until the tree has applied cleanly at least
 once.
+
+An import produces a tree that matches the gateway exactly, so the first apply
+usually has an empty diff. It is still not a no-op: every declared row is
+claimed by the [adoption step](#adoption-of-already-matching-resources) with an
+idempotent PUT and written into `.state/<env>.json`, and the run prints
+`Adopted N already-matching resource(s) into the ledger`. Check that count
+against the import's written total before assuming the migration is finished —
+a row the confirmation read found changed, or one skipped as spec-owned, is
+*not* in the ledger, and shared mode will never prune it when you later delete
+its file. Rows skipped for either reason are named individually in the apply
+output.
 
 ## PR review output
 

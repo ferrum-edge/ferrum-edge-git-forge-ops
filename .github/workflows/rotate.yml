@@ -107,10 +107,60 @@ jobs:
             exit 1
           fi
 
+      # Rotation shares `ferrum-apply-<env>` with apply-on-merge, so it can sit
+      # behind a running apply for minutes and then reconcile from the ledger
+      # snapshot it checked out at dispatch time — the shard count and slot
+      # metadata that apply just rewrote would be invisible to it. Take the
+      # protected branch as it stands now that the lock is held, exactly as the
+      # apply job does.
       - name: Check out protected main for rotation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.repository.default_branch }}
+          # Full history: `git merge-base --is-ancestor` below cannot answer
+          # from a shallow clone, and "cannot tell" would fail closed always.
+          fetch-depth: 0
           persist-credentials: false
+
+      # Re-resolve the branch after the queue drains, move onto its current
+      # head, and refuse a dispatch whose ref has since been superseded — a
+      # re-run of an old rotation would otherwise write its credential against
+      # an obsolete ledger.
+      - name: Refresh protected branch and reject stale deployments
+        id: freshness
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TRIGGER_SHA: ${{ github.sha }}
+          FETCH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TRIGGER_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Triggering commit is not a 40-hex object name."
+            exit 1
+          }
+          # The checkout deliberately persisted no credentials, so authenticate
+          # this one fetch with the job's read-only token and drop the header
+          # again on the way out.
+          auth=$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git fetch --no-tags --force origin \
+            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          fresh_head=$(git rev-parse "refs/remotes/origin/${DEFAULT_BRANCH}")
+          # Stay ON the branch: the state commit at the end of this job pushes
+          # it, and a detached HEAD has nothing to push.
+          git checkout --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/${DEFAULT_BRANCH}"
+          echo "Triggering commit: $TRIGGER_SHA"
+          echo "Protected ${DEFAULT_BRANCH} HEAD: $fresh_head"
+          git cat-file -e "${TRIGGER_SHA}^{commit}" 2>/dev/null || {
+            echo "::error::Triggering commit $TRIGGER_SHA is not reachable from ${DEFAULT_BRANCH} at $fresh_head; refusing to rotate against a revision the protected branch no longer carries."
+            exit 1
+          }
+          git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head" || {
+            echo "::error::Stale deployment: $TRIGGER_SHA is not an ancestor of ${DEFAULT_BRANCH} at $fresh_head. Dispatch the rotation again from the current head."
+            exit 1
+          }
+          echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
@@ -193,6 +243,12 @@ jobs:
           FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          # Optional JWT claim settings; see apply-on-merge.yml for why they
+          # are bound explicitly and why blank means "unset", not "empty".
+          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
+          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
+          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}
+          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
