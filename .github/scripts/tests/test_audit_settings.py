@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -344,6 +345,97 @@ class SettingsAuditTests(unittest.TestCase):
         rendered = "\n".join(audit.violations)
         self.assertIn("verified Marketplace", rendered)
         self.assertIn("exactly match", rendered)
+
+
+class TemplateRepositoryAuditTests(unittest.TestCase):
+    """The upstream template has no state-writer App and no environments."""
+
+    def template_responses(self):
+        responses = secure_responses()
+        # Solo-maintainer template: the admin role holds a pull-request-mode
+        # bypass and there is no App to name.
+        responses["repos/acme/repo/rulesets/7"]["bypass_actors"] = [
+            {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "pull_request"}
+        ]
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {"total_count": 0, "environments": []}
+        ]
+        return responses
+
+    def run_audit(self, responses, *, template_repo):
+        with patch.object(
+            audit_settings,
+            "gh_json",
+            side_effect=lambda path, paginate=False: responses[path],
+        ):
+            return audit_settings.run(
+                "acme/repo",
+                "main",
+                REQUIRED_CHECKS,
+                None if template_repo else 99,
+                "refs/tags/v*",
+                template_repo,
+            )
+
+    def test_template_mode_skips_bypass_and_environment_requirements(self):
+        audit = self.run_audit(self.template_responses(), template_repo=True)
+        self.assertEqual(audit.violations, [])
+        rendered = "\n".join(audit.evidence)
+        self.assertIn("state-writer App bypass", rendered)
+        self.assertIn("protected-environment", rendered)
+
+    def test_the_same_repository_fails_without_template_mode(self):
+        audit = self.run_audit(self.template_responses(), template_repo=False)
+        rendered = "\n".join(audit.violations)
+        self.assertIn("configured state-writer App", rendered)
+        self.assertIn("always mode", rendered)
+        self.assertIn("at least one protected environment", rendered)
+
+    def test_template_mode_still_audits_everything_else(self):
+        responses = self.template_responses()
+        responses["repos/acme/repo/actions/permissions"]["sha_pinning_required"] = False
+        responses["repos/acme/repo/rulesets/8"]["bypass_actors"] = []
+        next(
+            rule
+            for rule in responses["repos/acme/repo/rulesets/7"]["rules"]
+            if rule["type"] == "required_status_checks"
+        )["parameters"]["required_status_checks"] = [{"context": "rust-ci-check"}]
+        audit = self.run_audit(responses, template_repo=True)
+        rendered = "\n".join(audit.violations)
+        self.assertIn("full-SHA pinning", rendered)
+        self.assertIn("at least one bypass actor", rendered)
+        self.assertIn("missing required status checks", rendered)
+
+    def test_template_mode_still_audits_a_listed_environment(self):
+        responses = self.template_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {"total_count": 1, "environments": [{"name": "production"}]}
+        ]
+        responses["repos/acme/repo/environments/production"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": None,
+        }
+        audit = self.run_audit(responses, template_repo=True)
+        rendered = "\n".join(audit.violations)
+        self.assertIn("require at least one reviewer", rendered)
+        self.assertIn("prevent self-review", rendered)
+
+
+class SharedConstantTests(unittest.TestCase):
+    def test_required_status_checks_match_the_settings_audit_workflow(self):
+        workflow = (
+            Path(__file__).resolve().parents[3]
+            / ".github"
+            / "workflows"
+            / "settings-audit.yml"
+        ).read_text(encoding="utf-8")
+        declared = set(
+            re.findall(r"--required-check '([^']+)'", workflow)
+        )
+        self.assertEqual(declared, set(audit_settings.REQUIRED_STATUS_CHECKS))
+
+    def test_release_tag_pattern_is_the_documented_default(self):
+        self.assertEqual(audit_settings.RELEASE_TAG_PATTERN, "refs/tags/v*")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,12 @@ sys.modules[SPEC.name] = check_agent_setup
 SPEC.loader.exec_module(check_agent_setup)
 
 
+# Deliberately not the upstream maintainer's handle: the ownership check reads
+# the expected owner set out of CODEOWNERS itself, so a customer's own handle
+# must satisfy it exactly as the upstream one does.
+FIXTURE_CODEOWNER = "@example-maintainer"
+
+
 def skill_text(name: str, *, claude: bool = False) -> str:
     linked = (
         "Every dispatch uses a dedicated linked git worktree.\n" if claude else ""
@@ -133,10 +139,7 @@ def write_valid_setup(
     )
     codeowners = root / ".github" / "CODEOWNERS"
     codeowners.write_text(
-        "\n".join(
-            f"{path} {check_agent_setup.CODEOWNER}"
-            for path in check_agent_setup.CODEOWNED_PATHS
-        )
+        "\n".join(f"{path} {FIXTURE_CODEOWNER}" for path in check_agent_setup.CODEOWNED_PATHS)
         + "\n",
         encoding="utf-8",
     )
@@ -431,6 +434,64 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn('python3 "$validator" --root "$GITHUB_WORKSPACE"', joined)
         self.assertIn("unittest discover", joined)
         self.assertIn("shellcheck --external-sources", joined)
+
+    def test_codeowners_accepts_a_multi_owner_declaration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            codeowners = root / ".github/CODEOWNERS"
+            codeowners.write_text(
+                "# gitforgeops: replace these handles with your own maintainers\n"
+                + "\n".join(
+                    f"{path} @acme-lead @acme/platform"
+                    for path in check_agent_setup.CODEOWNED_PATHS
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+    def test_codeowners_rejects_a_path_outside_the_declared_owner_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            codeowners = root / ".github/CODEOWNERS"
+            codeowners.write_text(
+                codeowners.read_text(encoding="utf-8").replace(
+                    f"/.claude/ {FIXTURE_CODEOWNER}", "/.claude/ @someone-else"
+                ),
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(
+            any(
+                f"/.claude/ must be owned only by {FIXTURE_CODEOWNER}" in violation
+                for violation in violations
+            ),
+            violations,
+        )
+
+    def test_codeowners_requires_a_valid_owner_declaration(self):
+        for declaration, expected in (
+            ("/.github/CODEOWNERS\n", "must name the repository's code owners"),
+            ("/.github/CODEOWNERS not-a-handle\n", "@user or @org/team handles"),
+            ("/.github/CODEOWNERS owner@example.com\n", "@user or @org/team handles"),
+        ):
+            with self.subTest(declaration=declaration):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_valid_setup(root)
+                    codeowners = root / ".github/CODEOWNERS"
+                    codeowners.write_text(
+                        codeowners.read_text(encoding="utf-8").replace(
+                            f"/.github/CODEOWNERS {FIXTURE_CODEOWNER}\n", declaration
+                        ),
+                        encoding="utf-8",
+                    )
+                    violations = check_agent_setup.collect_violations(root)
+                self.assertTrue(
+                    any(expected in violation for violation in violations), violations
+                )
 
     def test_codeowners_rejects_later_overriding_patterns(self):
         with tempfile.TemporaryDirectory() as directory:
