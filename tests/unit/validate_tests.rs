@@ -871,3 +871,194 @@ fn plugin_config_stand_ins_are_shape_aware_and_input_only() {
         serde_json::json!("${gh-env-secret:alloc=require}")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scrubbing fails closed for values a validator can re-encode. Substring
+// replacement only protects a secret the child echoed as those exact bytes;
+// a PEM key comes back as an indented block scalar and a quoted value comes
+// back escaped, and a stream that merely *looks* redacted is worse than one
+// that is withheld.
+// ---------------------------------------------------------------------------
+
+/// A validator that re-emits the spec as a YAML block scalar, the way a
+/// multi-line value actually comes back: indented, wrapped, with no
+/// contiguous copy of the original bytes anywhere in the output.
+#[cfg(unix)]
+const REENCODING_VALIDATOR: &str = r#"#!/bin/sh
+echo 'error: consumer app: credential rejected'
+echo 'key: |'
+sed 's/^/  /' "$7"
+exit 1
+"#;
+
+#[cfg(unix)]
+#[test]
+fn a_multi_line_secret_withholds_the_stream_instead_of_half_redacting_it() {
+    let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\n-----END PRIVATE KEY-----";
+    let config = consumer_config(serde_json::json!({"mtls_auth": [{"private_key": pem}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "reencoding-validator", REENCODING_VALIDATOR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert_eq!(result.stdout, "");
+    assert!(
+        result.stderr.contains("not safely scrubbable"),
+        "the notice must name the reason: {}",
+        result.stderr
+    );
+    // No line of the key survives, not even one the block scalar indented.
+    for line in pem.lines() {
+        assert!(!result.stderr.contains(line), "{}", result.stderr);
+        assert!(!result.stdout.contains(line), "{}", result.stdout);
+    }
+}
+
+/// A secret carrying a quote is re-encoded by every emitter that has to quote
+/// it. The escaped form is a needle in its own right, so an ordinary
+/// single-line diagnostic is still scrubbed rather than lost — but a value
+/// that reaches the output through some *other* encoding still withholds.
+#[test]
+fn json_escaped_and_single_quoted_forms_of_a_secret_are_scrubbed() {
+    use gitforgeops::secrets::SecretScrubber;
+
+    let secret = "quote\"and'apostrophe-secret";
+    let config = consumer_config_for_standins(serde_json::json!({
+        "keyauth": [{"key": secret}]
+    }));
+    let scrubber = SecretScrubber::from_gateway_config(&config);
+
+    // The JSON-escaped form (`\"`) and the single-quoted YAML form (`''`) are
+    // both replaced, not merely detected.
+    let json_form = format!(
+        "key = \"{}\"",
+        secret.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let yaml_form = format!("key = '{}'", secret.replace('\'', "''"));
+    for text in [&json_form, &yaml_form] {
+        let scrubbed = scrubber.scrub(text);
+        assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+        assert!(!scrubbed.contains("apostrophe-secret"), "{scrubbed}");
+    }
+}
+
+/// ...and because a quote is also a re-encoding hazard, the stream as a whole
+/// is withheld: the escaped needles above are a best effort, not a guarantee.
+#[cfg(unix)]
+#[test]
+fn a_secret_carrying_a_quote_withholds_the_stream() {
+    use gitforgeops::secrets::is_reencoding_hazard;
+
+    assert!(is_reencoding_hazard("quote\"secret-value"));
+    assert!(is_reencoding_hazard("multi\nline"));
+    assert!(is_reencoding_hazard("trailing-space "));
+    assert!(is_reencoding_hazard("comment#marker-value"));
+    assert!(is_reencoding_hazard("mapping: indicator"));
+    // The common case is untouched.
+    assert!(!is_reencoding_hazard("Ax7Kd9QpLm2Rn4Tv6Wy8Zb0Ce3Fh5Jk"));
+
+    let config = consumer_config(serde_json::json!({
+        "keyauth": [{"key": "quote\"secret-value"}]
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert_eq!(result.stdout, "");
+    assert!(
+        result.stderr.contains("not safely scrubbable"),
+        "{}",
+        result.stderr
+    );
+    assert!(!result.stderr.contains("secret-value"), "{}", result.stderr);
+}
+
+/// A validator that reproduces only part of a secret — a wrapped line, a
+/// truncated echo — leaves no needle to replace, so the surviving run is
+/// caught by the fragment scan.
+#[cfg(unix)]
+#[test]
+fn a_surviving_fragment_of_a_secret_withholds_the_stream() {
+    let secret = "Ax7Kd9QpLm2Rn4Tv6Wy8Zb0Ce3Fh5JkNp1Su4Xz7Bd0Gg";
+    let fragment = &secret[..20];
+    let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(
+        dir.path(),
+        "truncating-validator",
+        &format!("#!/bin/sh\necho 'error: key starts with {fragment}'\nexit 1\n"),
+    );
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert_eq!(result.stdout, "");
+    assert!(!result.stderr.contains(fragment), "{}", result.stderr);
+    assert!(
+        result.stderr.contains("12-byte run"),
+        "the notice must name the reason: {}",
+        result.stderr
+    );
+}
+
+/// The narrowing that keeps the scan usable: a run the *document* already
+/// contains in public text is printed by the validator whether or not a secret
+/// exists, so it is not evidence of a leak. Here the header value embeds its
+/// own header name.
+#[cfg(unix)]
+#[test]
+fn a_public_run_shared_with_a_secret_does_not_withhold_the_stream() {
+    let config = plugin_config_for(
+        "otel",
+        "otel_tracing",
+        serde_json::json!({
+            "headers": {"x-honeycomb-team": "x-honeycomb-team-issued-key-material"},
+            "sample_rate": "0.1"
+        }),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(
+        !result.stdout.contains("issued-key-material"),
+        "{}",
+        result.stdout
+    );
+    assert!(result.stdout.contains("sample_rate"), "{}", result.stdout);
+    assert!(
+        result.stderr.contains("unknown field `listen_path_typo`"),
+        "{}",
+        result.stderr
+    );
+}
+
+/// (d) The case that has to keep working: a single-line API key. Diagnostics
+/// stay complete, the credential does not.
+#[cfg(unix)]
+#[test]
+fn an_ordinary_single_line_secret_keeps_full_diagnostics() {
+    let secret = "Ax7Kd9QpLm2Rn4Tv6Wy8Zb0Ce3Fh5Jk";
+    let config = consumer_config(serde_json::json!({
+        "keyauth": [{"key": secret}],
+        "hmac_auth": [{"secret": "Zq3Wm8Nb5Vc2Xs9Df6Gh1Jk4Lp7Ty0R"}]
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(!result.stdout.contains(secret), "{}", result.stdout);
+    assert!(result.stdout.contains("[REDACTED]"), "{}", result.stdout);
+    assert!(
+        result.stderr.contains("unknown field `listen_path_typo`"),
+        "{}",
+        result.stderr
+    );
+    assert!(
+        !result.stderr.contains("withheld"),
+        "an ordinary credential must not cost the diagnostics: {}",
+        result.stderr
+    );
+}

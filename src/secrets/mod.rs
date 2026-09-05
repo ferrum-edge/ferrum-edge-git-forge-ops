@@ -26,4 +26,7 @@ pub use resolver::{
     IMPORT_REQUIRED_PLACEHOLDER, MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES,
     MIN_ENTROPY_BYTES_FOR_32_CHARS, REDACTED_SENTINEL,
 };
-pub use scrubber::{SecretScrubber, MIN_SCRUB_LENGTH, REDACTION};
+pub use scrubber::{
+    is_reencoding_hazard, ScrubbedOutput, SecretScrubber, SuppressionReason, FRAGMENT_SCAN_LENGTH,
+    MIN_SCRUB_LENGTH, REDACTION,
+};
