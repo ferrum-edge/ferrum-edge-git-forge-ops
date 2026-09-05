@@ -13,3 +13,4 @@ pub mod review;
 pub mod secrets;
 pub mod state;
 pub mod validate;
+pub mod verdict;

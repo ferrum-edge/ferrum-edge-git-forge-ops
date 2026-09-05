@@ -292,6 +292,11 @@ Any **live** resource with `api_spec_id` set is classified `spec_owned`
   Resources" section. Unlike the unmanaged block, it is *not* gated on
   `ownership.drift_report`: a repo fighting the spec importer is a correctness
   problem, not drift noise.
+- Counted as drift by `diff --exit-on-drift` (exit 2), independently of every
+  `ownership.drift_alert_on` flag — `apply` blocks the namespace, so a nightly
+  monitor reporting success would be reporting on a gateway nobody can
+  reconcile. Non-conflicting spec-owned rows stay non-blocking, and other
+  namespaces are still compared. See `verdict::DriftVerdict`.
 
 `full_replace` does not delete the graph either: the restore body carries the
 live spec-owned rows and the live `api_specs` section through unchanged, which
@@ -328,6 +333,42 @@ Severity `error` blocks `apply` unless overridden. Override = PR label
 `overrides.required_permission` (default `write`). Implementation:
 `src/policy/github_override.rs::check_override`.
 
+### Preview verdicts (`src/verdict.rs`)
+
+Two pure computations, shared so a preview and the run it previews cannot
+disagree.
+
+**`apply_blockers`** — every fail-closed gate `apply` refuses on that is
+decidable *without* a gateway, as `Vec<ApplyBlocker>` over five
+`BlockerKind`s: `Validation`, `Security`, `Policy`, `RequiredCredentials`,
+`SlotRemap`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
+section (class, count, remedy) plus a summary line, and exits 1 when it is
+non-empty. `cmd_apply` calls the *same per-class predicates*
+(`security_blocker`, `policy_blocker`, `required_credentials_blocker`,
+`validation_blocker`) at its own gate points rather than the aggregate, because
+its ordering is load-bearing — the security audit has to refuse before the
+credential bundle is read, the required-slot check before the first gateway
+call. Sharing the predicates and not the control flow is the whole design.
+
+Rules that must not drift: warning severity never blocks; `alloc=generate`
+awaiting first-apply allocation is *not* a blocker (`missing_required()` is,
+`needs_allocation()` is not); `policy_findings` are fed **post-override**
+(`PolicyFinding::is_blocking` reads `overridden_by`). `plan` resolves the
+override through the same `resolve_pr_number` + `check_override` path `apply`
+uses, and fails closed — no PR, an inactive decision, or a GitHub error leaves
+every blocking finding standing. Gateway-dependent gates (large-prune,
+stale-view, per-resource write failures) are deliberately excluded: a preview
+cannot decide them.
+
+Adding a new fail-closed gate to `apply` means adding a `BlockerKind` here, or
+`plan` silently goes back to promising applies that refuse.
+
+**`DriftVerdict`** — what makes `diff --exit-on-drift` exit `DRIFT_EXIT_CODE`
+(2). Managed add/modify, managed delete and unmanaged-added each honor their
+`ownership.drift_alert_on` flag; **spec conflicts do not** and cannot be muted
+(see the spec-owned tier). Informational spec-owned rows the repo does not
+declare are never drift.
+
 ### Credential broker (in-GitHub, no third-party)
 
 Consumer credentials use placeholders like
@@ -341,6 +382,19 @@ bare object is permanent false drift; the assembler normalizes the object form
 on load. Slot paths elide `ArrayIndex(0)` so the normalization doesn't rename
 (and orphan) already-allocated slots; entries ≥1 get a `[N]` segment. Older
 encodings stay in the read-only lookup candidate list.
+
+`basicauth[].username` and `mtls_auth[].identity` are **identities, not
+secrets** — the public halves of their credentials, which the broker cannot
+generate and a resource file cannot omit and still say which credential it
+describes. `secrets::resolver::is_identity_credential_leaf(credential_type,
+leaf)` is the single classifier, keyed on the credential type *and* the leaf
+key together (a `username` under a custom credential type is still a secret).
+Four callers must agree or a config becomes acceptable to one command and
+refused by another: the resolver (never broker one), `import`'s capture walk
+(never redact one out of the file), `secrets::scrubber` (never black one out of
+a validator diagnostic), and `diff::security::check_literal_credentials` (never
+block `apply` on one). That last one carries the credential type and leaf key
+down the walk separately from the human-readable diagnostic path.
 
 Generation constraints, enforced at resolve time so `plan` fails before `apply`
 writes an unusable value: `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24
@@ -428,6 +482,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
+- `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
 - `src/error.rs` — unified `Error` enum via `thiserror`
 
 ### Key Design Principles
