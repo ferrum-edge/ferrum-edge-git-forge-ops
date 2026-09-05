@@ -95,7 +95,19 @@ AGENT_POLICY_SCRIPT_MARKERS = (
     "group: agent-setup-policy-${{ github.event.pull_request.number }}",
     "cancel-in-progress: true",
 )
-CODEOWNER = "@jeremyjpj0916"
+# The expected owner set is not hard-coded: a customer copies this repository
+# from its template and replaces the upstream maintainer with their own. It is
+# read from the `/.github/CODEOWNERS` rule inside CODEOWNERS itself — the file
+# declares who owns it, and because that path is one of the protected entries
+# below, changing the declaration needs a review from the owners it currently
+# names. Every protected path must then be owned by exactly that set, so a
+# customer swaps one handle in one place and the check stays as strong as it
+# was upstream.
+CODEOWNER_DECLARATION_PATH = "/.github/CODEOWNERS"
+# GitHub handles and `@org/team` slugs. Anything else (a bare word, an email,
+# an empty owner list) is rejected rather than silently accepted as the
+# declared set.
+CODEOWNER_HANDLE = re.compile(r"\A@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:/[A-Za-z0-9._-]+)?\Z")
 CODEOWNED_PATHS = (
     "/.github/CODEOWNERS",
     "/.github/workflows/agent-setup-ci.yml",
@@ -377,19 +389,36 @@ def validate_agent_workflows(root: Path) -> list[str]:
             if (parts := line.split()) and not parts[0].startswith("#")
         ]
         owners_by_path = dict(parsed_rules)
-        for protected in CODEOWNED_PATHS:
-            if owners_by_path.get(protected) != {CODEOWNER}:
-                violations.append(
-                    f".github/CODEOWNERS: {protected} must be owned only by {CODEOWNER}"
-                )
-        final_rules = parsed_rules[-len(CODEOWNED_PATHS) :]
-        if len(final_rules) != len(CODEOWNED_PATHS) or any(
-            pattern != protected or CODEOWNER not in owners
-            for (pattern, owners), protected in zip(final_rules, CODEOWNED_PATHS)
-        ):
+        declared = owners_by_path.get(CODEOWNER_DECLARATION_PATH, set())
+        invalid = sorted(
+            owner for owner in declared if not CODEOWNER_HANDLE.fullmatch(owner)
+        )
+        if not declared:
             violations.append(
-                ".github/CODEOWNERS: protected agent ownership rules must be the final rules so later patterns cannot override them"
+                f".github/CODEOWNERS: {CODEOWNER_DECLARATION_PATH} must name the "
+                "repository's code owners; it declares the owner set every other "
+                "protected path is checked against"
             )
+        elif invalid:
+            violations.append(
+                f".github/CODEOWNERS: {CODEOWNER_DECLARATION_PATH} owners must be "
+                f"@user or @org/team handles: {invalid}"
+            )
+        else:
+            owners_label = " ".join(sorted(declared))
+            for protected in CODEOWNED_PATHS:
+                if owners_by_path.get(protected) != declared:
+                    violations.append(
+                        f".github/CODEOWNERS: {protected} must be owned only by {owners_label}"
+                    )
+            final_rules = parsed_rules[-len(CODEOWNED_PATHS) :]
+            if len(final_rules) != len(CODEOWNED_PATHS) or any(
+                pattern != protected or owners != declared
+                for (pattern, owners), protected in zip(final_rules, CODEOWNED_PATHS)
+            ):
+                violations.append(
+                    ".github/CODEOWNERS: protected agent ownership rules must be the final rules so later patterns cannot override them"
+                )
     return violations
 
 
