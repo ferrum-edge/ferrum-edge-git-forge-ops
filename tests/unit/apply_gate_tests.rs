@@ -55,11 +55,16 @@ struct Repo {
 }
 
 impl Repo {
-    fn with_consumer(consumer_yaml: &str) -> Self {
+    /// Build a checkout from `(relative path, contents)` pairs.
+    fn with_files(files: &[(&str, &str)]) -> Self {
         let dir = TempDir::new().expect("tempdir");
-        let consumers = dir.path().join("resources/ferrum/consumers");
-        std::fs::create_dir_all(&consumers).expect("resource tree");
-        std::fs::write(consumers.join("app.yaml"), consumer_yaml).expect("consumer");
+        for (relative, contents) in files {
+            let path = dir.path().join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("resource tree");
+            }
+            std::fs::write(&path, contents).expect("write repo file");
+        }
 
         // `ferrum-edge validate` is not installed in Rust CI, and these tests
         // are about the gates that run around it rather than about schema
@@ -70,6 +75,10 @@ impl Repo {
         set_executable(&validator);
 
         Self { dir, validator }
+    }
+
+    fn with_consumer(consumer_yaml: &str) -> Self {
+        Self::with_files(&[("resources/ferrum/consumers/app.yaml", consumer_yaml)])
     }
 
     fn published(&self) -> PathBuf {
@@ -304,5 +313,118 @@ fn plan_exits_nonzero_on_an_unacknowledged_credential_slot_remap() {
         stdout(&allowed).contains("Accepted via --allow-credential-slot-remap"),
         "{}",
         stdout(&allowed)
+    );
+}
+
+/// The issue-128 mTLS consumer: one identity leaf, nothing else.
+const MTLS_IDENTITY_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    mtls_auth:
+      - identity: client.example
+"#;
+
+/// The issue-128 Basic-auth consumer as `import` writes it: a legible
+/// username beside a brokered secret half.
+const BASICAUTH_IDENTITY_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    basicauth:
+      - username: alice
+        password_hash: "${gh-env-secret:alloc=require}"
+"#;
+
+/// Bundle seeding the Basic-auth consumer's one brokered slot.
+const BASICAUTH_BUNDLE: &str = r#"{"FERRUM_CREDS_BUNDLE": {
+    "ferrum/app/basicauth/password_hash": "hmac_sha256:0123456789abcdef"
+}}"#;
+
+/// The same Basic-auth consumer with the hash committed instead of brokered.
+const BASICAUTH_LITERAL_HASH_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    basicauth:
+      - username: alice
+        password_hash: "hmac_sha256:0123456789abcdef"
+"#;
+
+#[test]
+fn apply_accepts_credential_identity_fields_without_an_override() {
+    // Regression for #128: `mtls_auth[].identity` and `basicauth[].username`
+    // are the public halves of their credentials, produced verbatim by this
+    // repo's own `import`. Treating them as committed secrets refused
+    // supported configurations before the validator ever ran.
+    for (name, consumer, bundle) in [
+        ("mtls_auth identity", MTLS_IDENTITY_CONSUMER, None),
+        (
+            "basicauth username",
+            BASICAUTH_IDENTITY_CONSUMER,
+            Some(BASICAUTH_BUNDLE),
+        ),
+    ] {
+        let repo = Repo::with_consumer(consumer);
+        let env: Vec<(&str, &str)> = bundle
+            .map(|b| vec![("FERRUM_CREDS_JSON", b)])
+            .unwrap_or_default();
+
+        let planned = repo.run(&["plan"], &env);
+        assert!(
+            planned.status.success(),
+            "{name} must plan clean; stdout={} stderr={}",
+            stdout(&planned),
+            stderr(&planned)
+        );
+        assert!(
+            !stdout(&planned).contains("Literal credential"),
+            "{name} must not be reported as a literal secret: {}",
+            stdout(&planned)
+        );
+
+        let applied = repo.run(&["apply", "--auto-approve"], &env);
+        assert!(
+            applied.status.success(),
+            "{name} must apply; stdout={} stderr={}",
+            stdout(&applied),
+            stderr(&applied)
+        );
+        assert!(
+            repo.published().exists(),
+            "{name} must reach the published document"
+        );
+    }
+}
+
+#[test]
+fn apply_still_refuses_a_committed_secret_beside_an_identity() {
+    // The exemption is per-leaf. A Basic-auth consumer whose username is
+    // legible and whose hash is committed is still a committed secret.
+    let repo = Repo::with_consumer(BASICAUTH_LITERAL_HASH_CONSUMER);
+
+    let output = repo.run(&["apply", "--auto-approve"], &[]);
+
+    assert!(
+        !output.status.success(),
+        "a committed password_hash must still block; stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("basicauth[0].password_hash"),
+        "the refusal must name the secret leaf: {stderr}"
+    );
+    assert!(
+        !stderr.contains("basicauth[0].username"),
+        "the identity half must not be reported: {stderr}"
+    );
+    assert!(
+        !repo.published().exists(),
+        "a refused apply must publish nothing"
     );
 }

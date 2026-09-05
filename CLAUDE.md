@@ -298,6 +298,19 @@ on load. Slot paths elide `ArrayIndex(0)` so the normalization doesn't rename
 (and orphan) already-allocated slots; entries ≥1 get a `[N]` segment. Older
 encodings stay in the read-only lookup candidate list.
 
+`basicauth[].username` and `mtls_auth[].identity` are **identities, not
+secrets** — the public halves of their credentials, which the broker cannot
+generate and a resource file cannot omit and still say which credential it
+describes. `secrets::resolver::is_identity_credential_leaf(credential_type,
+leaf)` is the single classifier, keyed on the credential type *and* the leaf
+key together (a `username` under a custom credential type is still a secret).
+Four callers must agree or a config becomes acceptable to one command and
+refused by another: the resolver (never broker one), `import`'s capture walk
+(never redact one out of the file), `secrets::scrubber` (never black one out of
+a validator diagnostic), and `diff::security::check_literal_credentials` (never
+block `apply` on one). That last one carries the credential type and leaf key
+down the walk separately from the human-readable diagnostic path.
+
 Generation constraints, enforced at resolve time so `plan` fails before `apply`
 writes an unusable value: `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24
 entropy bytes); `basicauth` generation is refused in file mode and
