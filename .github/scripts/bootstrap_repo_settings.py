@@ -85,6 +85,21 @@ ENVIRONMENT_SECRETS = (
         "FERRUM_GH_PROVISIONER_TOKEN",
         "required only for the credential broker (allocate/rotate)",
     ),
+    # Optional to configure, mandatory to match: every admin-API workflow binds
+    # these four, and an unset secret means "use the default", not "empty".
+    (
+        "FERRUM_ADMIN_JWT_ISSUER",
+        "optional; default ferrum-edge, must equal the gateway's issuer",
+    ),
+    ("FERRUM_ADMIN_JWT_ROLE", "optional; default admin"),
+    (
+        "FERRUM_ADMIN_JWT_AUDIENCE",
+        "optional; set only if the gateway configures an audience",
+    ),
+    (
+        "FERRUM_ADMIN_JWT_TTL_SECS",
+        "optional; default 3600, must fit the gateway's FERRUM_ADMIN_JWT_MAX_TTL",
+    ),
     ("FERRUM_GATEWAY_CA_CERT", "optional; base64 PEM for a private CA"),
     ("FERRUM_GATEWAY_CLIENT_CERT", "optional; base64 PEM, mTLS (needs the key too)"),
     ("FERRUM_GATEWAY_CLIENT_KEY", "optional; base64 PEM, mTLS (needs the cert too)"),

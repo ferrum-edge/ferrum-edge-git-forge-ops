@@ -162,7 +162,18 @@ order — deep detail for each control lives in
    | `FERRUM_ADMIN_JWT_SECRET` | api mode | HS256 signing key, **at least 32 characters** |
    | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | yes | From step 6 |
    | `FERRUM_GH_PROVISIONER_TOKEN` | credential broker | App installation token, or a fine-grained PAT with `Secrets: write` + `Environments: write` |
+   | `FERRUM_ADMIN_JWT_ISSUER` | optional | `iss` claim, default `ferrum-edge` |
+   | `FERRUM_ADMIN_JWT_ROLE` | optional | `role` claim, default `admin` |
+   | `FERRUM_ADMIN_JWT_AUDIENCE` | optional | `aud` claim; emitted **only** when set |
+   | `FERRUM_ADMIN_JWT_TTL_SECS` | optional | Token lifetime, default `3600` |
    | `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` | optional | base64 PEM; mTLS needs **both** cert and key |
+
+   The four `FERRUM_ADMIN_JWT_*` claim settings are optional to *configure*, not
+   optional to get right: set one and it must equal what the gateway expects, or
+   every admin call is a `401`. Leave them unset and the defaults above apply —
+   the workflows bind all four, and a blank secret reads as unset, not as an
+   empty issuer or an empty audience. `apply`, `rotate`, `diff` (drift check),
+   and the trusted PR live review all mint tokens from them.
 
    You do **not** create `FERRUM_CREDS_BUNDLE[_N]`. The broker writes them itself:
    the first apply that meets an `alloc=generate` (or `alloc=rotate`) placeholder
@@ -1095,15 +1106,26 @@ Only three kinds of configuration source exist:
 |---|---|---|
 | `FERRUM_GATEWAY_URL` | yes (api mode) | Admin API base URL. **Must be `https://`** — see [Transport security](#transport-security). |
 | `FERRUM_ADMIN_JWT_SECRET` | yes (api mode) | HS256 secret for minting admin JWTs; min 32 chars |
-| `FERRUM_ADMIN_JWT_ISSUER` | no (default `ferrum-edge`) | `iss` claim; must equal the gateway's own issuer or every call is 401 |
-| `FERRUM_ADMIN_JWT_ROLE` | no (default `admin`) | `role` claim; `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only |
-| `FERRUM_ADMIN_JWT_AUDIENCE` | no | `aud` claim, emitted **only** when set — a gateway with no configured audience rejects a token that carries one |
-| `FERRUM_ADMIN_JWT_TTL_SECS` | no (default `3600`) | Token lifetime; must sit inside the gateway's `FERRUM_ADMIN_JWT_MAX_TTL` |
+| `FERRUM_ADMIN_JWT_ISSUER` | optional (default `ferrum-edge`) | `iss` claim; must equal the gateway's own issuer or every call is 401 |
+| `FERRUM_ADMIN_JWT_ROLE` | optional (default `admin`) | `role` claim; `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only |
+| `FERRUM_ADMIN_JWT_AUDIENCE` | optional (default: no `aud`) | `aud` claim, emitted **only** when set — a gateway with no configured audience rejects a token that carries one |
+| `FERRUM_ADMIN_JWT_TTL_SECS` | optional (default `3600`) | Token lifetime; must sit inside the gateway's `FERRUM_ADMIN_JWT_MAX_TTL` |
 | `FERRUM_GATEWAY_CA_CERT` | no | Custom CA (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_CERT` | no | Client cert for mTLS (base64 PEM) |
 | `FERRUM_GATEWAY_CLIENT_KEY` | no | Client key for mTLS (base64 PEM, required if cert is set) |
 | `FERRUM_GH_PROVISIONER_TOKEN` | no (required for allocate/rotate) | GitHub App installation token or PAT with `Secrets: write` + `Environments: write` |
 | `FERRUM_CREDS_BUNDLE[_N]` | managed by broker | Credential bundles, shards `0..15` — **you generally never touch these by hand**. The workflows bind each shard by name, so `_16` and above are never read; see [Storage: bundled environment secrets](#storage-bundled-environment-secrets) |
+
+The four `FERRUM_ADMIN_JWT_*` claim settings are optional to configure and
+mandatory to match: whatever you set here has to equal the gateway's own
+`FERRUM_ADMIN_JWT_ISSUER` / audience / role expectations and sit inside its
+`FERRUM_ADMIN_JWT_MAX_TTL`, or every admin call answers `401`. Every workflow
+that reaches the admin API — `apply-on-merge.yml`, `rotate.yml`,
+`drift-check.yml`, and the live half of `trusted-pr-review.yml` — binds all four
+from the selected GitHub Environment, and an unset (or blank) secret means
+"use the default", not "empty issuer" / "empty audience".
+`materialize-file.yml` binds none of them: it refuses to run outside file mode
+and never opens an admin connection.
 
 #### Migrating from older gitforgeops
 

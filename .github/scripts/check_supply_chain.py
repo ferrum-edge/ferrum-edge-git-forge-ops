@@ -38,6 +38,29 @@ PRIVILEGED_WORKFLOWS = (
     "materialize-file.yml",
     "rotate.yml",
 )
+ADMIN_JWT_SECRET_BINDING = (
+    "FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}"
+)
+# The optional claim settings the README documents as per-environment secrets.
+# They are only optional to *configure* — once configured they must reach the
+# process, or the run mints a token the gateway rejects.
+ADMIN_JWT_OPTIONAL_SETTINGS = (
+    "FERRUM_ADMIN_JWT_ISSUER",
+    "FERRUM_ADMIN_JWT_ROLE",
+    "FERRUM_ADMIN_JWT_AUDIENCE",
+    "FERRUM_ADMIN_JWT_TTL_SECS",
+)
+# Every workflow that reaches the admin REST API. `materialize-file.yml` is
+# absent on purpose: it refuses to run outside file mode and never opens an
+# admin connection, so it binds no JWT material at all.
+ADMIN_API_WORKFLOWS = (
+    "apply-on-merge.yml",
+    "drift-check.yml",
+    "rotate.yml",
+    "trusted-pr-review.yml",
+)
+STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
+STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 FRESH_HEAD_STEP = "Refresh protected branch and reject stale deployments"
 # The checkout that feeds a privileged reconcile has to name the branch, not
 # the triggering event's commit, and has to carry enough history for the
@@ -222,6 +245,41 @@ def credential_bundle_binding_violations(
     return violations
 
 
+def admin_jwt_binding_violations(workflow: str, text: str) -> list[str]:
+    """A step that mints an admin JWT must receive every documented claim setting.
+
+    GitHub Environment Secrets are not process environment variables. The README
+    documents `FERRUM_ADMIN_JWT_ISSUER`, `_ROLE`, `_AUDIENCE` and `_TTL_SECS` as
+    per-environment secrets, but binding only `FERRUM_ADMIN_JWT_SECRET` meant the
+    workflows always minted the default issuer and role, no audience, and a
+    3600s TTL. A gateway configured with a custom issuer or audience, or a
+    `FERRUM_ADMIN_JWT_MAX_TTL` under an hour, answered 401 to every call — while
+    a local run with the same values exported succeeded.
+
+    Blank stays "unset": the Rust env parser treats empty and whitespace-only
+    values as absent, so binding all four is safe on an environment that
+    configures none of them.
+    """
+    violations: list[str] = []
+    for step in STEP_SPLIT.split(text):
+        if ADMIN_JWT_SECRET_BINDING not in step:
+            continue
+        name_match = STEP_NAME.search(step)
+        name = name_match.group(1) if name_match else "<unnamed step>"
+        missing = [
+            setting
+            for setting in ADMIN_JWT_OPTIONAL_SETTINGS
+            if f"{setting}: ${{{{ secrets.{setting} }}}}" not in step
+        ]
+        if missing:
+            violations.append(
+                f"{workflow}: step {name!r} binds FERRUM_ADMIN_JWT_SECRET but not "
+                f"{', '.join(missing)}; a documented per-environment secret that "
+                "never reaches the process is a 401 the operator cannot explain"
+            )
+    return violations
+
+
 def stale_deployment_guard_violations(
     workflow: str, text: str, contract: dict
 ) -> list[str]:
@@ -381,7 +439,7 @@ def rust_toolchain_violations(workflow: str, text: str) -> list[str]:
     the action's floating default while the first step's pin kept the workflow
     green. Match per step instead.
     """
-    for step in re.split(r"\n(?=\s*-\s+(?:name|uses):)", text):
+    for step in STEP_SPLIT.split(text):
         if "dtolnay/rust-toolchain@" not in step:
             continue
         if not re.search(r"^\s*toolchain:\s*1\.98\.0\s*$", step, re.MULTILINE):
@@ -658,6 +716,9 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(
             whole_secrets_context_violations(str(workflow.relative_to(root)), text)
         )
+        violations.extend(
+            admin_jwt_binding_violations(str(workflow.relative_to(root)), text)
+        )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
                 f"{workflow.relative_to(root)}: download must go through install-ferrum-edge.sh"
@@ -821,6 +882,18 @@ def main(argv: list[str] | None = None) -> int:
                 (workflows / state_writer_workflow).read_text(encoding="utf-8"),
             )
         )
+
+    # The per-step rule above only fires where the secret is bound. Name the
+    # admin-API workflows too, so silently dropping the whole JWT block from one
+    # of them — which would fail authentication rather than fall back to a
+    # default — is caught here rather than at 2am against a live gateway.
+    for admin_api_workflow in ADMIN_API_WORKFLOWS:
+        text = (workflows / admin_api_workflow).read_text(encoding="utf-8")
+        if ADMIN_JWT_SECRET_BINDING not in text:
+            violations.append(
+                f"{admin_api_workflow}: an admin-API workflow must bind "
+                f"{ADMIN_JWT_SECRET_BINDING!r} from the selected GitHub Environment"
+            )
 
     for fresh_head_workflow, contract in FRESH_HEAD_WORKFLOWS.items():
         violations.extend(

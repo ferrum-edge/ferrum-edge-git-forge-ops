@@ -625,6 +625,100 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("must be read from vars" in item for item in violations), violations
         )
 
+    def test_admin_jwt_step_must_bind_every_documented_claim_setting(self):
+        secure = "\n".join(
+            [
+                "      - name: Apply",
+                "        env:",
+                "          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}",
+                "          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}",
+                "          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}",
+                "          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}",
+                "          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}",
+                "        run: gitforgeops apply --auto-approve",
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.admin_jwt_binding_violations("apply.yml", secure), []
+        )
+
+        for setting in check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS:
+            with self.subTest(setting=setting):
+                dropped = secure.replace(
+                    f"          {setting}: ${{{{ secrets.{setting} }}}}\n", "", 1
+                )
+                violations = check_supply_chain.admin_jwt_binding_violations(
+                    "apply.yml", dropped
+                )
+                self.assertTrue(
+                    any(
+                        "'Apply'" in item and setting in item for item in violations
+                    ),
+                    violations,
+                )
+
+        # A step that mints no token is not held to the rule.
+        unrelated = "      - name: Validate\n        run: gitforgeops validate\n"
+        self.assertEqual(
+            check_supply_chain.admin_jwt_binding_violations("apply.yml", unrelated), []
+        )
+
+    def test_every_api_workflow_binds_the_optional_jwt_settings(self):
+        # Source-of-truth check against the real workflows, not a synthetic
+        # fixture: this is the finding the issue reported.
+        for workflow in check_supply_chain.ADMIN_API_WORKFLOWS:
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn(check_supply_chain.ADMIN_JWT_SECRET_BINDING, text)
+                for setting in check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS:
+                    self.assertIn(f"{setting}: ${{{{ secrets.{setting} }}}}", text)
+                self.assertEqual(
+                    check_supply_chain.admin_jwt_binding_violations(workflow, text), []
+                )
+
+    def test_dropping_a_jwt_setting_from_a_real_workflow_fails_the_policy(self):
+        for workflow in ("drift-check.yml", "trusted-pr-review.yml"):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(
+                        "          FERRUM_ADMIN_JWT_AUDIENCE: "
+                        "${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}\n",
+                        "",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        "FERRUM_ADMIN_JWT_AUDIENCE" in item for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_an_api_workflow_that_binds_no_jwt_secret_at_all_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            text = path.read_text(encoding="utf-8")
+            for setting in (
+                "FERRUM_ADMIN_JWT_SECRET",
+                *check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS,
+            ):
+                text = text.replace(
+                    f"          {setting}: ${{{{ secrets.{setting} }}}}\n", "", 1
+                )
+            path.write_text(text, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("must bind" in item and "FERRUM_ADMIN_JWT_SECRET" in item for item in violations),
+            violations,
+        )
+
     def test_privileged_reconcile_must_refresh_the_protected_head(self):
         # The concurrency group serializes per environment; it does not move
         # the checkout. Dropping the freshness guard is exactly the bug: the

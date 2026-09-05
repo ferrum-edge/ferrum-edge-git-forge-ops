@@ -319,6 +319,19 @@ jobs:
           FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          # Optional JWT claim settings, documented as per-environment
+          # secrets. GitHub Environment Secrets are not process environment
+          # variables: unbound, the run always minted the default issuer, role
+          # and TTL with no audience, and a gateway configured otherwise
+          # answered 401 to every call. Blank is not "empty issuer" — the Rust
+          # env parser treats an empty or whitespace-only value as unset, so an
+          # environment that configures none of these keeps the documented
+          # defaults (`ferrum-edge`, `admin`, no `aud`, 3600s). Each must match
+          # the gateway's own configuration.
+          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
+          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
+          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}
+          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
