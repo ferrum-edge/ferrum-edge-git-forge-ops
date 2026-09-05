@@ -164,13 +164,17 @@ fn publish_document_with_permissions(
 /// never crosses a filesystem boundary, and it is removed on drop if any step
 /// before the rename fails.
 ///
-/// A destination that already exists and is **not a regular file** — the
+/// For an ordinary artifact, a destination that already exists and is **not a
+/// regular file** — the
 /// canonical cases being `gitforgeops export --output /dev/null` and a named
 /// pipe — takes the direct-write path instead. Atomic replacement is not
 /// merely unnecessary there, it is impossible: `rename(2)` onto `/dev/null`
 /// would replace the device node with a regular file, and the temp file has to
 /// be created in `/dev` first, which an unprivileged process cannot do. What
-/// the caller asked for is a write to that object, so write to it.
+/// the caller asked for is a write to that object, so write to it. Private
+/// publications never take this path: their destination must be a regular
+/// file so credential bytes cannot be streamed into an attacker-controlled
+/// pipe or terminal.
 fn write_atomically(
     path: &Path,
     parent: &Path,
@@ -178,7 +182,13 @@ fn write_atomically(
     permissions: PublicationPermissions,
 ) -> crate::error::Result<()> {
     if destination_needs_direct_write(path) {
-        return write_directly(path, bytes);
+        return match permissions {
+            PublicationPermissions::Regular => write_directly(path, bytes),
+            PublicationPermissions::Private => Err(crate::error::Error::Config(format!(
+                "private export destination {} must be a regular file",
+                path.display()
+            ))),
+        };
     }
 
     let mut temp = tempfile::Builder::new()
