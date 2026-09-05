@@ -80,7 +80,7 @@ impl Default for StateFile {
             resources: HashMap::new(),
             pending_creates: BTreeSet::new(),
             credentials: HashMap::new(),
-            credential_shard_count: 1,
+            credential_shard_count: default_shard_count(),
             overrides: Vec::new(),
         }
     }

@@ -21,6 +21,7 @@ mod repo_config_tests;
 mod review_tests;
 mod schema_tests;
 mod secrets_tests;
+mod serde_default_tests;
 mod state_tests;
 mod validate_tests;
 mod verdict_tests;
