@@ -48,6 +48,45 @@ const TWO_SLOT_BUNDLE: &str = r#"{"FERRUM_CREDS_BUNDLE": {
     "ferrum/app/keyauth/[1]/key": "second-entry-value"
 }}"#;
 
+/// Proxy dialing an `http` backend. Rejected by the `backend_scheme` policy
+/// below, accepted by every default (all policy rules ship disabled).
+const HTTP_PROXY: &str = r#"kind: Proxy
+spec:
+  id: "app"
+  listen_path: "/app"
+  backend_scheme: http
+  backend_host: "app.internal"
+  backend_port: 8080
+"#;
+
+/// The same proxy on the scheme the policy allows.
+const HTTPS_PROXY: &str = r#"kind: Proxy
+spec:
+  id: "app"
+  listen_path: "/app"
+  backend_scheme: https
+  backend_host: "app.internal"
+  backend_port: 443
+"#;
+
+/// `backend_scheme` at error severity: an `http` backend blocks apply.
+const HTTPS_ONLY_POLICY: &str = r#"version: 1
+policies:
+  backend_scheme:
+    enabled: true
+    severity: error
+    allowed_protocols: [https]
+"#;
+
+/// The same rule demoted to a warning, which apply does not refuse on.
+const HTTPS_ONLY_POLICY_WARNING: &str = r#"version: 1
+policies:
+  backend_scheme:
+    enabled: true
+    severity: warning
+    allowed_protocols: [https]
+"#;
+
 /// A throwaway repository checkout plus a stub validator.
 struct Repo {
     dir: TempDir,
@@ -55,11 +94,16 @@ struct Repo {
 }
 
 impl Repo {
-    fn with_consumer(consumer_yaml: &str) -> Self {
+    /// Build a checkout from `(relative path, contents)` pairs.
+    fn with_files(files: &[(&str, &str)]) -> Self {
         let dir = TempDir::new().expect("tempdir");
-        let consumers = dir.path().join("resources/ferrum/consumers");
-        std::fs::create_dir_all(&consumers).expect("resource tree");
-        std::fs::write(consumers.join("app.yaml"), consumer_yaml).expect("consumer");
+        for (relative, contents) in files {
+            let path = dir.path().join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("resource tree");
+            }
+            std::fs::write(&path, contents).expect("write repo file");
+        }
 
         // `ferrum-edge validate` is not installed in Rust CI, and these tests
         // are about the gates that run around it rather than about schema
@@ -70,6 +114,10 @@ impl Repo {
         set_executable(&validator);
 
         Self { dir, validator }
+    }
+
+    fn with_consumer(consumer_yaml: &str) -> Self {
+        Self::with_files(&[("resources/ferrum/consumers/app.yaml", consumer_yaml)])
     }
 
     fn published(&self) -> PathBuf {
@@ -304,5 +352,285 @@ fn plan_exits_nonzero_on_an_unacknowledged_credential_slot_remap() {
         stdout(&allowed).contains("Accepted via --allow-credential-slot-remap"),
         "{}",
         stdout(&allowed)
+    );
+}
+
+/// The issue-128 mTLS consumer: one identity leaf, nothing else.
+const MTLS_IDENTITY_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    mtls_auth:
+      - identity: client.example
+"#;
+
+/// The issue-128 Basic-auth consumer as `import` writes it: a legible
+/// username beside a brokered secret half.
+const BASICAUTH_IDENTITY_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    basicauth:
+      - username: alice
+        password_hash: "${gh-env-secret:alloc=require}"
+"#;
+
+/// Bundle seeding the Basic-auth consumer's one brokered slot.
+const BASICAUTH_BUNDLE: &str = r#"{"FERRUM_CREDS_BUNDLE": {
+    "ferrum/app/basicauth/password_hash": "hmac_sha256:0123456789abcdef"
+}}"#;
+
+/// The same Basic-auth consumer with the hash committed instead of brokered.
+const BASICAUTH_LITERAL_HASH_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    basicauth:
+      - username: alice
+        password_hash: "hmac_sha256:0123456789abcdef"
+"#;
+
+#[test]
+fn apply_accepts_credential_identity_fields_without_an_override() {
+    // Regression for #128: `mtls_auth[].identity` and `basicauth[].username`
+    // are the public halves of their credentials, produced verbatim by this
+    // repo's own `import`. Treating them as committed secrets refused
+    // supported configurations before the validator ever ran.
+    for (name, consumer, bundle) in [
+        ("mtls_auth identity", MTLS_IDENTITY_CONSUMER, None),
+        (
+            "basicauth username",
+            BASICAUTH_IDENTITY_CONSUMER,
+            Some(BASICAUTH_BUNDLE),
+        ),
+    ] {
+        let repo = Repo::with_consumer(consumer);
+        let env: Vec<(&str, &str)> = bundle
+            .map(|b| vec![("FERRUM_CREDS_JSON", b)])
+            .unwrap_or_default();
+
+        let planned = repo.run(&["plan"], &env);
+        assert!(
+            planned.status.success(),
+            "{name} must plan clean; stdout={} stderr={}",
+            stdout(&planned),
+            stderr(&planned)
+        );
+        assert!(
+            !stdout(&planned).contains("Literal credential"),
+            "{name} must not be reported as a literal secret: {}",
+            stdout(&planned)
+        );
+
+        let applied = repo.run(&["apply", "--auto-approve"], &env);
+        assert!(
+            applied.status.success(),
+            "{name} must apply; stdout={} stderr={}",
+            stdout(&applied),
+            stderr(&applied)
+        );
+        assert!(
+            repo.published().exists(),
+            "{name} must reach the published document"
+        );
+    }
+}
+
+#[test]
+fn apply_still_refuses_a_committed_secret_beside_an_identity() {
+    // The exemption is per-leaf. A Basic-auth consumer whose username is
+    // legible and whose hash is committed is still a committed secret.
+    let repo = Repo::with_consumer(BASICAUTH_LITERAL_HASH_CONSUMER);
+
+    let output = repo.run(&["apply", "--auto-approve"], &[]);
+
+    assert!(
+        !output.status.success(),
+        "a committed password_hash must still block; stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("basicauth[0].password_hash"),
+        "the refusal must name the secret leaf: {stderr}"
+    );
+    assert!(
+        !stderr.contains("basicauth[0].username"),
+        "the identity half must not be reported: {stderr}"
+    );
+    assert!(
+        !repo.published().exists(),
+        "a refused apply must publish nothing"
+    );
+}
+
+#[test]
+fn plan_exits_nonzero_on_a_blocking_policy_violation() {
+    // Issue-130 reproduction 1: an error-severity policy rule fires, apply
+    // refuses, and plan used to print the finding and exit 0.
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/proxies/app.yaml", HTTP_PROXY),
+        (".gitforgeops/policies.yaml", HTTPS_ONLY_POLICY),
+    ]);
+
+    let planned = repo.run(&["plan"], &[]);
+
+    assert!(
+        !planned.status.success(),
+        "plan must refuse what apply refuses; stdout={} stderr={}",
+        stdout(&planned),
+        stderr(&planned)
+    );
+    let out = stdout(&planned);
+    assert!(
+        out.contains("Policy Violations") && out.contains("backend_scheme"),
+        "the violation must still be printed: {out}"
+    );
+    assert!(
+        out.contains("Apply Blockers") && out.contains("policy (1)"),
+        "the verdict must name the blocker class and its count: {out}"
+    );
+    assert!(
+        out.contains("apply is blocked by 1 class(es)"),
+        "plan must print the summary line: {out}"
+    );
+
+    // And apply agrees, which is the property the shared computation exists
+    // to keep true.
+    let applied = repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(
+        !applied.status.success(),
+        "stdout={} stderr={}",
+        stdout(&applied),
+        stderr(&applied)
+    );
+    assert!(
+        stderr(&applied).contains("unresolved policy violation"),
+        "{}",
+        stderr(&applied)
+    );
+}
+
+#[test]
+fn plan_exits_zero_for_a_warning_only_policy_and_for_a_satisfied_one() {
+    // Warning severity never blocks apply, so it must never block plan.
+    let warned = Repo::with_files(&[
+        ("resources/ferrum/proxies/app.yaml", HTTP_PROXY),
+        (".gitforgeops/policies.yaml", HTTPS_ONLY_POLICY_WARNING),
+    ]);
+    let output = warned.run(&["plan"], &[]);
+    assert!(
+        output.status.success(),
+        "a warning is advisory; stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("backend_scheme"),
+        "the advisory must still be rendered: {}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("Apply Blockers"),
+        "nothing blocks, so no blocker section: {}",
+        stdout(&output)
+    );
+
+    // The same error-severity rule, satisfied.
+    let satisfied = Repo::with_files(&[
+        ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
+        (".gitforgeops/policies.yaml", HTTPS_ONLY_POLICY),
+    ]);
+    let output = satisfied.run(&["plan"], &[]);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
+#[test]
+fn plan_exits_nonzero_when_a_required_credential_slot_has_no_value() {
+    // Issue-130 reproduction 2: `alloc=require` with an empty bundle. Apply
+    // refuses before touching the gateway; plan printed `[MISSING (required)]`
+    // and exited 0.
+    let repo = Repo::with_consumer(BROKERED_CONSUMER);
+
+    let planned = repo.run(&["plan"], &[]);
+
+    assert!(
+        !planned.status.success(),
+        "plan must refuse a missing required slot; stdout={} stderr={}",
+        stdout(&planned),
+        stderr(&planned)
+    );
+    let out = stdout(&planned);
+    assert!(
+        out.contains("[MISSING (required)] ferrum/app/keyauth/key"),
+        "the slot must still be named: {out}"
+    );
+    assert!(
+        out.contains("required-credentials (1)"),
+        "the verdict must name the blocker class: {out}"
+    );
+
+    // Apply agrees.
+    let applied = repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(!applied.status.success());
+    assert!(
+        stderr(&applied).contains("required credential slots are missing"),
+        "{}",
+        stderr(&applied)
+    );
+
+    // Seeded, the same repository plans clean — the control that keeps this
+    // from being satisfied by "plan always fails".
+    let seeded = repo.run(&["plan"], &[("FERRUM_CREDS_JSON", BUNDLE)]);
+    assert!(
+        seeded.status.success(),
+        "stdout={} stderr={}",
+        stdout(&seeded),
+        stderr(&seeded)
+    );
+}
+
+#[test]
+fn a_slot_pending_generation_is_not_an_apply_blocker() {
+    // `alloc=generate` with an empty bundle is ordinary first-apply work the
+    // allocator performs. Confusing it with `alloc=require` would make every
+    // brand-new credential fail its own plan.
+    let repo = Repo::with_consumer(
+        r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    keyauth:
+      - key: "${gh-env-secret:alloc=generate}"
+"#,
+    );
+
+    let output = repo.run(&["plan"], &[]);
+
+    assert!(
+        output.status.success(),
+        "pending generation is not a blocker; stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("[needs-allocation] ferrum/app/keyauth/key"),
+        "the pending slot must still be shown: {}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("Apply Blockers"),
+        "{}",
+        stdout(&output)
     );
 }

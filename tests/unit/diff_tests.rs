@@ -745,6 +745,210 @@ fn security_blockers_is_empty_for_no_findings() {
     assert!(security_blockers(&[]).is_empty());
 }
 
+/// Build a one-consumer config carrying `credentials` verbatim.
+fn config_with_credentials(entries: &[(&str, serde_json::Value)]) -> GatewayConfig {
+    let mut creds = std::collections::BTreeMap::new();
+    for (credential_type, value) in entries {
+        creds.insert(credential_type.to_string(), value.clone());
+    }
+    GatewayConfig {
+        consumers: vec![Consumer {
+            credentials: creds,
+            ..make_consumer("app", "app")
+        }],
+        ..GatewayConfig::default()
+    }
+}
+
+/// The blocking messages an audit produced, for readable assertions.
+fn literal_credential_blockers(config: &GatewayConfig) -> Vec<String> {
+    use gitforgeops::diff::{audit_security_with_policy, security_blockers};
+
+    security_blockers(&audit_security_with_policy(config, None))
+        .into_iter()
+        .filter(|f| f.message.contains("Literal credential"))
+        .map(|f| f.message.clone())
+        .collect()
+}
+
+#[test]
+fn mtls_auth_identity_is_not_a_literal_secret() {
+    // The issue's first reproduction, verbatim: an ordinary mTLS consumer.
+    // `identity` is a certificate CN/SAN, the public half of the credential,
+    // and the broker cannot generate one — blocking on it made a supported
+    // declaration un-appliable.
+    let config = config_with_credentials(&[(
+        "mtls_auth",
+        serde_json::json!([{"identity": "client.example"}]),
+    )]);
+
+    assert!(
+        literal_credential_blockers(&config).is_empty(),
+        "mtls_auth identity must not block apply: {:?}",
+        literal_credential_blockers(&config)
+    );
+}
+
+#[test]
+fn basicauth_username_is_an_identity_but_its_secret_halves_still_block() {
+    // The issue's second reproduction: an imported Basic-auth consumer whose
+    // username is legible and whose secret half is brokered.
+    let brokered = config_with_credentials(&[(
+        "basicauth",
+        serde_json::json!([{
+            "username": "alice",
+            "password_hash": "${gh-env-secret:alloc=require}"
+        }]),
+    )]);
+    assert!(
+        literal_credential_blockers(&brokered).is_empty(),
+        "a brokered password beside a literal username must apply: {:?}",
+        literal_credential_blockers(&brokered)
+    );
+
+    // The exemption is per-leaf, not per-credential: the same consumer with a
+    // committed hash is still a committed secret.
+    let committed = config_with_credentials(&[(
+        "basicauth",
+        serde_json::json!([{"username": "alice", "password_hash": "hmac_sha256:deadbeef"}]),
+    )]);
+    let blockers = literal_credential_blockers(&committed);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].contains("basicauth[0].password_hash"),
+        "the finding must name the secret leaf, not the username: {}",
+        blockers[0]
+    );
+
+    // Plaintext `password` is the other secret half of the same object.
+    let plaintext = config_with_credentials(&[(
+        "basicauth",
+        serde_json::json!([{"username": "alice", "password": "hunter2"}]),
+    )]);
+    let blockers = literal_credential_blockers(&plaintext);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].contains("basicauth[0].password"),
+        "{blockers:?}"
+    );
+}
+
+#[test]
+fn every_other_credential_secret_still_blocks() {
+    // The gate this narrows exists for these. Each is a real secret leaf on
+    // one of ferrum-edge's five credential types.
+    for (credential_type, value, expected_path) in [
+        (
+            "keyauth",
+            serde_json::json!([{"key": "live-api-key"}]),
+            "keyauth[0].key",
+        ),
+        (
+            // The `jwt` key id is deliberately NOT exempt: the exemption list
+            // is exactly `basicauth[].username` and `mtls_auth[].identity`,
+            // the two leaves ferrum-edge documents as public halves. Here the
+            // kid is brokered so the assertion is about `secret` alone.
+            "jwt",
+            serde_json::json!([{
+                "key": "${gh-env-secret:alloc=require}",
+                "secret": "a-committed-jwt-signing-secret"
+            }]),
+            "jwt[0].secret",
+        ),
+        (
+            "hmac_auth",
+            serde_json::json!([{"secret": "a-committed-hmac-secret"}]),
+            "hmac_auth[0].secret",
+        ),
+        (
+            "mtls_auth",
+            serde_json::json!([{"identity": "client.example", "secret": "not-an-identity"}]),
+            "mtls_auth[0].secret",
+        ),
+    ] {
+        let config = config_with_credentials(&[(credential_type, value)]);
+        let blockers = literal_credential_blockers(&config);
+        assert_eq!(
+            blockers.len(),
+            1,
+            "{credential_type} must contribute exactly one blocker: {blockers:?}"
+        );
+        assert!(
+            blockers[0].contains(expected_path),
+            "expected {expected_path}: {}",
+            blockers[0]
+        );
+    }
+}
+
+#[test]
+fn identity_key_names_under_an_unrelated_credential_type_still_block() {
+    // The exemption keys on (credential type, leaf), never on the leaf alone.
+    // A custom credential type has no public-half contract with the gateway,
+    // so a string called `username` or `identity` there is exactly the
+    // committed secret the gate is for.
+    let config = config_with_credentials(&[(
+        "vendor_token",
+        serde_json::json!([{"username": "alice", "identity": "client.example"}]),
+    )]);
+
+    let blockers = literal_credential_blockers(&config);
+    assert_eq!(blockers.len(), 2, "{blockers:?}");
+    assert!(
+        blockers
+            .iter()
+            .any(|m| m.contains("vendor_token[0].username")),
+        "{blockers:?}"
+    );
+    assert!(
+        blockers
+            .iter()
+            .any(|m| m.contains("vendor_token[0].identity")),
+        "{blockers:?}"
+    );
+}
+
+#[test]
+fn the_identity_exemption_survives_extra_entries_and_the_object_form() {
+    // Slot identity is positional, so entry 1 must be treated exactly like
+    // entry 0 — an array index does not change which field a leaf is.
+    let multi = config_with_credentials(&[(
+        "basicauth",
+        serde_json::json!([
+            {"username": "alice", "password": "${gh-env-secret:alloc=require}"},
+            {"username": "bob", "password": "${gh-env-secret:alloc=require}"},
+        ]),
+    )]);
+    assert!(
+        literal_credential_blockers(&multi).is_empty(),
+        "{:?}",
+        literal_credential_blockers(&multi)
+    );
+
+    // The bare-object form the assembler normalizes on load. The audit does
+    // not depend on that normalization having happened.
+    let object_form = config_with_credentials(&[
+        (
+            "mtls_auth",
+            serde_json::json!({"identity": "client.example"}),
+        ),
+        (
+            "basicauth",
+            serde_json::json!({"username": "alice", "password": "${gh-env-secret:alloc=require}"}),
+        ),
+    ]);
+    assert!(
+        literal_credential_blockers(&object_form).is_empty(),
+        "{:?}",
+        literal_credential_blockers(&object_form)
+    );
+
+    // A bare string with no enclosing key is not an identity leaf: nothing
+    // says which field it is, so it fails closed.
+    let bare = config_with_credentials(&[("mtls_auth", serde_json::json!("client.example"))]);
+    assert_eq!(literal_credential_blockers(&bare).len(), 1);
+}
+
 #[test]
 fn security_detects_nested_literal_credential() {
     let mut creds = std::collections::BTreeMap::new();

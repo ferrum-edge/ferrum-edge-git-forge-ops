@@ -584,3 +584,53 @@ fn an_environment_without_an_overlay_is_never_checked() {
     assert!(resolved.overlay.is_none());
     validate_overlay_selection(&resolved, None, std::path::Path::new("/nonexistent")).unwrap();
 }
+
+#[test]
+fn ownership_block_without_drift_alert_on_keeps_the_documented_alert_defaults() {
+    // Regression: `DriftAlertOn` derived `Default` (all false), so an
+    // `ownership:` block that omitted `drift_alert_on:` muted the
+    // managed-modified and managed-deleted alerts that the per-field serde
+    // defaults and the docs promise are on.
+    let yaml = r#"
+version: 1
+environments:
+  production:
+    ownership:
+      mode: shared
+"#;
+    let cfg: gitforgeops::config::repo_config::RepoConfig =
+        serde_yaml::from_str(yaml).expect("config parses");
+    let env = cfg
+        .environments
+        .get("production")
+        .expect("environment present");
+    let alerts = &env.ownership.drift_alert_on;
+    assert!(
+        alerts.managed_modified,
+        "managed_modified must default to true"
+    );
+    assert!(
+        alerts.managed_deleted,
+        "managed_deleted must default to true"
+    );
+    assert!(
+        !alerts.unmanaged_added,
+        "unmanaged_added must default to false"
+    );
+
+    let explicit: gitforgeops::config::repo_config::DriftAlertOn =
+        serde_yaml::from_str("{}").expect("empty block parses");
+    assert_eq!(
+        (
+            explicit.managed_modified,
+            explicit.managed_deleted,
+            explicit.unmanaged_added
+        ),
+        (
+            alerts.managed_modified,
+            alerts.managed_deleted,
+            alerts.unmanaged_added
+        ),
+        "an absent block and an empty block must agree"
+    );
+}

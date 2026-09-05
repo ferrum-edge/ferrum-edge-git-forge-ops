@@ -479,7 +479,17 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
 /// that tells a reader which credential a diagnostic is about.
 ///
 /// `leaf` is the enclosing object key of the string being classified
-/// (`None` when the credential is a bare string with no key).
+/// (`None` when the credential is a bare string with no key). An array index
+/// does not change which field a leaf is, so callers carry `leaf` through
+/// array recursion unchanged.
+///
+/// One definition, four callers, deliberately: the resolver (never broker an
+/// identity), `import`'s capture walk (never redact one out of the file), the
+/// validator-output scrubber (never black out the field that says which
+/// credential an error is about) and the pre-resolve security audit
+/// ([`crate::diff::security`], never block `apply` on one). Any two of those
+/// disagreeing produces a configuration that one command accepts and another
+/// refuses.
 pub(crate) fn is_identity_credential_leaf(credential_type: &str, leaf: Option<&str>) -> bool {
     matches!(
         (credential_type, leaf),
