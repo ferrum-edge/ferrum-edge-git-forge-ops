@@ -15,7 +15,8 @@ use crate::config::schema::{GatewayConfig, Resource};
 use crate::http_client::BackupSnapshot;
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
-    CredentialBundle, UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER,
+    capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
+    IMPORT_REQUIRED_PLACEHOLDER,
 };
 
 pub const IMPORT_MANIFEST_FILENAME: &str = ".gitforgeops-import.json";
@@ -121,6 +122,9 @@ pub struct ImportResult {
     /// placeholders. This includes schema-declared endpoints/header maps and
     /// fail-closed strings from custom plugin configs.
     pub redacted_plugin_config_values: usize,
+    /// Number of modeled `Upstream.service_discovery` secrets (the Consul ACL
+    /// token) replaced with broker placeholders.
+    pub redacted_service_discovery_values: usize,
     /// Future/unknown top-level backup sections that this build cannot import.
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
@@ -155,6 +159,7 @@ impl ImportResult {
             && self.skipped_spec_owned == 0
             && self.redacted_credential_values == 0
             && self.redacted_plugin_config_values == 0
+            && self.redacted_service_discovery_values == 0
             && self.unsupported_sections.is_empty()
         {
             return None;
@@ -197,6 +202,15 @@ impl ImportResult {
                 self.redacted_plugin_config_values
             ));
         }
+        if self.redacted_service_discovery_values > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} service-discovery secret(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
+                self.redacted_service_discovery_values
+            ));
+        }
         if !self.unsupported_sections.is_empty() {
             if !notice.is_empty() {
                 notice.push(' ');
@@ -217,21 +231,23 @@ impl ImportResult {
         Some(notice)
     }
 
-    /// Loud per-plugin review list for non-builtin plugins.
+    /// Loud per-plugin review list for the non-builtin plugins the operator
+    /// allowed through with `--allow-plaintext-plugin-config`.
     ///
     /// gitforgeops has no schema for a plugin it does not know, so it brokers
-    /// only what the key/URL sensitivity heuristics flag and leaves the rest
-    /// in the committed resource file. That is the right default — capturing
-    /// `mode: strict` into a GitHub Environment Secret makes the import
-    /// unusable — but it means a vendor field the heuristics do not recognize
-    /// as a credential lands in Git as written. Name every one of them.
+    /// only what the key/URL sensitivity heuristics flag. Everything they did
+    /// not flag makes the import *fail* unless the plugin was named on the
+    /// command line (see `enforce_plaintext_plugin_config_allowance`) —
+    /// capturing `mode: strict` into a GitHub Environment Secret makes the
+    /// import unusable, and committing an unrecognized `authToken` is worse.
+    /// This notice is what the accepted case prints: the exact leaves that
+    /// were written verbatim on the operator's say-so.
     pub fn custom_plugin_review_notice(&self) -> Option<String> {
         if self.unbrokered_plugin_config.is_empty() {
             return None;
         }
-        const MAX_PATHS_PER_PLUGIN: usize = 50;
         let mut notice = String::from(
-            "WARNING: review these plugin config values before committing. They belong to plugins this build does not recognize, so there is no schema to classify them by; only key/URL heuristics ran, and everything they did not flag was left in the imported files verbatim. If any of them is a credential, move it into the broker by hand:",
+            "WARNING: these plugin config values were written verbatim because --allow-plaintext-plugin-config named their plugin. This build has no schema for them, so only key/URL heuristics ran. Confirm once more that none of them is a credential before committing:",
         );
         for plugin in &self.unbrokered_plugin_config {
             let mut paths = plugin
@@ -386,6 +402,23 @@ fn diagnostic_metadata(value: &str) -> String {
 /// as drift, and `apply` pushes it back — a conflict no edit resolves. They are
 /// counted in [`ImportResult::skipped_spec_owned`] instead, and surfaced by
 /// [`ImportResult::unmanaged_sections_notice`].
+///
+/// # Unmodelled resource fields fail closed
+///
+/// A top-level field this build's typed mirror does not model is carried
+/// through `extra` and would be written into the tree verbatim, where the
+/// credential broker never sees it. This entry point refuses every such field:
+/// it applies [`ImportPassthroughPolicy::strict`]. The CLI's
+/// `--accept-unknown-field <NAME>` (with `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
+/// is the documented way to accept one after reading the source.
+///
+/// # Unrecognized plugins fail closed
+///
+/// A plugin this build has no schema for is classified by the key/URL
+/// heuristics alone, and a string they do not flag would be committed as
+/// written. This entry point allows none of that: an unclassifiable leaf is an
+/// error. The CLI's `--allow-plaintext-plugin-config <plugin_name>` is the
+/// documented way to accept them after reading the list.
 pub fn split_config(
     config: &GatewayConfig,
     output_dir: &Path,
@@ -397,9 +430,21 @@ pub fn split_config(
         None,
         false,
         &ImportPassthroughPolicy::strict(),
+        &[],
     )
 }
 
+/// Two operator acknowledgements gate this path, and both are evaluated
+/// before a single file is staged.
+///
+/// `passthrough_policy` governs top-level resource fields this build does not
+/// model (`--accept-unknown-field` plus `FERRUM_ALLOW_UNKNOWN_FIELDS`); an
+/// unacknowledged one aborts the whole import.
+///
+/// `allow_plaintext_plugin_config` holds exact `plugin_name`s whose
+/// heuristically-unclassifiable config strings the operator has reviewed and
+/// accepted as plaintext (`--allow-plaintext-plugin-config`). Any other plugin
+/// with such a string aborts the import too.
 pub(crate) fn split_config_with_inventory(
     config: &GatewayConfig,
     output_dir: &Path,
@@ -407,20 +452,33 @@ pub(crate) fn split_config_with_inventory(
     credential_bundle_output: Option<&Path>,
     require_credential_bundle: bool,
     passthrough_policy: &ImportPassthroughPolicy,
+    allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
     let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
-    let unbrokered_plugin_config = plugin_capture.unbrokered;
+    let captured_discovery = capture_and_redact_import_service_discovery_secrets(&mut safe_config)?;
+    let unbrokered_plugin_config = enforce_plaintext_plugin_config_allowance(
+        plugin_capture.unbrokered,
+        allow_plaintext_plugin_config,
+    )?;
     let credential_count = captured_credentials.len();
     let plugin_config_count = plugin_capture.captured.len();
+    let service_discovery_count = captured_discovery.len();
     let mut captured_secrets = captured_credentials;
     for (slot, value) in plugin_capture.captured {
         if captured_secrets.insert(slot.clone(), value).is_some() {
             return Err(crate::error::Error::Config(format!(
                 "secret slot '{slot}' is produced by both a consumer credential and plugin config"
+            )));
+        }
+    }
+    for (slot, value) in captured_discovery {
+        if captured_secrets.insert(slot.clone(), value).is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}' is produced by a service-discovery field and another resource"
             )));
         }
     }
@@ -431,6 +489,7 @@ pub(crate) fn split_config_with_inventory(
         sources: inventory.sources,
         redacted_credential_values: credential_count,
         redacted_plugin_config_values: plugin_config_count,
+        redacted_service_discovery_values: service_discovery_count,
         unbrokered_plugin_config,
         acknowledged_passthrough,
         ..ImportResult::default()
@@ -687,6 +746,70 @@ fn acknowledged_passthrough_review(config: &GatewayConfig) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// Longest per-plugin path list rendered in a notice or a refusal. A crafted
+/// backup could otherwise turn one plugin into a megabyte of terminal output.
+const MAX_PATHS_PER_PLUGIN: usize = 50;
+
+/// Refuse the import unless every unrecognized plugin holding an
+/// unclassifiable config string has been named on the command line.
+///
+/// gitforgeops has no schema for such a plugin, so only the key/URL
+/// sensitivity heuristics run over its config, and a vendor field they do not
+/// recognize — `authToken`, `serviceCredential`, anything the naming
+/// conventions missed — would be committed to Git exactly as the backup
+/// returned it. The old behavior printed a warning after publishing the tree,
+/// which is the wrong order: by the time an operator reads it, the value is on
+/// disk and (once merged) in the repository's history.
+///
+/// So the default is now to fail, and the failure is recoverable in the only
+/// way that is honest — the operator reads the named paths, decides that none
+/// of them is a credential, and re-runs with
+/// `--allow-plaintext-plugin-config <plugin_name>` for each plugin they
+/// accepted. Heuristically-flagged leaves are brokered either way; the flag
+/// only governs what the heuristics could *not* judge.
+///
+/// The refusal names the plugin id, its `plugin_name`, and every unclassified
+/// path — and no values, because the whole point is that gitforgeops does not
+/// know whether they are secrets.
+fn enforce_plaintext_plugin_config_allowance(
+    unbrokered: Vec<UnbrokeredPluginConfig>,
+    allowed: &[String],
+) -> crate::error::Result<Vec<UnbrokeredPluginConfig>> {
+    let refused: Vec<&UnbrokeredPluginConfig> = unbrokered
+        .iter()
+        .filter(|plugin| !allowed.contains(&plugin.plugin_name))
+        .collect();
+    if refused.is_empty() {
+        return Ok(unbrokered);
+    }
+
+    let mut message = String::from(
+        "refusing to import plaintext plugin config: this build has no schema for the plugin(s) below, so only the key/URL sensitivity heuristics ran, and the string values at these paths would be committed to the repository as written. Read them at the source, and if none is a credential re-run with --allow-plaintext-plugin-config <plugin_name> for each (exact plugin_name, repeatable). Nothing has been written.",
+    );
+    for plugin in refused {
+        let mut paths = plugin
+            .paths
+            .iter()
+            .take(MAX_PATHS_PER_PLUGIN)
+            .map(|path| diagnostic_metadata(path))
+            .collect::<Vec<_>>();
+        if plugin.paths.len() > MAX_PATHS_PER_PLUGIN {
+            paths.push(format!(
+                "[{} more]",
+                plugin.paths.len() - MAX_PATHS_PER_PLUGIN
+            ));
+        }
+        message.push_str(&format!(
+            "\n  PluginConfig {} ({}, plugin_name={}): {}",
+            diagnostic_metadata(&plugin.plugin_id),
+            diagnostic_metadata(&plugin.namespace),
+            diagnostic_metadata(&plugin.plugin_name),
+            paths.join(", ")
+        ));
+    }
+    Err(crate::error::Error::Config(message))
 }
 
 fn serialize_resource_yaml(resource: &Resource) -> crate::error::Result<String> {

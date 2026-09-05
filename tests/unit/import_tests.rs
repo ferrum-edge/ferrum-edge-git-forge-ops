@@ -1,14 +1,14 @@
 use gitforgeops::config::schema::*;
 use gitforgeops::import::split_config;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::PathBuf;
 
 /// Import's fail-closed default: no unmodelled top-level field is
 /// acknowledged, which is what every pre-existing case expects.
 fn strict_passthrough() -> gitforgeops::import::ImportPassthroughPolicy {
     gitforgeops::import::ImportPassthroughPolicy::strict()
 }
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::path::PathBuf;
 
 fn make_test_config() -> GatewayConfig {
     GatewayConfig {
@@ -129,6 +129,7 @@ fn file_import_rejects_passthrough_fields_without_publishing_them() {
         &output,
         None,
         &strict_passthrough(),
+        &[],
     )
     .unwrap_err()
     .to_string();
@@ -166,7 +167,7 @@ fn acknowledging_one_field_does_not_admit_another() {
         acknowledged: ["future_label".to_string()].into_iter().collect(),
     };
     let error =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy)
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy, &[])
             .unwrap_err()
             .to_string();
 
@@ -198,7 +199,7 @@ fn acknowledged_fields_still_need_the_passthrough_load_policy() {
         acknowledged: ["future_label".to_string()].into_iter().collect(),
     };
     let error =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy)
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy, &[])
             .unwrap_err()
             .to_string();
 
@@ -226,7 +227,7 @@ fn acknowledged_passthrough_round_trips_and_is_reported_for_review() {
         acknowledged: ["future_label".to_string()].into_iter().collect(),
     };
     let result =
-        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy)
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy, &[])
             .expect("an acknowledged field imports");
 
     let written =
@@ -268,6 +269,7 @@ fn a_source_without_unmodelled_fields_reports_no_passthrough_review() {
         &output,
         None,
         &strict_passthrough(),
+        &[],
     )
     .expect("a modelled source imports under the fail-closed default");
 
@@ -370,6 +372,7 @@ fn import_from_file_roundtrip() {
         tmp_import.path(),
         None,
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
     assert_eq!(result.proxies, 1);
@@ -403,6 +406,7 @@ fn file_import_requires_an_explicit_private_bundle_for_live_credentials() {
         &output,
         None,
         &strict_passthrough(),
+        &[],
     )
     .unwrap_err()
     .to_string();
@@ -429,6 +433,7 @@ fn file_import_preserves_existing_placeholders_without_a_migration_bundle() {
         &output,
         None,
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
 
@@ -499,6 +504,7 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
         &output,
         Some(&bundle_path),
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
 
@@ -609,6 +615,7 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         &output,
         Some(&bundle_path),
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
 
@@ -656,9 +663,11 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
 
 /// F5: a plugin this build does not know has no schema to classify it by, so
 /// only the key/URL sensitivity heuristics run. What they flag is brokered;
-/// what they do not is left in the committed file and named in a review
-/// notice, because capturing `mode: strict` into a GitHub Environment Secret
-/// makes the imported repo unappliable without telling anyone why.
+/// what they do not would land in the committed file verbatim, so it takes an
+/// explicit `--allow-plaintext-plugin-config <plugin_name>` and is named in a
+/// review notice afterwards. Capturing `mode: strict` into a GitHub
+/// Environment Secret instead would make the imported repo unappliable
+/// without telling anyone why.
 #[test]
 fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -694,6 +703,7 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         &output,
         Some(&bundle_path),
         &strict_passthrough(),
+        &["enterprise_custom".to_string()],
     )
     .unwrap();
 
@@ -751,6 +761,7 @@ fn builtin_plugin_import_raises_no_review_notice() {
         &output,
         Some(&bundle_path),
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
 
@@ -787,6 +798,7 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
         &output,
         None,
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
     assert_eq!(result.skipped_spec_owned, 1);
@@ -819,6 +831,7 @@ fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
         &output,
         Some(&bundle_path),
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
 
@@ -860,6 +873,7 @@ fn credential_migration_bundle_must_stay_outside_the_resource_tree() {
         &output,
         Some(&unsafe_bundle),
         &strict_passthrough(),
+        &[],
     )
     .unwrap_err()
     .to_string();
@@ -890,6 +904,7 @@ fn credential_migration_bundle_cannot_overwrite_its_source_backup() {
         &output,
         Some(&backup_path),
         &strict_passthrough(),
+        &[],
     )
     .unwrap_err()
     .to_string();
@@ -924,6 +939,7 @@ fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
         &output,
         Some(&unsafe_bundle),
         &strict_passthrough(),
+        &[],
     )
     .unwrap_err()
     .to_string();
@@ -1385,6 +1401,7 @@ fn file_import_parses_and_reports_the_full_backup_envelope() {
         output.path(),
         None,
         &strict_passthrough(),
+        &[],
     )
     .unwrap();
 
@@ -1465,6 +1482,7 @@ async fn api_import_rejects_cross_namespace_resources_before_writing() {
         Some("ferrum"),
         None,
         &strict_passthrough(),
+        &[],
     )
     .await
     .unwrap_err()
@@ -1513,6 +1531,7 @@ async fn api_import_refuses_cached_backup_before_writing() {
         Some("ferrum"),
         None,
         &strict_passthrough(),
+        &[],
     )
     .await
     .unwrap_err()
@@ -1572,8 +1591,363 @@ fn migration_bundle_paths_normalize_dotdot_under_a_missing_ancestor() {
         &output,
         Some(&bundle_path),
         &strict_passthrough(),
+        &[],
     )
     .expect("a normalizable path must not be refused by the containment resolver");
 
     assert!(destination_parent.path().join("migration.json").exists());
+}
+
+// ---------------------------------------------------------------------------
+// #126: a Consul ACL token in `Upstream.service_discovery` is live secret
+// material in a backup. It must reach the private migration bundle and nothing
+// else — not the tree, not the manifest, not stdout.
+// ---------------------------------------------------------------------------
+
+fn consul_upstream(token: &str) -> Upstream {
+    Upstream {
+        extra: Default::default(),
+        id: "orders".to_string(),
+        name: None,
+        namespace: "ferrum".to_string(),
+        targets: vec![],
+        algorithm: LoadBalancerAlgorithm::default(),
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: Some(ServiceDiscoveryConfig {
+            provider: SdProvider::Consul,
+            dns_sd: None,
+            kubernetes: None,
+            consul: Some(ConsulConfig {
+                address: "https://consul.example.test:8501".to_string(),
+                service_name: "orders".to_string(),
+                datacenter: None,
+                tag: None,
+                healthy_only: true,
+                token: Some(token.to_string()),
+                poll_interval_seconds: 30,
+            }),
+            mesh: None,
+            max_stale_seconds: None,
+            stale_policy: None,
+            default_weight: 100,
+        }),
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        subsets: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: vec![],
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+#[test]
+fn file_import_brokers_a_consul_discovery_token() {
+    let token = "SYNTHETIC-AUDIT-TOKEN";
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.upstreams.push(consul_upstream(token));
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(result.redacted_service_discovery_values, 1);
+
+    // The token is in the private bundle, under its canonical slot.
+    let raw_bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    let (merged, _) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
+    assert_eq!(
+        merged
+            .get("ferrum/orders/@service-discovery/consul/token")
+            .map(String::as_str),
+        Some(token)
+    );
+
+    // It is nowhere in the published tree, and the discovery identity is.
+    let upstream_yaml =
+        std::fs::read_to_string(output.join("ferrum/upstreams/orders.yaml")).unwrap();
+    assert!(!upstream_yaml.contains(token), "{upstream_yaml}");
+    assert!(
+        upstream_yaml.contains("${gh-env-secret:alloc=require}"),
+        "{upstream_yaml}"
+    );
+    assert!(
+        upstream_yaml.contains("consul.example.test"),
+        "{upstream_yaml}"
+    );
+    assert!(
+        upstream_yaml.contains("service_name: orders"),
+        "{upstream_yaml}"
+    );
+
+    // Nor in any other published file, including the manifest.
+    for entry in walk_files(&output) {
+        let body = std::fs::read_to_string(&entry).unwrap();
+        assert!(
+            !body.contains(token),
+            "{} leaked the token",
+            entry.display()
+        );
+    }
+
+    // Nor in anything printed to an operator.
+    let notice = result.unmanaged_sections_notice().expect("notice");
+    assert!(notice.contains("service-discovery secret"), "{notice}");
+    assert!(!notice.contains(token), "{notice}");
+}
+
+/// Whatever the source held, the imported tree resolves back to it from the
+/// migration bundle alone.
+#[test]
+fn imported_consul_token_resolves_from_the_migration_bundle() {
+    let token = "SYNTHETIC-AUDIT-TOKEN";
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.upstreams.push(consul_upstream(token));
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+
+    let raw_bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    let (merged, _) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
+    let resources = gitforgeops::config::load_resources(&output).unwrap();
+    let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
+    gitforgeops::secrets::resolve_secrets_with_mode(
+        &mut assembled,
+        &merged,
+        gitforgeops::config::GatewayMode::Api,
+    )
+    .unwrap();
+
+    let restored = assembled
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == "orders")
+        .and_then(|upstream| upstream.service_discovery.as_ref())
+        .and_then(|sd| sd.consul.as_ref())
+        .and_then(|consul| consul.token.as_deref());
+    assert_eq!(restored, Some(token));
+}
+
+/// Every regular file under `root`, recursively.
+fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+// ---------------------------------------------------------------------------
+// PR #90 review F5: for a plugin this build has no schema for, a string the
+// heuristics do not classify used to be published first and reported second.
+// It now fails the import, recoverably.
+// ---------------------------------------------------------------------------
+
+fn unknown_plugin_backup(source_dir: &std::path::Path) -> PathBuf {
+    let backup_path = source_dir.join("backup.yaml");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        extra: Default::default(),
+        id: "custom".to_string(),
+        plugin_name: "enterprise_custom".to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({
+            // `auth` is not one of the names the heuristics know, so nothing
+            // classifies it — which is exactly the case that must not be
+            // published on a guess.
+            "auth": "vendor-issued-bearer-material",
+            "api_key": "live-vendor-key"
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    backup_path
+}
+
+#[test]
+fn unclassified_config_of_an_unknown_plugin_fails_the_import() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = unknown_plugin_backup(source_dir.path());
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+
+    // Names the plugin and every unclassified path...
+    assert!(error.contains("PluginConfig custom"), "{error}");
+    assert!(error.contains("plugin_name=enterprise_custom"), "{error}");
+    assert!(error.contains("auth"), "{error}");
+    assert!(
+        error.contains("--allow-plaintext-plugin-config"),
+        "the refusal must name its own remedy: {error}"
+    );
+    // ...and echoes no value, secret or otherwise.
+    assert!(!error.contains("vendor-issued-bearer-material"), "{error}");
+    assert!(!error.contains("live-vendor-key"), "{error}");
+
+    // Nothing was published: not the tree, not the migration bundle.
+    assert!(!output.exists(), "the resource tree must not be published");
+    assert!(
+        !bundle_path.exists(),
+        "the migration bundle must not be written either"
+    );
+}
+
+#[test]
+fn allowing_the_plugin_writes_the_literal_and_lists_it() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = unknown_plugin_backup(source_dir.path());
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &["enterprise_custom".to_string()],
+    )
+    .unwrap();
+
+    let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/custom.yaml")).unwrap();
+    // The allowed leaf stays literal...
+    assert!(
+        plugin_yaml.contains("vendor-issued-bearer-material"),
+        "{plugin_yaml}"
+    );
+    // ...while a heuristic match is brokered either way.
+    assert_eq!(result.redacted_plugin_config_values, 1);
+    assert!(!plugin_yaml.contains("live-vendor-key"), "{plugin_yaml}");
+
+    let notice = result.custom_plugin_review_notice().expect("review notice");
+    assert!(
+        notice.contains("--allow-plaintext-plugin-config"),
+        "{notice}"
+    );
+    assert!(notice.contains("plugin_name=enterprise_custom"), "{notice}");
+    assert!(notice.contains("auth"), "{notice}");
+    assert!(
+        !notice.contains("vendor-issued-bearer-material"),
+        "{notice}"
+    );
+}
+
+/// The allowance is an exact `plugin_name` match: naming a different plugin
+/// (or a prefix of the right one) does not open the gate.
+#[test]
+fn the_plaintext_allowance_matches_plugin_names_exactly() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = unknown_plugin_backup(source_dir.path());
+    let destination_parent = tempfile::tempdir().unwrap();
+
+    for allowance in ["enterprise", "enterprise_custom_v2", "other_plugin"] {
+        let output = destination_parent.path().join(format!("out-{allowance}"));
+        let bundle_path = destination_parent
+            .path()
+            .join(format!("b-{allowance}.json"));
+        let error = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            Some(&bundle_path),
+            &strict_passthrough(),
+            &[allowance.to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("plugin_name=enterprise_custom"), "{error}");
+        assert!(!output.exists());
+    }
+}
+
+/// A builtin plugin's schema rules are authoritative, so the gate never fires
+/// for one — with or without the flag.
+#[test]
+fn builtin_plugins_are_unaffected_by_the_plaintext_gate() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        extra: Default::default(),
+        id: "otel".to_string(),
+        plugin_name: "otel_tracing".to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({"sample_rate": "0.1", "service_name": "gateway"}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+
+    assert!(result.custom_plugin_review_notice().is_none());
+    let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/otel.yaml")).unwrap();
+    assert!(plugin_yaml.contains("sample_rate"), "{plugin_yaml}");
 }

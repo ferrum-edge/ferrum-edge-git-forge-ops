@@ -157,6 +157,11 @@ fn private_temp_file(
 /// with `[REDACTED]`; every other diagnostic — the proxy typo that actually
 /// failed the run — is returned intact.
 ///
+/// Where the substitution cannot be trusted — a secret that an emitter would
+/// re-encode (a multi-line PEM key, a value carrying quotes), a value that
+/// survived it, or a surviving fragment of one — both streams are withheld
+/// with a notice naming the reason. See [`crate::secrets::SecretScrubber`].
+///
 /// Credential leaves that are *still* placeholders (no bundle loaded, as on a
 /// fork PR) are replaced with [`crate::validate::validation_standin`] values
 /// in the temp spec only, so shape checks such as ferrum-edge's 32-character
@@ -201,12 +206,6 @@ pub fn run_mesh_validation(
         &SecretScrubber::default(),
     )
 }
-
-/// Emitted in place of the validator's own output when, and only when,
-/// redaction provably failed. See [`crate::secrets::MIN_SCRUB_LENGTH`]: a
-/// credential shorter than the substring-replacement floor cannot be removed
-/// from a diagnostic without corrupting it, so the diagnostic goes instead.
-const SUPPRESSED_NOTICE: &str = "Validator diagnostics were withheld: a credential value survived redaction, so the output could not be shown without leaking it. Credentials shorter than 8 bytes cannot be redacted from a diagnostic without mangling it — lengthen the credential, or move the literal value into the ${gh-env-secret:...} broker.\n";
 
 /// Shared body of [`run_validation`] and [`run_mesh_validation`]: locate the
 /// binary, write `yaml` to a private temp file, and run `validate` in `mode`
@@ -275,16 +274,16 @@ fn run_validate_command(
     let output = output?;
 
     let exit_code = output.status.code().unwrap_or(-1);
-    let mut stdout = scrubber.scrub(&String::from_utf8_lossy(&output.stdout));
-    let mut stderr = scrubber.scrub(&String::from_utf8_lossy(&output.stderr));
-
-    // Last resort. Substring replacement removes every secret at or above
-    // `MIN_SCRUB_LENGTH`, so reaching here means a credential too short to
-    // replace safely was echoed back. Drop the stream rather than print it.
-    if scrubber.leaks(&stdout) || scrubber.leaks(&stderr) {
-        stdout = String::new();
-        stderr = SUPPRESSED_NOTICE.to_string();
-    }
+    // One decision point for scrub-or-withhold: a secret that cannot be
+    // matched reliably in re-encoded output, a value that survived verbatim,
+    // or a surviving fragment of one all withhold both streams and say which
+    // it was. Everything else comes back scrubbed and readable.
+    let scrubbed = scrubber.scrub_streams(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = scrubbed.stdout;
+    let stderr = scrubbed.stderr;
 
     // ferrum-edge validate's public contract is 0 for accepted input and 1
     // for schema rejection. Any other code (including -1 for termination by

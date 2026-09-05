@@ -19,11 +19,13 @@ fn cli_import_from_api_is_a_flag() {
             from_file,
             output_dir,
             credential_bundle_output,
+            allow_plaintext_plugin_config,
         } => {
             assert!(from_api);
             assert!(from_file.is_none());
             assert_eq!(output_dir, "/tmp/scratch-import");
             assert!(credential_bundle_output.is_none());
+            assert!(allow_plaintext_plugin_config.is_empty());
         }
         _ => panic!("expected import command"),
     }
@@ -217,5 +219,35 @@ fn cli_exposes_the_credential_slot_remap_opt_in_globally() {
         let cli = Cli::try_parse_from(argv.clone())
             .unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
         assert!(cli.allow_credential_slot_remap, "{argv:?}");
+    }
+}
+
+/// `--allow-plaintext-plugin-config` is repeatable and matched by exact
+/// `plugin_name`: an import touching two unrecognized plugins needs both
+/// named, and there is deliberately no wildcard.
+#[test]
+fn cli_accepts_repeated_plaintext_plugin_allowances() {
+    let cli = Cli::try_parse_from([
+        "gitforgeops",
+        "import",
+        "--from-api",
+        "--output-dir",
+        "/tmp/scratch-import",
+        "--allow-plaintext-plugin-config",
+        "enterprise_custom",
+        "--allow-plaintext-plugin-config",
+        "vendor_shim",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Commands::Import {
+            allow_plaintext_plugin_config,
+            ..
+        } => assert_eq!(
+            allow_plaintext_plugin_config,
+            vec!["enterprise_custom".to_string(), "vendor_shim".to_string()]
+        ),
+        _ => panic!("expected import command"),
     }
 }

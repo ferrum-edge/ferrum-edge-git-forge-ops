@@ -3,6 +3,9 @@ use crate::config::{GatewayConfig, GatewayMode};
 use super::bundle::CredentialBundle;
 use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 use super::plugin_config::{classify_plugin_config, render_config_path, ConfigPathComponent};
+use super::service_discovery::{
+    self, SdSecretField, SD_SECRET_FIELDS, SERVICE_DISCOVERY_SLOT_KIND,
+};
 
 /// Reserved third slot component for brokered plugin-config strings.
 ///
@@ -193,7 +196,7 @@ enum SlotComponent<'a> {
 ///
 /// Injective by construction, which keeps distinct credential tree
 /// locations mapped to distinct slot strings.
-fn escape_slot_component(s: &str) -> String {
+pub(crate) fn escape_slot_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -597,6 +600,47 @@ pub fn capture_and_redact_import_plugin_config_secrets(
     Ok(capture)
 }
 
+/// Capture modeled `Upstream.service_discovery` secrets and replace them with
+/// broker placeholders before import writes any resource file.
+///
+/// The discovery provider's own credential (today: the Consul ACL token) is
+/// returned verbatim by `GET /backup` exactly like a consumer credential, and
+/// an upstream is serialized whole. Without this pass the token would be
+/// committed to the repository by the one command whose input is guaranteed to
+/// contain live secrets.
+///
+/// Only leaves named by [`SD_SECRET_FIELDS`] are touched: `consul.address`,
+/// `service_name`, `datacenter` and `tag` identify *what* is discovered and
+/// stay readable, so the imported file still says what the upstream does.
+pub fn capture_and_redact_import_service_discovery_secrets(
+    cfg: &mut GatewayConfig,
+) -> crate::error::Result<CredentialBundle> {
+    let mut captured = CredentialBundle::new();
+
+    for upstream in &mut cfg.upstreams {
+        if upstream.api_spec_id.is_some() {
+            continue;
+        }
+        let namespace = upstream.namespace.clone();
+        let upstream_id = upstream.id.clone();
+        let Some(discovery) = upstream.service_discovery.as_mut() else {
+            continue;
+        };
+        for field in SD_SECRET_FIELDS {
+            let slot = service_discovery::slot(&namespace, &upstream_id, field.path);
+            let Some(leaf) = service_discovery::secret_leaf_mut(discovery, field.path) else {
+                continue;
+            };
+            let Some(text) = leaf.as_mut() else {
+                continue;
+            };
+            capture_and_redact_string(text, &slot, &mut captured, "service discovery")?;
+        }
+    }
+
+    Ok(captured)
+}
+
 fn capture_and_redact_value<'a>(
     value: &'a mut serde_json::Value,
     components: &mut Vec<SlotComponent<'a>>,
@@ -692,7 +736,11 @@ fn capture_and_redact_string(
     Ok(())
 }
 
-fn plugin_config_slot(namespace: &str, plugin_id: &str, path: &[ConfigPathComponent]) -> String {
+pub(crate) fn plugin_config_slot(
+    namespace: &str,
+    plugin_id: &str,
+    path: &[ConfigPathComponent],
+) -> String {
     let mut pieces = vec![
         escape_slot_component(namespace),
         escape_slot_component(plugin_id),
@@ -857,6 +905,25 @@ fn report_secrets_with_mode_inner(
             &mut report,
         )?;
     }
+    for upstream in &cfg.upstreams {
+        let Some(discovery) = upstream.service_discovery.as_ref() else {
+            continue;
+        };
+        for field in SD_SECRET_FIELDS {
+            let Some(text) = service_discovery::secret_leaf(discovery, field.path) else {
+                continue;
+            };
+            resolve_service_discovery_leaf(
+                text,
+                &upstream.namespace,
+                &upstream.id,
+                field,
+                bundle,
+                constraints,
+                &mut report,
+            )?;
+        }
+    }
     // Defense-in-depth: detect any duplicate slot strings. With the escape
     // function being injective, structurally-distinct tree locations can't
     // produce the same slot — but if a future refactor breaks the
@@ -953,6 +1020,34 @@ pub fn resolve_secrets_with_mode_and_options(
             bundle,
             &mut report,
         )?;
+    }
+
+    for upstream in cfg.upstreams.iter_mut() {
+        let namespace = upstream.namespace.clone();
+        let upstream_id = upstream.id.clone();
+        let Some(discovery) = upstream.service_discovery.as_mut() else {
+            continue;
+        };
+        for field in SD_SECRET_FIELDS {
+            let Some(leaf) = service_discovery::secret_leaf_mut(discovery, field.path) else {
+                continue;
+            };
+            let Some(text) = leaf.as_ref() else {
+                continue;
+            };
+            let resolved = resolve_service_discovery_leaf(
+                text,
+                &namespace,
+                &upstream_id,
+                field,
+                bundle,
+                ConstraintMode::Enforce,
+                &mut report,
+            )?;
+            if let Some(value) = resolved {
+                *leaf = Some(value);
+            }
+        }
     }
 
     detect_slot_collisions(&report)?;
@@ -1308,6 +1403,65 @@ fn walk_and_report(
         _ => {}
     }
     Ok(())
+}
+
+/// Report (and optionally resolve) one modeled service-discovery secret leaf.
+///
+/// Shared by the read-only walk and the mutating one so the slot, the status
+/// and the generation verdict cannot differ between `plan` and `apply`.
+/// Returns the bundle value when there is one, so the mutating caller can
+/// write it back; a literal (non-placeholder) leaf is left alone and reported
+/// by the security audit instead.
+///
+/// Semantics match plugin config: `alloc=require` with no stored value is
+/// [`SlotStatus::MissingRequired`], and a stored value resolves whatever the
+/// alloc mode says. The one addition is the [`SdSecretField::generatable`]
+/// gate — a field the *other* system mints cannot be satisfied by random
+/// bytes, so `alloc=generate` / `alloc=rotate` is refused at the point where
+/// allocation would otherwise happen, before any GitHub Environment Secret is
+/// written. An already-seeded slot keeps resolving: the alloc mode is moot
+/// once a value exists, exactly as in [`check_generation_constraints`].
+fn resolve_service_discovery_leaf(
+    text: &str,
+    namespace: &str,
+    upstream_id: &str,
+    field: &SdSecretField,
+    bundle: &CredentialBundle,
+    constraints: ConstraintMode,
+    report: &mut ResolveReport,
+) -> crate::error::Result<Option<String>> {
+    let Some(parsed) = parse_placeholder(text) else {
+        return Ok(None);
+    };
+    let placeholder = parsed?;
+    let slot = service_discovery::slot(namespace, upstream_id, field.path);
+    let existing = lookup_exact_slot_value(&slot, bundle)?;
+    let status = classify_status(&placeholder, existing);
+
+    if !field.generatable
+        && matches!(constraints, ConstraintMode::Enforce)
+        && matches!(status, SlotStatus::NeedsAllocation)
+    {
+        return Err(crate::error::Error::Config(format!(
+            "secret slot '{slot}': the broker cannot generate {} — {}. Use \
+             '${{gh-env-secret:alloc=require}}' and seed the slot with the real value.",
+            service_discovery::render_path(field.path),
+            field.ungeneratable_reason
+        )));
+    }
+
+    report
+        .slot_credential_types
+        .insert(slot.clone(), SERVICE_DISCOVERY_SLOT_KIND.to_string());
+    report.results.push(ResolveResult {
+        consumer_id: upstream_id.to_string(),
+        namespace: namespace.to_string(),
+        cred_key: service_discovery::cred_key(field.path),
+        slot,
+        placeholder,
+        status,
+    });
+    Ok(existing.cloned())
 }
 
 fn walk_plugin_and_report(
