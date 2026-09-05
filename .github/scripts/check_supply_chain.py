@@ -373,19 +373,61 @@ def installer_step_auth_violations(workflow: str, text: str) -> list[str]:
 
 
 def untrusted_pr_installer_violations(text: str) -> list[str]:
-    """Keep the PR token out of scripts supplied by the candidate checkout."""
-    required = (
-        "- name: Check out trusted validator installer",
-        "ref: ${{ github.event.repository.default_branch }}",
-        "path: trusted-validator",
-        "bash trusted-validator/.github/scripts/install-ferrum-edge.sh",
-        ".github/ferrum-edge-checksums.txt",
-    )
-    violations = [
-        f"validate-pr.yml: authenticated validator install is missing {item!r}"
-        for item in required
-        if item not in text
-    ]
+    """Keep the PR token out of scripts supplied by the candidate checkout.
+
+    The validator download step hands `GITHUB_TOKEN` to the installer so the
+    release-asset API call is authenticated. Running that installer from the
+    pull request's own checkout would hand the token to a script the pull
+    request wrote, so the code comes from the protected default branch.
+
+    The *allowlist* deliberately still comes from the candidate. A pull
+    request that refreshes the validator pin has to be validated against the
+    allowlist it is adding, or the pin could never be refreshed without first
+    merging an unvalidated change. The residual risk is bounded: the trusted
+    installer still requires the publisher's own checksum file to match the
+    bytes it downloaded from `ferrum-edge/ferrum-edge`, so a hostile allowlist
+    can at most approve a *different genuine upstream build* rather than
+    attacker-supplied bytes, and this job holds no secret beyond a read-only
+    token and already runs the pull request's own Cargo build scripts. Every
+    privileged consumer (`trusted-pr-review.yml`, `apply-on-merge.yml`) uses
+    the trusted allowlist instead.
+    """
+    violations: list[str] = []
+
+    checkout = named_step(text, "Check out trusted validator installer")
+    if checkout is None:
+        violations.append(
+            "validate-pr.yml: the validator installer must come from a protected "
+            "default-branch checkout"
+        )
+    else:
+        for required in (
+            "ref: ${{ github.event.repository.default_branch }}",
+            "path: trusted-validator",
+        ):
+            if required not in checkout:
+                violations.append(
+                    f"validate-pr.yml: trusted validator checkout is missing {required!r}"
+                )
+
+    install = named_step(text, "Download verified ferrum-edge binary")
+    if install is None:
+        violations.append("validate-pr.yml: the validator download step is missing")
+        return violations
+
+    # Collapse YAML line continuations so the assertion reads the argv the
+    # step actually runs rather than the way it happens to be wrapped. A
+    # prose mention of the allowlist in a comment cannot satisfy it.
+    command = " ".join(install.replace("\\\n", " ").split())
+    if not re.search(
+        r"bash trusted-validator/\.github/scripts/install-ferrum-edge\.sh "
+        r"\S+ \.github/ferrum-edge-checksums\.txt",
+        command,
+    ):
+        violations.append(
+            "validate-pr.yml: the trusted installer must run with the candidate's "
+            "reviewed digest allowlist as its second argument"
+        )
     if "bash .github/scripts/install-ferrum-edge.sh" in text:
         violations.append(
             "validate-pr.yml: candidate-checkout installer must not receive the GitHub token"

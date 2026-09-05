@@ -138,6 +138,9 @@ jobs:
         with:
           persist-credentials: false
 
+      # The installer runs with GITHUB_TOKEN. This job also builds the pull
+      # request's own Cargo tree, so the *script* must not be one the pull
+      # request wrote: it comes from the protected default branch instead.
       - name: Check out trusted validator installer
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -151,6 +154,14 @@ jobs:
           # execute any build whose SHA-256 is absent from the reviewed
           # .github/ferrum-edge-checksums.txt allowlist.
           GITHUB_TOKEN: ${{ github.token }}
+        # Trusted code, candidate allowlist. A pull request that refreshes the
+        # validator pin has to be validated against the digests it is adding,
+        # so the second argument is deliberately the candidate's allowlist. A
+        # hostile allowlist can only approve a different *genuine upstream*
+        # build — the installer still requires the publisher's own checksum to
+        # match — and this job carries no secret beyond a read-only token.
+        # Privileged consumers (trusted-pr-review.yml, apply-on-merge.yml) use
+        # the trusted allowlist instead.
         run: |
           bash trusted-validator/.github/scripts/install-ferrum-edge.sh \
             "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge" \

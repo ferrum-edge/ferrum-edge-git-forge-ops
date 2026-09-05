@@ -154,13 +154,62 @@ class SupplyChainPolicyTests(unittest.TestCase):
         self.assertEqual(
             check_supply_chain.untrusted_pr_installer_violations(workflow), []
         )
+
+        # Running the candidate's own installer is what hands a PR-authored
+        # script the job's GITHUB_TOKEN.
         insecure = workflow.replace(
             "bash trusted-validator/.github/scripts/install-ferrum-edge.sh",
             "bash .github/scripts/install-ferrum-edge.sh",
             1,
         )
         violations = check_supply_chain.untrusted_pr_installer_violations(insecure)
-        self.assertTrue(any("authenticated validator install" in item for item in violations))
+        self.assertTrue(
+            any("must not receive the GitHub token" in item for item in violations),
+            violations,
+        )
+
+        # Dropping the trusted checkout must be caught even if the invocation
+        # still names the trusted path.
+        without_checkout = workflow.replace(
+            "      - name: Check out trusted validator installer\n", "", 1
+        )
+        violations = check_supply_chain.untrusted_pr_installer_violations(
+            without_checkout
+        )
+        self.assertTrue(
+            any("protected default-branch checkout" in item for item in violations),
+            violations,
+        )
+
+    def test_validate_pr_installer_allowlist_argument_is_the_candidate_copy(self):
+        # A pin-refresh PR has to be validated against the allowlist it adds,
+        # so the second positional must be the candidate's file. A prose
+        # mention of the allowlist in a comment must not satisfy the policy.
+        workflow = (ROOT / ".github/workflows/validate-pr.yml").read_text(
+            encoding="utf-8"
+        )
+        for swapped in (
+            workflow.replace(
+                "            .github/ferrum-edge-checksums.txt\n",
+                "            trusted-validator/.github/ferrum-edge-checksums.txt\n",
+                1,
+            ),
+            workflow.replace(
+                " \\\n            \"$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge\" \\\n"
+                "            .github/ferrum-edge-checksums.txt\n",
+                "\n",
+                1,
+            ),
+        ):
+            self.assertNotEqual(workflow, swapped, "test fixture did not rewrite")
+            violations = check_supply_chain.untrusted_pr_installer_violations(swapped)
+            self.assertTrue(
+                any(
+                    "reviewed digest allowlist as its second argument" in item
+                    for item in violations
+                ),
+                violations,
+            )
 
     def test_candidate_branch_classifier_fails_even_when_trusted_text_remains(self):
         text = """
