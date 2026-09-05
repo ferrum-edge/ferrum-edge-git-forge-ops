@@ -272,6 +272,70 @@ pub(crate) fn sensitive_string_paths(
     classify_plugin_config(plugin_name, config).sensitive
 }
 
+/// The leaves this plugin's schema rules classify as **endpoints** — a URL,
+/// URI or DSN the gateway parses — as opposed to opaque secret material.
+///
+/// Brokering an endpoint is right (a URL routinely carries userinfo, a query
+/// token, or an internal hostname), but it changes what the field *looks*
+/// like: `ferrum-edge validate` parses `ldap_auth.ldap_url` and grades
+/// `${gh-env-secret:alloc=require}` as a malformed URL, so a secretless PR run
+/// fails on the brokering rather than on the configuration. The validator
+/// stand-in generator ([`crate::validate::standin`]) uses this to fabricate a
+/// syntactically valid URL for the temp spec instead of an opaque token.
+///
+/// Only the rule-declared endpoints are returned. The key/URL heuristics stay
+/// out: they fire on names like `api_key`, and a leaf they flagged for
+/// containing userinfo is a URL whose scheme we can no longer read off the
+/// document (it is a placeholder by then), so guessing one buys nothing that
+/// the opaque stand-in does not already give.
+pub(crate) fn endpoint_paths(
+    plugin_name: &str,
+    config: &Value,
+) -> BTreeSet<Vec<ConfigPathComponent>> {
+    let mut found = BTreeSet::new();
+    if config.is_null() || !config.is_object() {
+        return found;
+    }
+    for rule in rules_for(plugin_name) {
+        if matches!(rule.kind, RuleKind::Endpoint) {
+            apply_rule(config, rule.path, rule.kind, &[], &mut found);
+        }
+    }
+    found
+}
+
+/// URL scheme a stand-in for this endpoint field must carry.
+///
+/// ferrum-edge does not merely check that an endpoint parses; several plugins
+/// require a specific scheme (`ldap_auth` accepts `ldap`/`ldaps`, the Redis
+/// clients want a `redis` URL). The rule table keys endpoints by field name,
+/// so the field name is what decides here too, with the plugin name as the
+/// tiebreaker for a generically named field on a protocol-specific plugin.
+/// `https` is the fallback: every remaining builtin endpoint is an HTTP
+/// collector, webhook, or discovery document.
+pub(crate) fn endpoint_scheme(plugin_name: &str, path: &[ConfigPathComponent]) -> &'static str {
+    let leaf = path
+        .iter()
+        .rev()
+        .find_map(|part| match part {
+            ConfigPathComponent::Key(key) => Some(normalize_key(key)),
+            ConfigPathComponent::Index(_) => None,
+        })
+        .unwrap_or_default();
+    let plugin = normalize_key(plugin_name);
+    let says = |needle: &str| leaf.contains(needle) || plugin.contains(needle);
+
+    if says("ldap") {
+        "ldaps"
+    } else if says("redis") {
+        "redis"
+    } else if says("kafka") || leaf.contains("broker") {
+        "kafka"
+    } else {
+        "https"
+    }
+}
+
 /// Render a classified path the way an operator reads it: `headers.x-api-key`,
 /// `servers.[0].upstream_url`.
 pub(crate) fn render_config_path(path: &[ConfigPathComponent]) -> String {

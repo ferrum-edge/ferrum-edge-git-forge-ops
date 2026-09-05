@@ -726,7 +726,11 @@ fn capture_and_redact_string(
     Ok(())
 }
 
-fn plugin_config_slot(namespace: &str, plugin_id: &str, path: &[ConfigPathComponent]) -> String {
+pub(crate) fn plugin_config_slot(
+    namespace: &str,
+    plugin_id: &str,
+    path: &[ConfigPathComponent],
+) -> String {
     let mut pieces = vec![
         escape_slot_component(namespace),
         escape_slot_component(plugin_id),

@@ -3,7 +3,7 @@ pub mod bundle;
 pub mod delivery;
 pub mod github_api;
 pub mod placeholder;
-mod plugin_config;
+pub(crate) mod plugin_config;
 pub mod resolver;
 pub mod scrubber;
 pub(crate) mod service_discovery;

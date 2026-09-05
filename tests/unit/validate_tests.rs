@@ -650,3 +650,224 @@ fn format_results_github_annotations_cover_both_documents() {
     );
     assert!(output.contains("::error ::error: mesh is bad"), "{output}");
 }
+
+// ---------------------------------------------------------------------------
+// #133: a brokered plugin-config field the gateway *parses* must reach the
+// validator as something parseable. `${gh-env-secret:alloc=require}` is not a
+// URL, and grading it as one fails the required secretless PR job on the
+// brokering rather than on the configuration.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn plugin_config_for(
+    id: &str,
+    plugin_name: &str,
+    config: serde_json::Value,
+) -> gitforgeops::config::schema::GatewayConfig {
+    use gitforgeops::config::schema::{GatewayConfig, PluginConfig, PluginScope};
+
+    GatewayConfig {
+        plugin_configs: vec![PluginConfig {
+            extra: Default::default(),
+            id: id.to_string(),
+            plugin_name: plugin_name.to_string(),
+            namespace: "ferrum".to_string(),
+            config,
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        ..GatewayConfig::default()
+    }
+}
+
+/// A validator that enforces what ferrum-edge's `ldap_auth` enforces: the
+/// `ldap_url` must be an absolute URL with an `ldap`/`ldaps` scheme and a
+/// host. Anything relative — a broker placeholder included — is rejected.
+#[cfg(unix)]
+const LDAP_URL_VALIDATOR: &str = r#"#!/bin/sh
+url=$(sed -n 's/.*ldap_url: *//p' "$7" | tr -d '"' | tr -d "'")
+case "$url" in
+  ldap://?*|ldaps://?*) ;;
+  *) echo "error: ldap_auth: 'ldap_url' is not a valid URL: relative URL without a base" >&2; exit 1 ;;
+esac
+echo "ldap_url=$url"
+exit 0
+"#;
+
+#[cfg(unix)]
+#[test]
+fn brokered_plugin_urls_reach_the_validator_as_parseable_stand_ins() {
+    use gitforgeops::validate::VALIDATION_STANDIN_HOST;
+
+    let config = plugin_config_for(
+        "ldap",
+        "ldap_auth",
+        serde_json::json!({
+            "ldap_url": "${gh-env-secret:alloc=require}",
+            "bind_dn_template": "uid={username},dc=example,dc=test"
+        }),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "ldap-validator", LDAP_URL_VALIDATOR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(result.success, "{}{}", result.stdout, result.stderr);
+    assert!(
+        result
+            .stdout
+            .contains(&format!("ldaps://{VALIDATION_STANDIN_HOST}/")),
+        "the stand-in must be an LDAPS URL on the reserved host: {}",
+        result.stdout
+    );
+
+    // The stand-in lives in the temp spec only: the caller's config, and
+    // therefore everything export / apply / state serialize, still holds the
+    // placeholder.
+    assert_eq!(
+        config.plugin_configs[0].config["ldap_url"],
+        serde_json::json!("${gh-env-secret:alloc=require}")
+    );
+    let exported = serde_yaml::to_string(&config).unwrap();
+    assert!(
+        exported.contains("${gh-env-secret:alloc=require}"),
+        "{exported}"
+    );
+    assert!(!exported.contains(VALIDATION_STANDIN_HOST), "{exported}");
+}
+
+/// A nonsecret sibling that is genuinely wrong must still fail: stand-ins
+/// replace brokered leaves, they do not soften validation.
+#[cfg(unix)]
+#[test]
+fn a_broken_sibling_field_still_fails_with_a_stand_in_url() {
+    let config = plugin_config_for(
+        "ldap",
+        "ldap_auth",
+        serde_json::json!({"ldap_url": "${gh-env-secret:alloc=require}"}),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(
+        dir.path(),
+        "sibling-validator",
+        "#!/bin/sh\ngrep -q 'bind_dn_template' \"$7\" || { echo 'error: ldap_auth: missing bind_dn_template' >&2; exit 1; }\nexit 0\n",
+    );
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(!result.success);
+    assert!(
+        result.stderr.contains("missing bind_dn_template"),
+        "{}",
+        result.stderr
+    );
+}
+
+/// Shape selection, without a subprocess: endpoint-typed leaves become URLs
+/// with the scheme their plugin requires, token-typed leaves keep the opaque
+/// 64-hex form, and a header map keeps its keys.
+#[test]
+fn plugin_config_stand_ins_are_shape_aware_and_input_only() {
+    use gitforgeops::config::schema::{GatewayConfig, PluginConfig, PluginScope};
+    use gitforgeops::validate::{
+        with_validation_standins, VALIDATION_STANDIN_HOST, VALIDATION_STANDIN_PREFIX,
+    };
+
+    let plugin = |id: &str, plugin_name: &str, config: serde_json::Value| PluginConfig {
+        extra: Default::default(),
+        id: id.to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: "ferrum".to_string(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    let placeholder = serde_json::json!("${gh-env-secret:alloc=require}");
+    let config = GatewayConfig {
+        plugin_configs: vec![
+            plugin(
+                "ldap",
+                "ldap_auth",
+                serde_json::json!({"ldap_url": placeholder}),
+            ),
+            plugin(
+                "rl",
+                "rate_limiting",
+                serde_json::json!({"redis_url": placeholder, "limit": "100"}),
+            ),
+            plugin(
+                "otel",
+                "otel_tracing",
+                serde_json::json!({
+                    "endpoint": placeholder,
+                    "headers": {"x-honeycomb-team": placeholder}
+                }),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    let patched = with_validation_standins(&config).expect("substitution");
+    let value = |index: usize, path: &[&str]| -> String {
+        let mut cursor = &patched.plugin_configs[index].config;
+        for part in path {
+            cursor = &cursor[*part];
+        }
+        cursor.as_str().expect("string leaf").to_string()
+    };
+
+    assert_eq!(
+        value(0, &["ldap_url"]).split("://").next(),
+        Some("ldaps"),
+        "{}",
+        value(0, &["ldap_url"])
+    );
+    assert!(value(1, &["redis_url"]).starts_with("redis://"));
+    assert!(value(2, &["endpoint"]).starts_with("https://"));
+    for index in 0..3 {
+        assert!(
+            value(index, &[["ldap_url", "redis_url", "endpoint"][index]])
+                .contains(VALIDATION_STANDIN_HOST)
+        );
+    }
+
+    // A non-endpoint leaf keeps the opaque token shape, and its header key is
+    // untouched.
+    let header = value(2, &["headers", "x-honeycomb-team"]);
+    assert!(header.starts_with(VALIDATION_STANDIN_PREFIX), "{header}");
+    assert!(patched.plugin_configs[2].config["headers"]
+        .as_object()
+        .expect("header map")
+        .contains_key("x-honeycomb-team"));
+
+    // A literal sibling is left exactly as written.
+    assert_eq!(
+        patched.plugin_configs[1].config["limit"],
+        serde_json::json!("100")
+    );
+
+    // Distinct per slot, stable across calls, and never applied to the input.
+    let again = with_validation_standins(&config).expect("substitution");
+    assert_eq!(
+        patched.plugin_configs[0].config,
+        again.plugin_configs[0].config
+    );
+    assert_ne!(value(0, &["ldap_url"]), value(1, &["redis_url"]));
+    assert_eq!(
+        config.plugin_configs[0].config["ldap_url"],
+        serde_json::json!("${gh-env-secret:alloc=require}")
+    );
+}
