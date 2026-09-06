@@ -114,6 +114,7 @@ def configured_responses(
     main = copy.deepcopy(main)
     main["id"] = 7
     main["source_type"] = "Repository"
+    main["source"] = REPO
     for rule in main["rules"]:
         if rule["type"] == "pull_request":
             rule["parameters"]["require_last_push_approval"] = False
@@ -124,6 +125,8 @@ def configured_responses(
         )
     )
     tag["id"] = 8
+    tag["source_type"] = "Repository"
+    tag["source"] = REPO
 
     responses = {
         f"repos/{REPO}/actions/permissions": {
@@ -286,6 +289,37 @@ class IdempotencyTests(unittest.TestCase):
         self.assertEqual(
             recorded[f"variable {bootstrap.STATE_APP_VARIABLE}"], bootstrap.CREATE
         )
+
+    def test_unrelated_rulesets_are_not_repurposed(self):
+        responses = configured_responses()
+        main = responses[f"repos/{REPO}/rulesets/7"]
+        main["name"] = "production-lockdown"
+        main["conditions"]["ref_name"]["include"] = ["refs/heads/production"]
+        tag = responses[f"repos/{REPO}/rulesets/8"]
+        tag["name"] = "production-tags-lockdown"
+        tag["conditions"]["ref_name"]["include"] = ["refs/tags/prod-*"]
+
+        api = FakeApi(responses)
+        plan = bootstrap.build_plan(api, namespace())
+        ruleset_steps = [step for step in plan.steps if step.target.endswith(" ruleset")]
+
+        self.assertEqual([step.action for step in ruleset_steps], [bootstrap.CREATE] * 2)
+        self.assertEqual(
+            [step.writes[0][:2] for step in ruleset_steps],
+            [("POST", f"repos/{REPO}/rulesets")] * 2,
+        )
+
+    def test_same_name_with_different_ref_is_not_repurposed(self):
+        responses = configured_responses()
+        main = responses[f"repos/{REPO}/rulesets/7"]
+        main["conditions"]["ref_name"]["include"] = ["refs/heads/production"]
+
+        api = FakeApi(responses)
+        plan = bootstrap.build_plan(api, namespace())
+        main_step = next(step for step in plan.steps if step.target == "main ruleset")
+
+        self.assertEqual(main_step.action, bootstrap.CREATE)
+        self.assertEqual(main_step.writes[0][0], "POST")
 
     def test_controls_are_planned_in_the_documented_order(self):
         api = FakeApi(configured_responses())
