@@ -1100,10 +1100,10 @@ Protected main HEAD: 9ab1…
 
 Everything after that point — the `gitforgeops` binary it builds, the desired resources it assembles, and the `.state/<env>.json` it reconciles against — comes from that one commit. Two consequences worth knowing:
 
-- **Merges that queue up collapse safely.** Merge B queued behind A's apply used to read a ledger that predated A's state commit, see A's new rows as unmanaged, and stop reconciling them. Now B reconciles A's tree plus its own, against A's published ledger.
-- **A stale run is rejected, not silently replayed.** If the triggering commit is no longer an ancestor of the protected head (a re-run of an old workflow after the branch was rewritten, or a revision that was force-pushed away), the job fails before it builds a binary or contacts the gateway. Re-run the apply for the current head instead.
+- **Queued runs consume current generated state safely.** Merge B queued behind A's apply reads A's published ledger rather than treating A's rows as unmanaged. Only `.state/**` and file-mode `assembled/**` may differ from B's triggering revision.
+- **A stale or superseded run is rejected, not silently replayed.** A trigger that is no longer an ancestor is stale. An ancestor whose protected head contains any newer non-generated change is superseded. Both fail before building a binary or contacting the gateway; the newer merge's own run must reconcile that revision.
 
-Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author, because that is who is waiting for the slot. Every later merge has its own apply run with its own attribution.
+Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author. The generated-state-only guard guarantees that a later PR's desired input or executable cannot be applied under that attribution.
 
 ### Post-apply convergence
 
@@ -1116,9 +1116,9 @@ The merge commit is already on `main`, but config isn't (fully) applied. Re-run 
 1. Incremental mode re-fetches actual state via `GET /backup`, so already-applied resources are skipped.
 2. Full-replace mode is idempotent — `POST /restore` converges regardless of prior partial state.
 3. `.state/<env>.json` is an ownership manifest of the *last successful* apply; it never causes re-runs to skip work.
-4. The re-run reconciles the protected branch's **current** head, not the tree as it stood at the original merge — so a re-run started after later merges landed converges to the newest desired state rather than rolling it back. See [Ordering between runs](#ordering-between-runs-the-environment-lock-and-the-freshness-guard).
+4. The re-run refreshes generated ownership state from the protected branch, but refuses to run if a later substantive merge has superseded its desired input. Use that newer merge's apply run instead. See [Ordering between runs](#ordering-between-runs-the-environment-lock-and-the-freshness-guard).
 
-The one way a re-run refuses to start is a `Stale deployment` error, which means the commit that triggered the original run is no longer an ancestor of `main` — the branch was rewritten under it. Nothing was mutated; trigger a fresh apply from the current head.
+A `Stale deployment` error means the triggering commit is no longer an ancestor of `main`; a `Superseded deployment` error means a newer substantive revision is present. Nothing was mutated in either case; use the current revision's apply run.
 
 Two failures are the exception — do **not** blindly re-run:
 

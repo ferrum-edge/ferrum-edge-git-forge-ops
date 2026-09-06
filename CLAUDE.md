@@ -192,7 +192,10 @@ that runs before any build or gateway call: re-fetch the branch, `git checkout
 --force -B <branch> refs/remotes/origin/<branch>` (stay on the branch — the
 ledger commit later pushes it), print the triggering SHA and the branch head,
 and fail closed unless `git merge-base --is-ancestor` puts the trigger inside
-that head. Binary, desired state and ledger then all come from one commit;
+that head. Apply additionally permits differences from the trigger only under
+`.state/**` and `assembled/**`, binding the triggering PR's authorization and
+credential recipient to unchanged executable and desired inputs. Binary,
+desired state and ledger then all come from the refreshed checkout;
 `GITHUB_SHA` for the apply is that refreshed head, matching
 `state.last_applied_commit`. PR attribution (override label, credential
 recipient) stays on the triggering merge. `check_supply_chain.py::

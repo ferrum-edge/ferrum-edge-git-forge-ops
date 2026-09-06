@@ -937,6 +937,26 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("merge-base --is-ancestor" in item for item in violations), violations
         )
 
+    def test_apply_freshness_guard_must_bind_pr_attribution_to_revision(self):
+        # A queued old run may consume newer state-writer output, but it must
+        # not apply a later PR's resources or policy under the old PR's label
+        # and credential recipient.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8")
+            text = text.replace(
+                '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
+                "            ':(exclude).state/**' ':(exclude)assembled/**' || {\n",
+                '          true || {\n',
+                1,
+            )
+            path.write_text(text, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("must bind PR attribution" in item for item in violations), violations
+        )
+
     def test_state_commits_must_not_suppress_required_checks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))

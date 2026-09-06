@@ -191,6 +191,17 @@ jobs:
             echo "::error::Stale deployment: $TRIGGER_SHA is not an ancestor of ${DEFAULT_BRANCH} at $fresh_head. Re-run the apply for the current head instead."
             exit 1
           }
+          # PR authorization and credential delivery below are intentionally
+          # attributed to TRIGGER_SHA. A newer resource, policy, workflow, or
+          # binary revision must therefore never ride an older run's approval.
+          # State-writer commits are the sole exception: they advance the
+          # ownership ledger (and file-mode generated output) without changing
+          # the desired input or executable that the triggering PR approved.
+          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \
+            ':(exclude).state/**' ':(exclude)assembled/**' || {
+            echo "::error::Superseded deployment: ${DEFAULT_BRANCH} at $fresh_head contains changes beyond generated state since triggering commit $TRIGGER_SHA. Let the newer merge's apply run reconcile its own revision."
+            exit 1
+          }
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Download ferrum-edge binary
@@ -271,11 +282,11 @@ jobs:
       # ${{ github.actor }} for delivery would target the merger (or a bot),
       # not the contributor who actually requested the credential slot.
       #
-      # Attribution stays keyed on the TRIGGERING merge, not on the refreshed
-      # head: this run exists because that merge landed, and its author is the
-      # one waiting for a credential. When the head has moved further ahead,
-      # each of those later merges also has its own apply run, with its own
-      # attribution and its own override label.
+      # Attribution stays keyed on the TRIGGERING merge. The freshness guard
+      # permits the refreshed head to differ only in generated state/output,
+      # so the executable and desired input remain exactly those reviewed in
+      # this PR. A later substantive merge must use its own apply run, author,
+      # and override label.
       - name: Derive PR metadata from merge commit
         id: pr
         env:

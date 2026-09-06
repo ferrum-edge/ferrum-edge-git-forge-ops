@@ -89,6 +89,11 @@ FRESH_HEAD_CONTROLS = (
     'git cat-file -e "${TRIGGER_SHA}^{commit}"',
     'git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head"',
 )
+APPLY_REVISION_BINDING = (
+    'git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- .',
+    "':(exclude).state/**'",
+    "':(exclude)assembled/**'",
+)
 # Per privileged reconciling workflow: the checkout step name, the job-level
 # markers that prove the environment lock is already held, and every step that
 # must not run before the freshness guard.
@@ -327,6 +332,13 @@ def stale_deployment_guard_violations(
             violations.append(
                 f"{workflow}: {FRESH_HEAD_STEP!r} is missing {required!r}"
             )
+    if workflow == "apply-on-merge.yml":
+        for required in APPLY_REVISION_BINDING:
+            if required not in guard:
+                violations.append(
+                    f"{workflow}: {FRESH_HEAD_STEP!r} must bind PR attribution "
+                    f"to unchanged executable and desired inputs; missing {required!r}"
+                )
     guard_index = text.find(f"      - name: {FRESH_HEAD_STEP}\n")
     for marker in contract["lock"]:
         marker_index = text.find(marker)
