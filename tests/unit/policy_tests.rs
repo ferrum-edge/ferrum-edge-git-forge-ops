@@ -240,7 +240,7 @@ fn allowed_proxy_plugins_flags_disallowed_associations() {
         },
     ];
 
-    let cfg = GatewayConfig {
+    let mut cfg = GatewayConfig {
         proxies: vec![p],
         plugin_configs: vec![
             plugin_config("plugin-keyauth", "key_auth", "ferrum"),
@@ -248,6 +248,9 @@ fn allowed_proxy_plugins_flags_disallowed_associations() {
         ],
         ..Default::default()
     };
+    for plugin in &mut cfg.plugin_configs {
+        plugin.proxy_id = Some("p1".into());
+    }
     let policies = PolicyConfig {
         policies: PolicyRules {
             allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
@@ -3255,4 +3258,82 @@ fn shipped_policy_example_parses_and_keeps_every_rule_opt_in() {
             "auth_plugin_names lists {name}, which is not a gateway auth plugin"
         );
     }
+}
+
+#[test]
+fn allowed_proxy_plugins_checks_effective_namespace_globals() {
+    let mut other_proxy = proxy("other", BackendScheme::Https, 30_000, true);
+    other_proxy.namespace = "other".into();
+    let mut global = plugin_config("global", "request_transformer", "ferrum");
+    global.scope = PluginScope::Global;
+    let mut allowed_global = plugin_config("allowed", "key_auth", "ferrum");
+    allowed_global.scope = PluginScope::Global;
+    let mut disabled = plugin_config("disabled", "response_transformer", "ferrum");
+    disabled.scope = PluginScope::Global;
+    disabled.enabled = false;
+    let cfg = GatewayConfig {
+        proxies: vec![
+            proxy("p1", BackendScheme::Https, 30_000, true),
+            proxy("p2", BackendScheme::Https, 30_000, true),
+            other_proxy,
+        ],
+        plugin_configs: vec![global, allowed_global, disabled],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_plugin_names: vec!["KEY_AUTH".into()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    assert_eq!(findings[0].id, "p1");
+    assert_eq!(findings[1].id, "p2");
+    for finding in findings {
+        assert!(finding.is_blocking());
+        assert_eq!(finding.namespace, "ferrum");
+        assert!(finding.message.contains("plugin global"));
+        assert!(finding.message.contains("request_transformer"));
+    }
+}
+
+#[test]
+fn allowed_proxy_plugins_reports_only_effective_scoped_instances() {
+    let p = attach(
+        proxy("p1", BackendScheme::Https, 30_000, true),
+        &["scoped", "disabled"],
+    );
+    let mut global = plugin_config("global", "request_transformer", "ferrum");
+    global.scope = PluginScope::Global;
+    let mut scoped = plugin_config("scoped", "request_transformer", "ferrum");
+    scoped.proxy_id = Some("p1".into());
+    let mut disabled = plugin_config("disabled", "response_transformer", "ferrum");
+    disabled.proxy_id = Some("p1".into());
+    disabled.enabled = false;
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        plugin_configs: vec![global, scoped, disabled],
+        ..Default::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_plugin_names: vec!["key_auth".into()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].message.contains("plugin scoped"));
+    assert!(findings[0].message.contains("request_transformer"));
 }
