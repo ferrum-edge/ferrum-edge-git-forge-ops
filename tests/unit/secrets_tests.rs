@@ -2054,7 +2054,10 @@ fn serve_public_key_pages(
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}/users/fixture/keys", listener.local_addr().unwrap());
+    let endpoint = format!(
+        "http://{}/users/fixture/keys",
+        listener.local_addr().unwrap()
+    );
     let response_endpoint = endpoint.clone();
     let server = std::thread::spawn(move || {
         let mut requests = Vec::new();
