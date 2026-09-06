@@ -452,10 +452,7 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
 /// Match the import and diagnostic-scrubber classification before resolution.
 /// Disabled plugins are included because their config is still published.
 /// Findings identify the resource and field, never the classified value.
-fn check_literal_plugin_config_secrets(
-    plugin: &PluginConfig,
-    findings: &mut Vec<SecurityFinding>,
-) {
+fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
         let Some(serde_json::Value::String(value)) = value_at(&plugin.config, &path) else {
             continue;
