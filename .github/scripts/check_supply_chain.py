@@ -211,6 +211,25 @@ def credential_shard_limit(root: Path) -> tuple[int | None, list[str]]:
     return (rust_limit if rust_limit == loader_limit else None), violations
 
 
+def import_shard_ceiling_violations(root: Path) -> list[str]:
+    """Keep import packing on the same named-shard ceiling as allocation."""
+    path = root / "src/import/mod.rs"
+    source = path.read_text(encoding="utf-8") if path.is_file() else ""
+    start = source.find("fn render_migration_bundles(")
+    end = source.find("\nfn ", start + 1) if start >= 0 else -1
+    packing = source[start:end if end >= 0 else None] if start >= 0 else ""
+    if not re.search(
+        r'if\s+shard\s*>=\s*MAX_BUNDLE_SHARDS\s*\{\s*'
+        r'return\s+Err\(shard_ceiling_error\(slot,\s*"import"\)\);\s*\}',
+        packing,
+    ):
+        return [
+            "src/import/mod.rs: migration packing must refuse shard >= "
+            "MAX_BUNDLE_SHARDS with the shared shard_ceiling_error"
+        ]
+    return []
+
+
 def named_step(text: str, step_name: str) -> str | None:
     marker = f"      - name: {step_name}\n"
     start = text.find(marker)
@@ -971,6 +990,7 @@ def main(argv: list[str] | None = None) -> int:
 
     shard_limit, shard_limit_violations = credential_shard_limit(root)
     violations.extend(shard_limit_violations)
+    violations.extend(import_shard_ceiling_violations(root))
 
     for privileged_workflow in PRIVILEGED_WORKFLOWS:
         text = (workflows / privileged_workflow).read_text(encoding="utf-8")
