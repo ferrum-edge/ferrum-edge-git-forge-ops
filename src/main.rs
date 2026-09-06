@@ -863,6 +863,7 @@ fn cmd_validate(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
+    enforce_exclusive_scope(&resolved, &gateway_config)?;
     let _ = resolve_credentials(&mut gateway_config, &env_config)?;
 
     let result = validate::run_validation(&gateway_config, &env_config.edge_binary_path)?;
@@ -921,6 +922,7 @@ async fn cmd_export(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
+    enforce_exclusive_scope(&resolved, &gateway_config)?;
 
     if materialize {
         // Fail fast if credentials cannot be fully resolved — we don't want

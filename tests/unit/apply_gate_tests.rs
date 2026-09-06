@@ -634,3 +634,69 @@ spec:
         stdout(&output)
     );
 }
+
+#[test]
+fn offline_commands_enforce_exclusive_ownership_before_validation_or_export() {
+    for (mode, owned, filter, expected_error) in [
+        ("exclusive", "[ferrum]", None, Some("outside that list")),
+        (
+            "exclusive",
+            "[ferrum]",
+            Some("platform"),
+            Some("namespace_filter 'platform'"),
+        ),
+        ("exclusive", "[ferrum, platform]", None, None),
+        ("shared", "[ferrum]", None, None),
+    ] {
+        let config = format!(
+            "version: 1\ndefault_environment: production\nenvironments:\n  production:\n    overlay: staging\n    ownership:\n      mode: {mode}\n      namespaces: {owned}\n"
+        );
+        let other_proxy = HTTPS_PROXY.replace("app", "other");
+        let repo = Repo::with_files(&[
+            (".gitforgeops/config.yaml", &config),
+            ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
+            ("resources/platform/proxies/other.yaml", &other_proxy),
+        ]);
+        std::fs::create_dir_all(repo.dir.path().join("overlays/staging")).unwrap();
+        std::fs::write(&repo.validator, "#!/bin/sh\ntouch validator-ran\nexit 0\n").unwrap();
+        let marker = repo.dir.path().join("validator-ran");
+        let artifact = repo.dir.path().join("export.yaml");
+        for args in [
+            vec!["validate"],
+            vec!["export", "--output", "export.yaml"],
+            vec!["export", "--materialize", "--output", "export.yaml"],
+        ] {
+            std::fs::write(&artifact, "existing artifact").unwrap();
+            let mut env = Vec::new();
+            if let Some(filter) = filter {
+                env.push(("FERRUM_NAMESPACE", filter));
+            }
+            if expected_error.is_some() {
+                // Scope rejection must happen before credential parsing too.
+                env.push(("FERRUM_CREDS_JSON", "not valid JSON"));
+            }
+            let output = repo.run(&args, &env);
+            assert_eq!(
+                output.status.success(),
+                expected_error.is_none(),
+                "{mode} {owned} {filter:?} {args:?}: {} {}",
+                stdout(&output),
+                stderr(&output)
+            );
+            if let Some(expected) = expected_error {
+                assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+                assert!(!marker.exists(), "scope rejection must precede validation");
+                assert_eq!(
+                    std::fs::read_to_string(&artifact).unwrap(),
+                    "existing artifact"
+                );
+            } else if args[0] == "export" {
+                let exported = std::fs::read_to_string(&artifact).unwrap();
+                assert!(exported.contains("platform"));
+                assert!(exported.contains("ferrum"));
+            } else {
+                assert!(marker.exists(), "valid scope must reach the validator");
+            }
+        }
+    }
+}

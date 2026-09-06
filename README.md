@@ -505,6 +505,11 @@ The journal survives a crashed CI process, because the apply workflow commits st
 
 ### `exclusive` (strict 1:1)
 
+`validate` and `export` (including `--materialize`) enforce the same offline
+ownership namespace scope as plan/apply before resolving credentials, invoking
+the validator, or writing an artifact. Shared-mode validation/export retain their
+existing scope behavior.
+
 - Repo is authoritative for the listed `namespaces`.
 - Unmanaged resources in those namespaces → **pruned**.
 - Requires explicit `namespaces` list (safety rail against misconfiguration).
