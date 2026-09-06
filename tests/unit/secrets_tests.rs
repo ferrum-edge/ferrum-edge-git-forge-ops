@@ -2144,7 +2144,7 @@ async fn ssh_key_discovery_distinguishes_exhaustion_from_the_page_cap() {
             .unwrap();
         let result = fetch_ssh_recipient(&client, &endpoint).await;
         if expected_error {
-            let error = result.err().expect("incomplete discovery must fail");
+            let error = result.expect_err("incomplete discovery must fail");
             assert!(error.to_string().contains("pagination safety cap"));
         } else {
             assert_eq!(result.unwrap().is_some(), expected_some);
