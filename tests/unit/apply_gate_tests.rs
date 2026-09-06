@@ -245,6 +245,28 @@ fn plan_exits_nonzero_on_a_literal_consumer_credential() {
 }
 
 #[test]
+fn plan_and_apply_refuse_literal_plugin_secrets_without_publication() {
+    const PLUGIN: &str = r#"kind: PluginConfig
+spec:
+  id: "otel"
+  plugin_name: "otel_tracing"
+  scope: global
+  config:
+    authorization: "Bearer synthetic-plugin-value"
+"#;
+    for args in [vec!["plan"], vec!["apply", "--auto-approve"]] {
+        let repo = Repo::with_files(&[("resources/ferrum/plugins/otel.yaml", PLUGIN)]);
+        let output = repo.run(&args, &[]);
+        assert!(!output.status.success());
+        let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(diagnostics.contains("Literal plugin-config secret"));
+        assert!(diagnostics.contains("config.authorization"));
+        assert!(!diagnostics.contains("synthetic-plugin-value"));
+        assert!(!repo.published().exists());
+    }
+}
+
+#[test]
 fn plan_exits_zero_for_a_brokered_consumer() {
     let repo = Repo::with_consumer(BROKERED_CONSUMER);
 

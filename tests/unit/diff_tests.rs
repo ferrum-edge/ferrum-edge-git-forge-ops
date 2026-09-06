@@ -684,6 +684,63 @@ fn security_detects_literal_credential() {
 }
 
 #[test]
+fn security_blocks_classified_plugin_literals_without_exposing_values() {
+    use gitforgeops::diff::security_blockers;
+
+    for enabled in [true, false] {
+        let mut plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+        plugin.enabled = enabled;
+        plugin.config = serde_json::json!({
+            "authorization": "Bearer synthetic-authorization",
+            "headers": {"x-api-key": "synthetic-header-value"},
+            "endpoint": "https://collector.example.test",
+            "service_name": "ordinary-service"
+        });
+        let config = GatewayConfig {
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let findings = audit_security(&config);
+        let blockers = security_blockers(&findings);
+        assert_eq!(blockers.len(), 3, "{findings:?}");
+        for field in ["authorization", "headers.x-api-key", "endpoint"] {
+            assert!(blockers.iter().any(|finding| {
+                finding.kind == "PluginConfig"
+                    && finding.id == "otel"
+                    && finding.message.contains(&format!("config.{field}"))
+            }));
+        }
+        for finding in findings {
+            for value in [
+                "synthetic-authorization",
+                "synthetic-header-value",
+                "collector.example.test",
+            ] {
+                assert!(!finding.message.contains(value));
+            }
+        }
+    }
+}
+
+#[test]
+fn security_accepts_brokered_plugin_fields_and_unclassified_settings() {
+    use gitforgeops::diff::security_blockers;
+
+    let mut plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    plugin.config = serde_json::json!({
+        "authorization": "${gh-env-secret:alloc=require}",
+        "headers": {"x-api-key": "${gh-env-secret:alloc=require}"},
+        "endpoint": "${gh-env-secret:alloc=require}",
+        "service_name": "ordinary-service"
+    });
+    let config = GatewayConfig {
+        plugin_configs: vec![plugin],
+        ..GatewayConfig::default()
+    };
+    assert!(security_blockers(&audit_security(&config)).is_empty());
+}
+
+#[test]
 fn security_blockers_selects_only_error_severity_findings() {
     use gitforgeops::diff::security_blockers;
 

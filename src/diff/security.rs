@@ -8,6 +8,7 @@ use crate::plugin_catalog::{
 };
 use crate::policy::config::default_auth_plugin_names;
 use crate::policy::PolicyConfig;
+use crate::secrets::plugin_config::{render_config_path, sensitive_string_paths, value_at};
 use crate::secrets::resolver::is_identity_credential_leaf;
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,7 @@ pub fn audit_security_with_policy(
     }
 
     for plugin in &config.plugin_configs {
+        check_literal_plugin_config_secrets(plugin, &mut findings);
         check_plugin(plugin, &mut findings);
     }
 
@@ -442,6 +444,33 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
             ns,
             format!(
                 "{name} plugin {id} in namespace {ns} carries a trigger — authentication only runs when the predicate matches, leaving the remaining requests public; drop the trigger unless the exemption is intended"
+            ),
+        ));
+    }
+}
+
+/// Match the import and diagnostic-scrubber classification before resolution.
+/// Disabled plugins are included because their config is still published.
+/// Findings identify the resource and field, never the classified value.
+fn check_literal_plugin_config_secrets(
+    plugin: &PluginConfig,
+    findings: &mut Vec<SecurityFinding>,
+) {
+    for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
+        let Some(serde_json::Value::String(value)) = value_at(&plugin.config, &path) else {
+            continue;
+        };
+        if value.starts_with("${") {
+            continue;
+        }
+        let path = render_config_path(&path);
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            &plugin.id,
+            &plugin.namespace,
+            format!(
+                "Literal plugin-config secret in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                plugin.id, plugin.plugin_name, plugin.namespace
             ),
         ));
     }
