@@ -226,7 +226,8 @@ fn build_review_comment_inner(
             .iter()
             .filter(|finding| finding.severity == crate::diff::security::BLOCKING_SEVERITY)
             .count();
-        if let Some(decision) = security_override.filter(|decision| decision.active && blocking > 0) {
+        if let Some(decision) = security_override.filter(|decision| decision.active && blocking > 0)
+        {
             let approver = decision.approver.as_deref().unwrap_or("verified approver");
             md.push_str(&format!(
                 "> **Security findings OVERRIDDEN by {}**: {blocking} error-severity finding(s) remain listed above but do not block apply under this verified PR override. Validation and other admission gates still apply.\n\n",

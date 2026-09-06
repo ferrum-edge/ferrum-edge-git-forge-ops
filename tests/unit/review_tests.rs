@@ -1280,7 +1280,11 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
             decision,
         );
         let overridden = decision.is_some_and(|decision| decision.active);
-        assert_eq!(comment.contains("Apply is blocked"), !overridden, "{comment}");
+        assert_eq!(
+            comment.contains("Apply is blocked"),
+            !overridden,
+            "{comment}"
+        );
         assert_eq!(
             comment.contains("Security findings OVERRIDDEN by `reviewer`"),
             overridden,

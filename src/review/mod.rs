@@ -134,7 +134,9 @@ pub fn validate_for_review(
         execution_error: None,
     };
     for (kind, result) in results {
-        summary.output.push_str(&format!("=== {kind} validation ===\n"));
+        summary
+            .output
+            .push_str(&format!("=== {kind} validation ===\n"));
         match result {
             Ok(result) => {
                 summary.output.push_str(&result.stdout);
