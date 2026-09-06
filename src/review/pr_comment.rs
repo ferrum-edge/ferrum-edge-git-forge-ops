@@ -3,6 +3,7 @@ use crate::diff::breaking::BreakingChange;
 use crate::diff::resource_diff::{DiffAction, ResourceDiff, SpecOwnedResource, UnmanagedResource};
 use crate::diff::security::SecurityFinding;
 use crate::policy::config::OverrideConfig;
+use crate::policy::github_override::OverrideDecision;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
 
@@ -93,9 +94,11 @@ pub fn build_review_comment_with_status(
         security,
         best_practices,
         comparison_error,
+        None,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_review_comment_inner(
     validation_status: ReviewValidationStatus,
     validation_output: &str,
@@ -104,6 +107,7 @@ fn build_review_comment_inner(
     security: &[SecurityFinding],
     best_practices: &[BestPractice],
     comparison_error: Option<&str>,
+    security_override: Option<&OverrideDecision>,
 ) -> String {
     let mut md = String::new();
 
@@ -216,15 +220,19 @@ fn build_review_comment_inner(
         }
         append_omitted_list_item(&mut md, security.len(), "security finding");
         md.push('\n');
-        // The reviewer's copy of apply's verdict. `cmd_apply` refuses on
-        // exactly this set (see `diff::security_blockers`), so a comment that
-        // listed the findings without saying they are terminal would read as
-        // advice on a PR that cannot be merged-and-applied.
+        // Mirror apply's security verdict, including its verified override.
+        // Keep every finding visible whether it blocks apply or is overridden.
         let blocking = security
             .iter()
             .filter(|finding| finding.severity == crate::diff::security::BLOCKING_SEVERITY)
             .count();
-        if blocking > 0 {
+        if let Some(decision) = security_override.filter(|decision| decision.active && blocking > 0) {
+            let approver = decision.approver.as_deref().unwrap_or("verified approver");
+            md.push_str(&format!(
+                "> **Security findings OVERRIDDEN by {}**: {blocking} error-severity finding(s) remain listed above but do not block apply under this verified PR override. Validation and other admission gates still apply.\n\n",
+                bounded_inline_code(approver),
+            ));
+        } else if blocking > 0 {
             md.push_str(&format!(
                 "> **Apply is blocked** by {blocking} error-severity security finding(s). \
                  Consumer credentials must be committed as `${{gh-env-secret:...}}` placeholders — \
@@ -664,6 +672,45 @@ pub fn build_review_comment_v2_with_status(
     secrets: &ResolveReport,
     bundle_loaded: bool,
 ) -> String {
+    build_review_comment_v2_with_override(
+        validation_status,
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        policy,
+        unmanaged,
+        spec_owned,
+        override_reason,
+        override_cfg,
+        comparison_error,
+        environment_note,
+        secrets,
+        bundle_loaded,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_review_comment_v2_with_override(
+    validation_status: ReviewValidationStatus,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    policy: &[PolicyFinding],
+    unmanaged: &[UnmanagedResource],
+    spec_owned: &[SpecOwnedResource],
+    override_reason: Option<&str>,
+    override_cfg: Option<&OverrideConfig>,
+    comparison_error: Option<&str>,
+    environment_note: Option<&str>,
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+    security_override: Option<&OverrideDecision>,
+) -> String {
     let mut md = build_review_comment_inner(
         validation_status,
         validation_output,
@@ -672,6 +719,7 @@ pub fn build_review_comment_v2_with_status(
         security,
         best_practices,
         comparison_error,
+        security_override,
     );
 
     // Already-rendered markdown from `environment_header` — gitforgeops'

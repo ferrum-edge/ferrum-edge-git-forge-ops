@@ -1489,6 +1489,18 @@ output.
 
 ## PR review output
 
+The validation heading combines the gateway document and every assembled mesh
+fragment after overlays and namespace selection. Both must pass for `PASSED`;
+a rejected document reports `FAILED`, and an unavailable validator reports
+`ERROR`. Mesh remains outside the live gateway diff because it has no live
+Admin API comparison surface.
+
+Review uses the same verified PR override decision for policy and error-severity
+security findings as plan/apply, including security-only repositories using the
+default override configuration. Findings remain visible with the approver named
+when overridden. A missing or inactive override retains the blocking verdict;
+an override never changes the validation heading or other admission gates.
+
 ```markdown
 Environment: `staging` · Ownership: `Shared` · Strategy: `Incremental`
 

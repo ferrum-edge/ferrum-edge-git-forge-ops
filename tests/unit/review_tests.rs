@@ -1227,3 +1227,69 @@ fn live_comparison_enforcement_is_scoped_to_require_live() {
     assert!(enforce_live_comparison(true, None).is_ok());
     assert!(enforce_live_comparison(false, Some(STALE_LIVE_VIEW_REASON)).is_ok());
 }
+
+#[test]
+fn review_security_verdict_uses_verified_override_without_hiding_findings() {
+    use gitforgeops::policy::{github_override::apply_override, OverrideDecision};
+    use gitforgeops::review::build_review_comment_v2_with_override;
+
+    let security = vec![SecurityFinding {
+        severity: "error".into(),
+        kind: "Consumer".into(),
+        id: "app".into(),
+        namespace: "ferrum".into(),
+        message: "Literal credential in 'keyauth[0].key' on consumer app".into(),
+    }];
+    let active = OverrideDecision {
+        active: true,
+        approver: Some("reviewer".into()),
+        permission: Some("write".into()),
+        reason: "Verified configured label and write permission".into(),
+    };
+    let inactive = OverrideDecision::inactive("label missing or verification unavailable");
+    for decision in [None, Some(&inactive), Some(&active)] {
+        let mut policy = vec![PolicyFinding {
+            rule_id: "backend_scheme".into(),
+            severity: Severity::Error,
+            kind: "Proxy".into(),
+            id: "proxy".into(),
+            namespace: "ferrum".into(),
+            message: "http is not allowed".into(),
+            remediation: None,
+            overridden_by: None,
+        }];
+        if let Some(decision) = decision {
+            apply_override(&mut policy, decision);
+        }
+        let comment = build_review_comment_v2_with_override(
+            ReviewValidationStatus::Rejected,
+            "mesh rejected",
+            &[],
+            &[],
+            &security,
+            &[],
+            &policy,
+            &[],
+            &[],
+            decision.map(|decision| decision.reason.as_str()),
+            None,
+            None,
+            None,
+            &ResolveReport::default(),
+            false,
+            decision,
+        );
+        let overridden = decision.is_some_and(|decision| decision.active);
+        assert_eq!(comment.contains("Apply is blocked"), !overridden, "{comment}");
+        assert_eq!(
+            comment.contains("Security findings OVERRIDDEN by `reviewer`"),
+            overridden,
+            "{comment}"
+        );
+        assert!(comment.contains("Literal credential in"), "{comment}");
+        assert!(comment.contains("keyauth"), "{comment}");
+        assert!(comment.contains("http is not allowed"), "{comment}");
+        assert!(comment.contains("Validation: FAILED"), "{comment}");
+        assert!(comment.contains("mesh rejected"), "{comment}");
+    }
+}

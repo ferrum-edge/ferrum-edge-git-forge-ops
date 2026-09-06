@@ -1062,3 +1062,75 @@ fn an_ordinary_single_line_secret_keeps_full_diagnostics() {
         result.stderr
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn review_validates_gateway_and_mesh_before_reporting_passed() {
+    use gitforgeops::config::{GatewayConfig, MeshConfigSpec};
+    use gitforgeops::review::{
+        build_review_comment_with_status, validate_for_review, ReviewValidationStatus,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = GatewayConfig::default();
+    let mesh = MeshConfigSpec::default();
+    for (script, include_mesh, expected) in [
+        (
+            "#!/bin/sh\necho mode-$3\nif [ \"$3\" = mesh ]; then echo 'mesh rejected' >&2; exit 1; fi\n",
+            true,
+            ReviewValidationStatus::Rejected,
+        ),
+        (
+            "#!/bin/sh\necho mode-$3\nif [ \"$3\" = file ]; then echo 'gateway rejected' >&2; exit 1; fi\n",
+            true,
+            ReviewValidationStatus::Rejected,
+        ),
+        (
+            "#!/bin/sh\necho mode-$3\n",
+            true,
+            ReviewValidationStatus::Passed,
+        ),
+        (
+            "#!/bin/sh\necho mode-$3\nif [ \"$3\" = mesh ]; then exit 1; fi\n",
+            false,
+            ReviewValidationStatus::Passed,
+        ),
+    ] {
+        let binary = echo_validator(dir.path(), "review-validator", script);
+        let result = validate_for_review(
+            &gateway,
+            include_mesh.then_some(&mesh),
+            binary.to_str().unwrap(),
+        );
+        assert_eq!(result.status, expected, "{}", result.output);
+        assert!(result.output.contains("mode-file"));
+        assert_eq!(result.output.contains("mode-mesh"), include_mesh);
+        assert!(result.execution_error.is_none());
+        let comment = build_review_comment_with_status(
+            result.status,
+            &result.output,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert_eq!(
+            comment.contains("Validation: PASSED"),
+            expected == ReviewValidationStatus::Passed
+        );
+        if expected == ReviewValidationStatus::Rejected {
+            assert!(comment.contains("Validation: FAILED"));
+            assert!(comment.contains("rejected"));
+        }
+    }
+    let result = validate_for_review(
+        &gateway,
+        Some(&mesh),
+        dir.path().join("missing-validator").to_str().unwrap(),
+    );
+    assert_eq!(result.status, ReviewValidationStatus::ExecutionError);
+    assert!(result.execution_error.is_some());
+    assert!(result.output.contains("gateway validator execution error"));
+    assert!(result.output.contains("mesh validator execution error"));
+}
