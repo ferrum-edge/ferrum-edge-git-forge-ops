@@ -165,8 +165,7 @@ impl Repo {
             use std::os::unix::fs::PermissionsExt;
             let validator = self.dir.path().join("validator-stub");
             std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o700))
-                .unwrap();
+            std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o700)).unwrap();
             command.env("FERRUM_EDGE_BINARY_PATH", validator);
         }
         command.output().expect("run gitforgeops")
