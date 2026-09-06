@@ -2047,3 +2047,105 @@ fn literal_consul_token_is_a_blocking_security_finding() {
     let none = config_with_consul_token(None);
     assert!(security_blockers(&audit_security(&none)).is_empty());
 }
+
+fn serve_public_key_pages(
+    pages: Vec<Vec<&'static str>>,
+    continue_after_last: bool,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/users/fixture/keys", listener.local_addr().unwrap());
+    let response_endpoint = endpoint.clone();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let page_count = pages.len();
+        for (index, keys) in pages.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                bytes.push(byte[0]);
+                assert!(bytes.len() < 16_384);
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            requests.push(request.lines().next().unwrap().to_string());
+            let body = serde_json::to_string(
+                &keys
+                    .into_iter()
+                    .map(|key| serde_json::json!({"key": key}))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let link = if index + 1 < page_count || continue_after_last {
+                format!(
+                    "Link: <{response_endpoint}?per_page=100&page={}>; rel=\"next\"\r\n",
+                    index + 2
+                )
+            } else {
+                String::new()
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{link}Connection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        requests
+    });
+    (endpoint, server)
+}
+
+#[tokio::test]
+async fn ssh_key_discovery_follows_pages_until_the_first_compatible_recipient() {
+    use gitforgeops::secrets::delivery::fetch_ssh_recipient;
+    for public_key in [TEST_ED25519_PUBLIC_KEY, TEST_RSA_PUBLIC_KEY] {
+        let (endpoint, server) = serve_public_key_pages(
+            vec![vec!["unsupported-public-key"], vec![public_key]],
+            false,
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let (_, fingerprint) = fetch_ssh_recipient(&client, &endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fingerprint.starts_with("SHA256:"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("?per_page=100 "));
+        assert!(requests[1].contains("?per_page=100&page=2 "));
+    }
+}
+
+#[tokio::test]
+async fn ssh_key_discovery_distinguishes_exhaustion_from_the_page_cap() {
+    use gitforgeops::secrets::delivery::{fetch_ssh_recipient, MAX_SSH_KEY_PAGES};
+    for (pages, has_next, expected_some, expected_error) in [
+        (vec![vec![]], false, false, false),
+        (
+            vec![vec!["unsupported-public-key"], vec![]],
+            false,
+            false,
+            false,
+        ),
+        (vec![vec![TEST_ED25519_PUBLIC_KEY]], false, true, false),
+        (vec![vec![]; MAX_SSH_KEY_PAGES], true, false, true),
+    ] {
+        let count = pages.len();
+        let (endpoint, server) = serve_public_key_pages(pages, has_next);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = fetch_ssh_recipient(&client, &endpoint).await;
+        if expected_error {
+            let error = result.err().expect("incomplete discovery must fail");
+            assert!(error.to_string().contains("pagination safety cap"));
+        } else {
+            assert_eq!(result.unwrap().is_some(), expected_some);
+        }
+        assert_eq!(server.join().unwrap().len(), count);
+    }
+}
