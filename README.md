@@ -874,8 +874,8 @@ Requires `FERRUM_GH_PROVISIONER_TOKEN` — a GitHub App installation token (pref
 ### Rotation
 
 For CLI rotation, an explicit `--namespace` selects the target; when omitted,
-`FERRUM_NAMESPACE` or the selected environment's `namespace_filter` supplies the
-default, falling back to `ferrum` when neither is set. The consumer must still be
+the selected environment's `namespace_filter` supplies the default, followed by
+`FERRUM_NAMESPACE`, then `ferrum`, matching resource assembly precedence. The consumer must still be
 present in the assembled scope. The workflow passes its namespace explicitly.
 
 Trigger the `rotate.yml` workflow manually:

@@ -641,7 +641,7 @@ fn rotate_namespace_selection_respects_resolved_scope_and_explicit_precedence() 
         (None, None, None, "ferrum"),
         (Some("platform"), None, None, "platform"),
         (None, Some("platform"), None, "platform"),
-        (Some("platform"), Some("operations"), None, "operations"),
+        (Some("platform"), Some("operations"), None, "platform"),
         (Some("platform"), None, Some("explicit"), "explicit"),
         (None, Some("platform"), Some("explicit"), "explicit"),
     ] {
