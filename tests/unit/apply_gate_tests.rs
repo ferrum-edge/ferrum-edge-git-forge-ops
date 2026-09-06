@@ -634,3 +634,56 @@ spec:
         stdout(&output)
     );
 }
+
+#[test]
+fn rotate_namespace_selection_respects_resolved_scope_and_explicit_precedence() {
+    for (configured, environment, explicit, expected) in [
+        (None, None, None, "ferrum"),
+        (Some("platform"), None, None, "platform"),
+        (None, Some("platform"), None, "platform"),
+        (Some("platform"), Some("operations"), None, "operations"),
+        (Some("platform"), None, Some("explicit"), "explicit"),
+        (None, Some("platform"), Some("explicit"), "explicit"),
+    ] {
+        let scope = configured
+            .map(|namespace| format!("    namespace_filter: {namespace}\n"))
+            .unwrap_or_default();
+        let config = format!(
+            "version: 1\ndefault_environment: production\nenvironments:\n  production:\n    overlay: staging\n{scope}"
+        );
+        let repo = Repo::with_files(&[
+            (".gitforgeops/config.yaml", &config),
+            ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
+        ]);
+        std::fs::create_dir_all(repo.dir.path().join("overlays/staging")).unwrap();
+        let mut args = vec![
+            "rotate",
+            "--consumer",
+            "missing-consumer",
+            "--credential",
+            "keyauth/key",
+        ];
+        if let Some(namespace) = explicit {
+            args.extend(["--namespace", namespace]);
+        }
+        let mut env = vec![
+            ("FERRUM_GATEWAY_MODE", "api"),
+            ("GITHUB_REPOSITORY", "test/fixture"),
+            ("FERRUM_GH_PROVISIONER_TOKEN", "unused-test-token"),
+            ("FERRUM_CREDS_JSON", "{}"),
+        ];
+        if let Some(namespace) = environment {
+            env.push(("FERRUM_NAMESPACE", namespace));
+        }
+        // No consumer or placeholder exists, so preflight must refuse before
+        // any provisioning, credential delivery, or gateway request.
+        let output = repo.run(&args, &env);
+        assert!(!output.status.success());
+        let diagnostic = stderr(&output);
+        assert!(
+            diagnostic.contains(&format!("slot '{expected}/missing-consumer/keyauth/key'")),
+            "{configured:?} {environment:?} {explicit:?}: {diagnostic}"
+        );
+        assert!(!repo.published().exists());
+    }
+}

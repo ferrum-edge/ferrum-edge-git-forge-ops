@@ -140,6 +140,8 @@ pub enum Commands {
         consumer: String,
         #[arg(long)]
         credential: String,
+        /// Target namespace; defaults to FERRUM_NAMESPACE, the environment
+        /// namespace_filter, then ferrum. An explicit value takes precedence.
         #[arg(long)]
         namespace: Option<String>,
         /// GitHub login to deliver the rotated credential to (age-encrypted).

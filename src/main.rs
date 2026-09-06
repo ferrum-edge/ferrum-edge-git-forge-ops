@@ -2633,7 +2633,9 @@ async fn cmd_rotate(
 
     let _state_lock = StateFile::lock(&resolved.name)?;
     let mut state = StateFile::load(&resolved.name)?;
-    let ns = namespace.unwrap_or("ferrum");
+    let ns = namespace
+        .or(resolved.namespace_filter.as_deref())
+        .unwrap_or("ferrum");
     let slot = secrets::resolver::slot_path(ns, consumer, credential);
 
     // ALL preflight checks must run BEFORE rotate_and_deliver mutates the
