@@ -347,8 +347,10 @@ def main_ruleset_body(bypass_actors: list[dict]) -> dict:
             {
                 "type": "pull_request",
                 "parameters": {
-                    "required_approving_review_count": 1,
-                    "require_code_owner_review": True,
+                    "required_approving_review_count": 0,
+                    "require_code_owner_review": False,
+                    "require_last_push_approval": False,
+                    "require_extra_approval_for_unattributed_changes": False,
                     "required_review_thread_resolution": True,
                     "dismiss_stale_reviews_on_push": True,
                 },
