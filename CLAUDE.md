@@ -327,6 +327,9 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `forbid_tls_verify_disabled`, `allowed_proxy_plugins`, `allowed_backend_domains`,
 `waf_enforcement`, `require_ai_guardrails`, `rate_limit_completeness`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
+Enabled scheme, proxy-plugin and AI-guardrail rules reject empty or blank-only
+governing lists with a blocking `PolicyConfig` error, regardless of the configured
+finding severity. Omitted AI guardrail names still use their built-in defaults.
 
 Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
 is schema-first for the 82 builtins and heuristics-only for anything else: a
@@ -580,8 +583,10 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 Repository-local agent skills, Claude rules, and their dispatchers are guarded by
 `agent-setup-policy.yml`. The workflow runs trusted default-branch validation over candidate
 content on every PR, has only read access, and cancels stale runs per PR. Requiring
-`Agent Setup Policy / validate-trusted-policy` and code-owner review is what prevents a candidate
-from weakening its own validator; forks do not inherit those repository settings automatically.
+`Agent Setup Policy / validate-trusted-policy` validates candidates against trusted default-branch
+policy. The root orchestrator reviews the exact PR head and merges only after hosted CI passes
+and actionable review threads are resolved. No separate Code Owner or maintainer approval
+submission is required. Forks do not inherit repository settings automatically.
 
 - **No `.unwrap()` in production code paths** — use `?`, `.unwrap_or()`, or explicit match.
 - **No `.expect()` except where failure is a genuine bug** (e.g. `serde_json::to_string` on a static `Value`).

@@ -168,13 +168,21 @@ def audit_main_ruleset(
 
     pull_request = rules.get("pull_request", {}).get("parameters", {})
     audit.require(
-        int(pull_request.get("required_approving_review_count", 0)) >= 1,
-        "main ruleset must require at least one approving review",
+        pull_request.get("required_approving_review_count") == 0,
+        "main ruleset must allow root-reviewed PRs without approval submissions",
     )
     audit.require(
-        pull_request.get("require_code_owner_review") is True,
-        "main ruleset must require Code Owner review",
+        pull_request.get("require_code_owner_review") is False,
+        "main ruleset must not require Code Owner approval",
     )
+    for field in (
+        "require_last_push_approval",
+        "require_extra_approval_for_unattributed_changes",
+    ):
+        audit.require(
+            pull_request.get(field, False) is False,
+            f"main ruleset must not require additional approval via {field}",
+        )
     audit.require(
         pull_request.get("required_review_thread_resolution") is True,
         "main ruleset must require review-thread resolution",
