@@ -834,7 +834,7 @@ Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `
 - Each bundle is a JSON object: `{ "<slot>": "<value>", ... }`.
 - Single bundle holds ~440 credentials at 48 KB GitHub secret cap.
 - Auto-sharded by deterministic hash when any bundle approaches 40 KB.
-- **Shard ceiling: 16** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15`) × ~440 slots/bundle = **~7,000 credentials per environment**. `apply` and `rotate` refuse to create shard 16 rather than writing a secret nothing reads back.
+- **Shard ceiling: 16** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15`) × ~440 slots/bundle = **~7,000 credentials per environment**. `import`, `apply`, and `rotate` refuse to create shard 16 rather than writing a secret nothing reads back.
 
 #### "Load credential bundles"
 
@@ -1447,7 +1447,10 @@ git add resources/ferrum
 
 **4. Seed the credential bundle before applying.** The migration bundle is
 already sharded into `FERRUM_CREDS_BUNDLE*` objects under the same 40 KiB
-policy allocation uses, so each top-level key becomes a GitHub Environment
+policy allocation uses, with the same 16-shard ceiling. An import that would
+exceed this ceiling refuses before publishing either the migration bundle or
+the resource tree; its error explains the coordinated loader/workflow changes
+needed to raise capacity. Each top-level key becomes a GitHub Environment
 Secret of the same name in the environment that owns this gateway:
 
 ```bash

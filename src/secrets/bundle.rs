@@ -219,7 +219,7 @@ pub fn reserve_shard(
 }
 
 /// Actionable refusal for a bundle layout that has run out of named shards.
-fn shard_ceiling_error(slot: &str, operation: &str) -> crate::error::Error {
+pub(crate) fn shard_ceiling_error(slot: &str, operation: &str) -> crate::error::Error {
     crate::error::Error::Config(format!(
         "credential bundle shards are full: {operation} slot '{slot}' would need a new \
          {next} secret, but MAX_BUNDLE_SHARDS = {MAX_BUNDLE_SHARDS} (src/secrets/bundle.rs) \
