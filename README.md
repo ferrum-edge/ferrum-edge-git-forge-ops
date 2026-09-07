@@ -505,6 +505,22 @@ The journal survives a crashed CI process, because the apply workflow commits st
 
 ### `exclusive` (strict 1:1)
 
+All commands that load desired resources enforce exclusive ownership at the
+shared assembly boundary, including `validate`, `plan`, `review`, `diff`,
+`export` (including `--materialize`), and `apply`. Gateway resources use their
+effective namespace; `MeshConfig` fragments use their source directory namespace,
+not workload or service namespaces inside the mesh document. The check runs
+after overlays and namespace filtering, before validation, gateway calls, or
+artifact publication. Shared mode keeps merging all selected fragments.
+
+An exclusive environment that previously published mesh fragments from unowned
+directories now refuses them, naming the namespace and fragment label
+(`namespace/mesh/id`, with the file stem used when `id` is absent). Add the
+namespace to `ownership.namespaces` or move the fragment to an owned directory.
+`namespace_filter` / `FERRUM_NAMESPACE` still narrow the selected resources;
+an exclusive environment rejects a filter outside its owned list, even if the
+selection is empty. Allowed fragments still merge into one mesh document.
+
 - Repo is authoritative for the listed `namespaces`.
 - Unmanaged resources in those namespaces → **pruned**.
 - Requires explicit `namespaces` list (safety rail against misconfiguration).
@@ -693,9 +709,12 @@ overrides:
 ### Override flow (B2: label + permission)
 
 1. Someone with `write` repo permission (or higher — configurable) adds the `gitforgeops/policy-override` label to the PR.
-2. On next workflow run, gitforgeops fetches the PR labels and checks the labeler's permission via the GitHub API.
-3. If both checks pass, error-severity findings get annotated `OVERRIDDEN by @user` and no longer block apply.
-4. The override event is recorded in `.state/<env>.json.overrides` for audit.
+2. That same account submits a PR review on the current head, using **Comment** or **Approve**, with the entire body `gitforgeops-override gitforgeops/policy-override` (substitute your configured label). An ordinary approval is not an override request. The review's GitHub `commit_id` binds the request to that revision; a label event's `commit_id` is not a labeled-at head. See [GitHub review semantics](https://docs.github.com/en/rest/pulls/reviews) and [issue event semantics](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types).
+3. On the next run, gitforgeops verifies the current label, latest labeler, current permission, and that account's latest submitted review. The review must explicitly authorize the current PR head. A later push, dismissed review, rejection, or ordinary submitted review requires a new explicit override review. Missing evidence, incomplete pagination, and API failures leave blockers enforced. Existing label-only overrides must migrate to this review flow.
+4. The actual resource/overlay YAML and policy/environment files must exactly match the reviewed tree, and the executable/repository source must also match. Run local CLI commands from a clean Git repository root. An environment SHA or PR number alone cannot authorize input. Post-merge apply additionally proves that the PR's merge is an ancestor of the actual checkout; differences under `.state/` and `assembled/` are permitted, preserving the workflow freshness guard. If merging introduces other base-branch changes, update the PR with that base and submit a new override review before merging.
+5. Error-severity findings get annotated `OVERRIDDEN by @user`. Validation, credential requirements/remaps, ownership, and gateway admission gates remain enforced. The audit record stores `pr_number`, `review_id`, `authorized_head`, and the actual applied `commit`. Old state records load with absent evidence fields; they are historical records and cannot grant authorization. State/config schema versions are unchanged.
+
+Trusted live review verifies its sanitized candidate YAML against the reviewed tree and its protected configuration and executable checkout against the same tree. Its workflow sets the review-only `GITFORGEOPS_OVERRIDE_SOURCE` to that protected checkout; the path merely selects source to inspect and grants no authority. `plan` and `apply` ignore this setting and inspect their own checkout. A protected source/configuration mismatch leaves the override inactive. Static review without a GitHub token cannot verify an override and retains blockers. These checks use raw Git blob hashes without executing repository filters or scripts.
 
 If you want two-person separation-of-duties instead of one-person override, change `required_permission: admin` and only grant admin to a small group — the check is strictly `>=` on the permission rank (`admin > maintain > write > triage > read`).
 
@@ -745,13 +764,13 @@ Removal is asymmetric on the gateway side: omitting `keyauth`, `jwt`, `hmac_auth
 
 ### What the broker will and won't generate
 
-Generation constraints are checked at resolve time, so `plan` fails before `apply` writes a value the gateway would reject:
+Generation constraints are shared by the resolver and allocator: `plan` checks pending allocations, and allocation/rotation checks every new value before GitHub key discovery or secret writes. Seeded values keep resolving regardless of allocation mode:
 
 - `jwt` / `hmac_auth` need ≥32-character secrets, so `len=` must be at least 24 entropy bytes. The default `len=32` yields 43 base64url characters.
 - `basicauth` in **file mode** is refused: a file-mode gateway requires `password_hash`, and that hash is an HMAC-SHA256 under the gateway's own `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not have. Set the hash by hand, or use api mode where the admin API hashes a plaintext password on write.
 - `basicauth/…/password_hash` is refused in either mode, for the same reason.
 - A bundle value of `[REDACTED]` is refused — that is what a plain `GET /consumers/…` returns for `keyauth`/`jwt`/`hmac_auth` secrets, so a bundle holding it was seeded from the wrong endpoint. Re-seed from `GET /backup` or rotate the slot.
-- `mtls_auth.identity` has to match a real certificate field. Nothing stops you writing `alloc=generate` there, but the gateway will reject the result.
+- `mtls_auth.identity` and `basicauth.username` are public identities: supply them literally. They cannot be generated or rotated.
 
 ### Placeholder syntax
 
@@ -779,7 +798,7 @@ jwt:     [{secret: S}]           ->  ferrum/app-mobile/jwt/secret
 
 The elision is what keeps the object→array normalization from orphaning every value already allocated in `FERRUM_CREDS_BUNDLE*`. Lookups also fall back to older encodings (verbatim `[0]`, and the legacy dotted form) so a bundle written by an earlier gitforgeops still resolves after an upgrade; only the elided form is ever written.
 
-The same path syntax is what `gitforgeops rotate --credential` takes: `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `mtls_auth/identity`, `basicauth/password`, or `keyauth/[1]/key` for a second entry.
+The same path syntax is what `gitforgeops rotate --credential` takes: `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `basicauth/password`, or `keyauth/[1]/key` for a second entry.
 
 #### Secrets outside `Consumer.credentials`
 
@@ -874,6 +893,11 @@ Requires `FERRUM_GH_PROVISIONER_TOKEN` — a GitHub App installation token (pref
 
 ### Rotation
 
+For CLI rotation, an explicit `--namespace` selects the target; when omitted,
+the selected environment's `namespace_filter` supplies the default, followed by
+`FERRUM_NAMESPACE`, then `ferrum`, matching resource assembly precedence. The consumer must still be
+present in the assembled scope. The workflow passes its namespace explicitly.
+
 Trigger the `rotate.yml` workflow manually:
 
 ```
@@ -884,6 +908,25 @@ Actions → GitForgeOps Rotate Credential → Run workflow
 ```
 
 The rotation re-generates the value, overwrites the env secret, delivers it age-encrypted to `${{ github.actor }}` (whoever triggered the workflow), and then pushes the updated consumer directly to the live Admin API. Rotation is refused in file mode because there is no live gateway push path; use materialization to produce a new resolved flat file for file-mode gateways.
+
+Rotation supports only Consumer `keyauth/key`, `jwt/secret`, `hmac_auth/secret`
+and api-mode `basicauth/password`, including indexed entries. The target must
+be a placeholder on the declared Consumer in the selected namespace, and its
+siblings must already resolve. Password hashes, identities, unknown credential
+fields and reserved `@plugin-config` / `@service-discovery` slots are refused
+before GitHub key discovery, secret writes or gateway publication. A PluginConfig
+or Upstream sharing the Consumer's id does not make its slots Consumer credentials.
+Plugin allocation through `apply` remains supported; this command has no plugin
+or upstream publication path. Rotation reuses the Consumer snapshot checked by
+preflight so unrelated resources cannot introduce a later generation refusal.
+
+For externally issued secrets, mint the replacement at the provider, reseed the
+existing broker slot while preserving every other bundle entry, then run `apply`.
+If an older rotation replaced a Consul token or basic-auth password hash, the
+previous GitHub Environment Secret value cannot be read back. Reissue the Consul
+token with the required policies, or recompute the password hash using the
+gateway's `FERRUM_BASIC_AUTH_HMAC_SECRET`, then reseed and apply. For supported
+basic-auth rotation, use `basicauth/password` in api mode and let the gateway hash it.
 
 ### File mode (two-stage)
 
@@ -1069,7 +1112,7 @@ Some failures get their own error rather than a generic HTTP one:
 
 **404-tolerant deletes.** A DELETE that answers 404 already achieved its goal. The gateway cascades deletes server-side (deleting a proxy removes its scoped plugin configs), so a diff-driven follow-up delete legitimately finds nothing; treating that as an error used to wedge every later run on the same delete.
 
-**Partial-failure visibility** (incremental mode): errors are collected per resource rather than bailing on first failure. A run where 99 of 100 resources apply cleanly but 1 hits a 400 returns an `ApplyResult` with 99 successes and 1 error. CLI exits non-zero; you see exactly which resource failed and why. Read-only refusals, stale views, and restore-rollback damage are the exceptions — they are fatal for the whole run, because continuing to the next namespace is pointless or unsafe.
+**Partial-failure visibility** (incremental mode): errors are collected per resource rather than bailing on first failure. A run where 99 of 100 adds/updates apply cleanly but 1 hits a 400 returns an `ApplyResult` with 99 successes and 1 error; all planned deletes in the failed write's namespace are deferred and counted separately. CLI exits non-zero; you see exactly which resource failed and why. Read-only refusals, stale views, and restore-rollback damage are the exceptions — they are fatal for the whole run, because continuing to the next namespace is pointless or unsafe.
 
 ### Apply ordering and the batch fast path
 
@@ -1085,6 +1128,10 @@ Incremental apply sorts the diff into dependency order rather than by kind, beca
 | 5 | Delete Upstream, Delete Consumer |
 
 Deletes come *after* adds and modifies: an upstream can only be removed once nothing references it (`DELETE /upstreams/{id}` answers 409 while a proxy still points at it), so the proxy modify that drops the reference has to land first.
+
+If any Add or Modify fails, **all planned deletes in that namespace are deferred** for this run, in both shared and exclusive ownership. Remaining writes and unaffected namespaces continue; existing fatal errors still stop the run. The result and CLI count deferred deletes separately from successful deletes, and each deferred resource is named with its reason. Failed and deferred deletes keep their managed ledger entries; successful operations still update state, and the run exits non-zero. `--allow-large-prune` does not bypass this deferral. Plan, diff, and the apply preview describe deletes as conditional because they cannot predict write failures.
+
+This preserves an incumbent when a replacement fails, but does **not** make a rename atomic. Renaming a proxy ID while retaining the same routing key still conflicts with the incumbent on every unchanged retry. Keep the existing ID and modify it when possible, or stage a replacement on a distinct, valid routing key before removing the incumbent. If the same key must move between IDs, resolve the conflict through a planned migration or maintenance window; simply adding the new ID in an earlier PR cannot bypass gateway uniqueness. The incremental admin API offers no atomic route swap.
 
 Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-side cascade defaults to on and would delete the last-referenced hand-owned upstream along with the proxy — an invisible deletion that makes the next diff-driven `DELETE /upstreams/{id}` answer 404. gitforgeops owns the upstream lifecycle through its own diff and issues that delete itself.
 
@@ -1496,6 +1543,25 @@ output.
 
 ## PR review output
 
+The validation heading combines the gateway document and every assembled mesh
+fragment after overlays and namespace selection. Both must pass for `PASSED`;
+a rejected document reports `FAILED`, and an unavailable validator reports
+`ERROR`. Mesh remains outside the live gateway diff because it has no live
+Admin API comparison surface.
+
+Review uses the same verified PR override decision for policy and error-severity
+security findings as plan/apply, including security-only repositories using the
+default override configuration. Findings remain visible with the approver named
+when overridden. A missing or inactive override retains the blocking verdict;
+an override never changes the validation heading or other admission gates.
+
+Every comment starts with a bounded apply verdict computed from all findings,
+including validation, security/policy blockers, spec conflicts, credential slot
+remaps, and missing required credentials when bundle evidence is available.
+The 60,000-byte comment limit may shorten detailed listings, but these counts
+survive. The footer names the sections whose detail was reduced or omitted;
+use smaller namespace-scoped reviews to inspect that detail.
+
 ```markdown
 Environment: `staging` · Ownership: `Shared` · Strategy: `Incremental`
 
@@ -1531,7 +1597,7 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - [error] `backend_scheme` on **Proxy `my-api`** (`ferrum`): backend_scheme=http is not in the allowed list (https) · BLOCKING
   - _Change backend_scheme to one of: https_
 
-> **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label (requires `write` permission on this repo).
+> **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label and submit its revision-bound override review (requires `write` permission on this repo).
 
 ### Secret Broker Slots
 | Slot | Declared as |
@@ -1546,7 +1612,7 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions). Before mutation, the workflow resolves exactly one merged PR for the pushed commit; ambiguous/unattributed commits cannot borrow another PR's policy override or credential-delivery recipient.
 - **Credential values are never written back to the repo.** `.state/` contains ownership keys with constant markers plus non-secret delivery metadata—no credential-derived hashes.
 - **The state file is CI-owned and permission-attributed.** `state-guard.yml` rejects `.state/**` changes unless the latest effective override label actor currently has write/maintain/admin. Triage label authority is explicitly insufficient. Protected state commits use a short-lived, contents-only App token rather than a human PAT or unbypassable `GITHUB_TOKEN`. See [State file trust model](#state-file-trust-model).
-- **Policy overrides leave a permanent trail.** PR label event + approver permission + `.state/<env>.json.overrides` record.
+- **Policy overrides leave a permanent trail.** Current PR label attribution and permission, explicit revision-bound review, matching actual inputs, and `.state/<env>.json.overrides` evidence.
 - **The provisioner token is the bootstrap credential.** Rotate periodically; prefer GitHub App installation tokens over PATs (automatic 1-hour expiry, org-scoped).
 - **TLS material stays as GitHub secrets.** The binary only ever sees the base64-decoded PEM in-process.
 - **Executable dependencies are pinned and verified.** Every third-party Action uses a full commit SHA, Rust and `cargo-llvm-cov` use exact versions, validator bytes must match publisher and checked-in SHA-256 values, and Docker bases use manifest digests without mutable package-manager installs during the release build. Releases publish max-mode provenance, SBOM attestations, a GitHub-signed GHCR provenance statement, and a retained manifest of every action/toolchain/base/binary input. Dependabot proposes controlled updates and `check_supply_chain.py` rejects regressions.
@@ -1571,6 +1637,15 @@ gitforgeops --env production diff --exit-on-drift
 ## Docker
 
 A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into a single image. The `ferrum-edge` binary is copied from the official `ferrumedge/ferrum-edge` Docker Hub image; `gitforgeops` is compiled from source in a builder stage.
+
+Revision-bound overrides require a complete source checkout, including `.git`
+and the triggering merge's history. The runtime includes Git's local inspection
+commands and their loader/libraries copied from the existing digest-pinned Rust
+builder; no mutable package installation or extra image dependency is used.
+Those libraries are private to Git, so they do not replace the gateway's runtime
+libraries. Mount the checkout at `/repo` and run with its owner's UID/GID (for
+example, `--user "$(id -u):$(id -g)"`); no global `safe.directory` bypass is set.
+Missing history or mismatching reviewed inputs still leaves overrides inactive.
 
 ### Published images
 

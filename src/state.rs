@@ -29,6 +29,12 @@ pub struct OverrideRecord {
     pub commit: String,
     pub approver: String,
     pub recorded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<u64>,
 }
 
 /// Per-environment state file at `.state/<env>.json`. Written by apply +
@@ -604,7 +610,35 @@ impl StateFile {
             commit: commit.to_string(),
             approver: approver.to_string(),
             recorded_at: chrono::Utc::now().to_rfc3339(),
+            pr_number: None,
+            authorized_head: None,
+            review_id: None,
         });
+    }
+
+    pub fn record_verified_override(
+        &mut self,
+        rule_id: &str,
+        decision: &crate::policy::OverrideDecision,
+    ) {
+        if let (true, Some(approver), Some(commit), Some(pr), Some(head), Some(review)) = (
+            decision.active,
+            &decision.approver,
+            &decision.applied_revision,
+            decision.pr_number,
+            &decision.authorized_head,
+            decision.review_id,
+        ) {
+            self.overrides.push(OverrideRecord {
+                rule_id: rule_id.into(),
+                commit: commit.clone(),
+                approver: approver.clone(),
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+                pr_number: Some(pr),
+                authorized_head: Some(head.clone()),
+                review_id: Some(review),
+            });
+        }
     }
 
     pub fn previously_managed_keys(&self) -> std::collections::HashSet<String> {
