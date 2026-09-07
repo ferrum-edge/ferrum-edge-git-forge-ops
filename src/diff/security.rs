@@ -8,6 +8,7 @@ use crate::plugin_catalog::{
 };
 use crate::policy::config::default_auth_plugin_names;
 use crate::policy::PolicyConfig;
+use crate::secrets::plugin_config::{render_config_path, sensitive_string_paths, value_at};
 use crate::secrets::resolver::is_identity_credential_leaf;
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,7 @@ pub fn audit_security_with_policy(
     }
 
     for plugin in &config.plugin_configs {
+        check_literal_plugin_config_secrets(plugin, &mut findings);
         check_plugin(plugin, &mut findings);
     }
 
@@ -447,6 +449,35 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     }
 }
 
+/// Exempt only strings the broker can resolve; lookalikes remain literals.
+fn is_broker_placeholder(value: &str) -> bool {
+    matches!(crate::secrets::parse_placeholder(value), Some(Ok(_)))
+}
+
+/// Match the import and diagnostic-scrubber classification before resolution.
+/// Disabled plugins are included because their config is still published.
+/// Findings identify the resource and field, never the classified value.
+fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
+    for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
+        let Some(serde_json::Value::String(value)) = value_at(&plugin.config, &path) else {
+            continue;
+        };
+        if is_broker_placeholder(value) {
+            continue;
+        }
+        let path = render_config_path(&path);
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            &plugin.id,
+            &plugin.namespace,
+            format!(
+                "Literal plugin-config secret in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+        ));
+    }
+}
+
 /// A modeled `Upstream.service_discovery` secret that is not a broker
 /// placeholder is a credential committed to the repository, and `apply` would
 /// publish it to the gateway. Blocking, exactly like a literal consumer
@@ -461,7 +492,7 @@ fn check_literal_service_discovery_secrets(
     findings: &mut Vec<SecurityFinding>,
 ) {
     for (field, value) in crate::secrets::service_discovery::present_secrets(upstream) {
-        if value.starts_with("${") {
+        if is_broker_placeholder(value) {
             continue;
         }
         let path = crate::secrets::service_discovery::render_path(field.path);
@@ -507,7 +538,7 @@ fn check_literal_credentials(
     findings: &mut Vec<SecurityFinding>,
 ) {
     match value {
-        serde_json::Value::String(s) if !s.starts_with("${") => {
+        serde_json::Value::String(s) if !is_broker_placeholder(s) => {
             // `basicauth[].username` and `mtls_auth[].identity` are the public
             // halves of their credentials: `import` deliberately preserves
             // them verbatim, the broker refuses to generate them, and the
