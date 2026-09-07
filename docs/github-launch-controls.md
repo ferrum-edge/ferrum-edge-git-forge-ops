@@ -107,9 +107,10 @@ same broad authority as a human account and the settings audit rejects it.
 Create one active branch ruleset targeting exactly the default branch, with no
 additional include or exclusion patterns. It must:
 
-- require pull requests and at least one approval;
-- require Code Owner review (`.github/CODEOWNERS` owns workflows, state,
-  reconciliation, credential code, Cargo metadata, and container inputs);
+- require pull requests, with zero required approval submissions and no Code
+  Owner, last-push, or unattributed-change approval requirement;
+- require the root orchestrator to review every changed file at the exact head
+  being merged and verify the issue, cross-repository contracts, and hosted CI;
 - require all review conversations to be resolved;
 - dismiss stale approvals when reviewable commits are pushed;
 - require branches to be tested against the latest `main` commit;
@@ -128,15 +129,16 @@ additional include or exclusion patterns. It must:
   configured as an always-on bypass. Pull-request-only human/team bypasses are
   not permitted.
 
-A solo maintainer hits an obstacle here: the ruleset requires an approving
-review and there is nobody to give one. The workaround is a second bypass actor
-— the **Repository Admin** role in `pull_request` mode — merging with
-`gh pr merge --admin`. That is what `bootstrap_repo_settings.py` configures when
-`--state-writer-app-id` is omitted, and the audit reports it as a violation
-("must have exactly one bypass actor in any mode"). It is a deliberate, visible
-deviation rather than a supported configuration, and it does not remove the need
-for the App: `apply-on-merge.yml` and `rotate.yml` fail their preflight without
-`GITFORGEOPS_STATE_APP_ID` and `GITFORGEOPS_STATE_APP_PRIVATE_KEY`.
+The root orchestrator may merge a correct PR after exact-head review, passing
+hosted CI, and resolution of every actionable review thread. A separate GitHub
+approval submission from the maintainer or a Code Owner is not required.
+`.github/CODEOWNERS` records ownership for review routing; it is not an approval
+gate. The bootstrap and settings audit preserve this policy so a later settings
+refresh does not reinstate the approval requirement. Use the ordinary protected
+merge path; no administrator bypass is needed to satisfy review requirements.
+The state-writer App is still required for state commits: `apply-on-merge.yml`
+and `rotate.yml` fail their preflight without `GITFORGEOPS_STATE_APP_ID` and
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY`.
 
 Protect release tags (`v*`) with a tag ruleset that carries the `creation`,
 `update`, and `deletion` rules, and that names **at least one** bypass actor —
@@ -394,7 +396,7 @@ To refresh, review the upstream build and run:
 bash .github/scripts/refresh-ferrum-edge-pin.sh --append
 ```
 
-Commit the new line through normal CODEOWNER review and **keep the previous
+Commit the new line through exact-head root review and **keep the previous
 line**: pull requests already running the older binary stay green, and the
 installer accepts any allowlisted digest.
 

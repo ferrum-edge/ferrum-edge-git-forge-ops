@@ -226,7 +226,7 @@ order — deep detail for each control lives in
     `validator-pin-canary.yml` runs daily and opens (or updates) a single tracking
     issue with the line to add. To refresh, review the upstream build, then
     `bash .github/scripts/refresh-ferrum-edge-pin.sh --append` and merge through
-    normal CODEOWNER review — **keeping the previous line**, so in-flight pull
+    exact-head root review — **keeping the previous line**, so in-flight pull
     requests running the older binary stay green. See
     [Validator digest pinning](#validator-digest-pinning).
 
@@ -678,9 +678,10 @@ overrides:
 
 - `severity: error` → **blocks `gitforgeops apply`** until the violation is fixed or overridden.
 - `severity: warning` / `info` → surfaced in PR review, but apply proceeds.
+- Enabled `backend_scheme`, `allowed_proxy_plugins`, and `require_ai_guardrails` rules require a nonblank governing list. Empty or blank-only lists produce a blocking `PolicyConfig` error even at warning severity, including when no resources match. Populate the named list or disable the rule explicitly. Omitted scheme/plugin allowlists are empty; omitted guardrail names retain the built-in defaults. Existing empty enabled configurations must be corrected when upgrading.
 - Each violation includes the rule id, the resource, the current value, and a remediation hint in the PR comment.
 - `allowed_backend_domains` covers the destinations this repository authors statically: proxy `backend_host`, proxy `dns_override` pins, upstream `targets[*].host`, and statically configured service-discovery control-plane addresses such as `consul.address`. It is not a general gateway-egress control — plugin-config endpoints, ports, and the service names a discovery provider resolves after acknowledgment stay unchecked. The rule skips a proxy's `backend_host` only when it is blank and `upstream_id` exactly resolves to a same-namespace upstream with a static target or service discovery, or when an intentionally gateway-resident upstream's exact `{namespace, id}` is acknowledged under `allowed_external_upstreams`. Any nonblank fallback must still match the domain allowlist; empty, padded, unacknowledged, cross-namespace, duplicate, and destination-less references also fall back to checking `backend_host`. *Upgrading:* an upstream-backed proxy that still carries a placeholder `backend_host` is now reported, because that host remains a real dial target if the upstream reference ever stops resolving. Delete `backend_host` (and `backend_port`) from proxies that delegate to `upstream_id`, or list the host in `allowed_domains` when it is a deliberate fallback. Duplicate upstream `(namespace, id)` identities are blocking policy-configuration errors because the reference cannot be resolved unambiguously. Use the external allowance only when shared-mode or OpenAPI-spec-owned destinations have equivalent runtime egress controls. The rule always checks static `targets[*].host` values and every comma-separated nonblank proxy `dns_override` destination, including on upstream-backed proxies, as a fail-closed guard against gateway routing changes. A `dns_override` destination must be an exact IP literal whether or not `allowed_dns_override_addresses` is configured: a name pin is reported because it is still resolved at runtime and cannot be checked here. Put the pinned IPs in `allowed_dns_override_addresses` to avoid allowing the same address as a direct backend or upstream target. When that list is empty, pins are checked against the IP-literal entries of `allowed_domains` (or a bare `*`) and nothing else, and a repo that declares a pin with no such entry gets a blocking policy-configuration finding on top of the per-proxy ones. A configured list containing no valid entries stays empty and blocks every pin in addition to reporting its configuration errors. Because service discovery can publish destinations absent from the static document, a discovery-backed upstream is reported as unverifiable unless its exact identity is listed under `allowed_service_discovery_upstreams` after equivalent runtime controls are in place. A Consul acknowledgment suppresses only that dynamic-target warning: its statically authored `consul.address` host must match `allowed_service_discovery_control_plane_addresses`. Findings report the parsed host, never the raw address, so `https://user:password@host` credentials stay out of PR comments and logs. Only an empty control-plane list falls back to `allowed_domains`; an all-invalid configured list fails closed. Keep a dedicated control-plane list to avoid widening direct data-plane egress. Malformed allowlist entries and malformed acknowledgment identities are blocking policy-configuration errors; stale acknowledgments are informational findings. `*.example.com` matches DNS subdomains like `api.example.com` and `deep.api.example.com`; list `example.com` separately if the root domain is allowed too. Internationalized DNS names are normalized to their ASCII/punycode form before comparison. Suffix wildcards never match IP literals. Exact IP allowlist entries are compared canonically, so equivalent IPv6 spellings and optional IPv6 brackets match. A bare `*` is an explicit catch-all for every nonempty, syntactically bare destination, including IPs, DNS pins, and dynamic discovery; an empty enabled allowlist is a blocking policy-configuration error instead of silently disabling enforcement.
-- `allowed_proxy_plugins` checks plugin configs explicitly referenced from a proxy's `plugins:` list, matching `plugin_name` case-insensitively.
+- `allowed_proxy_plugins` checks each proxy's effective enabled plugins, including namespace globals and attached scoped instances after scope merging, matching `plugin_name` case-insensitively. Disabled instances are ignored; unresolved `plugins:` references still produce findings. Messages identify the plugin without exposing its configuration.
 - `backend_scheme` compares against the six canonical schemes (`http`, `https`, `tcp`, `tcps`, `udp`, `dtls`). A proxy that leaves `backend_scheme` unset is evaluated as `https`, matching the gateway's own default. Legacy entries in `allowed_protocols` (`wss`, `grpcs`, `tcp_tls`, …) are normalized before comparison, so an older policy file keeps meaning the same thing.
 - `require_auth_plugin` evaluates each proxy's *effective* plugin list — scoped plugin configs merged over global ones of the same `plugin_name`, with disabled instances discarded. Omit `auth_plugin_names` to accept all eleven built-in authenticators: `spiffe_identity`, `mtls_auth`, `jwks_auth`, `oauth2_introspection`, `oidc_relying_party`, `jwt_auth`, `key_auth`, `ldap_auth`, `basic_auth`, `hmac_auth`, `soap_ws_security`.
 - `waf_enforcement` catches a `waf` plugin that is attached but not blocking: `mode` other than `enforce`, a rule pack left entirely at `monitor`, or `on_body_too_large: skip`. Optional `min_paranoia_level` (gateway accepts 1–4, defaults to 1).
@@ -834,7 +835,7 @@ Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `
 - Each bundle is a JSON object: `{ "<slot>": "<value>", ... }`.
 - Single bundle holds ~440 credentials at 48 KB GitHub secret cap.
 - Auto-sharded by deterministic hash when any bundle approaches 40 KB.
-- **Shard ceiling: 16** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15`) × ~440 slots/bundle = **~7,000 credentials per environment**. `apply` and `rotate` refuse to create shard 16 rather than writing a secret nothing reads back.
+- **Shard ceiling: 16** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15`) × ~440 slots/bundle = **~7,000 credentials per environment**. `import`, `apply`, and `rotate` refuse to create shard 16 rather than writing a secret nothing reads back.
 
 #### "Load credential bundles"
 
@@ -865,7 +866,7 @@ On apply, for each `alloc=generate` or first-apply `alloc=rotate` placeholder wi
 1. Generate a 32-byte (or `len=`) random value from the OS CSPRNG, encoded base64url-no-pad (so 32 bytes → 43 characters).
 2. Fetch the env's libsodium public key from `GET /repos/.../environments/<env>/secrets/public-key`.
 3. Encrypt the updated bundle with `crypto_box_seal` and `PUT` to `/repos/.../environments/<env>/secrets/FERRUM_CREDS_BUNDLE[_N]`.
-4. Fetch the PR author's SSH public keys from `GET /users/{login}/keys`.
+4. Fetch the PR author's SSH public keys from `GET /users/{login}/keys`, following pagination (100 keys per page, at most 20 requests) until the first compatible key. An incomplete search fails; only a completed search can report no usable keys.
 5. Encrypt the new value with age to an Ed25519 (preferred) or RSA SSH recipient.
 6. Post an age-armored blob as a comment on the PR; the author decrypts locally.
 
@@ -1451,7 +1452,10 @@ git add resources/ferrum
 
 **4. Seed the credential bundle before applying.** The migration bundle is
 already sharded into `FERRUM_CREDS_BUNDLE*` objects under the same 40 KiB
-policy allocation uses, so each top-level key becomes a GitHub Environment
+policy allocation uses, with the same 16-shard ceiling. An import that would
+exceed this ceiling refuses before publishing either the migration bundle or
+the resource tree; its error explains the coordinated loader/workflow changes
+needed to raise capacity. Each top-level key becomes a GitHub Environment
 Secret of the same name in the environment that owns this gateway:
 
 ```bash
