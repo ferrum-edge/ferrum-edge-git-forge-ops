@@ -1,5 +1,6 @@
 pub mod config;
 pub mod github_override;
+pub mod override_input;
 pub mod registry;
 pub mod rules;
 
