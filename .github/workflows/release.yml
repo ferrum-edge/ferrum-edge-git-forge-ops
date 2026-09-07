@@ -200,6 +200,9 @@ jobs:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+          # v4 defaults to additional organization storage records, which need
+          # artifact-metadata:write. Preserve the signed-attestation contract.
+          create-storage-record: false
 
       # `docker/build-push-action` publishes ONE manifest digest to BOTH
       # registries, so the step above covers those exact bytes — but an
@@ -224,6 +227,7 @@ jobs:
         with:
           subject-name: docker.io/${{ vars.DOCKERHUB_IMAGE || 'ferrumedge/ferrum-edge-git-forge-ops' }}
           subject-digest: ${{ steps.build.outputs.digest }}
+          create-storage-record: false
 
       - name: Bind image digest into build-input record
         env:
