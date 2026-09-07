@@ -1050,7 +1050,10 @@ fn review_comment_v2_omits_spec_owned_section_when_empty() {
     );
 
     assert!(!comment.contains("### Spec-owned Resources"), "{comment}");
-    assert!(comment.contains("Spec-owned Resources: 0 total"), "{comment}");
+    assert!(
+        comment.contains("Spec-owned Resources: 0 total"),
+        "{comment}"
+    );
 }
 
 #[test]
