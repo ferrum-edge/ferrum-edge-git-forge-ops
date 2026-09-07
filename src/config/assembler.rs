@@ -23,6 +23,28 @@ pub struct AssembledOutput {
     /// `None` when the repo declares no `MeshConfig` resources at all — the
     /// signal that no mesh document should be written or validated.
     pub mesh: Option<MeshConfigSpec>,
+    /// Directory namespace and diagnostic label of each selected mesh fragment.
+    /// Retained across merging; namespaces inside mesh entries are not scope.
+    pub mesh_sources: Vec<(String, String)>,
+}
+
+impl AssembledOutput {
+    /// Enforce exclusive ownership on the fragments that survived filtering.
+    pub fn validate_mesh_scope(&self, env: &str, owned: &[String]) -> crate::error::Result<()> {
+        let violations: Vec<String> = self
+            .mesh_sources
+            .iter()
+            .filter(|(namespace, _)| !owned.contains(namespace))
+            .map(|(namespace, label)| format!("MeshConfig {label} in namespace '{namespace}'"))
+            .collect();
+        if !violations.is_empty() {
+            return Err(crate::error::Error::Config(format!(
+                "exclusive env '{env}' declares ownership.namespaces={owned:?}, but desired mesh fragments include namespaces outside that list:\n  {}\nEither add the namespace to ownership.namespaces, move the fragment to an owned namespace, or switch ownership.mode to 'shared'.",
+                violations.join("\n  ")
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Assemble loaded resources into a `GatewayConfig` plus an optional merged
@@ -52,6 +74,7 @@ pub fn assemble_with_namespace_filter(
 ) -> crate::error::Result<AssembledOutput> {
     let mut config = GatewayConfig::default();
     let mut mesh_fragments: Vec<(String, MeshConfigSpec)> = Vec::new();
+    let mut mesh_sources = Vec::new();
 
     for (namespace, resource) in resources {
         match resource {
@@ -89,6 +112,7 @@ pub fn assemble_with_namespace_filter(
                     Some(id) if !id.trim().is_empty() => format!("{namespace}/mesh/{id}"),
                     _ => format!("{namespace}/mesh"),
                 };
+                mesh_sources.push((namespace, label.clone()));
                 mesh_fragments.push((label, spec));
             }
         }
@@ -100,6 +124,7 @@ pub fn assemble_with_namespace_filter(
     Ok(AssembledOutput {
         gateway: config,
         mesh: merge_mesh_fragments(mesh_fragments)?,
+        mesh_sources,
     })
 }
 
