@@ -1329,6 +1329,7 @@ gitforgeops rotate --consumer ID --credential KEY \
 
 Notes:
 
+- `plan` exits non-zero when its authoritative live comparison finds repository declarations conflicting with API-spec-owned resources, and names the affected namespaces under `Apply Blockers`. Undeclared spec-owned rows remain informational. Skipped, unavailable, or cached comparisons do not invent ownership conflicts; offline admission gates still apply.
 - `--from-api` is a flag, not a value: `gitforgeops import --from-api`. It conflicts with `--from-file`.
 - `--accept-unknown-field NAME` (repeatable) acknowledges one top-level resource field this build does not model, so import writes it verbatim instead of refusing. It also requires `FERRUM_ALLOW_UNKNOWN_FIELDS=true`, without which the tree import just wrote would be rejected by the strict loader on the very next `validate`. Acknowledgement is by field name and is your assertion that the field is not a credential; gitforgeops cannot verify it and names every resource that used one. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones).
 - `--allow-plaintext-plugin-config <plugin_name>` is repeatable and matched by exact `plugin_name`. It accepts, for that plugin only, the config strings the sensitivity heuristics could not classify. Without it such an import **fails** — see the import bullet below.
