@@ -165,6 +165,36 @@ fn stdout(output: &Output) -> String {
 }
 
 #[test]
+fn supplied_pr_and_revision_cannot_authorize_any_caller_without_evidence() {
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/consumers/app.yaml", LITERAL_CONSUMER),
+        ("resources/ferrum/proxies/app.yaml", HTTP_PROXY),
+        (".gitforgeops/policies.yaml", HTTPS_ONLY_POLICY),
+    ]);
+    let head = "a".repeat(40);
+    let context = [
+        ("GITFORGEOPS_PR_NUMBER", "7"),
+        ("GITHUB_SHA", head.as_str()),
+        ("GITHUB_REPOSITORY", "fixture/repo"),
+        ("GITFORGEOPS_OVERRIDE_SOURCE", "/unrelated/checkout"),
+    ];
+    let apply = repo.run(&["apply", "--auto-approve"], &context);
+    assert!(!apply.status.success());
+    assert!(stderr(&apply).contains("unresolved security findings"));
+    assert!(!repo.published().exists());
+    assert!(!repo.dir.path().join(".state/default.json").exists());
+    let plan = repo.run(&["plan"], &context);
+    assert!(!plan.status.success());
+    assert!(stdout(&plan).contains("Apply Blockers"));
+    let review = repo.run(&["review", "--pr", "7"], &context);
+    assert!(stdout(&review).contains("Apply is blocked"));
+    assert!(stdout(&review).contains("backend_scheme"));
+    assert!(!stdout(&review).contains("OVERRIDDEN by"));
+    assert!(!repo.published().exists());
+    assert!(!repo.dir.path().join(".state/default.json").exists());
+}
+
+#[test]
 fn apply_refuses_a_literal_consumer_credential_and_publishes_nothing() {
     let repo = Repo::with_consumer(LITERAL_CONSUMER);
 
