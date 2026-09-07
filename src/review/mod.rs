@@ -3,9 +3,9 @@ pub mod pr_comment;
 
 pub use github::{comment_status_is_retryable, enforce_required_comment_delivery, post_pr_comment};
 pub use pr_comment::{
-    build_review_comment, build_review_comment_v2, build_review_comment_v2_with_status,
-    build_review_comment_with_status, environment_header, markdown_comment_for_terminal,
-    render_spec_owned, ReviewValidationStatus,
+    build_review_comment, build_review_comment_v2, build_review_comment_v2_with_override,
+    build_review_comment_v2_with_status, build_review_comment_with_status, environment_header,
+    markdown_comment_for_terminal, render_spec_owned, ReviewValidationStatus,
 };
 
 /// Prefix shared by every published "the live comparison did not happen" note.
@@ -103,4 +103,57 @@ pub fn enforce_comment_delivery(
         )));
     }
     Ok(())
+}
+
+/// Combined gateway and optional mesh validation for the reviewer's verdict.
+#[derive(Debug)]
+pub struct ReviewValidation {
+    pub status: ReviewValidationStatus,
+    pub output: String,
+    pub execution_error: Option<String>,
+}
+
+pub fn validate_for_review(
+    gateway: &crate::config::GatewayConfig,
+    mesh: Option<&crate::config::MeshConfigSpec>,
+    binary_path: &str,
+) -> ReviewValidation {
+    let mut results = vec![(
+        "gateway",
+        crate::validate::run_validation(gateway, binary_path),
+    )];
+    if let Some(mesh) = mesh {
+        results.push((
+            "mesh",
+            crate::validate::run_mesh_validation(mesh, binary_path),
+        ));
+    }
+    let mut summary = ReviewValidation {
+        status: ReviewValidationStatus::Passed,
+        output: String::new(),
+        execution_error: None,
+    };
+    for (kind, result) in results {
+        summary
+            .output
+            .push_str(&format!("=== {kind} validation ===\n"));
+        match result {
+            Ok(result) => {
+                summary.output.push_str(&result.stdout);
+                summary.output.push_str(&result.stderr);
+                summary.output.push('\n');
+                if !result.success && summary.status != ReviewValidationStatus::ExecutionError {
+                    summary.status = ReviewValidationStatus::Rejected;
+                }
+            }
+            Err(error) => {
+                let message = format!("{kind} validator execution error: {error}");
+                summary.output.push_str(&message);
+                summary.output.push('\n');
+                summary.status = ReviewValidationStatus::ExecutionError;
+                summary.execution_error.get_or_insert(message);
+            }
+        }
+    }
+    summary
 }
