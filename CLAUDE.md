@@ -327,6 +327,9 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `forbid_tls_verify_disabled`, `allowed_proxy_plugins`, `allowed_backend_domains`,
 `waf_enforcement`, `require_ai_guardrails`, `rate_limit_completeness`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
+Enabled scheme, proxy-plugin and AI-guardrail rules reject empty or blank-only
+governing lists with a blocking `PolicyConfig` error, regardless of the configured
+finding severity. Omitted AI guardrail names still use their built-in defaults.
 
 Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
 is schema-first for the 82 builtins and heuristics-only for anything else: a
