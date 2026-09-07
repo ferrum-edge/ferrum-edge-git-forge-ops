@@ -223,6 +223,19 @@ Configured per environment in repo config.
 - **`exclusive`**: repo is authoritative for the listed `namespaces`. Unmanaged
   resources get pruned. Required for `full_replace`.
 
+The shared `load_and_assemble_all` boundary enforces exclusive scope after
+overlays and namespace filtering, before returning to validate/plan/review/diff/
+export/apply callers. Gateway resources use their effective namespace; mesh
+fragments use their directory namespace. `AssembledOutput.mesh_sources` retains
+each selected fragment's namespace and diagnostic label across merging, so
+`validate_mesh_scope` can reject unowned fragments even when they only set a
+mesh-wide singleton. Diagnostics name `namespace/mesh/id` (file stem fallback)
+and explain how to add ownership or move the fragment. Inner workload/service
+namespaces do not grant fragment ownership. Shared mode remains unrestricted,
+and filters still exclude unselected mesh fragments before merging. An unowned
+exclusive filter is rejected even when it selects nothing. This also preserves
+the offline ownership gate for validate and export, including materialization.
+
 #### Adoption of already-matching rows
 
 A declared resource identical to its live row yields no diff entry, so no
