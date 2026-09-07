@@ -1442,7 +1442,8 @@ async fn cmd_plan(
     }
 
     // Plan's exit code is the preview's verdict: non-zero for everything that
-    // would stop `apply` and is decidable without a gateway. One shared
+    // would stop `apply` and is decidable without a gateway, plus ownership
+    // conflicts proven by the authoritative live comparison above. One shared
     // computation with `apply` (see `gitforgeops::verdict`) so the two cannot
     // drift — a plan that exits 0 for a repository apply deterministically
     // refuses is the failure mode this replaces. Every blocker has already
@@ -1456,12 +1457,26 @@ async fn cmd_plan(
         secret_report: &secret_report,
         allow_credential_slot_remap,
     });
-    if let Some(summary) = verdict::blocker_summary(&blockers) {
+    let offline_summary = verdict::blocker_summary(&blockers);
+    let conflict_namespaces: std::collections::BTreeSet<&str> = spec_owned
+        .iter()
+        .filter(|resource| actual_available && resource.is_conflict())
+        .map(|resource| resource.namespace.as_str())
+        .collect();
+    if offline_summary.is_some() || !conflict_namespaces.is_empty() {
         println!("=== Apply Blockers ===");
         for blocker in &blockers {
             println!("  {}", blocker.summary());
         }
-        println!("\n{summary}");
+        if !conflict_namespaces.is_empty() {
+            println!(
+                "  API-spec ownership conflicts block apply in namespace(s): {}. Remove the competing repository declarations or reconcile ownership with the API spec.",
+                conflict_namespaces.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        if let Some(summary) = offline_summary {
+            println!("\n{summary}");
+        }
         process::exit(1);
     }
 
