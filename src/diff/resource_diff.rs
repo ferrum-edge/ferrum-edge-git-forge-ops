@@ -37,20 +37,15 @@ pub fn mask_indeterminate_secret_values(
         {
             for (credential_type, desired_value) in &expected.credentials {
                 if let Some(live_value) = live.credentials.get_mut(credential_type) {
-                    mask_unresolved_leaves(
-                        desired_value,
-                        live_value,
-                        &mut Vec::new(),
-                        &|path| {
-                            let slot = consumer_credential_slot(
-                                &expected.namespace,
-                                &expected.id,
-                                credential_type,
-                                path,
-                            );
-                            unresolved.contains(slot.as_str())
-                        },
-                    );
+                    mask_unresolved_leaves(desired_value, live_value, &mut Vec::new(), &|path| {
+                        let slot = consumer_credential_slot(
+                            &expected.namespace,
+                            &expected.id,
+                            credential_type,
+                            path,
+                        );
+                        unresolved.contains(slot.as_str())
+                    });
                 }
             }
         }

@@ -197,8 +197,11 @@ fn placeholder_syntax_without_unresolved_provenance_does_not_authorize_masking()
         serde_json::json!([{"key": "synthetic-live-key"}]),
     );
     actual.plugin_configs[0].config = serde_json::json!({"authorization": "synthetic-live-key"});
-    actual.upstreams[0] =
-        upstream_with_consul("app", "https://consul.test:8501", Some("synthetic-live-key"));
+    actual.upstreams[0] = upstream_with_consul(
+        "app",
+        "https://consul.test:8501",
+        Some("synthetic-live-key"),
+    );
     let before = serde_json::to_value(&actual).unwrap();
     gitforgeops::diff::mask_indeterminate_secret_values(
         &desired,

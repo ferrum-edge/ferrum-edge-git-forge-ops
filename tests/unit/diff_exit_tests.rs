@@ -516,9 +516,8 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
     });
     let consumer =
         serde_json::json!({"kind": "Consumer", "spec": declared["consumers"][0]}).to_string();
-    let plugin =
-        serde_json::json!({"kind": "PluginConfig", "spec": declared["plugin_configs"][0]})
-            .to_string();
+    let plugin = serde_json::json!({"kind": "PluginConfig", "spec": declared["plugin_configs"][0]})
+        .to_string();
     let upstream =
         serde_json::json!({"kind": "Upstream", "spec": declared["upstreams"][0]}).to_string();
     for transport in ["inline", "file"] {
