@@ -50,6 +50,20 @@ impl PolicyFinding {
     }
 }
 
+/// An enabled gate needs a usable list even when there are no matching resources.
+pub(crate) fn empty_allowlist_finding(rule_id: &str, key: &str) -> PolicyFinding {
+    PolicyFinding {
+        rule_id: rule_id.to_string(),
+        severity: Severity::Error,
+        kind: "PolicyConfig".to_string(),
+        id: rule_id.to_string(),
+        namespace: "global".to_string(),
+        message: format!("enabled policy has no nonblank {key} entries"),
+        remediation: Some(format!("Populate {key} or explicitly disable {rule_id}")),
+        overridden_by: None,
+    }
+}
+
 pub trait PolicyCheck: Send + Sync {
     fn rule_id(&self) -> &str;
     fn evaluate(&self, cfg: &crate::config::GatewayConfig) -> Vec<PolicyFinding>;
