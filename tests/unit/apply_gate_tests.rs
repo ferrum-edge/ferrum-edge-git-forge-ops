@@ -275,6 +275,84 @@ fn plan_exits_nonzero_on_a_literal_consumer_credential() {
 }
 
 #[test]
+fn placeholder_lookalikes_are_refused_before_file_or_api_publication() {
+    for value in [
+        "${{ secrets.SYNTHETIC_KEY }}",
+        "${gh-env-secret:alloc=generate} ",
+        "${gh-env-secret:alloc=generate",
+        "${GH-ENV-SECRET:alloc=generate}",
+        "${env:SYNTHETIC_KEY}",
+        "${gh-env-secret:alloc=synthetic-secret}",
+        "${gh-env-secret:len=synthetic-secret}",
+        "${gh-env-secret:synthetic-secret}",
+        "${gh-env-secret:synthetic-secret=value}",
+    ] {
+        let consumer = BROKERED_CONSUMER.replace("${gh-env-secret:alloc=require}", value);
+        for args in [vec!["plan"], vec!["apply", "--auto-approve"]] {
+            let repo = Repo::with_consumer(&consumer);
+            let output = repo.run(&args, &[]);
+            assert!(!output.status.success());
+            let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(!diagnostics.contains(value), "{diagnostics}");
+            assert!(!diagnostics.contains("synthetic-secret"), "{diagnostics}");
+            assert!(!repo.published().exists());
+        }
+
+        // The security gate precedes every gateway call. Keep a listener open
+        // and verify the CLI never even connects, rather than merely checking
+        // that a failed API response prevented a write.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let repo = Repo::with_consumer(&consumer);
+        let output = repo.run(
+            &["apply", "--auto-approve"],
+            &[
+                ("FERRUM_GATEWAY_MODE", "api"),
+                ("FERRUM_GATEWAY_URL", &url),
+                ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "synthetic-admin-signing-key-at-least-32-bytes",
+                ),
+                ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "1"),
+                ("FERRUM_GATEWAY_MAX_RETRIES", "0"),
+            ],
+        );
+        assert!(!output.status.success());
+        let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(diagnostics.contains("Literal credential"), "{diagnostics}");
+        assert!(!diagnostics.contains(value), "{diagnostics}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn plan_and_apply_refuse_literal_plugin_secrets_without_publication() {
+    const PLUGIN: &str = r#"kind: PluginConfig
+spec:
+  id: "otel"
+  plugin_name: "otel_tracing"
+  scope: global
+  config:
+    authorization: "Bearer synthetic-plugin-value"
+"#;
+    for args in [vec!["plan"], vec!["apply", "--auto-approve"]] {
+        let repo = Repo::with_files(&[("resources/ferrum/plugins/otel.yaml", PLUGIN)]);
+        let output = repo.run(&args, &[]);
+        assert!(!output.status.success());
+        let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(diagnostics.contains("Literal plugin-config secret"));
+        assert!(diagnostics.contains("config.authorization"));
+        assert!(!diagnostics.contains("synthetic-plugin-value"));
+        assert!(!repo.published().exists());
+    }
+}
+
+#[test]
 fn plan_exits_zero_for_a_brokered_consumer() {
     let repo = Repo::with_consumer(BROKERED_CONSUMER);
 
