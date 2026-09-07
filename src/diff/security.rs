@@ -449,6 +449,11 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     }
 }
 
+/// Exempt only strings the broker can resolve; lookalikes remain literals.
+fn is_broker_placeholder(value: &str) -> bool {
+    matches!(crate::secrets::parse_placeholder(value), Some(Ok(_)))
+}
+
 /// Match the import and diagnostic-scrubber classification before resolution.
 /// Disabled plugins are included because their config is still published.
 /// Findings identify the resource and field, never the classified value.
@@ -457,7 +462,7 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
         let Some(serde_json::Value::String(value)) = value_at(&plugin.config, &path) else {
             continue;
         };
-        if value.starts_with("${") {
+        if is_broker_placeholder(value) {
             continue;
         }
         let path = render_config_path(&path);
@@ -487,7 +492,7 @@ fn check_literal_service_discovery_secrets(
     findings: &mut Vec<SecurityFinding>,
 ) {
     for (field, value) in crate::secrets::service_discovery::present_secrets(upstream) {
-        if value.starts_with("${") {
+        if is_broker_placeholder(value) {
             continue;
         }
         let path = crate::secrets::service_discovery::render_path(field.path);
@@ -533,7 +538,7 @@ fn check_literal_credentials(
     findings: &mut Vec<SecurityFinding>,
 ) {
     match value {
-        serde_json::Value::String(s) if !s.starts_with("${") => {
+        serde_json::Value::String(s) if !is_broker_placeholder(s) => {
             // `basicauth[].username` and `mtls_auth[].identity` are the public
             // halves of their credentials: `import` deliberately preserves
             // them verbatim, the broker refuses to generate them, and the

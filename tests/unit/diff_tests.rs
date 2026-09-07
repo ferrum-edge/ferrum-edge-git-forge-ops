@@ -684,6 +684,60 @@ fn security_detects_literal_credential() {
 }
 
 #[test]
+fn secret_audit_and_broker_parser_agree_across_resource_kinds() {
+    for value in [
+        "${{ secrets.SYNTHETIC_KEY }}",
+        "${gh-env-secret:alloc=generate} ",
+        "${gh-env-secret:alloc=generate",
+        "${GH-ENV-SECRET:alloc=generate}",
+        "${env:SYNTHETIC_KEY}",
+        "${gh-env-secret:alloc=synthetic-secret}",
+        "${gh-env-secret:len=synthetic-secret}",
+        "${gh-env-secret:synthetic-secret}",
+        "${gh-env-secret:synthetic-secret=value}",
+        "${gh-env-secret:alloc=require}",
+        "${gh-env-secret:alloc=generate|len=64}",
+    ] {
+        let valid = matches!(gitforgeops::secrets::parse_placeholder(value), Some(Ok(_)));
+        let mut consumer = make_consumer("app", "alice");
+        consumer.credentials.clear();
+        consumer
+            .credentials
+            .insert("keyauth".to_string(), serde_json::json!([{"key": value}]));
+        let mut plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+        plugin.config = serde_json::json!({"authorization": value});
+        let config = GatewayConfig {
+            consumers: vec![consumer],
+            plugin_configs: vec![plugin],
+            upstreams: vec![upstream_with_consul(
+                "orders",
+                "https://consul.example.test",
+                Some(value),
+            )],
+            ..GatewayConfig::default()
+        };
+        let findings = audit_security(&config);
+        let blockers = gitforgeops::diff::security_blockers(&findings);
+        assert_eq!(blockers.len(), if valid { 0 } else { 3 }, "{findings:?}");
+        if !valid {
+            for (kind, path) in [
+                ("Consumer", "keyauth[0].key"),
+                ("PluginConfig", "config.authorization"),
+                ("Upstream", "service_discovery.consul.token"),
+            ] {
+                assert!(blockers.iter().any(|finding| {
+                    finding.kind == kind && finding.message.contains(path)
+                }));
+            }
+        }
+        for finding in findings {
+            assert!(!finding.message.contains(value));
+            assert!(!finding.message.contains("synthetic-secret"));
+        }
+    }
+}
+
+#[test]
 fn security_blocks_classified_plugin_literals_without_exposing_values() {
     use gitforgeops::diff::security_blockers;
 
