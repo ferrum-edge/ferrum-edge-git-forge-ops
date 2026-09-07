@@ -2292,9 +2292,10 @@ fn spawn_prune_gateway(
                                     (200, "{}".into())
                                 }
                             } else if method == "DELETE" {
-                                state.live.proxies.retain(|proxy| {
-                                    proxy.namespace != namespace || proxy.id != id
-                                });
+                                state
+                                    .live
+                                    .proxies
+                                    .retain(|proxy| proxy.namespace != namespace || proxy.id != id);
                                 (204, String::new())
                             } else {
                                 panic!("unexpected proxy request: {request}");
@@ -2400,7 +2401,10 @@ fn failed_rename_cli_preserves_incumbent_and_journal_on_unchanged_retries() {
                 .env("FERRUM_GATEWAY_MODE", "api")
                 .env("FERRUM_GATEWAY_URL", &url)
                 .env("FERRUM_ALLOW_INSECURE_HTTP", "true")
-                .env("FERRUM_ADMIN_JWT_SECRET", "test-secret-must-be-32-chars-long")
+                .env(
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "test-secret-must-be-32-chars-long",
+                )
                 .env("FERRUM_GATEWAY_MAX_RETRIES", "0")
                 .env("FERRUM_EDGE_BINARY_PATH", &validator)
                 .output()
@@ -2589,11 +2593,19 @@ async fn failed_modify_defers_its_namespace_prunes_and_other_namespaces_progress
         "team-b".into(),
         "/proxies/pruned".into()
     )));
-    assert!(gateway.live.proxies.iter().any(|proxy| proxy.id == "retained"));
+    assert!(gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "retained"));
     assert!(gateway.live.proxies.iter().any(|proxy| {
         proxy.id == "fail-modify" && proxy.backend_port == live.proxies[1].backend_port
     }));
-    assert!(!gateway.live.proxies.iter().any(|proxy| proxy.id == "pruned"));
+    assert!(!gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "pruned"));
 }
 
 #[tokio::test]
@@ -2697,7 +2709,11 @@ async fn successful_writes_are_followed_by_prune_and_update_the_ledger() {
     assert_eq!(mutations.len(), 3);
     assert_eq!(mutations[2].0, "DELETE");
     assert_eq!(gateway.live.proxies.len(), 2);
-    assert!(!gateway.live.proxies.iter().any(|proxy| proxy.id == "pruned"));
+    assert!(!gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "pruned"));
 }
 
 #[tokio::test]
