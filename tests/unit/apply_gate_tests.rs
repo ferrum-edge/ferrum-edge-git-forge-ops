@@ -700,3 +700,29 @@ fn offline_commands_enforce_exclusive_ownership_before_validation_or_export() {
         }
     }
 }
+
+#[test]
+fn empty_enabled_allowlists_block_plan_and_apply_before_publication() {
+    for (rule, key) in [
+        ("backend_scheme", "allowed_protocols"),
+        ("allowed_proxy_plugins", "allowed_plugin_names"),
+        ("require_ai_guardrails", "guardrail_plugin_names"),
+    ] {
+        let policy = format!(
+            "version: 1\npolicies:\n  {rule}:\n    enabled: true\n    severity: warning\n    {key}: []\n"
+        );
+        for args in [vec!["plan"], vec!["apply", "--auto-approve"]] {
+            let repo = Repo::with_files(&[
+                ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
+                (".gitforgeops/policies.yaml", &policy),
+            ]);
+            let output = repo.run(&args, &[]);
+            assert!(!output.status.success());
+            let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(diagnostics.contains(key), "{diagnostics}");
+            assert!(diagnostics.contains("no nonblank"), "{diagnostics}");
+            assert!(!repo.published().exists());
+            assert!(!repo.dir.path().join(".state/default.json").exists());
+        }
+    }
+}

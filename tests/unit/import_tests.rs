@@ -855,6 +855,57 @@ fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
 }
 
 #[test]
+fn credential_migration_bundle_refuses_unbound_shards_before_publication() {
+    use gitforgeops::secrets::bundle::{BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS};
+
+    // Each synthetic value needs its own shard. The exact supported ceiling
+    // succeeds, while one more slot must leave both destinations unpublished.
+    for count in [MAX_BUNDLE_SHARDS, MAX_BUNDLE_SHARDS + 1] {
+        let source_dir = tempfile::tempdir().unwrap();
+        let backup_path = source_dir.path().join("backup.yaml");
+        let mut config = make_test_config();
+        config.consumers[0].credentials.clear();
+        let values = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "token": format!("{}-{index}", "x".repeat(BUNDLE_SOFT_LIMIT_BYTES / 2))
+                })
+            })
+            .collect::<Vec<_>>();
+        config.consumers[0]
+            .credentials
+            .insert("custom".to_string(), serde_json::Value::Array(values));
+        std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("resources");
+        let bundle_path = destination.path().join("migration.json");
+        let result = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            Some(&bundle_path),
+            &strict_passthrough(),
+            &[],
+        );
+
+        if count == MAX_BUNDLE_SHARDS {
+            result.unwrap();
+            let raw = std::fs::read_to_string(&bundle_path).unwrap();
+            let (merged, shards) = gitforgeops::secrets::load_bundles_from_env(&raw).unwrap();
+            assert_eq!(merged.len(), count as usize);
+            assert_eq!(shards.len(), MAX_BUNDLE_SHARDS as usize);
+            assert!(shards.keys().all(|shard| *shard < MAX_BUNDLE_SHARDS));
+            assert!(output.exists());
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("MAX_BUNDLE_SHARDS"), "{error}");
+            assert!(error.contains("import"), "{error}");
+            assert!(!bundle_path.exists());
+            assert!(!output.exists());
+        }
+    }
+}
+
+#[test]
 fn credential_migration_bundle_must_stay_outside_the_resource_tree() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
