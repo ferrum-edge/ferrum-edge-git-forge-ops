@@ -155,6 +155,23 @@ pub struct ResolveReport {
 }
 
 impl ResolveReport {
+    /// Explain comparison uncertainty without claiming the entire bundle is absent.
+    pub fn unresolved_comparison_note(&self) -> Option<String> {
+        let count = self
+            .results
+            .iter()
+            .filter(|result| result.status != SlotStatus::Resolved)
+            .count();
+        (count > 0).then(|| {
+            format!(
+                "{count} broker-controlled leaf/leaves remain unresolved. Authoritative live \
+                 comparisons exclude only unresolved leaves in Consumer credentials, plugin \
+                 config and service-discovery secrets; resolved values, literal siblings, \
+                 extra entries, shape changes and nonsecret fields are still compared."
+            )
+        })
+    }
+
     /// Structurally-captured credential type for `slot`, if this report
     /// produced it.
     pub fn credential_type_for(&self, slot: &str) -> Option<&str> {

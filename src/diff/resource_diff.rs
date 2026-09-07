@@ -4,7 +4,7 @@ use crate::config::schema::PassthroughFields;
 use crate::config::GatewayConfig;
 
 /// Exclude only unresolved broker-controlled leaves from a live comparison
-/// when the caller has no secret bundle and cannot materialize desired slots.
+/// after resolution, regardless of whether a bundle is absent, empty or partial.
 ///
 /// Matching Consumer credentials and PluginConfig config values are aligned
 /// leaf-by-leaf. Literal siblings, extra live entries, shape differences,

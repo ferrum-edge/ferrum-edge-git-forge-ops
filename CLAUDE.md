@@ -71,8 +71,11 @@ resource namespace per job, intersected with the environment's protected
 namespace scope. `review --require-live` fails that job when comparison is
 unavailable or its required PR comment cannot be delivered. Review markdown is
 bounded below GitHub's API limit, and unresolved credential values are excluded
-from live comparison when no bundle is available without hiding other Consumer
-fields. Environments with `live_review: false` are removed before the
+from authoritative live comparison per leaf after resolution, including with
+empty or partial bundles, without hiding resolved-secret or sibling drift.
+The same rule covers plugin config and modeled service-discovery secrets in
+diff, plan and review; missing required values still block actual apply.
+Environments with `live_review: false` are removed before the
 Environment-bound matrix, which is required for file mode. Fork PRs and
 new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in

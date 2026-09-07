@@ -996,11 +996,11 @@ pub fn build_review_comment_v2_with_override(
                  (typical for PRs from forks or runs without an environment \
                  binding). The table below shows which placeholders are \
                  declared; **actual allocation status is determined at apply \
-                 time**, not here. Only unresolved broker-controlled leaves in \
-                 Consumer credentials and plugin config are excluded from the \
-                 live diff; literal siblings, extra entries, shape changes, and \
-                 nonsecret fields are still compared._\n\n",
+                 time**, not here._\n\n",
             );
+        }
+        if let Some(note) = secrets.unresolved_comparison_note() {
+            md.push_str(&format!("_{note}_\n\n"));
         }
         md.push_str("| Slot | Declared as |\n|------|-------------|\n");
         for result in secrets.results.iter().take(MAX_SECTION_ITEMS) {

@@ -13,6 +13,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Output};
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
@@ -86,12 +87,17 @@ fn live_proxy(
 /// Routing on the namespace header rather than the path is what the admin API
 /// itself does — `/backup` is one endpoint and the namespace is a header — so
 /// a multi-namespace run is exercised the way production drives it.
-fn spawn_backup_stub(namespaces: Vec<(String, String)>) -> String {
+fn spawn_backup_stub(
+    namespaces: Vec<(String, String)>,
+    requests: Arc<Mutex<Vec<String>>>,
+    cached: bool,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let addr = listener.local_addr().expect("stub addr");
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
             let namespaces = namespaces.clone();
+            let requests = Arc::clone(&requests);
             std::thread::spawn(move || loop {
                 let mut buf = [0_u8; 8192];
                 let n = match stream.read(&mut buf) {
@@ -99,6 +105,7 @@ fn spawn_backup_stub(namespaces: Vec<(String, String)>) -> String {
                     Ok(n) => n,
                 };
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                requests.lock().unwrap().push(request.clone());
                 let body = namespaces
                     .iter()
                     .find(|(namespace, _)| {
@@ -107,9 +114,10 @@ fn spawn_backup_stub(namespaces: Vec<(String, String)>) -> String {
                     })
                     .map(|(_, body)| body.clone())
                     .unwrap_or_else(|| backup(serde_json::json!([])));
+                let provenance = if cached { "x-data-source: cached\r\n" } else { "" };
                 if write!(
                     stream,
-                    "HTTP/1.1 200 STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    "HTTP/1.1 200 STUB\r\n{provenance}content-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 )
@@ -126,10 +134,15 @@ fn spawn_backup_stub(namespaces: Vec<(String, String)>) -> String {
 struct Repo {
     dir: TempDir,
     url: String,
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl Repo {
     fn new(files: &[(&str, &str)], namespaces: Vec<(String, String)>) -> Self {
+        Self::with_cache(files, namespaces, false)
+    }
+
+    fn with_cache(files: &[(&str, &str)], namespaces: Vec<(String, String)>, cached: bool) -> Self {
         let dir = TempDir::new().expect("tempdir");
         for (relative, contents) in files {
             let path = dir.path().join(relative);
@@ -138,13 +151,19 @@ impl Repo {
             }
             std::fs::write(&path, contents).expect("write repo file");
         }
+        let requests = Arc::new(Mutex::new(Vec::new()));
         Self {
             dir,
-            url: spawn_backup_stub(namespaces),
+            url: spawn_backup_stub(namespaces, Arc::clone(&requests), cached),
+            requests,
         }
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with_env(args, &[])
+    }
+
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
         command.args(args).current_dir(self.dir.path()).env_clear();
         for name in ["PATH", "HOME", "TMPDIR"] {
@@ -161,14 +180,31 @@ impl Repo {
             .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
             .env("FERRUM_GATEWAY_MAX_RETRIES", "0");
         #[cfg(unix)]
-        if args.first() == Some(&"plan") {
+        let validator_dir = TempDir::new().unwrap();
+        #[cfg(unix)]
+        if matches!(args.first().copied(), Some("plan" | "review" | "apply")) {
             use std::os::unix::fs::PermissionsExt;
-            let validator = self.dir.path().join("validator-stub");
+            let validator = validator_dir.path().join("validator-stub");
             std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o700)).unwrap();
             command.env("FERRUM_EDGE_BINARY_PATH", validator);
         }
+        command.envs(env.iter().copied());
         command.output().expect("run gitforgeops")
+    }
+
+    fn snapshot(&self) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        walkdir::WalkDir::new(self.dir.path())
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                (
+                    entry.path().strip_prefix(self.dir.path()).unwrap().to_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -178,6 +214,245 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+/// Issue #179: exercise the actual resolver + command gates, not just the
+/// masking primitive. CI runs these children against synthetic loopback data.
+#[cfg(unix)]
+#[test]
+fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
+    let consumer = serde_json::json!({
+        "kind": "Consumer",
+        "spec": {
+            "id": "app", "username": "app",
+            "credentials": {
+                "keyauth": [{"key": "${gh-env-secret:alloc=require}"}],
+                "basicauth": [{
+                    "username": "alice",
+                    "password_hash": "${gh-env-secret:alloc=require}"
+                }]
+            }
+        }
+    })
+    .to_string();
+    let plugin = serde_json::json!({
+        "kind": "PluginConfig",
+        "spec": {
+            "id": "otel", "plugin_name": "otel_tracing", "scope": "global",
+            "config": {
+                "authorization": "${gh-env-secret:alloc=require}",
+                "protocol": "grpc"
+            }
+        }
+    })
+    .to_string();
+    for transport in ["absent", "inline", "file"] {
+        for population in ["empty", "unrelated", "partial", "full"] {
+            if transport == "absent" && population != "empty" {
+                continue;
+            }
+            for change in [
+                "none", "resolved", "literal", "literal_secret", "extra", "removed", "plugin",
+            ] {
+                if change == "resolved" && !matches!(population, "partial" | "full") {
+                    continue;
+                }
+                let mut live = serde_json::json!({
+                    "proxies": [], "upstreams": [],
+                    "consumers": [{
+                        "id": "app", "namespace": "ferrum", "username": "app",
+                        "credentials": {
+                            "keyauth": [{"key": "synthetic-key-value-0001"}],
+                            "basicauth": [{
+                                "username": "alice",
+                                "password_hash": "synthetic-hash-value-0001"
+                            }]
+                        }
+                    }],
+                    "plugin_configs": [{
+                        "id": "otel", "namespace": "ferrum", "plugin_name": "otel_tracing",
+                        "scope": "global",
+                        "config": {"authorization": "synthetic-bearer-0001", "protocol": "grpc"}
+                    }]
+                });
+                match change {
+                    "resolved" => {
+                        live["consumers"][0]["credentials"]["keyauth"][0]["key"] =
+                            serde_json::json!("synthetic-different-key");
+                    }
+                    "literal" => {
+                        live["consumers"][0]["credentials"]["basicauth"][0]["username"] =
+                            serde_json::json!("bob");
+                    }
+                    "extra" => {
+                        live["consumers"][0]["credentials"]["keyauth"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({"key": "synthetic-extra-key"}));
+                    }
+                    "removed" => {
+                        live["consumers"][0]["credentials"]["keyauth"] = serde_json::json!([]);
+                    }
+                    "plugin" => {
+                        live["plugin_configs"][0]["config"]["protocol"] =
+                            serde_json::json!("http/protobuf");
+                    }
+                    _ => {}
+                }
+                let mut slots = serde_json::Map::new();
+                if population != "empty" {
+                    slots.insert("other/other/keyauth/key".into(), "synthetic-unrelated".into());
+                }
+                if matches!(population, "partial" | "full") {
+                    slots.insert(
+                        "ferrum/app/keyauth/key".into(),
+                        "synthetic-key-value-0001".into(),
+                    );
+                }
+                if population == "full" {
+                    slots.insert(
+                        "ferrum/app/basicauth/password_hash".into(),
+                        "synthetic-hash-value-0001".into(),
+                    );
+                    slots.insert(
+                        "ferrum/otel/@plugin-config/config/authorization".into(),
+                        "synthetic-bearer-0001".into(),
+                    );
+                }
+                let bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": slots}).to_string();
+                // Match the hosted extractor's exact empty outer-object case.
+                let bundle = if population == "empty" { "{}" } else { &bundle };
+                let mut declared: serde_json::Value = serde_json::from_str(&consumer).unwrap();
+                if change == "literal_secret" {
+                    declared["spec"]["credentials"]["basicauth"][0]["password_hash"] =
+                        serde_json::json!("synthetic-literal-hash");
+                }
+                let declared = declared.to_string();
+                let repo = Repo::new(
+                    &[
+                        ("resources/ferrum/consumers/app.yaml", &declared),
+                        ("resources/ferrum/plugins/otel.yaml", &plugin),
+                    ],
+                    vec![("ferrum".into(), live.to_string())],
+                );
+                let bundle_file = repo.dir.path().join("bundle.json");
+                std::fs::write(&bundle_file, bundle).unwrap();
+                let env = match transport {
+                    "inline" => vec![("FERRUM_CREDS_JSON", bundle)],
+                    "file" => vec![("FERRUM_CREDS_JSON_FILE", bundle_file.to_str().unwrap())],
+                    _ => vec![],
+                };
+                let before = repo.snapshot();
+                for args in [&["diff", "--exit-on-drift"][..], &["plan"], &["review"]] {
+                    let output = repo.run_with_env(args, &env);
+                    let out = stdout(&output);
+                    let diagnostics = format!("{out}\n{}", stderr(&output));
+                    let context =
+                        format!("{transport}/{population}/{change}/{args:?}: {diagnostics}");
+                    let expected_code = match args[0] {
+                        "diff" => i32::from(change != "none") * 2,
+                        "plan" => i32::from(population != "full" || change == "literal_secret"),
+                        _ => 0,
+                    };
+                    assert_eq!(output.status.code(), Some(expected_code), "{context}");
+                    let in_sync = if args[0] == "diff" {
+                        out.contains("No differences found")
+                    } else {
+                        out.contains("None (in sync)")
+                    };
+                    assert_eq!(in_sync, change == "none", "{context}");
+                    assert_eq!(
+                        diagnostics.contains("remain unresolved"),
+                        population != "full",
+                        "{context}"
+                    );
+                    assert!(!diagnostics.contains("no credential bundle is available"));
+                    for secret in [
+                        "synthetic-key-value-0001",
+                        "synthetic-hash-value-0001",
+                        "synthetic-bearer-0001",
+                        "synthetic-different-key",
+                        "synthetic-extra-key",
+                        "synthetic-unrelated",
+                        "synthetic-literal-hash",
+                    ] {
+                        assert!(!diagnostics.contains(secret), "{context}");
+                    }
+                    assert_eq!(repo.snapshot(), before, "{context}");
+                    assert!(!repo.dir.path().join(".state").exists(), "{context}");
+                }
+                {
+                    let requests = repo.requests.lock().unwrap();
+                    assert!(!requests.is_empty());
+                    assert!(requests.iter().all(|request| request.starts_with("GET /backup ")));
+                }
+                if population != "full" && change == "none" {
+                    repo.requests.lock().unwrap().clear();
+                    let output = repo.run_with_env(&["apply", "--auto-approve"], &env);
+                    assert_eq!(output.status.code(), Some(1));
+                    assert!(stderr(&output).contains("required credential slots are missing"));
+                    assert!(repo.requests.lock().unwrap().is_empty());
+                    // Apply may create a lock file, but must never publish a ledger.
+                    let after = repo.snapshot();
+                    for (path, bytes) in &before {
+                        assert_eq!(after.get(path), Some(bytes));
+                    }
+                    assert!(after.keys().all(|path| {
+                        before.contains_key(path)
+                            || (path.starts_with(".state")
+                                && path.extension().is_some_and(|ext| ext == "lock"))
+                    }));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_bundle_does_not_make_cached_comparisons_authoritative() {
+    let consumer = r#"kind: Consumer
+spec:
+  id: app
+  username: app
+  credentials:
+    keyauth: [{key: "${gh-env-secret:alloc=require}"}]
+"#;
+    let live = serde_json::json!({
+        "consumers": [{
+            "id": "app", "namespace": "ferrum", "username": "app",
+            "credentials": {"keyauth": [{"key": "synthetic-cached-key"}]}
+        }]
+    });
+    let repo = Repo::with_cache(
+        &[("resources/ferrum/consumers/app.yaml", consumer)],
+        vec![("ferrum".into(), live.to_string())],
+        true,
+    );
+    let before = repo.snapshot();
+    let env = [("FERRUM_CREDS_JSON", "{}")];
+    let approximate = repo.run_with_env(&["diff"], &env);
+    assert_eq!(approximate.status.code(), Some(0));
+    assert!(stdout(&approximate).contains("MODIFY Consumer"));
+    assert!(stderr(&approximate).contains("approximate"));
+    assert!(!stderr(&approximate).contains("remain unresolved"));
+    let strict = repo.run_with_env(&["diff", "--exit-on-drift"], &env);
+    assert_eq!(strict.status.code(), Some(1));
+    assert!(stderr(&strict).contains("requires an authoritative backup"));
+    for args in [&["plan"][..], &["review", "--require-live"]] {
+        let output = repo.run_with_env(args, &env);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!stdout(&output).contains("None (in sync)"));
+        assert!(stdout(&output).contains("cached"));
+    }
+    assert_eq!(repo.snapshot(), before);
+    assert!(
+        repo.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET /backup "))
+    );
 }
 
 /// The documented drift exit code.

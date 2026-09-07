@@ -280,11 +280,9 @@ fn resolve_credentials(
 
 /// Is a credential bundle available to this invocation?
 ///
-/// Without one, every broker-controlled leaf stays a placeholder string while
-/// the live gateway returns either the real value or `[REDACTED]`, so a naive
-/// comparison reports permanent false drift on credentials nobody changed.
-/// `diff::mask_indeterminate_secret_values` neutralizes exactly those leaves;
-/// this predicate decides when to apply it.
+/// Used only to describe the review's allocation-status context. Bundle
+/// presence does not determine whether individual leaves resolved and must
+/// never gate live-comparison masking.
 fn credential_bundle_loaded(env_config: &EnvConfig) -> bool {
     let has_content = |value: Option<&str>| value.is_some_and(|raw| !raw.trim().is_empty());
     has_content(env_config.creds_bundle_json_file.as_deref())
@@ -1040,8 +1038,7 @@ async fn cmd_diff(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let mut desired = load_and_assemble_for(&resolved, &env_config)?;
     enforce_exclusive_scope(&resolved, &desired)?;
-    let _ = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = credential_bundle_loaded(&env_config);
+    let secret_report = resolve_credentials(&mut desired, &env_config)?;
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
@@ -1061,19 +1058,15 @@ async fn cmd_diff(
             .into());
         }
     }
-    // Same treatment `plan` and `review` give an unresolvable secret: with no
-    // bundle, a broker-controlled leaf is a placeholder here and a real (or
-    // `[REDACTED]`) value on the gateway, which compares as drift on every
-    // run and fails `drift-check.yml --exit-on-drift` forever. Literal
-    // siblings, extra entries, shape changes and every nonsecret field are
-    // still compared.
-    if !bundle_loaded && cached_namespaces.is_empty() {
+    // Mask only leaves still unresolved after loading any available bundle.
+    // The primitive preserves resolved values, siblings and structural drift.
+    if cached_namespaces.is_empty() {
         for pair in &mut namespace_pairs {
             diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
         }
-        eprintln!(
-            "Note: no credential bundle is available, so unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from this comparison. Everything else is compared normally."
-        );
+        if let Some(note) = secret_report.unresolved_comparison_note() {
+            eprintln!("Note: {note}");
+        }
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
         &namespace_pairs,
@@ -1187,7 +1180,6 @@ async fn cmd_plan(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = credential_bundle_loaded(&env_config);
     println!("=== Environment ===");
     println!(
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
@@ -1222,10 +1214,8 @@ async fn cmd_plan(
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
         println!("=== Credentials ===");
         println!("{}\n", note);
-        if !bundle_loaded {
-            println!(
-                "Unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from the live diff because no secret bundle is available; literal siblings, extra entries, shape changes, and nonsecret fields are still compared.\n"
-            );
+        if let Some(note) = secret_report.unresolved_comparison_note() {
+            println!("{note}\n");
         }
     }
 
@@ -1262,10 +1252,8 @@ async fn cmd_plan(
             Ok(mut namespace_pairs) => {
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
-                    if !bundle_loaded {
-                        for pair in &mut namespace_pairs {
-                            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
-                        }
+                    for pair in &mut namespace_pairs {
+                        diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
                     }
                     let (d, b, u, s) = compute_namespace_diffs(
                         &namespace_pairs,
@@ -2440,20 +2428,10 @@ async fn cmd_review(
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
                         }
                         None => {
-                            // Same treatment `plan` and `diff` give an
-                            // unresolvable secret: with no bundle loaded a
-                            // broker-controlled leaf is still a placeholder
-                            // here and a real (or `[REDACTED]`) value on the
-                            // gateway, so comparing them would publish
-                            // permanent false drift — and echo the live value
-                            // into a world-readable PR comment.
-                            if !bundle_loaded {
-                                for pair in &mut namespace_pairs {
-                                    diff::mask_indeterminate_secret_values(
-                                        &desired,
-                                        &mut pair.actual,
-                                    );
-                                }
+                            // Bundle presence says nothing about whether a
+                            // particular leaf resolved. Mask only placeholders.
+                            for pair in &mut namespace_pairs {
+                                diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
                             }
                             let (d, b, u, s) = compute_namespace_diffs(
                                 &namespace_pairs,
