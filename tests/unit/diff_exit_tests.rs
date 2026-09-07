@@ -114,7 +114,11 @@ fn spawn_backup_stub(
                     })
                     .map(|(_, body)| body.clone())
                     .unwrap_or_else(|| backup(serde_json::json!([])));
-                let provenance = if cached { "x-data-source: cached\r\n" } else { "" };
+                let provenance = if cached {
+                    "x-data-source: cached\r\n"
+                } else {
+                    ""
+                };
                 if write!(
                     stream,
                     "HTTP/1.1 200 STUB\r\n{provenance}content-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
@@ -171,6 +175,18 @@ impl Repo {
                 command.env(name, value);
             }
         }
+        // Keep coverage profiles outside the repository whose bytes we assert
+        // are unchanged. Preserve the hosted collector's destination despite
+        // env_clear(), resolving relative paths before changing the child cwd.
+        let profile_dir = TempDir::new().expect("profile tempdir");
+        let profile_path = std::env::var_os("LLVM_PROFILE_FILE")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| profile_dir.path().join("default_%m_%p.profraw"));
+        let profile_path = std::env::current_dir()
+            .expect("test working directory")
+            .join(profile_path);
+        command.env("LLVM_PROFILE_FILE", profile_path);
         command
             .env("FERRUM_GATEWAY_MODE", "api")
             .env("FERRUM_GATEWAY_URL", &self.url)
@@ -200,7 +216,11 @@ impl Repo {
             .filter(|entry| entry.file_type().is_file())
             .map(|entry| {
                 (
-                    entry.path().strip_prefix(self.dir.path()).unwrap().to_owned(),
+                    entry
+                        .path()
+                        .strip_prefix(self.dir.path())
+                        .unwrap()
+                        .to_owned(),
                     std::fs::read(entry.path()).unwrap(),
                 )
             })
@@ -252,7 +272,13 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                 continue;
             }
             for change in [
-                "none", "resolved", "literal", "literal_secret", "extra", "removed", "plugin",
+                "none",
+                "resolved",
+                "literal",
+                "literal_secret",
+                "extra",
+                "removed",
+                "plugin",
             ] {
                 if change == "resolved" && !matches!(population, "partial" | "full") {
                     continue;
@@ -301,7 +327,10 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                 }
                 let mut slots = serde_json::Map::new();
                 if population != "empty" {
-                    slots.insert("other/other/keyauth/key".into(), "synthetic-unrelated".into());
+                    slots.insert(
+                        "other/other/keyauth/key".into(),
+                        "synthetic-unrelated".into(),
+                    );
                 }
                 if matches!(population, "partial" | "full") {
                     slots.insert(
@@ -384,7 +413,9 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                 {
                     let requests = repo.requests.lock().unwrap();
                     assert!(!requests.is_empty());
-                    assert!(requests.iter().all(|request| request.starts_with("GET /backup ")));
+                    assert!(requests
+                        .iter()
+                        .all(|request| request.starts_with("GET /backup ")));
                 }
                 if population != "full" && change == "none" {
                     repo.requests.lock().unwrap().clear();
@@ -436,23 +467,40 @@ spec:
     assert!(stdout(&approximate).contains("MODIFY Consumer"));
     assert!(stderr(&approximate).contains("approximate"));
     assert!(!stderr(&approximate).contains("remain unresolved"));
+    assert!(!stdout(&approximate).contains("synthetic-cached-key"));
+    assert!(!stderr(&approximate).contains("synthetic-cached-key"));
+    assert_eq!(repo.snapshot(), before);
     let strict = repo.run_with_env(&["diff", "--exit-on-drift"], &env);
     assert_eq!(strict.status.code(), Some(1));
     assert!(stderr(&strict).contains("requires an authoritative backup"));
-    for args in [&["plan"][..], &["review", "--require-live"]] {
+    assert_eq!(repo.snapshot(), before);
+    // --require-live needs a PR number to reach the live comparison. The child
+    // has no GITHUB_TOKEN or GITHUB_REPOSITORY after env_clear(), so delivery
+    // fails locally before constructing an HTTP client; no comment is posted.
+    for args in [&["plan"][..], &["review", "--require-live", "--pr", "1"]] {
         let output = repo.run_with_env(args, &env);
         assert_eq!(output.status.code(), Some(1));
         assert!(!stdout(&output).contains("None (in sync)"));
-        assert!(stdout(&output).contains("cached"));
+        if args[0] == "plan" {
+            assert!(stdout(&output).contains("Live comparison skipped: cached backup data"));
+            assert!(stdout(&output).contains("SKIPPED (no live config available)"));
+        } else {
+            assert!(stderr(&output).contains("Cached backup data was served"));
+            assert!(stderr(&output)
+                .contains("trusted PR review requires a complete live gateway comparison"));
+            assert!(stdout(&output).contains("Changes: Skipped"));
+        }
+        assert!(!stdout(&output).contains("synthetic-cached-key"));
+        assert!(!stderr(&output).contains("synthetic-cached-key"));
+        assert_eq!(repo.snapshot(), before);
     }
     assert_eq!(repo.snapshot(), before);
-    assert!(
-        repo.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|request| request.starts_with("GET /backup "))
-    );
+    assert!(repo
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.starts_with("GET /backup ")));
 }
 
 /// The documented drift exit code.
