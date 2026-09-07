@@ -98,9 +98,9 @@ AGENT_POLICY_SCRIPT_MARKERS = (
 # The expected owner set is not hard-coded: a customer copies this repository
 # from its template and replaces the upstream maintainer with their own. It is
 # read from the `/.github/CODEOWNERS` rule inside CODEOWNERS itself — the file
-# declares who owns it, and because that path is one of the protected entries
-# below, changing the declaration needs a review from the owners it currently
-# names. Every protected path must then be owned by exactly that set, so a
+# declares who owns it for review routing. Changes receive exact-head root
+# review without requiring a Code Owner approval submission. Every protected
+# path must then be owned by exactly that set, so a
 # customer swaps one handle in one place and the check stays as strong as it
 # was upstream.
 CODEOWNER_DECLARATION_PATH = "/.github/CODEOWNERS"
