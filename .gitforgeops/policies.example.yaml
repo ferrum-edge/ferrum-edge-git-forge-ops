@@ -169,8 +169,9 @@ policies:
     enabled: false
     severity: error
 
-# Policy override — a PR labelled with `require_label` bypasses errors when the
-# account that added the label has at least `required_permission` on the repo.
+# Policy override — the latest labeler must hold `required_permission` and
+# submit a current-head PR review with body `gitforgeops-override <require_label>`.
+# Actual source/configuration must match that reviewed revision. See README.
 overrides:
   require_label: gitforgeops/policy-override
   required_permission: write     # admin | maintain | write

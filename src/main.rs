@@ -157,7 +157,7 @@ fn resolve_runtime(
 /// optional standalone mesh document.
 ///
 /// Most commands only care about the gateway half and take `.gateway`;
-/// `validate`, `plan`, `export` and file-mode `apply` also act on `.mesh`.
+/// `validate`, `plan`, `review`, `export` and file-mode `apply` also act on `.mesh`.
 fn load_and_assemble_all(
     resolved: &ResolvedEnv,
     env_config: &EnvConfig,
@@ -198,8 +198,8 @@ fn load_and_assemble_all(
 }
 
 /// [`load_and_assemble_all`] for the commands that only reconcile gateway
-/// resources. Mesh config has no live admin API, so `diff`, `review` and
-/// `rotate` have nothing to do with it.
+/// resources. Mesh config has no live admin API, so `diff` and `rotate`
+/// have nothing to do with it. Review still validates the mesh document.
 fn load_and_assemble_for(
     resolved: &ResolvedEnv,
     env_config: &EnvConfig,
@@ -1551,7 +1551,7 @@ async fn cmd_apply(
                     "Refusing to apply: {blocker_count} error-severity security finding(s) listed above. \
                      Consumer credentials belong in the broker as ${{gh-env-secret:...}} placeholders; a literal \
                      value in repository YAML is a committed secret and applying it publishes it to the gateway. \
-                     To override, add the '{}' label to the PR from an account with '{}' permission.",
+                     To override, add the '{}' label and submit its revision-bound override review from an account with '{}' permission.",
                     override_cfg.require_label, override_cfg.required_permission
                 );
                 match &override_decision {
@@ -2242,17 +2242,11 @@ async fn cmd_apply(
             }
         }
     }
-    if !overridden_for_audit.is_empty() {
-        // An override belongs to the attempted commit even when the apply is
-        // partial. Prefer the workflow's immutable input SHA; falling back to
-        // last_applied first would misattribute a failed attempt to the prior
-        // successfully landed commit.
-        let commit = std::env::var("GITHUB_SHA")
-            .ok()
-            .or_else(|| state.last_applied_commit.clone())
-            .unwrap_or_default();
-        for (rule_id, approver) in &overridden_for_audit {
-            state.record_override(rule_id, &commit, approver);
+    if let Some(decision) = &override_decision {
+        // The verified actual source revision and reviewed PR head are distinct
+        // for a merge and for later generated-state-only commits.
+        for (rule_id, _) in &overridden_for_audit {
+            state.record_verified_override(rule_id, decision);
         }
     }
     state.save()?;
@@ -2363,7 +2357,8 @@ async fn cmd_review(
         .into());
     }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    let mut desired = assembled.gateway;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
     // apply would produce.
@@ -2375,27 +2370,15 @@ async fn cmd_review(
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
     let bundle_loaded = credential_bundle_loaded(&env_config);
 
-    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
-    let (validation_status, validation_output, validation_execution_error) = match &val_result {
-        Ok(r) if r.success => (
-            review::ReviewValidationStatus::Passed,
-            format!("{}{}", r.stdout, r.stderr),
-            None,
-        ),
-        Ok(r) => (
-            review::ReviewValidationStatus::Rejected,
-            format!("{}{}", r.stdout, r.stderr),
-            None,
-        ),
-        Err(e) => {
-            let message = format!("Validator execution error: {e}");
-            (
-                review::ReviewValidationStatus::ExecutionError,
-                message,
-                Some(e.to_string()),
-            )
-        }
-    };
+    let review::ReviewValidation {
+        status: validation_status,
+        output: validation_output,
+        execution_error: validation_execution_error,
+    } = review::validate_for_review(
+        &desired,
+        assembled.mesh.as_ref(),
+        &env_config.edge_binary_path,
+    );
 
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
@@ -2486,25 +2469,31 @@ async fn cmd_review(
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
-    let (policy_findings, override_reason, override_cfg) = match policy_cfg {
-        Some(policy_cfg) => {
-            let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
-            let decision = match pr {
-                Some(pr_number) => {
-                    let d = policy::check_override(&env_config, &policy_cfg.overrides, pr_number)
-                        .await?;
-                    policy::github_override::apply_override(&mut findings, &d);
-                    Some(d)
-                }
-                None => None,
-            };
-            (
-                findings,
-                decision.map(|d| d.reason),
-                Some(policy_cfg.overrides),
+    let mut policy_findings = policy_cfg
+        .as_ref()
+        .map(|cfg| policy::evaluate_policies(&desired, cfg))
+        .unwrap_or_default();
+    let override_cfg = policy_cfg
+        .as_ref()
+        .map(|cfg| cfg.overrides.clone())
+        .unwrap_or_default();
+    // Apply and plan share one verified decision across policy and security.
+    // Security-only repositories also use the default override configuration.
+    let override_decision = match pr {
+        Some(pr_number)
+            if policy_cfg.is_some()
+                || verdict::security_blocker(&security_findings, false).is_some() =>
+        {
+            let decision = policy::github_override::check_review_override(
+                &env_config,
+                &override_cfg,
+                pr_number,
             )
+            .await?;
+            policy::github_override::apply_override(&mut policy_findings, &decision);
+            Some(decision)
         }
-        None => (Vec::new(), None, None),
+        _ => None,
     };
 
     let ownership_note = review::environment_header(
@@ -2513,7 +2502,7 @@ async fn cmd_review(
         &format!("{:?}", resolved.apply_strategy),
     );
 
-    let comment = review::build_review_comment_v2_with_status(
+    let comment = review::build_review_comment_v2_with_override(
         validation_status,
         &validation_output,
         &diffs,
@@ -2523,12 +2512,15 @@ async fn cmd_review(
         &policy_findings,
         &unmanaged,
         &spec_owned,
-        override_reason.as_deref(),
-        override_cfg.as_ref(),
+        override_decision
+            .as_ref()
+            .map(|decision| decision.reason.as_str()),
+        Some(&override_cfg),
         comparison_error.as_deref(),
         Some(&ownership_note),
         &secret_report,
         bundle_loaded,
+        override_decision.as_ref(),
     );
 
     let mut comment_delivery_error = None;
