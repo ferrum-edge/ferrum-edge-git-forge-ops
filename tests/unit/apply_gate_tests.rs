@@ -965,7 +965,10 @@ fn mesh_scope_refusal_precedes_admin_api_connections() {
         );
         assert!(!output.status.success());
         let stderr = stderr(&output);
-        assert!(stderr.contains("platform/mesh/outside-fragment"), "{stderr}");
+        assert!(
+            stderr.contains("platform/mesh/outside-fragment"),
+            "{stderr}"
+        );
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
