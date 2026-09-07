@@ -14,7 +14,8 @@ use super::github_api::{fetch_public_key, put_environment_secret};
 use super::placeholder::PlaceholderAlloc;
 use super::resolver::{
     check_generation_allowed, credential_type_from_slot, current_gateway_mode, ResolveReport,
-    ResolveResult, SlotStatus, MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, REDACTED_SENTINEL,
+    ResolveResult, SlotStatus, MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES,
+    REDACTED_SENTINEL,
 };
 
 #[derive(Debug, Clone)]

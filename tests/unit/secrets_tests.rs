@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use gitforgeops::config::schema::{Consumer, GatewayConfig};
 use gitforgeops::secrets::{
     bundle::{pick_shard, shard_secret_name},
-    load_bundles_from_env, parse_placeholder, resolve_secrets, slot_path, PlaceholderAlloc, SlotStatus,
+    load_bundles_from_env, parse_placeholder, resolve_secrets, slot_path, PlaceholderAlloc,
+    SlotStatus,
 };
 
 const TEST_ED25519_PUBLIC_KEY: &str =
