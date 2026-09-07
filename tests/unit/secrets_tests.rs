@@ -57,7 +57,8 @@ fn parse_placeholder_rejects_unknown_alloc() {
     let err = parse_placeholder("${gh-env-secret:alloc=steal}")
         .unwrap()
         .unwrap_err();
-    assert!(err.to_string().contains("steal"));
+    assert!(err.to_string().contains("unknown secret alloc mode"));
+    assert!(!err.to_string().contains("steal"));
 }
 
 #[test]
