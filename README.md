@@ -865,7 +865,7 @@ On apply, for each `alloc=generate` or first-apply `alloc=rotate` placeholder wi
 1. Generate a 32-byte (or `len=`) random value from the OS CSPRNG, encoded base64url-no-pad (so 32 bytes → 43 characters).
 2. Fetch the env's libsodium public key from `GET /repos/.../environments/<env>/secrets/public-key`.
 3. Encrypt the updated bundle with `crypto_box_seal` and `PUT` to `/repos/.../environments/<env>/secrets/FERRUM_CREDS_BUNDLE[_N]`.
-4. Fetch the PR author's SSH public keys from `GET /users/{login}/keys`.
+4. Fetch the PR author's SSH public keys from `GET /users/{login}/keys`, following pagination (100 keys per page, at most 20 requests) until the first compatible key. An incomplete search fails; only a completed search can report no usable keys.
 5. Encrypt the new value with age to an Ed25519 (preferred) or RSA SSH recipient.
 6. Post an age-armored blob as a comment on the PR; the author decrypts locally.
 
