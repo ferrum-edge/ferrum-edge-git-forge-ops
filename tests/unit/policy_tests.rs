@@ -3337,3 +3337,38 @@ fn allowed_proxy_plugins_reports_only_effective_scoped_instances() {
     assert!(findings[0].message.contains("plugin scoped"));
     assert!(findings[0].message.contains("request_transformer"));
 }
+
+#[test]
+fn enabled_allowlists_reject_empty_configuration_even_at_warning_severity() {
+    for (rule, key, defaulted) in [
+        ("backend_scheme", "allowed_protocols", false),
+        ("allowed_proxy_plugins", "allowed_plugin_names", false),
+        ("require_ai_guardrails", "guardrail_plugin_names", true),
+    ] {
+        for enabled in [true, false] {
+            for list in [None, Some("[]"), Some("['', '  ']")] {
+                let mut yaml = format!(
+                    "version: 1\npolicies:\n  {rule}:\n    enabled: {enabled}\n    severity: warning\n"
+                );
+                if let Some(list) = list {
+                    yaml.push_str(&format!("    {key}: {list}\n"));
+                }
+                let policies: PolicyConfig = serde_yaml::from_str(&yaml).unwrap();
+                let findings = evaluate_policies(&GatewayConfig::default(), &policies);
+                if !enabled || (defaulted && list.is_none()) {
+                    assert!(findings.is_empty(), "{yaml}: {findings:?}");
+                    continue;
+                }
+                assert_eq!(findings.len(), 1, "{yaml}: {findings:?}");
+                let finding = &findings[0];
+                assert_eq!(finding.rule_id, rule);
+                assert_eq!(finding.id, rule);
+                assert_eq!(finding.kind, "PolicyConfig");
+                assert_eq!(finding.namespace, "global");
+                assert_eq!(finding.severity, Severity::Error);
+                assert!(finding.is_blocking());
+                assert!(finding.message.contains(key));
+            }
+        }
+    }
+}

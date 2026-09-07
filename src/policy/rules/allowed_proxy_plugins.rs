@@ -22,8 +22,19 @@ impl PolicyCheck for AllowedProxyPluginsRule {
 
     fn evaluate(&self, cfg: &GatewayConfig) -> Vec<PolicyFinding> {
         let mut findings = Vec::new();
-        if !self.config.enabled || self.config.allowed_plugin_names.is_empty() {
+        if !self.config.enabled {
             return findings;
+        }
+        if self
+            .config
+            .allowed_plugin_names
+            .iter()
+            .all(|s| s.trim().is_empty())
+        {
+            return vec![crate::policy::empty_allowlist_finding(
+                self.rule_id(),
+                "allowed_plugin_names",
+            )];
         }
 
         let allowed: Vec<String> = self
