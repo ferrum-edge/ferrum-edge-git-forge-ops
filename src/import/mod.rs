@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::config::schema::{GatewayConfig, Resource};
 use crate::http_client::BackupSnapshot;
+use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
     capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
@@ -867,11 +868,8 @@ fn render_migration_bundles(captured: &CredentialBundle) -> crate::error::Result
                     <= crate::secrets::bundle::BUNDLE_SOFT_LIMIT_BYTES
             })
             .unwrap_or(shards.len() as u32);
-        if shard >= 100 {
-            return Err(crate::error::Error::Config(
-                "credential migration bundle would exceed GitHub's 100 environment-secret shard limit"
-                    .to_string(),
-            ));
+        if shard >= MAX_BUNDLE_SHARDS {
+            return Err(shard_ceiling_error(slot, "import"));
         }
         let current = shard_sizes.get(&shard).copied().unwrap_or(2);
         let projected = current + usize::from(current > 2) + entry_size;

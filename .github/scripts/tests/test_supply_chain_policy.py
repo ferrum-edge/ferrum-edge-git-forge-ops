@@ -557,6 +557,23 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("MAX_BUNDLE_SHARDS disagrees" in item for item in violations), violations
         )
 
+    def test_import_packing_must_use_the_shared_shard_ceiling(self):
+        self.assertEqual(check_supply_chain.import_shard_ceiling_violations(ROOT), [])
+        for replacement in ("shard >= 100", "shard > MAX_BUNDLE_SHARDS"):
+            with self.subTest(replacement=replacement):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / "src/import/mod.rs"
+                    original = path.read_text(encoding="utf-8")
+                    changed = original.replace("shard >= MAX_BUNDLE_SHARDS", replacement)
+                    self.assertNotEqual(original, changed)
+                    path.write_text(changed, encoding="utf-8")
+                    violations = self._violations(root)
+                self.assertTrue(
+                    any("migration packing must refuse" in item for item in violations),
+                    violations,
+                )
+
     def test_privileged_workflows_must_bind_every_declared_shard(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
@@ -1207,6 +1224,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ".dockerignore",
             "rust-toolchain.toml",
             "src/secrets/bundle.rs",
+            "src/import/mod.rs",
         ):
             source = ROOT / relative
             destination = root / relative
