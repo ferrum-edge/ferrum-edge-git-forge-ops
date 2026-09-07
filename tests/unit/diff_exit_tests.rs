@@ -160,6 +160,14 @@ impl Repo {
             .env("FERRUM_ALLOW_INSECURE_HTTP", "true")
             .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
             .env("FERRUM_GATEWAY_MAX_RETRIES", "0");
+        #[cfg(unix)]
+        if args.first() == Some(&"plan") {
+            use std::os::unix::fs::PermissionsExt;
+            let validator = self.dir.path().join("validator-stub");
+            std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o700)).unwrap();
+            command.env("FERRUM_EDGE_BINARY_PATH", validator);
+        }
         command.output().expect("run gitforgeops")
     }
 }
@@ -387,4 +395,43 @@ fn other_namespaces_are_still_compared_alongside_a_conflict() {
             && out.contains("API-spec ownership conflicts"),
         "the verdict must name both categories: {out}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_fails_only_for_conflicting_live_spec_ownership() {
+    for (live_id, expected_code) in [("app", 1), ("spec-app", 0)] {
+        let repo = Repo::new(
+            &[("resources/ferrum/proxies/app.yaml", FERRUM_PROXY)],
+            vec![(
+                "ferrum".to_string(),
+                backup(serde_json::json!([live_proxy(
+                    live_id,
+                    "ferrum",
+                    8080,
+                    Some("spec-1")
+                )])),
+            )],
+        );
+        let output = repo.run(&["plan"]);
+        let out = stdout(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "{out} {}",
+            stderr(&output)
+        );
+        assert!(out.contains("Spec-owned Resources"), "{out}");
+        assert_eq!(
+            out.contains("=== Apply Blockers ==="),
+            expected_code == 1,
+            "{out}"
+        );
+        if expected_code == 1 {
+            assert!(
+                out.contains("API-spec ownership conflicts block apply in namespace(s): ferrum"),
+                "{out}"
+            );
+        }
+    }
 }
