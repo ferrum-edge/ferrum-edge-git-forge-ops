@@ -147,6 +147,18 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
+Incremental Add/Modify failures defer every planned Delete in that namespace,
+including failed pending-create ownership assertions. Remaining writes and other
+namespaces continue under the existing fatal-error rules. `ApplyResult::deletes_deferred`
+and CLI counts distinguish deferrals from successful deletes; per-resource messages
+name what was retained and why. Deferred and failed deletes never enter
+`applied_incremental`, so the managed ledger survives and the run exits non-zero.
+Plan/diff/apply previews explain that pruning is conditional. No flag bypasses
+this gate. A same-routing-key ID rename still conflicts on an unchanged retry:
+preserving the incumbent does not free its key. Keep its ID and modify it, stage
+a replacement on a distinct valid key, or plan a migration/maintenance window to
+resolve the conflict. Incremental CRUD does not offer an atomic route swap.
+
 A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate.
 
 Create and batch POST error responses are never retried blindly. An ambiguous outcome is reconciled through an authoritative (non-cached) backup, and the readback has three severities (`LiveMatch`): the **exact** row live → an idempotent PUT declares repository ownership and the create is recorded; the row **absent** → the write provably did not commit, so it is an ordinary per-resource error and the rest of the run continues; the row **present but different**, or no usable verification at all → a run-stopping `AmbiguousMutation`. `resource_values_match` is a subset test (desired ⊆ live, minus server timestamps) so a gateway-populated optional does not read as a foreign row.
@@ -210,6 +222,19 @@ Configured per environment in repo config.
   *unmanaged* and left alone. `full_replace` is rejected in this mode.
 - **`exclusive`**: repo is authoritative for the listed `namespaces`. Unmanaged
   resources get pruned. Required for `full_replace`.
+
+The shared `load_and_assemble_all` boundary enforces exclusive scope after
+overlays and namespace filtering, before returning to validate/plan/review/diff/
+export/apply callers. Gateway resources use their effective namespace; mesh
+fragments use their directory namespace. `AssembledOutput.mesh_sources` retains
+each selected fragment's namespace and diagnostic label across merging, so
+`validate_mesh_scope` can reject unowned fragments even when they only set a
+mesh-wide singleton. Diagnostics name `namespace/mesh/id` (file stem fallback)
+and explain how to add ownership or move the fragment. Inner workload/service
+namespaces do not grant fragment ownership. Shared mode remains unrestricted,
+and filters still exclude unselected mesh fragments before merging. An unowned
+exclusive filter is rejected even when it selects nothing. This also preserves
+the offline ownership gate for validate and export, including materialization.
 
 #### Adoption of already-matching rows
 
@@ -350,10 +375,20 @@ reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
 where a scoped plugin config replaces a global one of the same `plugin_name`).
 Rules that reason about plugins go through it rather than hard-coding names.
 
-Severity `error` blocks `apply` unless overridden. Override = PR label
-(configurable name) added by a user whose repo permission is ≥
-`overrides.required_permission` (default `write`). Implementation:
-`src/policy/github_override.rs::check_override`.
+Severity `error` blocks `apply` unless overridden. Override requires the current
+configured PR label, its latest labeler's current permission ≥
+`overrides.required_permission` (default `write`), and that account's latest
+submitted PR review with exact body `gitforgeops-override <configured-label>`.
+Only APPROVED/COMMENTED reviews whose `commit_id` is the current PR head qualify.
+Label-event `commit_id` is not a labeled-at head. Actual desired/configuration
+bytes and executable source must match that head's complete Git tree. Merged
+PRs additionally require merge ancestry; `.state/**` and `assembled/**` remain
+the only permitted post-review differences. Trusted review checks split candidate
+data/protected source via review-only `GITFORGEOPS_OVERRIDE_SOURCE`; apply/plan
+always inspect their own checkout. All use the shared authorization predicate
+in `src/policy/github_override.rs` and raw input verification in
+`src/policy/override_input.rs`. Audit entries record PR, review id, authorized
+head and actual applied revision; optional fields preserve old state loading.
 
 ### Preview verdicts (`src/verdict.rs`)
 
@@ -418,11 +453,28 @@ a validator diagnostic), and `diff::security::check_literal_credentials` (never
 block `apply` on one). That last one carries the credential type and leaf key
 down the walk separately from the human-readable diagnostic path.
 
-Generation constraints, enforced at resolve time so `plan` fails before `apply`
-writes an unusable value: `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24
-entropy bytes); `basicauth` generation is refused in file mode and
+Generation constraints, shared by `resolver::check_generation_allowed` and the
+allocator so `plan` and generation cannot disagree: `jwt`/`hmac_auth` secrets
+need ≥32 chars (`len=` ≥ 24 entropy bytes); `basicauth` generation is refused in file mode and
 `basicauth/…/password_hash` in either mode (the hash is HMAC-SHA256 under the
 gateway's own secret); a bundle value of `[REDACTED]` is refused.
+
+The allocator validates the entire candidate batch before GitHub key discovery,
+including direct callers and lenient reports. Structural types must agree with
+the encoded slot. The same policy rejects non-generatable discovery secrets
+using `SD_SECRET_FIELDS`, and rejects generation of public identity fields.
+Already-seeded slots still resolve regardless of their allocation mode.
+
+`allocator::check_rotation_allowed` additionally restricts rotation to Consumer
+`keyauth/key`, `jwt/secret`, `hmac_auth/secret` and api-mode `basicauth/password`,
+including indexed entries. Both the CLI and `rotate_and_deliver` enforce it.
+The command has no PluginConfig/Upstream publication path: reserved slots cannot
+be rotated even when those resources share a Consumer id. Plugin allocation via
+apply remains supported. Target placeholder, generation, namespace/ownership,
+sibling resolution and gateway-client construction all precede secret writes;
+publication reuses the preflight's desired Consumer snapshot. Externally issued
+secrets must be reissued, reseeded into the bundle and applied. A value destroyed
+by an older rotation cannot be recovered from GitHub's write-only secret API.
 
 Slot identity is positional, and `resolver::check_array_slot_identity` splits
 the two consequences by whether evidence exists:
@@ -444,7 +496,8 @@ Literal (non-placeholder) consumer credentials are an apply blocker too:
 document before the state lock, the bundle read, and any gateway call, health
 preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
-label + repo permission), resolved once and shared by both gates.
+label + revision-bound review + current repo permission and input verification),
+resolved once and shared by both gates.
 
 #### Secrets outside `Consumer.credentials`
 

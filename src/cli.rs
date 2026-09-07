@@ -134,12 +134,17 @@ pub enum Commands {
         #[arg(long)]
         include_scopes: bool,
     },
-    /// Rotate a specific credential slot. Requires provisioner token.
+    /// Rotate a Consumer credential slot in api mode. Requires provisioner token.
     Rotate {
         #[arg(long)]
         consumer: String,
+        /// Consumer field: keyauth/key, jwt/secret, hmac_auth/secret or
+        /// basicauth/password; use <type>/[N]/<field> for later entries.
+        /// Hashes, identities, PluginConfig and Upstream slots cannot be rotated.
         #[arg(long)]
         credential: String,
+        /// Target namespace; defaults to the resolved environment filter
+        /// (configured namespace_filter, then FERRUM_NAMESPACE), then ferrum.
         #[arg(long)]
         namespace: Option<String>,
         /// GitHub login to deliver the rotated credential to (age-encrypted).
