@@ -745,13 +745,13 @@ Removal is asymmetric on the gateway side: omitting `keyauth`, `jwt`, `hmac_auth
 
 ### What the broker will and won't generate
 
-Generation constraints are checked at resolve time, so `plan` fails before `apply` writes a value the gateway would reject:
+Generation constraints are shared by the resolver and allocator: `plan` checks pending allocations, and allocation/rotation checks every new value before GitHub key discovery or secret writes. Seeded values keep resolving regardless of allocation mode:
 
 - `jwt` / `hmac_auth` need ≥32-character secrets, so `len=` must be at least 24 entropy bytes. The default `len=32` yields 43 base64url characters.
 - `basicauth` in **file mode** is refused: a file-mode gateway requires `password_hash`, and that hash is an HMAC-SHA256 under the gateway's own `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not have. Set the hash by hand, or use api mode where the admin API hashes a plaintext password on write.
 - `basicauth/…/password_hash` is refused in either mode, for the same reason.
 - A bundle value of `[REDACTED]` is refused — that is what a plain `GET /consumers/…` returns for `keyauth`/`jwt`/`hmac_auth` secrets, so a bundle holding it was seeded from the wrong endpoint. Re-seed from `GET /backup` or rotate the slot.
-- `mtls_auth.identity` has to match a real certificate field. Nothing stops you writing `alloc=generate` there, but the gateway will reject the result.
+- `mtls_auth.identity` and `basicauth.username` are public identities: supply them literally. They cannot be generated or rotated.
 
 ### Placeholder syntax
 
@@ -779,7 +779,7 @@ jwt:     [{secret: S}]           ->  ferrum/app-mobile/jwt/secret
 
 The elision is what keeps the object→array normalization from orphaning every value already allocated in `FERRUM_CREDS_BUNDLE*`. Lookups also fall back to older encodings (verbatim `[0]`, and the legacy dotted form) so a bundle written by an earlier gitforgeops still resolves after an upgrade; only the elided form is ever written.
 
-The same path syntax is what `gitforgeops rotate --credential` takes: `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `mtls_auth/identity`, `basicauth/password`, or `keyauth/[1]/key` for a second entry.
+The same path syntax is what `gitforgeops rotate --credential` takes: `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `basicauth/password`, or `keyauth/[1]/key` for a second entry.
 
 #### Secrets outside `Consumer.credentials`
 
@@ -889,6 +889,25 @@ Actions → GitForgeOps Rotate Credential → Run workflow
 ```
 
 The rotation re-generates the value, overwrites the env secret, delivers it age-encrypted to `${{ github.actor }}` (whoever triggered the workflow), and then pushes the updated consumer directly to the live Admin API. Rotation is refused in file mode because there is no live gateway push path; use materialization to produce a new resolved flat file for file-mode gateways.
+
+Rotation supports only Consumer `keyauth/key`, `jwt/secret`, `hmac_auth/secret`
+and api-mode `basicauth/password`, including indexed entries. The target must
+be a placeholder on the declared Consumer in the selected namespace, and its
+siblings must already resolve. Password hashes, identities, unknown credential
+fields and reserved `@plugin-config` / `@service-discovery` slots are refused
+before GitHub key discovery, secret writes or gateway publication. A PluginConfig
+or Upstream sharing the Consumer's id does not make its slots Consumer credentials.
+Plugin allocation through `apply` remains supported; this command has no plugin
+or upstream publication path. Rotation reuses the Consumer snapshot checked by
+preflight so unrelated resources cannot introduce a later generation refusal.
+
+For externally issued secrets, mint the replacement at the provider, reseed the
+existing broker slot while preserving every other bundle entry, then run `apply`.
+If an older rotation replaced a Consul token or basic-auth password hash, the
+previous GitHub Environment Secret value cannot be read back. Reissue the Consul
+token with the required policies, or recompute the password hash using the
+gateway's `FERRUM_BASIC_AUTH_HMAC_SECRET`, then reseed and apply. For supported
+basic-auth rotation, use `basicauth/password` in api mode and let the gateway hash it.
 
 ### File mode (two-stage)
 

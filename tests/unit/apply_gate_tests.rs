@@ -713,3 +713,174 @@ fn empty_enabled_allowlists_block_plan_and_apply_before_publication() {
         }
     }
 }
+
+#[test]
+fn rotate_checks_target_generation_before_any_network_or_state_publication() {
+    // The Upstream and PluginConfig deliberately share the Consumer id.
+    // An HTTPS proxy trap catches all GitHub traffic, including key discovery;
+    // the gateway uses the same loopback listener. Nothing reaches production.
+    for (credential, credentials, expected) in [
+        (
+            "@service-discovery/consul/token",
+            r#"{"keyauth":[{"key":"${gh-env-secret:alloc=require}"}]}"#,
+            "Consul ACL token",
+        ),
+        (
+            "@plugin-config/config/api_key",
+            r#"{"keyauth":[{"key":"${gh-env-secret:alloc=require}"}]}"#,
+            "PluginConfig and Upstream slots cannot be published",
+        ),
+        (
+            "basicauth/password_hash",
+            r#"{"basicauth":[{"username":"app","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
+            "cannot generate a basicauth password_hash",
+        ),
+        (
+            "basicauth/[1]/password_hash",
+            r#"{"basicauth":[{"username":"one","password_hash":"${gh-env-secret:alloc=require}"},{"username":"two","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
+            "cannot generate a basicauth password_hash",
+        ),
+        (
+            "jwt/secret",
+            r#"{"jwt":[{"secret":"${gh-env-secret:alloc=require|len=16}"}]}"#,
+            "at least 32 characters",
+        ),
+        (
+            "keyauth/key",
+            r#"{"keyauth":[{"key":"literal-value"}]}"#,
+            "no `${gh-env-secret:...}` placeholder",
+        ),
+        (
+            "mtls_auth/identity",
+            r#"{"mtls_auth":[{"identity":"${gh-env-secret:alloc=require}"}]}"#,
+            "identity fields",
+        ),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let consumer = format!(
+            "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials: {credentials}\n"
+        );
+        let repo = Repo::with_files(&[
+            ("resources/platform/consumers/app.yaml", &consumer),
+            (
+                "resources/platform/upstreams/app.yaml",
+                "kind: Upstream\nspec:\n  id: app\n  targets: []\n  service_discovery:\n    provider: consul\n    consul:\n      address: https://consul.invalid\n      service_name: orders\n      token: '${gh-env-secret:alloc=require}'\n",
+            ),
+            (
+                "resources/platform/plugins/app.yaml",
+                "kind: PluginConfig\nspec:\n  id: app\n  plugin_name: custom\n  scope: global\n  config:\n    api_key: '${gh-env-secret:alloc=require}'\n",
+            ),
+        ]);
+        let bundle = serde_json::json!({
+            "FERRUM_CREDS_BUNDLE": {
+                format!("platform/app/{credential}"): "existing-sensitive-value"
+            }
+        })
+        .to_string();
+        let bundle_path = repo.dir.path().join("bundle.json");
+        std::fs::write(&bundle_path, &bundle).unwrap();
+        let output = repo.run(
+            &[
+                "rotate",
+                "--consumer",
+                "app",
+                "--credential",
+                credential,
+                "--recipient",
+                "recipient",
+            ],
+            &[
+                ("FERRUM_GATEWAY_MODE", "api"),
+                ("FERRUM_NAMESPACE", "platform"),
+                ("FERRUM_GATEWAY_URL", &endpoint),
+                ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "synthetic-admin-secret-at-least-32-bytes",
+                ),
+                ("GITHUB_REPOSITORY", "test/fixture"),
+                ("FERRUM_GH_PROVISIONER_TOKEN", "synthetic-token"),
+                ("FERRUM_CREDS_JSON_FILE", bundle_path.to_str().unwrap()),
+                ("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", "1"),
+                ("HTTPS_PROXY", &endpoint),
+                ("HTTP_PROXY", &endpoint),
+                ("ALL_PROXY", &endpoint),
+                ("NO_PROXY", ""),
+            ],
+        );
+        let diagnostic = stderr(&output);
+        assert!(!output.status.success(), "{credential}");
+        assert!(diagnostic.contains(expected), "{credential}: {diagnostic}");
+        assert!(diagnostic.contains("platform/app/"), "{diagnostic}");
+        assert!(!diagnostic.contains("existing-sensitive-value"));
+        assert!(!stdout(&output).contains("existing-sensitive-value"));
+        assert_eq!(std::fs::read_to_string(bundle_path).unwrap(), bundle);
+        assert!(!repo.published().exists());
+        assert!(!repo.dir.path().join(".state/default.json").exists());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "refusal must precede every GitHub/gateway request"
+        );
+    }
+}
+
+#[test]
+fn rotate_supported_credentials_in_resolved_namespace_reach_provisioning() {
+    // Positive controls end at the local proxy, before any secret write.
+    // An unrelated invalid JWT must not block this Consumer's preflight.
+    for (kind, field) in [
+        ("keyauth", "key"),
+        ("jwt", "secret"),
+        ("hmac_auth", "secret"),
+        ("basicauth", "password"),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let credential = format!("{kind}/[1]/{field}");
+        let consumer = format!(
+            "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: existing-sibling-value\n        username: first\n      - {field}: '${{gh-env-secret:alloc=require}}'\n        username: second\n"
+        );
+        let repo = Repo::with_files(&[
+            ("resources/platform/consumers/app.yaml", &consumer),
+            (
+                "resources/platform/consumers/unrelated.yaml",
+                "kind: Consumer\nspec:\n  id: unrelated\n  username: unrelated\n  credentials:\n    jwt:\n      - secret: '${gh-env-secret:alloc=generate|len=16}'\n",
+            ),
+        ]);
+        let output = repo.run(
+            &["rotate", "--consumer", "app", "--credential", &credential],
+            &[
+                ("FERRUM_GATEWAY_MODE", "api"),
+                ("FERRUM_NAMESPACE", "platform"),
+                ("FERRUM_GATEWAY_URL", &endpoint),
+                ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "synthetic-admin-secret-at-least-32-bytes",
+                ),
+                ("GITHUB_REPOSITORY", "test/fixture"),
+                ("FERRUM_GH_PROVISIONER_TOKEN", "synthetic-token"),
+                ("FERRUM_CREDS_JSON", "{}"),
+                ("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", "1"),
+                ("HTTPS_PROXY", &endpoint),
+                ("HTTP_PROXY", &endpoint),
+                ("ALL_PROXY", &endpoint),
+                ("NO_PROXY", ""),
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "the proxy deliberately never responds"
+        );
+        assert!(
+            listener.accept().is_ok(),
+            "{credential} must reach provisioning in platform: {}",
+            stderr(&output)
+        );
+        assert!(!repo.dir.path().join(".state/default.json").exists());
+    }
+}

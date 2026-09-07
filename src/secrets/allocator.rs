@@ -4,6 +4,8 @@ use base64::Engine;
 use rand::Rng;
 use reqwest::Client;
 
+use crate::config::GatewayMode;
+
 use super::bundle::{
     merge_bundles, reserve_shard, serialize_bundle, shard_secret_name, CredentialBundle,
 };
@@ -11,8 +13,8 @@ use super::delivery::{deliver_to_author, DeliveryResult};
 use super::github_api::{fetch_public_key, put_environment_secret};
 use super::placeholder::PlaceholderAlloc;
 use super::resolver::{
-    check_min_entropy, credential_type_from_slot, ResolveReport, ResolveResult, SlotStatus,
-    MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, REDACTED_SENTINEL,
+    check_generation_allowed, credential_type_from_slot, current_gateway_mode, ResolveReport,
+    ResolveResult, SlotStatus, MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, REDACTED_SENTINEL,
 };
 
 #[derive(Debug, Clone)]
@@ -113,9 +115,17 @@ pub async fn allocate_and_deliver(
         return Ok(outcome);
     }
 
-    let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
-        .await
-        .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
+    // Validate the entire batch before even discovering GitHub keys. A later
+    // invalid candidate must not allow earlier candidates to reach delivery.
+    let mode = current_gateway_mode()?;
+    for candidate in &candidates {
+        check_generation_allowed(
+            &candidate.slot,
+            report.credential_type_for(&candidate.slot),
+            candidate.placeholder.length_bytes,
+            &mode,
+        )?;
+    }
 
     // Phase 1: plan shard assignments, generate values, and encrypt delivery
     // ciphertexts. No GitHub writes and no mutation of `shards` yet.
@@ -144,10 +154,11 @@ pub async fn allocate_and_deliver(
         // comes from the report, where the resolver captured it as a slot
         // *component*; parsing it back out of the slot string is only the
         // fallback.
-        let value = generate_credential_value_typed(
+        let value = generate_credential_value_with_mode(
             &candidate.slot,
             candidate.placeholder.length_bytes,
             report.credential_type_for(&candidate.slot),
+            &mode,
         )
         .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
@@ -168,12 +179,29 @@ pub async fn allocate_and_deliver(
         )
         .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
+        // Reserve in `staged` before discovering any recipient keys, so
+        // every slot's capacity check also completes without network I/O.
+        staged
+            .entry(shard)
+            .or_default()
+            .insert(candidate.slot.clone(), value.clone());
+
+        planned.push(Planned {
+            slot: candidate.slot.clone(),
+            value,
+            shard,
+            alloc: candidate.placeholder.alloc,
+            delivered: None,
+        });
+    }
+
+    for candidate in &mut planned {
         // Encrypt delivery BEFORE any GitHub write. If recipient has no
         // compatible SSH key, we abort phase 1 — nothing has been
         // committed yet, so shards/outcome stay empty and the next run can
         // retry once keys are fixed.
-        let delivered = if let Some(login) = pr_author {
-            match deliver_to_author(client, login, value.as_bytes())
+        candidate.delivered = if let Some(login) = pr_author {
+            match deliver_to_author(client, login, candidate.value.as_bytes())
                 .await
                 .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?
             {
@@ -193,22 +221,6 @@ pub async fn allocate_and_deliver(
         } else {
             None
         };
-
-        // Reserve in `staged` so the next `pick_shard` accounts for this
-        // candidate's bytes when deciding whether the same target shard
-        // still has room.
-        staged
-            .entry(shard)
-            .or_default()
-            .insert(candidate.slot.clone(), value.clone());
-
-        planned.push(Planned {
-            slot: candidate.slot.clone(),
-            value,
-            shard,
-            alloc: candidate.placeholder.alloc,
-            delivered,
-        });
     }
 
     // Group by target shard so we PUT each shard at most once.
@@ -216,6 +228,10 @@ pub async fn allocate_and_deliver(
     for p in planned {
         by_shard.entry(p.shard).or_default().push(p);
     }
+
+    let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
+        .await
+        .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
     // Phase 2: per-shard PUT; commit to `shards` and `outcome` only on
     // successful PUT. If a PUT fails, earlier shards are already live on
@@ -293,10 +309,19 @@ pub async fn rotate_and_deliver(
 ) -> Result<AllocatedSlot, AllocationFailure> {
     let partial = AllocateOutcome::default();
 
-    // Validate the requested length against the credential type BEFORE the
-    // GitHub round-trip, so `rotate --credential jwt/secret` with an
-    // undersized `len=` fails without touching the environment's secrets.
-    let value = generate_credential_value(slot, length_bytes)
+    // Rotation publishes Consumers only. Reserved resource slots and every
+    // generation refusal must fail before GitHub key discovery or writes.
+    let mode = current_gateway_mode()?;
+    check_rotation_allowed(slot, length_bytes, &mode)?;
+    let value = generate_credential_value_with_mode(slot, length_bytes, None, &mode)
+        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
+
+    // Capacity and serialization refusals also precede key discovery.
+    let target_shard = reserve_shard(slot, value.len(), shards, shard_count, "rotating")
+        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
+    let mut staged_bundle = shards.get(&target_shard).cloned().unwrap_or_default();
+    staged_bundle.insert(slot.to_string(), value.clone());
+    let serialized = serialize_bundle(&staged_bundle)
         .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
     let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
@@ -329,18 +354,6 @@ pub async fn rotate_and_deliver(
         None
     };
 
-    // Keep the slot on the shard it already occupies, and refuse up front
-    // rather than PUTting a FERRUM_CREDS_BUNDLE_<N> that no workflow binds:
-    // the write would succeed at the GitHub API and then be invisible to
-    // every later run.
-    let target_shard = reserve_shard(slot, value.len(), shards, shard_count, "rotating")
-        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
-
-    let bundle = shards.get(&target_shard).cloned().unwrap_or_default();
-    let mut staged_bundle = bundle;
-    staged_bundle.insert(slot.to_string(), value.clone());
-    let serialized = serialize_bundle(&staged_bundle)
-        .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
     let secret_name = shard_secret_name(target_shard);
     let allocated = AllocatedSlot {
         slot: slot.to_string(),
@@ -393,7 +406,9 @@ fn random_value(length_bytes: usize) -> String {
 /// * The reserved sentinel [`REDACTED_SENTINEL`] is never stored. base64url
 ///   cannot produce it, so this is a tripwire for a future encoding change.
 ///
-/// The resolver runs the same `len=` check at plan time
+/// Basic-auth hashes, identity fields, file-mode basic-auth generation and
+/// non-generatable discovery tokens are refused by the shared policy too.
+/// The resolver runs the same generation checks at plan time
 /// (`check_generation_constraints`) so `plan`/`diff` fail before any GitHub
 /// write; this is the last line of defense for callers that reach the
 /// allocator directly (notably `gitforgeops rotate`, whose `--credential`
@@ -409,7 +424,7 @@ pub fn generate_credential_value(slot: &str, length_bytes: usize) -> crate::erro
 /// so getting it wrong silently emits a credential the gateway rejects. The
 /// resolver already knows the type as a slot *component* before the slot
 /// string is joined ([`ResolveReport::slot_credential_types`]), so
-/// `allocate_and_deliver` passes it through instead of parsing it back out.
+/// `allocate_and_deliver` passes it through and checks agreement with the slot.
 ///
 /// `cred_type == None` falls back to splitting the slot
 /// ([`credential_type_from_slot`]) — the path `gitforgeops rotate` takes,
@@ -423,21 +438,18 @@ pub fn generate_credential_value_typed(
     length_bytes: usize,
     cred_type: Option<&str>,
 ) -> crate::error::Result<String> {
-    let cred_type = match cred_type {
-        Some(t) => t.to_string(),
-        None => credential_type_from_slot(slot).ok_or_else(|| {
-            crate::error::Error::Config(format!(
-                "credential slot '{slot}' has no credential-type component, so the \
-                 minimum-length rule for jwt/hmac_auth secrets cannot be applied. Slots are \
-                 '<namespace>/<consumer>/<credential-type>/…' — build the slot with \
-                 secrets::slot_path rather than by hand."
-            ))
-        })?,
-    };
+    generate_credential_value_with_mode(slot, length_bytes, cred_type, &current_gateway_mode()?)
+}
 
-    // One shared implementation of the floor, also used by the resolver's
-    // plan-time check so the two can't drift.
-    check_min_entropy(slot, &cred_type, length_bytes)?;
+/// Generate with an explicit gateway mode, using the resolver's full policy.
+pub fn generate_credential_value_with_mode(
+    slot: &str,
+    length_bytes: usize,
+    cred_type: Option<&str>,
+    mode: &GatewayMode,
+) -> crate::error::Result<String> {
+    check_generation_allowed(slot, cred_type, length_bytes, mode)?;
+    let cred_type = credential_type_from_slot(slot).unwrap_or_default();
 
     let value = random_value(length_bytes);
     let chars = value.chars().count();
@@ -462,6 +474,50 @@ pub fn generate_credential_value_typed(
     }
 
     Ok(value)
+}
+
+/// Validate the Consumer-only rotation contract before any external action.
+/// Plugin allocation through apply remains supported; rotating plugin or
+/// discovery slots needs a resource-specific publication contract of its own.
+pub fn check_rotation_allowed(
+    slot: &str,
+    length_bytes: usize,
+    mode: &GatewayMode,
+) -> crate::error::Result<()> {
+    check_generation_allowed(slot, None, length_bytes, mode)?;
+    if !matches!(mode, GatewayMode::Api) {
+        return Err(crate::error::Error::Config(
+            "Refusing to rotate: rotation requires an api-mode gateway".into(),
+        ));
+    }
+    let parts: Vec<&str> = slot.split('/').collect();
+    let field = match parts.get(3..) {
+        Some([field]) => Some(*field),
+        Some([index, field])
+            if index
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<usize>().ok())
+                .is_some_and(|n| n > 0) =>
+        {
+            Some(*field)
+        }
+        _ => None,
+    };
+    if matches!(
+        (parts.get(2).copied(), field),
+        (Some("keyauth"), Some("key"))
+            | (Some("jwt" | "hmac_auth"), Some("secret"))
+            | (Some("basicauth"), Some("password"))
+    ) {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "Refusing to rotate slot '{slot}': rotate supports only Consumer keyauth/key, \
+         jwt/secret, hmac_auth/secret and api-mode basicauth/password (including [N] entries). \
+         PluginConfig and Upstream slots cannot be published by this command. \
+         Reissue externally managed secrets at their provider, reseed the bundle and apply."
+    )))
 }
 
 /// Utility re-export for consumers who need to flatten shards after allocation.
