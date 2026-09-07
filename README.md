@@ -226,7 +226,7 @@ order — deep detail for each control lives in
     `validator-pin-canary.yml` runs daily and opens (or updates) a single tracking
     issue with the line to add. To refresh, review the upstream build, then
     `bash .github/scripts/refresh-ferrum-edge-pin.sh --append` and merge through
-    normal CODEOWNER review — **keeping the previous line**, so in-flight pull
+    exact-head root review — **keeping the previous line**, so in-flight pull
     requests running the older binary stay green. See
     [Validator digest pinning](#validator-digest-pinning).
 
