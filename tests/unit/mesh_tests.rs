@@ -767,3 +767,44 @@ fn summary_of_an_empty_document_is_empty() {
     assert_eq!(MeshConfigSpec::default().summary(), "");
     assert!(MeshConfigSpec::default().is_empty());
 }
+
+#[test]
+fn assembled_mesh_retains_directory_scope_after_overlays_and_filtering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resources_dir = tmp.path().join("resources");
+    let overlay_dir = tmp.path().join("overlays/staging");
+    write_tree(
+        &resources_dir,
+        &[
+            ("alpha/mesh/core.yaml", CORE_FRAGMENT),
+            ("gamma/mesh/extra.yaml", EXTRA_FRAGMENT),
+        ],
+    );
+    write_tree(
+        &overlay_dir,
+        &[(
+            "gamma/mesh/extra.yaml",
+            "kind: MeshConfig\nspec:\n  outbound_traffic_policy:\n    mode: ALLOW_ANY\n",
+        )],
+    );
+    let mut resources = load_resources(&resources_dir).unwrap();
+    apply_overlay(&mut resources, &overlay_dir).unwrap();
+    let assembled = assemble(resources.clone()).unwrap();
+    let error = assembled
+        .validate_mesh_scope("production", &["alpha".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("namespace 'gamma'"), "{error}");
+    assert!(error.contains("gamma/mesh/extra"), "{error}");
+    assembled
+        .validate_mesh_scope("production", &["alpha".into(), "gamma".into()])
+        .unwrap();
+    let filtered = assemble_with_namespace_filter(resources, Some("alpha")).unwrap();
+    filtered
+        .validate_mesh_scope("production", &["alpha".into()])
+        .unwrap();
+    assert_eq!(filtered.mesh_sources.len(), 1);
+    // Inner workload/service namespaces deliberately differ from directory scope.
+    assert_eq!(filtered.mesh_sources[0].0, "alpha");
+    assert!(filtered.mesh.unwrap().outbound_traffic_policy.is_none());
+}

@@ -726,3 +726,168 @@ fn empty_enabled_allowlists_block_plan_and_apply_before_publication() {
         }
     }
 }
+
+const SCOPE_MESH: &str = "kind: MeshConfig\nspec:\n  istio_root_namespace: mesh-root\n";
+const OTHER_SCOPE_MESH: &str = "kind: MeshConfig\nid: outside-fragment\nspec: {}\n";
+const SCOPE_OVERLAY: &str =
+    "kind: MeshConfig\nid: outside-fragment\nspec:\n  outbound_traffic_policy:\n    mode: ALLOW_ANY\n";
+
+fn mesh_scope_repo(mode: &str, owned: &str, filter: Option<&str>) -> Repo {
+    let filter = filter
+        .map(|filter| format!("    namespace_filter: {filter}\n"))
+        .unwrap_or_default();
+    let config = format!(
+        "version: 1\ndefault_environment: production\nenvironments:\n  production:\n    overlay: staging\n{filter}    ownership:\n      mode: {mode}\n      namespaces: {owned}\n"
+    );
+    let repo = Repo::with_files(&[
+        (".gitforgeops/config.yaml", &config),
+        ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
+        ("resources/ferrum/mesh/core.yaml", SCOPE_MESH),
+        ("resources/platform/mesh/extra.yaml", OTHER_SCOPE_MESH),
+        ("overlays/staging/platform/mesh/extra.yaml", SCOPE_OVERLAY),
+    ]);
+    std::fs::write(&repo.validator, "#!/bin/sh\ntouch validator-ran\nexit 0\n").unwrap();
+    repo
+}
+
+#[test]
+fn mesh_scope_refusal_precedes_command_side_effects() {
+    for args in [
+        vec!["validate"],
+        vec!["plan"],
+        vec!["review", "--pr", "160", "--require-live"],
+        vec!["diff"],
+        vec!["export", "--output", "export.yaml"],
+        vec!["export", "--materialize", "--output", "export.yaml"],
+        vec!["apply", "--auto-approve"],
+    ] {
+        for existing in [false, true] {
+            let repo = mesh_scope_repo("exclusive", "[ferrum]", None);
+            let paths = [
+                repo.published(),
+                repo.dir.path().join("mesh.yaml"),
+                repo.dir.path().join("export.yaml"),
+                repo.dir.path().join(".state/production.json"),
+            ];
+            if existing {
+                for path in &paths {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, "unchanged sentinel").unwrap();
+                }
+            }
+            let output = repo.run(
+                &args,
+                &[
+                    ("FERRUM_MESH_FILE_OUTPUT_PATH", "mesh.yaml"),
+                    ("FERRUM_CREDS_JSON", "invalid bundle: must not be read"),
+                ],
+            );
+            let error = stderr(&output);
+            assert!(!output.status.success(), "{args:?}: {error}");
+            assert!(error.contains("ownership.namespaces"), "{error}");
+            assert!(error.contains("namespace 'platform'"), "{error}");
+            assert!(error.contains("platform/mesh/outside-fragment"), "{error}");
+            assert!(!repo.dir.path().join("validator-ran").exists());
+            for path in &paths {
+                if existing {
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), "unchanged sentinel");
+                } else {
+                    assert!(!path.exists(), "{}", path.display());
+                }
+            }
+            assert!(!repo.dir.path().join(".state/production.lock").exists());
+        }
+    }
+}
+
+#[test]
+fn mesh_scope_preserves_shared_owned_and_filtered_publication() {
+    for (mode, owned, repo_filter, env_filter, includes_platform) in [
+        ("exclusive", "[ferrum, platform]", None, None, true),
+        ("shared", "[ferrum]", None, None, true),
+        ("exclusive", "[ferrum]", Some("ferrum"), None, false),
+        ("exclusive", "[ferrum]", None, Some("ferrum"), false),
+        ("shared", "[ferrum]", None, Some("ferrum"), false),
+    ] {
+        for args in [
+            vec!["validate"],
+            vec!["plan"],
+            vec!["export", "--output", "export.yaml"],
+            vec!["export", "--materialize", "--output", "export.yaml"],
+            vec!["apply", "--auto-approve"],
+        ] {
+            let repo = mesh_scope_repo(mode, owned, repo_filter);
+            let mut env = vec![("FERRUM_MESH_FILE_OUTPUT_PATH", "mesh.yaml")];
+            if let Some(filter) = env_filter {
+                env.push(("FERRUM_NAMESPACE", filter));
+            }
+            let output = repo.run(&args, &env);
+            assert!(
+                output.status.success(),
+                "{mode} {owned} {repo_filter:?} {env_filter:?} {args:?}: {} {}",
+                stdout(&output),
+                stderr(&output)
+            );
+            if matches!(args[0], "export" | "apply") {
+                let mesh = std::fs::read_to_string(repo.dir.path().join("mesh.yaml")).unwrap();
+                assert!(mesh.contains("mesh-root"), "{mesh}");
+                assert_eq!(mesh.contains("ALLOW_ANY"), includes_platform, "{mesh}");
+            } else {
+                assert!(repo.dir.path().join("validator-ran").exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn mesh_scope_rejects_unowned_filters_even_for_an_empty_selection() {
+    for filter_in_config in [false, true] {
+        let repo = mesh_scope_repo(
+            "exclusive",
+            "[ferrum]",
+            filter_in_config.then_some("missing"),
+        );
+        let mut env = vec![("FERRUM_MESH_FILE_OUTPUT_PATH", "mesh.yaml")];
+        if !filter_in_config {
+            env.push(("FERRUM_NAMESPACE", "missing"));
+        }
+        let output = repo.run(&["export", "--output", "export.yaml"], &env);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("namespace_filter 'missing'"));
+        assert!(!repo.dir.path().join("mesh.yaml").exists());
+        assert!(!repo.dir.path().join("export.yaml").exists());
+    }
+}
+
+#[test]
+fn mesh_scope_refusal_precedes_admin_api_connections() {
+    for args in [
+        vec!["plan"],
+        vec!["diff"],
+        vec!["review", "--pr", "160", "--require-live"],
+        vec!["apply", "--auto-approve"],
+    ] {
+        let repo = mesh_scope_repo("exclusive", "[ferrum]", None);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let output = repo.run(
+            &args,
+            &[
+                ("FERRUM_GATEWAY_MODE", "api"),
+                ("FERRUM_GATEWAY_URL", &url),
+                ("FERRUM_ADMIN_JWT_SECRET", "synthetic-scope-test-signing-key"),
+                ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "1"),
+                ("FERRUM_GATEWAY_MAX_RETRIES", "0"),
+            ],
+        );
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("platform/mesh/outside-fragment"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!repo.dir.path().join("validator-ran").exists());
+        assert!(!repo.dir.path().join(".state").exists());
+    }
+}
