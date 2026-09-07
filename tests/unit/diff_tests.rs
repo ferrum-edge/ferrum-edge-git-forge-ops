@@ -725,9 +725,9 @@ fn secret_audit_and_broker_parser_agree_across_resource_kinds() {
                 ("PluginConfig", "config.authorization"),
                 ("Upstream", "service_discovery.consul.token"),
             ] {
-                assert!(blockers.iter().any(|finding| {
-                    finding.kind == kind && finding.message.contains(path)
-                }));
+                assert!(blockers
+                    .iter()
+                    .any(|finding| { finding.kind == kind && finding.message.contains(path) }));
             }
         }
         for finding in findings {
@@ -1082,11 +1082,11 @@ fn security_detects_nested_literal_credential() {
 }
 
 #[test]
-fn security_passes_template_credential() {
+fn security_passes_broker_template_credential() {
     let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
-        serde_json::json!({"key": "${API_KEY}"}),
+        serde_json::json!({"key": "${gh-env-secret:alloc=require}"}),
     );
     let config = GatewayConfig {
         consumers: vec![Consumer {
@@ -1105,8 +1105,8 @@ fn security_passes_template_credential() {
 
 #[test]
 fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
-    // Regression guard: audit_security classifies any string that doesn't
-    // start with `${` as a literal credential. If the caller (cmd_plan,
+    // Regression guard: audit_security classifies any string that isn't a
+    // valid broker placeholder as a literal credential. If the caller (cmd_plan,
     // cmd_review) runs audit AFTER resolve_secrets, legitimate placeholders
     // have been replaced with real values and the auditor spuriously flags
     // them as literal credentials — drowning real findings in noise.
