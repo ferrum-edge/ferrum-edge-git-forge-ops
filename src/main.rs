@@ -1062,7 +1062,7 @@ async fn cmd_diff(
     // The primitive preserves resolved values, siblings and structural drift.
     if cached_namespaces.is_empty() {
         for pair in &mut namespace_pairs {
-            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual, &secret_report);
         }
         if let Some(note) = secret_report.unresolved_comparison_note() {
             eprintln!("Note: {note}");
@@ -1253,7 +1253,11 @@ async fn cmd_plan(
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
                     for pair in &mut namespace_pairs {
-                        diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+                        diff::mask_indeterminate_secret_values(
+                            &desired,
+                            &mut pair.actual,
+                            &secret_report,
+                        );
                     }
                     let (d, b, u, s) = compute_namespace_diffs(
                         &namespace_pairs,
@@ -2429,9 +2433,13 @@ async fn cmd_review(
                         }
                         None => {
                             // Bundle presence says nothing about whether a
-                            // particular leaf resolved. Mask only placeholders.
+                            // particular leaf resolved. Use resolution provenance.
                             for pair in &mut namespace_pairs {
-                                diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+                                diff::mask_indeterminate_secret_values(
+                                    &desired,
+                                    &mut pair.actual,
+                                    &secret_report,
+                                );
                             }
                             let (d, b, u, s) = compute_namespace_diffs(
                                 &namespace_pairs,

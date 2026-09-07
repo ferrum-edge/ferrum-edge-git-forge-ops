@@ -73,6 +73,9 @@ unavailable or its required PR comment cannot be delivered. Review markdown is
 bounded below GitHub's API limit, and unresolved credential values are excluded
 from authoritative live comparison per leaf after resolution, including with
 empty or partial bundles, without hiding resolved-secret or sibling drift.
+Masking uses canonical slots from the resolution report, not value syntax;
+seeded secrets that resemble broker placeholders remain comparable. Modeled
+service-discovery diff values are redacted even when they resemble placeholders.
 The same rule covers plugin config and modeled service-discovery secrets in
 diff, plan and review; missing required values still block actual apply.
 Environments with `live_review: false` are removed before the

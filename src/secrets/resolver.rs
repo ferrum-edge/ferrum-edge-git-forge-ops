@@ -483,6 +483,26 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
     join_slot_components(&components)
 }
 
+/// Derive a comparison slot from structural keys, without parsing or escaping
+/// an already-rendered path again. Reuse the resolver's index-zero elision.
+pub(crate) fn consumer_credential_slot(
+    namespace: &str,
+    consumer_id: &str,
+    credential_type: &str,
+    path: &[ConfigPathComponent],
+) -> String {
+    let mut components = vec![
+        SlotComponent::Literal(namespace),
+        SlotComponent::Literal(consumer_id),
+        SlotComponent::Literal(credential_type),
+    ];
+    components.extend(path.iter().map(|part| match part {
+        ConfigPathComponent::Key(key) => SlotComponent::Literal(key),
+        ConfigPathComponent::Index(index) => SlotComponent::ArrayIndex(*index),
+    }));
+    join_slot_components(&components)
+}
+
 /// Is this credential leaf an *identity* rather than a secret?
 ///
 /// ferrum-edge's credential shapes mix the two in one object:

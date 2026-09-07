@@ -99,11 +99,25 @@ fn spawn_backup_stub(
             let namespaces = namespaces.clone();
             let requests = Arc::clone(&requests);
             std::thread::spawn(move || loop {
+                // TCP may split a header across reads. Bound both its size and
+                // total read time so malformed fixtures cannot hang the matrix.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 let mut buf = [0_u8; 8192];
-                let n = match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => n,
-                };
+                let mut n = 0;
+                while !buf[..n].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let now = std::time::Instant::now();
+                    let remaining = deadline.saturating_duration_since(now);
+                    if n == buf.len()
+                        || remaining.is_zero()
+                        || stream.set_read_timeout(Some(remaining)).is_err()
+                    {
+                        return;
+                    }
+                    match stream.read(&mut buf[n..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => n += read,
+                    }
+                }
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 requests.lock().unwrap().push(request.clone());
                 let body = namespaces
@@ -433,6 +447,179 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                             || (path.starts_with(".state")
                                 && path.extension().is_some_and(|ext| ext == "lock"))
                     }));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() {
+    const PLACEHOLDER: &str = "${gh-env-secret:alloc=require}";
+    const LIVE: &str = "synthetic-provenance-live-secret";
+    // JSON pointers address fixture leaves; slot strings independently spell
+    // the broker contract, including zero elision and escaped literal keys.
+    let leaves = [
+        ("consumers", "/credentials/keyauth/0/key", "keyauth/key"),
+        ("consumers", "/credentials/keyauth/1/key", "keyauth/[1]/key"),
+        (
+            "consumers",
+            "/credentials/keyauth/1/api~1key~0[1]",
+            "keyauth/[1]/api~1key~0~21]",
+        ),
+        (
+            "plugin_configs",
+            "/config/authorization",
+            "@plugin-config/config/authorization",
+        ),
+        (
+            "plugin_configs",
+            "/config/headers/0/api~1key~0[1]",
+            "@plugin-config/config/headers/[0]/api~1key~0~21]",
+        ),
+        (
+            "upstreams",
+            "/service_discovery/consul/token",
+            "@service-discovery/consul/token",
+        ),
+    ];
+    // Sharing an id across kinds also checks the reserved slot keyspaces.
+    let declared = serde_json::json!({
+        "consumers": [{
+            "id": "app", "namespace": "ferrum", "username": "app",
+            "credentials": {
+                "keyauth": [
+                    {"key": PLACEHOLDER},
+                    {"key": PLACEHOLDER, "api/key~[1]": PLACEHOLDER}
+                ]
+            }
+        }],
+        "plugin_configs": [{
+            "id": "app", "namespace": "ferrum", "plugin_name": "otel_tracing",
+            "scope": "global",
+            "config": {
+                "authorization": PLACEHOLDER, "protocol": "grpc",
+                "headers": [{"api/key~[1]": PLACEHOLDER}]
+            }
+        }],
+        "upstreams": [{
+            "id": "app", "namespace": "ferrum", "targets": [],
+            "service_discovery": {
+                "provider": "consul",
+                "consul": {
+                    "address": "https://consul.test:8501",
+                    "service_name": "app", "token": PLACEHOLDER
+                }
+            }
+        }]
+    });
+    let consumer =
+        serde_json::json!({"kind": "Consumer", "spec": declared["consumers"][0]}).to_string();
+    let plugin =
+        serde_json::json!({"kind": "PluginConfig", "spec": declared["plugin_configs"][0]})
+            .to_string();
+    let upstream =
+        serde_json::json!({"kind": "Upstream", "spec": declared["upstreams"][0]}).to_string();
+    for transport in ["inline", "file"] {
+        for full in [false, true] {
+            // The final case resolves the first canonical leaf via its legacy
+            // explicit-zero lookup alias. The report still uses the canonical slot.
+            for target in 0..=leaves.len() {
+                let target_index = target % leaves.len();
+                for different in [false, true] {
+                    let mut live = declared.clone();
+                    let mut slots = serde_json::Map::new();
+                    for (index, &(kind, pointer, suffix)) in leaves.iter().enumerate() {
+                        *live[kind][0].pointer_mut(pointer).unwrap() = LIVE.into();
+                        if index == target_index || full {
+                            let suffix = if target == leaves.len() && index == 0 {
+                                "keyauth/[0]/key"
+                            } else {
+                                suffix
+                            };
+                            let value = if index == target_index {
+                                PLACEHOLDER
+                            } else {
+                                LIVE
+                            };
+                            slots.insert(format!("ferrum/app/{suffix}"), value.into());
+                        }
+                    }
+                    let (kind, pointer, _) = leaves[target_index];
+                    if !different {
+                        *live[kind][0].pointer_mut(pointer).unwrap() = PLACEHOLDER.into();
+                    }
+                    let repo = Repo::new(
+                        &[
+                            ("resources/ferrum/consumers/app.yaml", &consumer),
+                            ("resources/ferrum/plugins/app.yaml", &plugin),
+                            ("resources/ferrum/upstreams/app.yaml", &upstream),
+                        ],
+                        vec![("ferrum".into(), live.to_string())],
+                    );
+                    let bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": slots}).to_string();
+                    let bundle_file = repo.dir.path().join("bundle.json");
+                    std::fs::write(&bundle_file, &bundle).unwrap();
+                    let env = if transport == "inline" {
+                        vec![("FERRUM_CREDS_JSON", bundle.as_str())]
+                    } else {
+                        vec![("FERRUM_CREDS_JSON_FILE", bundle_file.to_str().unwrap())]
+                    };
+                    let before = repo.snapshot();
+                    for args in [&["diff", "--exit-on-drift"][..], &["plan"], &["review"]] {
+                        let output = repo.run_with_env(args, &env);
+                        let out = stdout(&output);
+                        let diagnostics = format!("{out}\n{}", stderr(&output));
+                        let context = format!(
+                            "{transport}/full={full}/target={target}/different={different}/{args:?}: {diagnostics}"
+                        );
+                        let expected_code = match args[0] {
+                            "diff" => i32::from(different) * 2,
+                            "plan" => i32::from(!full),
+                            _ => 0,
+                        };
+                        assert_eq!(output.status.code(), Some(expected_code), "{context}");
+                        let in_sync = if args[0] == "diff" {
+                            out.contains("No differences found")
+                        } else {
+                            out.contains("None (in sync)")
+                        };
+                        assert_eq!(in_sync, !different, "{context}");
+                        assert_eq!(
+                            diagnostics
+                                .contains("5 broker-controlled leaf/leaves remain unresolved"),
+                            !full,
+                            "{context}"
+                        );
+                        assert_eq!(
+                            diagnostics.contains("remain unresolved"),
+                            !full,
+                            "{context}"
+                        );
+                        if args[0] == "diff" && different {
+                            assert!(out.contains("Found 1 difference(s)"), "{context}");
+                            let expected_kind = match kind {
+                                "consumers" => "Consumer",
+                                "plugin_configs" => "PluginConfig",
+                                _ => "Upstream",
+                            };
+                            assert!(
+                                out.contains(&format!("MODIFY {expected_kind}")),
+                                "{context}"
+                            );
+                        }
+                        assert!(!diagnostics.contains(LIVE), "{context}");
+                        assert!(!diagnostics.contains(PLACEHOLDER), "{context}");
+                        assert_eq!(repo.snapshot(), before, "{context}");
+                        assert!(!repo.dir.path().join(".state").exists(), "{context}");
+                    }
+                    assert!(repo
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|request| request.starts_with("GET /backup ")));
                 }
             }
         }
