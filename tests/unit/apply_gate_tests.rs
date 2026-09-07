@@ -876,13 +876,18 @@ fn mesh_scope_refusal_precedes_admin_api_connections() {
             &[
                 ("FERRUM_GATEWAY_MODE", "api"),
                 ("FERRUM_GATEWAY_URL", &url),
-                ("FERRUM_ADMIN_JWT_SECRET", "synthetic-scope-test-signing-key"),
+                ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "synthetic-scope-test-signing-key",
+                ),
                 ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "1"),
                 ("FERRUM_GATEWAY_MAX_RETRIES", "0"),
             ],
         );
         assert!(!output.status.success());
-        assert!(stderr(&output).contains("platform/mesh/outside-fragment"));
+        let stderr = stderr(&output);
+        assert!(stderr.contains("platform/mesh/outside-fragment"), "{stderr}");
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
