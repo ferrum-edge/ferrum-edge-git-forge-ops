@@ -2662,7 +2662,9 @@ async fn cmd_rotate(
 
     let _state_lock = StateFile::lock(&resolved.name)?;
     let mut state = StateFile::load(&resolved.name)?;
-    let ns = namespace.unwrap_or("ferrum");
+    let ns = namespace
+        .or(resolved.namespace_filter.as_deref())
+        .unwrap_or("ferrum");
     let slot = secrets::resolver::slot_path(ns, consumer, credential);
 
     // ALL preflight checks must run BEFORE rotate_and_deliver mutates the
@@ -2679,6 +2681,11 @@ async fn cmd_rotate(
                 .into(),
         );
     }
+
+    // Do not let a reserved Upstream/PluginConfig slot masquerade as a
+    // Consumer credential when the resources happen to share an id.
+    // Length is checked again below using the actual placeholder declaration.
+    secrets::allocator::check_rotation_allowed(&slot, 32, &env_config.gateway_mode)?;
 
     let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
 
@@ -2712,6 +2719,11 @@ async fn cmd_rotate(
             .into());
         }
     };
+    secrets::allocator::check_rotation_allowed(
+        &slot,
+        placeholder_length,
+        &env_config.gateway_mode,
+    )?;
 
     // Preflight 3: target consumer is declared in the repo. Without this,
     // rotate_and_deliver writes a secret the gateway push will then refuse
@@ -2764,6 +2776,9 @@ async fn cmd_rotate(
     let mut shard_count = state.credential_shard_count.max(1);
 
     let client = build_github_api_client(&env_config)?;
+    // Construct the gateway client before replacing the write-only secret:
+    // invalid JWT/TLS configuration is a preflight error too.
+    let gateway_client = AdminClient::new_scoped(&env_config, [ns])?;
 
     let outcome = match secrets::rotate_and_deliver(
         &client,
@@ -2815,8 +2830,8 @@ async fn cmd_rotate(
 
     // Now push to the gateway.
     let push_status = push_rotated_consumer_to_gateway(
-        &env_config,
-        &resolved,
+        &gateway_client,
+        &desired_for_check,
         &per_shard,
         ns,
         consumer,
@@ -2862,22 +2877,26 @@ async fn cmd_rotate(
 }
 
 /// Push just the rotated consumer to the live gateway so the new credential
-/// is immediately usable. Loads desired config, resolves placeholders against
-/// the post-rotation bundle (including rotate slots), finds the target
-/// consumer, and calls `update_consumer`.
+/// is immediately usable. Reuses the preflight's desired snapshot and resolves
+/// only the target Consumer, so unrelated generation failures cannot surface
+/// after the secret has been written.
 async fn push_rotated_consumer_to_gateway(
-    env_config: &EnvConfig,
-    resolved: &ResolvedEnv,
+    client: &AdminClient,
+    desired_snapshot: &GatewayConfig,
     per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
     namespace: &str,
     consumer_id: &str,
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !matches!(env_config.gateway_mode, GatewayMode::Api) {
-        return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
-    }
-
-    let mut desired = load_and_assemble_for(resolved, env_config)?;
+    let mut desired = GatewayConfig {
+        consumers: desired_snapshot
+            .consumers
+            .iter()
+            .filter(|c| c.namespace == namespace && c.id == consumer_id)
+            .cloned()
+            .collect(),
+        ..Default::default()
+    };
     let merged = secrets::merge_bundles(per_shard);
     // `rotate_and_deliver` just wrote the fresh value into the bundle; this
     // resolve picks it up for the consumer being pushed to the gateway. The
@@ -2916,7 +2935,6 @@ async fn push_rotated_consumer_to_gateway(
         ).into());
     }
 
-    let client = AdminClient::new_scoped(env_config, [namespace])?;
     client.update_consumer(consumer, namespace).await?;
     Ok(())
 }
