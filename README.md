@@ -505,6 +505,22 @@ The journal survives a crashed CI process, because the apply workflow commits st
 
 ### `exclusive` (strict 1:1)
 
+All commands that load desired resources enforce exclusive ownership at the
+shared assembly boundary, including `validate`, `plan`, `review`, `diff`,
+`export` (including `--materialize`), and `apply`. Gateway resources use their
+effective namespace; `MeshConfig` fragments use their source directory namespace,
+not workload or service namespaces inside the mesh document. The check runs
+after overlays and namespace filtering, before validation, gateway calls, or
+artifact publication. Shared mode keeps merging all selected fragments.
+
+An exclusive environment that previously published mesh fragments from unowned
+directories now refuses them, naming the namespace and fragment label
+(`namespace/mesh/id`, with the file stem used when `id` is absent). Add the
+namespace to `ownership.namespaces` or move the fragment to an owned directory.
+`namespace_filter` / `FERRUM_NAMESPACE` still narrow the selected resources;
+an exclusive environment rejects a filter outside its owned list, even if the
+selection is empty. Allowed fragments still merge into one mesh document.
+
 - Repo is authoritative for the listed `namespaces`.
 - Unmanaged resources in those namespaces → **pruned**.
 - Requires explicit `namespaces` list (safety rail against misconfiguration).
