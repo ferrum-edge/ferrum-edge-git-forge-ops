@@ -1593,9 +1593,14 @@ gitforgeops --env production diff --exit-on-drift
 
 A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into a single image. The `ferrum-edge` binary is copied from the official `ferrumedge/ferrum-edge` Docker Hub image; `gitforgeops` is compiled from source in a builder stage.
 
-Revision-bound overrides also require Git and a complete source checkout. The
-stock slim runtime does not include Git, so it leaves overrides inactive; use
-the GitHub workflow runner or a Git-equipped runtime when an override is needed.
+Revision-bound overrides require a complete source checkout, including `.git`
+and the triggering merge's history. The runtime includes Git's local inspection
+commands and their loader/libraries copied from the existing digest-pinned Rust
+builder; no mutable package installation or extra image dependency is used.
+Those libraries are private to Git, so they do not replace the gateway's runtime
+libraries. Mount the checkout at `/repo` and run with its owner's UID/GID (for
+example, `--user "$(id -u):$(id -g)"`); no global `safe.directory` bypass is set.
+Missing history or mismatching reviewed inputs still leaves overrides inactive.
 
 ### Published images
 

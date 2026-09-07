@@ -288,7 +288,12 @@ async fn check_override_context(
             .flatten();
     let current_reviews = fetch_reviews(&client, repo, pr_number, token).await.ok();
     let current_review = current_reviews.as_ref().and_then(|reviews| {
-        authorized_review(reviews, &approver, &override_cfg.require_label, &pr.head.sha)
+        authorized_review(
+            reviews,
+            &approver,
+            &override_cfg.require_label,
+            &pr.head.sha,
+        )
     });
     if current_labeler.as_deref() != Some(approver.as_str()) || current_review != Some(review) {
         return Ok(OverrideDecision::inactive(

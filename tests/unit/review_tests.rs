@@ -38,14 +38,16 @@ fn oversized_review_preserves_every_blocker_and_names_omitted_sections() {
             namespace: "tenant".into(),
             details: (0..20)
                 .map(|field| FieldChange {
-                    field: format!("field-{field}"),
-                    old_value: "界".repeat(170),
-                    new_value: "診".repeat(170),
+                    // The review lists field names, never old/new values.
+                    // Oversize the rendered input so this exercises truncation.
+                    field: format!("field-{field}-{}", "界".repeat(170)),
+                    old_value: "unrendered-old-secret".repeat(32),
+                    new_value: "unrendered-new-secret".repeat(32),
                 })
                 .collect(),
         })
         .collect();
-    let policy = [PolicyFinding {
+    let finding = PolicyFinding {
         rule_id: "backend_scheme".into(),
         severity: Severity::Error,
         kind: "Proxy".into(),
@@ -54,7 +56,16 @@ fn oversized_review_preserves_every_blocker_and_names_omitted_sections() {
         message: "scheme rejected".into(),
         remediation: None,
         overridden_by: None,
-    }];
+    };
+    // Heading-like metadata in the verdict must not hide the actual omitted
+    // section from the footer's section detection.
+    let policy = [
+        finding.clone(),
+        PolicyFinding {
+            rule_id: "### Policy Violations".into(),
+            ..finding
+        },
+    ];
     let security = [SecurityFinding {
         severity: "error".into(),
         kind: "Consumer".into(),
@@ -96,18 +107,23 @@ fn oversized_review_preserves_every_blocker_and_names_omitted_sections() {
     };
     let comment = render();
     assert_eq!(comment, render(), "truncation must be deterministic");
+    assert!(!comment.contains("unrendered-old-secret"));
+    assert!(!comment.contains("unrendered-new-secret"));
     assert!(comment.len() <= MAX_REVIEW_COMMENT_BYTES);
     assert!(
         comment.len() > MAX_REVIEW_COMMENT_BYTES - 2_000,
         "a long table row must not waste the remaining budget: {}",
         comment.len()
     );
-    let verdict = comment.split("## Ferrum Edge Config Review").next().unwrap();
+    let verdict = comment
+        .split("## Ferrum Edge Config Review")
+        .next()
+        .unwrap();
     for expected in [
         "Apply is blocked",
         "Validation: rejected",
         "Security Findings: 1 total, 1 blocking",
-        "Policy Violations: 1 total, 1 blocking",
+        "Policy Violations: 2 total, 2 blocking",
         "`backend_scheme`",
         "1 **CONFLICT**",
         "Credential Slot Remaps: 1 blocking",
@@ -809,9 +825,8 @@ fn review_comment_preserves_trusted_markup_and_names_empty_code_spans() {
     );
 
     assert!(comment.starts_with("### Apply verdict\n\n"));
-    assert!(comment.contains(
-        "Environment: `production` · Ownership: `Shared` · Strategy: `Incremental`\n\n"
-    ));
+    assert!(comment
+        .contains("Environment: `production` · Ownership: `Shared` · Strategy: `Incremental`\n\n"));
     assert!(comment.contains("**Proxy `(unnamed)`** (`(unnamed)`): missing identity"));
     assert!(!comment.contains("``"));
 }
@@ -1034,7 +1049,8 @@ fn review_comment_v2_omits_spec_owned_section_when_empty() {
         true,
     );
 
-    assert!(!comment.contains("Spec-owned"), "{comment}");
+    assert!(!comment.contains("### Spec-owned Resources"), "{comment}");
+    assert!(comment.contains("Spec-owned Resources: 0 total"), "{comment}");
 }
 
 #[test]
@@ -1169,7 +1185,11 @@ fn review_comment_omits_the_remap_section_when_there_are_none() {
         true,
     );
 
-    assert!(!comment.contains("Credential Slot Remaps"), "{comment}");
+    assert!(!comment.contains("### Credential Slot Remaps"), "{comment}");
+    assert!(
+        comment.contains("Credential Slot Remaps: 0 blocking"),
+        "{comment}"
+    );
 }
 
 #[test]
@@ -1233,11 +1253,16 @@ fn review_comment_environment_header_renders_as_markdown_not_escaped_text() {
         &ResolveReport::default(),
         true,
     );
-    let first_line = comment.lines().next().unwrap();
+    assert!(comment.starts_with("### Apply verdict\n\n"));
+    let header_line = comment
+        .lines()
+        .find(|line| line.starts_with("Environment: "))
+        .unwrap();
     assert_eq!(
-        first_line,
+        header_line,
         "Environment: `default` · Ownership: `Shared` · Strategy: `Incremental`"
     );
+    assert!(comment.contains(&format!("{header}\n\n## Ferrum Edge Config Review")));
     assert!(
         !comment.contains("\\`"),
         "the header must not be escaped: {comment}"

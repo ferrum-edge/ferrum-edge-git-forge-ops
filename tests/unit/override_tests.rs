@@ -90,7 +90,11 @@ fn fixture() -> (tempfile::TempDir, String, Value) {
     );
     git(dir.path(), &["config", "commit.gpgsign", "false"]);
     write(dir.path(), "src/main.rs", "// reviewed executable source\n");
-    write(dir.path(), "resources/team/proxies/app.yaml", "kind: Proxy\n");
+    write(
+        dir.path(),
+        "resources/team/proxies/app.yaml",
+        "kind: Proxy\n",
+    );
     write(dir.path(), ".gitforgeops/policies.yaml", "version: 1\n");
     let head = commit(dir.path());
     let tree = git(dir.path(), &["ls-tree", "-rz", "HEAD"]);
@@ -124,7 +128,11 @@ fn actual_input_allows_merge_and_generated_state_only_descendants() {
     );
     assert!(verify_input(&tree, dir.path(), dir.path(), true, None).is_err());
     assert!(verify_input(&tree, dir.path(), dir.path(), true, Some(&"f".repeat(40))).is_err());
-    write(dir.path(), "resources/team/proxies/app.yaml", "kind: Consumer\n");
+    write(
+        dir.path(),
+        "resources/team/proxies/app.yaml",
+        "kind: Consumer\n",
+    );
     commit(dir.path());
     assert!(verify_input(&tree, dir.path(), dir.path(), true, Some(&merge)).is_err());
 }
@@ -151,6 +159,36 @@ fn actual_input_rejects_dirty_executable_policy_overlay_and_untracked_yaml() {
     assert!(verify_input(&json!({}), dir.path(), dir.path(), false, None).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn actual_input_accepts_a_read_only_checkout() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, head, tree) = fixture();
+    let permissions: Vec<_> = walkdir::WalkDir::new(dir.path())
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let permissions = entry.metadata().unwrap().permissions();
+            (entry.into_path(), permissions)
+        })
+        .collect();
+    for (path, permissions) in &permissions {
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(permissions.mode() & !0o222),
+        )
+        .unwrap();
+    }
+    let result = verify_input(&tree, dir.path(), dir.path(), false, None);
+    // Restore directory permissions so TempDir can remove the fixture even
+    // when the assertion fails. The container runs this test as a non-root UID.
+    for (path, permissions) in permissions {
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+    assert_eq!(result, Ok(head));
+}
+
 #[test]
 fn source_hashing_ignores_git_stat_cache_and_rejects_staged_new_executables() {
     let (dir, _, tree) = fixture();
@@ -170,7 +208,11 @@ fn source_hashing_ignores_git_stat_cache_and_rejects_staged_new_executables() {
 fn split_trusted_review_proves_candidate_bytes_and_protected_executable() {
     let (source, _, tree) = fixture();
     let data = tempfile::tempdir().unwrap();
-    write(data.path(), "resources/team/proxies/app.yaml", "kind: Proxy\n");
+    write(
+        data.path(),
+        "resources/team/proxies/app.yaml",
+        "kind: Proxy\n",
+    );
     write(data.path(), ".gitforgeops/policies.yaml", "version: 1\n");
     assert!(verify_input(&tree, source.path(), data.path(), false, None).is_ok());
     write(data.path(), ".gitforgeops/policies.yaml", "version: 2\n");
@@ -211,6 +253,9 @@ fn override_audit_distinguishes_reviewed_and_applied_revisions_and_loads_legacy(
     assert_eq!(reloaded.overrides.len(), 1);
     assert_eq!(reloaded.overrides[0].pr_number, Some(7));
     assert_eq!(reloaded.overrides[0].review_id, Some(42));
-    assert_eq!(reloaded.overrides[0].authorized_head, decision.authorized_head);
+    assert_eq!(
+        reloaded.overrides[0].authorized_head,
+        decision.authorized_head
+    );
     assert_eq!(reloaded.overrides[0].commit, "b".repeat(40));
 }

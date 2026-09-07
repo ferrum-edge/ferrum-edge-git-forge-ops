@@ -33,7 +33,10 @@ fn generated(path: &str) -> bool {
 fn input(path: &str) -> bool {
     ((path.starts_with("resources/") || path.starts_with("overlays/"))
         && (path.ends_with(".yaml") || path.ends_with(".yml")))
-        || matches!(path, ".gitforgeops/config.yaml" | ".gitforgeops/policies.yaml")
+        || matches!(
+            path,
+            ".gitforgeops/config.yaml" | ".gitforgeops/policies.yaml"
+        )
 }
 
 fn git(source: &Path, args: &[&str]) -> Result<String, String> {
@@ -122,7 +125,9 @@ pub fn verify_input(
     merged: bool,
     merge_revision: Option<&str>,
 ) -> Result<String, String> {
-    let source_root = source.canonicalize().map_err(|_| "missing source checkout")?;
+    let source_root = source
+        .canonicalize()
+        .map_err(|_| "missing source checkout")?;
     let data_root = data.canonicalize().map_err(|_| "missing desired input")?;
     let source = source_root.as_path();
     let data = data_root.as_path();
@@ -192,18 +197,14 @@ pub fn verify_input(
             return Err("uncommitted executable or repository input".into());
         }
     }
-    let unknown = git(source, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let unknown = git(
+        source,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
     let indexed = git(source, &["ls-files", "--cached", "-z"])?;
-    if unknown
-        .split('\0')
-        .chain(indexed.split('\0'))
-        .any(|path| {
-            !path.is_empty()
-                && !generated(path)
-                && !input(path)
-                && !expected_source.contains_key(path)
-        })
-    {
+    if unknown.split('\0').chain(indexed.split('\0')).any(|path| {
+        !path.is_empty() && !generated(path) && !input(path) && !expected_source.contains_key(path)
+    }) {
         return Err("uncommitted executable or repository input".into());
     }
 

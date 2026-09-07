@@ -15,6 +15,8 @@ const MAX_SECTION_ITEMS: usize = 100;
 const MAX_DETAILS_PER_DIFF: usize = 20;
 const MAX_INLINE_BYTES: usize = 512;
 const MAX_VALIDATION_BYTES: usize = 8_192;
+// The footer can name every section AND close an identifier's dynamic code
+// span (up to MAX_INLINE_BYTES + 1 backticks). Reserve space for both.
 const TRUNCATION_NOTICE_RESERVE: usize = 1_024;
 
 /// Characters that carry no visible meaning in a review comment but can
@@ -684,7 +686,7 @@ fn finalize_comment(md: String) -> String {
     let omitted_sections: Vec<_> = sections
         .into_iter()
         .filter(|section| {
-            let heading = format!("### {section}");
+            let heading = format!("\n### {section}");
             md.find(&heading).is_some_and(|start| {
                 let next = md[start + heading.len()..]
                     .find("\n### ")
