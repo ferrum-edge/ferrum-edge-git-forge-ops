@@ -2211,6 +2211,511 @@ fn candidate_ids(candidates: &[AdoptionCandidate]) -> Vec<String> {
         .collect()
 }
 
+// Stateful loopback gateway for prune regressions. A DELETE really removes
+// the incumbent, so both the transcript and surviving state are observable.
+// HTTP route uniqueness is enforced on create/update; no atomic swap exists.
+struct PruneGatewayState {
+    live: GatewayConfig,
+    requests: Vec<(String, String, String)>,
+}
+
+fn spawn_prune_gateway(
+    live: GatewayConfig,
+    rejection: Option<(&'static str, &'static str, u16)>,
+) -> (String, Arc<Mutex<PruneGatewayState>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(Mutex::new(PruneGatewayState {
+        live,
+        requests: Vec::new(),
+    }));
+    let shared = Arc::clone(&state);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                while let Some(request) = read_request(&mut stream) {
+                    let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+                    let mut words = headers.split_whitespace();
+                    let method = words.next().unwrap();
+                    let path = words.next().unwrap().split('?').next().unwrap();
+                    let namespace = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("x-ferrum-namespace"))
+                        .map(|(_, value)| value.trim())
+                        .unwrap_or("ferrum");
+                    let (status, response) = {
+                        let mut state = shared.lock().unwrap();
+                        state
+                            .requests
+                            .push((method.into(), namespace.into(), path.into()));
+                        if method == "GET" && path == "/health" {
+                            (200, HEALTHY.to_string())
+                        } else if method == "GET" && path == "/backup" {
+                            let config = gitforgeops::config::filter_config_by_namespace(
+                                &state.live,
+                                namespace,
+                            );
+                            (200, backup_body(&config))
+                        } else if path.starts_with("/proxies") {
+                            let incoming = if matches!(method, "POST" | "PUT") {
+                                Some(serde_json::from_str::<Proxy>(body).unwrap())
+                            } else {
+                                None
+                            };
+                            let id = incoming
+                                .as_ref()
+                                .map(|proxy| proxy.id.clone())
+                                .unwrap_or_else(|| {
+                                    path.strip_prefix("/proxies/").unwrap().to_string()
+                                });
+                            if let Some((_, _, status)) =
+                                rejection.filter(|(verb, key, _)| *verb == method && *key == id)
+                            {
+                                (status, r#"{"error":"injected resource failure"}"#.into())
+                            } else if let Some(incoming) = incoming {
+                                assert_eq!(incoming.namespace, namespace);
+                                let conflict = state.live.proxies.iter().any(|proxy| {
+                                    proxy.namespace == namespace
+                                        && proxy.id != incoming.id
+                                        && proxy.hosts == incoming.hosts
+                                        && proxy.listen_path == incoming.listen_path
+                                });
+                                if conflict {
+                                    (409, r#"{"error":"proxy route already exists"}"#.into())
+                                } else {
+                                    state.live.proxies.retain(|proxy| {
+                                        proxy.namespace != namespace || proxy.id != incoming.id
+                                    });
+                                    state.live.proxies.push(incoming);
+                                    (200, "{}".into())
+                                }
+                            } else if method == "DELETE" {
+                                state
+                                    .live
+                                    .proxies
+                                    .retain(|proxy| proxy.namespace != namespace || proxy.id != id);
+                                (204, String::new())
+                            } else {
+                                panic!("unexpected proxy request: {request}");
+                            }
+                        } else {
+                            panic!("unexpected request: {request}");
+                        }
+                    };
+                    if write!(
+                        stream,
+                        "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), state)
+}
+
+fn routed_proxy(id: &str, namespace: &str, route: &str) -> Proxy {
+    let mut resource = proxy(id, namespace, None);
+    resource.listen_path = Some(route.into());
+    resource
+}
+
+fn proxy_ledger(live: &GatewayConfig) -> StateFile {
+    let ops = live
+        .proxies
+        .iter()
+        .map(|proxy| gitforgeops::apply::AppliedOp {
+            kind: "Proxy".into(),
+            namespace: proxy.namespace.clone(),
+            id: proxy.id.clone(),
+            action: DiffAction::Add,
+        })
+        .collect::<Vec<_>>();
+    ledger_of(&ops, live)
+}
+
+fn record_prune_result(state: &mut StateFile, result: &ApplyResult, desired: &GatewayConfig) {
+    for op in result.applied_incremental.iter().chain(&result.adopted) {
+        state.record_op(op, desired).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_rename_cli_preserves_incumbent_and_journal_on_unchanged_retries() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    for mode in ["shared", "exclusive"] {
+        let live = GatewayConfig {
+            proxies: vec![routed_proxy("api-v1", "ferrum", "/orders")],
+            ..Default::default()
+        };
+        let (url, gateway) = spawn_prune_gateway(live.clone(), None);
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join(".gitforgeops")).unwrap();
+        std::fs::create_dir_all(root.join(".state")).unwrap();
+        std::fs::create_dir_all(root.join("resources/ferrum/proxies")).unwrap();
+        std::fs::write(
+            root.join(".gitforgeops/config.yaml"),
+            format!(
+                "version: 1\ndefault_environment: prod\nenvironments:\n  prod:\n    apply_strategy: incremental\n    ownership:\n      mode: {mode}\n      namespaces: [ferrum]\n      large_prune_threshold_percent: 100\n"
+            ),
+        )
+        .unwrap();
+        let desired = routed_proxy("api-v2", "ferrum", "/orders");
+        std::fs::write(
+            root.join("resources/ferrum/proxies/api-v2.yaml"),
+            serde_yaml::to_string(&serde_json::json!({"kind": "Proxy", "spec": desired})).unwrap(),
+        )
+        .unwrap();
+        let mut state = proxy_ledger(&live);
+        state.environment = "prod".into();
+        state.last_applied_commit = Some("previous-clean-commit".into());
+        let state_path = root.join(".state/prod.json");
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let validator = root.join("validator");
+        std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Each run sends one POST. Deferral keeps the routing key occupied,
+        // so the second unchanged apply must fail too, preserving the journal.
+        for attempt in 1..=2 {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
+            command.current_dir(root).env_clear();
+            for name in ["PATH", "HOME", "TMPDIR"] {
+                if let Ok(value) = std::env::var(name) {
+                    command.env(name, value);
+                }
+            }
+            let output = command
+                .args(["apply", "--auto-approve"])
+                .env("FERRUM_GATEWAY_MODE", "api")
+                .env("FERRUM_GATEWAY_URL", &url)
+                .env("FERRUM_ALLOW_INSECURE_HTTP", "true")
+                .env(
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "test-secret-must-be-32-chars-long",
+                )
+                .env("FERRUM_GATEWAY_MAX_RETRIES", "0")
+                .env("FERRUM_EDGE_BINARY_PATH", &validator)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{mode}: {stdout}\n{stderr}");
+            assert!(
+                stdout.contains("0 deleted, 1 deletes deferred"),
+                "{stdout}\n{stderr}"
+            );
+            assert!(
+                stderr.contains("[ferrum] DEFER DELETE Proxy `api-v1`"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("proxy route already exists"), "{stderr}");
+            let saved: StateFile =
+                serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+            assert_eq!(saved.resources, state.resources);
+            assert_eq!(saved.last_applied_commit, state.last_applied_commit);
+            assert!(saved
+                .pending_creates
+                .contains(&state_key("ferrum", "Proxy", "api-v2")));
+            let gateway = gateway.lock().unwrap();
+            assert!(gateway
+                .requests
+                .iter()
+                .all(|(method, _, _)| method != "DELETE"));
+            assert_eq!(
+                gateway
+                    .requests
+                    .iter()
+                    .filter(|(method, _, _)| method == "POST")
+                    .count(),
+                attempt
+            );
+            assert_eq!(gateway.live.proxies.len(), 1);
+            assert_eq!(gateway.live.proxies[0].id, "api-v1");
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_proven_absent_defers_prune_without_replaying_the_post() {
+    let live = GatewayConfig {
+        proxies: vec![routed_proxy("retained", "ferrum", "/old")],
+        ..Default::default()
+    };
+    let desired = GatewayConfig {
+        proxies: vec![routed_proxy("failed-add", "ferrum", "/new")],
+        ..Default::default()
+    };
+    let (url, gateway) = spawn_prune_gateway(live, Some(("POST", "failed-add", 503)));
+    let result = apply_api(
+        &desired,
+        &stub_client_with_retries(url, 3),
+        &["ferrum".into()],
+        OwnershipScope::Exclusive,
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.deletes_deferred, 1);
+    assert!(result.fatal_error.is_none());
+    assert!(result.applied_incremental.is_empty());
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert_eq!(
+        gateway
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "POST")
+            .count(),
+        1
+    );
+    assert!(gateway.requests.iter().all(|(m, _, _)| m != "DELETE"));
+    assert_eq!(gateway.live.proxies[0].id, "retained");
+}
+
+#[tokio::test]
+async fn failed_pending_create_assertion_also_defers_prunes() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("retained", "ferrum", "/old"),
+            routed_proxy("pending", "ferrum", "/new"),
+        ],
+        ..Default::default()
+    };
+    let desired = GatewayConfig {
+        proxies: vec![live.proxies[1].clone()],
+        ..Default::default()
+    };
+    let (url, gateway) = spawn_prune_gateway(live, Some(("PUT", "pending", 422)));
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["ferrum".into()],
+        OwnershipScope::Exclusive,
+        None,
+        None,
+        &ApplyOptions {
+            pending_create_assertions: BTreeSet::from([state_key("ferrum", "Proxy", "pending")]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.deletes_deferred, 1);
+    assert!(result.applied_incremental.is_empty());
+    assert!(result.adopted.is_empty());
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert!(gateway
+        .requests
+        .iter()
+        .all(|(m, _, _)| m != "DELETE" && m != "POST"));
+    assert_eq!(gateway.live.proxies.len(), 2);
+}
+
+#[tokio::test]
+async fn failed_modify_defers_its_namespace_prunes_and_other_namespaces_progress() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("retained", "team-a", "/old"),
+            routed_proxy("fail-modify", "team-a", "/keep"),
+            routed_proxy("pruned", "team-b", "/old"),
+        ],
+        ..Default::default()
+    };
+    let mut modified = live.proxies[1].clone();
+    modified.backend_port = 9090;
+    let desired = GatewayConfig {
+        proxies: vec![
+            modified,
+            routed_proxy("added-a", "team-a", "/new"),
+            routed_proxy("added-b", "team-b", "/new"),
+        ],
+        ..Default::default()
+    };
+    let mut state = proxy_ledger(&live);
+    let managed = state.previously_managed_keys();
+    let (url, gateway) = spawn_prune_gateway(live.clone(), Some(("PUT", "fail-modify", 422)));
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-a".into(), "team-b".into()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((result.created, result.updated, result.deleted), (2, 0, 1));
+    assert_eq!(result.deletes_deferred, 1);
+    assert_eq!(result.errors.len(), 1);
+    assert!(result.errors[0].contains("[team-a] Proxy fail-modify update"));
+    record_prune_result(&mut state, &result, &desired);
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-a", "Proxy", "retained")));
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-a", "Proxy", "fail-modify")));
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-a", "Proxy", "added-a")));
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-b", "Proxy", "added-b")));
+    assert!(!state
+        .resources
+        .contains_key(&state_key("team-b", "Proxy", "pruned")));
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert!(gateway
+        .requests
+        .iter()
+        .all(|(method, ns, _)| method != "DELETE" || ns != "team-a"));
+    assert!(gateway.requests.contains(&(
+        "DELETE".into(),
+        "team-b".into(),
+        "/proxies/pruned".into()
+    )));
+    assert!(gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "retained"));
+    assert!(gateway.live.proxies.iter().any(|proxy| {
+        proxy.id == "fail-modify" && proxy.backend_port == live.proxies[1].backend_port
+    }));
+    assert!(!gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "pruned"));
+}
+
+#[tokio::test]
+async fn failed_delete_keeps_its_ledger_entry_and_other_deletes_still_run() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("retained", "ferrum", "/old"),
+            routed_proxy("pruned", "ferrum", "/other"),
+        ],
+        ..Default::default()
+    };
+    let mut state = proxy_ledger(&live);
+    let managed = state.previously_managed_keys();
+    let (url, gateway) = spawn_prune_gateway(live, Some(("DELETE", "retained", 409)));
+    let desired = GatewayConfig::default();
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["ferrum".into()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.deleted, 1);
+    assert_eq!(result.deletes_deferred, 0);
+    record_prune_result(&mut state, &result, &desired);
+    assert!(state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "retained")));
+    assert!(!state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "pruned")));
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert_eq!(
+        gateway
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .count(),
+        2
+    );
+    assert_eq!(gateway.live.proxies.len(), 1);
+    assert_eq!(gateway.live.proxies[0].id, "retained");
+}
+
+#[tokio::test]
+async fn successful_writes_are_followed_by_prune_and_update_the_ledger() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("pruned", "ferrum", "/old"),
+            routed_proxy("modified", "ferrum", "/keep"),
+        ],
+        ..Default::default()
+    };
+    let mut modified = live.proxies[1].clone();
+    modified.backend_port = 9090;
+    let desired = GatewayConfig {
+        proxies: vec![modified, routed_proxy("added", "ferrum", "/new")],
+        ..Default::default()
+    };
+    let mut state = proxy_ledger(&live);
+    let managed = state.previously_managed_keys();
+    let (url, gateway) = spawn_prune_gateway(live, None);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["ferrum".into()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap()
+    .into_result()
+    .unwrap();
+    assert_eq!((result.created, result.updated, result.deleted), (1, 1, 1));
+    assert_eq!(result.deletes_deferred, 0);
+    record_prune_result(&mut state, &result, &desired);
+    assert_eq!(state.resources.len(), 2);
+    assert!(state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "added")));
+    assert!(!state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "pruned")));
+    let gateway = gateway.lock().unwrap();
+    let mutations = gateway
+        .requests
+        .iter()
+        .filter(|(m, _, _)| m != "GET")
+        .collect::<Vec<_>>();
+    assert_eq!(mutations.len(), 3);
+    assert_eq!(mutations[2].0, "DELETE");
+    assert_eq!(gateway.live.proxies.len(), 2);
+    assert!(!gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "pruned"));
+}
+
 #[tokio::test]
 async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
     // Issue #129's reproduction. Two consumers imported from the gateway match

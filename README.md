@@ -505,6 +505,22 @@ The journal survives a crashed CI process, because the apply workflow commits st
 
 ### `exclusive` (strict 1:1)
 
+All commands that load desired resources enforce exclusive ownership at the
+shared assembly boundary, including `validate`, `plan`, `review`, `diff`,
+`export` (including `--materialize`), and `apply`. Gateway resources use their
+effective namespace; `MeshConfig` fragments use their source directory namespace,
+not workload or service namespaces inside the mesh document. The check runs
+after overlays and namespace filtering, before validation, gateway calls, or
+artifact publication. Shared mode keeps merging all selected fragments.
+
+An exclusive environment that previously published mesh fragments from unowned
+directories now refuses them, naming the namespace and fragment label
+(`namespace/mesh/id`, with the file stem used when `id` is absent). Add the
+namespace to `ownership.namespaces` or move the fragment to an owned directory.
+`namespace_filter` / `FERRUM_NAMESPACE` still narrow the selected resources;
+an exclusive environment rejects a filter outside its owned list, even if the
+selection is empty. Allowed fragments still merge into one mesh document.
+
 - Repo is authoritative for the listed `namespaces`.
 - Unmanaged resources in those namespaces → **pruned**.
 - Requires explicit `namespaces` list (safety rail against misconfiguration).
@@ -1096,7 +1112,7 @@ Some failures get their own error rather than a generic HTTP one:
 
 **404-tolerant deletes.** A DELETE that answers 404 already achieved its goal. The gateway cascades deletes server-side (deleting a proxy removes its scoped plugin configs), so a diff-driven follow-up delete legitimately finds nothing; treating that as an error used to wedge every later run on the same delete.
 
-**Partial-failure visibility** (incremental mode): errors are collected per resource rather than bailing on first failure. A run where 99 of 100 resources apply cleanly but 1 hits a 400 returns an `ApplyResult` with 99 successes and 1 error. CLI exits non-zero; you see exactly which resource failed and why. Read-only refusals, stale views, and restore-rollback damage are the exceptions — they are fatal for the whole run, because continuing to the next namespace is pointless or unsafe.
+**Partial-failure visibility** (incremental mode): errors are collected per resource rather than bailing on first failure. A run where 99 of 100 adds/updates apply cleanly but 1 hits a 400 returns an `ApplyResult` with 99 successes and 1 error; all planned deletes in the failed write's namespace are deferred and counted separately. CLI exits non-zero; you see exactly which resource failed and why. Read-only refusals, stale views, and restore-rollback damage are the exceptions — they are fatal for the whole run, because continuing to the next namespace is pointless or unsafe.
 
 ### Apply ordering and the batch fast path
 
@@ -1112,6 +1128,10 @@ Incremental apply sorts the diff into dependency order rather than by kind, beca
 | 5 | Delete Upstream, Delete Consumer |
 
 Deletes come *after* adds and modifies: an upstream can only be removed once nothing references it (`DELETE /upstreams/{id}` answers 409 while a proxy still points at it), so the proxy modify that drops the reference has to land first.
+
+If any Add or Modify fails, **all planned deletes in that namespace are deferred** for this run, in both shared and exclusive ownership. Remaining writes and unaffected namespaces continue; existing fatal errors still stop the run. The result and CLI count deferred deletes separately from successful deletes, and each deferred resource is named with its reason. Failed and deferred deletes keep their managed ledger entries; successful operations still update state, and the run exits non-zero. `--allow-large-prune` does not bypass this deferral. Plan, diff, and the apply preview describe deletes as conditional because they cannot predict write failures.
+
+This preserves an incumbent when a replacement fails, but does **not** make a rename atomic. Renaming a proxy ID while retaining the same routing key still conflicts with the incumbent on every unchanged retry. Keep the existing ID and modify it when possible, or stage a replacement on a distinct, valid routing key before removing the incumbent. If the same key must move between IDs, resolve the conflict through a planned migration or maintenance window; simply adding the new ID in an earlier PR cannot bypass gateway uniqueness. The incremental admin API offers no atomic route swap.
 
 Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-side cascade defaults to on and would delete the last-referenced hand-owned upstream along with the proxy — an invisible deletion that makes the next diff-driven `DELETE /upstreams/{id}` answer 404. gitforgeops owns the upstream lifecycle through its own diff and issues that delete itself.
 
