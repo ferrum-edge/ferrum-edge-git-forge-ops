@@ -431,11 +431,28 @@ a validator diagnostic), and `diff::security::check_literal_credentials` (never
 block `apply` on one). That last one carries the credential type and leaf key
 down the walk separately from the human-readable diagnostic path.
 
-Generation constraints, enforced at resolve time so `plan` fails before `apply`
-writes an unusable value: `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24
-entropy bytes); `basicauth` generation is refused in file mode and
+Generation constraints, shared by `resolver::check_generation_allowed` and the
+allocator so `plan` and generation cannot disagree: `jwt`/`hmac_auth` secrets
+need ≥32 chars (`len=` ≥ 24 entropy bytes); `basicauth` generation is refused in file mode and
 `basicauth/…/password_hash` in either mode (the hash is HMAC-SHA256 under the
 gateway's own secret); a bundle value of `[REDACTED]` is refused.
+
+The allocator validates the entire candidate batch before GitHub key discovery,
+including direct callers and lenient reports. Structural types must agree with
+the encoded slot. The same policy rejects non-generatable discovery secrets
+using `SD_SECRET_FIELDS`, and rejects generation of public identity fields.
+Already-seeded slots still resolve regardless of their allocation mode.
+
+`allocator::check_rotation_allowed` additionally restricts rotation to Consumer
+`keyauth/key`, `jwt/secret`, `hmac_auth/secret` and api-mode `basicauth/password`,
+including indexed entries. Both the CLI and `rotate_and_deliver` enforce it.
+The command has no PluginConfig/Upstream publication path: reserved slots cannot
+be rotated even when those resources share a Consumer id. Plugin allocation via
+apply remains supported. Target placeholder, generation, namespace/ownership,
+sibling resolution and gateway-client construction all precede secret writes;
+publication reuses the preflight's desired Consumer snapshot. Externally issued
+secrets must be reissued, reseeded into the bundle and applied. A value destroyed
+by an older rotation cannot be recovered from GitHub's write-only secret API.
 
 Slot identity is positional, and `resolver::check_array_slot_identity` splits
 the two consequences by whether evidence exists:
