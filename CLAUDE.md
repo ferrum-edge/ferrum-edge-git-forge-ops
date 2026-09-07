@@ -147,6 +147,18 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
+Incremental Add/Modify failures defer every planned Delete in that namespace,
+including failed pending-create ownership assertions. Remaining writes and other
+namespaces continue under the existing fatal-error rules. `ApplyResult::deletes_deferred`
+and CLI counts distinguish deferrals from successful deletes; per-resource messages
+name what was retained and why. Deferred and failed deletes never enter
+`applied_incremental`, so the managed ledger survives and the run exits non-zero.
+Plan/diff/apply previews explain that pruning is conditional. No flag bypasses
+this gate. A same-routing-key ID rename still conflicts on an unchanged retry:
+preserving the incumbent does not free its key. Keep its ID and modify it, stage
+a replacement on a distinct valid key, or plan a migration/maintenance window to
+resolve the conflict. Incremental CRUD does not offer an atomic route swap.
+
 A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate.
 
 Create and batch POST error responses are never retried blindly. An ambiguous outcome is reconciled through an authoritative (non-cached) backup, and the readback has three severities (`LiveMatch`): the **exact** row live → an idempotent PUT declares repository ownership and the create is recorded; the row **absent** → the write provably did not commit, so it is an ordinary per-resource error and the rest of the run continues; the row **present but different**, or no usable verification at all → a run-stopping `AmbiguousMutation`. `resource_values_match` is a subset test (desired ⊆ live, minus server timestamps) so a gateway-populated optional does not read as a foreign row.

@@ -1109,6 +1109,10 @@ async fn cmd_diff(
         }
     }
 
+    if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
+        println!("{note}\n");
+    }
+
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
         println!(
             "\nUnmanaged resources (mode: {:?}, not touched by apply):",
@@ -1302,6 +1306,10 @@ async fn cmd_plan(
             println!("  {} {} {}", action, d.kind, d.id);
         }
         println!();
+    }
+
+    if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
+        println!("{note}\n");
     }
 
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
@@ -1787,6 +1795,11 @@ async fn cmd_apply(
                     };
                     println!("  {} {} {}", action, d.kind, d.id);
                 }
+                if let Some(note) =
+                    apply::incremental_prune_notice(&resolved.apply_strategy, &diffs)
+                {
+                    println!("{note}");
+                }
                 if !adoptions.is_empty() {
                     println!(
                         "\n{} already-matching resource(s) would be adopted into the ownership ledger:",
@@ -2075,10 +2088,11 @@ async fn cmd_apply(
             // Print counts up front so partial-success runs surface what
             // landed even when we're about to propagate an error.
             println!(
-                "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped, {} spec-owned skipped",
+                "Applied: {} created, {} updated, {} deleted, {} deletes deferred, {} unmanaged skipped, {} spec-owned skipped",
                 raw.created,
                 raw.updated,
                 raw.deleted,
+                raw.deletes_deferred,
                 raw.unmanaged_skipped,
                 raw.spec_owned_skipped
             );
