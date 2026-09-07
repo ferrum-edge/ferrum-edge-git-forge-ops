@@ -350,10 +350,20 @@ reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
 where a scoped plugin config replaces a global one of the same `plugin_name`).
 Rules that reason about plugins go through it rather than hard-coding names.
 
-Severity `error` blocks `apply` unless overridden. Override = PR label
-(configurable name) added by a user whose repo permission is ≥
-`overrides.required_permission` (default `write`). Implementation:
-`src/policy/github_override.rs::check_override`.
+Severity `error` blocks `apply` unless overridden. Override requires the current
+configured PR label, its latest labeler's current permission ≥
+`overrides.required_permission` (default `write`), and that account's latest
+submitted PR review with exact body `gitforgeops-override <configured-label>`.
+Only APPROVED/COMMENTED reviews whose `commit_id` is the current PR head qualify.
+Label-event `commit_id` is not a labeled-at head. Actual desired/configuration
+bytes and executable source must match that head's complete Git tree. Merged
+PRs additionally require merge ancestry; `.state/**` and `assembled/**` remain
+the only permitted post-review differences. Trusted review checks split candidate
+data/protected source via review-only `GITFORGEOPS_OVERRIDE_SOURCE`; apply/plan
+always inspect their own checkout. All use the shared authorization predicate
+in `src/policy/github_override.rs` and raw input verification in
+`src/policy/override_input.rs`. Audit entries record PR, review id, authorized
+head and actual applied revision; optional fields preserve old state loading.
 
 ### Preview verdicts (`src/verdict.rs`)
 
@@ -444,7 +454,8 @@ Literal (non-placeholder) consumer credentials are an apply blocker too:
 document before the state lock, the bundle read, and any gateway call, health
 preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
-label + repo permission), resolved once and shared by both gates.
+label + revision-bound review + current repo permission and input verification),
+resolved once and shared by both gates.
 
 #### Secrets outside `Consumer.credentials`
 

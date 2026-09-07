@@ -26,9 +26,162 @@ fn review_comment_shows_validation_pass() {
 }
 
 #[test]
+fn oversized_review_preserves_every_blocker_and_names_omitted_sections() {
+    use gitforgeops::secrets::placeholder::{PlaceholderAlloc, SecretPlaceholder};
+    use gitforgeops::secrets::{ResolveResult, SlotStatus};
+
+    let diffs: Vec<_> = (0..100)
+        .map(|index| ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "Proxy".into(),
+            id: format!("proxy-{index}"),
+            namespace: "tenant".into(),
+            details: (0..20)
+                .map(|field| FieldChange {
+                    field: format!("field-{field}"),
+                    old_value: "界".repeat(170),
+                    new_value: "診".repeat(170),
+                })
+                .collect(),
+        })
+        .collect();
+    let policy = [PolicyFinding {
+        rule_id: "backend_scheme".into(),
+        severity: Severity::Error,
+        kind: "Proxy".into(),
+        id: "app".into(),
+        namespace: "tenant".into(),
+        message: "scheme rejected".into(),
+        remediation: None,
+        overridden_by: None,
+    }];
+    let security = [SecurityFinding {
+        severity: "error".into(),
+        kind: "Consumer".into(),
+        id: "app".into(),
+        namespace: "tenant".into(),
+        message: "literal credential".into(),
+    }];
+    let mut secrets = ResolveReport::default();
+    secrets.slot_remaps.push("orphaned broker slot".into());
+    secrets.results.push(ResolveResult {
+        consumer_id: "app".into(),
+        namespace: "tenant".into(),
+        cred_key: "keyauth/key".into(),
+        slot: "tenant/app/keyauth/key".into(),
+        placeholder: SecretPlaceholder {
+            alloc: PlaceholderAlloc::Require,
+            length_bytes: 32,
+        },
+        status: SlotStatus::MissingRequired,
+    });
+    let render = || {
+        build_review_comment_v2(
+            false,
+            "mesh rejected",
+            &diffs,
+            &[],
+            &security,
+            &[],
+            &policy,
+            &[],
+            &[spec_owned_entry("spec-proxy", true, false)],
+            None,
+            None,
+            None,
+            None,
+            &secrets,
+            true,
+        )
+    };
+    let comment = render();
+    assert_eq!(comment, render(), "truncation must be deterministic");
+    assert!(comment.len() <= MAX_REVIEW_COMMENT_BYTES);
+    assert!(
+        comment.len() > MAX_REVIEW_COMMENT_BYTES - 2_000,
+        "a long table row must not waste the remaining budget: {}",
+        comment.len()
+    );
+    let verdict = comment.split("## Ferrum Edge Config Review").next().unwrap();
+    for expected in [
+        "Apply is blocked",
+        "Validation: rejected",
+        "Security Findings: 1 total, 1 blocking",
+        "Policy Violations: 1 total, 1 blocking",
+        "`backend_scheme`",
+        "1 **CONFLICT**",
+        "Credential Slot Remaps: 1 blocking",
+        "1 missing required (blocking)",
+    ] {
+        assert!(verdict.contains(expected), "missing {expected}: {verdict}");
+    }
+    let notice = comment
+        .split("Detail reduced or omitted from:")
+        .nth(1)
+        .unwrap();
+    for section in [
+        "Changes",
+        "Security Findings",
+        "Policy Violations",
+        "Spec-owned Resources",
+        "Credential Slot Remaps",
+        "Secret Broker Slots",
+    ] {
+        assert!(notice.contains(section), "{notice}");
+    }
+}
+
+#[test]
 fn review_comment_shows_validation_fail() {
     let comment = build_review_comment(false, "some error", &[], &[], &[], &[], None);
     assert!(comment.contains("FAIL"));
+}
+
+#[test]
+fn verified_security_only_override_clears_only_its_verdict() {
+    use gitforgeops::policy::OverrideDecision;
+    use gitforgeops::review::build_review_comment_v2_with_override;
+
+    let decision = OverrideDecision {
+        active: true,
+        approver: Some("maintainer".into()),
+        permission: Some("write".into()),
+        reason: "PR 7 review 42 authorized head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        pr_number: Some(7),
+        authorized_head: Some("a".repeat(40)),
+        review_id: Some(42),
+        applied_revision: Some("b".repeat(40)),
+    };
+    let security = [SecurityFinding {
+        severity: "error".into(),
+        kind: "Consumer".into(),
+        id: "app".into(),
+        namespace: "tenant".into(),
+        message: "literal credential".into(),
+    }];
+    let comment = build_review_comment_v2_with_override(
+        ReviewValidationStatus::Passed,
+        "",
+        &[],
+        &[],
+        &security,
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+        Some(&decision),
+    );
+    assert!(!comment.contains("Apply is blocked"));
+    assert!(comment.contains("Security Findings: 1 total, 0 blocking, 1 overridden"));
+    assert!(comment.contains("Security findings OVERRIDDEN by `maintainer`"));
+    assert!(comment.contains("literal credential"));
+    assert!(comment.contains("PR 7 review 42 authorized head"));
 }
 
 #[test]
@@ -655,7 +808,8 @@ fn review_comment_preserves_trusted_markup_and_names_empty_code_spans() {
         true,
     );
 
-    assert!(comment.starts_with(
+    assert!(comment.starts_with("### Apply verdict\n\n"));
+    assert!(comment.contains(
         "Environment: `production` · Ownership: `Shared` · Strategy: `Incremental`\n\n"
     ));
     assert!(comment.contains("**Proxy `(unnamed)`** (`(unnamed)`): missing identity"));
@@ -1245,6 +1399,10 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
         approver: Some("reviewer".into()),
         permission: Some("write".into()),
         reason: "Verified configured label and write permission".into(),
+        pr_number: Some(7),
+        authorized_head: Some("a".repeat(40)),
+        review_id: Some(10),
+        applied_revision: Some("b".repeat(40)),
     };
     let inactive = OverrideDecision::inactive("label missing or verification unavailable");
     for decision in [None, Some(&inactive), Some(&active)] {
@@ -1280,11 +1438,11 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
             decision,
         );
         let overridden = decision.is_some_and(|decision| decision.active);
-        assert_eq!(
+        assert!(
             comment.contains("Apply is blocked"),
-            !overridden,
-            "{comment}"
+            "mesh still blocks: {comment}"
         );
+        assert_eq!(comment.contains("1 blocking, 0 overridden"), !overridden);
         assert_eq!(
             comment.contains("Security findings OVERRIDDEN by `reviewer`"),
             overridden,

@@ -1536,7 +1536,7 @@ async fn cmd_apply(
                     "Refusing to apply: {blocker_count} error-severity security finding(s) listed above. \
                      Consumer credentials belong in the broker as ${{gh-env-secret:...}} placeholders; a literal \
                      value in repository YAML is a committed secret and applying it publishes it to the gateway. \
-                     To override, add the '{}' label to the PR from an account with '{}' permission.",
+                     To override, add the '{}' label and submit its revision-bound override review from an account with '{}' permission.",
                     override_cfg.require_label, override_cfg.required_permission
                 );
                 match &override_decision {
@@ -2227,17 +2227,11 @@ async fn cmd_apply(
             }
         }
     }
-    if !overridden_for_audit.is_empty() {
-        // An override belongs to the attempted commit even when the apply is
-        // partial. Prefer the workflow's immutable input SHA; falling back to
-        // last_applied first would misattribute a failed attempt to the prior
-        // successfully landed commit.
-        let commit = std::env::var("GITHUB_SHA")
-            .ok()
-            .or_else(|| state.last_applied_commit.clone())
-            .unwrap_or_default();
-        for (rule_id, approver) in &overridden_for_audit {
-            state.record_override(rule_id, &commit, approver);
+    if let Some(decision) = &override_decision {
+        // The verified actual source revision and reviewed PR head are distinct
+        // for a merge and for later generated-state-only commits.
+        for (rule_id, _) in &overridden_for_audit {
+            state.record_verified_override(rule_id, decision);
         }
     }
     state.save()?;
@@ -2475,7 +2469,12 @@ async fn cmd_review(
             if policy_cfg.is_some()
                 || verdict::security_blocker(&security_findings, false).is_some() =>
         {
-            let decision = policy::check_override(&env_config, &override_cfg, pr_number).await?;
+            let decision = policy::github_override::check_review_override(
+                &env_config,
+                &override_cfg,
+                pr_number,
+            )
+            .await?;
             policy::github_override::apply_override(&mut policy_findings, &decision);
             Some(decision)
         }

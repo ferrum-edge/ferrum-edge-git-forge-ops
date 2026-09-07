@@ -693,9 +693,12 @@ overrides:
 ### Override flow (B2: label + permission)
 
 1. Someone with `write` repo permission (or higher — configurable) adds the `gitforgeops/policy-override` label to the PR.
-2. On next workflow run, gitforgeops fetches the PR labels and checks the labeler's permission via the GitHub API.
-3. If both checks pass, error-severity findings get annotated `OVERRIDDEN by @user` and no longer block apply.
-4. The override event is recorded in `.state/<env>.json.overrides` for audit.
+2. That same account submits a PR review on the current head, using **Comment** or **Approve**, with the entire body `gitforgeops-override gitforgeops/policy-override` (substitute your configured label). An ordinary approval is not an override request. The review's GitHub `commit_id` binds the request to that revision; a label event's `commit_id` is not a labeled-at head. See [GitHub review semantics](https://docs.github.com/en/rest/pulls/reviews) and [issue event semantics](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types).
+3. On the next run, gitforgeops verifies the current label, latest labeler, current permission, and that account's latest submitted review. The review must explicitly authorize the current PR head. A later push, dismissed review, rejection, or ordinary submitted review requires a new explicit override review. Missing evidence, incomplete pagination, and API failures leave blockers enforced. Existing label-only overrides must migrate to this review flow.
+4. The actual resource/overlay YAML and policy/environment files must exactly match the reviewed tree, and the executable/repository source must also match. Run local CLI commands from a clean Git repository root. An environment SHA or PR number alone cannot authorize input. Post-merge apply additionally proves that the PR's merge is an ancestor of the actual checkout; differences under `.state/` and `assembled/` are permitted, preserving the workflow freshness guard. If merging introduces other base-branch changes, update the PR with that base and submit a new override review before merging.
+5. Error-severity findings get annotated `OVERRIDDEN by @user`. Validation, credential requirements/remaps, ownership, and gateway admission gates remain enforced. The audit record stores `pr_number`, `review_id`, `authorized_head`, and the actual applied `commit`. Old state records load with absent evidence fields; they are historical records and cannot grant authorization. State/config schema versions are unchanged.
+
+Trusted live review verifies its sanitized candidate YAML against the reviewed tree and its protected configuration and executable checkout against the same tree. Its workflow sets the review-only `GITFORGEOPS_OVERRIDE_SOURCE` to that protected checkout; the path merely selects source to inspect and grants no authority. `plan` and `apply` ignore this setting and inspect their own checkout. A protected source/configuration mismatch leaves the override inactive. Static review without a GitHub token cannot verify an override and retains blockers. These checks use raw Git blob hashes without executing repository filters or scripts.
 
 If you want two-person separation-of-duties instead of one-person override, change `required_permission: admin` and only grant admin to a small group — the check is strictly `>=` on the permission rank (`admin > maintain > write > triage > read`).
 
@@ -1505,6 +1508,13 @@ default override configuration. Findings remain visible with the approver named
 when overridden. A missing or inactive override retains the blocking verdict;
 an override never changes the validation heading or other admission gates.
 
+Every comment starts with a bounded apply verdict computed from all findings,
+including validation, security/policy blockers, spec conflicts, credential slot
+remaps, and missing required credentials when bundle evidence is available.
+The 60,000-byte comment limit may shorten detailed listings, but these counts
+survive. The footer names the sections whose detail was reduced or omitted;
+use smaller namespace-scoped reviews to inspect that detail.
+
 ```markdown
 Environment: `staging` · Ownership: `Shared` · Strategy: `Incremental`
 
@@ -1540,7 +1550,7 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - [error] `backend_scheme` on **Proxy `my-api`** (`ferrum`): backend_scheme=http is not in the allowed list (https) · BLOCKING
   - _Change backend_scheme to one of: https_
 
-> **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label (requires `write` permission on this repo).
+> **Apply is blocked** until the listed violations are resolved. To override, add the `gitforgeops/policy-override` label and submit its revision-bound override review (requires `write` permission on this repo).
 
 ### Secret Broker Slots
 | Slot | Declared as |
@@ -1555,7 +1565,7 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - **Apply only runs post-merge on `main`.** `apply-on-merge.yml` binds the environment; GitHub enforces protection rules (required reviewers, branch restrictions). Before mutation, the workflow resolves exactly one merged PR for the pushed commit; ambiguous/unattributed commits cannot borrow another PR's policy override or credential-delivery recipient.
 - **Credential values are never written back to the repo.** `.state/` contains ownership keys with constant markers plus non-secret delivery metadata—no credential-derived hashes.
 - **The state file is CI-owned and permission-attributed.** `state-guard.yml` rejects `.state/**` changes unless the latest effective override label actor currently has write/maintain/admin. Triage label authority is explicitly insufficient. Protected state commits use a short-lived, contents-only App token rather than a human PAT or unbypassable `GITHUB_TOKEN`. See [State file trust model](#state-file-trust-model).
-- **Policy overrides leave a permanent trail.** PR label event + approver permission + `.state/<env>.json.overrides` record.
+- **Policy overrides leave a permanent trail.** Current PR label attribution and permission, explicit revision-bound review, matching actual inputs, and `.state/<env>.json.overrides` evidence.
 - **The provisioner token is the bootstrap credential.** Rotate periodically; prefer GitHub App installation tokens over PATs (automatic 1-hour expiry, org-scoped).
 - **TLS material stays as GitHub secrets.** The binary only ever sees the base64-decoded PEM in-process.
 - **Executable dependencies are pinned and verified.** Every third-party Action uses a full commit SHA, Rust and `cargo-llvm-cov` use exact versions, validator bytes must match publisher and checked-in SHA-256 values, and Docker bases use manifest digests without mutable package-manager installs during the release build. Releases publish max-mode provenance, SBOM attestations, a GitHub-signed GHCR provenance statement, and a retained manifest of every action/toolchain/base/binary input. Dependabot proposes controlled updates and `check_supply_chain.py` rejects regressions.
@@ -1580,6 +1590,10 @@ gitforgeops --env production diff --exit-on-drift
 ## Docker
 
 A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into a single image. The `ferrum-edge` binary is copied from the official `ferrumedge/ferrum-edge` Docker Hub image; `gitforgeops` is compiled from source in a builder stage.
+
+Revision-bound overrides also require Git and a complete source checkout. The
+stock slim runtime does not include Git, so it leaves overrides inactive; use
+the GitHub workflow runner or a Git-equipped runtime when an override is needed.
 
 ### Published images
 

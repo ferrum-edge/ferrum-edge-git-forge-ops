@@ -14,6 +14,7 @@ mod jwt_tests;
 mod loader_tests;
 mod mesh_tests;
 mod ownership_tests;
+mod override_tests;
 mod passthrough_tests;
 mod policy_tests;
 mod reconcile_tests;

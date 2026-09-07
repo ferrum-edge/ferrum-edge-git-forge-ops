@@ -15,7 +15,7 @@ const MAX_SECTION_ITEMS: usize = 100;
 const MAX_DETAILS_PER_DIFF: usize = 20;
 const MAX_INLINE_BYTES: usize = 512;
 const MAX_VALIDATION_BYTES: usize = 8_192;
-const TRUNCATION_NOTICE_RESERVE: usize = 256;
+const TRUNCATION_NOTICE_RESERVE: usize = 1_024;
 
 /// Characters that carry no visible meaning in a review comment but can
 /// misrepresent one: C0/C1 controls (terminal escapes among them), the bidi
@@ -86,7 +86,7 @@ pub fn build_review_comment_with_status(
     best_practices: &[BestPractice],
     comparison_error: Option<&str>,
 ) -> String {
-    finalize_comment(build_review_comment_inner(
+    let mut md = build_review_comment_inner(
         validation_status,
         validation_output,
         diffs,
@@ -95,7 +95,117 @@ pub fn build_review_comment_with_status(
         best_practices,
         comparison_error,
         None,
-    ))
+    );
+    md.insert_str(
+        0,
+        &verdict_summary(
+            validation_status,
+            security,
+            &[],
+            &[],
+            &ResolveReport::default(),
+            false,
+            None,
+        ),
+    );
+    finalize_comment(md)
+}
+
+/// A bounded, count-complete verdict precedes every bulk section. Counts use
+/// the full input slices, never the detail caps. Keep this block independent
+/// of environment banners, validator output, and finding message lengths.
+#[allow(clippy::too_many_arguments)]
+fn verdict_summary(
+    validation: ReviewValidationStatus,
+    security: &[SecurityFinding],
+    policy: &[PolicyFinding],
+    spec_owned: &[SpecOwnedResource],
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+    decision: Option<&OverrideDecision>,
+) -> String {
+    let security_count = security
+        .iter()
+        .filter(|finding| finding.severity == crate::diff::security::BLOCKING_SEVERITY)
+        .count();
+    let security_blocking = if decision.is_some_and(|decision| decision.active) {
+        0
+    } else {
+        security_count
+    };
+    let policy_blocking = policy
+        .iter()
+        .filter(|finding| finding.is_blocking())
+        .count();
+    let conflicts = spec_owned.iter().filter(|row| row.is_conflict()).count();
+    let missing = secrets.missing_required().len();
+    let blocked = validation != ReviewValidationStatus::Passed
+        || security_blocking > 0
+        || policy_blocking > 0
+        || conflicts > 0
+        || !secrets.slot_remaps.is_empty()
+        || (bundle_loaded && missing > 0);
+    let mut md = String::from("### Apply verdict\n\n");
+    md.push_str(if blocked {
+        "> **Apply is blocked** by the findings summarized below.\n\n"
+    } else {
+        "> No evaluated blocker. Gateway-dependent gates and unavailable credential evidence still apply.\n\n"
+    });
+    md.push_str(&format!(
+        "- Validation: {}.\n- Security Findings: {} total, {security_blocking} blocking, {} overridden.\n- Policy Violations: {} total, {policy_blocking} blocking.\n- Spec-owned Resources: {} total, {conflicts} **CONFLICT**(s); conflicting namespaces cannot apply.\n- Credential Slot Remaps: {} blocking unless explicitly acknowledged with `--allow-credential-slot-remap`.\n",
+        match validation {
+            ReviewValidationStatus::Passed => "passed",
+            ReviewValidationStatus::Rejected => "rejected; blocks apply",
+            ReviewValidationStatus::ExecutionError => "unavailable; blocks apply",
+        },
+        security.len(),
+        security_count - security_blocking,
+        policy.len(),
+        spec_owned.len(),
+        secrets.slot_remaps.len(),
+    ));
+    if bundle_loaded {
+        md.push_str(&format!(
+            "- Secret Broker Slots: {} total, {missing} missing required (blocking), {} awaiting generation (non-blocking).\n",
+            secrets.results.len(), secrets.needs_allocation().len(),
+        ));
+    } else {
+        md.push_str(&format!(
+            "- Secret Broker Slots: {} declared; bundle unavailable, required-slot status must be checked at apply.\n",
+            secrets.results.len(),
+        ));
+    }
+    let rules: std::collections::BTreeSet<_> = policy
+        .iter()
+        .filter(|finding| finding.is_blocking())
+        .map(|finding| finding.rule_id.as_str())
+        .collect();
+    if !rules.is_empty() {
+        md.push_str("- Blocking policy rules: ");
+        md.push_str(
+            &rules
+                .iter()
+                .take(12)
+                .map(|rule| bounded_inline_code(rule))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        if rules.len() > 12 {
+            md.push_str(&format!(
+                "; {} additional rule id(s) omitted",
+                rules.len() - 12
+            ));
+        }
+        md.push_str(".\n");
+    }
+    if let Some(decision) = decision.filter(|decision| decision.active) {
+        md.push_str(&format!(
+            "- Override evidence: {}. Validation and other admission gates remain enforced.\n",
+            bounded_markdown_text(&decision.reason),
+        ));
+    }
+    md.push('\n');
+    md
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -551,13 +661,69 @@ fn finalize_comment(md: String) -> String {
     while end > 0 && !md.is_char_boundary(end) {
         end -= 1;
     }
-    if let Some(newline) = md[..end].rfind('\n') {
-        end = newline;
+    while end > 0 && md.as_bytes()[end - 1] == b'`' {
+        end -= 1;
     }
+    // Cut at a UTF-8 boundary rather than dropping a potentially enormous
+    // table row. The complete verdict is already above all detail. Terminate
+    // any code fence/inline span opened by the retained detail before the notice.
     let mut bounded = md[..end].to_string();
     let omitted = md.len().saturating_sub(end);
+    let sections = [
+        "Validation:",
+        "Changes",
+        "Breaking Changes",
+        "Security Findings",
+        "Best Practice Recommendations",
+        "Unmanaged Resources",
+        "Spec-owned Resources",
+        "Policy Violations",
+        "Credential Slot Remaps",
+        "Secret Broker Slots",
+    ];
+    let omitted_sections: Vec<_> = sections
+        .into_iter()
+        .filter(|section| {
+            let heading = format!("### {section}");
+            md.find(&heading).is_some_and(|start| {
+                let next = md[start + heading.len()..]
+                    .find("\n### ")
+                    .map(|offset| start + heading.len() + offset)
+                    .unwrap_or(md.len());
+                next > end
+            })
+        })
+        .collect();
+    // Rendered code spans use backtick runs. A matching run closes a truncated
+    // span; fences occur only in the bounded validation section, before bulk.
+    let trailing_line = bounded.rsplit('\n').next().unwrap_or_default();
+    let bytes = trailing_line.as_bytes();
+    let mut index = 0;
+    let mut open_span = None;
+    while index < bytes.len() {
+        if open_span.is_none() && bytes[index] == b'\\' {
+            index += 2;
+        } else if bytes[index] == b'`' {
+            let start = index;
+            while index < bytes.len() && bytes[index] == b'`' {
+                index += 1;
+            }
+            let length = index - start;
+            match open_span {
+                None => open_span = Some(length),
+                Some(open) if open == length => open_span = None,
+                Some(_) => {}
+            }
+        } else {
+            index += 1;
+        }
+    }
+    if let Some(length) = open_span {
+        bounded.push_str(&"`".repeat(length));
+    }
     bounded.push_str(&format!(
-        "\n\n> Review output was truncated to fit GitHub's comment limit ({omitted} UTF-8 byte(s) omitted). Omitted details remain available in the workflow logs.\n"
+        "\n\n> Review output was truncated to fit GitHub's comment limit ({omitted} UTF-8 byte(s) omitted). Detail reduced or omitted from: {}. Complete blocking counts remain in Apply verdict above; use smaller scoped reviews to inspect omitted detail.\n",
+        omitted_sections.join(", "),
     ));
     debug_assert!(bounded.len() <= MAX_REVIEW_COMMENT_BYTES);
     bounded
@@ -784,7 +950,7 @@ pub fn build_review_comment_v2_with_override(
                 None => (&default_label, &default_permission),
             };
             md.push_str(&format!(
-                "> **Apply is blocked** until the listed violations are resolved. To override, add the {} label (requires {} permission on this repo).\n\n",
+                "> **Apply is blocked** until the listed violations are resolved. To override, add the {} label and submit its revision-bound override review (requires {} permission on this repo).\n\n",
                 bounded_inline_code(label),
                 bounded_inline_code(permission),
             ));
@@ -857,5 +1023,19 @@ pub fn build_review_comment_v2_with_override(
         md.push('\n');
     }
 
+    let mut summary = verdict_summary(
+        validation_status,
+        security,
+        policy,
+        spec_owned,
+        secrets,
+        bundle_loaded,
+        security_override,
+    );
+    summary.push_str(&format!(
+        "Detail totals: {} Changes; {} Breaking Changes; {} Best Practice Recommendations; {} Unmanaged Resources.\n\n",
+        diffs.len(), breaking.len(), best_practices.len(), unmanaged.len(),
+    ));
+    md.insert_str(0, &summary);
     finalize_comment(md)
 }
