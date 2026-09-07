@@ -654,7 +654,7 @@ fn empty_enabled_allowlists_block_plan_and_apply_before_publication() {
             assert!(!output.status.success());
             let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
             assert!(diagnostics.contains(key), "{diagnostics}");
-            assert!(diagnostics.contains("PolicyConfig"), "{diagnostics}");
+            assert!(diagnostics.contains("no nonblank"), "{diagnostics}");
             assert!(!repo.published().exists());
             assert!(!repo.dir.path().join(".state/default.json").exists());
         }
