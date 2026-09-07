@@ -791,7 +791,7 @@ fn parse_index_segment(piece: &str) -> Option<usize> {
 /// already has an `EnvConfig` in hand) don't have to go through the process
 /// environment. `main.rs` calls the two-argument forms, whose signatures stay
 /// stable.
-fn current_gateway_mode() -> crate::error::Result<GatewayMode> {
+pub(crate) fn current_gateway_mode() -> crate::error::Result<GatewayMode> {
     Ok(crate::config::load_env_config()?.gateway_mode)
 }
 
@@ -1075,12 +1075,8 @@ pub fn resolve_secrets_with_mode_and_options(
 /// * `jwt` / `hmac_auth` — secrets must be ≥32 characters, so `len=` must be
 ///   at least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] entropy bytes.
 ///
-/// `mtls_auth.identity` is *also* not brokerable (it has to match a real
-/// certificate's CN/SAN/fingerprint), but it is left as a documented footgun
-/// rather than a hard error: unlike basicauth there is no mode in which a
-/// generated value is correct, so anyone writing `alloc=generate` there has
-/// already gone out of their way, and failing existing configs closed on
-/// upgrade would be worse than the gateway's own rejection message.
+/// Identity fields cannot be generated either. Existing bundle values still
+/// resolve without generation, including externally issued credentials.
 fn check_generation_constraints(
     components: &[SlotComponent<'_>],
     placeholder: &SecretPlaceholder,
@@ -1099,10 +1095,66 @@ fn check_generation_constraints(
         Some(SlotComponent::Literal(s)) => *s,
         _ => return Ok(()),
     };
-    let leaf = match components.last() {
-        Some(SlotComponent::Literal(s)) => *s,
-        _ => "",
-    };
+    check_generation_allowed(&slot, Some(cred_type), placeholder.length_bytes, mode)
+}
+
+/// Shared, side-effect-free generation policy for resolver and allocator.
+/// The supplied structural type must agree with the encoded slot; otherwise
+/// a caller could relabel a password hash or discovery token as an API key.
+pub fn check_generation_allowed(
+    slot: &str,
+    cred_type: Option<&str>,
+    length_bytes: usize,
+    mode: &GatewayMode,
+) -> crate::error::Result<()> {
+    let encoded_type = credential_type_from_slot(slot).ok_or_else(|| {
+        crate::error::Error::Config(format!(
+            "credential slot '{slot}' has no credential-type component; build it with secrets::slot_path"
+        ))
+    })?;
+    if cred_type.is_some_and(|t| t != encoded_type) {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': supplied credential type disagrees with the slot"
+        )));
+    }
+    let cred_type = encoded_type.as_str();
+    let path: Vec<String> = slot
+        .split('/')
+        .skip(3)
+        .map(unescape_slot_component)
+        .collect();
+    let leaf = path.last().map(String::as_str).unwrap_or_default();
+    if is_identity_credential_leaf(cred_type, Some(leaf)) {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': identity fields must be supplied literally, never generated"
+        )));
+    }
+    if cred_type == SERVICE_DISCOVERY_SLOT_KIND {
+        let field = service_discovery::SD_SECRET_FIELDS
+            .iter()
+            .find(|field| {
+                field
+                    .path
+                    .iter()
+                    .copied()
+                    .eq(path.iter().map(String::as_str))
+            })
+            .ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "secret slot '{slot}': unknown service-discovery secret; generation is refused"
+                ))
+            })?;
+        if !field.generatable {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}': the broker cannot generate {} — {}. Use \
+                 '${{gh-env-secret:alloc=require}}' and seed the slot with the real value. \
+                 If a previous rotation replaced it, reissue it at the provider and reseed; \
+                 the previous GitHub secret cannot be recovered.",
+                service_discovery::render_path(field.path),
+                field.ungeneratable_reason
+            )));
+        }
+    }
 
     if cred_type == "basicauth" {
         if leaf == "password_hash" {
@@ -1125,7 +1177,12 @@ fn check_generation_constraints(
         }
     }
 
-    check_min_entropy(&slot, cred_type, placeholder.length_bytes)?;
+    check_min_entropy(slot, cred_type, length_bytes)?;
+    if !(16..=256).contains(&length_bytes) {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': generation length must be 16..=256 entropy bytes"
+        )));
+    }
 
     Ok(())
 }
@@ -1438,16 +1495,15 @@ fn resolve_service_discovery_leaf(
     let existing = lookup_exact_slot_value(&slot, bundle)?;
     let status = classify_status(&placeholder, existing);
 
-    if !field.generatable
-        && matches!(constraints, ConstraintMode::Enforce)
+    if matches!(constraints, ConstraintMode::Enforce)
         && matches!(status, SlotStatus::NeedsAllocation)
     {
-        return Err(crate::error::Error::Config(format!(
-            "secret slot '{slot}': the broker cannot generate {} — {}. Use \
-             '${{gh-env-secret:alloc=require}}' and seed the slot with the real value.",
-            service_discovery::render_path(field.path),
-            field.ungeneratable_reason
-        )));
+        check_generation_allowed(
+            &slot,
+            Some(SERVICE_DISCOVERY_SLOT_KIND),
+            placeholder.length_bytes,
+            &GatewayMode::Api,
+        )?;
     }
 
     report
