@@ -1689,7 +1689,9 @@ fn resolver_and_allocator_share_generation_verdicts_in_both_modes() {
 #[test]
 fn rotation_accepts_only_supported_consumer_fields() {
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::allocator::{check_rotation_allowed, generate_credential_value_with_mode};
+    use gitforgeops::secrets::allocator::{
+        check_rotation_allowed, generate_credential_value_with_mode,
+    };
 
     for key in [
         "keyauth/key",
@@ -1738,7 +1740,9 @@ fn rotation_accepts_only_supported_consumer_fields() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn allocator_refusals_leave_network_and_shards_untouched() {
-    use gitforgeops::secrets::{allocate_and_deliver, rotate_and_deliver, ResolveReport, ResolveResult};
+    use gitforgeops::secrets::{
+        allocate_and_deliver, rotate_and_deliver, ResolveReport, ResolveResult,
+    };
 
     // Any attempted GitHub request, including recipient-key discovery, must
     // connect to this proxy. No production endpoint can be reached.

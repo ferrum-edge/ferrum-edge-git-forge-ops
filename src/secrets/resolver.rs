@@ -1118,11 +1118,7 @@ pub fn check_generation_allowed(
         )));
     }
     let cred_type = encoded_type.as_str();
-    let path: Vec<String> = slot
-        .split('/')
-        .skip(3)
-        .map(unescape_slot_component)
-        .collect();
+    let path: Vec<String> = slot.split('/').skip(3).map(unescape_slot_component).collect();
     let leaf = path.last().map(String::as_str).unwrap_or_default();
     if is_identity_credential_leaf(cred_type, Some(leaf)) {
         return Err(crate::error::Error::Config(format!(
@@ -1132,13 +1128,7 @@ pub fn check_generation_allowed(
     if cred_type == SERVICE_DISCOVERY_SLOT_KIND {
         let field = service_discovery::SD_SECRET_FIELDS
             .iter()
-            .find(|field| {
-                field
-                    .path
-                    .iter()
-                    .copied()
-                    .eq(path.iter().map(String::as_str))
-            })
+            .find(|field| field.path.iter().copied().eq(path.iter().map(String::as_str)))
             .ok_or_else(|| {
                 crate::error::Error::Config(format!(
                     "secret slot '{slot}': unknown service-discovery secret; generation is refused"
