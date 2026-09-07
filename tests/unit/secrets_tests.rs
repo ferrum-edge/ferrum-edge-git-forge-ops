@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use gitforgeops::config::schema::{Consumer, GatewayConfig};
 use gitforgeops::secrets::{
     bundle::{pick_shard, shard_secret_name},
-    load_bundles_from_env, parse_placeholder, resolve_secrets, PlaceholderAlloc, SlotStatus,
+    load_bundles_from_env, parse_placeholder, resolve_secrets, slot_path, PlaceholderAlloc,
+    SlotStatus,
 };
 
 const TEST_ED25519_PUBLIC_KEY: &str =
@@ -1627,17 +1628,204 @@ fn report_records_the_credential_type_structurally() {
 }
 
 #[test]
-fn explicit_credential_type_drives_the_minimum_length_rule() {
+fn explicit_credential_type_must_agree_with_the_slot() {
     use gitforgeops::secrets::generate_credential_value_typed;
 
-    // The slot string alone would say `keyauth`; the structured type wins.
+    // A forged structural type must not bypass the encoded slot's policy.
     let err = generate_credential_value_typed("ferrum/app/keyauth/key", 16, Some("jwt"))
-        .expect_err("the supplied type must decide the floor")
+        .expect_err("the supplied type must match the slot")
         .to_string();
-    assert!(err.contains("at least 32 characters"), "{err}");
+    assert!(err.contains("disagrees with the slot"), "{err}");
 
     let ok = generate_credential_value_typed("ferrum/app/jwt/secret", 24, Some("jwt")).unwrap();
     assert!(ok.chars().count() >= 32);
+}
+
+#[test]
+fn resolver_and_allocator_share_generation_verdicts_in_both_modes() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::allocator::generate_credential_value_with_mode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    for mode in [GatewayMode::Api, GatewayMode::File] {
+        for (kind, leaf, length, allowed) in [
+            ("keyauth", "key", 16, true),
+            ("jwt", "secret", 16, false),
+            ("jwt", "secret", 24, true),
+            ("hmac_auth", "secret", 23, false),
+            ("hmac_auth", "secret", 32, true),
+            ("basicauth", "password_hash", 32, false),
+            ("basicauth", "password", 32, mode == GatewayMode::Api),
+        ] {
+            for indexed in [false, true] {
+                let placeholder = format!("${{gh-env-secret:alloc=generate|len={length}}}");
+                let values = if indexed {
+                    vec![entry(leaf, "seeded-value"), entry(leaf, &placeholder)]
+                } else {
+                    vec![entry(leaf, &placeholder)]
+                };
+                let mut cfg = consumer_with(kind, serde_json::Value::Array(values));
+                let suffix = if indexed { "[1]/" } else { "" };
+                let slot = format!("ferrum/app/{kind}/{suffix}{leaf}");
+                let resolved = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), mode.clone());
+                let generated = generate_credential_value_with_mode(&slot, length, None, &mode);
+                assert_eq!(resolved.is_ok(), allowed, "resolver: {slot} {mode:?}");
+                assert_eq!(generated.is_ok(), allowed, "allocator: {slot} {mode:?}");
+                if let Err(error) = generated {
+                    assert!(error.to_string().contains(&slot));
+                    assert!(!error.to_string().contains("seeded-value"));
+                }
+            }
+        }
+
+        let mut cfg = config_with_consul_token(Some(GENERATE));
+        assert!(resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), mode.clone()).is_err());
+        let error = generate_credential_value_with_mode(CONSUL_TOKEN_SLOT, 32, None, &mode)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Consul ACL token"), "{error}");
+        assert!(error.contains("reseed"), "{error}");
+    }
+}
+
+#[test]
+fn rotation_accepts_only_supported_consumer_fields() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::allocator::{
+        check_rotation_allowed, generate_credential_value_with_mode,
+    };
+
+    for key in [
+        "keyauth/key",
+        "jwt/secret",
+        "hmac_auth/[1]/secret",
+        "basicauth/[2]/password",
+    ] {
+        let slot = slot_path("team/alpha", "app/id", key);
+        assert!(check_rotation_allowed(&slot, 32, &GatewayMode::Api).is_ok());
+        assert!(check_rotation_allowed(&slot, 32, &GatewayMode::File).is_err());
+    }
+    for key in [
+        "@service-discovery/consul/token",
+        "@service-discovery/future/token",
+        "@plugin-config/config/api_key",
+        "basicauth/[1]/password_hash",
+        "basicauth/username",
+        "mtls_auth/identity",
+        "unknown/secret",
+        "jwt/key",
+        "keyauth/nested/key",
+    ] {
+        let slot = slot_path("ferrum", "app", key);
+        let error = check_rotation_allowed(&slot, 32, &GatewayMode::Api).unwrap_err();
+        assert!(error.to_string().contains(&slot), "{error}");
+    }
+    // Plugin allocation via apply remains supported; only Consumer rotation
+    // is restricted. A plugin needs its own publication contract to rotate.
+    assert!(generate_credential_value_with_mode(
+        "ferrum/plugin/@plugin-config/config/api_key",
+        32,
+        None,
+        &GatewayMode::Api,
+    )
+    .is_ok());
+    for slot in [
+        "ferrum/app/basicauth/password_hash",
+        "ferrum/app/@service-discovery/consul/token",
+    ] {
+        assert!(
+            generate_credential_value_with_mode(slot, 32, Some("keyauth"), &GatewayMode::Api)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn allocator_refusals_leave_network_and_shards_untouched() {
+    use gitforgeops::secrets::{
+        allocate_and_deliver, rotate_and_deliver, ResolveReport, ResolveResult,
+    };
+
+    // Any attempted GitHub request, including recipient-key discovery, must
+    // connect to this proxy. No production endpoint can be reached.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(proxy).unwrap())
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .unwrap();
+    for key in [
+        "@service-discovery/consul/token",
+        "@plugin-config/config/api_key",
+        "basicauth/[1]/password_hash",
+        "mtls_auth/identity",
+        "jwt/key",
+    ] {
+        let slot = slot_path("ferrum", "app", key);
+        let original = BTreeMap::from([(
+            0,
+            BTreeMap::from([(slot.clone(), "existing-sensitive-value".to_string())]),
+        )]);
+        let mut shards = original.clone();
+        let mut count = 1;
+        let failure = rotate_and_deliver(
+            &client,
+            "test/fixture",
+            "staging",
+            "synthetic-token",
+            Some("recipient"),
+            &slot,
+            32,
+            &mut shards,
+            &mut count,
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.to_string().contains(&slot));
+        assert!(!failure.to_string().contains("existing-sensitive-value"));
+        assert!(failure.partial.allocated.is_empty());
+        assert_eq!(shards, original);
+        assert_eq!(count, 1);
+    }
+
+    // A valid first candidate must not reach delivery before a later invalid
+    // candidate is checked. Use a hand-built report to exercise direct callers.
+    let mut report = ResolveReport::default();
+    for key in ["keyauth/key", "basicauth/password_hash"] {
+        report.results.push(ResolveResult {
+            consumer_id: "app".into(),
+            namespace: "ferrum".into(),
+            cred_key: key.into(),
+            slot: slot_path("ferrum", "app", key),
+            placeholder: parse_placeholder(GENERATE).unwrap().unwrap(),
+            status: SlotStatus::NeedsAllocation,
+        });
+    }
+    let mut shards = BTreeMap::new();
+    let mut count = 1;
+    let failure = allocate_and_deliver(
+        &client,
+        "test/fixture",
+        "staging",
+        "synthetic-token",
+        Some("recipient"),
+        &report,
+        &mut shards,
+        &mut count,
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.to_string().contains("password_hash"));
+    assert!(failure.partial.allocated.is_empty());
+    assert!(shards.is_empty());
+    assert_eq!(count, 1);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a refused allocation or rotation must make zero network requests"
+    );
 }
 
 /// A slot with no credential-type component used to parse back as `""`, which
