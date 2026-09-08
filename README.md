@@ -1397,6 +1397,8 @@ Notes:
   The ordinary single-line API key, JWT or HMAC secret has none of those properties, so the common case keeps its full diagnostics — which is the point of scrubbing rather than suppressing.
 - **Unresolved placeholders are validated through stand-ins.** A run with no credential bundle (any fork PR) would otherwise hand `${gh-env-secret:alloc=generate}` — 30 characters — to a validator that requires `jwt` and `hmac_auth` secrets to be at least 32, and hand the same string to an `ldap_auth` plugin that parses `ldap_url` as a URL. Instead the temp spec gets a deterministic, obviously fake value of the right *shape*, derived from the leaf's own broker slot, so CI grades the repository's structure rather than the placeholder literal:
 
+  For a resolved snapshot, the matching resolution report must explicitly mark the canonical slot unresolved before it can receive a stand-in. Resolved values remain byte-for-byte intact for validation, even when they resemble broker placeholders; an invalid short JWT secret or endpoint must still fail. Unreported slots are also validated unchanged. Consumer paths reuse the resolver's escaping and index-zero elision; plugin paths retain every array index. File-mode apply and the report-free validation API instead validate an unresolved publication document, where valid placeholder syntax still permits stand-ins. Modeled service-discovery fields remain outside the stand-in contract and are validated unchanged.
+
   | Brokered leaf | Stand-in |
   |---|---|
   | `basicauth` `password_hash` | `hmac_sha256:<64 hex>` |

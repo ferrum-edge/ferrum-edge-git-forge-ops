@@ -894,6 +894,275 @@ fn a_broken_sibling_field_still_fails_with_a_stand_in_url() {
     );
 }
 
+/// Capture the actual private spec before checking its shape. The capture
+/// stays inside the test's private directory and is never a diagnostic.
+#[cfg(unix)]
+fn capturing_validator(dir: &Path, checks: &str) -> std::path::PathBuf {
+    echo_validator(
+        dir,
+        "capture-validator",
+        &format!("#!/bin/sh\ncp \"$7\" \"$(dirname \"$0\")/input.yaml\" || exit 2\n{checks}"),
+    )
+}
+
+#[cfg(unix)]
+fn captured_validator_input(dir: &Path) -> gitforgeops::config::GatewayConfig {
+    serde_yaml::from_slice(&std::fs::read(dir.join("input.yaml")).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn resolved_placeholder_shaped_values_reach_shape_checks_verbatim() {
+    use gitforgeops::secrets::resolve_secrets;
+    use gitforgeops::validate::run_validation_with_report;
+    use std::collections::BTreeMap;
+
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let jwt_check = r#"
+secret=$(sed -n 's/.*secret: *//p' "$7" | tr -d '"' | tr -d "'")
+if [ "${#secret}" -lt 32 ]; then
+  cat "$7"
+  echo 'error: jwt secret must be at least 32 characters' >&2
+  cat "$7" >&2
+  exit 1
+fi
+exit 0
+"#;
+    for plugin in [false, true] {
+        // Ordinary invalid and placeholder-shaped resolved values must fail;
+        // unresolved placeholders and valid resolved values must still pass.
+        for (seed, success) in [
+            (None, true),
+            (Some(placeholder), false),
+            (Some("invalid-short-value"), false),
+            (Some("ldaps://valid.example/long-enough-for-jwt"), true),
+        ] {
+            let mut config = if plugin {
+                plugin_config_for(
+                    "ldap",
+                    "ldap_auth",
+                    serde_json::json!({"ldap_url": placeholder}),
+                )
+            } else {
+                consumer_config(serde_json::json!({"jwt": [{"secret": placeholder}]}))
+            };
+            let slot = if plugin {
+                "ferrum/ldap/@plugin-config/config/ldap_url"
+            } else {
+                "ferrum/app/jwt/secret"
+            };
+            let bundle: BTreeMap<String, String> = seed
+                .map(|value| (slot.to_string(), value.to_string()))
+                .into_iter()
+                .collect();
+            let report = resolve_secrets(&mut config, &bundle).unwrap();
+            let before = serde_yaml::to_string(&config).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let validator = capturing_validator(
+                dir.path(),
+                if plugin {
+                    LDAP_URL_VALIDATOR
+                } else {
+                    jwt_check
+                },
+            );
+            let result =
+                run_validation_with_report(&config, validator.to_str().unwrap(), &report).unwrap();
+            assert_eq!(result.success, success);
+            assert_eq!(result.exit_code, i32::from(!success));
+            let captured = captured_validator_input(dir.path());
+            let actual = if plugin {
+                captured.plugin_configs[0].config["ldap_url"].as_str().unwrap()
+            } else {
+                captured.consumers[0].credentials["jwt"][0]["secret"]
+                    .as_str()
+                    .unwrap()
+            };
+            if let Some(value) = seed {
+                assert_eq!(actual, value);
+                assert!(!result.stdout.contains(value));
+                assert!(!result.stderr.contains(value));
+            } else {
+                assert!(actual.contains("gitforgeops-validation-standin"));
+            }
+            assert_eq!(serde_yaml::to_string(&config).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
+    use gitforgeops::secrets::resolve_secrets;
+    use gitforgeops::validate::{run_validation_with_report, validation_standin};
+    use std::collections::BTreeMap;
+
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let mut config = consumer_config(serde_json::json!({
+        "keyauth": [
+            {"a/b~[1]": [placeholder, placeholder]},
+            {"a/b~[1]": [placeholder, placeholder]}
+        ]
+    }));
+    config.consumers[0].namespace = "n/s~[".to_string();
+    config.consumers[0].id = "a/p~[".to_string();
+    let mut plugin = plugin_config_for(
+        "p/l~[",
+        "custom_fixture",
+        serde_json::json!({"a/b~[1]": [placeholder, placeholder]}),
+    );
+    plugin.plugin_configs[0].namespace = "n/s~[".to_string();
+    config.plugin_configs = plugin.plugin_configs;
+    config.upstreams.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "discovery", "namespace": "ferrum", "targets": [],
+            "service_discovery": {"provider": "consul", "consul": {
+                "address": "https://consul.example", "service_name": "orders", "token": placeholder
+            }}
+        }))
+        .unwrap(),
+    );
+    let resolved_slots = [
+        "n~1s~0~2/a~1p~0~2/keyauth/a~1b~0~21]",
+        "n~1s~0~2/a~1p~0~2/keyauth/[1]/a~1b~0~21]/[1]",
+        "n~1s~0~2/p~1l~0~2/@plugin-config/config/a~1b~0~21]/[0]",
+        "ferrum/discovery/@service-discovery/consul/token",
+    ];
+    for seeded in [false, true] {
+        let mut snapshot = config.clone();
+        let bundle: BTreeMap<String, String> = resolved_slots
+            .iter()
+            .filter(|_| seeded)
+            .map(|slot| (slot.to_string(), placeholder.to_string()))
+            .collect();
+        let report = resolve_secrets(&mut snapshot, &bundle).unwrap();
+        assert_eq!(report.results.len(), 7);
+        for slot in resolved_slots {
+            assert!(report.results.iter().any(|result| result.slot == slot));
+        }
+        let before = serde_yaml::to_string(&snapshot).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), "exit 0\n");
+        let result =
+            run_validation_with_report(&snapshot, validator.to_str().unwrap(), &report).unwrap();
+        assert!(result.success);
+        let captured = captured_validator_input(dir.path());
+        let credentials = &captured.consumers[0].credentials["keyauth"];
+        for (entry, index, slot) in [
+            (0, 0, resolved_slots[0]),
+            (0, 1, "n~1s~0~2/a~1p~0~2/keyauth/a~1b~0~21]/[1]"),
+            (1, 0, "n~1s~0~2/a~1p~0~2/keyauth/[1]/a~1b~0~21]"),
+            (1, 1, resolved_slots[1]),
+        ] {
+            let expected = if seeded && resolved_slots.contains(&slot) {
+                placeholder.to_string()
+            } else {
+                validation_standin(slot, Some("a/b~[1]"))
+            };
+            assert_eq!(credentials[entry]["a/b~[1]"][index], expected);
+        }
+        for (index, slot) in [
+            resolved_slots[2],
+            "n~1s~0~2/p~1l~0~2/@plugin-config/config/a~1b~0~21]/[1]",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let expected = if seeded && index == 0 {
+                placeholder.to_string()
+            } else {
+                validation_standin(slot, None)
+            };
+            assert_eq!(captured.plugin_configs[0].config["a/b~[1]"][index], expected);
+        }
+        // Discovery has no stand-in contract: both resolved and unresolved
+        // modeled fields must survive the validator hand-off verbatim.
+        assert_eq!(
+            serde_yaml::to_string(&captured.upstreams).unwrap(),
+            serde_yaml::to_string(&snapshot.upstreams).unwrap()
+        );
+        assert_eq!(serde_yaml::to_string(&snapshot).unwrap(), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn validator_report_never_grants_standins_to_unreported_or_conflicting_slots() {
+    use gitforgeops::secrets::{resolve_secrets, ResolveReport, SlotStatus};
+    use gitforgeops::validate::run_validation_with_report;
+
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let mut config = consumer_config(serde_json::json!({"jwt": [{"secret": placeholder}]}));
+    config.plugin_configs = plugin_config_for(
+        "ldap",
+        "ldap_auth",
+        serde_json::json!({"ldap_url": placeholder}),
+    )
+    .plugin_configs;
+    let report = resolve_secrets(&mut config, &Default::default()).unwrap();
+    let mut wrong_slot = report.clone();
+    wrong_slot.results[0].slot = "ferrum/app/jwt/[0]/secret".to_string();
+    wrong_slot.results[1].slot = "ferrum/ldap/@plugin-config/config/ldap_url/[0]".to_string();
+    let mut conflicting = report.clone();
+    for mut resolved in report.results {
+        resolved.status = SlotStatus::Resolved;
+        conflicting.results.push(resolved);
+    }
+    for report in [ResolveReport::default(), wrong_slot, conflicting] {
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), "exit 1\n");
+        let result =
+            run_validation_with_report(&config, validator.to_str().unwrap(), &report).unwrap();
+        assert!(!result.success);
+        let captured = captured_validator_input(dir.path());
+        assert_eq!(
+            captured.consumers[0].credentials["jwt"][0]["secret"],
+            placeholder
+        );
+        assert_eq!(captured.plugin_configs[0].config["ldap_url"], placeholder);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unresolved_reports_and_report_free_documents_keep_standins_for_every_alloc_mode() {
+    use gitforgeops::secrets::resolve_secrets;
+    use gitforgeops::validate::{run_validation_with_report, validation_standin};
+
+    for alloc in ["require", "generate", "rotate"] {
+        let placeholder = format!("${{gh-env-secret:alloc={alloc}}}");
+        // Bare objects and canonical index-zero arrays identify the same slot.
+        for credential in [
+            serde_json::json!({"secret": placeholder}),
+            serde_json::json!([{"secret": placeholder}]),
+        ] {
+            let mut config = consumer_config(serde_json::json!({"jwt": credential}));
+            let report = resolve_secrets(&mut config, &Default::default()).unwrap();
+            let before = serde_yaml::to_string(&config).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let validator = capturing_validator(dir.path(), "exit 0\n");
+            for with_report in [false, true] {
+                let binary = validator.to_str().unwrap();
+                let result = if with_report {
+                    run_validation_with_report(&config, binary, &report)
+                } else {
+                    run_validation(&config, binary)
+                }
+                .unwrap();
+                assert!(result.success);
+                let captured = captured_validator_input(dir.path());
+                let jwt = &captured.consumers[0].credentials["jwt"];
+                let entry = if jwt.is_array() { &jwt[0] } else { jwt };
+                assert_eq!(
+                    entry["secret"],
+                    validation_standin("ferrum/app/jwt/secret", Some("secret"))
+                );
+                assert_eq!(serde_yaml::to_string(&config).unwrap(), before);
+            }
+        }
+    }
+}
+
 /// Shape selection, without a subprocess: endpoint-typed leaves become URLs
 /// with the scheme their plugin requires, token-typed leaves keep the opaque
 /// 64-hex form, and a header map keeps its keys.

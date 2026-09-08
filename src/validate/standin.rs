@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::config::GatewayConfig;
 use crate::secrets::parse_placeholder;
 use crate::secrets::plugin_config::ConfigPathComponent;
+use crate::secrets::resolver::{consumer_credential_slot, ResolveReport, SlotStatus};
 
 /// Fixed marker every opaque stand-in starts with. It is deliberately
 /// unmistakable: a value carrying this prefix anywhere but a validator temp
@@ -101,7 +102,8 @@ pub fn validation_url_standin(slot: &str, scheme: &str) -> String {
 /// overwhelmingly common bundle-loaded case, which then validates the config
 /// as-is with no clone).
 ///
-/// Two sources, matching the two the resolver walks:
+/// Two sources covered by the stand-in contract (modeled service-discovery
+/// fields remain byte-for-byte unchanged):
 ///
 /// * **`Consumer.credentials`** — shape-checked by ferrum-edge (the
 ///   32-character `jwt`/`hmac_auth` floor, the `hmac_sha256:<64 hex>`
@@ -119,7 +121,39 @@ pub fn validation_url_standin(slot: &str, scheme: &str) -> String {
 /// Nothing outside the 0600 temp spec handed to `ferrum-edge validate` ever
 /// sees the result: the caller's `config` is untouched, and export, apply,
 /// delivery and state all serialize that original.
+/// This report-free API assumes an unresolved publication document. Resolved
+/// snapshots must use [`crate::validate::run_validation_with_report`] so actual
+/// values with placeholder syntax remain subject to validation.
 pub fn with_validation_standins(config: &GatewayConfig) -> Option<GatewayConfig> {
+    with_validation_standins_for_report(config, None)
+}
+
+/// A report must describe the supplied resolved snapshot. Only explicitly
+/// unresolved canonical slots are eligible; resolved or unreported values
+/// reach the validator unchanged, even when their bytes look like placeholders.
+/// Without a report, `config` is an unresolved publication document and valid
+/// placeholder syntax remains sufficient (including file-mode apply).
+pub(crate) fn with_validation_standins_for_report(
+    config: &GatewayConfig,
+    report: Option<&ResolveReport>,
+) -> Option<GatewayConfig> {
+    let unresolved = report.map(|report| {
+        let mut slots = std::collections::HashMap::new();
+        for result in &report.results {
+            // A contradictory duplicate cannot grant stand-in eligibility.
+            let eligible = result.status != SlotStatus::Resolved;
+            slots
+                .entry(result.slot.as_str())
+                .and_modify(|allowed| *allowed &= eligible)
+                .or_insert(eligible);
+        }
+        slots
+    });
+    let eligible = |slot: &str| {
+        unresolved
+            .as_ref()
+            .is_none_or(|slots| slots.get(slot) == Some(&true))
+    };
     let credentials_brokered = config
         .consumers
         .iter()
@@ -133,16 +167,16 @@ pub fn with_validation_standins(config: &GatewayConfig) -> Option<GatewayConfig>
     }
 
     let mut patched = config.clone();
+    let mut changed = false;
     for consumer in &mut patched.consumers {
         let namespace = consumer.namespace.clone();
         let consumer_id = consumer.id.clone();
         for (credential_type, value) in consumer.credentials.iter_mut() {
-            let mut path = vec![
-                namespace.clone(),
-                consumer_id.clone(),
-                credential_type.clone(),
-            ];
-            substitute_leaves(value, &mut path, None);
+            changed |= substitute_leaves(value, &mut Vec::new(), None, &|path| {
+                let slot =
+                    consumer_credential_slot(&namespace, &consumer_id, credential_type, path);
+                eligible(&slot).then_some(slot)
+            });
         }
     }
 
@@ -157,17 +191,18 @@ pub fn with_validation_standins(config: &GatewayConfig) -> Option<GatewayConfig>
         let plugin_id = plugin.id.clone();
         let plugin_name = plugin.plugin_name.clone();
         let mut path = Vec::new();
-        substitute_plugin_leaves(
+        changed |= substitute_plugin_leaves(
             &mut plugin.config,
             &namespace,
             &plugin_id,
             &plugin_name,
             &endpoints,
             &mut path,
+            &eligible,
         );
     }
 
-    Some(patched)
+    changed.then_some(patched)
 }
 
 fn substitute_plugin_leaves(
@@ -177,15 +212,20 @@ fn substitute_plugin_leaves(
     plugin_name: &str,
     endpoints: &std::collections::BTreeSet<Vec<ConfigPathComponent>>,
     path: &mut Vec<ConfigPathComponent>,
-) {
+    eligible: &impl Fn(&str) -> bool,
+) -> bool {
+    let mut changed = false;
     match value {
         serde_json::Value::String(text) => {
             if !matches!(parse_placeholder(text), Some(Ok(_))) {
-                return;
+                return false;
             }
             // The canonical broker slot, so a stand-in is distinct per leaf
             // and stable across runs for the same repository.
             let slot = crate::secrets::resolver::plugin_config_slot(namespace, plugin_id, path);
+            if !eligible(&slot) {
+                return false;
+            }
             *text = if endpoints.contains(path) {
                 validation_url_standin(
                     &slot,
@@ -194,23 +234,29 @@ fn substitute_plugin_leaves(
             } else {
                 validation_standin(&slot, None)
             };
+            changed = true;
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 path.push(ConfigPathComponent::Key(key.clone()));
-                substitute_plugin_leaves(child, namespace, plugin_id, plugin_name, endpoints, path);
+                changed |= substitute_plugin_leaves(
+                    child, namespace, plugin_id, plugin_name, endpoints, path, eligible,
+                );
                 path.pop();
             }
         }
         serde_json::Value::Array(items) => {
             for (index, child) in items.iter_mut().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
-                substitute_plugin_leaves(child, namespace, plugin_id, plugin_name, endpoints, path);
+                changed |= substitute_plugin_leaves(
+                    child, namespace, plugin_id, plugin_name, endpoints, path, eligible,
+                );
                 path.pop();
             }
         }
         _ => {}
     }
+    changed
 }
 
 fn has_placeholder(value: &serde_json::Value) -> bool {
@@ -222,31 +268,41 @@ fn has_placeholder(value: &serde_json::Value) -> bool {
     }
 }
 
-fn substitute_leaves(value: &mut serde_json::Value, path: &mut Vec<String>, leaf: Option<&str>) {
+fn substitute_leaves(
+    value: &mut serde_json::Value,
+    path: &mut Vec<ConfigPathComponent>,
+    leaf: Option<&str>,
+    eligible_slot: &impl Fn(&[ConfigPathComponent]) -> Option<String>,
+) -> bool {
+    let mut changed = false;
     match value {
         serde_json::Value::String(text) => {
             if matches!(parse_placeholder(text), Some(Ok(_))) {
-                *text = validation_standin(&path.join("/"), leaf);
+                if let Some(slot) = eligible_slot(path) {
+                    *text = validation_standin(&slot, leaf);
+                    changed = true;
+                }
             }
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
-                path.push(key.clone());
+                path.push(ConfigPathComponent::Key(key.clone()));
                 let leaf = key.clone();
-                substitute_leaves(child, path, Some(&leaf));
+                changed |= substitute_leaves(child, path, Some(&leaf), eligible_slot);
                 path.pop();
             }
         }
         serde_json::Value::Array(items) => {
             for (index, child) in items.iter_mut().enumerate() {
-                path.push(format!("[{index}]"));
+                path.push(ConfigPathComponent::Index(index));
                 // An index does not change which field the leaf is, so the
                 // enclosing object key carries through.
                 let inherited = leaf.map(str::to_string);
-                substitute_leaves(child, path, inherited.as_deref());
+                changed |= substitute_leaves(child, path, inherited.as_deref(), eligible_slot);
                 path.pop();
             }
         }
         _ => {}
     }
+    changed
 }

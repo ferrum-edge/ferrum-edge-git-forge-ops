@@ -128,7 +128,13 @@ pipeline, both because resolution has already run by then:
   is 30 characters and ferrum-edge's floor for `jwt`/`hmac_auth` is 32, so a
   bundle-less fork PR would otherwise fail on the placeholder rather than on
   the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
-  no other output path ever sees a stand-in.
+  no other output path ever sees a stand-in. Resolved snapshots use the
+  corresponding `ResolveReport`: only explicitly unresolved canonical consumer
+  and plugin slots may receive stand-ins. Resolved or unreported values stay
+  byte-for-byte intact, even if they have placeholder syntax. Consumer paths
+  share the resolver's escaping and index-zero elision. The report-free API
+  and file apply retain syntax-based stand-ins for unresolved publication
+  documents; modeled service-discovery fields remain unchanged.
 - `secrets::SecretScrubber` collects every non-placeholder Consumer credential
   leaf (minus literal identity fields), every `sensitive_string_paths`
   plugin-config leaf and modeled service-discovery secret, plus values at all

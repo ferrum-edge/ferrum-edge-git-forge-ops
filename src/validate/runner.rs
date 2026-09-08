@@ -172,27 +172,30 @@ pub fn run_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config(config);
-    run_gateway_validation(config, binary_path, &scrubber)
+    run_gateway_validation(config, binary_path, &scrubber, None)
 }
 
 /// Validate a resolved snapshot using both literal-secret classification and
-/// the corresponding resolver report as redaction provenance.
+/// the corresponding resolver report as redaction and stand-in provenance.
+/// Resolved and unreported slots are validated verbatim, even if their actual
+/// values have placeholder syntax. Only reported unresolved slots get fakes.
 pub fn run_validation_with_report(
     config: &GatewayConfig,
     binary_path: &str,
     report: &crate::secrets::ResolveReport,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config_with_report(config, report);
-    run_gateway_validation(config, binary_path, &scrubber)
+    run_gateway_validation(config, binary_path, &scrubber, Some(report))
 }
 
 fn run_gateway_validation(
     config: &GatewayConfig,
     binary_path: &str,
     scrubber: &SecretScrubber,
+    report: Option<&crate::secrets::ResolveReport>,
 ) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
-    let standins = crate::validate::standin::with_validation_standins(config);
+    let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
     let yaml = serde_yaml::to_string(standins.as_ref().unwrap_or(config))?;
     run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, scrubber)
 }

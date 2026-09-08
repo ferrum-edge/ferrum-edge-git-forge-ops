@@ -57,9 +57,21 @@ not collect unused bundle entries or redact an unrelated literal identity just
 because of its field name. A value that itself resembles a placeholder is still
 protected when its slot resolved. The report stores metadata, not secret values.
 
+The same report controls validator stand-ins: only explicitly unresolved
+canonical consumer and plugin slots may be substituted. A resolved value that
+looks like a placeholder reaches the validator byte-for-byte, so an invalid
+short JWT secret or endpoint still fails validation without leaking through
+diagnostics. Unreported slots also remain unchanged. The report-free API and
+file apply retain syntax-based stand-ins for the unresolved publication
+document; a read-only allocation report is not substitution provenance for
+that document. Modeled service-discovery values remain unchanged in validator
+input, as before.
+
 Regression coverage includes whole-input preservation in strict and lenient
 resolution, literal identity audit/import controls, canonical provenance slots,
 and CLI runs with synthetic bundles and a validator that quotes its input.
 CLI refusal tests trap gateway/GitHub traffic on loopback and check that input,
 bundle and existing output files survive and no validator, state lock or export
-is created. These tests run in GitHub-hosted Rust CI.
+is created. Validator-input captures additionally cover resolved placeholder
+values, unresolved stand-ins, escaped/indexed slots, incomplete reports,
+unchanged inputs and file publication. These tests run in GitHub-hosted Rust CI.

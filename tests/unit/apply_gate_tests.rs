@@ -508,6 +508,65 @@ fn plan_exits_nonzero_on_a_literal_consumer_credential() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn file_apply_standins_validate_the_publication_document_not_the_resolved_report() {
+    let consumer = "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    jwt:\n      - secret: '${gh-env-secret:alloc=require}'\n";
+    let plugin = "kind: PluginConfig\nspec:\n  id: ldap\n  plugin_name: ldap_auth\n  scope: global\n  config:\n    ldap_url: '${gh-env-secret:alloc=require}'\n";
+    let bundle = r#"{"FERRUM_CREDS_BUNDLE": {
+        "ferrum/app/jwt/secret": "${gh-env-secret:alloc=require}",
+        "ferrum/ldap/@plugin-config/config/ldap_url": "${gh-env-secret:alloc=require}"
+    }}"#;
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/consumers/app.yaml", consumer),
+        ("resources/ferrum/plugins/ldap.yaml", plugin),
+    ]);
+    std::fs::write(
+        &repo.validator,
+        r#"#!/bin/sh
+cp "$7" validator-input.yaml || exit 2
+secret=$(sed -n 's/.*secret: *//p' "$7" | tr -d '"' | tr -d "'")
+url=$(sed -n 's/.*ldap_url: *//p' "$7" | tr -d '"' | tr -d "'")
+if [ "${#secret}" -lt 32 ]; then
+  echo 'error: jwt secret too short' >&2
+  exit 1
+fi
+case "$url" in
+  ldaps://?*) exit 0 ;;
+  *) echo 'error: ldap_url invalid' >&2; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    // Validate uses the resolved snapshot even in file mode, so the actual
+    // placeholder-shaped bundle value must fail the validator's shape check.
+    let validation = repo.run(&["validate"], &[("FERRUM_CREDS_JSON", bundle)]);
+    assert!(!validation.status.success());
+    assert!(stdout(&validation).contains("jwt secret too short"));
+    let captured = std::fs::read_to_string(repo.dir.path().join("validator-input.yaml")).unwrap();
+    assert!(captured.contains("${gh-env-secret:alloc=require}"));
+    assert!(!captured.contains("gitforgeops-validation-standin"));
+    assert!(!repo.published().exists());
+
+    let apply = repo.run(&["apply", "--auto-approve"], &[("FERRUM_CREDS_JSON", bundle)]);
+    assert!(apply.status.success(), "{}{}", stdout(&apply), stderr(&apply));
+    let captured = std::fs::read_to_string(repo.dir.path().join("validator-input.yaml")).unwrap();
+    assert!(captured.contains("secret: gitforgeops-validation-standin-"));
+    assert!(captured.contains("ldap_url: ldaps://gitforgeops-validation-standin.invalid/"));
+    assert!(!captured.contains("${gh-env-secret:"));
+    let published = std::fs::read_to_string(repo.published()).unwrap();
+    assert!(published.contains("${gh-env-secret:alloc=require}"));
+    assert!(!published.contains("gitforgeops-validation-standin"));
+    assert_eq!(
+        std::fs::read_to_string(repo.dir.path().join("resources/ferrum/consumers/app.yaml")).unwrap(),
+        consumer
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.dir.path().join("resources/ferrum/plugins/ldap.yaml")).unwrap(),
+        plugin
+    );
+}
+
 #[test]
 fn placeholder_lookalikes_are_refused_before_file_or_api_publication() {
     for value in [
