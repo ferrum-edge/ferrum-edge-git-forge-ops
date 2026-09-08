@@ -649,8 +649,8 @@ fn make_proxy(id: &str) -> Resource {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         },
     }
 }
@@ -666,8 +666,8 @@ fn make_consumer(id: &str) -> Resource {
             custom_id: None,
             credentials: Default::default(),
             acl_groups: vec![],
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         },
     }
 }
@@ -701,8 +701,8 @@ fn make_upstream(id: &str) -> Resource {
             backend_tls_sni: None,
             backend_tls_san_allow_list: vec![],
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         },
     }
 }
@@ -732,8 +732,8 @@ fn consumer_config_with_credentials(
         custom_id: None,
         credentials: map,
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     cfg
 }

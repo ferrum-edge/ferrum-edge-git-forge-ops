@@ -449,7 +449,10 @@ jobs:
             "assembled/${{ matrix.environment }}.yaml" \
             "assembled/${{ matrix.environment }}-mesh.yaml"; do
             # The assembled docs exist only in file mode, and the mesh doc only
-            # when the repo declares MeshConfig fragments — absence is normal.
+            # once the repo has declared MeshConfig fragments — absence is
+            # normal. Removing the last fragment retracts the mesh doc in place
+            # (rewritten as `mesh: {}`, never deleted), so this stages the
+            # retraction as an ordinary modification.
             [ -f "$path" ] || continue
             git add "$path"
           done
