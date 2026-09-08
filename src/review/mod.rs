@@ -67,6 +67,7 @@ pub fn redact_comparison_error(error: &crate::error::Error) -> String {
         }
         Error::GatewayReadOnly(_) => "the gateway admin API is read-only",
         Error::StaleGatewayView(_) => "the gateway served a stale view of live state",
+        Error::BackupNamespace(_) => "the backup contained missing or foreign resource namespaces",
         Error::CommittedNotLive { .. } => "a gateway write is committed but not yet live",
         Error::Config(_) => "the gateway client configuration was rejected",
         _ => "the live comparison could not be completed",

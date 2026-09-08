@@ -542,14 +542,24 @@ async fn allocate_if_needed(
         return Ok(None);
     }
 
+    if let Some(blocker) = verdict::credential_provisioning_blockers(
+        report,
+        env_config.github_provisioner_token.is_some(),
+        env_config.github_repository.is_some(),
+    )
+    .first()
+    {
+        return Err(blocker.kind.remedy().into());
+    }
+
     let token = env_config
         .github_provisioner_token
         .as_deref()
-        .ok_or("FERRUM_GH_PROVISIONER_TOKEN not set; cannot allocate credential slots")?;
+        .ok_or(verdict::BlockerKind::ProvisionerToken.remedy())?;
     let repo = env_config
         .github_repository
         .as_deref()
-        .ok_or("GITHUB_REPOSITORY not set; cannot write to GitHub Environment Secrets")?;
+        .ok_or(verdict::BlockerKind::ProvisioningRepository.remedy())?;
 
     let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
 
@@ -655,6 +665,36 @@ fn adoption_handled_keys(
         .map(|d| diff::resource_diff::state_key(&d.namespace, &d.kind, &d.id))
         .chain(state.pending_creates.iter().cloned())
         .collect()
+}
+
+/// Compute ownership work from the unmasked snapshot. Masking unresolved secrets
+/// is appropriate for drift display, but cannot establish equality for adoption.
+fn ownership_preview(
+    pairs: &[NamespaceSnapshot],
+    state: &StateFile,
+    strategy: &config::ApplyStrategy,
+) -> (Vec<diff::ResourceDiff>, Vec<apply::AdoptionCandidate>) {
+    if !matches!(strategy, config::ApplyStrategy::Incremental) {
+        return (Vec::new(), Vec::new());
+    }
+    let mut pending = Vec::new();
+    for pair in pairs {
+        pending.extend(apply::pending_create_assertion_diffs(
+            &pair.desired,
+            &pair.actual,
+            &state.pending_creates,
+            &pair.namespace,
+        ));
+    }
+    let (mut diffs, _, _, _) = compute_namespace_diffs(pairs, None, diff::DiffOptions::default());
+    diffs.extend(pending.iter().cloned());
+    let handled = adoption_handled_keys(&diffs, state);
+    let ledger = ledger_keys(state);
+    let adoptions = pairs
+        .iter()
+        .flat_map(|pair| apply::adoption_candidates(&pair.desired, &pair.actual, &ledger, &handled))
+        .collect();
+    (pending, adoptions)
 }
 
 fn cached_namespace_names(namespace_pairs: &[NamespaceSnapshot]) -> Vec<String> {
@@ -1251,6 +1291,7 @@ async fn cmd_plan(
         println!();
     }
 
+    let mut adoptions = Vec::new();
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
@@ -1261,6 +1302,9 @@ async fn cmd_plan(
             Ok(mut namespace_pairs) => {
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
+                    let (pending, candidates) =
+                        ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy);
+                    adoptions = candidates;
                     for pair in &mut namespace_pairs {
                         diff::mask_indeterminate_secret_values(
                             &desired,
@@ -1268,11 +1312,12 @@ async fn cmd_plan(
                             &secret_report,
                         );
                     }
-                    let (d, b, u, s) = compute_namespace_diffs(
+                    let (mut d, b, u, s) = compute_namespace_diffs(
                         &namespace_pairs,
                         managed.as_ref(),
                         diff::DiffOptions::default(),
                     );
+                    d.extend(pending);
                     (d, b, u, s, true, None)
                 } else {
                     (
@@ -1288,6 +1333,7 @@ async fn cmd_plan(
                     )
                 }
             }
+            Err(e @ gitforgeops::error::Error::BackupNamespace(_)) => return Err(e.into()),
             Err(e) => {
                 eprintln!("Could not fetch live config: {}", e);
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
@@ -1307,7 +1353,7 @@ async fn cmd_plan(
     println!("=== Changes ===");
     if !actual_available {
         println!("SKIPPED (no live config available)\n");
-    } else if diffs.is_empty() {
+    } else if diffs.is_empty() && adoptions.is_empty() {
         println!("None (in sync)\n");
     } else {
         for d in &diffs {
@@ -1317,6 +1363,17 @@ async fn cmd_plan(
                 diff::DiffAction::Delete => "DELETE",
             };
             println!("  {} {} {}", action, d.kind, d.id);
+        }
+        println!();
+    }
+
+    if !adoptions.is_empty() {
+        println!("{}", apply::ADOPTION_PREVIEW_NOTICE);
+        for candidate in &adoptions {
+            println!(
+                "  ADOPT {} {} ({})",
+                candidate.kind, candidate.id, candidate.namespace
+            );
         }
         println!();
     }
@@ -1469,6 +1526,8 @@ async fn cmd_plan(
         policy_findings: &policy_findings,
         secret_report: &secret_report,
         allow_credential_slot_remap,
+        provisioner_token_present: env_config.github_provisioner_token.is_some(),
+        github_repository_present: env_config.github_repository.is_some(),
     });
     let offline_summary = verdict::blocker_summary(&blockers);
     let conflict_namespaces: std::collections::BTreeSet<&str> = spec_owned
@@ -1780,34 +1839,10 @@ async fn cmd_apply(
                 }
                 let (mut diffs, _, unmanaged, spec_owned) =
                     compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
-                for pair in &namespace_pairs {
-                    diffs.extend(apply::pending_create_assertion_diffs(
-                        &pair.desired,
-                        &pair.actual,
-                        &state.pending_creates,
-                        &pair.namespace,
-                    ));
-                }
+                let (pending, adoptions) =
+                    ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy);
+                diffs.extend(pending);
                 let diffs = apply::order_diffs(diffs);
-
-                // Rows that already match live but were never claimed. They
-                // are not gateway changes, but the apply below does write to
-                // the ledger (and, in shared mode, issues an idempotent PUT),
-                // so a preview that called this "no changes" would understate
-                // the run.
-                let handled = adoption_handled_keys(&diffs, &state);
-                let managed_ledger = ledger_keys(&state);
-                let adoptions: Vec<apply::AdoptionCandidate> = namespace_pairs
-                    .iter()
-                    .flat_map(|pair| {
-                        apply::adoption_candidates(
-                            &pair.desired,
-                            &pair.actual,
-                            &managed_ledger,
-                            &handled,
-                        )
-                    })
-                    .collect();
 
                 if diffs.is_empty()
                     && unmanaged.is_empty()
@@ -1840,6 +1875,7 @@ async fn cmd_apply(
                         "\n{} already-matching resource(s) would be adopted into the ownership ledger:",
                         adoptions.len()
                     );
+                    println!("{}", apply::ADOPTION_PREVIEW_NOTICE);
                     for candidate in &adoptions {
                         println!("  ADOPT {} {}", candidate.kind, candidate.id);
                     }
@@ -2415,6 +2451,7 @@ async fn cmd_review(
         &secret_report,
     );
 
+    let mut adoptions = Vec::new();
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
@@ -2451,6 +2488,12 @@ async fn cmd_review(
                         None => {
                             // Bundle presence says nothing about whether a
                             // particular leaf resolved. Use resolution provenance.
+                            let (pending, candidates) = ownership_preview(
+                                &namespace_pairs,
+                                &state,
+                                &resolved.apply_strategy,
+                            );
+                            adoptions = candidates;
                             for pair in &mut namespace_pairs {
                                 diff::mask_indeterminate_secret_values(
                                     &desired,
@@ -2458,11 +2501,12 @@ async fn cmd_review(
                                     &secret_report,
                                 );
                             }
-                            let (d, b, u, s) = compute_namespace_diffs(
+                            let (mut d, b, u, s) = compute_namespace_diffs(
                                 &namespace_pairs,
                                 managed.as_ref(),
                                 diff::DiffOptions::default(),
                             );
+                            d.extend(pending);
                             (d, b, u, s, None)
                         }
                     }
@@ -2531,7 +2575,13 @@ async fn cmd_review(
         &format!("{:?}", resolved.apply_strategy),
     );
 
-    let comment = review::build_review_comment_v2_with_override(
+    let provisioning_blockers = verdict::credential_provisioning_blockers(
+        &secret_report,
+        env_config.github_provisioner_token.is_some(),
+        env_config.github_repository.is_some(),
+    );
+
+    let comment = review::pr_comment::build_review_comment_with_preview(
         validation_status,
         &validation_output,
         &diffs,
@@ -2550,6 +2600,8 @@ async fn cmd_review(
         &secret_report,
         bundle_loaded,
         override_decision.as_ref(),
+        &adoptions,
+        &provisioning_blockers,
     );
 
     let mut comment_delivery_error = None;
@@ -2594,7 +2646,9 @@ async fn cmd_review(
     review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
 
-    let _ = !secret_report.results.is_empty();
+    if let Some(summary) = verdict::blocker_summary(&provisioning_blockers) {
+        return Err(summary.into());
+    }
     if let Some(error) = validation_execution_error {
         return Err(format!("validator execution failed during review: {error}").into());
     }

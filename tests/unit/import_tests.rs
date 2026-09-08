@@ -1538,7 +1538,7 @@ async fn api_import_rejects_cross_namespace_resources_before_writing() {
     .await
     .unwrap_err()
     .to_string();
-    assert!(error.contains("cross-namespace import"), "{error}");
+    assert!(error.contains("refusing the snapshot"), "{error}");
     assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
 }
 

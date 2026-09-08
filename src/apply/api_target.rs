@@ -1230,6 +1230,13 @@ async fn apply_incremental(
     // do not prevent other deletes from being attempted.
     let mut writes_failed = false;
     for diff in &diffs {
+        if diff.namespace != namespace {
+            return Err(crate::error::Error::BackupNamespace(format!(
+                "diff namespace {:?} does not match apply namespace {namespace:?}",
+                diff.namespace
+            )));
+        }
+        let namespace = diff.namespace.as_str();
         if writes_failed && matches!(diff.action, DiffAction::Delete) {
             result.deletes_deferred += 1;
             eprintln!(

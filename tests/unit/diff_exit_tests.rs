@@ -400,8 +400,12 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                     assert_eq!(output.status.code(), Some(expected_code), "{context}");
                     let in_sync = if args[0] == "diff" {
                         out.contains("No differences found")
+                    } else if args[0] == "plan" {
+                        !["  ADD ", "  MODIFY ", "  DELETE "]
+                            .iter()
+                            .any(|action| out.contains(action))
                     } else {
-                        out.contains("None (in sync)")
+                        !out.contains("| Action | Kind | ID | Details |")
                     };
                     assert_eq!(in_sync, change == "none", "{context}");
                     assert_eq!(
@@ -581,8 +585,12 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
                         assert_eq!(output.status.code(), Some(expected_code), "{context}");
                         let in_sync = if args[0] == "diff" {
                             out.contains("No differences found")
+                        } else if args[0] == "plan" {
+                            !["  ADD ", "  MODIFY ", "  DELETE "]
+                                .iter()
+                                .any(|action| out.contains(action))
                         } else {
-                            out.contains("None (in sync)")
+                            !out.contains("| Action | Kind | ID | Details |")
                         };
                         assert_eq!(in_sync, !different, "{context}");
                         assert_eq!(
@@ -942,5 +950,145 @@ fn plan_fails_only_for_conflicting_live_spec_ownership() {
                 "{out}"
             );
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_backup_namespaces_refuse_diff_plan_and_apply_without_mutations() {
+    for requested in ["ferrum", "team-b"] {
+        for namespace in [None, Some("foreign")] {
+            let mut row = live_proxy("app", requested, 8080, None);
+            match namespace {
+                Some(value) => row["namespace"] = value.into(),
+                None => {
+                    row.as_object_mut().unwrap().remove("namespace");
+                }
+            }
+            let path = format!("resources/{requested}/proxies/app.yaml");
+            let repo = Repo::new(
+                &[(&path, FERRUM_PROXY)],
+                vec![(requested.into(), backup(serde_json::json!([row])))],
+            );
+            for args in [&["diff"][..], &["plan"], &["apply", "--auto-approve"]] {
+                let output = repo.run(args);
+                assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+                let error = stderr(&output);
+                assert!(error.contains("namespace-scoped backup"), "{error}");
+                assert!(error.contains("app"), "{error}");
+                assert!(!stdout(&output).contains("DELETE Proxy"));
+            }
+            for request in repo.requests.lock().unwrap().iter() {
+                assert!(request.starts_with("GET "), "{request}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_and_review_preview_adoption_and_its_delete_fence_in_both_modes() {
+    for mode in ["shared", "exclusive"] {
+        let config = format!(
+            r#"version: 1
+environments:
+  staging:
+    ownership:
+      mode: {mode}
+      namespaces: [ferrum]
+"#
+        );
+        for cached in [false, true] {
+            let repo = Repo::with_cache(
+                &[
+                    ("resources/ferrum/proxies/app.yaml", FERRUM_PROXY),
+                    (".gitforgeops/config.yaml", &config),
+                ],
+                vec![(
+                    "ferrum".into(),
+                    backup(serde_json::json!([live_proxy("app", "ferrum", 8080, None)])),
+                )],
+                cached,
+            );
+            let before = repo.snapshot();
+            for command in ["plan", "review"] {
+                let output = repo.run(&[command]);
+                let out = stdout(&output);
+                assert!(output.status.success(), "{out} {}", stderr(&output));
+                assert_eq!(out.contains("ADOPT Proxy"), !cached, "{out}");
+                assert!(!out.contains("None (in sync)"), "{out}");
+                if !cached {
+                    assert!(out.contains("delete fence"), "{out}");
+                    assert!(out.contains("idempotent PUT"), "{out}");
+                    assert!(out.contains("without a PUT"), "{out}");
+                }
+            }
+            assert_eq!(before, repo.snapshot());
+            for request in repo.requests.lock().unwrap().iter() {
+                assert!(request.starts_with("GET /backup "), "{request}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ownership_preview_excludes_managed_and_spec_owned_rows_and_shows_pending_assertions() {
+    use gitforgeops::diff::resource_diff::state_key;
+    use gitforgeops::state::StateFile;
+
+    for situation in ["managed", "pending", "spec-owned", "different", "full-replace"] {
+        let mut state = StateFile::default();
+        let key = state_key("ferrum", "Proxy", "app");
+        if situation == "managed" {
+            state.resources.insert(key.clone(), "managed:v1".into());
+        }
+        if situation == "pending" {
+            state.pending_creates.insert(key);
+        }
+        let state_json = serde_json::to_string(&state).unwrap();
+        let mut files = vec![
+            ("resources/ferrum/proxies/app.yaml", FERRUM_PROXY),
+            (".state/default.json", state_json.as_str()),
+        ];
+        if situation == "full-replace" {
+            files.push((
+                ".gitforgeops/config.yaml",
+                r#"version: 1
+environments:
+  default:
+    apply_strategy: full_replace
+    ownership:
+      mode: exclusive
+      namespaces: [ferrum]
+"#,
+            ));
+        }
+        let row = live_proxy(
+            "app",
+            "ferrum",
+            if situation == "different" { 9090 } else { 8080 },
+            (situation == "spec-owned").then_some("spec-1"),
+        );
+        let repo = Repo::new(
+            &files,
+            vec![("ferrum".into(), backup(serde_json::json!([row])))],
+        );
+        let before = repo.snapshot();
+        for command in ["plan", "review"] {
+            let output = repo.run(&[command]);
+            let out = stdout(&output);
+            assert!(!out.contains("ADOPT Proxy"), "{situation}: {out}");
+            if situation == "pending" {
+                let action = if command == "plan" {
+                    "MODIFY Proxy app"
+                } else {
+                    "| Modify |"
+                };
+                assert!(out.contains(action), "{out}");
+                assert!(!out.contains("None (in sync)"), "{out}");
+            }
+        }
+        assert_eq!(before, repo.snapshot());
     }
 }
