@@ -951,6 +951,62 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     assert!(missing_required.contains("**MISSING (required)**"));
 }
 
+#[test]
+fn review_comment_cap_renders_the_same_prefix_across_runs() {
+    use gitforgeops::config::schema::{GatewayConfig, Proxy};
+    use gitforgeops::diff::compute_diff_with_ownership;
+
+    let proxies: Vec<Proxy> = (0..120)
+        .map(|index| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("p-{index:03}"),
+                "namespace": "ferrum",
+                "backend_host": "example.com",
+                "backend_port": 443,
+            }))
+            .unwrap()
+        })
+        .collect();
+    let desired = GatewayConfig {
+        proxies,
+        ..Default::default()
+    };
+    let actual = GatewayConfig::default();
+
+    let render = || {
+        let result =
+            compute_diff_with_ownership(&desired, &actual, Some(&std::collections::HashSet::new()));
+        build_review_comment_v2(
+            true,
+            "",
+            &result.diffs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &result.unmanaged,
+            &result.spec_owned,
+            None,
+            None,
+            None,
+            None,
+            &ResolveReport::default(),
+            false,
+        )
+    };
+
+    let first = render();
+    let second = render();
+    assert_eq!(first, second, "review comment must be deterministic");
+
+    // 120 adds, capped at 100 rows: the deterministic (ns, kind, id) prefix is
+    // what a reviewer sees, and the last 20 are named only by the omission row.
+    assert!(first.contains("20 additional change(s) omitted"), "{first}");
+    assert!(first.contains("p-000"), "{first}");
+    assert!(first.contains("p-099"), "{first}");
+    assert!(!first.contains("p-119"), "{first}");
+}
+
 // --- Spec-owned section ------------------------------------------------------
 
 fn spec_owned_entry(id: &str, declared_in_repo: bool, pruned: bool) -> SpecOwnedResource {

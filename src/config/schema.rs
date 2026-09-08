@@ -367,6 +367,12 @@ pub struct KubernetesConfig {
     pub service_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_name: Option<String>,
+    /// Whether the discovered address is `IPv4` or `IPv6`. Optional; `null`
+    /// (omitted) means automatic. The value is validated by `ferrum-edge
+    /// validate`, not here — like every other closed-value field this mirror
+    /// carries as a string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_selector: Option<String>,
     #[serde(default = "default_sd_poll_interval")]
@@ -827,10 +833,10 @@ pub struct Proxy {
     pub allowed_methods: Option<Vec<String>>,
     #[serde(default)]
     pub allowed_ws_origins: Vec<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -857,10 +863,10 @@ pub struct Consumer {
     pub credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub acl_groups: Vec<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -909,10 +915,10 @@ pub struct Upstream {
     /// Admin-only ownership tag set by the spec-import API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -944,10 +950,10 @@ pub struct PluginConfig {
     /// Admin-only ownership tag set by the spec-import API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a

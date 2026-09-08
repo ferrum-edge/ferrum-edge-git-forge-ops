@@ -135,8 +135,8 @@ fn scoped_record_preserves_entries_outside_scope() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }
     }
 
@@ -244,8 +244,11 @@ fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
     state.reserve_adds(&diffs, &desired).unwrap();
 
     let mut exact_live = desired.clone();
-    exact_live.upstreams[0].created_at += chrono::Duration::seconds(5);
-    exact_live.upstreams[0].updated_at += chrono::Duration::seconds(5);
+    // The gateway stamps both fields on the live row; the desired document
+    // omits them. The subset match must still hold because timestamps are
+    // never compared.
+    exact_live.upstreams[0].created_at = Some(chrono::Utc::now());
+    exact_live.upstreams[0].updated_at = Some(chrono::Utc::now());
     let actual = BTreeMap::from([("ferrum".to_string(), exact_live)]);
 
     assert_eq!(
@@ -828,8 +831,8 @@ fn record_op_preserves_state_for_failed_delete() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }
     }
 
@@ -922,8 +925,8 @@ fn record_op_preserves_state_for_failed_delete() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     let cfg = GatewayConfig {
         consumers: vec![consumer],
