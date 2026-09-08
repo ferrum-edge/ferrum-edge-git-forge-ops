@@ -1,10 +1,22 @@
 use gitforgeops::config::schema::*;
+use gitforgeops::diff::resource_diff::{
+    compute_diff, compute_diff_with_scope, state_key, DiffAction, OwnershipScope,
+};
 use gitforgeops::diff::{
     best_practice::check_best_practices, breaking::detect_breaking_changes,
-    is_sensitive_diff_field, mask_indeterminate_secret_values, resource_diff::compute_diff,
-    resource_diff::compute_diff_with_scope, resource_diff::state_key, resource_diff::DiffAction,
-    resource_diff::OwnershipScope, security::audit_security,
+    is_sensitive_diff_field, security::audit_security,
 };
+
+fn mask_without_bundle(desired: &GatewayConfig, actual: &mut GatewayConfig) {
+    let mut resolved = desired.clone();
+    let report = gitforgeops::secrets::resolve_secrets_with_mode(
+        &mut resolved,
+        &gitforgeops::secrets::CredentialBundle::default(),
+        gitforgeops::config::GatewayMode::Api,
+    )
+    .unwrap();
+    gitforgeops::diff::mask_indeterminate_secret_values(&resolved, actual, &report);
+}
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
     Proxy {
@@ -103,7 +115,7 @@ fn credential_indeterminate_review_masks_only_matching_consumer_values() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert_eq!(diffs[0].kind, "Consumer");
@@ -147,7 +159,7 @@ fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert!(
@@ -158,6 +170,46 @@ fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
         "{:?}",
         diffs[0].details
     );
+}
+
+#[test]
+fn placeholder_syntax_without_unresolved_provenance_does_not_authorize_masking() {
+    let mut consumer = make_consumer("app", "app");
+    consumer.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    let mut plugin = make_plugin_config("app", "ferrum", "otel_tracing", PluginScope::Global);
+    plugin.config = serde_json::json!({"authorization": "${gh-env-secret:alloc=require}"});
+    let desired = GatewayConfig {
+        consumers: vec![consumer],
+        plugin_configs: vec![plugin],
+        upstreams: vec![upstream_with_consul(
+            "app",
+            "https://consul.test:8501",
+            Some("${gh-env-secret:alloc=require}"),
+        )],
+        ..GatewayConfig::default()
+    };
+    let mut actual = desired.clone();
+    actual.consumers[0].credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "synthetic-live-key"}]),
+    );
+    actual.plugin_configs[0].config = serde_json::json!({"authorization": "synthetic-live-key"});
+    actual.upstreams[0] = upstream_with_consul(
+        "app",
+        "https://consul.test:8501",
+        Some("synthetic-live-key"),
+    );
+    let before = serde_json::to_value(&actual).unwrap();
+    gitforgeops::diff::mask_indeterminate_secret_values(
+        &desired,
+        &mut actual,
+        &gitforgeops::secrets::ResolveReport::default(),
+    );
+    assert_eq!(serde_json::to_value(&actual).unwrap(), before);
+    assert_eq!(compute_diff(&desired, &actual).len(), 3);
 }
 
 #[test]
@@ -187,7 +239,7 @@ fn credential_indeterminate_review_masks_only_placeholder_leaves() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert!(
@@ -239,7 +291,7 @@ fn unmasked_broker_controlled_leaves_are_permanent_false_drift() {
     // What `diff` reported before it masked: two changes nobody made.
     assert_eq!(compute_diff(&desired, &actual).len(), 2);
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
 
     assert!(
         compute_diff(&desired, &actual).is_empty(),
@@ -271,7 +323,7 @@ fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert_eq!(diffs[0].details.len(), 1, "{:?}", diffs[0].details);
@@ -1490,10 +1542,9 @@ fn service_discovery_diff_redacts_the_token_but_shows_the_address() {
     assert!(!is_sensitive_diff_field("Upstream", "service_discovery"));
 }
 
-/// A brokered field is legible on both sides: an unresolved placeholder is
-/// repository data, and a reviewer needs to see that the slot is brokered.
+/// Value text alone cannot establish whether either token is unresolved.
 #[test]
-fn service_discovery_diff_keeps_a_placeholder_visible() {
+fn service_discovery_diff_redacts_placeholder_shaped_tokens() {
     let desired = GatewayConfig {
         upstreams: vec![upstream_with_consul(
             "orders",
@@ -1518,16 +1569,10 @@ fn service_discovery_diff_keeps_a_placeholder_visible() {
         .find(|change| change.field == "service_discovery")
         .expect("the address changed");
 
-    assert!(
-        change.new_value.contains("gh-env-secret"),
-        "{}",
-        change.new_value
-    );
-    assert!(
-        !change.new_value.contains("[REDACTED]"),
-        "{}",
-        change.new_value
-    );
+    for side in [&change.old_value, &change.new_value] {
+        assert!(!side.contains("gh-env-secret"), "{side}");
+        assert!(side.contains("[REDACTED]"), "{side}");
+    }
 }
 
 /// Bundle-less review: an unresolvable placeholder must not read as drift
@@ -1551,7 +1596,7 @@ fn masking_aligns_the_discovery_token_only() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
 
     let consul = actual.upstreams[0]
         .service_discovery

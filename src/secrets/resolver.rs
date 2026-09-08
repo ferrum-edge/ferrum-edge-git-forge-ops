@@ -155,6 +155,23 @@ pub struct ResolveReport {
 }
 
 impl ResolveReport {
+    /// Explain comparison uncertainty without claiming the entire bundle is absent.
+    pub fn unresolved_comparison_note(&self) -> Option<String> {
+        let count = self
+            .results
+            .iter()
+            .filter(|result| result.status != SlotStatus::Resolved)
+            .count();
+        (count > 0).then(|| {
+            format!(
+                "{count} broker-controlled leaf/leaves remain unresolved. Authoritative live \
+                 comparisons exclude only unresolved leaves in Consumer credentials, plugin \
+                 config and service-discovery secrets; resolved values, literal siblings, \
+                 extra entries, shape changes and nonsecret fields are still compared."
+            )
+        })
+    }
+
     /// Structurally-captured credential type for `slot`, if this report
     /// produced it.
     pub fn credential_type_for(&self, slot: &str) -> Option<&str> {
@@ -463,6 +480,26 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
             None => components.push(SlotComponent::Literal(piece)),
         }
     }
+    join_slot_components(&components)
+}
+
+/// Derive a comparison slot from structural keys, without parsing or escaping
+/// an already-rendered path again. Reuse the resolver's index-zero elision.
+pub(crate) fn consumer_credential_slot(
+    namespace: &str,
+    consumer_id: &str,
+    credential_type: &str,
+    path: &[ConfigPathComponent],
+) -> String {
+    let mut components = vec![
+        SlotComponent::Literal(namespace),
+        SlotComponent::Literal(consumer_id),
+        SlotComponent::Literal(credential_type),
+    ];
+    components.extend(path.iter().map(|part| match part {
+        ConfigPathComponent::Key(key) => SlotComponent::Literal(key),
+        ConfigPathComponent::Index(index) => SlotComponent::ArrayIndex(*index),
+    }));
     join_slot_components(&components)
 }
 
