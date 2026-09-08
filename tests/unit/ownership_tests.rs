@@ -620,10 +620,22 @@ fn diff_and_unmanaged_buckets_are_sorted_deterministically() {
     assert_eq!(
         diffs,
         vec![
-            ("acme".to_string(), "Consumer".to_string(), "c-a".to_string()),
-            ("acme".to_string(), "PluginConfig".to_string(), "pc-a".to_string()),
+            (
+                "acme".to_string(),
+                "Consumer".to_string(),
+                "c-a".to_string()
+            ),
+            (
+                "acme".to_string(),
+                "PluginConfig".to_string(),
+                "pc-a".to_string()
+            ),
             ("ferrum".to_string(), "Proxy".to_string(), "p-a".to_string()),
-            ("ferrum".to_string(), "Upstream".to_string(), "u-a".to_string()),
+            (
+                "ferrum".to_string(),
+                "Upstream".to_string(),
+                "u-a".to_string()
+            ),
         ]
     );
 
@@ -635,10 +647,26 @@ fn diff_and_unmanaged_buckets_are_sorted_deterministically() {
     assert_eq!(
         unmanaged,
         vec![
-            ("acme".to_string(), "Consumer".to_string(), "c-live".to_string()),
-            ("acme".to_string(), "PluginConfig".to_string(), "pc-live".to_string()),
-            ("ferrum".to_string(), "Proxy".to_string(), "p-live".to_string()),
-            ("ferrum".to_string(), "Upstream".to_string(), "u-live".to_string()),
+            (
+                "acme".to_string(),
+                "Consumer".to_string(),
+                "c-live".to_string()
+            ),
+            (
+                "acme".to_string(),
+                "PluginConfig".to_string(),
+                "pc-live".to_string()
+            ),
+            (
+                "ferrum".to_string(),
+                "Proxy".to_string(),
+                "p-live".to_string()
+            ),
+            (
+                "ferrum".to_string(),
+                "Upstream".to_string(),
+                "u-live".to_string()
+            ),
         ]
     );
 }
