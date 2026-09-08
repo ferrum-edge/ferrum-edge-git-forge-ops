@@ -1039,6 +1039,24 @@ mesh:
 
 Point a mesh node's `FERRUM_MESH_FILE_CONFIG_PATH` at that file with `FERRUM_MESH_CONFIG_PROTOCOL=file`. Every node loads the same document and derives its own slice from its `FERRUM_MESH_WORKLOAD_SPIFFE_ID`. Mesh config holds no credential placeholders, so there is no materialize stage for it — what apply writes is final.
 
+### Retraction: deleting the last fragment
+
+Publication is a reconciliation, not an append-only write. When a change removes the **last** `MeshConfig` fragment, `export` and file-mode `apply` rewrite the destination as the explicit empty document instead of leaving the previous one in place:
+
+```yaml
+version: '1'
+mesh: {}
+```
+
+That is the shape ferrum-edge's mesh loader reads as "no mesh policy" — its `MeshFileDocument` is `deny_unknown_fields` with a required `mesh` key, and every field inside the mesh model defaults, so `mesh: {}` parses and validates. The file is **not** deleted: the mesh file source treats a missing path as a fatal startup error, so removing it would turn a policy retraction into a node outage. `plan`, `apply`, `export` and the PR review comment all print a `RETRACT mesh` line naming the path.
+
+Retraction only ever touches a destination gitforgeops can prove it published. Two independent gates:
+
+- **Provenance.** `.state/<env>.json` records `mesh_document_path` — the destination this repository publishes to — and a file whose bytes are exactly what this build's renderer emits is recognised as one of ours even before the ledger has an entry (repositories that published under an older release still converge). Anything else — a hand-written document, a repointed path, somebody else's file — is reported and left untouched.
+- **Scope.** A `FERRUM_NAMESPACE`-filtered run narrows which fragments are loaded at all, and the mesh document is mesh-wide, so "no fragments selected" is never read as "the repository declares none". A filtered run reports the skip and publishes nothing.
+
+An api-mode `apply` neither publishes nor retracts (there is no mesh admin API); it prints its usual notice. A repository that has never published a mesh document creates nothing.
+
 ### Validation, and the absence of a mesh admin API
 
 `validate`, `plan`, and `apply` run a **second** validation pass, `ferrum-edge validate -m mesh`, against the rendered document (byte-for-byte what gets published, `version` stamp included). That pass runs the same parse → normalize → validate → slice-derivation pipeline a mesh node runs at startup. It only runs when the repo actually declares mesh fragments.
@@ -1336,7 +1354,7 @@ Runtime variables supported by the binary include:
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Legacy/env-driven strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
 | `FERRUM_OVERLAY` | — | Legacy overlay selector used only without repo config/env selection. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode output path. Bundled file-mode apply sets this to `assembled/<env>.yaml`. |
-| `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`. Separate document, separate path — see [Mesh configuration](#mesh-configuration). Bundled workflows set `assembled/<env>-mesh.yaml`. |
+| `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`, and retracted (rewritten as `mesh: {}`, never deleted) when the last `MeshConfig` fragment is removed. Separate document, separate path — see [Mesh configuration](#mesh-configuration). Bundled workflows set `assembled/<env>-mesh.yaml`. |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | `iss` claim minted into admin tokens. |
 | `FERRUM_ADMIN_JWT_ROLE` | `admin` | `role` claim. `viewer` / `operator` are insufficient for what gitforgeops does. |
 | `FERRUM_ADMIN_JWT_AUDIENCE` | — | `aud` claim; emitted only when set. |

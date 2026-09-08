@@ -951,3 +951,29 @@ fn record_op_preserves_state_for_failed_delete() {
         "out-of-namespace entry must remain untouched"
     );
 }
+
+#[test]
+fn the_mesh_document_attribution_round_trips_and_gates_only_its_own_path() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let mut state = StateFile {
+            environment: "sandbox".to_string(),
+            ..StateFile::default()
+        };
+        // A repository that never published a mesh document attributes none,
+        // and the key stays out of the ledger entirely.
+        assert!(!state.publishes_mesh_document("assembled/sandbox-mesh.yaml"));
+        state.save().unwrap();
+        let fresh = std::fs::read_to_string(".state/sandbox.json").unwrap();
+        assert!(!fresh.contains("mesh_document_path"), "{fresh}");
+
+        state.record_mesh_publication("assembled/sandbox-mesh.yaml");
+        state.save().unwrap();
+
+        let reloaded = StateFile::load("sandbox").unwrap();
+        assert!(reloaded.publishes_mesh_document("assembled/sandbox-mesh.yaml"));
+        // Attribution is per destination: repointing the configured output
+        // path does not hand gitforgeops authority over the new one.
+        assert!(!reloaded.publishes_mesh_document("assembled/other-mesh.yaml"));
+    });
+}

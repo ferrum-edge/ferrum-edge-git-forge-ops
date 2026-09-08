@@ -1483,3 +1483,32 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
         assert!(comment.contains("mesh rejected"), "{comment}");
     }
 }
+
+#[test]
+fn the_mesh_retraction_banner_names_the_destination_and_the_outcome() {
+    // Mesh has no live gateway API, so a pending retraction never appears
+    // under "Changes". Without this banner it would reach a reviewer as
+    // nothing at all.
+    use gitforgeops::apply::MeshPublication;
+    use gitforgeops::review::render_mesh_retraction;
+
+    let path = "assembled/sandbox-mesh.yaml";
+
+    let published = render_mesh_retraction(MeshPublication::Published, path);
+    assert!(published.is_none());
+    let never = render_mesh_retraction(MeshPublication::NeverPublished, path);
+    assert!(never.is_none());
+
+    let pending = render_mesh_retraction(MeshPublication::Retracted, path);
+    let pending = pending.expect("a pending retraction is reported");
+    assert!(pending.contains("RETRACT mesh"), "{pending}");
+    assert!(pending.contains(path), "{pending}");
+
+    let unattributed = render_mesh_retraction(MeshPublication::Unattributed, path);
+    let unattributed = unattributed.expect("a skipped retraction is reported");
+    assert!(unattributed.contains("RETRACT mesh: skipped"), "{unattributed}");
+
+    let narrowed = render_mesh_retraction(MeshPublication::NarrowedScope, path);
+    let narrowed = narrowed.expect("a skipped retraction is reported");
+    assert!(narrowed.contains("RETRACT mesh: skipped"), "{narrowed}");
+}
