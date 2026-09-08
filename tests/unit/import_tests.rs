@@ -2113,7 +2113,9 @@ fn builtin_plaintext_allowance_writes_and_lists_unbrokered_paths() {
                 "https://collector.example/v1/traces?token=synthetic-endpoint"
             );
         }
-        let notice = result.custom_plugin_review_notice().expect("builtin review notice");
+        let notice = result
+            .custom_plugin_review_notice()
+            .expect("builtin review notice");
         assert!(notice.contains(&format!("plugin_name={plugin_name}")));
         assert!(notice.contains("--allow-plaintext-plugin-config"));
         for path in [
