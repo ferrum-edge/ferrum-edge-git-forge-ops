@@ -822,6 +822,48 @@ def state_writer_token_violations(
     return violations
 
 
+STATE_PUSH_RETRY_REQUIRED = (
+    "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    'git push origin "HEAD:$DEFAULT_BRANCH"',
+    'git fetch origin "$DEFAULT_BRANCH"',
+    'git rebase "origin/$DEFAULT_BRANCH"',
+)
+STATE_PUSH_RETRY_FORBIDDEN = (
+    "git fetch origin main",
+    "origin/main",
+)
+
+
+def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> list[str]:
+    """State commits must rebase and push against the repository default branch.
+
+    The freshness guard already parameterises checkout and ancestry on
+    ``DEFAULT_BRANCH``; hardcoding ``origin/main`` in the post-mutation push
+    retry loop breaks on forks whose default branch is not literally ``main``.
+    """
+    violations: list[str] = []
+    commit_index = text.find(commit_step)
+    if commit_index < 0:
+        return [f"{workflow}: a {commit_step!r} step is required"]
+    commit_block = text[commit_index:]
+    next_step = re.search(r"\n      - (?:name|uses):", commit_block[1:])
+    if next_step is not None:
+        commit_block = commit_block[: next_step.start() + 1]
+    for forbidden in STATE_PUSH_RETRY_FORBIDDEN:
+        if forbidden in commit_block:
+            violations.append(
+                f"{workflow}: {commit_step!r} must not hardcode {forbidden!r}; "
+                "use the repository default branch"
+            )
+    for required in STATE_PUSH_RETRY_REQUIRED:
+        if required not in commit_block:
+            violations.append(
+                f"{workflow}: {commit_step!r} is missing default-branch push retry "
+                f"control {required!r}"
+            )
+    return violations
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1156,6 +1198,9 @@ def main(argv: list[str] | None = None) -> int:
         text = (workflows / state_workflow).read_text(encoding="utf-8")
         violations.extend(
             state_writer_token_violations(state_workflow, text, commit_step)
+        )
+        violations.extend(
+            state_push_retry_violations(state_workflow, text, commit_step)
         )
 
     static_review = (workflows / "validate-pr.yml").read_text(encoding="utf-8")

@@ -407,6 +407,40 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertTrue(any("persisted by checkout" in item for item in violations))
         self.assertTrue(any("minted after" in item for item in violations))
 
+    def test_state_push_retry_must_use_the_default_branch(self):
+        commit_step = "- name: Commit state update"
+        secure = "\n".join(
+            [
+                commit_step,
+                "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+                'git push origin "HEAD:$DEFAULT_BRANCH"',
+                'git fetch origin "$DEFAULT_BRANCH"',
+                'git rebase "origin/$DEFAULT_BRANCH"',
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.state_push_retry_violations(
+                "rotate.yml", secure, commit_step
+            ),
+            [],
+        )
+
+        insecure = secure.replace(
+            'git rebase "origin/$DEFAULT_BRANCH"',
+            "git rebase origin/main",
+        )
+        violations = check_supply_chain.state_push_retry_violations(
+            "rotate.yml", insecure, commit_step
+        )
+        self.assertTrue(
+            any("must not hardcode 'origin/main'" in item for item in violations),
+            violations,
+        )
+        self.assertTrue(
+            any("missing default-branch push retry" in item for item in violations),
+            violations,
+        )
+
     def test_every_whole_secrets_context_form_is_rejected(self):
         # `secrets.NAME` and `secrets['NAME']` were caught in validate-pr.yml,
         # but the whole-context forms — which hand over EVERY environment
