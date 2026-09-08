@@ -442,6 +442,8 @@ Pending allocations require both provisioning environment variables. `plan` and
 `review` use `credential_provisioning_blockers`, render the missing capability,
 and exit 1. Apply calls the same predicate at its existing allocation gate,
 after safety checks and before external writes, retaining the exact refusal text.
+File apply also checks before publishing either output document, while keeping
+credential allocation after placeholder publication.
 Only presence is checked; token validity is a remote question. With no pending
 allocation, neither variable is required.
 

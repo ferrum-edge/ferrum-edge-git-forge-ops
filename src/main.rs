@@ -2215,6 +2215,18 @@ async fn cmd_apply(
                 return Ok(());
             }
 
+            // Refuse missing provisioning capability before publishing either
+            // document. Allocation itself stays after placeholder publication.
+            if let Some(blocker) = verdict::credential_provisioning_blockers(
+                &secret_report,
+                env_config.github_provisioner_token.is_some(),
+                env_config.github_repository.is_some(),
+            )
+            .first()
+            {
+                return Err(blocker.kind.remedy().into());
+            }
+
             // Write the placeholder-preserving file FIRST. `desired` still
             // has `${gh-env-secret:...}` strings because the initial resolve
             // doesn't replace rotate placeholders and the allocator hasn't

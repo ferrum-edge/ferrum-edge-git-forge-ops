@@ -1544,9 +1544,9 @@ fn rotate_supported_credentials_in_resolved_namespace_reach_provisioning() {
 #[test]
 fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
     let consumer = BROKERED_CONSUMER.replace("alloc=require", "alloc=generate");
-    let repo = Repo::with_consumer(&consumer);
     for token_present in [false, true] {
         for repository_present in [false, true] {
+            let repo = Repo::with_consumer(&consumer);
             let mut env = Vec::new();
             if token_present {
                 env.push(("FERRUM_GH_PROVISIONER_TOKEN", "synthetic-provisioner"));
@@ -1569,6 +1569,14 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
                     !repository_present,
                     "{out}"
                 );
+                assert!(
+                    !repo.published().exists(),
+                    "{command} published with token={token_present}, repo={repository_present}"
+                );
+                assert!(
+                    !repo.dir.path().join(".state/default.json").exists(),
+                    "{command} wrote state with token={token_present}, repo={repository_present}"
+                );
             }
             if !token_present || !repository_present {
                 let output = repo.run(&["apply", "--auto-approve"], &env);
@@ -1580,10 +1588,17 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
                 };
                 assert!(stderr(&output).contains(expected), "{}", stderr(&output));
             }
-            assert!(!repo.published().exists());
-            assert!(!repo.dir.path().join(".state/default.json").exists());
+            assert!(
+                !repo.published().exists(),
+                "apply published with token={token_present}, repository={repository_present}"
+            );
+            assert!(
+                !repo.dir.path().join(".state/default.json").exists(),
+                "apply wrote state with token={token_present}, repository={repository_present}"
+            );
         }
     }
+    let repo = Repo::with_consumer(&consumer);
     let seeded = repo.run(&["plan"], &[("FERRUM_CREDS_JSON", BUNDLE)]);
     assert!(seeded.status.success(), "{}", stdout(&seeded));
     assert!(!stdout(&seeded).contains("Apply Blockers"));
