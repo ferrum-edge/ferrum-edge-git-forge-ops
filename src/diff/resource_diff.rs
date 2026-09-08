@@ -411,10 +411,18 @@ pub fn compute_diff_with_options(
         &mut result,
     );
 
-    // `actual` is walked through a HashMap, so the spec-owned bucket comes out
-    // in arbitrary order. It is rendered verbatim into PR comments and plan
-    // output — sort it so re-runs of an unchanged config produce an unchanged
-    // report.
+    // `actual` is walked through a HashMap, so all three buckets come out in
+    // arbitrary order. They are rendered verbatim into PR comments and plan
+    // output — sort them so re-runs of an unchanged config produce an
+    // unchanged report. `(namespace, kind, id)` is the canonical identity used
+    // by `state_key` and rejected as a duplicate by
+    // `validate_unique_resource_keys`, so it is a total order here.
+    result
+        .diffs
+        .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));
+    result
+        .unmanaged
+        .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));
     result
         .spec_owned
         .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));

@@ -463,6 +463,67 @@ spec:
 }
 
 #[test]
+fn kubernetes_service_discovery_address_type_roundtrips() {
+    let with_type = r#"
+kind: Upstream
+spec:
+  id: "pool-k8s"
+  targets: []
+  service_discovery:
+    provider: kubernetes
+    kubernetes:
+      service_name: "checkout"
+      namespace: "prod"
+      address_type: IPv6
+"#;
+    let spec = match serde_yaml::from_str::<Resource>(with_type).unwrap() {
+        Resource::Upstream { spec } => spec,
+        _ => panic!("expected Upstream"),
+    };
+    let sd = spec
+        .service_discovery
+        .as_ref()
+        .expect("service_discovery preserved");
+    let k8s = sd.kubernetes.as_ref().expect("kubernetes block preserved");
+    assert_eq!(k8s.address_type.as_deref(), Some("IPv6"));
+
+    let round = serde_yaml::to_string(&spec).unwrap();
+    let reparsed: Upstream = serde_yaml::from_str(&round).unwrap();
+    let reparsed_k8s = reparsed
+        .service_discovery
+        .expect("service_discovery preserved")
+        .kubernetes
+        .expect("kubernetes block preserved");
+    assert_eq!(reparsed_k8s.address_type.as_deref(), Some("IPv6"));
+
+    // Absent `address_type` stays absent (no fabricated default), so a
+    // kubernetes block without it round-trips unchanged.
+    let without_type = r#"
+kind: Upstream
+spec:
+  id: "pool-k8s-auto"
+  targets: []
+  service_discovery:
+    provider: kubernetes
+    kubernetes:
+      service_name: "checkout"
+"#;
+    let spec = match serde_yaml::from_str::<Resource>(without_type).unwrap() {
+        Resource::Upstream { spec } => spec,
+        _ => panic!("expected Upstream"),
+    };
+    assert_eq!(
+        spec.service_discovery
+            .as_ref()
+            .and_then(|sd| sd.kubernetes.as_ref())
+            .and_then(|k| k.address_type.as_deref()),
+        None
+    );
+    let round = serde_yaml::to_string(&spec).unwrap();
+    assert!(!round.contains("address_type"), "{round}");
+}
+
+#[test]
 fn upstream_health_check_and_cookie_extensions_roundtrip() {
     let yaml = r#"
 kind: Upstream
