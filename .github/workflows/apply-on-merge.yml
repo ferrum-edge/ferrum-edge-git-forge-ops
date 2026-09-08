@@ -426,6 +426,7 @@ jobs:
         # push to main, contention is normal — retry with rebase on rejection.
         if: ${{ !cancelled() }}
         env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}
         run: |
           set -euo pipefail
@@ -461,17 +462,21 @@ jobs:
           git commit -m "chore(gitforgeops): state update for ${{ matrix.environment }}"
 
           for attempt in 1 2 3 4 5; do
-            if git push; then
+            if git push origin "HEAD:$DEFAULT_BRANCH"; then
               echo "Pushed state on attempt $attempt."
               exit 0
             fi
             echo "Push rejected on attempt $attempt; fetching + rebasing..."
-            git fetch origin main
+            git fetch origin "$DEFAULT_BRANCH"
             # Rebase preserves the single state commit on top of whatever
             # other envs pushed in the meantime. Each env's state file is
             # independent so there's no real conflict to resolve — but abort
             # cleanly if one somehow surfaces.
-            git rebase origin/main || { git rebase --abort; echo "Rebase failed" >&2; exit 1; }
+            git rebase "origin/$DEFAULT_BRANCH" || {
+              git rebase --abort
+              echo "Rebase failed" >&2
+              exit 1
+            }
             sleep $((attempt * 2))
           done
 

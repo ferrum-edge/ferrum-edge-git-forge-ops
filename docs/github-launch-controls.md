@@ -148,7 +148,8 @@ the `creation` rule and no bypass actor at all, nobody can push a `v*` tag and
 the tag half of `release.yml` can never fire, so `audit_settings.py` treats an
 empty bypass list as a misconfiguration rather than as maximum strictness.
 
-The release workflow also checks that a tag commit is reachable from `main`;
+The release workflow also checks that a tag commit is reachable from the
+protected default branch;
 tag protection ensures a branch-controlled workflow cannot remove that check
 before secrets are used.
 
