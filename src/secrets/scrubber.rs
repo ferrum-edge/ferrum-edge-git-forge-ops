@@ -412,7 +412,8 @@ fn collect_resolved_secrets(
             continue;
         };
         for field in super::service_discovery::SD_SECRET_FIELDS {
-            let slot = super::service_discovery::slot(&upstream.namespace, &upstream.id, field.path);
+            let slot =
+                super::service_discovery::slot(&upstream.namespace, &upstream.id, field.path);
             if resolved.contains(slot.as_str()) {
                 if let Some(value) = super::service_discovery::secret_leaf(discovery, field.path) {
                     if !value.is_empty() {

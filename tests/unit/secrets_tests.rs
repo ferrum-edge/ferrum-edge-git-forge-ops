@@ -879,7 +879,10 @@ fn identity_placeholders_fail_before_resolution_in_every_walk() {
             "prefix-${gh-env-secret:alloc=require}",
         ] {
             for (value, path) in [
-                (entry(leaf, placeholder), format!("{credential_type}/{leaf}")),
+                (
+                    entry(leaf, placeholder),
+                    format!("{credential_type}/{leaf}"),
+                ),
                 (
                     serde_json::json!([entry(leaf, placeholder)]),
                     format!("{credential_type}/{leaf}"),
@@ -898,8 +901,7 @@ fn identity_placeholders_fail_before_resolution_in_every_walk() {
                 cfg.consumers[0].id = "app/~[1]".to_string();
                 // This valid, seeded consumer precedes the invalid one. A
                 // refusal in a later leaf must not leave this one substituted.
-                let mut earlier =
-                    consumer_with("keyauth", serde_json::json!([{ "key": REQUIRE }]));
+                let mut earlier = consumer_with("keyauth", serde_json::json!([{ "key": REQUIRE }]));
                 earlier.consumers[0].id = "earlier".to_string();
                 cfg.consumers.insert(0, earlier.consumers.remove(0));
                 let original = serde_json::to_value(&cfg).unwrap();
@@ -911,10 +913,7 @@ fn identity_placeholders_fail_before_resolution_in_every_walk() {
                         "synthetic-earlier-secret-value".to_string(),
                     )]);
                     if seeded {
-                        bundle.insert(
-                            slot.clone(),
-                            "synthetic-identity-bundle-value".to_string(),
-                        );
+                        bundle.insert(slot.clone(), "synthetic-identity-bundle-value".to_string());
                     }
                     for mode in [GatewayMode::Api, GatewayMode::File] {
                         for allow_remap in [false, true] {
@@ -940,10 +939,7 @@ fn identity_placeholders_fail_before_resolution_in_every_walk() {
                                 assert!(matches!(error, gitforgeops::error::Error::Config(_)));
                                 let diagnostic = error.to_string();
                                 assert!(diagnostic.contains(&slot), "{diagnostic}");
-                                assert!(
-                                    diagnostic.contains("supplied literally"),
-                                    "{diagnostic}"
-                                );
+                                assert!(diagnostic.contains("supplied literally"), "{diagnostic}");
                                 assert!(!diagnostic.contains("synthetic-"), "{diagnostic}");
                                 assert!(!diagnostic.contains(placeholder), "{diagnostic}");
                             }
@@ -1001,7 +997,10 @@ fn literal_identity_classification_stays_consistent_across_broker_audit_and_impo
         "public-login public-client.example synthetic-custom-secret",
         "",
     );
-    assert_eq!(output.stdout, "public-login public-client.example [REDACTED]");
+    assert_eq!(
+        output.stdout,
+        "public-login public-client.example [REDACTED]"
+    );
     let captured = capture_and_redact_import_credentials(&mut cfg).unwrap();
     assert_eq!(captured, bundle);
     assert_eq!(

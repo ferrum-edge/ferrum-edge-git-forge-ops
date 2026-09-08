@@ -311,7 +311,10 @@ fn literal_identity_cli_diagnostics_remain_readable_with_a_loaded_bundle() {
             ] {
                 let output = repo.run(
                     &args,
-                    &[("FERRUM_GATEWAY_MODE", mode), ("FERRUM_CREDS_JSON", &bundle)],
+                    &[
+                        ("FERRUM_GATEWAY_MODE", mode),
+                        ("FERRUM_CREDS_JSON", &bundle),
+                    ],
                 );
                 let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
                 // Ordinary review reports a schema rejection in its comment
@@ -320,7 +323,10 @@ fn literal_identity_cli_diagnostics_remain_readable_with_a_loaded_bundle() {
                     assert!(!output.status.success(), "stub validator must reject");
                 }
                 assert!(repo.dir.path().join("validator-ran").exists());
-                assert!(diagnostic.contains(identity), "{mode} {args:?}: {diagnostic}");
+                assert!(
+                    diagnostic.contains(identity),
+                    "{mode} {args:?}: {diagnostic}"
+                );
                 assert!(
                     diagnostic.contains("synthetic schema rejection"),
                     "{diagnostic}"
