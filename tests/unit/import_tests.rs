@@ -67,8 +67,8 @@ fn make_test_config() -> GatewayConfig {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }],
         consumers: vec![Consumer {
             extra: Default::default(),
@@ -78,8 +78,8 @@ fn make_test_config() -> GatewayConfig {
             custom_id: None,
             credentials: std::collections::BTreeMap::new(),
             acl_groups: vec![],
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }],
         ..GatewayConfig::default()
     }
@@ -389,6 +389,63 @@ fn import_from_file_roundtrip() {
 }
 
 #[test]
+fn file_import_preserves_declared_timestamps_and_omits_absent_ones() {
+    let created: chrono::DateTime<chrono::Utc> = "2019-05-04T11:22:33Z".parse().unwrap();
+    let updated: chrono::DateTime<chrono::Utc> = "2021-09-12T08:15:00Z".parse().unwrap();
+
+    let mut config = make_test_config();
+    config.proxies[0].created_at = Some(created);
+    config.proxies[0].updated_at = Some(updated);
+    config.consumers[0].created_at = None;
+    config.consumers[0].updated_at = None;
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+
+    let assembled =
+        gitforgeops::config::assemble(gitforgeops::config::load_resources(&output).unwrap())
+            .unwrap()
+            .gateway;
+
+    let proxy = assembled
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "proxy-test")
+        .unwrap();
+    assert_eq!(proxy.created_at, Some(created));
+    assert_eq!(proxy.updated_at, Some(updated));
+
+    let consumer = assembled
+        .consumers
+        .iter()
+        .find(|consumer| consumer.id == "consumer-test")
+        .unwrap();
+    assert_eq!(consumer.created_at, None);
+    assert_eq!(consumer.updated_at, None);
+
+    // The written proxy file carries the gateway's real timestamps verbatim.
+    let proxy_file =
+        std::fs::read_to_string(output.join("ferrum/proxies/proxy-test.yaml")).unwrap();
+    assert!(proxy_file.contains("2019-05-04"), "{proxy_file}");
+    let consumer_file =
+        std::fs::read_to_string(output.join("ferrum/consumers/consumer-test.yaml")).unwrap();
+    assert!(!consumer_file.contains("created_at"), "{consumer_file}");
+    assert!(!consumer_file.contains("updated_at"), "{consumer_file}");
+}
+
+#[test]
 fn file_import_requires_an_explicit_private_bundle_for_live_credentials() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
@@ -602,8 +659,8 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -693,8 +750,8 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -751,8 +808,8 @@ fn builtin_plugin_import_raises_no_review_notice() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -786,8 +843,8 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
         priority_override: None,
         trigger: None,
         api_spec_id: Some("payments-v1".to_string()),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -1692,8 +1749,8 @@ fn consul_upstream(token: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -1851,8 +1908,8 @@ fn unknown_plugin_backup(source_dir: &std::path::Path) -> PathBuf {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
     backup_path
@@ -1982,8 +2039,8 @@ fn builtin_plugins_are_unaffected_by_the_plaintext_gate() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 

@@ -122,8 +122,8 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }],
         ..GatewayConfig::default()
     };
@@ -1173,6 +1173,66 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
             .all(|request| !request.contains("POST /upstreams")),
         "the uncertain create must not be replayed"
     );
+}
+
+#[tokio::test]
+async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
+    // A hand-authored resource carries no `created_at` / `updated_at`. Those
+    // timestamps belong to the gateway: the modify body must not assert an
+    // apply-run wall clock, and the create body must let the gateway stamp it.
+    let mut live_proxy = proxy("p1", "ferrum", None);
+    live_proxy.backend_host = "old.example".to_string();
+    live_proxy.created_at = Some(chrono::Utc::now());
+    live_proxy.updated_at = Some(chrono::Utc::now());
+
+    let desired = GatewayConfig {
+        proxies: vec![proxy("p1", "ferrum", None)],
+        upstreams: vec![upstream("u1", "ferrum")],
+        ..Default::default()
+    };
+    let live = GatewayConfig {
+        proxies: vec![live_proxy],
+        ..Default::default()
+    };
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /proxies/p1".into(), 200, "{}".into(), vec![]),
+        ("POST /upstreams".into(), 201, "{}".into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("ferrum".to_string(), live)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("apply succeeds");
+
+    assert_eq!(result.updated, 1);
+    assert_eq!(result.created, 1);
+
+    let requests = requests.lock().unwrap();
+    let put = requests
+        .iter()
+        .find(|request| request.contains("PUT /proxies/p1"))
+        .expect("modify issued");
+    let put_body = put.split_once("\r\n\r\n").expect("request body").1;
+    assert!(!put_body.contains("created_at"), "{put_body}");
+    assert!(!put_body.contains("updated_at"), "{put_body}");
+
+    let post = requests
+        .iter()
+        .find(|request| request.contains("POST /upstreams"))
+        .expect("create issued");
+    let post_body = post.split_once("\r\n\r\n").expect("request body").1;
+    assert!(!post_body.contains("created_at"), "{post_body}");
+    assert!(!post_body.contains("updated_at"), "{post_body}");
 }
 
 #[tokio::test]

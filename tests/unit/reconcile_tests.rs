@@ -71,8 +71,8 @@ fn proxy(id: &str, namespace: &str) -> Proxy {
         stream_proxy_protocol: None,
         backend_proxy_protocol: None,
         stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
