@@ -74,8 +74,8 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
         stream_proxy_protocol: None,
         backend_proxy_protocol: None,
         stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -88,8 +88,8 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: std::collections::BTreeMap::new(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -351,8 +351,8 @@ fn make_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -386,8 +386,8 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 

@@ -195,10 +195,10 @@ pub fn operation_rank(action: &DiffAction, kind: &str) -> u8 {
 
 /// Sort a computed diff into admin-API application order.
 ///
-/// Stable, so resources sharing a rank keep the diff's original (deterministic)
-/// ordering. Applied here in the api target rather than in `compute_diff` —
-/// the diff is also consumed by `plan`/`diff` output where the grouping by kind
-/// is the more readable presentation.
+/// Stable, so resources sharing a rank keep `compute_diff`'s
+/// `(namespace, kind, id)` ordering. Applied here in the api target rather than
+/// in `compute_diff` — the diff is also consumed by `plan`/`diff` output where
+/// the grouping by kind is the more readable presentation.
 pub fn order_diffs(mut diffs: Vec<ResourceDiff>) -> Vec<ResourceDiff> {
     diffs.sort_by_key(|d| operation_rank(&d.action, &d.kind));
     diffs
@@ -1982,8 +1982,10 @@ fn create_outcome_is_ambiguous(error: &crate::error::Error) -> bool {
 /// row with the same value, recursively through nested objects. Arrays and
 /// scalars still compare exactly — a differing target list or timeout is a
 /// real difference, not a gateway default. Extra keys on the live side are
-/// ignored. `created_at` / `updated_at` are dropped outright because the
-/// desired side fabricates them at deserialize time.
+/// ignored. `created_at` / `updated_at` are dropped outright: the desired side
+/// omits them unless the repository declares them, and the gateway always
+/// stamps them on the live side, so a comparison that kept them would read
+/// every row as a foreign one.
 ///
 /// This is not an ownership proof and is never used as one: the callers follow
 /// a positive match with an idempotent PUT that overwrites the row with the
