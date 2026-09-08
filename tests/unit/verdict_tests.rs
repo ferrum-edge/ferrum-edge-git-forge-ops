@@ -402,7 +402,10 @@ fn provisioning_blockers_require_pending_allocations_and_missing_capability() {
     for pending in [false, true] {
         let report = report(
             if pending {
-                vec![slot(SlotStatus::NeedsAllocation, PlaceholderAlloc::Generate)]
+                vec![slot(
+                    SlotStatus::NeedsAllocation,
+                    PlaceholderAlloc::Generate,
+                )]
             } else {
                 vec![slot(SlotStatus::MissingRequired, PlaceholderAlloc::Require)]
             },

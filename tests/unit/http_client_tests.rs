@@ -1698,7 +1698,11 @@ fn scoped_backup_requires_explicit_matching_namespace_for_every_resource_kind() 
                 let mut body = serde_json::json!({});
                 body[section] = serde_json::json!([row]);
                 let result = BackupSnapshot::from_scoped_body(&body.to_string(), namespace);
-                assert_eq!(result.is_ok(), wire_namespace == Some(namespace), "{result:?}");
+                assert_eq!(
+                    result.is_ok(),
+                    wire_namespace == Some(namespace),
+                    "{result:?}"
+                );
                 if let Err(error) = result {
                     assert!(error.to_string().contains("row"));
                 }

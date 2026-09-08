@@ -174,7 +174,8 @@ fn verdict_summary(
         md.push_str(&format!(
             "- Secret Broker Slots: {} total, {missing} missing required (blocking), \
              {} awaiting generation (requires provisioning environment).\n",
-            secrets.results.len(), secrets.needs_allocation().len(),
+            secrets.results.len(),
+            secrets.needs_allocation().len(),
         ));
     } else {
         md.push_str(&format!(

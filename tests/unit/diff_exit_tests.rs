@@ -1037,7 +1037,13 @@ fn ownership_preview_excludes_managed_and_spec_owned_rows_and_shows_pending_asse
     use gitforgeops::diff::resource_diff::state_key;
     use gitforgeops::state::StateFile;
 
-    for situation in ["managed", "pending", "spec-owned", "different", "full-replace"] {
+    for situation in [
+        "managed",
+        "pending",
+        "spec-owned",
+        "different",
+        "full-replace",
+    ] {
         let mut state = StateFile::default();
         let key = state_key("ferrum", "Proxy", "app");
         if situation == "managed" {
