@@ -2087,8 +2087,8 @@ fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     if plugin_name == "otel_tracing" {
         config.plugin_configs[0].config["endpoint"] =
