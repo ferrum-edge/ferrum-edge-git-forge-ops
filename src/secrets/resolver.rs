@@ -520,8 +520,9 @@ pub(crate) fn consumer_credential_slot(
 /// does not change which field a leaf is, so callers carry `leaf` through
 /// array recursion unchanged.
 ///
-/// One definition, four callers, deliberately: the resolver (never broker an
-/// identity), `import`'s capture walk (never redact one out of the file), the
+/// One classification shared by resolution's whole-document preflight (reject
+/// identity placeholders in strict and lenient walks), generation/rotation,
+/// `import`'s capture walk (never redact a literal identity out of the file), the
 /// validator-output scrubber (never black out the field that says which
 /// credential an error is about) and the pre-resolve security audit
 /// ([`crate::diff::security`], never block `apply` on one). Any two of those
@@ -532,6 +533,64 @@ pub(crate) fn is_identity_credential_leaf(credential_type: &str, leaf: Option<&s
         (credential_type, leaf),
         ("basicauth", Some("username")) | ("mtls_auth", Some("identity"))
     )
+}
+
+/// Reject broker syntax in public credential identities before any bundle
+/// lookup, substitution or side effect. Also used at the CLI load boundary:
+/// plain export and inspect-only previews must enforce the same contract.
+/// Literal identities remain readable repository data.
+pub fn validate_identity_placeholders(cfg: &GatewayConfig) -> crate::error::Result<()> {
+    for consumer in &cfg.consumers {
+        for (credential_type, value) in &consumer.credentials {
+            let mut components = vec![
+                SlotComponent::Literal(&consumer.namespace),
+                SlotComponent::Literal(&consumer.id),
+                SlotComponent::Literal(credential_type),
+            ];
+            check_identity_placeholders(value, &mut components, credential_type, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_identity_placeholders<'a>(
+    value: &'a serde_json::Value,
+    components: &mut Vec<SlotComponent<'a>>,
+    credential_type: &str,
+    leaf: Option<&str>,
+) -> crate::error::Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            // Include malformed/embedded broker syntax: it must not become a
+            // literal identity merely because the placeholder parser refuses it.
+            if is_identity_credential_leaf(credential_type, leaf)
+                && text.contains("${gh-env-secret:")
+            {
+                let slot = join_slot_components(components);
+                return Err(crate::error::Error::Config(format!(
+                    "credential slot '{slot}': identity fields must be supplied literally; \
+                     broker placeholders are forbidden. Author the public username or mTLS \
+                     identity in the resource YAML and retire its old bundle slot."
+                )));
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, child) in fields {
+                components.push(SlotComponent::Literal(key));
+                check_identity_placeholders(child, components, credential_type, Some(key))?;
+                components.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                components.push(SlotComponent::ArrayIndex(index));
+                check_identity_placeholders(child, components, credential_type, leaf)?;
+                components.pop();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Capture every string credential leaf under its canonical broker slot and
@@ -871,9 +930,9 @@ pub fn report_secrets_with_options(
 /// but the preflight walks the *whole* assembled config to find it — so an
 /// unrelated consumer holding, say, a `len=16` `jwt` generate placeholder
 /// would abort a rotation that has nothing to do with it. Structural errors
-/// (malformed placeholders, `[REDACTED]` bundle values, slot collisions) are
-/// still hard failures in both variants, because those make the report itself
-/// untrustworthy.
+/// (identity placeholders, malformed placeholders, `[REDACTED]` bundle values,
+/// slot collisions) are still hard failures in both variants, because those
+/// make the report itself untrustworthy.
 ///
 /// `plan`/`diff`/`apply` keep using strict [`report_secrets`]: there the
 /// constraint really is fatal, since apply would otherwise write a GitHub
@@ -918,6 +977,7 @@ fn report_secrets_with_mode_inner(
     constraints: ConstraintMode,
     options: ResolveOptions,
 ) -> crate::error::Result<ResolveReport> {
+    validate_identity_placeholders(cfg)?;
     let mut report = ResolveReport::default();
     for consumer in &cfg.consumers {
         let namespace = &consumer.namespace;
@@ -1023,8 +1083,21 @@ pub fn resolve_secrets_with_mode(
 }
 
 /// [`resolve_secrets`] with both the gateway mode and the slot-remap verdict
-/// supplied explicitly.
+/// supplied explicitly. Any error leaves the entire input unchanged.
 pub fn resolve_secrets_with_mode_and_options(
+    cfg: &mut GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
+    options: ResolveOptions,
+) -> crate::error::Result<ResolveReport> {
+    validate_identity_placeholders(cfg)?;
+    let mut candidate = cfg.clone();
+    let report = resolve_secrets_in_place(&mut candidate, bundle, mode, options)?;
+    *cfg = candidate;
+    Ok(report)
+}
+
+fn resolve_secrets_in_place(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
     mode: GatewayMode,

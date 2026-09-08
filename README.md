@@ -764,13 +764,15 @@ Removal is asymmetric on the gateway side: omitting `keyauth`, `jwt`, `hmac_auth
 
 ### What the broker will and won't generate
 
-Generation constraints are shared by the resolver and allocator: `plan` checks pending allocations, and allocation/rotation checks every new value before GitHub key discovery or secret writes. Seeded values keep resolving regardless of allocation mode:
+Generation constraints are shared by the resolver and allocator: `plan` checks pending allocations, and allocation/rotation checks every new value before GitHub key discovery or secret writes. Seeded secret values keep resolving regardless of allocation mode; identity placeholders are always refused:
 
 - `jwt` / `hmac_auth` need ≥32-character secrets, so `len=` must be at least 24 entropy bytes. The default `len=32` yields 43 base64url characters.
 - `basicauth` in **file mode** is refused: a file-mode gateway requires `password_hash`, and that hash is an HMAC-SHA256 under the gateway's own `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not have. Set the hash by hand, or use api mode where the admin API hashes a plaintext password on write.
 - `basicauth/…/password_hash` is refused in either mode, for the same reason.
 - A bundle value of `[REDACTED]` is refused — that is what a plain `GET /consumers/…` returns for `keyauth`/`jwt`/`hmac_auth` secrets, so a bundle holding it was seeded from the wrong endpoint. Re-seed from `GET /backup` or rotate the slot.
-- `mtls_auth.identity` and `basicauth.username` are public identities: supply them literally. They cannot be generated or rotated.
+- `mtls_auth.identity` and `basicauth.username` are public identities: supply them literally. Broker placeholders are refused even with `alloc=require` and a seeded bundle, in both gateway modes and inspect-only previews. They cannot be generated or rotated.
+
+**Compatibility note for the next release:** repositories that brokered either identity leaf now fail before resolution or side effects, including plain export. Replace the placeholder with the intended public identity in resource/overlay YAML and retire the old identity slot from the bundle without shifting credential-array entries. If an earlier run materialized that slot, treat its value as potentially disclosed in validator logs or PR output and replace any affected authentication secret through its owning system. See [credential identity migration and command coverage](docs/credential-identities.md).
 
 ### Placeholder syntax
 

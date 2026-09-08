@@ -4,8 +4,8 @@ pub mod standin;
 
 pub use reporter::{format_result, format_results, OutputFormat};
 pub use runner::{
-    build_validate_args_for_mode, run_mesh_validation, run_validation, scrubbed_env_names,
-    ValidationResult, GATEWAY_VALIDATE_MODE, MESH_VALIDATE_MODE,
+    build_validate_args_for_mode, run_mesh_validation, run_validation, run_validation_with_report,
+    scrubbed_env_names, ValidationResult, GATEWAY_VALIDATE_MODE, MESH_VALIDATE_MODE,
 };
 pub use standin::{
     validation_standin, validation_url_standin, with_validation_standins, VALIDATION_STANDIN_HOST,

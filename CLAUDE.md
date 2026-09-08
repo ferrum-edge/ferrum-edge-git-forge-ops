@@ -130,9 +130,10 @@ pipeline, both because resolution has already run by then:
   the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
   no other output path ever sees a stand-in.
 - `secrets::SecretScrubber` collects every non-placeholder Consumer credential
-  leaf (minus the identity fields `basicauth[].username` /
-  `mtls_auth[].identity`) and every `sensitive_string_paths` plugin-config
-  leaf, and removes those exact byte sequences — plus their base64 and
+  leaf (minus literal identity fields), every `sensitive_string_paths`
+  plugin-config leaf and modeled service-discovery secret, plus values at all
+  successfully resolved slots when paired with a `ResolveReport`. It removes
+  those exact byte sequences — plus their base64 and
   percent-encoded forms — from the validator child's stdout/stderr, replacing
   each with `[REDACTED]`. Non-credential diagnostics stay intact. Blanket
   suppression survives only as a fallback for a secret shorter than
@@ -452,12 +453,28 @@ generate and a resource file cannot omit and still say which credential it
 describes. `secrets::resolver::is_identity_credential_leaf(credential_type,
 leaf)` is the single classifier, keyed on the credential type *and* the leaf
 key together (a `username` under a custom credential type is still a secret).
-Four callers must agree or a config becomes acceptable to one command and
-refused by another: the resolver (never broker one), `import`'s capture walk
-(never redact one out of the file), `secrets::scrubber` (never black one out of
-a validator diagnostic), and `diff::security::check_literal_credentials` (never
-block `apply` on one). That last one carries the credential type and leaf key
-down the walk separately from the human-readable diagnostic path.
+The resolver's whole-document `validate_identity_placeholders` preflight rejects
+broker syntax in these leaves before either the read-only (including lenient)
+or mutating walk. The CLI also calls it after overlay/namespace selection in
+`load_and_assemble_all`, covering plain export and inspect-only apply before
+bundle reads, state locks, validation or allocation. Rotate loads through that
+boundary before its bundle/state preflight. There is no allocation-mode,
+seeded-bundle or slot-remap exception. A diagnostic names only the canonical
+slot and the literal-identity remedy. Mutating resolution works on a candidate
+copy and commits it only on success, so any failure leaves the entire input
+unchanged, including leaves visited before the error.
+
+The same classifier governs generation/rotation, `import`'s capture walk (keep
+literal identities), `secrets::scrubber` (keep literal identities readable), and
+`diff::security::check_literal_credentials` (never flag literal identities).
+The classifier uses the credential type and enclosing leaf key, carrying that
+key through arrays; rendered diagnostic paths never decide classification.
+Validator calls on resolved snapshots additionally pass their `ResolveReport`
+to the scrubber: every resolved canonical slot contributes its actual value,
+even when it resembles a placeholder or has a nonsensitive field name. Reports
+retain no secret values. File-mode apply validates its unresolved publication
+document and does not pair it with a resolved-snapshot report. See
+`docs/credential-identities.md` for the command-boundary audit and migration.
 
 Generation constraints, shared by `resolver::check_generation_allowed` and the
 allocator so `plan` and generation cannot disagree: `jwt`/`hmac_auth` secrets
@@ -469,7 +486,8 @@ The allocator validates the entire candidate batch before GitHub key discovery,
 including direct callers and lenient reports. Structural types must agree with
 the encoded slot. The same policy rejects non-generatable discovery secrets
 using `SD_SECRET_FIELDS`, and rejects generation of public identity fields.
-Already-seeded slots still resolve regardless of their allocation mode.
+Already-seeded secret slots still resolve regardless of their allocation mode;
+public identity leaves reject broker syntax even when seeded.
 
 `allocator::check_rotation_allowed` additionally restricts rotation to Consumer
 `keyauth/key`, `jwt/secret`, `hmac_auth/secret` and api-mode `basicauth/password`,

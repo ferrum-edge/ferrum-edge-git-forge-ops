@@ -164,6 +164,234 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+#[cfg(unix)]
+#[test]
+fn identity_broker_cli_refuses_before_validator_network_or_file_side_effects() {
+    for (kind, leaf) in [("basicauth", "username"), ("mtls_auth", "identity")] {
+        for alloc in ["require", "generate", "rotate"] {
+            for seeded in [false, true] {
+                let consumer = format!(
+                    "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    keyauth:\n      - key: '${{gh-env-secret:alloc=generate}}'\n    {kind}:\n      - {leaf}: public-first\n      - {leaf}: '${{gh-env-secret:alloc={alloc}}}'\n"
+                );
+                let repo = Repo::with_consumer(&consumer);
+                std::fs::write(
+                    &repo.validator,
+                    "#!/bin/sh\ntouch validator-ran\ncat \"$7\"\ncat \"$7\" >&2\nexit 1\n",
+                )
+                .unwrap();
+                let slot = format!("ferrum/app/{kind}/[1]/{leaf}");
+                let bundle = if seeded {
+                    serde_json::json!({"FERRUM_CREDS_BUNDLE": {
+                        (slot.clone()): "synthetic-identity-bundle-value",
+                        "ferrum/app/keyauth/key": "synthetic-sibling-bundle-value"
+                    }})
+                } else {
+                    serde_json::json!({})
+                }
+                .to_string();
+                let bundle_path = repo.dir.path().join("bundle.json");
+                std::fs::write(&bundle_path, &bundle).unwrap();
+                std::fs::create_dir_all(repo.published().parent().unwrap()).unwrap();
+                std::fs::write(repo.published(), "existing output must survive").unwrap();
+                // All remote requests, including GitHub key discovery and PR
+                // delivery, are trapped on loopback. Refusal must send none.
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let endpoint = format!("http://{}", listener.local_addr().unwrap());
+                for mode in ["api", "file"] {
+                    for args in [
+                        vec!["validate"],
+                        vec!["validate", "--format", "json"],
+                        vec!["validate", "--format", "github-annotations"],
+                        vec!["plan"],
+                        vec!["diff", "--exit-on-drift"],
+                        vec!["review", "--pr", "1"],
+                        // No --auto-approve: exercise inspect-only apply too.
+                        vec!["apply"],
+                        vec!["apply", "--auto-approve"],
+                        vec!["export", "--output", "export.yaml"],
+                        vec!["export", "--materialize", "--output", "export.yaml"],
+                        vec!["export", "--materialize", "--encrypt-to", "fixture"],
+                        vec![
+                            "rotate",
+                            "--consumer",
+                            "app",
+                            "--credential",
+                            "keyauth/key",
+                            "--recipient",
+                            "fixture",
+                        ],
+                    ] {
+                        let output = repo.run(
+                            &args,
+                            &[
+                                ("FERRUM_GATEWAY_MODE", mode),
+                                ("FERRUM_GATEWAY_URL", &endpoint),
+                                ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
+                                (
+                                    "FERRUM_ADMIN_JWT_SECRET",
+                                    "synthetic-admin-secret-at-least-32-bytes",
+                                ),
+                                ("FERRUM_CREDS_JSON_FILE", bundle_path.to_str().unwrap()),
+                                ("GITHUB_REPOSITORY", "test/fixture"),
+                                ("GITHUB_TOKEN", "synthetic-token"),
+                                ("FERRUM_GH_PROVISIONER_TOKEN", "synthetic-token"),
+                                ("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", "1"),
+                                ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "1"),
+                                ("HTTPS_PROXY", &endpoint),
+                                ("HTTP_PROXY", &endpoint),
+                                ("ALL_PROXY", &endpoint),
+                                ("NO_PROXY", ""),
+                            ],
+                        );
+                        let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
+                        assert!(!output.status.success(), "{mode} {args:?}: {diagnostic}");
+                        assert!(diagnostic.contains(&slot), "{mode} {args:?}: {diagnostic}");
+                        assert!(diagnostic.contains("supplied literally"), "{diagnostic}");
+                        assert!(!diagnostic.contains("synthetic-"), "{diagnostic}");
+                        assert!(!repo.dir.path().join("validator-ran").exists());
+                        assert!(!repo.dir.path().join(".state").exists());
+                        assert!(!repo.dir.path().join("export.yaml").exists());
+                        assert_eq!(
+                            std::fs::read_to_string(repo.published()).unwrap(),
+                            "existing output must survive"
+                        );
+                        assert_eq!(std::fs::read_to_string(&bundle_path).unwrap(), bundle);
+                        assert_eq!(
+                            std::fs::read_to_string(
+                                repo.dir.path().join("resources/ferrum/consumers/app.yaml")
+                            )
+                            .unwrap(),
+                            consumer
+                        );
+                        assert_eq!(
+                            listener.accept().unwrap_err().kind(),
+                            std::io::ErrorKind::WouldBlock,
+                            "{mode} {args:?} must refuse before GitHub/gateway traffic"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_identity_cli_diagnostics_remain_readable_with_a_loaded_bundle() {
+    for (consumer, identity, bundle) in [
+        (BASICAUTH_IDENTITY_CONSUMER, "alice", BASICAUTH_BUNDLE),
+        (MTLS_IDENTITY_CONSUMER, "client.example", "{}"),
+    ] {
+        // Stale, unused identity slots must not make literal identities secret
+        // by value association with the bundle. Only substituted slots count.
+        let mut bundle: serde_json::Value = serde_json::from_str(bundle).unwrap();
+        if bundle.get("FERRUM_CREDS_BUNDLE").is_none() {
+            bundle["FERRUM_CREDS_BUNDLE"] = serde_json::json!({});
+        }
+        let key = if identity == "alice" {
+            "ferrum/app/basicauth/username"
+        } else {
+            "ferrum/app/mtls_auth/identity"
+        };
+        bundle["FERRUM_CREDS_BUNDLE"][key] = serde_json::json!(identity);
+        let bundle = bundle.to_string();
+        for mode in ["api", "file"] {
+            let repo = Repo::with_consumer(consumer);
+            std::fs::write(
+                &repo.validator,
+                "#!/bin/sh\ntouch validator-ran\ncat \"$7\"\necho 'error: synthetic schema rejection' >&2\ncat \"$7\" >&2\nexit 1\n",
+            )
+            .unwrap();
+            for args in [
+                vec!["validate"],
+                vec!["plan"],
+                vec!["review"],
+                vec!["apply", "--auto-approve"],
+            ] {
+                let output = repo.run(
+                    &args,
+                    &[("FERRUM_GATEWAY_MODE", mode), ("FERRUM_CREDS_JSON", &bundle)],
+                );
+                let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
+                // Ordinary review reports a schema rejection in its comment
+                // and only fails the command for a validator execution error.
+                if args[0] != "review" {
+                    assert!(!output.status.success(), "stub validator must reject");
+                }
+                assert!(repo.dir.path().join("validator-ran").exists());
+                assert!(diagnostic.contains(identity), "{mode} {args:?}: {diagnostic}");
+                assert!(
+                    diagnostic.contains("synthetic schema rejection"),
+                    "{diagnostic}"
+                );
+                assert!(
+                    !diagnostic.contains("hmac_sha256:0123456789abcdef"),
+                    "{diagnostic}"
+                );
+                assert!(!diagnostic.contains("Literal credential"), "{diagnostic}");
+                assert!(!repo.published().exists());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_validator_uses_resolution_provenance_for_every_substituted_leaf() {
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/consumers/app.yaml", MTLS_IDENTITY_CONSUMER),
+        (
+            "resources/ferrum/plugins/opaque.yaml",
+            "kind: PluginConfig\nspec:\n  id: opaque\n  plugin_name: custom_fixture\n  scope: global\n  config:\n    display_mode: '${gh-env-secret:alloc=require}'\n",
+        ),
+    ]);
+    std::fs::write(
+        &repo.validator,
+        "#!/bin/sh\ncat \"$7\"\necho 'error: synthetic schema rejection' >&2\ncat \"$7\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    // This value lives in an otherwise nonsensitive field. Only provenance
+    // proves it came from the bundle; classifying the resolved field cannot.
+    let bundle = r#"{"FERRUM_CREDS_BUNDLE": {
+        "ferrum/opaque/@plugin-config/config/display_mode": "synthetic-provenance-only-value"
+    }}"#;
+    for mode in ["api", "file"] {
+        for args in [
+            vec!["validate"],
+            vec!["plan"],
+            vec!["review"],
+            vec!["apply", "--auto-approve"],
+        ] {
+            if mode == "file" && args[0] == "apply" {
+                continue; // File apply validates its unresolved publication document.
+            }
+            let output = repo.run(
+                &args,
+                &[("FERRUM_GATEWAY_MODE", mode), ("FERRUM_CREDS_JSON", bundle)],
+            );
+            let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
+            if args[0] != "review" {
+                assert!(!output.status.success());
+            }
+            assert!(
+                !diagnostic.contains("synthetic-provenance-only-value"),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("[REDACTED]"),
+                "{mode} {args:?}: {diagnostic}"
+            );
+            assert!(diagnostic.contains("client.example"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("synthetic schema rejection"),
+                "{diagnostic}"
+            );
+            assert!(!repo.published().exists());
+        }
+    }
+}
+
 #[test]
 fn supplied_pr_and_revision_cannot_authorize_any_caller_without_evidence() {
     let repo = Repo::with_files(&[

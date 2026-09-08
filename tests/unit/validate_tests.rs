@@ -196,6 +196,131 @@ fn credential_identity_fields_are_not_redacted() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn provenance_scrubs_legacy_brokered_identities_without_hiding_literal_identities() {
+    use gitforgeops::secrets::{parse_placeholder, ResolveReport, ResolveResult, SlotStatus};
+
+    // The resolver now refuses this input. Model a legacy resolved snapshot
+    // directly to prove that the output defense does not trust classification
+    // alone or blanket-redact every identity in the same document.
+    let config = consumer_config(serde_json::json!({
+        "basicauth": [
+            {"username": "synthetic-legacy-login-secret"},
+            {"username": "public-login"}
+        ],
+        "mtls_auth": [
+            {"identity": "synthetic-legacy-mtls-secret"},
+            {"identity": "public-client.example"}
+        ]
+    }));
+    let mut report = ResolveReport::default();
+    for cred_key in ["basicauth/username", "mtls_auth/identity"] {
+        report.results.push(ResolveResult {
+            consumer_id: "app".to_string(),
+            namespace: "ferrum".to_string(),
+            cred_key: cred_key.to_string(),
+            slot: format!("ferrum/app/{cred_key}"),
+            placeholder: parse_placeholder("${gh-env-secret:alloc=require}")
+                .unwrap()
+                .unwrap(),
+            status: SlotStatus::Resolved,
+        });
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "legacy-echo", ECHO_SPEC_WITH_PROXY_ERROR);
+    let result = gitforgeops::validate::run_validation_with_report(
+        &config,
+        validator.to_str().unwrap(),
+        &report,
+    )
+    .unwrap();
+    let review = gitforgeops::review::validate_for_review_with_report(
+        &config,
+        None,
+        validator.to_str().unwrap(),
+        &report,
+    );
+    for output in [&result.stdout, &result.stderr, &review.output] {
+        assert!(!output.contains("synthetic-legacy-"), "{output}");
+        assert!(output.contains("public-login"), "{output}");
+        assert!(output.contains("public-client.example"), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scrubber_provenance_preserves_canonical_indexed_escaped_slots_and_unresolved_siblings() {
+    use gitforgeops::secrets::{resolve_secrets, SecretScrubber};
+    use std::collections::BTreeMap;
+
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let mut config = consumer_config(serde_json::json!({
+        "basicauth": [{"username": "public-login"}],
+        "keyauth": [
+            {"key": placeholder, "a/b~[1]": placeholder, "unseeded": placeholder},
+            {"key": placeholder}
+        ]
+    }));
+    config.plugin_configs.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "plugin", "namespace": "ferrum", "plugin_name": "custom", "scope": "global",
+            "config": {"a/b~[1]": ["public-mode", placeholder]}
+        }))
+        .unwrap(),
+    );
+    config.upstreams.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "discovery", "namespace": "ferrum", "targets": [],
+            "service_discovery": {"provider": "consul", "consul": {
+                "address": "https://consul.example", "service_name": "orders", "token": placeholder
+            }}
+        }))
+        .unwrap(),
+    );
+    let slots = [
+        "ferrum/app/keyauth/key",
+        "ferrum/app/keyauth/a~1b~0~21]",
+        "ferrum/app/keyauth/[1]/key",
+        "ferrum/plugin/@plugin-config/config/a~1b~0~21]/[1]",
+        "ferrum/discovery/@service-discovery/consul/token",
+    ];
+    let bundle: BTreeMap<String, String> = slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            (
+                slot.to_string(),
+                format!("${{gh-env-secret:alloc=require|len={}}}", 48 + index),
+            )
+        })
+        .collect();
+    let report = resolve_secrets(&mut config, &bundle).unwrap();
+    assert_eq!(report.results.len(), 6);
+    assert_eq!(report.missing_required().len(), 1);
+    for slot in slots {
+        assert!(report.results.iter().any(|result| result.slot == slot));
+    }
+    let scrubber = SecretScrubber::from_gateway_config_with_report(&config, &report);
+    let text = format!(
+        "public-login public-mode {placeholder} {}",
+        bundle.values().cloned().collect::<Vec<_>>().join(" ")
+    );
+    let output = scrubber.scrub_streams(&text, &text);
+    assert!(output.suppressed.is_none(), "{output:?}");
+    for text in [&output.stdout, &output.stderr] {
+        for value in bundle.values() {
+            assert!(!text.contains(value), "{text}");
+        }
+        assert!(
+            text.contains(placeholder),
+            "unresolved sibling must stay public: {text}"
+        );
+        assert!(text.contains("public-login public-mode"), "{text}");
+    }
+}
+
 /// F2: plugin-config secrets brokered by this release are scrubbed too, while
 /// the plugin's non-sensitive settings stay visible.
 #[cfg(unix)]

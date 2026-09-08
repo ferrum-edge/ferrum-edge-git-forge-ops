@@ -172,10 +172,29 @@ pub fn run_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config(config);
+    run_gateway_validation(config, binary_path, &scrubber)
+}
+
+/// Validate a resolved snapshot using both literal-secret classification and
+/// the corresponding resolver report as redaction provenance.
+pub fn run_validation_with_report(
+    config: &GatewayConfig,
+    binary_path: &str,
+    report: &crate::secrets::ResolveReport,
+) -> crate::error::Result<ValidationResult> {
+    let scrubber = SecretScrubber::from_gateway_config_with_report(config, report);
+    run_gateway_validation(config, binary_path, &scrubber)
+}
+
+fn run_gateway_validation(
+    config: &GatewayConfig,
+    binary_path: &str,
+    scrubber: &SecretScrubber,
+) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
     let standins = crate::validate::standin::with_validation_standins(config);
     let yaml = serde_yaml::to_string(standins.as_ref().unwrap_or(config))?;
-    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, &scrubber)
+    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, scrubber)
 }
 
 /// Validate the standalone mesh document with
