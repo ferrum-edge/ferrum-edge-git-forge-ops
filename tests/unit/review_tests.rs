@@ -1506,7 +1506,10 @@ fn the_mesh_retraction_banner_names_the_destination_and_the_outcome() {
 
     let unattributed = render_mesh_retraction(MeshPublication::Unattributed, path);
     let unattributed = unattributed.expect("a skipped retraction is reported");
-    assert!(unattributed.contains("RETRACT mesh: skipped"), "{unattributed}");
+    assert!(
+        unattributed.contains("RETRACT mesh: skipped"),
+        "{unattributed}"
+    );
 
     let narrowed = render_mesh_retraction(MeshPublication::NarrowedScope, path);
     let narrowed = narrowed.expect("a skipped retraction is reported");

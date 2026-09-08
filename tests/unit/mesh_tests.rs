@@ -912,7 +912,11 @@ fn an_unattributed_destination_is_reported_and_left_untouched() {
 
         let publication = reconcile_mesh_file(None, path, whole_repository(false));
 
-        assert_eq!(publication.unwrap(), MeshPublication::Unattributed, "{foreign:?}");
+        assert_eq!(
+            publication.unwrap(),
+            MeshPublication::Unattributed,
+            "{foreign:?}"
+        );
         assert_eq!(read(&target), foreign);
     }
 }
@@ -1005,7 +1009,10 @@ fn a_retraction_that_cannot_be_written_is_an_error_not_a_silent_success() {
 
     let result = reconcile_mesh_file(None, path, whole_repository(true));
 
-    assert!(result.is_err(), "a failed retraction must not report success");
+    assert!(
+        result.is_err(),
+        "a failed retraction must not report success"
+    );
     assert!(target.is_dir(), "the destination is left as it was");
 }
 
