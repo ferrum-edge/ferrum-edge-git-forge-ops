@@ -59,6 +59,15 @@ pub struct StateFile {
     pub credential_shard_count: u32,
     #[serde(default)]
     pub overrides: Vec<OverrideRecord>,
+    /// The mesh-document destination this repository has published to, if it
+    /// ever has. It is the *attribution* record for
+    /// `FERRUM_MESH_FILE_OUTPUT_PATH`: retraction (rewriting the destination
+    /// as an empty mesh document once the last `MeshConfig` fragment is gone)
+    /// only ever touches a path gitforgeops itself wrote. Holds a path, never
+    /// any mesh content — the document is a public artifact, but the ledger is
+    /// not where it lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_document_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -88,6 +97,7 @@ impl Default for StateFile {
             credentials: HashMap::new(),
             credential_shard_count: default_shard_count(),
             overrides: Vec::new(),
+            mesh_document_path: None,
         }
     }
 }
@@ -639,6 +649,28 @@ impl StateFile {
                 review_id: Some(review),
             });
         }
+    }
+
+    /// True when this repository is on record as the publisher of the mesh
+    /// document at `output_path`.
+    ///
+    /// Retraction is a destructive rewrite of a path the operator configured,
+    /// so it is gated on provenance rather than on the file merely being
+    /// there. An environment that never declared a `MeshConfig` fragment — or
+    /// one whose destination was repointed at a file somebody else owns —
+    /// answers `false` and is left alone.
+    pub fn publishes_mesh_document(&self, output_path: &str) -> bool {
+        self.mesh_document_path.as_deref() == Some(output_path)
+    }
+
+    /// Record `output_path` as this repository's mesh-document destination.
+    ///
+    /// Called for a retraction as well as an ordinary publish: a retracted
+    /// document is still a gitforgeops artifact sitting at that path, and
+    /// forgetting it would make the very next run report the empty document it
+    /// just wrote as somebody else's file.
+    pub fn record_mesh_publication(&mut self, output_path: &str) {
+        self.mesh_document_path = Some(output_path.to_string());
     }
 
     pub fn previously_managed_keys(&self) -> std::collections::HashSet<String> {
