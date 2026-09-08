@@ -741,6 +741,8 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         config: serde_json::json!({
             "mode": "strict",
             "opaque": {"value": "probably-a-tuning-knob"},
+            "signing_key": "custom-unclassified-material",
+            "extra_headers": {"x-vendor-auth": "custom-unclassified-header"},
             "api_key": "live-vendor-key",
             "headers": {"x-vendor-auth": "live-vendor-header"}
         }),
@@ -770,6 +772,8 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     assert!(!plugin_yaml.contains("live-vendor-header"), "{plugin_yaml}");
     // The plugin still says what it does.
     assert!(plugin_yaml.contains("strict"), "{plugin_yaml}");
+    assert!(plugin_yaml.contains("custom-unclassified-material"));
+    assert!(plugin_yaml.contains("custom-unclassified-header"));
     assert!(
         plugin_yaml.contains("probably-a-tuning-knob"),
         "{plugin_yaml}"
@@ -780,11 +784,12 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     assert!(notice.contains("plugin_name=enterprise_custom"), "{notice}");
     assert!(notice.contains("mode"), "{notice}");
     assert!(notice.contains("opaque.value"), "{notice}");
+    assert!(notice.contains("signing_key"), "{notice}");
+    assert!(notice.contains("extra_headers.x-vendor-auth"), "{notice}");
     assert!(!notice.contains("api_key"), "{notice}");
 }
 
-/// A builtin plugin's schema rules are authoritative, so there is nothing for
-/// a human to review afterwards.
+/// Schema-covered builtin secrets are brokered without a plaintext allowance.
 #[test]
 fn builtin_plugin_import_raises_no_review_notice() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -2020,10 +2025,9 @@ fn the_plaintext_allowance_matches_plugin_names_exactly() {
     }
 }
 
-/// A builtin plugin's schema rules are authoritative, so the gate never fires
-/// for one — with or without the flag.
+/// Ordinary builtin settings do not require a plaintext allowance.
 #[test]
-fn builtin_plugins_are_unaffected_by_the_plaintext_gate() {
+fn builtin_plugins_without_secret_looking_leaves_import_silently() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
@@ -2058,4 +2062,129 @@ fn builtin_plugins_are_unaffected_by_the_plaintext_gate() {
     assert!(result.custom_plugin_review_notice().is_none());
     let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/otel.yaml")).unwrap();
     assert!(plugin_yaml.contains("sample_rate"), "{plugin_yaml}");
+}
+
+fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf {
+    let backup_path = source.join("backup.yaml");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        extra: Default::default(),
+        id: "builtin".to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({
+            "signing_key": "synthetic-signing-material",
+            "nested": [{
+                "api_key": "synthetic-api-material",
+                "dsn": "https://user:synthetic-password@vendor.example/hook"
+            }],
+            "extra_headers": {"x-vendor-auth": "synthetic-header-material"},
+            "mode": "strict"
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
+    });
+    if plugin_name == "otel_tracing" {
+        config.plugin_configs[0].config["endpoint"] =
+            serde_json::json!("https://collector.example/v1/traces?token=synthetic-endpoint");
+    }
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    backup_path
+}
+
+#[test]
+fn builtin_unbrokered_secrets_block_before_tree_or_bundle_publication() {
+    // Exercise both a builtin without rules and one with existing schema rules.
+    for plugin_name in ["a2a_gateway", "otel_tracing"] {
+        let source = tempfile::tempdir().unwrap();
+        let backup_path = builtin_plugin_backup(source.path(), plugin_name);
+        let destination = tempfile::tempdir().unwrap();
+        for allowed in [vec![], vec![format!("{plugin_name}_other")]] {
+            let output = destination.path().join("resources");
+            let bundle_path = destination.path().join("migration.json");
+            let error = gitforgeops::import::from_file::import_from_file(
+                &backup_path,
+                &output,
+                Some(&bundle_path),
+                &strict_passthrough(),
+                &allowed,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("refusing to import plaintext plugin config"));
+            assert!(error.contains(&format!("plugin_name={plugin_name}")));
+            assert!(error.contains("PluginConfig builtin"));
+            for path in [
+                "signing_key",
+                "nested.[0].api_key",
+                "nested.[0].dsn",
+                "extra_headers.x-vendor-auth",
+            ] {
+                assert!(error.contains(path), "{error}");
+            }
+            assert!(!error.contains("synthetic-"), "{error}");
+            assert!(!output.exists());
+            assert!(!bundle_path.exists());
+        }
+    }
+}
+
+#[test]
+fn builtin_plaintext_allowance_writes_and_lists_unbrokered_paths() {
+    for plugin_name in ["a2a_gateway", "otel_tracing"] {
+        let source = tempfile::tempdir().unwrap();
+        let backup_path = builtin_plugin_backup(source.path(), plugin_name);
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("resources");
+        let bundle_path = destination.path().join("migration.json");
+        let result = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            Some(&bundle_path),
+            &strict_passthrough(),
+            &[plugin_name.to_string()],
+        )
+        .unwrap();
+
+        let expected_brokered = usize::from(plugin_name == "otel_tracing");
+        assert_eq!(result.redacted_plugin_config_values, expected_brokered);
+        let yaml = std::fs::read_to_string(output.join("ferrum/plugins/builtin.yaml")).unwrap();
+        assert!(yaml.contains("synthetic-signing-material"));
+        assert!(yaml.contains("synthetic-api-material"));
+        assert!(yaml.contains("synthetic-password"));
+        assert!(yaml.contains("synthetic-header-material"));
+        assert!(yaml.contains("mode: strict"));
+        assert!(!yaml.contains("synthetic-endpoint"));
+        if expected_brokered > 0 {
+            let bundle = std::fs::read_to_string(&bundle_path).unwrap();
+            let (values, _) = gitforgeops::secrets::load_bundles_from_env(&bundle).unwrap();
+            assert_eq!(
+                values["ferrum/builtin/@plugin-config/config/endpoint"],
+                "https://collector.example/v1/traces?token=synthetic-endpoint"
+            );
+        }
+        let notice = result
+            .custom_plugin_review_notice()
+            .expect("builtin review notice");
+        assert!(notice.contains(&format!("plugin_name={plugin_name}")));
+        assert!(notice.contains("--allow-plaintext-plugin-config"));
+        for path in [
+            "signing_key",
+            "nested.[0].api_key",
+            "nested.[0].dsn",
+            "extra_headers.x-vendor-auth",
+        ] {
+            assert!(notice.contains(path), "{notice}");
+        }
+        assert!(!notice.contains("synthetic-"), "{notice}");
+        assert!(!notice.contains("mode"), "{notice}");
+        assert!(!notice.contains("endpoint"), "{notice}");
+    }
 }

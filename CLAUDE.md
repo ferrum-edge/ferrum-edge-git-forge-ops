@@ -380,16 +380,24 @@ governing lists with a blocking `PolicyConfig` error, regardless of the configur
 finding severity. Omitted AI guardrail names still use their built-in defaults.
 
 Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
-is schema-first for the 82 builtins and heuristics-only for anything else: a
-non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
-flag, and the leaves they did not flag come back as
-`ImportResult::unbrokered_plugin_config`. Those **fail the import**
+brokers builtin leaves covered by `rules_for`; secret-looking key/URL heuristic
+matches outside those rules come back as `ImportResult::unbrokered_plugin_config`.
+The rule table is deliberately incomplete: builtin fallback also flags compound
+`*_key` names and extra/outbound/additional header maps. Ordinary builtin strings
+stay literal without a notice. Custom plugins retain their existing behavior:
+heuristic matches are brokered, and unflagged strings require review. Both kinds
+of unbrokered strings **fail the import**
 (`import::enforce_plaintext_plugin_config_allowance`) unless the operator
 passes `--allow-plaintext-plugin-config <plugin_name>` (repeatable, exact
 match), in which case they are written literally and listed in a per-plugin
 review notice. The refusal names the plugin id, `plugin_name` and every
 unclassified path, echoes no values, and writes nothing — not the tree, not
-the migration bundle. `apply` / `plan` are untouched by this gate.
+the migration bundle. `sensitive_string_paths` still includes builtin heuristic
+matches for redaction and security checks even when import requires allowance.
+`apply` / `plan` are untouched by this import-only gate. Schema rules include
+OAuth/OIDC client secrets and private keys, OIDC session encryption secrets,
+LDAP service-account passwords, and SOAP WS-Security Redis and UsernameToken
+credentials. Rule additions must be checked against the gateway's OpenAPI schemas.
 `basicauth[].username` and `mtls_auth[].identity` are never brokered in either
 path (`resolver::is_identity_credential_leaf`).
 

@@ -628,7 +628,7 @@ pub fn capture_and_redact_import_credentials(
     Ok(captured)
 }
 
-/// One non-builtin plugin's config strings that import left in place.
+/// One plugin's config strings that require plaintext allowance during import.
 #[derive(Debug, Clone)]
 pub struct UnbrokeredPluginConfig {
     pub namespace: String,
@@ -644,8 +644,7 @@ pub struct UnbrokeredPluginConfig {
 pub struct PluginConfigCapture {
     /// Slot → live value for every leaf moved into the private bundle.
     pub captured: CredentialBundle,
-    /// Per-plugin review lists for non-builtin plugins. Empty when the repo
-    /// imported only builtin plugins.
+    /// Per-plugin review lists for builtin or custom unbrokered strings.
     pub unbrokered: Vec<UnbrokeredPluginConfig>,
 }
 
@@ -654,8 +653,8 @@ pub struct PluginConfigCapture {
 ///
 /// The gateway's admin backup intentionally returns plugin configs raw. The
 /// classifier mirrors its schema-aware projection contract and fails closed
-/// for custom plugins, so OIDC/LDAP/Kafka/Redis/collector credentials and
-/// arbitrary authorization-header values cannot be committed by import.
+/// for builtin and custom plugins. Its unbrokered list must pass import's
+/// plaintext allowance gate before any resource or bundle is published.
 pub fn capture_and_redact_import_plugin_config_secrets(
     cfg: &mut GatewayConfig,
 ) -> crate::error::Result<PluginConfigCapture> {
