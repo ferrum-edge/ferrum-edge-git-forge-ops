@@ -105,15 +105,16 @@ pub enum Commands {
         /// which the strict loader would reject the files import just wrote.
         #[arg(long, value_name = "NAME")]
         accept_unknown_field: Vec<String>,
-        /// Accept unclassifiable plaintext config for this plugin, by exact
+        /// Accept unbrokered plaintext config for this plugin, by exact
         /// `plugin_name`. Repeatable.
         ///
-        /// gitforgeops has no schema for a plugin it does not recognize, so
-        /// only the key/URL sensitivity heuristics run over its config; a
-        /// vendor field they do not flag would otherwise be committed to Git
-        /// as written. Without this flag such an import fails, naming every
-        /// unclassified path. Pass the plugin name once you have read that
-        /// list and confirmed none of it is a credential.
+        /// Builtin plugins require this for secret-looking key/URL heuristic
+        /// matches outside their broker rules. Custom plugins require it for
+        /// strings the heuristics do not flag. Without this flag import fails
+        /// before writing the tree or bundle and lists the paths, never values.
+        /// After reviewing the source, accept only non-credentials; accepted
+        /// paths stay literal and appear in a review notice. Schema-covered
+        /// builtin secrets and custom heuristic matches are still brokered.
         #[arg(long, value_name = "PLUGIN_NAME")]
         allow_plaintext_plugin_config: Vec<String>,
     },

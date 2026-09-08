@@ -9,6 +9,106 @@ use gitforgeops::secrets::{
 
 const TEST_ED25519_PUBLIC_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJb/uPnYEeAChxZ067A7P02MTEz2XC9PmkknEGctaIuN";
+
+#[test]
+fn builtin_schema_credentials_are_brokered_and_excluded_from_plaintext_review() {
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for (plugin_name, config, expected) in [
+        (
+            "oauth2_introspection",
+            serde_json::json!({"providers": [{"client_auth": {
+                "client_secret": "synthetic-client-secret",
+                "private_key_pem": "synthetic-private-key"
+            }}]}),
+            2,
+        ),
+        (
+            "oidc_relying_party",
+            serde_json::json!({
+                "providers": [{"client_auth": {
+                    "client_secret": "synthetic-client-secret",
+                    "private_key_pem": "synthetic-private-key"
+                }}],
+                "session": {
+                    "encryption_secret": "synthetic-current-secret",
+                    "encryption_secret_previous": "synthetic-previous-secret"
+                }
+            }),
+            4,
+        ),
+        (
+            "ldap_auth",
+            serde_json::json!({"service_account_password": "synthetic-ldap-password"}),
+            1,
+        ),
+        (
+            "soap_ws_security",
+            serde_json::json!({
+                "redis_url": "redis://localhost:6379",
+                "redis_password": "synthetic-redis-password",
+                "username_token": {"credentials": [{
+                    "username": "public-login",
+                    "password": "synthetic-soap-password"
+                }]}
+            }),
+            3,
+        ),
+    ] {
+        let mut gateway: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "plugin_configs": [{
+                "id": "builtin",
+                "plugin_name": plugin_name,
+                "scope": "global",
+                "config": config
+            }]
+        }))
+        .unwrap();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        assert_eq!(capture.captured.len(), expected, "{plugin_name}");
+        // The credentials container also flags the SOAP username heuristically;
+        // only its password has an explicit broker rule.
+        if plugin_name == "soap_ws_security" {
+            assert_eq!(capture.unbrokered.len(), 1);
+            assert_eq!(
+                capture.unbrokered[0].paths,
+                vec!["username_token.credentials.[0].username"]
+            );
+        } else {
+            assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+        }
+        let written = gateway.plugin_configs[0].config.to_string();
+        assert!(!written.contains("synthetic-"), "{plugin_name}");
+        assert_eq!(
+            written.matches("${gh-env-secret:alloc=require}").count(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn builtin_unbrokered_heuristic_matches_stay_sensitive_to_the_scrubber() {
+    let gateway: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "builtin",
+            "plugin_name": "a2a_gateway",
+            "scope": "global",
+            "config": {
+                "signing_key": "synthetic-signing-material",
+                "api_key": "synthetic-api-material",
+                "mode": "visible-setting"
+            }
+        }]
+    }))
+    .unwrap();
+    let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+    assert_eq!(
+        scrubber.scrub("synthetic-signing-material synthetic-api-material visible-setting"),
+        "[REDACTED] [REDACTED] visible-setting"
+    );
+}
 const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
 
 #[test]
