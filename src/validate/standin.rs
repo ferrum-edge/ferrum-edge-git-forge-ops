@@ -240,7 +240,13 @@ fn substitute_plugin_leaves(
             for (key, child) in map.iter_mut() {
                 path.push(ConfigPathComponent::Key(key.clone()));
                 changed |= substitute_plugin_leaves(
-                    child, namespace, plugin_id, plugin_name, endpoints, path, eligible,
+                    child,
+                    namespace,
+                    plugin_id,
+                    plugin_name,
+                    endpoints,
+                    path,
+                    eligible,
                 );
                 path.pop();
             }
@@ -249,7 +255,13 @@ fn substitute_plugin_leaves(
             for (index, child) in items.iter_mut().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
                 changed |= substitute_plugin_leaves(
-                    child, namespace, plugin_id, plugin_name, endpoints, path, eligible,
+                    child,
+                    namespace,
+                    plugin_id,
+                    plugin_name,
+                    endpoints,
+                    path,
+                    eligible,
                 );
                 path.pop();
             }

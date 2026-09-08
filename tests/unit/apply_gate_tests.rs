@@ -548,8 +548,16 @@ esac
     assert!(!captured.contains("gitforgeops-validation-standin"));
     assert!(!repo.published().exists());
 
-    let apply = repo.run(&["apply", "--auto-approve"], &[("FERRUM_CREDS_JSON", bundle)]);
-    assert!(apply.status.success(), "{}{}", stdout(&apply), stderr(&apply));
+    let apply = repo.run(
+        &["apply", "--auto-approve"],
+        &[("FERRUM_CREDS_JSON", bundle)],
+    );
+    assert!(
+        apply.status.success(),
+        "{}{}",
+        stdout(&apply),
+        stderr(&apply)
+    );
     let captured = std::fs::read_to_string(repo.dir.path().join("validator-input.yaml")).unwrap();
     assert!(captured.contains("secret: gitforgeops-validation-standin-"));
     assert!(captured.contains("ldap_url: ldaps://gitforgeops-validation-standin.invalid/"));
@@ -558,11 +566,13 @@ esac
     assert!(published.contains("${gh-env-secret:alloc=require}"));
     assert!(!published.contains("gitforgeops-validation-standin"));
     assert_eq!(
-        std::fs::read_to_string(repo.dir.path().join("resources/ferrum/consumers/app.yaml")).unwrap(),
+        std::fs::read_to_string(repo.dir.path().join("resources/ferrum/consumers/app.yaml"))
+            .unwrap(),
         consumer
     );
     assert_eq!(
-        std::fs::read_to_string(repo.dir.path().join("resources/ferrum/plugins/ldap.yaml")).unwrap(),
+        std::fs::read_to_string(repo.dir.path().join("resources/ferrum/plugins/ldap.yaml"))
+            .unwrap(),
         plugin
     );
 }

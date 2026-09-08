@@ -972,7 +972,9 @@ exit 0
             assert_eq!(result.exit_code, i32::from(!success));
             let captured = captured_validator_input(dir.path());
             let actual = if plugin {
-                captured.plugin_configs[0].config["ldap_url"].as_str().unwrap()
+                captured.plugin_configs[0].config["ldap_url"]
+                    .as_str()
+                    .unwrap()
             } else {
                 captured.consumers[0].credentials["jwt"][0]["secret"]
                     .as_str()
@@ -1073,7 +1075,10 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
             } else {
                 validation_standin(slot, None)
             };
-            assert_eq!(captured.plugin_configs[0].config["a/b~[1]"][index], expected);
+            assert_eq!(
+                captured.plugin_configs[0].config["a/b~[1]"][index],
+                expected
+            );
         }
         // Discovery has no stand-in contract: both resolved and unresolved
         // modeled fields must survive the validator hand-off verbatim.
