@@ -862,6 +862,158 @@ const GENERATE: &str = "${gh-env-secret:alloc=generate}";
 const REQUIRE: &str = "${gh-env-secret:alloc=require}";
 
 #[test]
+fn identity_placeholders_fail_before_resolution_in_every_walk() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_lenient, report_secrets_with_mode_and_options,
+        resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    for (credential_type, leaf) in [("basicauth", "username"), ("mtls_auth", "identity")] {
+        for placeholder in [
+            REQUIRE,
+            GENERATE,
+            "${gh-env-secret:alloc=rotate}",
+            "${gh-env-secret:alloc=synthetic-invalid-option}",
+            "${gh-env-secret:alloc=require",
+            "prefix-${gh-env-secret:alloc=require}",
+        ] {
+            for (value, path) in [
+                (
+                    entry(leaf, placeholder),
+                    format!("{credential_type}/{leaf}"),
+                ),
+                (
+                    serde_json::json!([entry(leaf, placeholder)]),
+                    format!("{credential_type}/{leaf}"),
+                ),
+                (
+                    serde_json::json!([entry(leaf, "public-first"), entry(leaf, placeholder)]),
+                    format!("{credential_type}/[1]/{leaf}"),
+                ),
+                (
+                    serde_json::json!([{leaf: ["public-first", placeholder]}]),
+                    format!("{credential_type}/{leaf}/[1]"),
+                ),
+            ] {
+                let mut cfg = consumer_with(credential_type, value);
+                cfg.consumers[0].namespace = "team/~[0]".to_string();
+                cfg.consumers[0].id = "app/~[1]".to_string();
+                // This valid, seeded consumer precedes the invalid one. A
+                // refusal in a later leaf must not leave this one substituted.
+                let mut earlier = consumer_with("keyauth", serde_json::json!([{ "key": REQUIRE }]));
+                earlier.consumers[0].id = "earlier".to_string();
+                cfg.consumers.insert(0, earlier.consumers.remove(0));
+                let original = serde_json::to_value(&cfg).unwrap();
+                let slot = slot_path("team/~[0]", "app/~[1]", &path);
+
+                for seeded in [false, true] {
+                    let mut bundle = BTreeMap::from([(
+                        "ferrum/earlier/keyauth/key".to_string(),
+                        "synthetic-earlier-secret-value".to_string(),
+                    )]);
+                    if seeded {
+                        bundle.insert(slot.clone(), "synthetic-identity-bundle-value".to_string());
+                    }
+                    for mode in [GatewayMode::Api, GatewayMode::File] {
+                        for allow_remap in [false, true] {
+                            let options = ResolveOptions::allowing_slot_remap(allow_remap);
+                            let errors = [
+                                report_secrets_with_mode_and_options(
+                                    &cfg,
+                                    &bundle,
+                                    mode.clone(),
+                                    options,
+                                )
+                                .unwrap_err(),
+                                report_secrets_lenient(&cfg, &bundle).unwrap_err(),
+                                resolve_secrets_with_mode_and_options(
+                                    &mut cfg,
+                                    &bundle,
+                                    mode.clone(),
+                                    options,
+                                )
+                                .unwrap_err(),
+                            ];
+                            for error in errors {
+                                assert!(matches!(error, gitforgeops::error::Error::Config(_)));
+                                let diagnostic = error.to_string();
+                                assert!(diagnostic.contains(&slot), "{diagnostic}");
+                                assert!(diagnostic.contains("supplied literally"), "{diagnostic}");
+                                assert!(!diagnostic.contains("synthetic-"), "{diagnostic}");
+                                assert!(!diagnostic.contains(placeholder), "{diagnostic}");
+                            }
+                            assert_eq!(serde_json::to_value(&cfg).unwrap(), original);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn later_resolution_errors_leave_the_entire_input_unchanged() {
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::json!([{"key": REQUIRE}, {"key": "${gh-env-secret:alloc=invalid}"}]),
+    );
+    let original = serde_json::to_value(&cfg).unwrap();
+    let bundle = BTreeMap::from([(
+        "ferrum/app/keyauth/key".to_string(),
+        "synthetic-earlier-secret-value".to_string(),
+    )]);
+    assert!(resolve_secrets(&mut cfg, &bundle).is_err());
+    assert_eq!(serde_json::to_value(&cfg).unwrap(), original);
+}
+
+#[test]
+fn literal_identity_classification_stays_consistent_across_broker_audit_and_import() {
+    use gitforgeops::secrets::{capture_and_redact_import_credentials, SecretScrubber};
+
+    let mut cfg = consumer_with(
+        "basicauth",
+        serde_json::json!([{"username": "public-login"}]),
+    );
+    cfg.consumers[0].credentials.insert(
+        "mtls_auth".to_string(),
+        serde_json::json!([{"identity": "public-client.example"}]),
+    );
+    // A same-named leaf under an unknown type remains a secret.
+    cfg.consumers[0].credentials.insert(
+        "custom".to_string(),
+        serde_json::json!({"username": REQUIRE}),
+    );
+    let bundle = BTreeMap::from([(
+        "ferrum/app/custom/username".to_string(),
+        "synthetic-custom-secret".to_string(),
+    )]);
+    assert!(gitforgeops::diff::audit_security(&cfg).is_empty());
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].slot, "ferrum/app/custom/username");
+    let scrubber = SecretScrubber::from_gateway_config_with_report(&cfg, &report);
+    let output = scrubber.scrub_streams(
+        "public-login public-client.example synthetic-custom-secret",
+        "",
+    );
+    assert_eq!(
+        output.stdout,
+        "public-login public-client.example [REDACTED]"
+    );
+    let captured = capture_and_redact_import_credentials(&mut cfg).unwrap();
+    assert_eq!(captured, bundle);
+    assert_eq!(
+        cfg.consumers[0].credentials["basicauth"][0]["username"],
+        "public-login"
+    );
+    assert_eq!(
+        cfg.consumers[0].credentials["mtls_auth"][0]["identity"],
+        "public-client.example"
+    );
+}
+
+#[test]
 fn object_and_array_credential_forms_derive_the_same_slot() {
     // THE upgrade-safety invariant. A repo that shipped
     // `keyauth: {key: "${...}"}` allocated `ferrum/app/keyauth/key`. After

@@ -118,10 +118,34 @@ pub fn validate_for_review(
     mesh: Option<&crate::config::MeshConfigSpec>,
     binary_path: &str,
 ) -> ReviewValidation {
-    let mut results = vec![(
-        "gateway",
+    combine_validation_for_review(
         crate::validate::run_validation(gateway, binary_path),
-    )];
+        mesh,
+        binary_path,
+    )
+}
+
+/// Review validation for a resolved snapshot, preserving resolution provenance
+/// through the same output boundary used by validate, plan and API apply.
+pub fn validate_for_review_with_report(
+    gateway: &crate::config::GatewayConfig,
+    mesh: Option<&crate::config::MeshConfigSpec>,
+    binary_path: &str,
+    report: &crate::secrets::ResolveReport,
+) -> ReviewValidation {
+    combine_validation_for_review(
+        crate::validate::run_validation_with_report(gateway, binary_path, report),
+        mesh,
+        binary_path,
+    )
+}
+
+fn combine_validation_for_review(
+    gateway: crate::error::Result<crate::validate::ValidationResult>,
+    mesh: Option<&crate::config::MeshConfigSpec>,
+    binary_path: &str,
+) -> ReviewValidation {
+    let mut results = vec![("gateway", gateway)];
     if let Some(mesh) = mesh {
         results.push((
             "mesh",

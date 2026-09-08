@@ -200,6 +200,7 @@ fn load_and_assemble_all(
     // diff, review, export and file-mode apply fail on the originating PR,
     // instead of waiting for post-merge API apply to discover it.
     apply::validate_no_desired_spec_tags(&gateway_config)?;
+    secrets::resolver::validate_identity_placeholders(&gateway_config)?;
     Ok(config::AssembledOutput {
         gateway: gateway_config,
         mesh: assembled.mesh,
@@ -872,9 +873,13 @@ fn cmd_validate(
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
     enforce_exclusive_scope(&resolved, &gateway_config)?;
-    let _ = resolve_credentials(&mut gateway_config, &env_config)?;
+    let secret_report = resolve_credentials(&mut gateway_config, &env_config)?;
 
-    let result = validate::run_validation(&gateway_config, &env_config.edge_binary_path)?;
+    let result = validate::run_validation_with_report(
+        &gateway_config,
+        &env_config.edge_binary_path,
+        &secret_report,
+    )?;
 
     // Mesh config is a second, independently-loaded document with its own
     // validator mode. Only run it when the repo actually declares mesh
@@ -1192,7 +1197,11 @@ async fn cmd_plan(
     println!();
 
     println!("=== Validation ===");
-    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
+    let val_result = validate::run_validation_with_report(
+        &desired,
+        &env_config.edge_binary_path,
+        &secret_report,
+    );
     let mut validation_ok = report_plan_validation("gateway", &val_result);
     if let Some(mesh) = &desired_mesh {
         let mesh_result = validate::run_mesh_validation(mesh, &env_config.edge_binary_path);
@@ -1623,7 +1632,14 @@ async fn cmd_apply(
         return Err("required credential slots are missing".into());
     }
 
-    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path)?;
+    let val_result = match env_config.gateway_mode {
+        GatewayMode::File => validate::run_validation(&desired, &env_config.edge_binary_path),
+        GatewayMode::Api => validate::run_validation_with_report(
+            &desired,
+            &env_config.edge_binary_path,
+            &secret_report,
+        ),
+    }?;
     if verdict::validation_blocker(val_result.success).is_some() {
         let formatted = validate::format_result(&val_result, validate::OutputFormat::Text);
         eprint!("{}", formatted);
@@ -2392,10 +2408,11 @@ async fn cmd_review(
         status: validation_status,
         output: validation_output,
         execution_error: validation_execution_error,
-    } = review::validate_for_review(
+    } = review::validate_for_review_with_report(
         &desired,
         assembled.mesh.as_ref(),
         &env_config.edge_binary_path,
+        &secret_report,
     );
 
     let state = StateFile::load(&resolved.name)?;
@@ -2633,6 +2650,9 @@ async fn cmd_rotate(
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    // Validate the whole desired input before reading a bundle or creating a
+    // state lock, including invalid identity placeholders in sibling consumers.
+    let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
 
     let repo = env_config
         .github_repository
@@ -2676,8 +2696,6 @@ async fn cmd_rotate(
     // Consumer credential when the resources happen to share an id.
     // Length is checked again below using the actual placeholder declaration.
     secrets::allocator::check_rotation_allowed(&slot, 32, &env_config.gateway_mode)?;
-
-    let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
 
     // Preflight 1b: in exclusive mode, the same ownership-scope rules
     // apply/diff/plan/review enforce must apply here too. A manual rotate
