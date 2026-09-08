@@ -13,3 +13,9 @@ pub use file_target::{
     reconcile_mesh_file, render_file_yaml, render_mesh_yaml, MeshPublication, MeshRetractionScope,
     MESH_DOCUMENT_VERSION,
 };
+
+/// Ownership changes must be explicit in every apply preview.
+pub const ADOPTION_PREVIEW_NOTICE: &str = "Adoption adds matching rows to the ownership ledger. \
+    Shared mode issues an idempotent PUT after a fresh equality check and widens the delete fence: \
+    removing a declaration later permits deletion. Exclusive mode records ownership without a PUT. \
+    Changed or cached confirmation snapshots skip adoption.";

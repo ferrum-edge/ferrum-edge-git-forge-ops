@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    BackupNamespace(String),
+
     #[error("failed to read file {path}: {source}")]
     FileRead {
         path: PathBuf,

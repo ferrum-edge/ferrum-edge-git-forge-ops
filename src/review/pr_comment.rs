@@ -98,6 +98,7 @@ pub fn build_review_comment_with_status(
         best_practices,
         comparison_error,
         None,
+        false,
     );
     md.insert_str(
         0,
@@ -109,6 +110,7 @@ pub fn build_review_comment_with_status(
             &ResolveReport::default(),
             false,
             None,
+            false,
         ),
     );
     finalize_comment(md)
@@ -126,6 +128,7 @@ fn verdict_summary(
     secrets: &ResolveReport,
     bundle_loaded: bool,
     decision: Option<&OverrideDecision>,
+    provisioning_blocked: bool,
 ) -> String {
     let security_count = security
         .iter()
@@ -142,7 +145,8 @@ fn verdict_summary(
         .count();
     let conflicts = spec_owned.iter().filter(|row| row.is_conflict()).count();
     let missing = secrets.missing_required().len();
-    let blocked = validation != ReviewValidationStatus::Passed
+    let blocked = provisioning_blocked
+        || validation != ReviewValidationStatus::Passed
         || security_blocking > 0
         || policy_blocking > 0
         || conflicts > 0
@@ -169,8 +173,10 @@ fn verdict_summary(
     ));
     if bundle_loaded {
         md.push_str(&format!(
-            "- Secret Broker Slots: {} total, {missing} missing required (blocking), {} awaiting generation (non-blocking).\n",
-            secrets.results.len(), secrets.needs_allocation().len(),
+            "- Secret Broker Slots: {} total, {missing} missing required (blocking), \
+             {} awaiting generation (requires provisioning environment).\n",
+            secrets.results.len(),
+            secrets.needs_allocation().len(),
         ));
     } else {
         md.push_str(&format!(
@@ -221,6 +227,7 @@ fn build_review_comment_inner(
     best_practices: &[BestPractice],
     comparison_error: Option<&str>,
     security_override: Option<&OverrideDecision>,
+    has_adoptions: bool,
 ) -> String {
     let mut md = String::new();
 
@@ -291,6 +298,8 @@ fn build_review_comment_inner(
         }
         append_omitted_table_row(&mut md, diffs.len(), "change");
         md.push('\n');
+    } else if has_adoptions {
+        md.push_str("### Changes: Ownership adoption\n\n");
     } else {
         md.push_str("### Changes: None (in sync)\n\n");
     }
@@ -912,6 +921,49 @@ pub fn build_review_comment_v2_with_override(
     bundle_loaded: bool,
     security_override: Option<&OverrideDecision>,
 ) -> String {
+    build_review_comment_with_preview(
+        validation_status,
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        policy,
+        unmanaged,
+        spec_owned,
+        override_reason,
+        override_cfg,
+        comparison_error,
+        environment_note,
+        secrets,
+        bundle_loaded,
+        security_override,
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_review_comment_with_preview(
+    validation_status: ReviewValidationStatus,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    policy: &[PolicyFinding],
+    unmanaged: &[UnmanagedResource],
+    spec_owned: &[SpecOwnedResource],
+    override_reason: Option<&str>,
+    override_cfg: Option<&OverrideConfig>,
+    comparison_error: Option<&str>,
+    environment_note: Option<&str>,
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+    security_override: Option<&OverrideDecision>,
+    adoptions: &[crate::apply::AdoptionCandidate],
+    provisioning_blockers: &[crate::verdict::ApplyBlocker],
+) -> String {
     let mut md = build_review_comment_inner(
         validation_status,
         validation_output,
@@ -921,7 +973,24 @@ pub fn build_review_comment_v2_with_override(
         best_practices,
         comparison_error,
         security_override,
+        !adoptions.is_empty(),
     );
+
+    if comparison_error.is_none() && !adoptions.is_empty() {
+        md.push_str("### Ownership Adoption\n\n");
+        md.push_str(crate::apply::ADOPTION_PREVIEW_NOTICE);
+        md.push_str("\n\n");
+        for candidate in adoptions.iter().take(MAX_SECTION_ITEMS) {
+            md.push_str(&format!(
+                "- ADOPT {} {} ({})\n",
+                bounded_markdown_text(&candidate.kind),
+                bounded_inline_code(&candidate.id),
+                bounded_inline_code(&candidate.namespace),
+            ));
+        }
+        append_omitted_list_item(&mut md, adoptions.len(), "adoption");
+        md.push('\n');
+    }
 
     // Already-rendered markdown from `environment_header` — gitforgeops'
     // own banner, whose untrusted components are fenced there. Escaping it
@@ -1065,7 +1134,12 @@ pub fn build_review_comment_v2_with_override(
         secrets,
         bundle_loaded,
         security_override,
+        !provisioning_blockers.is_empty(),
     );
+    for blocker in provisioning_blockers {
+        summary.push_str(&format!("- **Apply is blocked:** {}\n", blocker.summary()));
+    }
+    summary.push_str(&format!("- Ownership adoptions: {}.\n\n", adoptions.len()));
     summary.push_str(&format!(
         "Detail totals: {} Changes; {} Breaking Changes; {} Best Practice Recommendations; {} Unmanaged Resources.\n\n",
         diffs.len(), breaking.len(), best_practices.len(), unmanaged.len(),

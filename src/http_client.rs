@@ -394,7 +394,7 @@ impl AdminClient {
             self.saw_cached_backup.store(true, Ordering::Relaxed);
         }
 
-        let mut snapshot = BackupSnapshot::from_body(&resp.body)?;
+        let mut snapshot = BackupSnapshot::from_scoped_body(&resp.body, namespace)?;
         snapshot.cached = cached;
         // A live read never fails on the count seal (see `SealStrictness`),
         // but an operator should know the gateway's own inventory disagreed
@@ -1256,6 +1256,29 @@ pub struct BackupSnapshot {
 }
 
 impl BackupSnapshot {
+    /// Validate wire identities before repository-oriented defaults can invent them.
+    pub fn from_scoped_body(body: &str, namespace: &str) -> crate::error::Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+        for section in ["proxies", "consumers", "upstreams", "plugin_configs"] {
+            if let Some(rows) = value.get(section).and_then(serde_json::Value::as_array) {
+                for row in rows {
+                    if row.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace) {
+                        let id = row
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("?");
+                        return Err(crate::error::Error::BackupNamespace(format!(
+                            "namespace-scoped backup for {namespace:?} returned {section} {id:?} \
+                             with a missing or foreign namespace; refusing the snapshot"
+                        )));
+                    }
+                }
+            }
+        }
+        Self::from_value_with_strictness(value, SealStrictness::Advisory)
+    }
+
     /// Parse a backup body. The four managed sections deserialize into the
     /// permissive `GatewayConfig`; the rest is picked out by key. Unknown
     /// future top-level sections are retained by name so full-replace can fail

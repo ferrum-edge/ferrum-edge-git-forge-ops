@@ -28,8 +28,8 @@ gitforgeops export [--output PATH]                        # Emit flat YAML (plac
 gitforgeops export --materialize [--encrypt-to GH_LOGIN]  # Resolve creds; age-encrypt output (file mode stage 2)
 gitforgeops diff [--exit-on-drift]                        # Compare desired vs live gateway (/backup)
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
-                                                          # Exits 1 on validation failure, an error-severity security
-                                                          # finding, or an unacknowledged credential-slot remap
+                                                          # Includes adoption; exits 1 on offline apply blockers,
+                                                          # invalid backup namespaces, or live ownership conflicts
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
@@ -191,6 +191,12 @@ Publication is a **reconciliation**, not a conditional write: `apply::reconcile_
 - Directory-inferred: `resources/<ns>/…` → resource `namespace: <ns>` unless the spec overrides with a non-default value.
 - `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
+- `BackupSnapshot::from_scoped_body` validates every resource's explicit wire namespace
+  before deserialization can default it. Missing or foreign namespaces refuse the
+  snapshot for all API consumers, including confirmation reads. Repository YAML
+  defaults are unchanged. The incremental loop uses each diff entry's namespace
+  and refuses a mismatch with the enclosing namespace. `diff`, `plan`, and `apply`
+  fail; review withholds comparison (`--require-live` fails).
 
 ### Multi-Environment (repo config)
 
@@ -274,8 +280,10 @@ recorded (`ApplyResult::adopted`, replayed through `StateFile::record_op`).
 Never adopt from a cached (`X-Data-Source: cached`) backup — it clears
 `api_spec_id` tags — and never adopt a spec-owned row. A failed adoption PUT
 records nothing and lands in `ApplyResult::errors`. `apply` prints
-`adoption_summary_line` plus per-resource lines; the interactive preview lists
-`ADOPT <Kind> <id>` and no longer reports "No changes to apply."
+`adoption_summary_line` plus per-resource lines; the interactive preview, `plan`, and PR `review` list
+`ADOPT <Kind> <id>` and explain the widened shared-mode delete fence. The shared
+`ownership_preview` also includes pending-create assertions, runs before secret
+masking, and excludes full-replace and cached comparisons.
 
 The state file is the trust boundary for both of those, and it is CI-authored:
 `apply-on-merge.yml` / `rotate.yml` commit `.state/<env>.json` back to `main`
@@ -419,26 +427,40 @@ Two pure computations, shared so a preview and the run it previews cannot
 disagree.
 
 **`apply_blockers`** — every fail-closed gate `apply` refuses on that is
-decidable *without* a gateway, as `Vec<ApplyBlocker>` over five
+decidable *without* a gateway, as `Vec<ApplyBlocker>` over seven
 `BlockerKind`s: `Validation`, `Security`, `Policy`, `RequiredCredentials`,
-`SlotRemap`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
+`SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
 non-empty. `cmd_apply` calls the *same per-class predicates*
 (`security_blocker`, `policy_blocker`, `required_credentials_blocker`,
-`validation_blocker`) at its own gate points rather than the aggregate, because
+`validation_blocker`, `credential_provisioning_blockers`) at its own gate points rather than the aggregate, because
 its ordering is load-bearing — the security audit has to refuse before the
 credential bundle is read, the required-slot check before the first gateway
 call. Sharing the predicates and not the control flow is the whole design.
 
 Rules that must not drift: warning severity never blocks; `alloc=generate`
 awaiting first-apply allocation is *not* a blocker (`missing_required()` is,
-`needs_allocation()` is not); `policy_findings` are fed **post-override**
+`needs_allocation()` alone is not); `policy_findings` are fed **post-override**
 (`PolicyFinding::is_blocking` reads `overridden_by`). `plan` resolves the
 override through the same `resolve_pr_number` + `check_override` path `apply`
 uses, and fails closed — no PR, an inactive decision, or a GitHub error leaves
 every blocking finding standing. Gateway-dependent gates (large-prune,
 stale-view, per-resource write failures) are deliberately excluded: a preview
 cannot decide them.
+
+Pending allocations require both provisioning environment variables. `plan` and
+`review` use `credential_provisioning_blockers`, render the missing capability,
+and exit 1. Apply calls the same predicate at its existing allocation gate,
+after safety checks and before external writes, retaining the exact refusal text.
+File apply also checks before publishing either output document, while keeping
+credential allocation after placeholder publication.
+Only presence is checked; token validity is a remote question. With no pending
+allocation, neither variable is required.
+
+| BlockerKind | Missing environment variable |
+|---|---|
+| `ProvisionerToken` | `FERRUM_GH_PROVISIONER_TOKEN` |
+| `ProvisioningRepository` | `GITHUB_REPOSITORY` |
 
 Adding a new fail-closed gate to `apply` means adding a `BlockerKind` here, or
 `plan` silently goes back to promising applies that refuse.
