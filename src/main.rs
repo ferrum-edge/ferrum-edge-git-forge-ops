@@ -878,6 +878,60 @@ fn mesh_summary_line(mesh: &config::MeshConfigSpec) -> String {
     }
 }
 
+/// What a mesh reconciliation in this run is allowed to conclude from "the
+/// assembler produced no mesh document".
+///
+/// Two independent facts, both required before a retraction may rewrite the
+/// destination: the ledger has to attribute the path to this repository, and
+/// the run has to have seen every fragment the repository declares.
+/// `FERRUM_NAMESPACE` narrows which fragments the assembler loads at all, and
+/// the published document is mesh-wide, so a filtered run selecting nothing is
+/// not evidence that nothing is declared.
+fn mesh_retraction_scope(
+    resolved: &ResolvedEnv,
+    state: &StateFile,
+    output_path: &str,
+) -> apply::MeshRetractionScope {
+    apply::MeshRetractionScope {
+        ledger_attributed: state.publishes_mesh_document(output_path),
+        covers_repository: resolved.namespace_filter.is_none(),
+    }
+}
+
+/// Operator-facing line for a mesh reconciliation that publishes no declared
+/// document. `None` when there is nothing worth saying (a document was
+/// published, or nothing was ever published here).
+///
+/// `preview` renders the same outcome in the future tense, so `plan` and the
+/// `apply` it previews describe one event rather than two.
+fn mesh_retraction_line(
+    publication: apply::MeshPublication,
+    output_path: &str,
+    preview: bool,
+) -> Option<String> {
+    match publication {
+        apply::MeshPublication::Published | apply::MeshPublication::NeverPublished => None,
+        apply::MeshPublication::Retracted => Some(if preview {
+            format!(
+                "RETRACT mesh: {output_path} will be rewritten as an empty mesh document (the repository declares no MeshConfig fragments)"
+            )
+        } else {
+            format!(
+                "RETRACT mesh: rewrote {output_path} as an empty mesh document (the repository declares no MeshConfig fragments)"
+            )
+        }),
+        apply::MeshPublication::AlreadyRetracted => Some(format!(
+            "RETRACT mesh: {output_path} already holds the empty mesh document (the repository declares no MeshConfig fragments)"
+        )),
+        apply::MeshPublication::Unattributed => Some(format!(
+            "Warning: the repository declares no MeshConfig fragments, but {output_path} exists and is not a document gitforgeops published; leaving it untouched. Remove it by hand once no mesh node reads it."
+        )),
+        apply::MeshPublication::NarrowedScope => Some(format!(
+            "Notice: no MeshConfig fragment is in scope for this namespace-filtered run, so {output_path} is left as published. Re-run without FERRUM_NAMESPACE to retract a mesh document the repository no longer declares."
+        )),
+    }
+}
+
 /// Print one document's plan-time validation verdict and return whether it
 /// counts as passing.
 ///
@@ -1023,13 +1077,32 @@ async fn cmd_export(
     // the gateway file. It also carries no credential placeholders, so
     // `--materialize` / `--encrypt-to` have nothing to act on: it is always
     // published verbatim to FERRUM_MESH_FILE_OUTPUT_PATH.
-    if let Some(mesh) = &assembled.mesh {
-        apply::apply_mesh_file(mesh, &env_config.mesh_file_output_path)?;
-        eprintln!(
+    //
+    // Publication is a reconciliation, not a conditional write: a repository
+    // that deleted its last fragment has to converge the destination too, or
+    // every mesh node reading it keeps enforcing policy nobody declares any
+    // more. `export` does not write the ledger, so it reads the attribution
+    // record and leaves it alone — a retraction is idempotent, and the next
+    // `apply` records it.
+    let mesh_state = StateFile::load(&resolved.name)?;
+    let mesh_publication = apply::reconcile_mesh_file(
+        assembled.mesh.as_ref(),
+        &env_config.mesh_file_output_path,
+        mesh_retraction_scope(&resolved, &mesh_state, &env_config.mesh_file_output_path),
+    )?;
+    match &assembled.mesh {
+        Some(mesh) => eprintln!(
             "Exported mesh document to {} ({})",
             env_config.mesh_file_output_path,
             mesh_summary_line(mesh)
-        );
+        ),
+        None => {
+            if let Some(line) =
+                mesh_retraction_line(mesh_publication, &env_config.mesh_file_output_path, false)
+            {
+                eprintln!("{line}");
+            }
+        }
     }
 
     let plaintext_materialized = materialize && encrypt_to.is_none();
@@ -1249,15 +1322,39 @@ async fn cmd_plan(
     }
     println!();
 
-    if let Some(mesh) = &desired_mesh {
-        // Counts only: mesh resources have no live gateway API to diff
-        // against, so they never appear under "=== Changes ===".
+    // Counts only: mesh resources have no live gateway API to diff against, so
+    // they never appear under "=== Changes ===". A pending retraction is
+    // previewed here too — it is a real change to a live control document, and
+    // a preview that stayed silent about it would be the same silence the
+    // publish path used to have. Only file mode publishes (and therefore
+    // retracts) the document; an api-mode apply prints its no-mesh-API notice
+    // instead and touches nothing.
+    let mesh_publication = match env_config.gateway_mode {
+        GatewayMode::File => Some(apply::plan_mesh_publication(
+            desired_mesh.as_ref(),
+            &env_config.mesh_file_output_path,
+            mesh_retraction_scope(
+                &resolved,
+                &StateFile::load(&resolved.name)?,
+                &env_config.mesh_file_output_path,
+            ),
+        )?),
+        GatewayMode::Api => None,
+    };
+    let mesh_retraction_preview = mesh_publication.and_then(|publication| {
+        mesh_retraction_line(publication, &env_config.mesh_file_output_path, true)
+    });
+    if desired_mesh.is_some() || mesh_retraction_preview.is_some() {
         println!("=== Mesh ===");
-        println!(
-            "mesh: {} (published to {})\n",
-            mesh_summary_line(mesh),
-            env_config.mesh_file_output_path
-        );
+        match (&desired_mesh, &mesh_retraction_preview) {
+            (Some(mesh), _) => println!(
+                "mesh: {} (published to {})\n",
+                mesh_summary_line(mesh),
+                env_config.mesh_file_output_path
+            ),
+            (None, Some(line)) => println!("{line}\n"),
+            (None, None) => {}
+        }
     }
 
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
@@ -1812,6 +1909,9 @@ async fn cmd_apply(
     let mut adopted_ops: Vec<apply::AppliedOp> = Vec::new();
     let mut fully_replaced: Vec<String> = Vec::new();
 
+    // Set by the file-mode arm below: mesh is file-only, and an api-mode
+    // apply neither publishes nor retracts the document.
+    let mut mesh_publication: Option<apply::MeshPublication> = None;
     match env_config.gateway_mode {
         GatewayMode::Api => {
             // The shared repository-load boundary already rejected
@@ -2242,13 +2342,31 @@ async fn cmd_apply(
             // resources. Mesh config holds no credential placeholders, so
             // there is no materialize step for it — what is written here is
             // final.
-            if let Some(mesh) = &desired_mesh {
-                apply::apply_mesh_file(mesh, &env_config.mesh_file_output_path)?;
-                println!(
+            //
+            // Total over `desired_mesh`: a repository that just deleted its
+            // last fragment converges the destination to the explicit empty
+            // document instead of leaving the previous one on disk (and, under
+            // `apply-on-merge.yml`, committed on the default branch) for every
+            // mesh node to keep enforcing.
+            mesh_publication = Some(apply::reconcile_mesh_file(
+                desired_mesh.as_ref(),
+                &env_config.mesh_file_output_path,
+                mesh_retraction_scope(&resolved, &state, &env_config.mesh_file_output_path),
+            )?);
+            match (&desired_mesh, mesh_publication) {
+                (Some(mesh), _) => println!(
                     "Written mesh document to {} ({})",
                     env_config.mesh_file_output_path,
                     mesh_summary_line(mesh)
-                );
+                ),
+                (None, Some(publication)) => {
+                    if let Some(line) =
+                        mesh_retraction_line(publication, &env_config.mesh_file_output_path, false)
+                    {
+                        println!("{line}");
+                    }
+                }
+                (None, None) => {}
             }
 
             // Now allocate. The in-memory mutation after the disk write is
@@ -2292,6 +2410,22 @@ async fn cmd_apply(
     match env_config.gateway_mode {
         GatewayMode::File => {
             state.record(&desired, &namespaces);
+            // Attribution, not content: the ledger records *that* this
+            // repository publishes the mesh document at this path, which is
+            // the gate a later retraction has to pass. Recorded for a
+            // retraction too — the empty document sitting there is still this
+            // repository's artifact, and forgetting it would make the next run
+            // report the file it just wrote as somebody else's.
+            if matches!(
+                mesh_publication,
+                Some(
+                    apply::MeshPublication::Published
+                        | apply::MeshPublication::Retracted
+                        | apply::MeshPublication::AlreadyRetracted
+                )
+            ) {
+                state.record_mesh_publication(&env_config.mesh_file_output_path);
+            }
         }
         GatewayMode::Api => {
             for ns in &fully_replaced {
@@ -2581,11 +2715,28 @@ async fn cmd_review(
         _ => None,
     };
 
-    let ownership_note = review::environment_header(
+    let mut ownership_note = review::environment_header(
         &resolved.name,
         &format!("{:?}", resolved.ownership.mode),
         &format!("{:?}", resolved.apply_strategy),
     );
+    // A pending mesh retraction is a change to a live control document that
+    // never shows up under "Changes" — mesh has no live gateway API to diff
+    // against. It rides on the environment banner rather than as a late
+    // section so it survives `finalize_comment`'s size bounding, which trims
+    // from the end.
+    if env_config.gateway_mode == GatewayMode::File {
+        let publication = apply::plan_mesh_publication(
+            assembled.mesh.as_ref(),
+            &env_config.mesh_file_output_path,
+            mesh_retraction_scope(&resolved, &state, &env_config.mesh_file_output_path),
+        )?;
+        if let Some(note) =
+            review::render_mesh_retraction(publication, &env_config.mesh_file_output_path)
+        {
+            ownership_note.push_str(&note);
+        }
+    }
 
     let provisioning_blockers = verdict::credential_provisioning_blockers(
         &secret_report,

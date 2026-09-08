@@ -9,8 +9,9 @@ pub use api_target::{
     validate_no_desired_spec_tags, AdoptionCandidate, AppliedOp, ApplyOptions, ApplyResult,
 };
 pub use file_target::{
-    apply_file, apply_mesh_file, publish_export, publish_private_export, render_file_yaml,
-    render_mesh_yaml, MESH_DOCUMENT_VERSION,
+    apply_file, apply_mesh_file, plan_mesh_publication, publish_export, publish_private_export,
+    reconcile_mesh_file, render_file_yaml, render_mesh_yaml, MeshPublication, MeshRetractionScope,
+    MESH_DOCUMENT_VERSION,
 };
 
 /// Ownership changes must be explicit in every apply preview.

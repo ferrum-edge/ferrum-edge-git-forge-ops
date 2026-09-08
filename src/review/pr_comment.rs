@@ -1,3 +1,4 @@
+use crate::apply::MeshPublication;
 use crate::diff::best_practice::BestPractice;
 use crate::diff::breaking::BreakingChange;
 use crate::diff::resource_diff::{DiffAction, ResourceDiff, SpecOwnedResource, UnmanagedResource};
@@ -738,6 +739,37 @@ fn finalize_comment(md: String) -> String {
     ));
     debug_assert!(bounded.len() <= MAX_REVIEW_COMMENT_BYTES);
     bounded
+}
+
+/// The mesh-retraction banner, or `None` when the mesh document needs no
+/// comment.
+///
+/// Mesh resources never appear under "Changes" — there is no mesh admin API to
+/// compare against — so a post-merge apply that will rewrite the published
+/// mesh document as empty would otherwise reach a reviewer as nothing at all.
+/// Returned as its own rendered block so `cmd_review` can put it beside the
+/// environment banner, above every size-bounded section.
+pub fn render_mesh_retraction(publication: MeshPublication, output_path: &str) -> Option<String> {
+    let body = match publication {
+        MeshPublication::Published | MeshPublication::NeverPublished => return None,
+        MeshPublication::Retracted => format!(
+            "**RETRACT mesh** — this repository declares no `MeshConfig` fragments any more. The post-merge apply rewrites {} as an empty mesh document, so mesh nodes stop enforcing the deleted policy.",
+            bounded_inline_code(output_path)
+        ),
+        MeshPublication::AlreadyRetracted => format!(
+            "**RETRACT mesh** — this repository declares no `MeshConfig` fragments, and {} already holds the empty mesh document. Nothing to publish.",
+            bounded_inline_code(output_path)
+        ),
+        MeshPublication::Unattributed => format!(
+            "**RETRACT mesh: skipped** — this repository declares no `MeshConfig` fragments, but {} is not a document gitforgeops published. It is left untouched; remove it by hand once no mesh node reads it.",
+            bounded_inline_code(output_path)
+        ),
+        MeshPublication::NarrowedScope => format!(
+            "**RETRACT mesh: skipped** — no `MeshConfig` fragment is in scope for this namespace-filtered review, which is not evidence that the repository declares none. {} is left as published.",
+            bounded_inline_code(output_path)
+        ),
+    };
+    Some(format!("\n\n{body}"))
 }
 
 /// The "Spec-owned resources" section, or an empty string when there are none.
