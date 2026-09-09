@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use gitforgeops::config::schema::{BackendScheme, GatewayConfig, Proxy};
 use gitforgeops::diff::{
     compute_diff_with_options, compute_diff_with_ownership, state_key, DiffAction, DiffOptions,
-    OwnershipScope,
+    DiffResult, OwnershipScope,
 };
 
 fn proxy(id: &str, namespace: &str) -> Proxy {
@@ -62,8 +62,8 @@ fn proxy(id: &str, namespace: &str) -> Proxy {
         stream_proxy_protocol: None,
         backend_proxy_protocol: None,
         stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -538,4 +538,171 @@ fn spec_owned_bucket_is_sorted_deterministically() {
             ("ferrum".to_string(), "zulu".to_string()),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// #172: `diff_collection` walks HashMaps, so `diffs` / `unmanaged` used to come
+// out in `RandomState` order — the same inputs produced a differently ordered
+// change list (and, past the review comment's 100-row cap, a differently
+// populated one) on every run. All three buckets now sort by
+// `(namespace, kind, id)`.
+// ---------------------------------------------------------------------------
+
+fn consumer(id: &str, namespace: &str) -> gitforgeops::config::schema::Consumer {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "username": id,
+        "namespace": namespace,
+    }))
+    .unwrap()
+}
+
+fn upstream(id: &str, namespace: &str) -> gitforgeops::config::schema::Upstream {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": namespace,
+        "targets": [{"host": "10.0.0.1", "port": 8080}],
+    }))
+    .unwrap()
+}
+
+fn plugin_config(id: &str, namespace: &str) -> gitforgeops::config::schema::PluginConfig {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": namespace,
+        "plugin_name": "cors",
+        "config": {},
+        "scope": "global",
+    }))
+    .unwrap()
+}
+
+fn add(
+    proxies: Vec<Proxy>,
+    consumers: Vec<gitforgeops::config::schema::Consumer>,
+    upstreams: Vec<gitforgeops::config::schema::Upstream>,
+    plugin_configs: Vec<gitforgeops::config::schema::PluginConfig>,
+) -> GatewayConfig {
+    GatewayConfig {
+        proxies,
+        consumers,
+        upstreams,
+        plugin_configs,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn diff_and_unmanaged_buckets_are_sorted_deterministically() {
+    let desired = add(
+        vec![proxy("p-a", "ferrum")],
+        vec![consumer("c-a", "acme")],
+        vec![upstream("u-a", "ferrum")],
+        vec![plugin_config("pc-a", "acme")],
+    );
+    let actual = add(
+        vec![proxy("p-live", "ferrum")],
+        vec![consumer("c-live", "acme")],
+        vec![upstream("u-live", "ferrum")],
+        vec![plugin_config("pc-live", "acme")],
+    );
+
+    // Shared mode, nothing previously managed: every desired resource is an
+    // Add and every live resource is unmanaged.
+    let managed = HashSet::new();
+    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+
+    let diffs: Vec<(String, String, String)> = result
+        .diffs
+        .iter()
+        .map(|d| (d.namespace.clone(), d.kind.clone(), d.id.clone()))
+        .collect();
+    assert_eq!(
+        diffs,
+        vec![
+            (
+                "acme".to_string(),
+                "Consumer".to_string(),
+                "c-a".to_string()
+            ),
+            (
+                "acme".to_string(),
+                "PluginConfig".to_string(),
+                "pc-a".to_string()
+            ),
+            ("ferrum".to_string(), "Proxy".to_string(), "p-a".to_string()),
+            (
+                "ferrum".to_string(),
+                "Upstream".to_string(),
+                "u-a".to_string()
+            ),
+        ]
+    );
+
+    let unmanaged: Vec<(String, String, String)> = result
+        .unmanaged
+        .iter()
+        .map(|u| (u.namespace.clone(), u.kind.clone(), u.id.clone()))
+        .collect();
+    assert_eq!(
+        unmanaged,
+        vec![
+            (
+                "acme".to_string(),
+                "Consumer".to_string(),
+                "c-live".to_string()
+            ),
+            (
+                "acme".to_string(),
+                "PluginConfig".to_string(),
+                "pc-live".to_string()
+            ),
+            (
+                "ferrum".to_string(),
+                "Proxy".to_string(),
+                "p-live".to_string()
+            ),
+            (
+                "ferrum".to_string(),
+                "Upstream".to_string(),
+                "u-live".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn diff_order_is_stable_across_two_runs() {
+    let desired = add(
+        vec![proxy("p-a", "ferrum"), proxy("p-b", "acme")],
+        vec![consumer("c-a", "ferrum")],
+        vec![upstream("u-a", "acme")],
+        vec![plugin_config("pc-a", "ferrum")],
+    );
+    let actual = add(
+        vec![proxy("p-x", "ferrum"), proxy("p-y", "acme")],
+        vec![consumer("c-x", "ferrum")],
+        vec![upstream("u-x", "acme")],
+        vec![plugin_config("pc-x", "ferrum")],
+    );
+    let managed = HashSet::new();
+
+    let first = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let second = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+
+    let order = |result: &DiffResult| -> Vec<(String, String, String)> {
+        result
+            .diffs
+            .iter()
+            .map(|d| (d.namespace.clone(), d.kind.clone(), d.id.clone()))
+            .collect()
+    };
+    assert_eq!(order(&first), order(&second));
+    assert_eq!(first.diffs.len(), second.diffs.len());
+    // The sort must not change which entries exist — only their order.
+    let mut first_ids: Vec<_> = first.diffs.iter().map(|d| d.id.clone()).collect();
+    let mut second_ids: Vec<_> = second.diffs.iter().map(|d| d.id.clone()).collect();
+    first_ids.sort_unstable();
+    second_ids.sort_unstable();
+    assert_eq!(first_ids, second_ids);
 }

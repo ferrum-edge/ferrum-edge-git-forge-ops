@@ -105,15 +105,16 @@ pub enum Commands {
         /// which the strict loader would reject the files import just wrote.
         #[arg(long, value_name = "NAME")]
         accept_unknown_field: Vec<String>,
-        /// Accept unclassifiable plaintext config for this plugin, by exact
+        /// Accept unbrokered plaintext config for this plugin, by exact
         /// `plugin_name`. Repeatable.
         ///
-        /// gitforgeops has no schema for a plugin it does not recognize, so
-        /// only the key/URL sensitivity heuristics run over its config; a
-        /// vendor field they do not flag would otherwise be committed to Git
-        /// as written. Without this flag such an import fails, naming every
-        /// unclassified path. Pass the plugin name once you have read that
-        /// list and confirmed none of it is a credential.
+        /// Builtin plugins require this for secret-looking key/URL heuristic
+        /// matches outside their broker rules. Custom plugins require it for
+        /// strings the heuristics do not flag. Without this flag import fails
+        /// before writing the tree or bundle and lists the paths, never values.
+        /// After reviewing the source, accept only non-credentials; accepted
+        /// paths stay literal and appear in a review notice. Schema-covered
+        /// builtin secrets and custom heuristic matches are still brokered.
         #[arg(long, value_name = "PLUGIN_NAME")]
         allow_plaintext_plugin_config: Vec<String>,
     },
@@ -134,12 +135,17 @@ pub enum Commands {
         #[arg(long)]
         include_scopes: bool,
     },
-    /// Rotate a specific credential slot. Requires provisioner token.
+    /// Rotate a Consumer credential slot in api mode. Requires provisioner token.
     Rotate {
         #[arg(long)]
         consumer: String,
+        /// Consumer field: keyauth/key, jwt/secret, hmac_auth/secret or
+        /// basicauth/password; use <type>/[N]/<field> for later entries.
+        /// Hashes, identities, PluginConfig and Upstream slots cannot be rotated.
         #[arg(long)]
         credential: String,
+        /// Target namespace; defaults to the resolved environment filter
+        /// (configured namespace_filter, then FERRUM_NAMESPACE), then ferrum.
         #[arg(long)]
         namespace: Option<String>,
         /// GitHub login to deliver the rotated credential to (age-encrypted).
