@@ -1,5 +1,6 @@
 pub mod config;
 pub mod github_override;
+pub mod override_input;
 pub mod registry;
 pub mod rules;
 
@@ -47,6 +48,20 @@ pub struct PolicyFinding {
 impl PolicyFinding {
     pub fn is_blocking(&self) -> bool {
         self.severity.blocks_apply() && self.overridden_by.is_none()
+    }
+}
+
+/// An enabled gate needs a usable list even when there are no matching resources.
+pub(crate) fn empty_allowlist_finding(rule_id: &str, key: &str) -> PolicyFinding {
+    PolicyFinding {
+        rule_id: rule_id.to_string(),
+        severity: Severity::Error,
+        kind: "PolicyConfig".to_string(),
+        id: rule_id.to_string(),
+        namespace: "global".to_string(),
+        message: format!("enabled policy has no nonblank {key} entries"),
+        remediation: Some(format!("Populate {key} or explicitly disable {rule_id}")),
+        overridden_by: None,
     }
 }
 

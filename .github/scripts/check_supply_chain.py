@@ -211,6 +211,25 @@ def credential_shard_limit(root: Path) -> tuple[int | None, list[str]]:
     return (rust_limit if rust_limit == loader_limit else None), violations
 
 
+def import_shard_ceiling_violations(root: Path) -> list[str]:
+    """Keep import packing on the same named-shard ceiling as allocation."""
+    path = root / "src/import/mod.rs"
+    source = path.read_text(encoding="utf-8") if path.is_file() else ""
+    start = source.find("fn render_migration_bundles(")
+    end = source.find("\nfn ", start + 1) if start >= 0 else -1
+    packing = source[start:end if end >= 0 else None] if start >= 0 else ""
+    if not re.search(
+        r'if\s+shard\s*>=\s*MAX_BUNDLE_SHARDS\s*\{\s*'
+        r'return\s+Err\(shard_ceiling_error\(slot,\s*"import"\)\);\s*\}',
+        packing,
+    ):
+        return [
+            "src/import/mod.rs: migration packing must refuse shard >= "
+            "MAX_BUNDLE_SHARDS with the shared shard_ceiling_error"
+        ]
+    return []
+
+
 def named_step(text: str, step_name: str) -> str | None:
     marker = f"      - name: {step_name}\n"
     start = text.find(marker)
@@ -803,6 +822,48 @@ def state_writer_token_violations(
     return violations
 
 
+STATE_PUSH_RETRY_REQUIRED = (
+    "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    'git push origin "HEAD:$DEFAULT_BRANCH"',
+    'git fetch origin "$DEFAULT_BRANCH"',
+    'git rebase "origin/$DEFAULT_BRANCH"',
+)
+STATE_PUSH_RETRY_FORBIDDEN = (
+    "git fetch origin main",
+    "origin/main",
+)
+
+
+def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> list[str]:
+    """State commits must rebase and push against the repository default branch.
+
+    The freshness guard already parameterises checkout and ancestry on
+    ``DEFAULT_BRANCH``; hardcoding ``origin/main`` in the post-mutation push
+    retry loop breaks on forks whose default branch is not literally ``main``.
+    """
+    violations: list[str] = []
+    commit_index = text.find(commit_step)
+    if commit_index < 0:
+        return [f"{workflow}: a {commit_step!r} step is required"]
+    commit_block = text[commit_index:]
+    next_step = re.search(r"\n      - (?:name|uses):", commit_block[1:])
+    if next_step is not None:
+        commit_block = commit_block[: next_step.start() + 1]
+    for forbidden in STATE_PUSH_RETRY_FORBIDDEN:
+        if forbidden in commit_block:
+            violations.append(
+                f"{workflow}: {commit_step!r} must not hardcode {forbidden!r}; "
+                "use the repository default branch"
+            )
+    for required in STATE_PUSH_RETRY_REQUIRED:
+        if required not in commit_block:
+            violations.append(
+                f"{workflow}: {commit_step!r} is missing default-branch push retry "
+                f"control {required!r}"
+            )
+    return violations
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -971,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
 
     shard_limit, shard_limit_violations = credential_shard_limit(root)
     violations.extend(shard_limit_violations)
+    violations.extend(import_shard_ceiling_violations(root))
 
     for privileged_workflow in PRIVILEGED_WORKFLOWS:
         text = (workflows / privileged_workflow).read_text(encoding="utf-8")
@@ -1136,6 +1198,9 @@ def main(argv: list[str] | None = None) -> int:
         text = (workflows / state_workflow).read_text(encoding="utf-8")
         violations.extend(
             state_writer_token_violations(state_workflow, text, commit_step)
+        )
+        violations.extend(
+            state_push_retry_violations(state_workflow, text, commit_step)
         )
 
     static_review = (workflows / "validate-pr.yml").read_text(encoding="utf-8")

@@ -155,6 +155,23 @@ pub struct ResolveReport {
 }
 
 impl ResolveReport {
+    /// Explain comparison uncertainty without claiming the entire bundle is absent.
+    pub fn unresolved_comparison_note(&self) -> Option<String> {
+        let count = self
+            .results
+            .iter()
+            .filter(|result| result.status != SlotStatus::Resolved)
+            .count();
+        (count > 0).then(|| {
+            format!(
+                "{count} broker-controlled leaf/leaves remain unresolved. Authoritative live \
+                 comparisons exclude only unresolved leaves in Consumer credentials, plugin \
+                 config and service-discovery secrets; resolved values, literal siblings, \
+                 extra entries, shape changes and nonsecret fields are still compared."
+            )
+        })
+    }
+
     /// Structurally-captured credential type for `slot`, if this report
     /// produced it.
     pub fn credential_type_for(&self, slot: &str) -> Option<&str> {
@@ -466,6 +483,26 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
     join_slot_components(&components)
 }
 
+/// Derive a comparison slot from structural keys, without parsing or escaping
+/// an already-rendered path again. Reuse the resolver's index-zero elision.
+pub(crate) fn consumer_credential_slot(
+    namespace: &str,
+    consumer_id: &str,
+    credential_type: &str,
+    path: &[ConfigPathComponent],
+) -> String {
+    let mut components = vec![
+        SlotComponent::Literal(namespace),
+        SlotComponent::Literal(consumer_id),
+        SlotComponent::Literal(credential_type),
+    ];
+    components.extend(path.iter().map(|part| match part {
+        ConfigPathComponent::Key(key) => SlotComponent::Literal(key),
+        ConfigPathComponent::Index(index) => SlotComponent::ArrayIndex(*index),
+    }));
+    join_slot_components(&components)
+}
+
 /// Is this credential leaf an *identity* rather than a secret?
 ///
 /// ferrum-edge's credential shapes mix the two in one object:
@@ -483,8 +520,9 @@ pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
 /// does not change which field a leaf is, so callers carry `leaf` through
 /// array recursion unchanged.
 ///
-/// One definition, four callers, deliberately: the resolver (never broker an
-/// identity), `import`'s capture walk (never redact one out of the file), the
+/// One classification shared by resolution's whole-document preflight (reject
+/// identity placeholders in strict and lenient walks), generation/rotation,
+/// `import`'s capture walk (never redact a literal identity out of the file), the
 /// validator-output scrubber (never black out the field that says which
 /// credential an error is about) and the pre-resolve security audit
 /// ([`crate::diff::security`], never block `apply` on one). Any two of those
@@ -495,6 +533,64 @@ pub(crate) fn is_identity_credential_leaf(credential_type: &str, leaf: Option<&s
         (credential_type, leaf),
         ("basicauth", Some("username")) | ("mtls_auth", Some("identity"))
     )
+}
+
+/// Reject broker syntax in public credential identities before any bundle
+/// lookup, substitution or side effect. Also used at the CLI load boundary:
+/// plain export and inspect-only previews must enforce the same contract.
+/// Literal identities remain readable repository data.
+pub fn validate_identity_placeholders(cfg: &GatewayConfig) -> crate::error::Result<()> {
+    for consumer in &cfg.consumers {
+        for (credential_type, value) in &consumer.credentials {
+            let mut components = vec![
+                SlotComponent::Literal(&consumer.namespace),
+                SlotComponent::Literal(&consumer.id),
+                SlotComponent::Literal(credential_type),
+            ];
+            check_identity_placeholders(value, &mut components, credential_type, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_identity_placeholders<'a>(
+    value: &'a serde_json::Value,
+    components: &mut Vec<SlotComponent<'a>>,
+    credential_type: &str,
+    leaf: Option<&str>,
+) -> crate::error::Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            // Include malformed/embedded broker syntax: it must not become a
+            // literal identity merely because the placeholder parser refuses it.
+            if is_identity_credential_leaf(credential_type, leaf)
+                && text.contains("${gh-env-secret:")
+            {
+                let slot = join_slot_components(components);
+                return Err(crate::error::Error::Config(format!(
+                    "credential slot '{slot}': identity fields must be supplied literally; \
+                     broker placeholders are forbidden. Author the public username or mTLS \
+                     identity in the resource YAML and retire its old bundle slot."
+                )));
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, child) in fields {
+                components.push(SlotComponent::Literal(key));
+                check_identity_placeholders(child, components, credential_type, Some(key))?;
+                components.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                components.push(SlotComponent::ArrayIndex(index));
+                check_identity_placeholders(child, components, credential_type, leaf)?;
+                components.pop();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Capture every string credential leaf under its canonical broker slot and
@@ -532,7 +628,7 @@ pub fn capture_and_redact_import_credentials(
     Ok(captured)
 }
 
-/// One non-builtin plugin's config strings that import left in place.
+/// One plugin's config strings that require plaintext allowance during import.
 #[derive(Debug, Clone)]
 pub struct UnbrokeredPluginConfig {
     pub namespace: String,
@@ -548,8 +644,7 @@ pub struct UnbrokeredPluginConfig {
 pub struct PluginConfigCapture {
     /// Slot → live value for every leaf moved into the private bundle.
     pub captured: CredentialBundle,
-    /// Per-plugin review lists for non-builtin plugins. Empty when the repo
-    /// imported only builtin plugins.
+    /// Per-plugin review lists for builtin or custom unbrokered strings.
     pub unbrokered: Vec<UnbrokeredPluginConfig>,
 }
 
@@ -558,8 +653,8 @@ pub struct PluginConfigCapture {
 ///
 /// The gateway's admin backup intentionally returns plugin configs raw. The
 /// classifier mirrors its schema-aware projection contract and fails closed
-/// for custom plugins, so OIDC/LDAP/Kafka/Redis/collector credentials and
-/// arbitrary authorization-header values cannot be committed by import.
+/// for builtin and custom plugins. Its unbrokered list must pass import's
+/// plaintext allowance gate before any resource or bundle is published.
 pub fn capture_and_redact_import_plugin_config_secrets(
     cfg: &mut GatewayConfig,
 ) -> crate::error::Result<PluginConfigCapture> {
@@ -791,7 +886,7 @@ fn parse_index_segment(piece: &str) -> Option<usize> {
 /// already has an `EnvConfig` in hand) don't have to go through the process
 /// environment. `main.rs` calls the two-argument forms, whose signatures stay
 /// stable.
-fn current_gateway_mode() -> crate::error::Result<GatewayMode> {
+pub(crate) fn current_gateway_mode() -> crate::error::Result<GatewayMode> {
     Ok(crate::config::load_env_config()?.gateway_mode)
 }
 
@@ -834,9 +929,9 @@ pub fn report_secrets_with_options(
 /// but the preflight walks the *whole* assembled config to find it — so an
 /// unrelated consumer holding, say, a `len=16` `jwt` generate placeholder
 /// would abort a rotation that has nothing to do with it. Structural errors
-/// (malformed placeholders, `[REDACTED]` bundle values, slot collisions) are
-/// still hard failures in both variants, because those make the report itself
-/// untrustworthy.
+/// (identity placeholders, malformed placeholders, `[REDACTED]` bundle values,
+/// slot collisions) are still hard failures in both variants, because those
+/// make the report itself untrustworthy.
 ///
 /// `plan`/`diff`/`apply` keep using strict [`report_secrets`]: there the
 /// constraint really is fatal, since apply would otherwise write a GitHub
@@ -881,6 +976,7 @@ fn report_secrets_with_mode_inner(
     constraints: ConstraintMode,
     options: ResolveOptions,
 ) -> crate::error::Result<ResolveReport> {
+    validate_identity_placeholders(cfg)?;
     let mut report = ResolveReport::default();
     for consumer in &cfg.consumers {
         let namespace = &consumer.namespace;
@@ -986,8 +1082,21 @@ pub fn resolve_secrets_with_mode(
 }
 
 /// [`resolve_secrets`] with both the gateway mode and the slot-remap verdict
-/// supplied explicitly.
+/// supplied explicitly. Any error leaves the entire input unchanged.
 pub fn resolve_secrets_with_mode_and_options(
+    cfg: &mut GatewayConfig,
+    bundle: &CredentialBundle,
+    mode: GatewayMode,
+    options: ResolveOptions,
+) -> crate::error::Result<ResolveReport> {
+    validate_identity_placeholders(cfg)?;
+    let mut candidate = cfg.clone();
+    let report = resolve_secrets_in_place(&mut candidate, bundle, mode, options)?;
+    *cfg = candidate;
+    Ok(report)
+}
+
+fn resolve_secrets_in_place(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
     mode: GatewayMode,
@@ -1075,12 +1184,8 @@ pub fn resolve_secrets_with_mode_and_options(
 /// * `jwt` / `hmac_auth` — secrets must be ≥32 characters, so `len=` must be
 ///   at least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] entropy bytes.
 ///
-/// `mtls_auth.identity` is *also* not brokerable (it has to match a real
-/// certificate's CN/SAN/fingerprint), but it is left as a documented footgun
-/// rather than a hard error: unlike basicauth there is no mode in which a
-/// generated value is correct, so anyone writing `alloc=generate` there has
-/// already gone out of their way, and failing existing configs closed on
-/// upgrade would be worse than the gateway's own rejection message.
+/// Identity fields cannot be generated either. Existing bundle values still
+/// resolve without generation, including externally issued credentials.
 fn check_generation_constraints(
     components: &[SlotComponent<'_>],
     placeholder: &SecretPlaceholder,
@@ -1099,10 +1204,66 @@ fn check_generation_constraints(
         Some(SlotComponent::Literal(s)) => *s,
         _ => return Ok(()),
     };
-    let leaf = match components.last() {
-        Some(SlotComponent::Literal(s)) => *s,
-        _ => "",
-    };
+    check_generation_allowed(&slot, Some(cred_type), placeholder.length_bytes, mode)
+}
+
+/// Shared, side-effect-free generation policy for resolver and allocator.
+/// The supplied structural type must agree with the encoded slot; otherwise
+/// a caller could relabel a password hash or discovery token as an API key.
+pub fn check_generation_allowed(
+    slot: &str,
+    cred_type: Option<&str>,
+    length_bytes: usize,
+    mode: &GatewayMode,
+) -> crate::error::Result<()> {
+    let encoded_type = credential_type_from_slot(slot).ok_or_else(|| {
+        crate::error::Error::Config(format!(
+            "credential slot '{slot}' has no credential-type component; build it with secrets::slot_path"
+        ))
+    })?;
+    if cred_type.is_some_and(|t| t != encoded_type) {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': supplied credential type disagrees with the slot"
+        )));
+    }
+    let cred_type = encoded_type.as_str();
+    let path: Vec<String> = slot
+        .split('/')
+        .skip(3)
+        .map(unescape_slot_component)
+        .collect();
+    let leaf = path.last().map(String::as_str).unwrap_or_default();
+    if is_identity_credential_leaf(cred_type, Some(leaf)) {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': identity fields must be supplied literally, never generated"
+        )));
+    }
+    if cred_type == SERVICE_DISCOVERY_SLOT_KIND {
+        let field = service_discovery::SD_SECRET_FIELDS
+            .iter()
+            .find(|field| {
+                field
+                    .path
+                    .iter()
+                    .copied()
+                    .eq(path.iter().map(String::as_str))
+            })
+            .ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "secret slot '{slot}': unknown service-discovery secret; generation is refused"
+                ))
+            })?;
+        if !field.generatable {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}': the broker cannot generate {} — {}. Use \
+                 '${{gh-env-secret:alloc=require}}' and seed the slot with the real value. \
+                 If a previous rotation replaced it, reissue it at the provider and reseed; \
+                 the previous GitHub secret cannot be recovered.",
+                service_discovery::render_path(field.path),
+                field.ungeneratable_reason
+            )));
+        }
+    }
 
     if cred_type == "basicauth" {
         if leaf == "password_hash" {
@@ -1125,7 +1286,12 @@ fn check_generation_constraints(
         }
     }
 
-    check_min_entropy(&slot, cred_type, placeholder.length_bytes)?;
+    check_min_entropy(slot, cred_type, length_bytes)?;
+    if !(16..=256).contains(&length_bytes) {
+        return Err(crate::error::Error::Config(format!(
+            "credential slot '{slot}': generation length must be 16..=256 entropy bytes"
+        )));
+    }
 
     Ok(())
 }
@@ -1438,16 +1604,15 @@ fn resolve_service_discovery_leaf(
     let existing = lookup_exact_slot_value(&slot, bundle)?;
     let status = classify_status(&placeholder, existing);
 
-    if !field.generatable
-        && matches!(constraints, ConstraintMode::Enforce)
+    if matches!(constraints, ConstraintMode::Enforce)
         && matches!(status, SlotStatus::NeedsAllocation)
     {
-        return Err(crate::error::Error::Config(format!(
-            "secret slot '{slot}': the broker cannot generate {} — {}. Use \
-             '${{gh-env-secret:alloc=require}}' and seed the slot with the real value.",
-            service_discovery::render_path(field.path),
-            field.ungeneratable_reason
-        )));
+        check_generation_allowed(
+            &slot,
+            Some(SERVICE_DISCOVERY_SLOT_KIND),
+            placeholder.length_bytes,
+            &GatewayMode::Api,
+        )?;
     }
 
     report

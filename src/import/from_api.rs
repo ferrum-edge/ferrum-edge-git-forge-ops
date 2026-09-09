@@ -53,7 +53,6 @@ pub async fn import_from_api(
                 "refusing to import namespace '{namespace}': the backup's count seal does not match the document it sealed ({notice}). The snapshot may be truncated; publishing it would make a partial configuration the repository's desired state."
             )));
         }
-        validate_snapshot_namespace(&snapshot.config, &namespace)?;
 
         match &backup_version {
             Some(version) if version != &snapshot.config.version => {
@@ -104,43 +103,4 @@ pub async fn import_from_api(
         passthrough_policy,
         allow_plaintext_plugin_config,
     )
-}
-
-fn validate_snapshot_namespace(
-    config: &GatewayConfig,
-    requested_namespace: &str,
-) -> crate::error::Result<()> {
-    for (kind, id, actual_namespace) in config
-        .proxies
-        .iter()
-        .map(|resource| ("Proxy", resource.id.as_str(), resource.namespace.as_str()))
-        .chain(config.consumers.iter().map(|resource| {
-            (
-                "Consumer",
-                resource.id.as_str(),
-                resource.namespace.as_str(),
-            )
-        }))
-        .chain(config.upstreams.iter().map(|resource| {
-            (
-                "Upstream",
-                resource.id.as_str(),
-                resource.namespace.as_str(),
-            )
-        }))
-        .chain(config.plugin_configs.iter().map(|resource| {
-            (
-                "PluginConfig",
-                resource.id.as_str(),
-                resource.namespace.as_str(),
-            )
-        }))
-    {
-        if actual_namespace != requested_namespace {
-            return Err(crate::error::Error::Config(format!(
-                "namespace-scoped backup for {requested_namespace:?} returned {kind} {id:?} in namespace {actual_namespace:?}; refusing to publish a cross-namespace import"
-            )));
-        }
-    }
-    Ok(())
 }

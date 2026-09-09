@@ -27,6 +27,11 @@ environments:
     ownership:
       mode: exclusive           # repo is the source of truth
       namespaces: [ferrum]      # scope of exclusivity (required for exclusive)
+      # Checked after overlays and namespace filtering by every desired-state
+      # command, including validate/export. Gateway rows use their effective
+      # namespace; MeshConfig fragments use resources/<namespace>/mesh/.
+      # Unowned fragments fail with their namespace and fragment label: add
+      # ownership here or move the fragment. Shared mode does not restrict them.
       drift_report: true
       large_prune_threshold_percent: 25
 

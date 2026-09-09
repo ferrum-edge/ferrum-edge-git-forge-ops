@@ -211,6 +211,33 @@ jobs:
             fi
           done
 
+      - name: Build override regressions with the pinned builder
+        run: |
+          docker build --target builder -t gitforgeops:test-builder .
+          mkdir -p "$RUNNER_TEMP/override-tests"
+          docker run --rm --network none \
+            -v "$PWD/tests:/build/tests:ro" \
+            -v "$RUNNER_TEMP/override-tests:/checks" \
+            gitforgeops:test-builder sh -ec '
+              cargo test --release --locked --offline --test unit_tests --no-run
+              find /build/target/release/deps -maxdepth 1 -type f \
+                -name "unit_tests-*" -executable -exec cp "{}" /checks/unit_tests \;
+              test -x /checks/unit_tests
+            '
+
+      - name: Verify override inputs inside the shipped runtime
+        run: |
+          # Exercise actual authorization input checks, including dirty source,
+          # merged descendants and split trusted review. No network, credentials,
+          # root privilege or external checkout is needed by these fixtures.
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_SYSTEM=/dev/null \
+            -v "$RUNNER_TEMP/override-tests:/checks:ro" \
+            --entrypoint /checks/unit_tests gitforgeops:scan \
+            unit::override_tests:: --nocapture
+
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

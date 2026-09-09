@@ -1,8 +1,10 @@
+use crate::apply::MeshPublication;
 use crate::diff::best_practice::BestPractice;
 use crate::diff::breaking::BreakingChange;
 use crate::diff::resource_diff::{DiffAction, ResourceDiff, SpecOwnedResource, UnmanagedResource};
 use crate::diff::security::SecurityFinding;
 use crate::policy::config::OverrideConfig;
+use crate::policy::github_override::OverrideDecision;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
 
@@ -14,7 +16,9 @@ const MAX_SECTION_ITEMS: usize = 100;
 const MAX_DETAILS_PER_DIFF: usize = 20;
 const MAX_INLINE_BYTES: usize = 512;
 const MAX_VALIDATION_BYTES: usize = 8_192;
-const TRUNCATION_NOTICE_RESERVE: usize = 256;
+// The footer can name every section AND close an identifier's dynamic code
+// span (up to MAX_INLINE_BYTES + 1 backticks). Reserve space for both.
+const TRUNCATION_NOTICE_RESERVE: usize = 1_024;
 
 /// Characters that carry no visible meaning in a review comment but can
 /// misrepresent one: C0/C1 controls (terminal escapes among them), the bidi
@@ -85,7 +89,7 @@ pub fn build_review_comment_with_status(
     best_practices: &[BestPractice],
     comparison_error: Option<&str>,
 ) -> String {
-    finalize_comment(build_review_comment_inner(
+    let mut md = build_review_comment_inner(
         validation_status,
         validation_output,
         diffs,
@@ -93,9 +97,127 @@ pub fn build_review_comment_with_status(
         security,
         best_practices,
         comparison_error,
-    ))
+        None,
+        false,
+    );
+    md.insert_str(
+        0,
+        &verdict_summary(
+            validation_status,
+            security,
+            &[],
+            &[],
+            &ResolveReport::default(),
+            false,
+            None,
+            false,
+        ),
+    );
+    finalize_comment(md)
 }
 
+/// A bounded, count-complete verdict precedes every bulk section. Counts use
+/// the full input slices, never the detail caps. Keep this block independent
+/// of environment banners, validator output, and finding message lengths.
+#[allow(clippy::too_many_arguments)]
+fn verdict_summary(
+    validation: ReviewValidationStatus,
+    security: &[SecurityFinding],
+    policy: &[PolicyFinding],
+    spec_owned: &[SpecOwnedResource],
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+    decision: Option<&OverrideDecision>,
+    provisioning_blocked: bool,
+) -> String {
+    let security_count = security
+        .iter()
+        .filter(|finding| finding.severity == crate::diff::security::BLOCKING_SEVERITY)
+        .count();
+    let security_blocking = if decision.is_some_and(|decision| decision.active) {
+        0
+    } else {
+        security_count
+    };
+    let policy_blocking = policy
+        .iter()
+        .filter(|finding| finding.is_blocking())
+        .count();
+    let conflicts = spec_owned.iter().filter(|row| row.is_conflict()).count();
+    let missing = secrets.missing_required().len();
+    let blocked = provisioning_blocked
+        || validation != ReviewValidationStatus::Passed
+        || security_blocking > 0
+        || policy_blocking > 0
+        || conflicts > 0
+        || !secrets.slot_remaps.is_empty()
+        || (bundle_loaded && missing > 0);
+    let mut md = String::from("### Apply verdict\n\n");
+    md.push_str(if blocked {
+        "> **Apply is blocked** by the findings summarized below.\n\n"
+    } else {
+        "> No evaluated blocker. Gateway-dependent gates and unavailable credential evidence still apply.\n\n"
+    });
+    md.push_str(&format!(
+        "- Validation: {}.\n- Security Findings: {} total, {security_blocking} blocking, {} overridden.\n- Policy Violations: {} total, {policy_blocking} blocking.\n- Spec-owned Resources: {} total, {conflicts} **CONFLICT**(s); conflicting namespaces cannot apply.\n- Credential Slot Remaps: {} blocking unless explicitly acknowledged with `--allow-credential-slot-remap`.\n",
+        match validation {
+            ReviewValidationStatus::Passed => "passed",
+            ReviewValidationStatus::Rejected => "rejected; blocks apply",
+            ReviewValidationStatus::ExecutionError => "unavailable; blocks apply",
+        },
+        security.len(),
+        security_count - security_blocking,
+        policy.len(),
+        spec_owned.len(),
+        secrets.slot_remaps.len(),
+    ));
+    if bundle_loaded {
+        md.push_str(&format!(
+            "- Secret Broker Slots: {} total, {missing} missing required (blocking), \
+             {} awaiting generation (requires provisioning environment).\n",
+            secrets.results.len(),
+            secrets.needs_allocation().len(),
+        ));
+    } else {
+        md.push_str(&format!(
+            "- Secret Broker Slots: {} declared; bundle unavailable, required-slot status must be checked at apply.\n",
+            secrets.results.len(),
+        ));
+    }
+    let rules: std::collections::BTreeSet<_> = policy
+        .iter()
+        .filter(|finding| finding.is_blocking())
+        .map(|finding| finding.rule_id.as_str())
+        .collect();
+    if !rules.is_empty() {
+        md.push_str("- Blocking policy rules: ");
+        md.push_str(
+            &rules
+                .iter()
+                .take(12)
+                .map(|rule| bounded_inline_code(rule))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        if rules.len() > 12 {
+            md.push_str(&format!(
+                "; {} additional rule id(s) omitted",
+                rules.len() - 12
+            ));
+        }
+        md.push_str(".\n");
+    }
+    if let Some(decision) = decision.filter(|decision| decision.active) {
+        md.push_str(&format!(
+            "- Override evidence: {}. Validation and other admission gates remain enforced.\n",
+            bounded_markdown_text(&decision.reason),
+        ));
+    }
+    md.push('\n');
+    md
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_review_comment_inner(
     validation_status: ReviewValidationStatus,
     validation_output: &str,
@@ -104,6 +226,8 @@ fn build_review_comment_inner(
     security: &[SecurityFinding],
     best_practices: &[BestPractice],
     comparison_error: Option<&str>,
+    security_override: Option<&OverrideDecision>,
+    has_adoptions: bool,
 ) -> String {
     let mut md = String::new();
 
@@ -174,6 +298,8 @@ fn build_review_comment_inner(
         }
         append_omitted_table_row(&mut md, diffs.len(), "change");
         md.push('\n');
+    } else if has_adoptions {
+        md.push_str("### Changes: Ownership adoption\n\n");
     } else {
         md.push_str("### Changes: None (in sync)\n\n");
     }
@@ -216,15 +342,20 @@ fn build_review_comment_inner(
         }
         append_omitted_list_item(&mut md, security.len(), "security finding");
         md.push('\n');
-        // The reviewer's copy of apply's verdict. `cmd_apply` refuses on
-        // exactly this set (see `diff::security_blockers`), so a comment that
-        // listed the findings without saying they are terminal would read as
-        // advice on a PR that cannot be merged-and-applied.
+        // Mirror apply's security verdict, including its verified override.
+        // Keep every finding visible whether it blocks apply or is overridden.
         let blocking = security
             .iter()
             .filter(|finding| finding.severity == crate::diff::security::BLOCKING_SEVERITY)
             .count();
-        if blocking > 0 {
+        if let Some(decision) = security_override.filter(|decision| decision.active && blocking > 0)
+        {
+            let approver = decision.approver.as_deref().unwrap_or("verified approver");
+            md.push_str(&format!(
+                "> **Security findings OVERRIDDEN by {}**: {blocking} error-severity finding(s) remain listed above but do not block apply under this verified PR override. Validation and other admission gates still apply.\n\n",
+                bounded_inline_code(approver),
+            ));
+        } else if blocking > 0 {
             md.push_str(&format!(
                 "> **Apply is blocked** by {blocking} error-severity security finding(s). \
                  Consumer credentials must be committed as `${{gh-env-secret:...}}` placeholders — \
@@ -542,16 +673,103 @@ fn finalize_comment(md: String) -> String {
     while end > 0 && !md.is_char_boundary(end) {
         end -= 1;
     }
-    if let Some(newline) = md[..end].rfind('\n') {
-        end = newline;
+    while end > 0 && md.as_bytes()[end - 1] == b'`' {
+        end -= 1;
     }
+    // Cut at a UTF-8 boundary rather than dropping a potentially enormous
+    // table row. The complete verdict is already above all detail. Terminate
+    // any code fence/inline span opened by the retained detail before the notice.
     let mut bounded = md[..end].to_string();
     let omitted = md.len().saturating_sub(end);
+    let sections = [
+        "Validation:",
+        "Changes",
+        "Breaking Changes",
+        "Security Findings",
+        "Best Practice Recommendations",
+        "Unmanaged Resources",
+        "Spec-owned Resources",
+        "Policy Violations",
+        "Credential Slot Remaps",
+        "Secret Broker Slots",
+    ];
+    let omitted_sections: Vec<_> = sections
+        .into_iter()
+        .filter(|section| {
+            let heading = format!("\n### {section}");
+            md.find(&heading).is_some_and(|start| {
+                let next = md[start + heading.len()..]
+                    .find("\n### ")
+                    .map(|offset| start + heading.len() + offset)
+                    .unwrap_or(md.len());
+                next > end
+            })
+        })
+        .collect();
+    // Rendered code spans use backtick runs. A matching run closes a truncated
+    // span; fences occur only in the bounded validation section, before bulk.
+    let trailing_line = bounded.rsplit('\n').next().unwrap_or_default();
+    let bytes = trailing_line.as_bytes();
+    let mut index = 0;
+    let mut open_span = None;
+    while index < bytes.len() {
+        if open_span.is_none() && bytes[index] == b'\\' {
+            index += 2;
+        } else if bytes[index] == b'`' {
+            let start = index;
+            while index < bytes.len() && bytes[index] == b'`' {
+                index += 1;
+            }
+            let length = index - start;
+            match open_span {
+                None => open_span = Some(length),
+                Some(open) if open == length => open_span = None,
+                Some(_) => {}
+            }
+        } else {
+            index += 1;
+        }
+    }
+    if let Some(length) = open_span {
+        bounded.push_str(&"`".repeat(length));
+    }
     bounded.push_str(&format!(
-        "\n\n> Review output was truncated to fit GitHub's comment limit ({omitted} UTF-8 byte(s) omitted). Omitted details remain available in the workflow logs.\n"
+        "\n\n> Review output was truncated to fit GitHub's comment limit ({omitted} UTF-8 byte(s) omitted). Detail reduced or omitted from: {}. Complete blocking counts remain in Apply verdict above; use smaller scoped reviews to inspect omitted detail.\n",
+        omitted_sections.join(", "),
     ));
     debug_assert!(bounded.len() <= MAX_REVIEW_COMMENT_BYTES);
     bounded
+}
+
+/// The mesh-retraction banner, or `None` when the mesh document needs no
+/// comment.
+///
+/// Mesh resources never appear under "Changes" — there is no mesh admin API to
+/// compare against — so a post-merge apply that will rewrite the published
+/// mesh document as empty would otherwise reach a reviewer as nothing at all.
+/// Returned as its own rendered block so `cmd_review` can put it beside the
+/// environment banner, above every size-bounded section.
+pub fn render_mesh_retraction(publication: MeshPublication, output_path: &str) -> Option<String> {
+    let body = match publication {
+        MeshPublication::Published | MeshPublication::NeverPublished => return None,
+        MeshPublication::Retracted => format!(
+            "**RETRACT mesh** — this repository declares no `MeshConfig` fragments any more. The post-merge apply rewrites {} as an empty mesh document, so mesh nodes stop enforcing the deleted policy.",
+            bounded_inline_code(output_path)
+        ),
+        MeshPublication::AlreadyRetracted => format!(
+            "**RETRACT mesh** — this repository declares no `MeshConfig` fragments, and {} already holds the empty mesh document. Nothing to publish.",
+            bounded_inline_code(output_path)
+        ),
+        MeshPublication::Unattributed => format!(
+            "**RETRACT mesh: skipped** — this repository declares no `MeshConfig` fragments, but {} is not a document gitforgeops published. It is left untouched; remove it by hand once no mesh node reads it.",
+            bounded_inline_code(output_path)
+        ),
+        MeshPublication::NarrowedScope => format!(
+            "**RETRACT mesh: skipped** — no `MeshConfig` fragment is in scope for this namespace-filtered review, which is not evidence that the repository declares none. {} is left as published.",
+            bounded_inline_code(output_path)
+        ),
+    };
+    Some(format!("\n\n{body}"))
 }
 
 /// The "Spec-owned resources" section, or an empty string when there are none.
@@ -664,6 +882,88 @@ pub fn build_review_comment_v2_with_status(
     secrets: &ResolveReport,
     bundle_loaded: bool,
 ) -> String {
+    build_review_comment_v2_with_override(
+        validation_status,
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        policy,
+        unmanaged,
+        spec_owned,
+        override_reason,
+        override_cfg,
+        comparison_error,
+        environment_note,
+        secrets,
+        bundle_loaded,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_review_comment_v2_with_override(
+    validation_status: ReviewValidationStatus,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    policy: &[PolicyFinding],
+    unmanaged: &[UnmanagedResource],
+    spec_owned: &[SpecOwnedResource],
+    override_reason: Option<&str>,
+    override_cfg: Option<&OverrideConfig>,
+    comparison_error: Option<&str>,
+    environment_note: Option<&str>,
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+    security_override: Option<&OverrideDecision>,
+) -> String {
+    build_review_comment_with_preview(
+        validation_status,
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        policy,
+        unmanaged,
+        spec_owned,
+        override_reason,
+        override_cfg,
+        comparison_error,
+        environment_note,
+        secrets,
+        bundle_loaded,
+        security_override,
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_review_comment_with_preview(
+    validation_status: ReviewValidationStatus,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    policy: &[PolicyFinding],
+    unmanaged: &[UnmanagedResource],
+    spec_owned: &[SpecOwnedResource],
+    override_reason: Option<&str>,
+    override_cfg: Option<&OverrideConfig>,
+    comparison_error: Option<&str>,
+    environment_note: Option<&str>,
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+    security_override: Option<&OverrideDecision>,
+    adoptions: &[crate::apply::AdoptionCandidate],
+    provisioning_blockers: &[crate::verdict::ApplyBlocker],
+) -> String {
     let mut md = build_review_comment_inner(
         validation_status,
         validation_output,
@@ -672,7 +972,25 @@ pub fn build_review_comment_v2_with_status(
         security,
         best_practices,
         comparison_error,
+        security_override,
+        !adoptions.is_empty(),
     );
+
+    if comparison_error.is_none() && !adoptions.is_empty() {
+        md.push_str("### Ownership Adoption\n\n");
+        md.push_str(crate::apply::ADOPTION_PREVIEW_NOTICE);
+        md.push_str("\n\n");
+        for candidate in adoptions.iter().take(MAX_SECTION_ITEMS) {
+            md.push_str(&format!(
+                "- ADOPT {} {} ({})\n",
+                bounded_markdown_text(&candidate.kind),
+                bounded_inline_code(&candidate.id),
+                bounded_inline_code(&candidate.namespace),
+            ));
+        }
+        append_omitted_list_item(&mut md, adoptions.len(), "adoption");
+        md.push('\n');
+    }
 
     // Already-rendered markdown from `environment_header` — gitforgeops'
     // own banner, whose untrusted components are fenced there. Escaping it
@@ -735,7 +1053,7 @@ pub fn build_review_comment_v2_with_status(
                 None => (&default_label, &default_permission),
             };
             md.push_str(&format!(
-                "> **Apply is blocked** until the listed violations are resolved. To override, add the {} label (requires {} permission on this repo).\n\n",
+                "> **Apply is blocked** until the listed violations are resolved. To override, add the {} label and submit its revision-bound override review (requires {} permission on this repo).\n\n",
                 bounded_inline_code(label),
                 bounded_inline_code(permission),
             ));
@@ -779,11 +1097,11 @@ pub fn build_review_comment_v2_with_status(
                  (typical for PRs from forks or runs without an environment \
                  binding). The table below shows which placeholders are \
                  declared; **actual allocation status is determined at apply \
-                 time**, not here. Only unresolved broker-controlled leaves in \
-                 Consumer credentials and plugin config are excluded from the \
-                 live diff; literal siblings, extra entries, shape changes, and \
-                 nonsecret fields are still compared._\n\n",
+                 time**, not here._\n\n",
             );
+        }
+        if let Some(note) = secrets.unresolved_comparison_note() {
+            md.push_str(&format!("_{note}_\n\n"));
         }
         md.push_str("| Slot | Declared as |\n|------|-------------|\n");
         for result in secrets.results.iter().take(MAX_SECTION_ITEMS) {
@@ -808,5 +1126,24 @@ pub fn build_review_comment_v2_with_status(
         md.push('\n');
     }
 
+    let mut summary = verdict_summary(
+        validation_status,
+        security,
+        policy,
+        spec_owned,
+        secrets,
+        bundle_loaded,
+        security_override,
+        !provisioning_blockers.is_empty(),
+    );
+    for blocker in provisioning_blockers {
+        summary.push_str(&format!("- **Apply is blocked:** {}\n", blocker.summary()));
+    }
+    summary.push_str(&format!("- Ownership adoptions: {}.\n\n", adoptions.len()));
+    summary.push_str(&format!(
+        "Detail totals: {} Changes; {} Breaking Changes; {} Best Practice Recommendations; {} Unmanaged Resources.\n\n",
+        diffs.len(), breaking.len(), best_practices.len(), unmanaged.len(),
+    ));
+    md.insert_str(0, &summary);
     finalize_comment(md)
 }

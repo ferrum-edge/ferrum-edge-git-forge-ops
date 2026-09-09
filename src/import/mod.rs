@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::config::schema::{GatewayConfig, Resource};
 use crate::http_client::BackupSnapshot;
+use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
     capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
@@ -129,9 +130,9 @@ pub struct ImportResult {
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
     pub sources: Vec<ImportSourceMetadata>,
-    /// Non-builtin plugins whose config strings were left in the imported
-    /// files because the sensitivity heuristics did not flag them. Surfaced
-    /// by [`ImportResult::custom_plugin_review_notice`] so an operator reads
+    /// Plugins whose config strings required explicit plaintext allowance:
+    /// builtin heuristic matches outside broker rules, or custom unflagged leaves.
+    /// Surfaced by [`ImportResult::custom_plugin_review_notice`] so an operator reads
     /// them before committing.
     ///
     /// Deliberately kept out of the import manifest: the manifest is a
@@ -231,23 +232,19 @@ impl ImportResult {
         Some(notice)
     }
 
-    /// Loud per-plugin review list for the non-builtin plugins the operator
+    /// Loud per-plugin review list for the builtin or custom plugins the operator
     /// allowed through with `--allow-plaintext-plugin-config`.
     ///
-    /// gitforgeops has no schema for a plugin it does not know, so it brokers
-    /// only what the key/URL sensitivity heuristics flag. Everything they did
-    /// not flag makes the import *fail* unless the plugin was named on the
-    /// command line (see `enforce_plaintext_plugin_config_allowance`) —
-    /// capturing `mode: strict` into a GitHub Environment Secret makes the
-    /// import unusable, and committing an unrecognized `authToken` is worse.
-    /// This notice is what the accepted case prints: the exact leaves that
-    /// were written verbatim on the operator's say-so.
+    /// Builtin heuristic matches outside broker rules and unflagged custom
+    /// strings fail import unless the plugin was named on the command line
+    /// (see `enforce_plaintext_plugin_config_allowance`). This notice lists
+    /// the exact leaves written verbatim on the operator's say-so.
     pub fn custom_plugin_review_notice(&self) -> Option<String> {
         if self.unbrokered_plugin_config.is_empty() {
             return None;
         }
         let mut notice = String::from(
-            "WARNING: these plugin config values were written verbatim because --allow-plaintext-plugin-config named their plugin. This build has no schema for them, so only key/URL heuristics ran. Confirm once more that none of them is a credential before committing:",
+            "WARNING: these plugin config values were written verbatim because --allow-plaintext-plugin-config named their plugin. These paths are secret-looking builtin fields outside this build's broker rules, or unclassified custom-plugin strings. Confirm once more that none of them is a credential before committing:",
         );
         for plugin in &self.unbrokered_plugin_config {
             let mut paths = plugin
@@ -412,13 +409,15 @@ fn diagnostic_metadata(value: &str) -> String {
 /// `--accept-unknown-field <NAME>` (with `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
 /// is the documented way to accept one after reading the source.
 ///
-/// # Unrecognized plugins fail closed
+/// # Unbrokered plugin config fails closed
 ///
 /// A plugin this build has no schema for is classified by the key/URL
 /// heuristics alone, and a string they do not flag would be committed as
 /// written. This entry point allows none of that: an unclassifiable leaf is an
 /// error. The CLI's `--allow-plaintext-plugin-config <plugin_name>` is the
 /// documented way to accept them after reading the list.
+/// Builtin plugins also require this allowance for secret-looking key/URL
+/// heuristic matches outside their schema-declared broker rules.
 pub fn split_config(
     config: &GatewayConfig,
     output_dir: &Path,
@@ -442,7 +441,7 @@ pub fn split_config(
 /// unacknowledged one aborts the whole import.
 ///
 /// `allow_plaintext_plugin_config` holds exact `plugin_name`s whose
-/// heuristically-unclassifiable config strings the operator has reviewed and
+/// unbrokered config strings the operator has reviewed and
 /// accepted as plaintext (`--allow-plaintext-plugin-config`). Any other plugin
 /// with such a string aborts the import too.
 pub(crate) fn split_config_with_inventory(
@@ -752,27 +751,12 @@ fn acknowledged_passthrough_review(config: &GatewayConfig) -> Vec<String> {
 /// backup could otherwise turn one plugin into a megabyte of terminal output.
 const MAX_PATHS_PER_PLUGIN: usize = 50;
 
-/// Refuse the import unless every unrecognized plugin holding an
-/// unclassifiable config string has been named on the command line.
-///
-/// gitforgeops has no schema for such a plugin, so only the key/URL
-/// sensitivity heuristics run over its config, and a vendor field they do not
-/// recognize — `authToken`, `serviceCredential`, anything the naming
-/// conventions missed — would be committed to Git exactly as the backup
-/// returned it. The old behavior printed a warning after publishing the tree,
-/// which is the wrong order: by the time an operator reads it, the value is on
-/// disk and (once merged) in the repository's history.
-///
-/// So the default is now to fail, and the failure is recoverable in the only
-/// way that is honest — the operator reads the named paths, decides that none
-/// of them is a credential, and re-runs with
-/// `--allow-plaintext-plugin-config <plugin_name>` for each plugin they
-/// accepted. Heuristically-flagged leaves are brokered either way; the flag
-/// only governs what the heuristics could *not* judge.
-///
-/// The refusal names the plugin id, its `plugin_name`, and every unclassified
-/// path — and no values, because the whole point is that gitforgeops does not
-/// know whether they are secrets.
+/// Refuse before publication unless every plugin with unbrokered strings has
+/// been named via `--allow-plaintext-plugin-config <plugin_name>`.
+/// Builtin heuristic matches outside broker rules and unflagged custom strings
+/// require review at the source. The operator may accept non-credentials as
+/// plaintext; schema-covered builtin secrets and custom heuristic matches are
+/// brokered regardless. Diagnostics name plugin ids and paths, never values.
 fn enforce_plaintext_plugin_config_allowance(
     unbrokered: Vec<UnbrokeredPluginConfig>,
     allowed: &[String],
@@ -786,7 +770,7 @@ fn enforce_plaintext_plugin_config_allowance(
     }
 
     let mut message = String::from(
-        "refusing to import plaintext plugin config: this build has no schema for the plugin(s) below, so only the key/URL sensitivity heuristics ran, and the string values at these paths would be committed to the repository as written. Read them at the source, and if none is a credential re-run with --allow-plaintext-plugin-config <plugin_name> for each (exact plugin_name, repeatable). Nothing has been written.",
+        "refusing to import plaintext plugin config: these paths are secret-looking builtin fields outside this build's broker rules, or unclassified custom-plugin strings, and would be committed to the repository as written. Read them at the source, and if none is a credential re-run with --allow-plaintext-plugin-config <plugin_name> for each (exact plugin_name, repeatable). Nothing has been written.",
     );
     for plugin in refused {
         let mut paths = plugin
@@ -867,11 +851,8 @@ fn render_migration_bundles(captured: &CredentialBundle) -> crate::error::Result
                     <= crate::secrets::bundle::BUNDLE_SOFT_LIMIT_BYTES
             })
             .unwrap_or(shards.len() as u32);
-        if shard >= 100 {
-            return Err(crate::error::Error::Config(
-                "credential migration bundle would exceed GitHub's 100 environment-secret shard limit"
-                    .to_string(),
-            ));
+        if shard >= MAX_BUNDLE_SHARDS {
+            return Err(shard_ceiling_error(slot, "import"));
         }
         let current = shard_sizes.get(&shard).copied().unwrap_or(2);
         let projected = current + usize::from(current > 2) + entry_size;

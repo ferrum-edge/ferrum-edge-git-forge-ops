@@ -2,15 +2,33 @@ use std::collections::HashSet;
 
 use crate::config::schema::PassthroughFields;
 use crate::config::GatewayConfig;
+use crate::secrets::plugin_config::ConfigPathComponent;
+use crate::secrets::resolver::{consumer_credential_slot, plugin_config_slot};
+use crate::secrets::{ResolveReport, SlotStatus};
 
 /// Exclude only unresolved broker-controlled leaves from a live comparison
-/// when the caller has no secret bundle and cannot materialize desired slots.
+/// after resolution, regardless of whether a bundle is absent, empty or partial.
 ///
+/// The report must come from resolving this desired configuration. Value text
+/// is not provenance: a resolved secret can itself resemble broker syntax.
 /// Matching Consumer credentials and PluginConfig config values are aligned
 /// leaf-by-leaf. Literal siblings, extra live entries, shape differences,
 /// adds/deletes, and every nonsecret field remain visible, so review loses no
 /// actionable drift signal beyond exact values it cannot authoritatively know.
-pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut GatewayConfig) {
+pub fn mask_indeterminate_secret_values(
+    desired: &GatewayConfig,
+    actual: &mut GatewayConfig,
+    report: &ResolveReport,
+) {
+    let unresolved: HashSet<&str> = report
+        .results
+        .iter()
+        .filter(|result| result.status != SlotStatus::Resolved)
+        .map(|result| result.slot.as_str())
+        .collect();
+    if unresolved.is_empty() {
+        return;
+    }
     for live in &mut actual.consumers {
         if let Some(expected) = desired
             .consumers
@@ -19,7 +37,15 @@ pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut Ga
         {
             for (credential_type, desired_value) in &expected.credentials {
                 if let Some(live_value) = live.credentials.get_mut(credential_type) {
-                    mask_placeholder_leaves(desired_value, live_value);
+                    mask_unresolved_leaves(desired_value, live_value, &mut Vec::new(), &|path| {
+                        let slot = consumer_credential_slot(
+                            &expected.namespace,
+                            &expected.id,
+                            credential_type,
+                            path,
+                        );
+                        unresolved.contains(slot.as_str())
+                    });
                 }
             }
         }
@@ -31,7 +57,16 @@ pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut Ga
             .iter()
             .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
         {
-            mask_placeholder_leaves(&expected.config, &mut live.config);
+            mask_unresolved_leaves(
+                &expected.config,
+                &mut live.config,
+                &mut Vec::new(),
+                &|path| {
+                    unresolved.contains(
+                        plugin_config_slot(&expected.namespace, &expected.id, path).as_str(),
+                    )
+                },
+            );
         }
     }
 
@@ -61,7 +96,12 @@ pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut Ga
             else {
                 continue;
             };
-            if !matches!(crate::secrets::parse_placeholder(placeholder), Some(Ok(_))) {
+            let slot = crate::secrets::service_discovery::slot(
+                &expected.namespace,
+                &expected.id,
+                field.path,
+            );
+            if !unresolved.contains(slot.as_str()) {
                 continue;
             }
             if let Some(slot) =
@@ -75,23 +115,34 @@ pub fn mask_indeterminate_secret_values(desired: &GatewayConfig, actual: &mut Ga
     }
 }
 
-fn mask_placeholder_leaves(desired: &serde_json::Value, live: &mut serde_json::Value) {
+fn mask_unresolved_leaves(
+    desired: &serde_json::Value,
+    live: &mut serde_json::Value,
+    path: &mut Vec<ConfigPathComponent>,
+    is_unresolved: &impl Fn(&[ConfigPathComponent]) -> bool,
+) {
     match (desired, live) {
         (serde_json::Value::String(expected), serde_json::Value::String(actual))
-            if matches!(crate::secrets::parse_placeholder(expected), Some(Ok(_))) =>
+            if is_unresolved(path) =>
         {
             *actual = expected.clone();
         }
         (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
             for (key, expected_child) in expected {
                 if let Some(actual_child) = actual.get_mut(key) {
-                    mask_placeholder_leaves(expected_child, actual_child);
+                    path.push(ConfigPathComponent::Key(key.clone()));
+                    mask_unresolved_leaves(expected_child, actual_child, path, is_unresolved);
+                    path.pop();
                 }
             }
         }
         (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
-            for (expected_child, actual_child) in expected.iter().zip(actual.iter_mut()) {
-                mask_placeholder_leaves(expected_child, actual_child);
+            for (index, (expected_child, actual_child)) in
+                expected.iter().zip(actual.iter_mut()).enumerate()
+            {
+                path.push(ConfigPathComponent::Index(index));
+                mask_unresolved_leaves(expected_child, actual_child, path, is_unresolved);
+                path.pop();
             }
         }
         _ => {}
@@ -120,9 +171,8 @@ pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
 /// control-plane address or service-name change — exactly the drift a reviewer
 /// is there to catch — so only the classified leaves are replaced.
 ///
-/// A well-formed `${gh-env-secret:…}` placeholder is repository data and stays
-/// legible, matching the validator scrubber's rule: a reviewer needs to see
-/// that a field is brokered.
+/// Redact even placeholder-shaped strings: the field diff has no resolution
+/// provenance, and either side may hold accepted secret material with that shape.
 fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
     if kind != "Upstream" {
         return;
@@ -150,9 +200,6 @@ fn redact_service_discovery_json(serialized: &str) -> Option<String> {
         let Some(serde_json::Value::String(leaf)) = json_leaf_mut(&mut value, field.path) else {
             continue;
         };
-        if matches!(crate::secrets::parse_placeholder(leaf), Some(Ok(_))) {
-            continue;
-        }
         *leaf = crate::secrets::REDACTION.to_string();
         redacted = true;
     }
@@ -364,10 +411,18 @@ pub fn compute_diff_with_options(
         &mut result,
     );
 
-    // `actual` is walked through a HashMap, so the spec-owned bucket comes out
-    // in arbitrary order. It is rendered verbatim into PR comments and plan
-    // output — sort it so re-runs of an unchanged config produce an unchanged
-    // report.
+    // `actual` is walked through a HashMap, so all three buckets come out in
+    // arbitrary order. They are rendered verbatim into PR comments and plan
+    // output — sort them so re-runs of an unchanged config produce an
+    // unchanged report. `(namespace, kind, id)` is the canonical identity used
+    // by `state_key` and rejected as a duplicate by
+    // `validate_unique_resource_keys`, so it is a total order here.
+    result
+        .diffs
+        .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));
+    result
+        .unmanaged
+        .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));
     result
         .spec_owned
         .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));
