@@ -11,6 +11,7 @@
 # and merges only after hosted CI passes and actionable threads are resolved.
 /.github/ferrum-edge-checksums.txt @jeremyjpj0916
 /.gitforgeops/ @jeremyjpj0916
+/.state @jeremyjpj0916
 /.state/ @jeremyjpj0916
 /assembled/ @jeremyjpj0916
 /Dockerfile @jeremyjpj0916

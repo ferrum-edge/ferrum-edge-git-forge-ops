@@ -18,8 +18,8 @@ PATTERNS = {
         r"rust-toolchain(?:\.toml)?$|(?:\.?(?:rustfmt|clippy)\.toml)$|"
         r"\.github/workflows/rust-ci\.yml$)"
     ),
-    "declarative": re.compile(r"^(?:resources/|overlays/|\.gitforgeops/)"),
-    "state": re.compile(r"^\.state/"),
+    "declarative": re.compile(r"^(?:resources/|overlays/|\.gitforgeops/|\.state(?:/|$))"),
+    "state": re.compile(r"^\.state(?:/|$)"),
 }
 GITHUB_PULL_FILES_LIMIT = 3_000
 
