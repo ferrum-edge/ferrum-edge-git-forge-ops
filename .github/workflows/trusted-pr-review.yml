@@ -396,6 +396,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITFORGEOPS_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          # Authorization compares candidate YAML bytes and protected config
+          # with the reviewed head, and executable inputs with this checkout.
+          # This path is evidence to inspect, never an authorization assertion.
+          GITFORGEOPS_OVERRIDE_SOURCE: ../trusted
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           # Optional JWT claim settings; see apply-on-merge.yml for why they

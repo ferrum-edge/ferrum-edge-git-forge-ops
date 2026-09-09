@@ -55,6 +55,9 @@ pub struct ApplyResult {
     /// resource is gone either way), but counted so an all-404 namespace can
     /// be called out — see [`all_deletes_missing_warning`].
     pub deletes_missing: usize,
+    /// Planned deletes not attempted because an Add/Modify failed in the same
+    /// namespace. They never enter `applied_incremental`, preserving ownership.
+    pub deletes_deferred: usize,
     pub unmanaged_skipped: usize,
     /// Live resources owned by an API-spec import that this run deliberately
     /// left alone (see [`spec_owned_skip_messages`]).
@@ -101,8 +104,8 @@ impl ApplyResult {
     pub fn into_result(mut self) -> crate::error::Result<Self> {
         let fatal = self.fatal_error.take();
         let counts = format!(
-            "{} created, {} updated, {} deleted",
-            self.created, self.updated, self.deleted
+            "{} created, {} updated, {} deleted, {} deletes deferred",
+            self.created, self.updated, self.deleted, self.deletes_deferred
         );
 
         match (fatal, self.errors.is_empty()) {
@@ -169,9 +172,10 @@ pub fn all_deletes_missing_warning(
 /// Deletes go *after* adds/modifies rather than before: an upstream can only
 /// be removed once nothing references it, and the proxy modify that drops the
 /// reference has to land first (`DELETE /upstreams/{id}` answers 409 while a
-/// proxy still points at it). The cost is that a delete-then-recreate on a
-/// contended unique value (a listen address, say) now conflicts — rare, and
-/// visible as a 409 rather than a silent wrong result.
+/// proxy still points at it). A rename on a contended unique value (a route,
+/// say) conflicts. Any failed Add/Modify defers this namespace's deletes,
+/// preserving the incumbent; an unchanged retry still conflicts until the
+/// operator resolves the routing conflict. This is not an atomic swap.
 pub fn operation_rank(action: &DiffAction, kind: &str) -> u8 {
     match action {
         DiffAction::Add | DiffAction::Modify => match kind {
@@ -191,13 +195,29 @@ pub fn operation_rank(action: &DiffAction, kind: &str) -> u8 {
 
 /// Sort a computed diff into admin-API application order.
 ///
-/// Stable, so resources sharing a rank keep the diff's original (deterministic)
-/// ordering. Applied here in the api target rather than in `compute_diff` —
-/// the diff is also consumed by `plan`/`diff` output where the grouping by kind
-/// is the more readable presentation.
+/// Stable, so resources sharing a rank keep `compute_diff`'s
+/// `(namespace, kind, id)` ordering. Applied here in the api target rather than
+/// in `compute_diff` — the diff is also consumed by `plan`/`diff` output where
+/// the grouping by kind is the more readable presentation.
 pub fn order_diffs(mut diffs: Vec<ResourceDiff>) -> Vec<ResourceDiff> {
     diffs.sort_by_key(|d| operation_rank(&d.action, &d.kind));
     diffs
+}
+
+/// A preview cannot predict write failures, so describe deletes as conditional.
+pub fn incremental_prune_notice(
+    strategy: &ApplyStrategy,
+    diffs: &[ResourceDiff],
+) -> Option<&'static str> {
+    if matches!(strategy, ApplyStrategy::Incremental)
+        && diffs.iter().any(|d| matches!(d.action, DiffAction::Delete))
+    {
+        Some(
+            "Incremental deletes are conditional: any failed Add/Modify defers all deletes in that namespace. A same-route rename requires resolving the routing conflict; an unchanged retry cannot complete it.",
+        )
+    } else {
+        None
+    }
 }
 
 /// Apply configuration to the gateway via the admin API.
@@ -389,6 +409,7 @@ pub async fn apply_api(
         aggregate.updated += namespace_result.updated;
         aggregate.deleted += namespace_result.deleted;
         aggregate.deletes_missing += namespace_result.deletes_missing;
+        aggregate.deletes_deferred += namespace_result.deletes_deferred;
         aggregate.unmanaged_skipped += namespace_result.unmanaged_skipped;
         aggregate.spec_owned_skipped += namespace_result.spec_owned_skipped;
         aggregate
@@ -1203,7 +1224,27 @@ async fn apply_incremental(
         return Ok(result);
     }
 
+    // All Add/Modify ranks precede all Delete ranks. Keep collecting write
+    // failures, but do not remove incumbents when desired state was not
+    // established. This flag belongs to this namespace only; failed deletes
+    // do not prevent other deletes from being attempted.
+    let mut writes_failed = false;
     for diff in &diffs {
+        if diff.namespace != namespace {
+            return Err(crate::error::Error::BackupNamespace(format!(
+                "diff namespace {:?} does not match apply namespace {namespace:?}",
+                diff.namespace
+            )));
+        }
+        let namespace = diff.namespace.as_str();
+        if writes_failed && matches!(diff.action, DiffAction::Delete) {
+            result.deletes_deferred += 1;
+            eprintln!(
+                "[{namespace}] DEFER DELETE {} `{}`: an Add/Modify failed in this namespace; prune not attempted and existing managed ledger entries preserved. Resolve the write failure before retrying.",
+                diff.kind, diff.id
+            );
+            continue;
+        }
         let key = (diff.namespace.as_str(), diff.id.as_str());
         let outcome = match (&diff.action, diff.kind.as_str()) {
             (DiffAction::Add, "Proxy") => match index.proxies.get(&key) {
@@ -1318,6 +1359,9 @@ async fn apply_incremental(
                 return Ok(result);
             }
             Err(e) => {
+                if matches!(diff.action, DiffAction::Add | DiffAction::Modify) {
+                    writes_failed = true;
+                }
                 result.errors.push(format!(
                     "{} {} {}: {}",
                     diff.kind,
@@ -1940,8 +1984,10 @@ fn create_outcome_is_ambiguous(error: &crate::error::Error) -> bool {
 /// row with the same value, recursively through nested objects. Arrays and
 /// scalars still compare exactly — a differing target list or timeout is a
 /// real difference, not a gateway default. Extra keys on the live side are
-/// ignored. `created_at` / `updated_at` are dropped outright because the
-/// desired side fabricates them at deserialize time.
+/// ignored. `created_at` / `updated_at` are dropped outright: the desired side
+/// omits them unless the repository declares them, and the gateway always
+/// stamps them on the live side, so a comparison that kept them would read
+/// every row as a foreign one.
 ///
 /// This is not an ownership proof and is never used as one: the callers follow
 /// a positive match with an idempotent PUT that overwrites the row with the

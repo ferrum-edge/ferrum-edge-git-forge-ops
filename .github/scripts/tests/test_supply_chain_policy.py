@@ -407,6 +407,40 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertTrue(any("persisted by checkout" in item for item in violations))
         self.assertTrue(any("minted after" in item for item in violations))
 
+    def test_state_push_retry_must_use_the_default_branch(self):
+        commit_step = "- name: Commit state update"
+        secure = "\n".join(
+            [
+                commit_step,
+                "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+                'git push origin "HEAD:$DEFAULT_BRANCH"',
+                'git fetch origin "$DEFAULT_BRANCH"',
+                'git rebase "origin/$DEFAULT_BRANCH"',
+            ]
+        )
+        self.assertEqual(
+            check_supply_chain.state_push_retry_violations(
+                "rotate.yml", secure, commit_step
+            ),
+            [],
+        )
+
+        insecure = secure.replace(
+            'git rebase "origin/$DEFAULT_BRANCH"',
+            "git rebase origin/main",
+        )
+        violations = check_supply_chain.state_push_retry_violations(
+            "rotate.yml", insecure, commit_step
+        )
+        self.assertTrue(
+            any("must not hardcode 'origin/main'" in item for item in violations),
+            violations,
+        )
+        self.assertTrue(
+            any("missing default-branch push retry" in item for item in violations),
+            violations,
+        )
+
     def test_every_whole_secrets_context_form_is_rejected(self):
         # `secrets.NAME` and `secrets['NAME']` were caught in validate-pr.yml,
         # but the whole-context forms — which hand over EVERY environment
@@ -556,6 +590,23 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertTrue(
             any("MAX_BUNDLE_SHARDS disagrees" in item for item in violations), violations
         )
+
+    def test_import_packing_must_use_the_shared_shard_ceiling(self):
+        self.assertEqual(check_supply_chain.import_shard_ceiling_violations(ROOT), [])
+        for replacement in ("shard >= 100", "shard > MAX_BUNDLE_SHARDS"):
+            with self.subTest(replacement=replacement):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / "src/import/mod.rs"
+                    original = path.read_text(encoding="utf-8")
+                    changed = original.replace("shard >= MAX_BUNDLE_SHARDS", replacement)
+                    self.assertNotEqual(original, changed)
+                    path.write_text(changed, encoding="utf-8")
+                    violations = self._violations(root)
+                self.assertTrue(
+                    any("migration packing must refuse" in item for item in violations),
+                    violations,
+                )
 
     def test_privileged_workflows_must_bind_every_declared_shard(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1207,6 +1258,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ".dockerignore",
             "rust-toolchain.toml",
             "src/secrets/bundle.rs",
+            "src/import/mod.rs",
         ):
             source = ROOT / relative
             destination = root / relative

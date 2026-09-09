@@ -4,7 +4,10 @@
 
 use std::path::{Path, PathBuf};
 
-use gitforgeops::apply::{apply_mesh_file, render_mesh_yaml};
+use gitforgeops::apply::{
+    apply_mesh_file, plan_mesh_publication, reconcile_mesh_file, render_mesh_yaml, MeshPublication,
+    MeshRetractionScope,
+};
 use gitforgeops::config::{
     apply_overlay, assemble, assemble_with_namespace_filter, load_resources, schema::Resource,
     MeshConfigSpec,
@@ -766,4 +769,453 @@ fn summary_reports_only_non_empty_collections() {
 fn summary_of_an_empty_document_is_empty() {
     assert_eq!(MeshConfigSpec::default().summary(), "");
     assert!(MeshConfigSpec::default().is_empty());
+}
+
+#[test]
+fn assembled_mesh_retains_directory_scope_after_overlays_and_filtering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let resources_dir = tmp.path().join("resources");
+    let overlay_dir = tmp.path().join("overlays/staging");
+    write_tree(
+        &resources_dir,
+        &[
+            ("alpha/mesh/core.yaml", CORE_FRAGMENT),
+            ("gamma/mesh/extra.yaml", EXTRA_FRAGMENT),
+        ],
+    );
+    write_tree(
+        &overlay_dir,
+        &[(
+            "gamma/mesh/extra.yaml",
+            "kind: MeshConfig\nspec:\n  outbound_traffic_policy:\n    mode: ALLOW_ANY\n",
+        )],
+    );
+    let mut resources = load_resources(&resources_dir).unwrap();
+    apply_overlay(&mut resources, &overlay_dir).unwrap();
+    let assembled = assemble(resources.clone()).unwrap();
+    let error = assembled
+        .validate_mesh_scope("production", &["alpha".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("namespace 'gamma'"), "{error}");
+    assert!(error.contains("gamma/mesh/extra"), "{error}");
+    assembled
+        .validate_mesh_scope("production", &["alpha".into(), "gamma".into()])
+        .unwrap();
+    let filtered = assemble_with_namespace_filter(resources, Some("alpha")).unwrap();
+    filtered
+        .validate_mesh_scope("production", &["alpha".into()])
+        .unwrap();
+    assert_eq!(filtered.mesh_sources.len(), 1);
+    // Inner workload/service namespaces deliberately differ from directory scope.
+    assert_eq!(filtered.mesh_sources[0].0, "alpha");
+    assert!(filtered.mesh.unwrap().outbound_traffic_policy.is_none());
+}
+
+// ── Retraction ────────────────────────────────────────────────────────────
+//
+// Publication is a reconciliation: removing the last `MeshConfig` fragment has
+// to converge the published document too. Otherwise every mesh node reading
+// `FERRUM_MESH_FILE_OUTPUT_PATH` keeps enforcing policy the repository deleted,
+// and (under `apply-on-merge.yml`) the stale document stays committed on the
+// default branch forever.
+
+/// A run that sees the whole repository, with `ledger_attributed` under test.
+fn whole_repository(ledger_attributed: bool) -> MeshRetractionScope {
+    MeshRetractionScope {
+        ledger_attributed,
+        covers_repository: true,
+    }
+}
+
+fn one_workload() -> MeshConfigSpec {
+    let mut mesh = MeshConfigSpec::default();
+    mesh.workloads
+        .push(serde_json::json!({"spiffe_id": "spiffe://cluster.local/ns/ferrum/sa/api"}));
+    mesh
+}
+
+/// The document a retraction publishes.
+fn empty_mesh_document() -> String {
+    render_mesh_yaml(&MeshConfigSpec::default()).unwrap()
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).expect("read published document")
+}
+
+#[test]
+fn removing_the_last_fragment_retracts_the_published_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("assembled/sandbox-mesh.yaml");
+    let path = target.to_str().unwrap();
+
+    let published = reconcile_mesh_file(Some(&one_workload()), path, whole_repository(true));
+    assert_eq!(published.unwrap(), MeshPublication::Published);
+    assert!(read(&target).contains("spiffe"));
+
+    let retracted = reconcile_mesh_file(None, path, whole_repository(true));
+    assert_eq!(retracted.unwrap(), MeshPublication::Retracted);
+
+    // The retraction is the document ferrum-edge's `MeshFileDocument` reads as
+    // "no mesh policy": exactly `version` plus an empty `mesh` mapping.
+    let written = read(&target);
+    assert_eq!(written, empty_mesh_document());
+    let parsed: serde_yaml::Mapping = serde_yaml::from_str(&written).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed["version"].as_str(), Some("1"));
+    assert!(parsed["mesh"].as_mapping().is_some_and(|m| m.is_empty()));
+}
+
+#[test]
+fn a_repository_that_never_published_a_mesh_document_retracts_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("assembled/sandbox-mesh.yaml");
+    let path = target.to_str().unwrap();
+
+    let publication = reconcile_mesh_file(None, path, whole_repository(false));
+
+    assert_eq!(publication.unwrap(), MeshPublication::NeverPublished);
+    assert!(!target.exists(), "retraction must not fabricate a document");
+}
+
+#[test]
+fn a_document_this_renderer_produced_is_attributed_without_a_ledger_entry() {
+    // The ledger only exists from the first apply that ran a build carrying
+    // it. A repository that published under an older build, then deleted its
+    // last fragment, still has to converge.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    let path = target.to_str().unwrap();
+    apply_mesh_file(&one_workload(), path).unwrap();
+
+    let publication = reconcile_mesh_file(None, path, whole_repository(false));
+
+    assert_eq!(publication.unwrap(), MeshPublication::Retracted);
+    assert_eq!(read(&target), empty_mesh_document());
+}
+
+#[test]
+fn an_unattributed_destination_is_reported_and_left_untouched() {
+    for foreign in [
+        // Hand-written: same meaning, different formatting.
+        "version: \"1\"\nmesh:\n  workloads: []\n",
+        // Somebody else's file entirely.
+        "# operator-managed\nproxies: []\n",
+        // A gitforgeops-shaped document carrying an extra key.
+        "version: '1'\nmesh: {}\nnote: keep\n",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("mesh.yaml");
+        let path = target.to_str().unwrap();
+        std::fs::write(&target, foreign).unwrap();
+
+        let publication = reconcile_mesh_file(None, path, whole_repository(false));
+
+        assert_eq!(
+            publication.unwrap(),
+            MeshPublication::Unattributed,
+            "{foreign:?}"
+        );
+        assert_eq!(read(&target), foreign);
+    }
+}
+
+#[test]
+fn a_hand_edited_destination_the_ledger_claims_is_still_retracted() {
+    // Provenance is the gate and the ledger is the primary record, so an
+    // operator who hand-edited a document this repository publishes still gets
+    // convergence.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    let path = target.to_str().unwrap();
+    std::fs::write(&target, "version: \"1\"\nmesh:\n  workloads: []\n").unwrap();
+
+    let publication = reconcile_mesh_file(None, path, whole_repository(true));
+
+    assert_eq!(publication.unwrap(), MeshPublication::Retracted);
+    assert_eq!(read(&target), empty_mesh_document());
+}
+
+#[test]
+fn retraction_is_idempotent_and_does_not_republish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    let path = target.to_str().unwrap();
+    apply_mesh_file(&one_workload(), path).unwrap();
+    reconcile_mesh_file(None, path, whole_repository(true)).unwrap();
+    let first = std::fs::metadata(&target).unwrap();
+
+    let publication = reconcile_mesh_file(None, path, whole_repository(true));
+
+    assert_eq!(publication.unwrap(), MeshPublication::AlreadyRetracted);
+    // A mesh node reloads on any content change, so a no-op republish is not
+    // worth one: the destination is not reopened for writing at all.
+    let second = std::fs::metadata(&target).unwrap();
+    assert_eq!(first.modified().unwrap(), second.modified().unwrap());
+    assert_eq!(read(&target), empty_mesh_document());
+}
+
+#[test]
+fn a_namespace_filtered_run_never_retracts() {
+    // `FERRUM_NAMESPACE` narrows which fragments the assembler loads at all,
+    // and the published document is mesh-wide. "No fragments selected" is not
+    // evidence that the repository declares none.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    let path = target.to_str().unwrap();
+    apply_mesh_file(&one_workload(), path).unwrap();
+    let before = read(&target);
+
+    let narrowed = MeshRetractionScope {
+        ledger_attributed: true,
+        covers_repository: false,
+    };
+    let publication = reconcile_mesh_file(None, path, narrowed);
+
+    assert_eq!(publication.unwrap(), MeshPublication::NarrowedScope);
+    assert_eq!(read(&target), before);
+}
+
+#[test]
+fn planning_a_publication_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    let path = target.to_str().unwrap();
+
+    let absent = plan_mesh_publication(None, path, whole_repository(true));
+    assert_eq!(absent.unwrap(), MeshPublication::NeverPublished);
+    assert!(!target.exists());
+
+    apply_mesh_file(&one_workload(), path).unwrap();
+    let before = read(&target);
+
+    // The preview and the run it previews agree, and the preview is inert.
+    let pending = plan_mesh_publication(None, path, whole_repository(true));
+    assert_eq!(pending.unwrap(), MeshPublication::Retracted);
+    let declared = plan_mesh_publication(Some(&one_workload()), path, whole_repository(true));
+    assert_eq!(declared.unwrap(), MeshPublication::Published);
+    assert_eq!(read(&target), before);
+}
+
+#[test]
+fn a_retraction_that_cannot_be_written_is_an_error_not_a_silent_success() {
+    // Fail-loud: the destination is a directory, so the publish cannot land.
+    // Nothing may report a retraction that did not happen.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    std::fs::create_dir(&target).unwrap();
+    let path = target.to_str().unwrap();
+
+    let result = reconcile_mesh_file(None, path, whole_repository(true));
+
+    assert!(
+        result.is_err(),
+        "a failed retraction must not report success"
+    );
+    assert!(target.is_dir(), "the destination is left as it was");
+}
+
+// ── Retraction, end to end ────────────────────────────────────────────────
+//
+// The publish/retract decision is only worth anything if the *commands* make
+// it. These run the real binary in a throwaway checkout, in file mode, with a
+// stub standing in for `ferrum-edge` (absent in Rust CI).
+
+const RETRACTION_PROXY: &str = r#"kind: Proxy
+spec:
+  id: "api"
+  listen_path: "/api"
+  backend_scheme: https
+  backend_host: "api.internal"
+  backend_port: 443
+"#;
+
+const RETRACTION_FRAGMENT: &str = r#"kind: MeshConfig
+spec:
+  istio_root_namespace: istio-system
+  workloads:
+    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+      service_name: api
+      namespace: ferrum
+      trust_domain: cluster.local
+      selector:
+        static: api
+"#;
+
+/// A throwaway checkout plus a stub validator, run in file mode.
+struct MeshRepo {
+    dir: tempfile::TempDir,
+    validator: PathBuf,
+}
+
+impl MeshRepo {
+    fn new(with_fragment: bool) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut files = vec![("resources/ferrum/proxies/api.yaml", RETRACTION_PROXY)];
+        if with_fragment {
+            files.push(("resources/ferrum/mesh/core.yaml", RETRACTION_FRAGMENT));
+        }
+        write_tree(dir.path(), &files);
+
+        let validator = dir.path().join("ferrum-edge-stub");
+        std::fs::write(&validator, "#!/bin/sh\nexit 0\n").expect("stub");
+        set_executable(&validator);
+
+        Self { dir, validator }
+    }
+
+    fn mesh_document(&self) -> PathBuf {
+        self.dir.path().join("assembled/mesh.yaml")
+    }
+
+    fn published_mesh(&self) -> String {
+        read(&self.mesh_document())
+    }
+
+    fn remove_fragment(&self) {
+        let fragment = self.dir.path().join("resources/ferrum/mesh/core.yaml");
+        std::fs::remove_file(fragment).expect("remove the last mesh fragment");
+    }
+
+    /// Run the binary hermetically: the child inherits only PATH/HOME/TMPDIR
+    /// plus the `FERRUM_*` variables named here, so an ambient
+    /// `FERRUM_GATEWAY_URL` in a developer shell cannot make a file-mode test
+    /// talk to a gateway. Returns stdout and stderr combined.
+    fn run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> String {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
+        command.args(args).current_dir(self.dir.path()).env_clear();
+        for name in ["PATH", "HOME", "TMPDIR"] {
+            if let Ok(value) = std::env::var(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .env("FERRUM_GATEWAY_MODE", "file")
+            .env("FERRUM_FILE_OUTPUT_PATH", "assembled/resources.yaml")
+            .env("FERRUM_MESH_FILE_OUTPUT_PATH", "assembled/mesh.yaml")
+            .env("FERRUM_EDGE_BINARY_PATH", &self.validator);
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        let output = command.output().expect("run gitforgeops");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+        assert!(output.status.success(), "{args:?} failed: {combined}");
+        combined
+    }
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(path, mode).expect("chmod");
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) {}
+
+#[cfg(unix)]
+#[test]
+fn cli_apply_retracts_the_mesh_document_when_the_last_fragment_is_removed() {
+    let repo = MeshRepo::new(true);
+    repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(repo.published_mesh().contains("sa/api"));
+
+    repo.remove_fragment();
+
+    // The preview and the run it previews describe the same event, and the
+    // preview publishes nothing.
+    let planned = repo.run(&["plan"], &[]);
+    assert!(planned.contains("=== Mesh ==="), "{planned}");
+    assert!(planned.contains("RETRACT mesh"), "{planned}");
+    assert!(repo.published_mesh().contains("sa/api"), "plan published");
+
+    let applied = repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(applied.contains("RETRACT mesh"), "{applied}");
+    assert_eq!(repo.published_mesh(), empty_mesh_document());
+
+    // The ledger now attributes the destination, so the next run converges it
+    // without re-deriving provenance from the bytes.
+    let state_dir = repo.dir.path().join(".state");
+    let mut state = String::new();
+    for entry in std::fs::read_dir(state_dir).expect("state directory") {
+        let path = entry.expect("state entry").path();
+        state.push_str(&std::fs::read_to_string(path).unwrap_or_default());
+    }
+    assert!(state.contains("mesh_document_path"), "{state}");
+    assert!(state.contains("assembled/mesh.yaml"), "{state}");
+
+    let again = repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(again.contains("already holds the empty"), "{again}");
+    assert_eq!(repo.published_mesh(), empty_mesh_document());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_never_publishes_a_mesh_document_for_a_repository_that_declares_none() {
+    let repo = MeshRepo::new(false);
+
+    let applied = repo.run(&["apply", "--auto-approve"], &[]);
+    let planned = repo.run(&["plan"], &[]);
+    let exported = repo.run(&["export", "--output", "export.yaml"], &[]);
+
+    assert!(!repo.mesh_document().exists(), "fabricated a mesh document");
+    for output in [&applied, &planned, &exported] {
+        assert!(!output.contains("RETRACT mesh"), "{output}");
+        assert!(!output.contains("mesh document"), "{output}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_export_retracts_with_and_without_materialize() {
+    for materialize in [false, true] {
+        let repo = MeshRepo::new(true);
+        let mut args = vec!["export", "--output", "export.yaml"];
+        if materialize {
+            args.push("--materialize");
+        }
+
+        repo.run(&args, &[]);
+        assert!(repo.published_mesh().contains("sa/api"), "{args:?}");
+
+        repo.remove_fragment();
+        let retracted = repo.run(&args, &[]);
+
+        assert!(retracted.contains("RETRACT mesh"), "{args:?}: {retracted}");
+        assert_eq!(repo.published_mesh(), empty_mesh_document(), "{args:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_leaves_an_unattributed_mesh_document_alone() {
+    let repo = MeshRepo::new(false);
+    let foreign = "version: \"1\"\nmesh:\n  workloads: []\n";
+    std::fs::create_dir_all(repo.dir.path().join("assembled")).unwrap();
+    std::fs::write(repo.mesh_document(), foreign).unwrap();
+
+    let applied = repo.run(&["apply", "--auto-approve"], &[]);
+
+    assert!(applied.contains("not a document gitforgeops"), "{applied}");
+    assert_eq!(repo.published_mesh(), foreign);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_namespace_filtered_runs_never_retract() {
+    let repo = MeshRepo::new(true);
+    repo.run(&["apply", "--auto-approve"], &[]);
+    let published = repo.published_mesh();
+
+    // `edge` declares nothing at all, so the filtered run selects no fragment
+    // — which is not evidence that the repository declares none.
+    let only_edge = [("FERRUM_NAMESPACE", "edge")];
+    let filtered = repo.run(&["apply", "--auto-approve"], &only_edge);
+
+    assert!(filtered.contains("namespace-filtered run"), "{filtered}");
+    assert_eq!(repo.published_mesh(), published);
 }

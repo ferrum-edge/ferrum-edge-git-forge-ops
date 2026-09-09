@@ -135,8 +135,8 @@ fn scoped_record_preserves_entries_outside_scope() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }
     }
 
@@ -244,8 +244,11 @@ fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
     state.reserve_adds(&diffs, &desired).unwrap();
 
     let mut exact_live = desired.clone();
-    exact_live.upstreams[0].created_at += chrono::Duration::seconds(5);
-    exact_live.upstreams[0].updated_at += chrono::Duration::seconds(5);
+    // The gateway stamps both fields on the live row; the desired document
+    // omits them. The subset match must still hold because timestamps are
+    // never compared.
+    exact_live.upstreams[0].created_at = Some(chrono::Utc::now());
+    exact_live.upstreams[0].updated_at = Some(chrono::Utc::now());
     let actual = BTreeMap::from([("ferrum".to_string(), exact_live)]);
 
     assert_eq!(
@@ -828,8 +831,8 @@ fn record_op_preserves_state_for_failed_delete() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }
     }
 
@@ -922,8 +925,8 @@ fn record_op_preserves_state_for_failed_delete() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     let cfg = GatewayConfig {
         consumers: vec![consumer],
@@ -950,4 +953,30 @@ fn record_op_preserves_state_for_failed_delete() {
         Some(&"sha256:OTHER".to_string()),
         "out-of-namespace entry must remain untouched"
     );
+}
+
+#[test]
+fn the_mesh_document_attribution_round_trips_and_gates_only_its_own_path() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let mut state = StateFile {
+            environment: "sandbox".to_string(),
+            ..StateFile::default()
+        };
+        // A repository that never published a mesh document attributes none,
+        // and the key stays out of the ledger entirely.
+        assert!(!state.publishes_mesh_document("assembled/sandbox-mesh.yaml"));
+        state.save().unwrap();
+        let fresh = std::fs::read_to_string(".state/sandbox.json").unwrap();
+        assert!(!fresh.contains("mesh_document_path"), "{fresh}");
+
+        state.record_mesh_publication("assembled/sandbox-mesh.yaml");
+        state.save().unwrap();
+
+        let reloaded = StateFile::load("sandbox").unwrap();
+        assert!(reloaded.publishes_mesh_document("assembled/sandbox-mesh.yaml"));
+        // Attribution is per destination: repointing the configured output
+        // path does not hand gitforgeops authority over the new one.
+        assert!(!reloaded.publishes_mesh_document("assembled/other-mesh.yaml"));
+    });
 }

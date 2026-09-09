@@ -1,10 +1,22 @@
 use gitforgeops::config::schema::*;
+use gitforgeops::diff::resource_diff::{
+    compute_diff, compute_diff_with_scope, state_key, DiffAction, OwnershipScope,
+};
 use gitforgeops::diff::{
     best_practice::check_best_practices, breaking::detect_breaking_changes,
-    is_sensitive_diff_field, mask_indeterminate_secret_values, resource_diff::compute_diff,
-    resource_diff::compute_diff_with_scope, resource_diff::state_key, resource_diff::DiffAction,
-    resource_diff::OwnershipScope, security::audit_security,
+    is_sensitive_diff_field, security::audit_security,
 };
+
+fn mask_without_bundle(desired: &GatewayConfig, actual: &mut GatewayConfig) {
+    let mut resolved = desired.clone();
+    let report = gitforgeops::secrets::resolve_secrets_with_mode(
+        &mut resolved,
+        &gitforgeops::secrets::CredentialBundle::default(),
+        gitforgeops::config::GatewayMode::Api,
+    )
+    .unwrap();
+    gitforgeops::diff::mask_indeterminate_secret_values(&resolved, actual, &report);
+}
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
     Proxy {
@@ -62,8 +74,8 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
         stream_proxy_protocol: None,
         backend_proxy_protocol: None,
         stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -76,8 +88,8 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: std::collections::BTreeMap::new(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -103,7 +115,7 @@ fn credential_indeterminate_review_masks_only_matching_consumer_values() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert_eq!(diffs[0].kind, "Consumer");
@@ -147,7 +159,7 @@ fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert!(
@@ -158,6 +170,46 @@ fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
         "{:?}",
         diffs[0].details
     );
+}
+
+#[test]
+fn placeholder_syntax_without_unresolved_provenance_does_not_authorize_masking() {
+    let mut consumer = make_consumer("app", "app");
+    consumer.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    let mut plugin = make_plugin_config("app", "ferrum", "otel_tracing", PluginScope::Global);
+    plugin.config = serde_json::json!({"authorization": "${gh-env-secret:alloc=require}"});
+    let desired = GatewayConfig {
+        consumers: vec![consumer],
+        plugin_configs: vec![plugin],
+        upstreams: vec![upstream_with_consul(
+            "app",
+            "https://consul.test:8501",
+            Some("${gh-env-secret:alloc=require}"),
+        )],
+        ..GatewayConfig::default()
+    };
+    let mut actual = desired.clone();
+    actual.consumers[0].credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "synthetic-live-key"}]),
+    );
+    actual.plugin_configs[0].config = serde_json::json!({"authorization": "synthetic-live-key"});
+    actual.upstreams[0] = upstream_with_consul(
+        "app",
+        "https://consul.test:8501",
+        Some("synthetic-live-key"),
+    );
+    let before = serde_json::to_value(&actual).unwrap();
+    gitforgeops::diff::mask_indeterminate_secret_values(
+        &desired,
+        &mut actual,
+        &gitforgeops::secrets::ResolveReport::default(),
+    );
+    assert_eq!(serde_json::to_value(&actual).unwrap(), before);
+    assert_eq!(compute_diff(&desired, &actual).len(), 3);
 }
 
 #[test]
@@ -187,7 +239,7 @@ fn credential_indeterminate_review_masks_only_placeholder_leaves() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert!(
@@ -239,7 +291,7 @@ fn unmasked_broker_controlled_leaves_are_permanent_false_drift() {
     // What `diff` reported before it masked: two changes nobody made.
     assert_eq!(compute_diff(&desired, &actual).len(), 2);
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
 
     assert!(
         compute_diff(&desired, &actual).is_empty(),
@@ -271,7 +323,7 @@ fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
     let diffs = compute_diff(&desired, &actual);
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert_eq!(diffs[0].details.len(), 1, "{:?}", diffs[0].details);
@@ -299,8 +351,8 @@ fn make_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -334,8 +386,8 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -684,6 +736,117 @@ fn security_detects_literal_credential() {
 }
 
 #[test]
+fn secret_audit_and_broker_parser_agree_across_resource_kinds() {
+    for value in [
+        "${{ secrets.SYNTHETIC_KEY }}",
+        "${gh-env-secret:alloc=generate} ",
+        "${gh-env-secret:alloc=generate",
+        "${GH-ENV-SECRET:alloc=generate}",
+        "${env:SYNTHETIC_KEY}",
+        "${gh-env-secret:alloc=synthetic-secret}",
+        "${gh-env-secret:len=synthetic-secret}",
+        "${gh-env-secret:synthetic-secret}",
+        "${gh-env-secret:synthetic-secret=value}",
+        "${gh-env-secret:alloc=require}",
+        "${gh-env-secret:alloc=generate|len=64}",
+    ] {
+        let valid = matches!(gitforgeops::secrets::parse_placeholder(value), Some(Ok(_)));
+        let mut consumer = make_consumer("app", "alice");
+        consumer.credentials.clear();
+        consumer
+            .credentials
+            .insert("keyauth".to_string(), serde_json::json!([{"key": value}]));
+        let mut plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+        plugin.config = serde_json::json!({"authorization": value});
+        let config = GatewayConfig {
+            consumers: vec![consumer],
+            plugin_configs: vec![plugin],
+            upstreams: vec![upstream_with_consul(
+                "orders",
+                "https://consul.example.test",
+                Some(value),
+            )],
+            ..GatewayConfig::default()
+        };
+        let findings = audit_security(&config);
+        let blockers = gitforgeops::diff::security_blockers(&findings);
+        assert_eq!(blockers.len(), if valid { 0 } else { 3 }, "{findings:?}");
+        if !valid {
+            for (kind, path) in [
+                ("Consumer", "keyauth[0].key"),
+                ("PluginConfig", "config.authorization"),
+                ("Upstream", "service_discovery.consul.token"),
+            ] {
+                assert!(blockers
+                    .iter()
+                    .any(|finding| { finding.kind == kind && finding.message.contains(path) }));
+            }
+        }
+        for finding in findings {
+            assert!(!finding.message.contains(value));
+            assert!(!finding.message.contains("synthetic-secret"));
+        }
+    }
+}
+
+#[test]
+fn security_blocks_classified_plugin_literals_without_exposing_values() {
+    use gitforgeops::diff::security_blockers;
+
+    for enabled in [true, false] {
+        let mut plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+        plugin.enabled = enabled;
+        plugin.config = serde_json::json!({
+            "authorization": "Bearer synthetic-authorization",
+            "headers": {"x-api-key": "synthetic-header-value"},
+            "endpoint": "https://collector.example.test",
+            "service_name": "ordinary-service"
+        });
+        let config = GatewayConfig {
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+        let findings = audit_security(&config);
+        let blockers = security_blockers(&findings);
+        assert_eq!(blockers.len(), 3, "{findings:?}");
+        for field in ["authorization", "headers.x-api-key", "endpoint"] {
+            assert!(blockers.iter().any(|finding| {
+                finding.kind == "PluginConfig"
+                    && finding.id == "otel"
+                    && finding.message.contains(&format!("config.{field}"))
+            }));
+        }
+        for finding in findings {
+            for value in [
+                "synthetic-authorization",
+                "synthetic-header-value",
+                "collector.example.test",
+            ] {
+                assert!(!finding.message.contains(value));
+            }
+        }
+    }
+}
+
+#[test]
+fn security_accepts_brokered_plugin_fields_and_unclassified_settings() {
+    use gitforgeops::diff::security_blockers;
+
+    let mut plugin = make_plugin_config("otel", "ferrum", "otel_tracing", PluginScope::Global);
+    plugin.config = serde_json::json!({
+        "authorization": "${gh-env-secret:alloc=require}",
+        "headers": {"x-api-key": "${gh-env-secret:alloc=require}"},
+        "endpoint": "${gh-env-secret:alloc=require}",
+        "service_name": "ordinary-service"
+    });
+    let config = GatewayConfig {
+        plugin_configs: vec![plugin],
+        ..GatewayConfig::default()
+    };
+    assert!(security_blockers(&audit_security(&config)).is_empty());
+}
+
+#[test]
 fn security_blockers_selects_only_error_severity_findings() {
     use gitforgeops::diff::security_blockers;
 
@@ -971,11 +1134,11 @@ fn security_detects_nested_literal_credential() {
 }
 
 #[test]
-fn security_passes_template_credential() {
+fn security_passes_broker_template_credential() {
     let mut creds = std::collections::BTreeMap::new();
     creds.insert(
         "keyauth".to_string(),
-        serde_json::json!({"key": "${API_KEY}"}),
+        serde_json::json!({"key": "${gh-env-secret:alloc=require}"}),
     );
     let config = GatewayConfig {
         consumers: vec![Consumer {
@@ -994,8 +1157,8 @@ fn security_passes_template_credential() {
 
 #[test]
 fn security_audit_must_run_pre_resolve_or_flags_resolved_values_as_literals() {
-    // Regression guard: audit_security classifies any string that doesn't
-    // start with `${` as a literal credential. If the caller (cmd_plan,
+    // Regression guard: audit_security classifies any string that isn't a
+    // valid broker placeholder as a literal credential. If the caller (cmd_plan,
     // cmd_review) runs audit AFTER resolve_secrets, legitimate placeholders
     // have been replaced with real values and the auditor spuriously flags
     // them as literal credentials — drowning real findings in noise.
@@ -1379,10 +1542,9 @@ fn service_discovery_diff_redacts_the_token_but_shows_the_address() {
     assert!(!is_sensitive_diff_field("Upstream", "service_discovery"));
 }
 
-/// A brokered field is legible on both sides: an unresolved placeholder is
-/// repository data, and a reviewer needs to see that the slot is brokered.
+/// Value text alone cannot establish whether either token is unresolved.
 #[test]
-fn service_discovery_diff_keeps_a_placeholder_visible() {
+fn service_discovery_diff_redacts_placeholder_shaped_tokens() {
     let desired = GatewayConfig {
         upstreams: vec![upstream_with_consul(
             "orders",
@@ -1407,16 +1569,10 @@ fn service_discovery_diff_keeps_a_placeholder_visible() {
         .find(|change| change.field == "service_discovery")
         .expect("the address changed");
 
-    assert!(
-        change.new_value.contains("gh-env-secret"),
-        "{}",
-        change.new_value
-    );
-    assert!(
-        !change.new_value.contains("[REDACTED]"),
-        "{}",
-        change.new_value
-    );
+    for side in [&change.old_value, &change.new_value] {
+        assert!(!side.contains("gh-env-secret"), "{side}");
+        assert!(side.contains("[REDACTED]"), "{side}");
+    }
 }
 
 /// Bundle-less review: an unresolvable placeholder must not read as drift
@@ -1440,7 +1596,7 @@ fn masking_aligns_the_discovery_token_only() {
         ..GatewayConfig::default()
     };
 
-    mask_indeterminate_secret_values(&desired, &mut actual);
+    mask_without_bundle(&desired, &mut actual);
 
     let consul = actual.upstreams[0]
         .service_discovery

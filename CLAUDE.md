@@ -28,8 +28,8 @@ gitforgeops export [--output PATH]                        # Emit flat YAML (plac
 gitforgeops export --materialize [--encrypt-to GH_LOGIN]  # Resolve creds; age-encrypt output (file mode stage 2)
 gitforgeops diff [--exit-on-drift]                        # Compare desired vs live gateway (/backup)
 gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
-                                                          # Exits 1 on validation failure, an error-severity security
-                                                          # finding, or an unacknowledged credential-slot remap
+                                                          # Includes adoption; exits 1 on offline apply blockers,
+                                                          # invalid backup namespaces, or live ownership conflicts
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
   [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
@@ -71,8 +71,14 @@ resource namespace per job, intersected with the environment's protected
 namespace scope. `review --require-live` fails that job when comparison is
 unavailable or its required PR comment cannot be delivered. Review markdown is
 bounded below GitHub's API limit, and unresolved credential values are excluded
-from live comparison when no bundle is available without hiding other Consumer
-fields. Environments with `live_review: false` are removed before the
+from authoritative live comparison per leaf after resolution, including with
+empty or partial bundles, without hiding resolved-secret or sibling drift.
+Masking uses canonical slots from the resolution report, not value syntax;
+seeded secrets that resemble broker placeholders remain comparable. Modeled
+service-discovery diff values are redacted even when they resemble placeholders.
+The same rule covers plugin config and modeled service-discovery secrets in
+diff, plan and review; missing required values still block actual apply.
+Environments with `live_review: false` are removed before the
 Environment-bound matrix, which is required for file mode. Fork PRs and
 new/remapped namespaces never enter the privileged
 live-read boundary. Rust is pinned to 1.98.0 in
@@ -122,11 +128,18 @@ pipeline, both because resolution has already run by then:
   is 30 characters and ferrum-edge's floor for `jwt`/`hmac_auth` is 32, so a
   bundle-less fork PR would otherwise fail on the placeholder rather than on
   the repo. Substitution happens on a **copy**, into the 0600 temp spec only;
-  no other output path ever sees a stand-in.
+  no other output path ever sees a stand-in. Resolved snapshots use the
+  corresponding `ResolveReport`: only explicitly unresolved canonical consumer
+  and plugin slots may receive stand-ins. Resolved or unreported values stay
+  byte-for-byte intact, even if they have placeholder syntax. Consumer paths
+  share the resolver's escaping and index-zero elision. The report-free API
+  and file apply retain syntax-based stand-ins for unresolved publication
+  documents; modeled service-discovery fields remain unchanged.
 - `secrets::SecretScrubber` collects every non-placeholder Consumer credential
-  leaf (minus the identity fields `basicauth[].username` /
-  `mtls_auth[].identity`) and every `sensitive_string_paths` plugin-config
-  leaf, and removes those exact byte sequences — plus their base64 and
+  leaf (minus literal identity fields), every `sensitive_string_paths`
+  plugin-config leaf and modeled service-discovery secret, plus values at all
+  successfully resolved slots when paired with a `ResolveReport`. It removes
+  those exact byte sequences — plus their base64 and
   percent-encoded forms — from the validator child's stdout/stderr, replacing
   each with `[REDACTED]`. Non-credential diagnostics stay intact. Blanket
   suppression survives only as a fallback for a secret shorter than
@@ -147,6 +160,18 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 
+Incremental Add/Modify failures defer every planned Delete in that namespace,
+including failed pending-create ownership assertions. Remaining writes and other
+namespaces continue under the existing fatal-error rules. `ApplyResult::deletes_deferred`
+and CLI counts distinguish deferrals from successful deletes; per-resource messages
+name what was retained and why. Deferred and failed deletes never enter
+`applied_incremental`, so the managed ledger survives and the run exits non-zero.
+Plan/diff/apply previews explain that pruning is conditional. No flag bypasses
+this gate. A same-routing-key ID rename still conflicts on an unchanged retry:
+preserving the incumbent does not free its key. Keep its ID and modify it, stage
+a replacement on a distinct valid key, or plan a migration/maintenance window to
+resolve the conflict. Incremental CRUD does not offer an atomic route swap.
+
 A `GET /health` preflight runs before the first mutation so a read-only plane fails once instead of N times; a sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations because cached fallback omits API-spec ownership metadata. `--allow-large-prune` does not bypass that gate.
 
 Create and batch POST error responses are never retried blindly. An ambiguous outcome is reconciled through an authoritative (non-cached) backup, and the readback has three severities (`LiveMatch`): the **exact** row live → an idempotent PUT declares repository ownership and the create is recorded; the row **absent** → the write provably did not commit, so it is an ordinary per-resource error and the rest of the run continues; the row **present but different**, or no usable verification at all → a run-stopping `AmbiguousMutation`. `resource_values_match` is a subset test (desired ⊆ live, minus server timestamps) so a gateway-populated optional does not read as a foreign row.
@@ -159,11 +184,19 @@ After apply, a best-effort `GET /cluster` prints a convergence line.
 
 `kind: MeshConfig` fragments live under `resources/<ns>/mesh/`. They are not gateway resources: every fragment folds into one standalone `{version: "1", mesh: {...}}` document (`apply::render_mesh_yaml`, `MESH_DOCUMENT_VERSION`) published to `FERRUM_MESH_FILE_OUTPUT_PATH` by `export` and file-mode `apply`. `validate` / `plan` / `apply` run a second pass, `ferrum-edge validate -m mesh`, over the rendered bytes. Mesh resources never appear in `diff` — there is no live API to compare against.
 
+Publication is a **reconciliation**, not a conditional write: `apply::reconcile_mesh_file` is total over `Option<&MeshConfigSpec>`, and removing the last fragment retracts the destination by rewriting it as `{version: '1', mesh: {}}`. Never by deleting it — ferrum-edge's mesh file source bails with `mesh configuration file not found`, so a deletion would turn a policy retraction into a node outage, while `MeshFileDocument` (`deny_unknown_fields`, required `mesh`, all inner fields defaulted) accepts the empty mapping. Two gates decide whether a retraction may touch the path, both in `MeshRetractionScope`: the destination must be attributable to gitforgeops (`StateFile::mesh_document_path`, or bytes this build's own renderer round-trips byte-for-byte, which covers repositories that published under an older release), and the run must not be `FERRUM_NAMESPACE`-filtered (a filter narrows which fragments load at all, and the document is mesh-wide, so an empty selection is not evidence of deletion). Anything else is reported and left alone. `apply::plan_mesh_publication` is the same decision without the write, so `plan` and `review` preview exactly what `apply` will do; all of them print a `RETRACT mesh` line. api-mode apply neither publishes nor retracts.
+
 ### Namespace Handling
 
 - Directory-inferred: `resources/<ns>/…` → resource `namespace: <ns>` unless the spec overrides with a non-default value.
 - `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
+- `BackupSnapshot::from_scoped_body` validates every resource's explicit wire namespace
+  before deserialization can default it. Missing or foreign namespaces refuse the
+  snapshot for all API consumers, including confirmation reads. Repository YAML
+  defaults are unchanged. The incremental loop uses each diff entry's namespace
+  and refuses a mismatch with the enclosing namespace. `diff`, `plan`, and `apply`
+  fail; review withholds comparison (`--require-live` fails).
 
 ### Multi-Environment (repo config)
 
@@ -211,6 +244,19 @@ Configured per environment in repo config.
 - **`exclusive`**: repo is authoritative for the listed `namespaces`. Unmanaged
   resources get pruned. Required for `full_replace`.
 
+The shared `load_and_assemble_all` boundary enforces exclusive scope after
+overlays and namespace filtering, before returning to validate/plan/review/diff/
+export/apply callers. Gateway resources use their effective namespace; mesh
+fragments use their directory namespace. `AssembledOutput.mesh_sources` retains
+each selected fragment's namespace and diagnostic label across merging, so
+`validate_mesh_scope` can reject unowned fragments even when they only set a
+mesh-wide singleton. Diagnostics name `namespace/mesh/id` (file stem fallback)
+and explain how to add ownership or move the fragment. Inner workload/service
+namespaces do not grant fragment ownership. Shared mode remains unrestricted,
+and filters still exclude unselected mesh fragments before merging. An unowned
+exclusive filter is rejected even when it selects nothing. This also preserves
+the offline ownership gate for validate and export, including materialization.
+
 #### Adoption of already-matching rows
 
 A declared resource identical to its live row yields no diff entry, so no
@@ -234,8 +280,10 @@ recorded (`ApplyResult::adopted`, replayed through `StateFile::record_op`).
 Never adopt from a cached (`X-Data-Source: cached`) backup — it clears
 `api_spec_id` tags — and never adopt a spec-owned row. A failed adoption PUT
 records nothing and lands in `ApplyResult::errors`. `apply` prints
-`adoption_summary_line` plus per-resource lines; the interactive preview lists
-`ADOPT <Kind> <id>` and no longer reports "No changes to apply."
+`adoption_summary_line` plus per-resource lines; the interactive preview, `plan`, and PR `review` list
+`ADOPT <Kind> <id>` and explain the widened shared-mode delete fence. The shared
+`ownership_preview` also includes pending-create assertions, runs before secret
+masking, and excludes full-replace and cached comparisons.
 
 The state file is the trust boundary for both of those, and it is CI-authored:
 `apply-on-merge.yml` / `rotate.yml` commit `.state/<env>.json` back to `main`
@@ -327,18 +375,29 @@ Rules: `proxy_timeout_bands`, `backend_scheme`, `require_auth_plugin`,
 `forbid_tls_verify_disabled`, `allowed_proxy_plugins`, `allowed_backend_domains`,
 `waf_enforcement`, `require_ai_guardrails`, `rate_limit_completeness`,
 `plugin_name_is_known`, `priority_override_range`. All default to `enabled: false`.
+Enabled scheme, proxy-plugin and AI-guardrail rules reject empty or blank-only
+governing lists with a blocking `PolicyConfig` error, regardless of the configured
+finding severity. Omitted AI guardrail names still use their built-in defaults.
 
 Import's plugin-config classification (`src/secrets/plugin_config.rs::classify_plugin_config`)
-is schema-first for the 82 builtins and heuristics-only for anything else: a
-non-builtin plugin brokers only the leaves the key/URL sensitivity heuristics
-flag, and the leaves they did not flag come back as
-`ImportResult::unbrokered_plugin_config`. Those **fail the import**
+brokers builtin leaves covered by `rules_for`; secret-looking key/URL heuristic
+matches outside those rules come back as `ImportResult::unbrokered_plugin_config`.
+The rule table is deliberately incomplete: builtin fallback also flags compound
+`*_key` names and extra/outbound/additional header maps. Ordinary builtin strings
+stay literal without a notice. Custom plugins retain their existing behavior:
+heuristic matches are brokered, and unflagged strings require review. Both kinds
+of unbrokered strings **fail the import**
 (`import::enforce_plaintext_plugin_config_allowance`) unless the operator
 passes `--allow-plaintext-plugin-config <plugin_name>` (repeatable, exact
 match), in which case they are written literally and listed in a per-plugin
 review notice. The refusal names the plugin id, `plugin_name` and every
 unclassified path, echoes no values, and writes nothing — not the tree, not
-the migration bundle. `apply` / `plan` are untouched by this gate.
+the migration bundle. `sensitive_string_paths` still includes builtin heuristic
+matches for redaction and security checks even when import requires allowance.
+`apply` / `plan` are untouched by this import-only gate. Schema rules include
+OAuth/OIDC client secrets and private keys, OIDC session encryption secrets,
+LDAP service-account passwords, and SOAP WS-Security Redis and UsernameToken
+credentials. Rule additions must be checked against the gateway's OpenAPI schemas.
 `basicauth[].username` and `mtls_auth[].identity` are never brokered in either
 path (`resolver::is_identity_credential_leaf`).
 
@@ -347,10 +406,20 @@ reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
 where a scoped plugin config replaces a global one of the same `plugin_name`).
 Rules that reason about plugins go through it rather than hard-coding names.
 
-Severity `error` blocks `apply` unless overridden. Override = PR label
-(configurable name) added by a user whose repo permission is ≥
-`overrides.required_permission` (default `write`). Implementation:
-`src/policy/github_override.rs::check_override`.
+Severity `error` blocks `apply` unless overridden. Override requires the current
+configured PR label, its latest labeler's current permission ≥
+`overrides.required_permission` (default `write`), and that account's latest
+submitted PR review with exact body `gitforgeops-override <configured-label>`.
+Only APPROVED/COMMENTED reviews whose `commit_id` is the current PR head qualify.
+Label-event `commit_id` is not a labeled-at head. Actual desired/configuration
+bytes and executable source must match that head's complete Git tree. Merged
+PRs additionally require merge ancestry; `.state/**` and `assembled/**` remain
+the only permitted post-review differences. Trusted review checks split candidate
+data/protected source via review-only `GITFORGEOPS_OVERRIDE_SOURCE`; apply/plan
+always inspect their own checkout. All use the shared authorization predicate
+in `src/policy/github_override.rs` and raw input verification in
+`src/policy/override_input.rs`. Audit entries record PR, review id, authorized
+head and actual applied revision; optional fields preserve old state loading.
 
 ### Preview verdicts (`src/verdict.rs`)
 
@@ -358,26 +427,40 @@ Two pure computations, shared so a preview and the run it previews cannot
 disagree.
 
 **`apply_blockers`** — every fail-closed gate `apply` refuses on that is
-decidable *without* a gateway, as `Vec<ApplyBlocker>` over five
+decidable *without* a gateway, as `Vec<ApplyBlocker>` over seven
 `BlockerKind`s: `Validation`, `Security`, `Policy`, `RequiredCredentials`,
-`SlotRemap`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
+`SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
 non-empty. `cmd_apply` calls the *same per-class predicates*
 (`security_blocker`, `policy_blocker`, `required_credentials_blocker`,
-`validation_blocker`) at its own gate points rather than the aggregate, because
+`validation_blocker`, `credential_provisioning_blockers`) at its own gate points rather than the aggregate, because
 its ordering is load-bearing — the security audit has to refuse before the
 credential bundle is read, the required-slot check before the first gateway
 call. Sharing the predicates and not the control flow is the whole design.
 
 Rules that must not drift: warning severity never blocks; `alloc=generate`
 awaiting first-apply allocation is *not* a blocker (`missing_required()` is,
-`needs_allocation()` is not); `policy_findings` are fed **post-override**
+`needs_allocation()` alone is not); `policy_findings` are fed **post-override**
 (`PolicyFinding::is_blocking` reads `overridden_by`). `plan` resolves the
 override through the same `resolve_pr_number` + `check_override` path `apply`
 uses, and fails closed — no PR, an inactive decision, or a GitHub error leaves
 every blocking finding standing. Gateway-dependent gates (large-prune,
 stale-view, per-resource write failures) are deliberately excluded: a preview
 cannot decide them.
+
+Pending allocations require both provisioning environment variables. `plan` and
+`review` use `credential_provisioning_blockers`, render the missing capability,
+and exit 1. Apply calls the same predicate at its existing allocation gate,
+after safety checks and before external writes, retaining the exact refusal text.
+File apply also checks before publishing either output document, while keeping
+credential allocation after placeholder publication.
+Only presence is checked; token validity is a remote question. With no pending
+allocation, neither variable is required.
+
+| BlockerKind | Missing environment variable |
+|---|---|
+| `ProvisionerToken` | `FERRUM_GH_PROVISIONER_TOKEN` |
+| `ProvisioningRepository` | `GITHUB_REPOSITORY` |
 
 Adding a new fail-closed gate to `apply` means adding a `BlockerKind` here, or
 `plan` silently goes back to promising applies that refuse.
@@ -408,18 +491,52 @@ generate and a resource file cannot omit and still say which credential it
 describes. `secrets::resolver::is_identity_credential_leaf(credential_type,
 leaf)` is the single classifier, keyed on the credential type *and* the leaf
 key together (a `username` under a custom credential type is still a secret).
-Four callers must agree or a config becomes acceptable to one command and
-refused by another: the resolver (never broker one), `import`'s capture walk
-(never redact one out of the file), `secrets::scrubber` (never black one out of
-a validator diagnostic), and `diff::security::check_literal_credentials` (never
-block `apply` on one). That last one carries the credential type and leaf key
-down the walk separately from the human-readable diagnostic path.
+The resolver's whole-document `validate_identity_placeholders` preflight rejects
+broker syntax in these leaves before either the read-only (including lenient)
+or mutating walk. The CLI also calls it after overlay/namespace selection in
+`load_and_assemble_all`, covering plain export and inspect-only apply before
+bundle reads, state locks, validation or allocation. Rotate loads through that
+boundary before its bundle/state preflight. There is no allocation-mode,
+seeded-bundle or slot-remap exception. A diagnostic names only the canonical
+slot and the literal-identity remedy. Mutating resolution works on a candidate
+copy and commits it only on success, so any failure leaves the entire input
+unchanged, including leaves visited before the error.
 
-Generation constraints, enforced at resolve time so `plan` fails before `apply`
-writes an unusable value: `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24
-entropy bytes); `basicauth` generation is refused in file mode and
+The same classifier governs generation/rotation, `import`'s capture walk (keep
+literal identities), `secrets::scrubber` (keep literal identities readable), and
+`diff::security::check_literal_credentials` (never flag literal identities).
+The classifier uses the credential type and enclosing leaf key, carrying that
+key through arrays; rendered diagnostic paths never decide classification.
+Validator calls on resolved snapshots additionally pass their `ResolveReport`
+to the scrubber: every resolved canonical slot contributes its actual value,
+even when it resembles a placeholder or has a nonsensitive field name. Reports
+retain no secret values. File-mode apply validates its unresolved publication
+document and does not pair it with a resolved-snapshot report. See
+`docs/credential-identities.md` for the command-boundary audit and migration.
+
+Generation constraints, shared by `resolver::check_generation_allowed` and the
+allocator so `plan` and generation cannot disagree: `jwt`/`hmac_auth` secrets
+need ≥32 chars (`len=` ≥ 24 entropy bytes); `basicauth` generation is refused in file mode and
 `basicauth/…/password_hash` in either mode (the hash is HMAC-SHA256 under the
 gateway's own secret); a bundle value of `[REDACTED]` is refused.
+
+The allocator validates the entire candidate batch before GitHub key discovery,
+including direct callers and lenient reports. Structural types must agree with
+the encoded slot. The same policy rejects non-generatable discovery secrets
+using `SD_SECRET_FIELDS`, and rejects generation of public identity fields.
+Already-seeded secret slots still resolve regardless of their allocation mode;
+public identity leaves reject broker syntax even when seeded.
+
+`allocator::check_rotation_allowed` additionally restricts rotation to Consumer
+`keyauth/key`, `jwt/secret`, `hmac_auth/secret` and api-mode `basicauth/password`,
+including indexed entries. Both the CLI and `rotate_and_deliver` enforce it.
+The command has no PluginConfig/Upstream publication path: reserved slots cannot
+be rotated even when those resources share a Consumer id. Plugin allocation via
+apply remains supported. Target placeholder, generation, namespace/ownership,
+sibling resolution and gateway-client construction all precede secret writes;
+publication reuses the preflight's desired Consumer snapshot. Externally issued
+secrets must be reissued, reseeded into the bundle and applied. A value destroyed
+by an older rotation cannot be recovered from GitHub's write-only secret API.
 
 Slot identity is positional, and `resolver::check_array_slot_identity` splits
 the two consequences by whether evidence exists:
@@ -441,7 +558,8 @@ Literal (non-placeholder) consumer credentials are an apply blocker too:
 document before the state lock, the bundle read, and any gateway call, health
 preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
-label + repo permission), resolved once and shared by both gates.
+label + revision-bound review + current repo permission and input verification),
+resolved once and shared by both gates.
 
 #### Secrets outside `Consumer.credentials`
 
@@ -512,7 +630,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
 - `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs`, `best_practice.rs`
-- `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`)
+- `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
 - `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output, plus the fail-closed policy — `is_reencoding_hazard` values withhold the stream outright, single-line re-encodings (base64/percent/JSON-escape/single-quoted YAML) are matched as needles, and a surviving `FRAGMENT_SCAN_LENGTH`-byte run that is not also in the scrubbed document withholds; `scrub_streams` is the one decision point), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `service_discovery.rs` (modeled `Upstream.service_discovery` secret table + slot derivation), `resolver.rs` (walks consumers, plugin config and service discovery, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
@@ -520,7 +638,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/validate/` — `standin.rs` (validator-only stand-ins for unresolved broker placeholders; URL shapes for endpoint-typed plugin fields via `secrets::plugin_config::{endpoint_paths, endpoint_scheme}`), `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections; `ImportPassthroughPolicy` + `reject_import_passthrough_fields` fail closed on unmodelled top-level fields unless each is acknowledged with `--accept-unknown-field` *and* `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
-- `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
+- `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
@@ -580,8 +698,10 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 Repository-local agent skills, Claude rules, and their dispatchers are guarded by
 `agent-setup-policy.yml`. The workflow runs trusted default-branch validation over candidate
 content on every PR, has only read access, and cancels stale runs per PR. Requiring
-`Agent Setup Policy / validate-trusted-policy` and code-owner review is what prevents a candidate
-from weakening its own validator; forks do not inherit those repository settings automatically.
+`Agent Setup Policy / validate-trusted-policy` validates candidates against trusted default-branch
+policy. The root orchestrator reviews the exact PR head and merges only after hosted CI passes
+and actionable review threads are resolved. No separate Code Owner or maintainer approval
+submission is required. Forks do not inherit repository settings automatically.
 
 - **No `.unwrap()` in production code paths** — use `?`, `.unwrap_or()`, or explicit match.
 - **No `.expect()` except where failure is a genuine bug** (e.g. `serde_json::to_string` on a static `Value`).
