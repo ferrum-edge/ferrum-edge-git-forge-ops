@@ -997,49 +997,45 @@ fn containing_git_worktree(path: &Path) -> crate::error::Result<Option<PathBuf>>
     Ok(None)
 }
 
-/// Resolve existing symlinked ancestors while still accepting a final path
-/// that does not exist yet, then normalize `.`/`..` components for a reliable
-/// containment comparison.
-///
-/// The lexical normalization runs **first**, before the canonicalize walk.
-/// `..` under an ancestor that does not exist otherwise walks the loop up to a
-/// component whose `file_name()` is `None` — a path ending in `..` has no file
-/// name — and reports "cannot resolve path … for containment validation",
-/// which says nothing about the actual problem. Collapsing the components up
-/// front turns `/nonexistent/../wanted` into `/wanted` and the check proceeds
-/// normally. Normalizing before resolution can differ from the kernel's view
-/// when a `..` crosses a symlink, but every symlinked *ancestor* that exists
-/// is still canonicalized below, and the only decision made from the result is
-/// a containment comparison that this makes stricter, not looser.
+/// Resolve path components in filesystem order, canonicalizing every existing
+/// component while still accepting a final path that does not exist yet.
+/// Processing `..` only after an existing symlink has been resolved preserves
+/// the kernel's path semantics; processing it lexically first could make the
+/// containment check inspect a different destination from the later write.
 fn resolve_for_containment(path: &Path) -> crate::error::Result<PathBuf> {
-    let absolute = lexically_normalized_absolute(path)?;
-    let mut existing = absolute.as_path();
-    let mut suffix = Vec::new();
-    let canonical = loop {
-        match std::fs::canonicalize(existing) {
-            Ok(canonical) => break canonical,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                let name = existing.file_name().ok_or_else(|| {
-                    crate::error::Error::Config(format!(
-                        "cannot resolve path {} for containment validation",
-                        path.display()
-                    ))
-                })?;
-                suffix.push(name.to_os_string());
-                existing = existing.parent().ok_or_else(|| {
-                    crate::error::Error::Config(format!(
-                        "cannot resolve path {} for containment validation",
-                        path.display()
-                    ))
-                })?;
-            }
-            Err(source) => return Err(crate::error::Error::Io(source)),
-        }
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
     };
-    Ok(suffix
-        .into_iter()
-        .rev()
-        .fold(canonical, |resolved, component| resolved.join(component)))
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(crate::error::Error::Config(format!(
+                        "path {} escapes the filesystem root",
+                        path.display()
+                    )));
+                }
+            }
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        resolved.push(name);
+                    }
+                    Err(source) => return Err(crate::error::Error::Io(source)),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Publish a complete import as one directory rename. Import is documented for
