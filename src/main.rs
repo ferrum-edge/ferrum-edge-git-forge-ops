@@ -632,11 +632,16 @@ async fn load_namespace_pairs_for(
     client: &AdminClient,
     desired: &GatewayConfig,
     namespaces: &[String],
+    mutation_safe: bool,
 ) -> gitforgeops::error::Result<Vec<NamespaceSnapshot>> {
     let mut pairs = Vec::new();
     for namespace in namespaces {
         let desired_namespace = config::filter_config_by_namespace(desired, namespace);
-        let snapshot = client.get_backup_snapshot(namespace).await?;
+        let snapshot = if mutation_safe {
+            client.get_backup_snapshot_for_mutation(namespace).await?
+        } else {
+            client.get_backup_snapshot(namespace).await?
+        };
         pairs.push(NamespaceSnapshot {
             namespace: namespace.clone(),
             desired: desired_namespace,
@@ -1161,7 +1166,8 @@ async fn cmd_diff(
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces)?;
-    let mut namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+    let mut namespace_pairs =
+        load_namespace_pairs_for(&client, &desired, &namespaces, false).await?;
     let cached_namespaces = cached_namespace_names(&namespace_pairs);
     if !cached_namespaces.is_empty() {
         eprintln!(
@@ -1395,7 +1401,7 @@ async fn cmd_plan(
     let client = AdminClient::new_scoped(&env_config, &namespaces);
     let (diffs, breaking, unmanaged, spec_owned, actual_available, provenance_note) = match &client
     {
-        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces, false).await {
             Ok(mut namespace_pairs) => {
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
@@ -1933,7 +1939,7 @@ async fn cmd_apply(
             if !auto_approve {
                 let managed = previously_managed(&resolved, &state);
                 let namespace_pairs =
-                    load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+                    load_namespace_pairs_for(&client, &desired, &namespaces, false).await?;
                 if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                     return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
                 }
@@ -2011,7 +2017,8 @@ async fn cmd_apply(
             // allocation after this gate means a blocked apply leaves GitHub
             // env secrets untouched — otherwise we'd burn a generated value
             // that the gateway never receives.
-            let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+            let namespace_pairs =
+                load_namespace_pairs_for(&client, &desired, &namespaces, true).await?;
             if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                 // This gate intentionally precedes credential allocation. A
                 // cached backup omits API-spec ownership metadata, so no
@@ -2609,7 +2616,7 @@ async fn cmd_review(
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
     } else {
         match &client {
-            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces, false).await {
                 // A `/backup` served from the gateway's in-memory snapshot
                 // is not the live view this review claims to publish, so
                 // the computed diff is dropped rather than presented as a

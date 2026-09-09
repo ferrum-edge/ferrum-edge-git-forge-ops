@@ -464,7 +464,7 @@ async fn prepare_apply(
             && (supplied_actual.is_none() || supplied_extras.is_none());
 
         if needs_paired_snapshot || supplied_actual.is_none() {
-            let snapshot = client.get_backup_snapshot(namespace).await?;
+            let snapshot = client.get_backup_snapshot_for_mutation(namespace).await?;
             if snapshot.cached {
                 return Err(crate::error::Error::StaleGatewayView(stale_view_message()));
             }
@@ -740,7 +740,7 @@ async fn ensure_spec_snapshot_is_current(
         return Ok(());
     }
 
-    let snapshot = client.get_backup_snapshot(namespace).await?;
+    let snapshot = client.get_backup_snapshot_for_mutation(namespace).await?;
     if snapshot.cached {
         return Err(crate::error::Error::StaleGatewayView(stale_view_message()));
     }
@@ -1136,8 +1136,8 @@ async fn apply_incremental(
     let actual = match actual {
         Some(actual) => actual,
         None => {
-            fetched_actual = client.get_backup(namespace).await?;
-            &fetched_actual
+            fetched_actual = client.get_backup_snapshot_for_mutation(namespace).await?;
+            &fetched_actual.config
         }
     };
     ensure_authoritative_view(client)?;
@@ -1570,24 +1570,26 @@ async fn adopt_matching_rows(
     // confirmation read to make.
     let confirmation = match ownership_scope {
         OwnershipScope::Exclusive => None,
-        OwnershipScope::Shared { .. } => match client.get_backup_snapshot(namespace).await {
-            Ok(snapshot) if snapshot.cached => {
-                skip_all(
-                    result,
-                    "the confirmation backup was served from cache (X-Data-Source: cached)"
-                        .to_string(),
-                );
-                return;
+        OwnershipScope::Shared { .. } => {
+            match client.get_backup_snapshot_for_mutation(namespace).await {
+                Ok(snapshot) if snapshot.cached => {
+                    skip_all(
+                        result,
+                        "the confirmation backup was served from cache (X-Data-Source: cached)"
+                            .to_string(),
+                    );
+                    return;
+                }
+                Ok(snapshot) => Some(snapshot.config),
+                Err(error) => {
+                    skip_all(
+                        result,
+                        format!("the confirmation backup could not be read: {error}"),
+                    );
+                    return;
+                }
             }
-            Ok(snapshot) => Some(snapshot.config),
-            Err(error) => {
-                skip_all(
-                    result,
-                    format!("the confirmation backup could not be read: {error}"),
-                );
-                return;
-            }
-        },
+        }
     };
 
     for candidate in &candidates {
@@ -1906,7 +1908,7 @@ async fn create_with_reconciliation(
         Err(error) if create_outcome_is_ambiguous(&error) => {
             let original = error.to_string();
             let snapshot = client
-                .get_backup_snapshot(namespace)
+                .get_backup_snapshot_for_mutation(namespace)
                 .await
                 .map_err(|verification| {
                     crate::error::Error::AmbiguousMutation(format!(
@@ -2277,7 +2279,7 @@ async fn try_batch_create(
             }
             Err(e) if create_outcome_is_ambiguous(&e) => {
                 let original = e.to_string();
-                let snapshot = match client.get_backup_snapshot(namespace).await {
+                let snapshot = match client.get_backup_snapshot_for_mutation(namespace).await {
                     Ok(snapshot) if snapshot.cached => {
                         result.fatal_error = Some(
                             crate::error::Error::AmbiguousMutation(format!(
