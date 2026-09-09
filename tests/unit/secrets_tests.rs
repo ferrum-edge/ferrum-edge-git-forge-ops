@@ -3,11 +3,112 @@ use std::collections::BTreeMap;
 use gitforgeops::config::schema::{Consumer, GatewayConfig};
 use gitforgeops::secrets::{
     bundle::{pick_shard, shard_secret_name},
-    load_bundles_from_env, parse_placeholder, resolve_secrets, PlaceholderAlloc, SlotStatus,
+    load_bundles_from_env, parse_placeholder, resolve_secrets, slot_path, PlaceholderAlloc,
+    SlotStatus,
 };
 
 const TEST_ED25519_PUBLIC_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJb/uPnYEeAChxZ067A7P02MTEz2XC9PmkknEGctaIuN";
+
+#[test]
+fn builtin_schema_credentials_are_brokered_and_excluded_from_plaintext_review() {
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for (plugin_name, config, expected) in [
+        (
+            "oauth2_introspection",
+            serde_json::json!({"providers": [{"client_auth": {
+                "client_secret": "synthetic-client-secret",
+                "private_key_pem": "synthetic-private-key"
+            }}]}),
+            2,
+        ),
+        (
+            "oidc_relying_party",
+            serde_json::json!({
+                "providers": [{"client_auth": {
+                    "client_secret": "synthetic-client-secret",
+                    "private_key_pem": "synthetic-private-key"
+                }}],
+                "session": {
+                    "encryption_secret": "synthetic-current-secret",
+                    "encryption_secret_previous": "synthetic-previous-secret"
+                }
+            }),
+            4,
+        ),
+        (
+            "ldap_auth",
+            serde_json::json!({"service_account_password": "synthetic-ldap-password"}),
+            1,
+        ),
+        (
+            "soap_ws_security",
+            serde_json::json!({
+                "redis_url": "redis://localhost:6379",
+                "redis_password": "synthetic-redis-password",
+                "username_token": {"credentials": [{
+                    "username": "public-login",
+                    "password": "synthetic-soap-password"
+                }]}
+            }),
+            3,
+        ),
+    ] {
+        let mut gateway: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "plugin_configs": [{
+                "id": "builtin",
+                "plugin_name": plugin_name,
+                "scope": "global",
+                "config": config
+            }]
+        }))
+        .unwrap();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        assert_eq!(capture.captured.len(), expected, "{plugin_name}");
+        // The credentials container also flags the SOAP username heuristically;
+        // only its password has an explicit broker rule.
+        if plugin_name == "soap_ws_security" {
+            assert_eq!(capture.unbrokered.len(), 1);
+            assert_eq!(
+                capture.unbrokered[0].paths,
+                vec!["username_token.credentials.[0].username"]
+            );
+        } else {
+            assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+        }
+        let written = gateway.plugin_configs[0].config.to_string();
+        assert!(!written.contains("synthetic-"), "{plugin_name}");
+        assert_eq!(
+            written.matches("${gh-env-secret:alloc=require}").count(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn builtin_unbrokered_heuristic_matches_stay_sensitive_to_the_scrubber() {
+    let gateway: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "builtin",
+            "plugin_name": "a2a_gateway",
+            "scope": "global",
+            "config": {
+                "signing_key": "synthetic-signing-material",
+                "api_key": "synthetic-api-material",
+                "mode": "visible-setting"
+            }
+        }]
+    }))
+    .unwrap();
+    let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+    assert_eq!(
+        scrubber.scrub("synthetic-signing-material synthetic-api-material visible-setting"),
+        "[REDACTED] [REDACTED] visible-setting"
+    );
+}
 const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
 
 #[test]
@@ -56,7 +157,8 @@ fn parse_placeholder_rejects_unknown_alloc() {
     let err = parse_placeholder("${gh-env-secret:alloc=steal}")
         .unwrap()
         .unwrap_err();
-    assert!(err.to_string().contains("steal"));
+    assert!(err.to_string().contains("unknown secret alloc mode"));
+    assert!(!err.to_string().contains("steal"));
 }
 
 #[test]
@@ -250,8 +352,8 @@ fn resolver_replaces_known_slot_and_reports_resolved() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
         "api_key".to_string(),
@@ -282,8 +384,8 @@ fn resolver_reports_missing_required() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
         "api_key".to_string(),
@@ -313,8 +415,8 @@ fn report_secrets_does_not_mutate_config() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     let placeholder = "${gh-env-secret:alloc=require}";
     consumer.credentials.insert(
@@ -356,8 +458,8 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     let placeholder = "${gh-env-secret:alloc=generate}";
     consumer.credentials.insert(
@@ -395,8 +497,8 @@ fn resolver_replaces_rotate_placeholder_with_bundle_value() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
         "api_key".to_string(),
@@ -438,8 +540,8 @@ fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
         "api_key".to_string(),
@@ -464,8 +566,8 @@ fn resolver_reports_needs_allocation_for_generate() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
         "api_key".to_string(),
@@ -493,8 +595,8 @@ fn flat_and_nested_credentials_produce_distinct_slots() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     // Flat top-level key with a literal dot in its name.
     consumer.credentials.insert(
@@ -537,8 +639,8 @@ fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     let mut nested = serde_json::Map::new();
     nested.insert(
@@ -588,8 +690,8 @@ fn slot_components_escape_slash_and_tilde_in_names() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
         "api_key".to_string(),
@@ -619,8 +721,8 @@ fn object_key_with_bracket_distinct_from_array_index() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     // Object with a literal "[0]" key.
     let mut bracket_obj = serde_json::Map::new();
@@ -705,8 +807,8 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
             custom_id: None,
             credentials: Default::default(),
             acl_groups: vec![],
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         };
         consumer.credentials.insert(cred_key.to_string(), value);
         cfg.consumers.push(consumer);
@@ -844,8 +946,8 @@ fn consumer_with(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(cred_key.to_string(), value);
     cfg.consumers.push(consumer);
@@ -858,6 +960,158 @@ fn entry(field: &str, value: &str) -> serde_json::Value {
 
 const GENERATE: &str = "${gh-env-secret:alloc=generate}";
 const REQUIRE: &str = "${gh-env-secret:alloc=require}";
+
+#[test]
+fn identity_placeholders_fail_before_resolution_in_every_walk() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_lenient, report_secrets_with_mode_and_options,
+        resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    for (credential_type, leaf) in [("basicauth", "username"), ("mtls_auth", "identity")] {
+        for placeholder in [
+            REQUIRE,
+            GENERATE,
+            "${gh-env-secret:alloc=rotate}",
+            "${gh-env-secret:alloc=synthetic-invalid-option}",
+            "${gh-env-secret:alloc=require",
+            "prefix-${gh-env-secret:alloc=require}",
+        ] {
+            for (value, path) in [
+                (
+                    entry(leaf, placeholder),
+                    format!("{credential_type}/{leaf}"),
+                ),
+                (
+                    serde_json::json!([entry(leaf, placeholder)]),
+                    format!("{credential_type}/{leaf}"),
+                ),
+                (
+                    serde_json::json!([entry(leaf, "public-first"), entry(leaf, placeholder)]),
+                    format!("{credential_type}/[1]/{leaf}"),
+                ),
+                (
+                    serde_json::json!([{leaf: ["public-first", placeholder]}]),
+                    format!("{credential_type}/{leaf}/[1]"),
+                ),
+            ] {
+                let mut cfg = consumer_with(credential_type, value);
+                cfg.consumers[0].namespace = "team/~[0]".to_string();
+                cfg.consumers[0].id = "app/~[1]".to_string();
+                // This valid, seeded consumer precedes the invalid one. A
+                // refusal in a later leaf must not leave this one substituted.
+                let mut earlier = consumer_with("keyauth", serde_json::json!([{ "key": REQUIRE }]));
+                earlier.consumers[0].id = "earlier".to_string();
+                cfg.consumers.insert(0, earlier.consumers.remove(0));
+                let original = serde_json::to_value(&cfg).unwrap();
+                let slot = slot_path("team/~[0]", "app/~[1]", &path);
+
+                for seeded in [false, true] {
+                    let mut bundle = BTreeMap::from([(
+                        "ferrum/earlier/keyauth/key".to_string(),
+                        "synthetic-earlier-secret-value".to_string(),
+                    )]);
+                    if seeded {
+                        bundle.insert(slot.clone(), "synthetic-identity-bundle-value".to_string());
+                    }
+                    for mode in [GatewayMode::Api, GatewayMode::File] {
+                        for allow_remap in [false, true] {
+                            let options = ResolveOptions::allowing_slot_remap(allow_remap);
+                            let errors = [
+                                report_secrets_with_mode_and_options(
+                                    &cfg,
+                                    &bundle,
+                                    mode.clone(),
+                                    options,
+                                )
+                                .unwrap_err(),
+                                report_secrets_lenient(&cfg, &bundle).unwrap_err(),
+                                resolve_secrets_with_mode_and_options(
+                                    &mut cfg,
+                                    &bundle,
+                                    mode.clone(),
+                                    options,
+                                )
+                                .unwrap_err(),
+                            ];
+                            for error in errors {
+                                assert!(matches!(error, gitforgeops::error::Error::Config(_)));
+                                let diagnostic = error.to_string();
+                                assert!(diagnostic.contains(&slot), "{diagnostic}");
+                                assert!(diagnostic.contains("supplied literally"), "{diagnostic}");
+                                assert!(!diagnostic.contains("synthetic-"), "{diagnostic}");
+                                assert!(!diagnostic.contains(placeholder), "{diagnostic}");
+                            }
+                            assert_eq!(serde_json::to_value(&cfg).unwrap(), original);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn later_resolution_errors_leave_the_entire_input_unchanged() {
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::json!([{"key": REQUIRE}, {"key": "${gh-env-secret:alloc=invalid}"}]),
+    );
+    let original = serde_json::to_value(&cfg).unwrap();
+    let bundle = BTreeMap::from([(
+        "ferrum/app/keyauth/key".to_string(),
+        "synthetic-earlier-secret-value".to_string(),
+    )]);
+    assert!(resolve_secrets(&mut cfg, &bundle).is_err());
+    assert_eq!(serde_json::to_value(&cfg).unwrap(), original);
+}
+
+#[test]
+fn literal_identity_classification_stays_consistent_across_broker_audit_and_import() {
+    use gitforgeops::secrets::{capture_and_redact_import_credentials, SecretScrubber};
+
+    let mut cfg = consumer_with(
+        "basicauth",
+        serde_json::json!([{"username": "public-login"}]),
+    );
+    cfg.consumers[0].credentials.insert(
+        "mtls_auth".to_string(),
+        serde_json::json!([{"identity": "public-client.example"}]),
+    );
+    // A same-named leaf under an unknown type remains a secret.
+    cfg.consumers[0].credentials.insert(
+        "custom".to_string(),
+        serde_json::json!({"username": REQUIRE}),
+    );
+    let bundle = BTreeMap::from([(
+        "ferrum/app/custom/username".to_string(),
+        "synthetic-custom-secret".to_string(),
+    )]);
+    assert!(gitforgeops::diff::audit_security(&cfg).is_empty());
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].slot, "ferrum/app/custom/username");
+    let scrubber = SecretScrubber::from_gateway_config_with_report(&cfg, &report);
+    let output = scrubber.scrub_streams(
+        "public-login public-client.example synthetic-custom-secret",
+        "",
+    );
+    assert_eq!(
+        output.stdout,
+        "public-login public-client.example [REDACTED]"
+    );
+    let captured = capture_and_redact_import_credentials(&mut cfg).unwrap();
+    assert_eq!(captured, bundle);
+    assert_eq!(
+        cfg.consumers[0].credentials["basicauth"][0]["username"],
+        "public-login"
+    );
+    assert_eq!(
+        cfg.consumers[0].credentials["mtls_auth"][0]["identity"],
+        "public-client.example"
+    );
+}
 
 #[test]
 fn object_and_array_credential_forms_derive_the_same_slot() {
@@ -1626,17 +1880,204 @@ fn report_records_the_credential_type_structurally() {
 }
 
 #[test]
-fn explicit_credential_type_drives_the_minimum_length_rule() {
+fn explicit_credential_type_must_agree_with_the_slot() {
     use gitforgeops::secrets::generate_credential_value_typed;
 
-    // The slot string alone would say `keyauth`; the structured type wins.
+    // A forged structural type must not bypass the encoded slot's policy.
     let err = generate_credential_value_typed("ferrum/app/keyauth/key", 16, Some("jwt"))
-        .expect_err("the supplied type must decide the floor")
+        .expect_err("the supplied type must match the slot")
         .to_string();
-    assert!(err.contains("at least 32 characters"), "{err}");
+    assert!(err.contains("disagrees with the slot"), "{err}");
 
     let ok = generate_credential_value_typed("ferrum/app/jwt/secret", 24, Some("jwt")).unwrap();
     assert!(ok.chars().count() >= 32);
+}
+
+#[test]
+fn resolver_and_allocator_share_generation_verdicts_in_both_modes() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::allocator::generate_credential_value_with_mode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    for mode in [GatewayMode::Api, GatewayMode::File] {
+        for (kind, leaf, length, allowed) in [
+            ("keyauth", "key", 16, true),
+            ("jwt", "secret", 16, false),
+            ("jwt", "secret", 24, true),
+            ("hmac_auth", "secret", 23, false),
+            ("hmac_auth", "secret", 32, true),
+            ("basicauth", "password_hash", 32, false),
+            ("basicauth", "password", 32, mode == GatewayMode::Api),
+        ] {
+            for indexed in [false, true] {
+                let placeholder = format!("${{gh-env-secret:alloc=generate|len={length}}}");
+                let values = if indexed {
+                    vec![entry(leaf, "seeded-value"), entry(leaf, &placeholder)]
+                } else {
+                    vec![entry(leaf, &placeholder)]
+                };
+                let mut cfg = consumer_with(kind, serde_json::Value::Array(values));
+                let suffix = if indexed { "[1]/" } else { "" };
+                let slot = format!("ferrum/app/{kind}/{suffix}{leaf}");
+                let resolved = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), mode.clone());
+                let generated = generate_credential_value_with_mode(&slot, length, None, &mode);
+                assert_eq!(resolved.is_ok(), allowed, "resolver: {slot} {mode:?}");
+                assert_eq!(generated.is_ok(), allowed, "allocator: {slot} {mode:?}");
+                if let Err(error) = generated {
+                    assert!(error.to_string().contains(&slot));
+                    assert!(!error.to_string().contains("seeded-value"));
+                }
+            }
+        }
+
+        let mut cfg = config_with_consul_token(Some(GENERATE));
+        assert!(resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), mode.clone()).is_err());
+        let error = generate_credential_value_with_mode(CONSUL_TOKEN_SLOT, 32, None, &mode)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Consul ACL token"), "{error}");
+        assert!(error.contains("reseed"), "{error}");
+    }
+}
+
+#[test]
+fn rotation_accepts_only_supported_consumer_fields() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::allocator::{
+        check_rotation_allowed, generate_credential_value_with_mode,
+    };
+
+    for key in [
+        "keyauth/key",
+        "jwt/secret",
+        "hmac_auth/[1]/secret",
+        "basicauth/[2]/password",
+    ] {
+        let slot = slot_path("team/alpha", "app/id", key);
+        assert!(check_rotation_allowed(&slot, 32, &GatewayMode::Api).is_ok());
+        assert!(check_rotation_allowed(&slot, 32, &GatewayMode::File).is_err());
+    }
+    for key in [
+        "@service-discovery/consul/token",
+        "@service-discovery/future/token",
+        "@plugin-config/config/api_key",
+        "basicauth/[1]/password_hash",
+        "basicauth/username",
+        "mtls_auth/identity",
+        "unknown/secret",
+        "jwt/key",
+        "keyauth/nested/key",
+    ] {
+        let slot = slot_path("ferrum", "app", key);
+        let error = check_rotation_allowed(&slot, 32, &GatewayMode::Api).unwrap_err();
+        assert!(error.to_string().contains(&slot), "{error}");
+    }
+    // Plugin allocation via apply remains supported; only Consumer rotation
+    // is restricted. A plugin needs its own publication contract to rotate.
+    assert!(generate_credential_value_with_mode(
+        "ferrum/plugin/@plugin-config/config/api_key",
+        32,
+        None,
+        &GatewayMode::Api,
+    )
+    .is_ok());
+    for slot in [
+        "ferrum/app/basicauth/password_hash",
+        "ferrum/app/@service-discovery/consul/token",
+    ] {
+        assert!(
+            generate_credential_value_with_mode(slot, 32, Some("keyauth"), &GatewayMode::Api)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn allocator_refusals_leave_network_and_shards_untouched() {
+    use gitforgeops::secrets::{
+        allocate_and_deliver, rotate_and_deliver, ResolveReport, ResolveResult,
+    };
+
+    // Any attempted GitHub request, including recipient-key discovery, must
+    // connect to this proxy. No production endpoint can be reached.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(proxy).unwrap())
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .unwrap();
+    for key in [
+        "@service-discovery/consul/token",
+        "@plugin-config/config/api_key",
+        "basicauth/[1]/password_hash",
+        "mtls_auth/identity",
+        "jwt/key",
+    ] {
+        let slot = slot_path("ferrum", "app", key);
+        let original = BTreeMap::from([(
+            0,
+            BTreeMap::from([(slot.clone(), "existing-sensitive-value".to_string())]),
+        )]);
+        let mut shards = original.clone();
+        let mut count = 1;
+        let failure = rotate_and_deliver(
+            &client,
+            "test/fixture",
+            "staging",
+            "synthetic-token",
+            Some("recipient"),
+            &slot,
+            32,
+            &mut shards,
+            &mut count,
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.to_string().contains(&slot));
+        assert!(!failure.to_string().contains("existing-sensitive-value"));
+        assert!(failure.partial.allocated.is_empty());
+        assert_eq!(shards, original);
+        assert_eq!(count, 1);
+    }
+
+    // A valid first candidate must not reach delivery before a later invalid
+    // candidate is checked. Use a hand-built report to exercise direct callers.
+    let mut report = ResolveReport::default();
+    for key in ["keyauth/key", "basicauth/password_hash"] {
+        report.results.push(ResolveResult {
+            consumer_id: "app".into(),
+            namespace: "ferrum".into(),
+            cred_key: key.into(),
+            slot: slot_path("ferrum", "app", key),
+            placeholder: parse_placeholder(GENERATE).unwrap().unwrap(),
+            status: SlotStatus::NeedsAllocation,
+        });
+    }
+    let mut shards = BTreeMap::new();
+    let mut count = 1;
+    let failure = allocate_and_deliver(
+        &client,
+        "test/fixture",
+        "staging",
+        "synthetic-token",
+        Some("recipient"),
+        &report,
+        &mut shards,
+        &mut count,
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.to_string().contains("password_hash"));
+    assert!(failure.partial.allocated.is_empty());
+    assert!(shards.is_empty());
+    assert_eq!(count, 1);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a refused allocation or rotation must make zero network requests"
+    );
 }
 
 /// A slot with no credential-type component used to parse back as `""`, which
@@ -1849,8 +2290,8 @@ fn upstream_with_consul_token(token: Option<&str>) -> gitforgeops::config::schem
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -2046,4 +2487,109 @@ fn literal_consul_token_is_a_blocking_security_finding() {
     // An upstream with no discovery block at all is not a finding either.
     let none = config_with_consul_token(None);
     assert!(security_blockers(&audit_security(&none)).is_empty());
+}
+
+fn serve_public_key_pages(
+    pages: Vec<Vec<&'static str>>,
+    continue_after_last: bool,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!(
+        "http://{}/users/fixture/keys",
+        listener.local_addr().unwrap()
+    );
+    let response_endpoint = endpoint.clone();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let page_count = pages.len();
+        for (index, keys) in pages.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                bytes.push(byte[0]);
+                assert!(bytes.len() < 16_384);
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            requests.push(request.lines().next().unwrap().to_string());
+            let body = serde_json::to_string(
+                &keys
+                    .into_iter()
+                    .map(|key| serde_json::json!({"key": key}))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let link = if index + 1 < page_count || continue_after_last {
+                format!(
+                    "Link: <{response_endpoint}?per_page=100&page={}>; rel=\"next\"\r\n",
+                    index + 2
+                )
+            } else {
+                String::new()
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{link}Connection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        requests
+    });
+    (endpoint, server)
+}
+
+#[tokio::test]
+async fn ssh_key_discovery_follows_pages_until_the_first_compatible_recipient() {
+    use gitforgeops::secrets::delivery::fetch_ssh_recipient;
+    for public_key in [TEST_ED25519_PUBLIC_KEY, TEST_RSA_PUBLIC_KEY] {
+        let (endpoint, server) = serve_public_key_pages(
+            vec![vec!["unsupported-public-key"], vec![public_key]],
+            false,
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let (_, fingerprint) = fetch_ssh_recipient(&client, &endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fingerprint.starts_with("SHA256:"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("?per_page=100 "));
+        assert!(requests[1].contains("?per_page=100&page=2 "));
+    }
+}
+
+#[tokio::test]
+async fn ssh_key_discovery_distinguishes_exhaustion_from_the_page_cap() {
+    use gitforgeops::secrets::delivery::{fetch_ssh_recipient, MAX_SSH_KEY_PAGES};
+    for (pages, has_next, expected_some, expected_error) in [
+        (vec![vec![]], false, false, false),
+        (
+            vec![vec!["unsupported-public-key"], vec![]],
+            false,
+            false,
+            false,
+        ),
+        (vec![vec![TEST_ED25519_PUBLIC_KEY]], false, true, false),
+        (vec![vec![]; MAX_SSH_KEY_PAGES], true, false, true),
+    ] {
+        let count = pages.len();
+        let (endpoint, server) = serve_public_key_pages(pages, has_next);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = fetch_ssh_recipient(&client, &endpoint).await;
+        if expected_error {
+            let error = result.expect_err("incomplete discovery must fail");
+            assert!(error.to_string().contains("pagination safety cap"));
+        } else {
+            assert_eq!(result.unwrap().is_some(), expected_some);
+        }
+        assert_eq!(server.join().unwrap().len(), count);
+    }
 }

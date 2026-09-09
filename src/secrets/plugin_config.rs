@@ -105,12 +105,18 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             endpoint(&["jwks_uri"]),
         ],
         "oauth2_introspection" => vec![
+            secret(&["providers", "*", "client_auth", "client_secret"]),
+            secret(&["providers", "*", "client_auth", "private_key_pem"]),
             endpoint(&["providers", "*", "discovery_url"]),
             endpoint(&["providers", "*", "introspection_endpoint"]),
             endpoint(&["discovery_url"]),
             endpoint(&["introspection_endpoint"]),
         ],
         "oidc_relying_party" => vec![
+            secret(&["providers", "*", "client_auth", "client_secret"]),
+            secret(&["providers", "*", "client_auth", "private_key_pem"]),
+            secret(&["session", "encryption_secret"]),
+            secret(&["session", "encryption_secret_previous"]),
             endpoint(&["providers", "*", "discovery_url"]),
             endpoint(&["providers", "*", "jwks_uri"]),
             endpoint(&["providers", "*", "token_endpoint"]),
@@ -124,7 +130,15 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             endpoint(&["userinfo_endpoint"]),
             endpoint(&["end_session_endpoint"]),
         ],
-        "ldap_auth" => vec![endpoint(&["ldap_url"])],
+        "ldap_auth" => vec![
+            endpoint(&["ldap_url"]),
+            secret(&["service_account_password"]),
+        ],
+        "soap_ws_security" => vec![
+            endpoint(&["redis_url"]),
+            secret(&["redis_password"]),
+            secret(&["username_token", "credentials", "*", "password"]),
+        ],
         "opa" => vec![secret(&["headers", "*"])],
         "ai_transcript_audit" => vec![
             endpoint(&["sink", "endpoint_url"]),
@@ -200,12 +214,9 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 pub(crate) struct PluginConfigClassification {
     /// Leaves import must move into the private broker bundle.
     pub sensitive: Vec<Vec<ConfigPathComponent>>,
-    /// Leaves of a **non-builtin** plugin that the heuristics did not flag, so
-    /// they stay in the committed resource file as written. Always empty for a
-    /// builtin plugin, whose schema-declared rules are authoritative.
-    ///
-    /// These are what the operator has to review by hand: gitforgeops has no
-    /// schema for the plugin and cannot tell a tuning knob from an API key.
+    /// Leaves requiring explicit plaintext allowance: heuristic matches outside
+    /// the builtin's schema rules, or unflagged strings in a non-builtin plugin.
+    /// Import must refuse before publication unless the operator accepts them.
     pub unbrokered: Vec<Vec<ConfigPathComponent>>,
 }
 
@@ -216,9 +227,9 @@ pub(crate) struct PluginConfigClassification {
 /// * **A config that is not an object** (a bare string, a list). There is no
 ///   key to judge anything by, so every string is brokered and nothing is
 ///   reported for review — fail closed, exactly as before.
-/// * **A builtin plugin.** Its schema-declared rules
-///   ([`rules_for`]) plus the conservative key/URL heuristics decide, and the
-///   result is authoritative: nothing is left for review.
+/// * **A builtin plugin.** Its schema-declared rules ([`rules_for`]) select
+///   brokered leaves. Secret-looking key/URL heuristic matches outside those
+///   rules require explicit plaintext allowance; other leaves stay literal.
 /// * **A non-builtin (custom, future, or renamed) plugin.** Only the
 ///   heuristics apply. Brokering *every* string leaf, which is what this used
 ///   to do, means a plugin whose config is `{"mode": "strict"}` has `strict`
@@ -243,7 +254,7 @@ pub(crate) fn classify_plugin_config(
     }
 
     if !is_builtin(plugin_name) {
-        collect_heuristic_paths(config, &root, &mut sensitive);
+        collect_heuristic_paths(config, &root, &mut sensitive, false);
         let mut all = BTreeSet::new();
         collect_string_paths(config, &root, &mut all);
         let unbrokered = all.difference(&sensitive).cloned().collect();
@@ -256,20 +267,27 @@ pub(crate) fn classify_plugin_config(
     for rule in rules_for(plugin_name) {
         apply_rule(config, rule.path, rule.kind, &root, &mut sensitive);
     }
-    collect_heuristic_paths(config, &root, &mut sensitive);
+    let mut heuristic = BTreeSet::new();
+    collect_heuristic_paths(config, &root, &mut heuristic, true);
+    let unbrokered = heuristic.difference(&sensitive).cloned().collect();
     PluginConfigClassification {
         sensitive: sensitive.into_iter().collect(),
-        unbrokered: Vec::new(),
+        unbrokered,
     }
 }
 
-/// Return every string leaf that import must move into the private broker
-/// bundle. Shorthand for [`classify_plugin_config`]'s `sensitive` half.
+/// Return every sensitive string for redaction and security checks, including
+/// builtin heuristic matches that import gates instead of automatically brokering.
 pub(crate) fn sensitive_string_paths(
     plugin_name: &str,
     config: &Value,
 ) -> Vec<Vec<ConfigPathComponent>> {
-    classify_plugin_config(plugin_name, config).sensitive
+    let classification = classify_plugin_config(plugin_name, config);
+    let mut sensitive: BTreeSet<_> = classification.sensitive.into_iter().collect();
+    if is_builtin(plugin_name) {
+        sensitive.extend(classification.unbrokered);
+    }
+    sensitive.into_iter().collect()
 }
 
 /// The leaves this plugin's schema rules classify as **endpoints** — a URL,
@@ -448,16 +466,25 @@ fn collect_heuristic_paths(
     value: &Value,
     current: &[ConfigPathComponent],
     found: &mut BTreeSet<Vec<ConfigPathComponent>>,
+    builtin: bool,
 ) {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
                 let mut next = current.to_vec();
                 next.push(ConfigPathComponent::Key(key.clone()));
-                if is_sensitive_key(key) || is_header_container(key) {
+                // Keep custom-plugin brokering stable; broaden only the builtin
+                // review safety net for compound keys and header-map aliases.
+                let builtin_match = builtin
+                    && (normalize_key(key).ends_with("key")
+                        || matches!(
+                            normalize_key(key).as_str(),
+                            "extraheaders" | "outboundheaders" | "additionalheaders"
+                        ));
+                if is_sensitive_key(key) || is_header_container(key) || builtin_match {
                     collect_string_paths(child, &next, found);
                 } else {
-                    collect_heuristic_paths(child, &next, found);
+                    collect_heuristic_paths(child, &next, found, builtin);
                 }
             }
         }
@@ -465,7 +492,7 @@ fn collect_heuristic_paths(
             for (index, child) in items.iter().enumerate() {
                 let mut next = current.to_vec();
                 next.push(ConfigPathComponent::Index(index));
-                collect_heuristic_paths(child, &next, found);
+                collect_heuristic_paths(child, &next, found, builtin);
             }
         }
         Value::String(text) if url_has_userinfo(text) => {
@@ -636,8 +663,7 @@ mod tests {
         assert!(classification.unbrokered.is_empty());
     }
 
-    /// A builtin plugin's schema rules are authoritative: nothing is deferred
-    /// to a human.
+    /// Schema-covered secrets and ordinary settings need no plaintext allowance.
     #[test]
     fn builtin_plugins_report_nothing_for_review() {
         let classification = classify_plugin_config(

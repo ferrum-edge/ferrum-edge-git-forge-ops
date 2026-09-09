@@ -26,9 +26,178 @@ fn review_comment_shows_validation_pass() {
 }
 
 #[test]
+fn oversized_review_preserves_every_blocker_and_names_omitted_sections() {
+    use gitforgeops::secrets::placeholder::{PlaceholderAlloc, SecretPlaceholder};
+    use gitforgeops::secrets::{ResolveResult, SlotStatus};
+
+    let diffs: Vec<_> = (0..100)
+        .map(|index| ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "Proxy".into(),
+            id: format!("proxy-{index}"),
+            namespace: "tenant".into(),
+            details: (0..20)
+                .map(|field| FieldChange {
+                    // The review lists field names, never old/new values.
+                    // Oversize the rendered input so this exercises truncation.
+                    field: format!("field-{field}-{}", "界".repeat(170)),
+                    old_value: "unrendered-old-secret".repeat(32),
+                    new_value: "unrendered-new-secret".repeat(32),
+                })
+                .collect(),
+        })
+        .collect();
+    let finding = PolicyFinding {
+        rule_id: "backend_scheme".into(),
+        severity: Severity::Error,
+        kind: "Proxy".into(),
+        id: "app".into(),
+        namespace: "tenant".into(),
+        message: "scheme rejected".into(),
+        remediation: None,
+        overridden_by: None,
+    };
+    // Heading-like metadata in the verdict must not hide the actual omitted
+    // section from the footer's section detection.
+    let policy = [
+        finding.clone(),
+        PolicyFinding {
+            rule_id: "### Policy Violations".into(),
+            ..finding
+        },
+    ];
+    let security = [SecurityFinding {
+        severity: "error".into(),
+        kind: "Consumer".into(),
+        id: "app".into(),
+        namespace: "tenant".into(),
+        message: "literal credential".into(),
+    }];
+    let mut secrets = ResolveReport::default();
+    secrets.slot_remaps.push("orphaned broker slot".into());
+    secrets.results.push(ResolveResult {
+        consumer_id: "app".into(),
+        namespace: "tenant".into(),
+        cred_key: "keyauth/key".into(),
+        slot: "tenant/app/keyauth/key".into(),
+        placeholder: SecretPlaceholder {
+            alloc: PlaceholderAlloc::Require,
+            length_bytes: 32,
+        },
+        status: SlotStatus::MissingRequired,
+    });
+    let render = || {
+        build_review_comment_v2(
+            false,
+            "mesh rejected",
+            &diffs,
+            &[],
+            &security,
+            &[],
+            &policy,
+            &[],
+            &[spec_owned_entry("spec-proxy", true, false)],
+            None,
+            None,
+            None,
+            None,
+            &secrets,
+            true,
+        )
+    };
+    let comment = render();
+    assert_eq!(comment, render(), "truncation must be deterministic");
+    assert!(!comment.contains("unrendered-old-secret"));
+    assert!(!comment.contains("unrendered-new-secret"));
+    assert!(comment.len() <= MAX_REVIEW_COMMENT_BYTES);
+    assert!(
+        comment.len() > MAX_REVIEW_COMMENT_BYTES - 2_000,
+        "a long table row must not waste the remaining budget: {}",
+        comment.len()
+    );
+    let verdict = comment
+        .split("## Ferrum Edge Config Review")
+        .next()
+        .unwrap();
+    for expected in [
+        "Apply is blocked",
+        "Validation: rejected",
+        "Security Findings: 1 total, 1 blocking",
+        "Policy Violations: 2 total, 2 blocking",
+        "`backend_scheme`",
+        "1 **CONFLICT**",
+        "Credential Slot Remaps: 1 blocking",
+        "1 missing required (blocking)",
+    ] {
+        assert!(verdict.contains(expected), "missing {expected}: {verdict}");
+    }
+    let notice = comment
+        .split("Detail reduced or omitted from:")
+        .nth(1)
+        .unwrap();
+    for section in [
+        "Changes",
+        "Security Findings",
+        "Policy Violations",
+        "Spec-owned Resources",
+        "Credential Slot Remaps",
+        "Secret Broker Slots",
+    ] {
+        assert!(notice.contains(section), "{notice}");
+    }
+}
+
+#[test]
 fn review_comment_shows_validation_fail() {
     let comment = build_review_comment(false, "some error", &[], &[], &[], &[], None);
     assert!(comment.contains("FAIL"));
+}
+
+#[test]
+fn verified_security_only_override_clears_only_its_verdict() {
+    use gitforgeops::policy::OverrideDecision;
+    use gitforgeops::review::build_review_comment_v2_with_override;
+
+    let decision = OverrideDecision {
+        active: true,
+        approver: Some("maintainer".into()),
+        permission: Some("write".into()),
+        reason: "PR 7 review 42 authorized head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        pr_number: Some(7),
+        authorized_head: Some("a".repeat(40)),
+        review_id: Some(42),
+        applied_revision: Some("b".repeat(40)),
+    };
+    let security = [SecurityFinding {
+        severity: "error".into(),
+        kind: "Consumer".into(),
+        id: "app".into(),
+        namespace: "tenant".into(),
+        message: "literal credential".into(),
+    }];
+    let comment = build_review_comment_v2_with_override(
+        ReviewValidationStatus::Passed,
+        "",
+        &[],
+        &[],
+        &security,
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+        Some(&decision),
+    );
+    assert!(!comment.contains("Apply is blocked"));
+    assert!(comment.contains("Security Findings: 1 total, 0 blocking, 1 overridden"));
+    assert!(comment.contains("Security findings OVERRIDDEN by `maintainer`"));
+    assert!(comment.contains("literal credential"));
+    assert!(comment.contains("PR 7 review 42 authorized head"));
 }
 
 #[test]
@@ -655,9 +824,9 @@ fn review_comment_preserves_trusted_markup_and_names_empty_code_spans() {
         true,
     );
 
-    assert!(comment.starts_with(
-        "Environment: `production` · Ownership: `Shared` · Strategy: `Incremental`\n\n"
-    ));
+    assert!(comment.starts_with("### Apply verdict\n\n"));
+    assert!(comment
+        .contains("Environment: `production` · Ownership: `Shared` · Strategy: `Incremental`\n\n"));
     assert!(comment.contains("**Proxy `(unnamed)`** (`(unnamed)`): missing identity"));
     assert!(!comment.contains("``"));
 }
@@ -782,6 +951,62 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     assert!(missing_required.contains("**MISSING (required)**"));
 }
 
+#[test]
+fn review_comment_cap_renders_the_same_prefix_across_runs() {
+    use gitforgeops::config::schema::{GatewayConfig, Proxy};
+    use gitforgeops::diff::compute_diff_with_ownership;
+
+    let proxies: Vec<Proxy> = (0..120)
+        .map(|index| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("p-{index:03}"),
+                "namespace": "ferrum",
+                "backend_host": "example.com",
+                "backend_port": 443,
+            }))
+            .unwrap()
+        })
+        .collect();
+    let desired = GatewayConfig {
+        proxies,
+        ..Default::default()
+    };
+    let actual = GatewayConfig::default();
+
+    let render = || {
+        let result =
+            compute_diff_with_ownership(&desired, &actual, Some(&std::collections::HashSet::new()));
+        build_review_comment_v2(
+            true,
+            "",
+            &result.diffs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &result.unmanaged,
+            &result.spec_owned,
+            None,
+            None,
+            None,
+            None,
+            &ResolveReport::default(),
+            false,
+        )
+    };
+
+    let first = render();
+    let second = render();
+    assert_eq!(first, second, "review comment must be deterministic");
+
+    // 120 adds, capped at 100 rows: the deterministic (ns, kind, id) prefix is
+    // what a reviewer sees, and the last 20 are named only by the omission row.
+    assert!(first.contains("20 additional change(s) omitted"), "{first}");
+    assert!(first.contains("p-000"), "{first}");
+    assert!(first.contains("p-099"), "{first}");
+    assert!(!first.contains("p-119"), "{first}");
+}
+
 // --- Spec-owned section ------------------------------------------------------
 
 fn spec_owned_entry(id: &str, declared_in_repo: bool, pruned: bool) -> SpecOwnedResource {
@@ -880,7 +1105,11 @@ fn review_comment_v2_omits_spec_owned_section_when_empty() {
         true,
     );
 
-    assert!(!comment.contains("Spec-owned"), "{comment}");
+    assert!(!comment.contains("### Spec-owned Resources"), "{comment}");
+    assert!(
+        comment.contains("Spec-owned Resources: 0 total"),
+        "{comment}"
+    );
 }
 
 #[test]
@@ -1015,7 +1244,11 @@ fn review_comment_omits_the_remap_section_when_there_are_none() {
         true,
     );
 
-    assert!(!comment.contains("Credential Slot Remaps"), "{comment}");
+    assert!(!comment.contains("### Credential Slot Remaps"), "{comment}");
+    assert!(
+        comment.contains("Credential Slot Remaps: 0 blocking"),
+        "{comment}"
+    );
 }
 
 #[test]
@@ -1079,11 +1312,16 @@ fn review_comment_environment_header_renders_as_markdown_not_escaped_text() {
         &ResolveReport::default(),
         true,
     );
-    let first_line = comment.lines().next().unwrap();
+    assert!(comment.starts_with("### Apply verdict\n\n"));
+    let header_line = comment
+        .lines()
+        .find(|line| line.starts_with("Environment: "))
+        .unwrap();
     assert_eq!(
-        first_line,
+        header_line,
         "Environment: `default` · Ownership: `Shared` · Strategy: `Incremental`"
     );
+    assert!(comment.contains(&format!("{header}\n\n## Ferrum Edge Config Review")));
     assert!(
         !comment.contains("\\`"),
         "the header must not be escaped: {comment}"
@@ -1226,4 +1464,110 @@ fn cached_backup_degrades_the_review_and_fails_require_live() {
 fn live_comparison_enforcement_is_scoped_to_require_live() {
     assert!(enforce_live_comparison(true, None).is_ok());
     assert!(enforce_live_comparison(false, Some(STALE_LIVE_VIEW_REASON)).is_ok());
+}
+
+#[test]
+fn review_security_verdict_uses_verified_override_without_hiding_findings() {
+    use gitforgeops::policy::{github_override::apply_override, OverrideDecision};
+    use gitforgeops::review::build_review_comment_v2_with_override;
+
+    let security = vec![SecurityFinding {
+        severity: "error".into(),
+        kind: "Consumer".into(),
+        id: "app".into(),
+        namespace: "ferrum".into(),
+        message: "Literal credential in 'keyauth[0].key' on consumer app".into(),
+    }];
+    let active = OverrideDecision {
+        active: true,
+        approver: Some("reviewer".into()),
+        permission: Some("write".into()),
+        reason: "Verified configured label and write permission".into(),
+        pr_number: Some(7),
+        authorized_head: Some("a".repeat(40)),
+        review_id: Some(10),
+        applied_revision: Some("b".repeat(40)),
+    };
+    let inactive = OverrideDecision::inactive("label missing or verification unavailable");
+    for decision in [None, Some(&inactive), Some(&active)] {
+        let mut policy = vec![PolicyFinding {
+            rule_id: "backend_scheme".into(),
+            severity: Severity::Error,
+            kind: "Proxy".into(),
+            id: "proxy".into(),
+            namespace: "ferrum".into(),
+            message: "http is not allowed".into(),
+            remediation: None,
+            overridden_by: None,
+        }];
+        if let Some(decision) = decision {
+            apply_override(&mut policy, decision);
+        }
+        let comment = build_review_comment_v2_with_override(
+            ReviewValidationStatus::Rejected,
+            "mesh rejected",
+            &[],
+            &[],
+            &security,
+            &[],
+            &policy,
+            &[],
+            &[],
+            decision.map(|decision| decision.reason.as_str()),
+            None,
+            None,
+            None,
+            &ResolveReport::default(),
+            false,
+            decision,
+        );
+        let overridden = decision.is_some_and(|decision| decision.active);
+        assert!(
+            comment.contains("Apply is blocked"),
+            "mesh still blocks: {comment}"
+        );
+        assert_eq!(comment.contains("1 blocking, 0 overridden"), !overridden);
+        assert_eq!(
+            comment.contains("Security findings OVERRIDDEN by `reviewer`"),
+            overridden,
+            "{comment}"
+        );
+        assert!(comment.contains("Literal credential in"), "{comment}");
+        assert!(comment.contains("keyauth"), "{comment}");
+        assert!(comment.contains("http is not allowed"), "{comment}");
+        assert!(comment.contains("Validation: FAILED"), "{comment}");
+        assert!(comment.contains("mesh rejected"), "{comment}");
+    }
+}
+
+#[test]
+fn the_mesh_retraction_banner_names_the_destination_and_the_outcome() {
+    // Mesh has no live gateway API, so a pending retraction never appears
+    // under "Changes". Without this banner it would reach a reviewer as
+    // nothing at all.
+    use gitforgeops::apply::MeshPublication;
+    use gitforgeops::review::render_mesh_retraction;
+
+    let path = "assembled/sandbox-mesh.yaml";
+
+    let published = render_mesh_retraction(MeshPublication::Published, path);
+    assert!(published.is_none());
+    let never = render_mesh_retraction(MeshPublication::NeverPublished, path);
+    assert!(never.is_none());
+
+    let pending = render_mesh_retraction(MeshPublication::Retracted, path);
+    let pending = pending.expect("a pending retraction is reported");
+    assert!(pending.contains("RETRACT mesh"), "{pending}");
+    assert!(pending.contains(path), "{pending}");
+
+    let unattributed = render_mesh_retraction(MeshPublication::Unattributed, path);
+    let unattributed = unattributed.expect("a skipped retraction is reported");
+    assert!(
+        unattributed.contains("RETRACT mesh: skipped"),
+        "{unattributed}"
+    );
+
+    let narrowed = render_mesh_retraction(MeshPublication::NarrowedScope, path);
+    let narrowed = narrowed.expect("a skipped retraction is reported");
+    assert!(narrowed.contains("RETRACT mesh: skipped"), "{narrowed}");
 }

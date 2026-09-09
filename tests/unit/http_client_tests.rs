@@ -1680,3 +1680,33 @@ fn convergence_summary_orders_by_instant_not_string() {
         "{summary}"
     );
 }
+
+#[test]
+fn scoped_backup_requires_explicit_matching_namespace_for_every_resource_kind() {
+    use gitforgeops::http_client::BackupSnapshot;
+
+    for section in ["proxies", "consumers", "upstreams", "plugin_configs"] {
+        for namespace in ["ferrum", "team"] {
+            for wire_namespace in [None, Some("foreign"), Some(namespace)] {
+                let mut row = serde_json::json!({
+                    "id": "row", "username": "row", "targets": [],
+                    "plugin_name": "key_auth", "scope": "global"
+                });
+                if let Some(value) = wire_namespace {
+                    row["namespace"] = value.into();
+                }
+                let mut body = serde_json::json!({});
+                body[section] = serde_json::json!([row]);
+                let result = BackupSnapshot::from_scoped_body(&body.to_string(), namespace);
+                assert_eq!(
+                    result.is_ok(),
+                    wire_namespace == Some(namespace),
+                    "{result:?}"
+                );
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("row"));
+                }
+            }
+        }
+    }
+}

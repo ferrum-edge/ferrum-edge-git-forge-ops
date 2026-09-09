@@ -51,6 +51,10 @@ pub enum BlockerKind {
     /// A credential-array shape change that re-owns a stored broker slot,
     /// without `--allow-credential-slot-remap`.
     SlotRemap,
+    /// Pending allocation requires the GitHub provisioner token.
+    ProvisionerToken,
+    /// Pending allocation requires the target GitHub repository.
+    ProvisioningRepository,
 }
 
 impl BlockerKind {
@@ -62,6 +66,8 @@ impl BlockerKind {
             BlockerKind::Policy => "policy",
             BlockerKind::RequiredCredentials => "required-credentials",
             BlockerKind::SlotRemap => "credential-slot-remap",
+            BlockerKind::ProvisionerToken => "provisioner-token",
+            BlockerKind::ProvisioningRepository => "provisioning-repository",
         }
     }
 
@@ -70,6 +76,12 @@ impl BlockerKind {
     /// command and not described in the other.
     pub fn remedy(self) -> &'static str {
         match self {
+            BlockerKind::ProvisionerToken => {
+                "FERRUM_GH_PROVISIONER_TOKEN not set; cannot allocate credential slots"
+            }
+            BlockerKind::ProvisioningRepository => {
+                "GITHUB_REPOSITORY not set; cannot write to GitHub Environment Secrets"
+            }
             BlockerKind::Validation => {
                 "the assembled document does not validate; fix the reported schema errors"
             }
@@ -140,6 +152,8 @@ pub struct ApplyGateInputs<'a> {
     pub secret_report: &'a ResolveReport,
     /// `--allow-credential-slot-remap` was passed.
     pub allow_credential_slot_remap: bool,
+    pub provisioner_token_present: bool,
+    pub github_repository_present: bool,
 }
 
 /// Validation is a single gate: it either passed or `apply` refuses.
@@ -168,11 +182,30 @@ pub fn policy_blocker(findings: &[PolicyFinding]) -> Option<ApplyBlocker> {
 /// `alloc=require` slots with no value.
 ///
 /// Distinct from [`crate::secrets::ResolveReport::needs_allocation`], which is
-/// ordinary first-apply work the allocator performs — those must never be
-/// reported as a blocker or every new credential would fail its own plan.
+/// ordinary first-apply work the allocator performs. Pending allocation is not
+/// a missing required value; its environment prerequisites are checked separately.
 pub fn required_credentials_blocker(report: &ResolveReport) -> Option<ApplyBlocker> {
     let count = report.missing_required().len();
     (count > 0).then(|| ApplyBlocker::new(BlockerKind::RequiredCredentials, count))
+}
+
+/// Presence checks only: token validity requires a remote call, outside this verdict.
+pub fn credential_provisioning_blockers(
+    report: &ResolveReport,
+    provisioner_token_present: bool,
+    github_repository_present: bool,
+) -> Vec<ApplyBlocker> {
+    if report.needs_allocation().is_empty() {
+        return Vec::new();
+    }
+    [
+        (!provisioner_token_present).then(|| ApplyBlocker::new(BlockerKind::ProvisionerToken, 1)),
+        (!github_repository_present)
+            .then(|| ApplyBlocker::new(BlockerKind::ProvisioningRepository, 1)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// A proven credential-slot reassignment the run has not acknowledged.
@@ -201,6 +234,11 @@ pub fn apply_blockers(inputs: ApplyGateInputs<'_>) -> Vec<ApplyBlocker> {
     ]
     .into_iter()
     .flatten()
+    .chain(credential_provisioning_blockers(
+        inputs.secret_report,
+        inputs.provisioner_token_present,
+        inputs.github_repository_present,
+    ))
     .collect()
 }
 

@@ -49,6 +49,8 @@ impl Default for DriftAlertOn {
 #[serde(default, deny_unknown_fields)]
 pub struct OwnershipConfig {
     pub mode: OwnershipMode,
+    /// Exclusive scope: effective gateway namespaces and mesh directory namespaces.
+    /// Checked after overlays and filtering; shared mode does not restrict either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespaces: Option<Vec<String>>,
     pub drift_report: bool,
