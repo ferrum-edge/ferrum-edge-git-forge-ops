@@ -1030,6 +1030,38 @@ fn credential_migration_bundle_cannot_overwrite_its_source_backup() {
     assert!(!output.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn credential_migration_bundle_cannot_alias_source_via_symlink_dotdot() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("source");
+    std::fs::create_dir_all(source_dir.join("sub")).unwrap();
+    let source = source_dir.join("backup.yaml");
+    std::fs::write(&source, "source backup").unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    symlink(source_dir.join("sub"), outside.path().join("jump")).unwrap();
+    let alias = outside.path().join("jump/../backup.yaml");
+
+    let output = root.path().join("resources");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &source,
+        &output,
+        Some(&alias),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("may not overwrite its source backup"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "source backup");
+}
+
 #[test]
 fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -1059,6 +1091,48 @@ fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
 
     assert!(error.contains("outside every Git worktree"), "{error}");
     assert!(!unsafe_bundle.exists());
+    assert!(!output.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn credential_migration_bundle_rejects_dotdot_after_symlink_into_worktree() {
+    use std::os::unix::fs::symlink;
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-production-key"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let outside = tempfile::tempdir().unwrap();
+    symlink(
+        std::env::current_dir().unwrap().join("src"),
+        outside.path().join("jump"),
+    )
+    .unwrap();
+    let unsafe_bundle = outside.path().join("jump/../never-write-credentials.json");
+
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&unsafe_bundle),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("outside every Git worktree"), "{error}");
+    assert!(!std::env::current_dir()
+        .unwrap()
+        .join("never-write-credentials.json")
+        .exists());
     assert!(!output.exists());
 }
 
