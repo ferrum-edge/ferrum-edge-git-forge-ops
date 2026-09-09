@@ -17,6 +17,25 @@ SPEC.loader.exec_module(check_supply_chain)
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
+    def test_codeowners_must_explicitly_cover_exact_state_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary))
+            path = root / ".github/CODEOWNERS"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(
+                "\n".join(
+                    line
+                    for line in text.splitlines()
+                    if not line.startswith("/.state ")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "CODEOWNERS: launch-critical path is not explicitly owned: /.state",
+                self._violations(root),
+            )
+
     def test_trusted_policy_checker_has_no_stale_bootstrap_fallback(self):
         # A one-time commit-pinned bootstrap covered the window where `main`
         # did not yet carry this checker. `main` carries it now, so a fallback

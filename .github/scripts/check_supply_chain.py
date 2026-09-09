@@ -1293,6 +1293,7 @@ def main(argv: list[str] | None = None) -> int:
         "/.github/scripts/",
         "/.github/ferrum-edge-checksums.txt",
         "/.gitforgeops/",
+        "/.state",
         "/.state/",
         "/Cargo.toml",
         "/Cargo.lock",

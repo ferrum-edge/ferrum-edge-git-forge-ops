@@ -1933,7 +1933,7 @@ async fn cmd_apply(
         }
     }
 
-    let is_first_apply = StateFile::is_first_apply(&resolved.name);
+    let is_first_apply = StateFile::is_first_apply(&resolved.name)?;
     if is_first_apply && matches!(resolved.ownership.mode, OwnershipMode::Shared) {
         eprintln!(
             "Notice: first apply for environment '{}' in shared mode. Resources on the gateway but not in this repo will be treated as unmanaged and left alone.",
