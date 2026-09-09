@@ -12,6 +12,7 @@ mod http_client_tests;
 mod import_tests;
 mod jwt_tests;
 mod loader_tests;
+mod log_injection_tests;
 mod mesh_tests;
 mod override_tests;
 mod ownership_tests;

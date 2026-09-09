@@ -1,4 +1,5 @@
 use super::runner::ValidationResult;
+use crate::diagnostics::sanitize_block;
 
 /// Output format for validation results.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,16 +97,25 @@ fn format_text(result: &ValidationResult) -> String {
         output.push_str("Validation failed.\n");
     }
 
+    // The child's streams echo repository YAML back at the operator, so they
+    // carry attacker-controlled bytes into whatever reads this text — in CI,
+    // an Actions job log that parses `::…::` at the start of a line as a
+    // workflow command. `sanitize_block` keeps the report's line structure and
+    // neutralizes exactly that. The GitHub-annotation format below is
+    // deliberately left alone: it emits real workflow commands and escapes
+    // their data with `escape_workflow_command_data`.
     if !result.stdout.is_empty() {
-        output.push_str(&result.stdout);
-        if !result.stdout.ends_with('\n') {
+        let stdout = sanitize_block(&result.stdout);
+        output.push_str(&stdout);
+        if !stdout.ends_with('\n') {
             output.push('\n');
         }
     }
 
     if !result.stderr.is_empty() {
-        output.push_str(&result.stderr);
-        if !result.stderr.ends_with('\n') {
+        let stderr = sanitize_block(&result.stderr);
+        output.push_str(&stderr);
+        if !stderr.ends_with('\n') {
             output.push('\n');
         }
     }
