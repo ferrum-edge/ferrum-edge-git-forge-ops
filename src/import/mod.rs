@@ -349,23 +349,14 @@ impl ImportResult {
     }
 }
 
+/// Render one untrusted backup-sourced value for an import diagnostic.
+///
+/// Delegates to the shared log sanitizer: the treatment this function
+/// introduced (control characters folded to `U+FFFD`, bounded length) is now
+/// applied to every diagnostic that interpolates untrusted text, not just
+/// import's. See [`crate::diagnostics`].
 fn diagnostic_metadata(value: &str) -> String {
-    const MAX_CHARS: usize = 256;
-    let mut sanitized = value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .take(MAX_CHARS)
-        .collect::<String>();
-    if value.chars().count() > MAX_CHARS {
-        sanitized.push_str("[truncated]");
-    }
-    sanitized
+    crate::diagnostics::sanitize(value)
 }
 
 /// Split a flat gateway configuration into per-resource YAML files.

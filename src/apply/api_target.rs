@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::ApplyStrategy;
+use crate::diagnostics::{safe, safe_line};
 use crate::diff::resource_diff::{
     compute_diff_with_options, state_key, DiffAction, DiffOptions, DiffResult, OwnershipScope,
     ResourceDiff, SpecOwnedResource,
@@ -333,7 +334,7 @@ pub async fn apply_api(
 
     for namespace in namespaces {
         if let Some(reason) = prepared.blocked.get(namespace) {
-            eprintln!("[{namespace}] {reason}");
+            eprintln!("[{}] {}", safe(namespace), safe_line(reason));
             aggregate.errors.push(format!("[{namespace}] {reason}"));
             continue;
         }
@@ -402,7 +403,7 @@ pub async fn apply_api(
             namespace_result.deleted,
             namespace_result.deletes_missing,
         ) {
-            eprintln!("Warning: {warning}");
+            eprintln!("Warning: {}", safe_line(warning));
         }
 
         aggregate.created += namespace_result.created;
@@ -585,7 +586,10 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
             Err(crate::error::Error::GatewayReadOnly(reason))
         }
         Err(e) => {
-            eprintln!("Warning: admin preflight GET /health failed ({e}); continuing.");
+            eprintln!(
+                "Warning: admin preflight GET /health failed ({}); continuing.",
+                safe_line(&e)
+            );
             Ok(())
         }
     }
@@ -1161,15 +1165,17 @@ async fn apply_incremental(
     );
     for assertion in &assertions {
         eprintln!(
-            "[{namespace}] asserting repository ownership of pending {} `{}` with an idempotent update",
-            assertion.kind, assertion.id
+            "[{}] asserting repository ownership of pending {} `{}` with an idempotent update",
+            safe(namespace),
+            safe(&assertion.kind),
+            safe(&assertion.id)
         );
     }
     diffs.extend(assertions);
     let diffs = order_diffs(diffs);
 
     for message in spec_owned_skip_messages(&spec_owned) {
-        eprintln!("[{namespace}] {message}");
+        eprintln!("[{}] {}", safe(namespace), safe_line(&message));
     }
     let spec_owned_skipped = spec_owned.iter().filter(|s| !s.pruned).count();
 
@@ -1195,8 +1201,9 @@ async fn apply_incremental(
             // 501: standalone-MongoDB gateway with no multi-document
             // transaction. Fall through to per-resource CRUD.
             None => eprintln!(
-                "[{namespace}] gateway does not support POST /batch (501); \
-                 falling back to per-resource creates."
+                "[{}] gateway does not support POST /batch (501); \
+                 falling back to per-resource creates.",
+                safe(namespace)
             ),
         }
     }
@@ -1240,8 +1247,10 @@ async fn apply_incremental(
         if writes_failed && matches!(diff.action, DiffAction::Delete) {
             result.deletes_deferred += 1;
             eprintln!(
-                "[{namespace}] DEFER DELETE {} `{}`: an Add/Modify failed in this namespace; prune not attempted and existing managed ledger entries preserved. Resolve the write failure before retrying.",
-                diff.kind, diff.id
+                "[{}] DEFER DELETE {} `{}`: an Add/Modify failed in this namespace; prune not attempted and existing managed ledger entries preserved. Resolve the write failure before retrying.",
+                safe(namespace),
+                safe(&diff.kind),
+                safe(&diff.id)
             );
             continue;
         }
@@ -1552,7 +1561,7 @@ async fn adopt_matching_rows(
             "not adopting {} already-matching resource(s): {reason}",
             candidates.len()
         );
-        eprintln!("[{namespace}] {message}");
+        eprintln!("[{}] {}", safe(namespace), safe_line(&message));
         result
             .adoption_skipped
             .push(format!("[{namespace}] {message}"));
@@ -1627,7 +1636,7 @@ async fn adopt_matching_rows(
                     "not adopting {} `{}`: the live row changed between this run's diff and the ownership assertion, so the repository is not overwriting it. The next apply reconciles it as an ordinary change.",
                     candidate.kind, candidate.id
                 );
-                eprintln!("[{namespace}] {message}");
+                eprintln!("[{}] {}", safe(namespace), safe_line(&message));
                 result
                     .adoption_skipped
                     .push(format!("[{namespace}] {message}"));
@@ -1635,8 +1644,11 @@ async fn adopt_matching_rows(
             }
             if let Err(error) = resource.assert_ownership(client, namespace).await {
                 eprintln!(
-                    "[{namespace}] failed to adopt {} `{}`: {error}",
-                    candidate.kind, candidate.id
+                    "[{}] failed to adopt {} `{}`: {}",
+                    safe(namespace),
+                    safe(&candidate.kind),
+                    safe(&candidate.id),
+                    safe_line(&error)
                 );
                 result.errors.push(format!(
                     "{} {} adopt: {error}",
@@ -1645,13 +1657,17 @@ async fn adopt_matching_rows(
                 continue;
             }
             eprintln!(
-                "[{namespace}] adopted {} `{}` into the ownership ledger with an idempotent update",
-                candidate.kind, candidate.id
+                "[{}] adopted {} `{}` into the ownership ledger with an idempotent update",
+                safe(namespace),
+                safe(&candidate.kind),
+                safe(&candidate.id)
             );
         } else {
             eprintln!(
-                "[{namespace}] adopted {} `{}` into the ownership ledger (exclusive ownership needs no assertion)",
-                candidate.kind, candidate.id
+                "[{}] adopted {} `{}` into the ownership ledger (exclusive ownership needs no assertion)",
+                safe(namespace),
+                safe(&candidate.kind),
+                safe(&candidate.id)
             );
         }
 
@@ -1937,9 +1953,10 @@ async fn create_with_reconciliation(
                             ))
                         })?;
                     eprintln!(
-                        "[{namespace}] {} `{}` returned an ambiguous response; an authoritative backup found the exact desired resource live and an idempotent update asserted repository ownership without replaying the create",
-                        resource.kind(),
-                        resource.id(),
+                        "[{}] {} `{}` returned an ambiguous response; an authoritative backup found the exact desired resource live and an idempotent update asserted repository ownership without replaying the create",
+                        safe(namespace),
+                        safe(resource.kind()),
+                        safe(resource.id()),
                     );
                     Ok(())
                 }
@@ -2251,8 +2268,9 @@ async fn try_batch_create(
             Ok(None) if position == 0 => return Ok(None),
             Ok(None) => {
                 eprintln!(
-                    "[{namespace}] gateway returned 501 for POST /batch after {} resource(s); \
+                    "[{}] gateway returned 501 for POST /batch after {} resource(s); \
                      creating the remaining {} resource(s) individually.",
+                    safe(namespace),
                     result.created,
                     total.saturating_sub(result.created),
                 );
@@ -2270,8 +2288,10 @@ async fn try_batch_create(
 
             Err(e) if batch_rejection_allows_replay(&e) => {
                 eprintln!(
-                    "[{namespace}] POST /batch chunk {} was definitively rejected ({e}); creating the remaining {} resource(s) individually so each failure is reported on its own.",
+                    "[{}] POST /batch chunk {} was definitively rejected ({}); creating the remaining {} resource(s) individually so each failure is reported on its own.",
+                    safe(namespace),
                     position + 1,
+                    safe_line(&e),
                     total.saturating_sub(result.created),
                 );
                 replay_from = Some(position);
@@ -2314,7 +2334,8 @@ async fn try_batch_create(
                             return Ok(Some(result));
                         }
                         eprintln!(
-                            "[{namespace}] POST /batch chunk {} returned an ambiguous response; an authoritative backup found all {} exact desired resources live and idempotent updates asserted repository ownership without replaying the batch",
+                            "[{}] POST /batch chunk {} returned an ambiguous response; an authoritative backup found all {} exact desired resources live and idempotent updates asserted repository ownership without replaying the batch",
+                            safe(namespace),
                             position + 1,
                             chunk.len(),
                         );

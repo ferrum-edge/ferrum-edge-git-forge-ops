@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::EnvConfig;
+use crate::diagnostics::{safe, safe_line};
 use crate::jwt::{self, JwtOptions};
 
 /// Page size requested from paginated list endpoints. The server clamps to
@@ -402,7 +403,9 @@ impl AdminClient {
         // refusal, because that document becomes permanent repo state.
         if let Some(notice) = snapshot.seal_violation_notice() {
             eprintln!(
-                "Warning: GET /backup for namespace '{namespace}' returned a count seal that does not match the document ({notice}). The seal was discarded; resource data is used as received."
+                "Warning: GET /backup for namespace '{}' returned a count seal that does not match the document ({}). The seal was discarded; resource data is used as received.",
+                safe(namespace),
+                safe_line(notice)
             );
         }
         Ok(snapshot)

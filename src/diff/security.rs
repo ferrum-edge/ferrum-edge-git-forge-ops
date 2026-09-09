@@ -1,5 +1,6 @@
 use crate::config::schema::{PluginConfig, Proxy};
 use crate::config::GatewayConfig;
+use crate::diagnostics::{sanitize, sanitize_line};
 use crate::plugin_catalog::{
     allows_uninspectable_body, cfg_array, cfg_bool, cfg_str, effective_plugins, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_retired, retired_replacement,
@@ -21,24 +22,30 @@ pub struct SecurityFinding {
 }
 
 impl SecurityFinding {
-    fn error(kind: &str, id: &str, namespace: &str, message: String) -> Self {
+    /// Build a finding, sanitizing the untrusted parts once at the point they
+    /// enter the struct.
+    ///
+    /// Every message below interpolates a repository-authored id, namespace,
+    /// plugin name or config path, and the CLI prints findings straight to
+    /// stdout/stderr. Sanitizing here rather than at each `format!` keeps the
+    /// guarantee whole: a finding can neither carry a line break into an
+    /// Actions log nor begin a line with `::`. See [`crate::diagnostics`].
+    fn new(severity: &str, kind: &str, id: &str, namespace: &str, message: String) -> Self {
         Self {
-            severity: "error".to_string(),
-            kind: kind.to_string(),
-            id: id.to_string(),
-            namespace: namespace.to_string(),
-            message,
+            severity: severity.to_string(),
+            kind: sanitize(kind),
+            id: sanitize(id),
+            namespace: sanitize(namespace),
+            message: sanitize_line(&message),
         }
     }
 
+    fn error(kind: &str, id: &str, namespace: &str, message: String) -> Self {
+        Self::new(BLOCKING_SEVERITY, kind, id, namespace, message)
+    }
+
     fn warning(kind: &str, id: &str, namespace: &str, message: String) -> Self {
-        Self {
-            severity: "warning".to_string(),
-            kind: kind.to_string(),
-            id: id.to_string(),
-            namespace: namespace.to_string(),
-            message,
-        }
+        Self::new("warning", kind, id, namespace, message)
     }
 }
 

@@ -11,6 +11,7 @@ use gitforgeops::config::{
     self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
     ResolvedEnv,
 };
+use gitforgeops::diagnostics::{safe, safe_block, safe_line};
 use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
@@ -116,7 +117,10 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        // Last line of defense for anything a printer below did not
+        // already sanitize: an error Display can carry a resource id, a
+        // YAML path or a gateway response body.
+        eprintln!("Error: {}", safe_block(&e));
         process::exit(1);
     }
 }
@@ -523,7 +527,7 @@ async fn surface_delivered_credentials(
         eprintln!(
             "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
             undelivered.len(),
-            undelivered.join(", ")
+            safe(undelivered.join(", "))
         );
     }
     Ok(())
@@ -799,7 +803,11 @@ fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
         };
         println!(
             "  {} {} ({}) spec={}{}",
-            s.kind, s.id, s.namespace, s.api_spec_id, note
+            safe(&s.kind),
+            safe(&s.id),
+            safe(&s.namespace),
+            safe(&s.api_spec_id),
+            note
         );
     }
     println!();
@@ -827,7 +835,11 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
     for finding in &blockers {
         eprintln!(
             "  [{}] {} {} ({}): {}",
-            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+            safe(&finding.severity),
+            safe(&finding.kind),
+            safe(&finding.id),
+            safe(&finding.namespace),
+            safe_line(&finding.message)
         );
     }
     for finding in findings
@@ -836,7 +848,11 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
     {
         eprintln!(
             "  [{}] {} {} ({}): {}",
-            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+            safe(&finding.severity),
+            safe(&finding.kind),
+            safe(&finding.id),
+            safe(&finding.namespace),
+            safe_line(&finding.message)
         );
     }
     eprintln!();
@@ -953,12 +969,12 @@ fn report_plan_validation(
                 println!("{label}: PASSED");
             } else {
                 println!("{label}: FAILED");
-                print!("{}", r.stderr);
+                print!("{}", safe_block(&r.stderr));
             }
             r.success
         }
         Err(e) => {
-            println!("{label}: ERROR ({e})");
+            println!("{label}: ERROR ({})", safe_block(e));
             false
         }
     }
@@ -1099,7 +1115,7 @@ async fn cmd_export(
         Some(mesh) => eprintln!(
             "Exported mesh document to {} ({})",
             env_config.mesh_file_output_path,
-            mesh_summary_line(mesh)
+            safe_line(mesh_summary_line(mesh))
         ),
         None => {
             if let Some(line) =
@@ -1117,7 +1133,8 @@ async fn cmd_export(
             Some(delivery) => {
                 eprintln!(
                     "Encrypted to @{} (ssh key {})",
-                    delivery.login, delivery.key_fingerprint
+                    safe(&delivery.login),
+                    safe(&delivery.key_fingerprint)
                 );
                 delivery.encrypted_b64.into_bytes()
             }
@@ -1172,7 +1189,7 @@ async fn cmd_diff(
     if !cached_namespaces.is_empty() {
         eprintln!(
             "Warning: diff is approximate because cached backup data was served for namespace(s) {}. API-spec ownership metadata is unavailable, so spec-owned/conflict classification is incomplete; no authoritative sync or drift decision is possible until the configuration database returns.",
-            cached_namespaces.join(", ")
+            safe(cached_namespaces.join(", "))
         );
         if exit_on_drift {
             return Err(gitforgeops::error::Error::StaleGatewayView(format!(
@@ -1189,7 +1206,7 @@ async fn cmd_diff(
             diff::mask_indeterminate_secret_values(&desired, &mut pair.actual, &secret_report);
         }
         if let Some(note) = secret_report.unresolved_comparison_note() {
-            eprintln!("Note: {note}");
+            eprintln!("Note: {}", safe_block(note));
         }
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
@@ -1221,17 +1238,25 @@ async fn cmd_diff(
                 diff::DiffAction::Modify => "MODIFY",
                 diff::DiffAction::Delete => "DELETE",
             };
-            println!("  {} {} {} ({})", action, d.kind, d.id, d.namespace);
+            println!(
+                "  {} {} {} ({})",
+                action,
+                safe(&d.kind),
+                safe(&d.id),
+                safe(&d.namespace)
+            );
             for change in &d.details {
                 if diff::is_sensitive_diff_field(&d.kind, &change.field) {
                     // Consumer credentials and plugin config can carry actual
                     // secret material. Printing them here would leak to CI
                     // logs, which are visible to anyone with run access.
-                    println!("    {}: [REDACTED] -> [REDACTED]", change.field);
+                    println!("    {}: [REDACTED] -> [REDACTED]", safe(&change.field));
                 } else {
                     println!(
                         "    {}: {} -> {}",
-                        change.field, change.old_value, change.new_value
+                        safe(&change.field),
+                        safe_line(&change.old_value),
+                        safe_line(&change.new_value)
                     );
                 }
             }
@@ -1239,7 +1264,7 @@ async fn cmd_diff(
     }
 
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
-        println!("{note}\n");
+        println!("{}\n", safe_block(note));
     }
 
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
@@ -1248,7 +1273,12 @@ async fn cmd_diff(
             resolved.ownership.mode
         );
         for u in &unmanaged {
-            println!("  {} {} ({})", u.kind, u.id, u.namespace);
+            println!(
+                "  {} {} ({})",
+                safe(&u.kind),
+                safe(&u.id),
+                safe(&u.namespace)
+            );
         }
     }
 
@@ -1273,7 +1303,7 @@ async fn cmd_diff(
     if exit_on_drift && drift.has_drift() {
         println!(
             "Drift detected ({}); exiting {}.",
-            drift.reasons().join(", "),
+            safe(drift.reasons().join(", ")),
             verdict::DRIFT_EXIT_CODE
         );
         process::exit(drift.exit_code());
@@ -1307,9 +1337,9 @@ async fn cmd_plan(
     println!("=== Environment ===");
     println!(
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
-        resolved.name,
-        resolved.overlay.as_deref().unwrap_or("<none>"),
-        resolved.namespace_filter.as_deref().unwrap_or("<all>"),
+        safe(&resolved.name),
+        safe(resolved.overlay.as_deref().unwrap_or("<none>")),
+        safe(resolved.namespace_filter.as_deref().unwrap_or("<all>")),
         resolved.apply_strategy,
         resolved.ownership.mode,
     );
@@ -1355,19 +1385,19 @@ async fn cmd_plan(
         match (&desired_mesh, &mesh_retraction_preview) {
             (Some(mesh), _) => println!(
                 "mesh: {} (published to {})\n",
-                mesh_summary_line(mesh),
+                safe_line(mesh_summary_line(mesh)),
                 env_config.mesh_file_output_path
             ),
-            (None, Some(line)) => println!("{line}\n"),
+            (None, Some(line)) => println!("{}\n", safe_block(line)),
             (None, None) => {}
         }
     }
 
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
         println!("=== Credentials ===");
-        println!("{}\n", note);
+        println!("{}\n", safe_block(note));
         if let Some(note) = secret_report.unresolved_comparison_note() {
-            println!("{note}\n");
+            println!("{}\n", safe_block(note));
         }
     }
 
@@ -1379,7 +1409,7 @@ async fn cmd_plan(
     if !secret_report.slot_remaps.is_empty() {
         println!("=== Credential Slot Remaps ===");
         for remap in &secret_report.slot_remaps {
-            println!("  {remap}");
+            println!("  {}", safe_line(remap));
         }
         if remap_blocked {
             println!(
@@ -1431,26 +1461,26 @@ async fn cmd_plan(
                         false,
                         Some(format!(
                             "Live comparison skipped: cached backup data was served for namespace(s) {}. API-spec ownership is unknown until the gateway configuration database recovers.",
-                            cached.join(", ")
+                            safe(cached.join(", "))
                         )),
                     )
                 }
             }
             Err(e @ gitforgeops::error::Error::BackupNamespace(_)) => return Err(e.into()),
             Err(e) => {
-                eprintln!("Could not fetch live config: {}", e);
+                eprintln!("Could not fetch live config: {}", safe_block(e));
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
             }
         },
         Err(e) => {
-            eprintln!("Could not create API client: {}", e);
+            eprintln!("Could not create API client: {}", safe_block(e));
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
         }
     };
 
     if let Some(note) = &provenance_note {
         println!("=== Live Data Provenance ===");
-        println!("WARNING: {note}\n");
+        println!("WARNING: {}\n", safe_block(note));
     }
 
     println!("=== Changes ===");
@@ -1465,7 +1495,7 @@ async fn cmd_plan(
                 diff::DiffAction::Modify => "MODIFY",
                 diff::DiffAction::Delete => "DELETE",
             };
-            println!("  {} {} {}", action, d.kind, d.id);
+            println!("  {} {} {}", action, safe(&d.kind), safe(&d.id));
         }
         println!();
     }
@@ -1475,14 +1505,16 @@ async fn cmd_plan(
         for candidate in &adoptions {
             println!(
                 "  ADOPT {} {} ({})",
-                candidate.kind, candidate.id, candidate.namespace
+                safe(&candidate.kind),
+                safe(&candidate.id),
+                safe(&candidate.namespace)
             );
         }
         println!();
     }
 
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
-        println!("{note}\n");
+        println!("{}\n", safe_block(note));
     }
 
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
@@ -1492,7 +1524,12 @@ async fn cmd_plan(
             resolved.ownership.mode
         );
         for u in &unmanaged {
-            println!("  {} {} ({})", u.kind, u.id, u.namespace);
+            println!(
+                "  {} {} ({})",
+                safe(&u.kind),
+                safe(&u.id),
+                safe(&u.namespace)
+            );
         }
         println!();
     }
@@ -1502,7 +1539,12 @@ async fn cmd_plan(
     if !breaking.is_empty() {
         println!("=== Breaking Changes ===");
         for bc in &breaking {
-            println!("  {} {}: {}", bc.kind, bc.id, bc.reason);
+            println!(
+                "  {} {}: {}",
+                safe(&bc.kind),
+                safe(&bc.id),
+                safe_line(&bc.reason)
+            );
         }
         println!();
     }
@@ -1564,7 +1606,13 @@ async fn cmd_plan(
     if !security_findings.is_empty() {
         println!("=== Security Findings ===");
         for sf in &security_findings {
-            println!("  [{}] {} {}: {}", sf.severity, sf.kind, sf.id, sf.message);
+            println!(
+                "  [{}] {} {}: {}",
+                safe(&sf.severity),
+                safe(&sf.kind),
+                safe(&sf.id),
+                safe_line(&sf.message)
+            );
         }
         if let Some(gate) = security_gate {
             // Same set `apply` refuses on, so the preview and the post-merge
@@ -1583,7 +1631,12 @@ async fn cmd_plan(
     if !bp_findings.is_empty() {
         println!("=== Best Practice Recommendations ===");
         for bp in &bp_findings {
-            println!("  {} {}: {}", bp.kind, bp.id, bp.message);
+            println!(
+                "  {} {}: {}",
+                safe(&bp.kind),
+                safe(&bp.id),
+                safe_line(&bp.message)
+            );
         }
         println!();
     }
@@ -1592,17 +1645,17 @@ async fn cmd_plan(
         println!("=== Policy Violations ===");
         for pf in &policy_findings {
             let overridden = match &pf.overridden_by {
-                Some(by) => format!(" (overridden by @{by})"),
+                Some(by) => format!(" (overridden by @{})", safe(by)),
                 None => String::new(),
             };
             println!(
                 "  [{}] {}: {} {} ({}): {}{}",
                 pf.severity.as_str(),
-                pf.rule_id,
-                pf.kind,
-                pf.id,
-                pf.namespace,
-                pf.message,
+                safe(&pf.rule_id),
+                safe(&pf.kind),
+                safe(&pf.id),
+                safe(&pf.namespace),
+                safe_line(&pf.message),
                 overridden
             );
         }
@@ -1611,7 +1664,7 @@ async fn cmd_plan(
 
     if let Some(note) = &override_note {
         println!("=== Override ===");
-        println!("{note}\n");
+        println!("{}\n", safe_block(note));
     }
 
     // Plan's exit code is the preview's verdict: non-zero for everything that
@@ -1641,16 +1694,16 @@ async fn cmd_plan(
     if offline_summary.is_some() || !conflict_namespaces.is_empty() {
         println!("=== Apply Blockers ===");
         for blocker in &blockers {
-            println!("  {}", blocker.summary());
+            println!("  {}", safe_block(blocker.summary()));
         }
         if !conflict_namespaces.is_empty() {
             println!(
                 "  API-spec ownership conflicts block apply in namespace(s): {}. Remove the competing repository declarations or reconcile ownership with the API spec.",
-                conflict_namespaces.into_iter().collect::<Vec<_>>().join(", ")
+                safe(conflict_namespaces.into_iter().collect::<Vec<_>>().join(", "))
             );
         }
         if let Some(summary) = offline_summary {
-            println!("\n{summary}");
+            println!("\n{}", safe_block(summary));
         }
         process::exit(1);
     }
@@ -1725,7 +1778,8 @@ async fn cmd_apply(
         match &override_approver {
             Some(approver) => {
                 eprintln!(
-                    "{blocker_count} error-severity security finding(s) overridden by @{approver}; continuing."
+                    "{blocker_count} error-severity security finding(s) overridden by @{}; continuing.",
+                    safe(approver)
                 );
                 overridden_for_audit.push((SECURITY_AUDIT_RULE_ID.to_string(), approver.clone()));
             }
@@ -1735,11 +1789,12 @@ async fn cmd_apply(
                      Consumer credentials belong in the broker as ${{gh-env-secret:...}} placeholders; a literal \
                      value in repository YAML is a committed secret and applying it publishes it to the gateway. \
                      To override, add the '{}' label and submit its revision-bound override review from an account with '{}' permission.",
-                    override_cfg.require_label, override_cfg.required_permission
+                    safe(&override_cfg.require_label),
+                    safe(&override_cfg.required_permission)
                 );
                 match &override_decision {
                     Some(decision) if !decision.active => {
-                        eprintln!("(override inactive: {})", decision.reason)
+                        eprintln!("(override inactive: {})", safe_block(&decision.reason))
                     }
                     Some(_) => {}
                     None => {
@@ -1789,7 +1844,7 @@ async fn cmd_apply(
             missing.len()
         );
         for m in missing {
-            eprintln!("  {}", m.slot);
+            eprintln!("  {}", safe(&m.slot));
         }
         return Err("required credential slots are missing".into());
     }
@@ -1827,7 +1882,7 @@ async fn cmd_apply(
             // api-mode apply look like it delivered the mesh document.
             eprintln!(
                 "Notice: {} mesh fragment(s) assembled, but FERRUM_GATEWAY_MODE=api has no mesh push path (ferrum-edge exposes no mesh admin API). Run `gitforgeops export` or a file-mode apply to publish {} for mesh nodes.",
-                mesh_summary_line(mesh),
+                safe_line(mesh_summary_line(mesh)),
                 env_config.mesh_file_output_path
             );
         }
@@ -1860,11 +1915,16 @@ async fn cmd_apply(
                 gate.count
             );
             for b in blockers {
-                eprintln!("  [{}] {}: {}", b.severity.as_str(), b.rule_id, b.message);
+                eprintln!(
+                    "  [{}] {}: {}",
+                    b.severity.as_str(),
+                    safe(&b.rule_id),
+                    safe_line(&b.message)
+                );
             }
             if let Some(d) = &override_decision {
                 if !d.active {
-                    eprintln!("(override inactive: {})", d.reason);
+                    eprintln!("(override inactive: {})", safe_block(&d.reason));
                 }
             } else {
                 eprintln!("(no PR associated with this commit; overrides not evaluated)");
@@ -1877,7 +1937,7 @@ async fn cmd_apply(
     if is_first_apply && matches!(resolved.ownership.mode, OwnershipMode::Shared) {
         eprintln!(
             "Notice: first apply for environment '{}' in shared mode. Resources on the gateway but not in this repo will be treated as unmanaged and left alone.",
-            resolved.name
+            safe(&resolved.name)
         );
     }
 
@@ -1969,12 +2029,12 @@ async fn cmd_apply(
                         diff::DiffAction::Modify => "MODIFY",
                         diff::DiffAction::Delete => "DELETE",
                     };
-                    println!("  {} {} {}", action, d.kind, d.id);
+                    println!("  {} {} {}", action, safe(&d.kind), safe(&d.id));
                 }
                 if let Some(note) =
                     apply::incremental_prune_notice(&resolved.apply_strategy, &diffs)
                 {
-                    println!("{note}");
+                    println!("{}", safe_block(note));
                 }
                 if !adoptions.is_empty() {
                     println!(
@@ -1983,7 +2043,7 @@ async fn cmd_apply(
                     );
                     println!("{}", apply::ADOPTION_PREVIEW_NOTICE);
                     for candidate in &adoptions {
-                        println!("  ADOPT {} {}", candidate.kind, candidate.id);
+                        println!("  ADOPT {} {}", safe(&candidate.kind), safe(&candidate.id));
                     }
                 }
                 if !unmanaged.is_empty() {
@@ -2003,7 +2063,7 @@ async fn cmd_apply(
                         pending_creds.len()
                     );
                     for r in pending_creds {
-                        println!("  [new] {}", r.slot);
+                        println!("  [new] {}", safe(&r.slot));
                     }
                 }
                 println!("\nUse --auto-approve to skip this check.");
@@ -2087,7 +2147,7 @@ async fn cmd_apply(
             let reconciled_pending =
                 state.reconcile_pending_creates(&desired, &actual_by_namespace, pending_scope);
             for warning in &reconciled_pending.warnings {
-                eprintln!("Warning: {warning}");
+                eprintln!("Warning: {}", safe_block(warning));
             }
             let reconciled_absent =
                 state.reconcile_absent_managed_resources(&desired, &actual_by_namespace);
@@ -2184,11 +2244,13 @@ async fn cmd_apply(
                     match &slot.delivered {
                         Some(d) => eprintln!(
                             "  {} -> @{} (ssh {})",
-                            slot.slot, d.login, d.key_fingerprint
+                            safe(&slot.slot),
+                            safe(&d.login),
+                            safe(&d.key_fingerprint)
                         ),
                         None => eprintln!(
                             "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
-                            slot.slot
+                            safe(&slot.slot)
                         ),
                     }
                 }
@@ -2275,7 +2337,7 @@ async fn cmd_apply(
                 raw.spec_owned_skipped
             );
             if let Some(line) = apply::adoption_summary_line(raw.adopted.len()) {
-                println!("{line}");
+                println!("{}", safe_block(line));
             }
 
             // Pull the per-op records out before `into_result()` consumes
@@ -2316,7 +2378,7 @@ async fn cmd_apply(
                     pending.len()
                 );
                 for r in pending {
-                    println!("  [new] {}", r.slot);
+                    println!("  [new] {}", safe(&r.slot));
                 }
                 println!("\nUse --auto-approve to proceed.");
                 return Ok(());
@@ -2364,7 +2426,7 @@ async fn cmd_apply(
                 (Some(mesh), _) => println!(
                     "Written mesh document to {} ({})",
                     env_config.mesh_file_output_path,
-                    mesh_summary_line(mesh)
+                    safe_line(mesh_summary_line(mesh))
                 ),
                 (None, Some(publication)) => {
                     if let Some(line) =
@@ -2550,18 +2612,18 @@ async fn cmd_import(
         );
     }
     if let Some(notice) = result.source_metadata_notice() {
-        println!("{notice}");
+        println!("{}", safe_block(notice));
     }
     if let Some(notice) = result.unmanaged_sections_notice() {
-        println!("{notice}");
+        println!("{}", safe_block(notice));
     }
     // Loud and last, so it is the final thing on screen: these are the values
     // gitforgeops could not classify and a human has to.
     if let Some(notice) = result.acknowledged_passthrough_notice() {
-        eprintln!("{notice}");
+        eprintln!("{}", safe_block(notice));
     }
     if let Some(notice) = result.custom_plugin_review_notice() {
-        eprintln!("{notice}");
+        eprintln!("{}", safe_block(notice));
     }
 
     Ok(())
@@ -2632,10 +2694,10 @@ async fn cmd_review(
                             if !cached.is_empty() {
                                 reason.push_str(&format!(
                                     " Cached backup data was served for namespace(s) {}; API-spec ownership is unknown until the gateway configuration database recovers.",
-                                    cached.join(", ")
+                                    safe(cached.join(", "))
                                 ));
                             }
-                            eprintln!("{reason}");
+                            eprintln!("{}", safe_block(&reason));
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
                         }
                         None => {
@@ -2669,7 +2731,7 @@ async fn cmd_review(
                 // a transport error's Display carries the gateway URL —
                 // an environment secret. See `review::redact_comparison_error`.
                 Err(e) => {
-                    eprintln!("Live gateway comparison failed: {e}");
+                    eprintln!("Live gateway comparison failed: {}", safe_block(&e));
                     (
                         Vec::new(),
                         Vec::new(),
@@ -2680,7 +2742,7 @@ async fn cmd_review(
                 }
             },
             Err(e) => {
-                eprintln!("Live gateway comparison failed: {e}");
+                eprintln!("Live gateway comparison failed: {}", safe_block(e));
                 (
                     Vec::new(),
                     Vec::new(),
@@ -2792,7 +2854,8 @@ async fn cmd_review(
                 }
                 Err(e) => {
                     eprintln!(
-                        "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {e}"
+                        "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {}",
+                        safe_block(&e)
                     );
                     write_review_to_step_summary(&comment)?;
                     print!("{}", review::markdown_comment_for_terminal(&comment));
@@ -3049,7 +3112,8 @@ async fn cmd_rotate(
         Some(d) => {
             println!(
                 "Delivered age-encrypted blob to @{} (ssh key {}):\n",
-                d.login, d.key_fingerprint
+                safe(&d.login),
+                safe(&d.key_fingerprint)
             );
             println!("{}", d.encrypted_b64);
         }
@@ -3087,8 +3151,12 @@ async fn cmd_rotate(
                 std::env::var("GITHUB_RUN_ID").ok().as_deref(),
             );
             state.save()?;
-            println!("Rotated slot {slot} in shard {}", outcome.shard);
-            println!("Gateway consumer '{}/{}' updated.", ns, consumer);
+            println!("Rotated slot {} in shard {}", safe(&slot), outcome.shard);
+            println!(
+                "Gateway consumer '{}/{}' updated.",
+                safe(ns),
+                safe(consumer)
+            );
         }
         Err(e) => {
             // Hard-fail: the credential store and gateway are out of sync.

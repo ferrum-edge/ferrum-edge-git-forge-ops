@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::config::{GatewayConfig, MeshConfigSpec};
+use crate::diagnostics::{safe_line, safe_path};
 
 /// Top-level key holding the anti-truncation seal understood by ferrum-edge's
 /// file-mode loader.
@@ -410,8 +411,9 @@ fn sync_parent_directory(
         (Err(source), PublicationPermissions::Private) => Err(crate::error::Error::Io(source)),
         (Err(source), PublicationPermissions::Regular) => {
             eprintln!(
-                "Warning: published {} but could not fsync its directory ({source}); the file is written and renamed into place, but its directory entry may not survive a host crash.",
-                parent.display()
+                "Warning: published {} but could not fsync its directory ({}); the file is written and renamed into place, but its directory entry may not survive a host crash.",
+                safe_path(parent),
+                safe_line(&source)
             );
             Ok(())
         }
