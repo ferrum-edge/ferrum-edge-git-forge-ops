@@ -79,7 +79,9 @@ fn assert_state_operations_refuse(environment: &str, message: &str) {
         StateFile::load(environment).unwrap_err().to_string(),
         StateFile::lock(environment).unwrap_err().to_string(),
         state.save().unwrap_err().to_string(),
-        StateFile::is_first_apply(environment).unwrap_err().to_string(),
+        StateFile::is_first_apply(environment)
+            .unwrap_err()
+            .to_string(),
     ];
     for error in errors {
         assert!(error.contains(message), "{error}");
@@ -130,7 +132,10 @@ fn state_operations_refuse_non_directory_state_path() {
     with_cwd(dir.path(), || {
         std::fs::write(".state", "not a directory").unwrap();
         assert_state_operations_refuse("production", ".state must be a real directory");
-        assert_eq!(std::fs::read_to_string(".state").unwrap(), "not a directory");
+        assert_eq!(
+            std::fs::read_to_string(".state").unwrap(),
+            "not a directory"
+        );
     });
 }
 
