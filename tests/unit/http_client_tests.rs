@@ -1207,10 +1207,9 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
     assert!(error.contains("resource_counts.upstreams"), "{error}");
 }
 
-/// F4: the count seal is metadata no live decision is made from, and it is
-/// emitted by a gateway build this one does not control. A live `GET /backup`
-/// that disagrees must not take `diff`/`plan`/`apply`/drift-check down — it
-/// records the disagreement, drops the seal, and hands over the resources.
+/// Read-only live comparisons preserve compatibility with seal variants, but
+/// mutation paths must reject every mismatch before trusting the resource
+/// arrays as authoritative.
 #[test]
 fn live_backup_reads_downgrade_count_seal_mismatches_to_advisories() {
     for body in [
@@ -1244,6 +1243,12 @@ fn live_backup_reads_downgrade_count_seal_mismatches_to_advisories() {
             "the disagreement must still be recorded: {body}"
         );
         assert!(snapshot.seal_violation_notice().is_some());
+        let mutation_error = snapshot
+            .require_consistent_seal("ferrum")
+            .expect_err("a mismatched seal must never authorize a mutation")
+            .to_string();
+        assert!(mutation_error.contains("refusing to mutate namespace 'ferrum'"));
+        assert!(mutation_error.contains("snapshot may be truncated"));
         // A seal that disagrees is discarded rather than half-retained.
         assert!(snapshot.counts.is_none() || snapshot.resource_counts.is_none());
 
@@ -1265,6 +1270,9 @@ fn live_backup_reads_keep_a_seal_that_agrees() {
     .unwrap();
 
     assert!(snapshot.seal_violations.is_empty());
+    snapshot
+        .require_consistent_seal("ferrum")
+        .expect("an agreeing seal is safe for mutation");
     assert_eq!(snapshot.counts.unwrap()["proxies"], 0);
 }
 
