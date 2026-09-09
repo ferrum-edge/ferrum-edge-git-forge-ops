@@ -202,12 +202,22 @@ jobs:
         run: |
           docker run --rm gitforgeops:scan --help >/dev/null
           docker run --rm --entrypoint ferrum-edge gitforgeops:scan --help >/dev/null
+          # dpkg keeps a "not-installed" stub record for a purged package that
+          # other installed packages still name in their dependencies, so a
+          # plain `dpkg-query -W` succeeds for it. Read the package's actual
+          # state instead: only an absent record or a not-installed stub is
+          # acceptable; installed, held, unpacked, half-configured,
+          # config-files and trigger states all mean the purge did not take.
           for package in apt libapt-pkg7.0 libssl3t64 openssl-provider-legacy; do
-            if docker run --rm --entrypoint dpkg-query gitforgeops:scan \
-              -W "$package" >/dev/null 2>&1; then
-              echo "Purged runtime package remains present: $package" >&2
-              exit 1
-            fi
+            state=$(docker run --rm --entrypoint dpkg-query gitforgeops:scan \
+              -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+            case "$state" in
+              ""|not-installed) ;;
+              *)
+                echo "Purged runtime package remains present ($state): $package" >&2
+                exit 1
+                ;;
+            esac
           done
 
       - name: Build override regressions with the pinned builder
