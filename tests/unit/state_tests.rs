@@ -52,7 +52,7 @@ fn state_file_writes_and_reads_per_env() {
     let dir = TempDir::new().unwrap();
 
     with_cwd(dir.path(), || {
-        assert!(StateFile::is_first_apply("staging"));
+        assert!(StateFile::is_first_apply("staging").unwrap());
 
         let mut state = StateFile::load("staging").unwrap();
         state
@@ -61,12 +61,144 @@ fn state_file_writes_and_reads_per_env() {
         state.last_applied_at = Some("2026-04-23T00:00:00Z".to_string());
         state.save().unwrap();
 
-        assert!(!StateFile::is_first_apply("staging"));
-        assert!(StateFile::is_first_apply("production"));
+        assert!(!StateFile::is_first_apply("staging").unwrap());
+        assert!(StateFile::is_first_apply("production").unwrap());
 
         let reloaded = StateFile::load("staging").unwrap();
         assert_eq!(reloaded.resources.len(), 1);
         assert_eq!(reloaded.environment, "staging");
+    });
+}
+
+fn assert_state_operations_refuse(environment: &str, message: &str) {
+    let state = StateFile {
+        environment: environment.to_string(),
+        ..StateFile::default()
+    };
+    let errors = [
+        StateFile::load(environment).unwrap_err().to_string(),
+        StateFile::lock(environment).unwrap_err().to_string(),
+        state.save().unwrap_err().to_string(),
+        StateFile::is_first_apply(environment)
+            .unwrap_err()
+            .to_string(),
+    ];
+    for error in errors {
+        assert!(error.contains(message), "{error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_symlinked_state_directory() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir("outside").unwrap();
+        let state = StateFile {
+            environment: "production".to_string(),
+            resources: std::collections::HashMap::from([(
+                state_key("ferrum", "Proxy", "p1"),
+                "managed:v1".to_string(),
+            )]),
+            ..StateFile::default()
+        };
+        let original = serde_json::to_string(&state).unwrap();
+        std::fs::write("outside/production.json", &original).unwrap();
+        std::os::unix::fs::symlink("outside", ".state").unwrap();
+
+        assert_state_operations_refuse("production", ".state must be a real directory");
+        assert_eq!(
+            std::fs::read_to_string("outside/production.json").unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read_dir("outside").unwrap().count(), 1);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_dangling_state_directory_symlink() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::os::unix::fs::symlink("missing", ".state").unwrap();
+        assert_state_operations_refuse("production", ".state must be a real directory");
+        assert!(!std::path::Path::new("missing").exists());
+    });
+}
+
+#[test]
+fn state_operations_refuse_non_directory_state_path() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::write(".state", "not a directory").unwrap();
+        assert_state_operations_refuse("production", ".state must be a real directory");
+        assert_eq!(
+            std::fs::read_to_string(".state").unwrap(),
+            "not a directory"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_special_state_directory_entry() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let _socket = std::os::unix::net::UnixListener::bind(".state").unwrap();
+        assert_state_operations_refuse("production", ".state must be a real directory");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_symlinked_children_and_nested_environment_paths() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir(".state").unwrap();
+        std::fs::create_dir("outside").unwrap();
+        std::fs::write("outside/production.json", "untouched").unwrap();
+        std::os::unix::fs::symlink("../outside", ".state/nested").unwrap();
+        assert_state_operations_refuse("nested/production", "environment name");
+
+        for target in ["../outside/production.json", "../missing"] {
+            std::os::unix::fs::symlink(target, ".state/production.json").unwrap();
+            std::os::unix::fs::symlink(target, ".state/production.lock").unwrap();
+            assert_state_operations_refuse("production", "must be a regular state file");
+            std::fs::remove_file(".state/production.json").unwrap();
+            std::fs::remove_file(".state/production.lock").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string("outside/production.json").unwrap(),
+            "untouched"
+        );
+        assert!(!std::path::Path::new("missing").exists());
+    });
+}
+
+#[test]
+fn state_operations_refuse_directories_in_place_of_files() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state/production.json").unwrap();
+        std::fs::create_dir(".state/production.lock").unwrap();
+        assert_state_operations_refuse("production", "must be a regular state file");
+    });
+}
+
+#[test]
+fn state_operations_validate_environment_names_without_creating_state() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        for environment in [
+            "",
+            "../outside",
+            "/absolute",
+            "nested/production",
+            "nested\\prod",
+        ] {
+            assert_state_operations_refuse(environment, "environment name");
+        }
+        assert!(!std::path::Path::new(".state").exists());
     });
 }
 
