@@ -1439,7 +1439,7 @@ alongside the resources.
 
 ```bash
 git checkout -b feature/adopt-ferrum-namespace
-cp -R /secure/scratch/ferrum resources/ferrum
+cp -R /secure/scratch/ferrum/ferrum/. resources/ferrum/
 cp /secure/scratch/ferrum/.gitforgeops-import.json resources/ferrum/
 git add resources/ferrum
 ```
