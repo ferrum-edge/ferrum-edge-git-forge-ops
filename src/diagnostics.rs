@@ -126,7 +126,10 @@ fn sanitize_single_line(value: &str, max_chars: usize) -> String {
 /// rather than replaced so CRLF input reads normally.
 pub fn sanitize_block(value: &str) -> String {
     let mut characters = value.chars();
-    let bounded = characters.by_ref().take(MAX_BLOCK_CHARS).collect::<String>();
+    let bounded = characters
+        .by_ref()
+        .take(MAX_BLOCK_CHARS)
+        .collect::<String>();
     let truncated = characters.next().is_some();
     let mut output = String::with_capacity(bounded.len());
     for (index, line) in bounded.split('\n').enumerate() {

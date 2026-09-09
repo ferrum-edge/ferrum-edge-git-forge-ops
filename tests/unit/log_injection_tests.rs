@@ -177,9 +177,7 @@ fn untrusted_error_variants_cannot_emit_a_workflow_command() {
 
 fn hostile_proxy() -> Proxy {
     let id = quoted_hostile();
-    let yaml = format!(
-        "id: {id}\nnamespace: {id}\nbackend_host: h.internal\nbackend_port: 8080\n"
-    );
+    let yaml = format!("id: {id}\nnamespace: {id}\nbackend_host: h.internal\nbackend_port: 8080\n");
     serde_yaml::from_str(&yaml).expect("hostile proxy")
 }
 
@@ -193,9 +191,7 @@ fn hostile_upstream() -> Upstream {
 
 fn hostile_plugin() -> PluginConfig {
     let id = quoted_hostile();
-    let yaml = format!(
-        "id: {id}\nnamespace: ferrum\nplugin_name: {id}\nscope: global\n"
-    );
+    let yaml = format!("id: {id}\nnamespace: ferrum\nplugin_name: {id}\nscope: global\n");
     serde_yaml::from_str(&yaml).expect("hostile plugin")
 }
 
@@ -306,9 +302,7 @@ impl Repo {
 /// audit reports it and `plan` prints the id.
 fn hostile_proxy_yaml() -> String {
     let id = quoted_hostile();
-    format!(
-        "kind: Proxy\nspec:\n  id: {id}\n  backend_host: h.internal\n  backend_port: 8080\n"
-    )
+    format!("kind: Proxy\nspec:\n  id: {id}\n  backend_host: h.internal\n  backend_port: 8080\n")
 }
 
 /// One proxy carrying an unknown `spec` field whose *key* is hostile. The

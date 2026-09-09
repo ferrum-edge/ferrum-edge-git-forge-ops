@@ -25,10 +25,18 @@ pub enum Error {
         source: serde_yaml::Error,
     },
 
-    #[error("unknown configuration field(s) in {}: {}", safe_path(path), safe_line(fields))]
+    #[error(
+        "unknown configuration field(s) in {}: {}",
+        safe_path(path),
+        safe_line(fields)
+    )]
     UnknownFields { path: PathBuf, fields: String },
 
-    #[error("failed to traverse configuration tree at {}: {}", safe_path(path), safe(source))]
+    #[error(
+        "failed to traverse configuration tree at {}: {}",
+        safe_path(path),
+        safe(source)
+    )]
     WalkDir {
         path: PathBuf,
         source: walkdir::Error,
@@ -59,7 +67,11 @@ pub enum Error {
     )]
     OrphanOverlay { id: String, path: PathBuf },
 
-    #[error("failed to parse state file {}: {}", safe_path(path), safe_block(source))]
+    #[error(
+        "failed to parse state file {}: {}",
+        safe_path(path),
+        safe_block(source)
+    )]
     StateParse {
         path: PathBuf,
         source: serde_json::Error,
@@ -109,7 +121,11 @@ pub enum Error {
 
     /// A write was durably committed but is not live yet (`applied: false`).
     /// Retrying would re-apply it; the caller must reconcile instead.
-    #[error("write committed, awaiting reload ({}): {}", safe(reason), safe_block(message))]
+    #[error(
+        "write committed, awaiting reload ({}): {}",
+        safe(reason),
+        safe_block(message)
+    )]
     CommittedNotLive { reason: String, message: String },
 
     /// A non-idempotent POST may have committed even though the client did
