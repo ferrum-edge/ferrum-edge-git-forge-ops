@@ -1,7 +1,7 @@
 use gitforgeops::validate::{
     build_validate_args_for_mode, format_result, format_results, run_validation,
-    scrubbed_env_names, OutputFormat, ValidationResult, GATEWAY_VALIDATE_MODE, MESH_VALIDATE_MODE,
-    VALIDATION_STANDIN_PREFIX,
+    scrubbed_env_names, validation_context_env, OutputFormat, ValidationResult,
+    GATEWAY_VALIDATE_MODE, MESH_ALLOW_NO_CA_ENV, MESH_VALIDATE_MODE, VALIDATION_STANDIN_PREFIX,
 };
 use std::path::Path;
 
@@ -589,6 +589,10 @@ fn env_scrub_targets_only_ferrum_variables() {
         "FERRUM_MODE",
         "FERRUM_GATEWAY_URL",
         "FERRUM_ADMIN_JWT_SECRET",
+        // The mesh validation-only opt-out is scrubbed like every other
+        // inherited variable; gitforgeops sets its own copy afterwards, so a
+        // parent value can neither enable nor disable the child's context.
+        "FERRUM_MESH_ALLOW_NO_CA",
         "PATH",
         "HOME",
         "TMPDIR",
@@ -605,6 +609,7 @@ fn env_scrub_targets_only_ferrum_variables() {
             "FERRUM_MODE".to_string(),
             "FERRUM_GATEWAY_URL".to_string(),
             "FERRUM_ADMIN_JWT_SECRET".to_string(),
+            "FERRUM_MESH_ALLOW_NO_CA".to_string(),
         ]
     );
 }
@@ -696,6 +701,96 @@ fn gateway_and_mesh_modes_are_distinct() {
         build_validate_args_for_mode(MESH_VALIDATE_MODE, Path::new("s"), Path::new("c")),
         "the two documents must not be validated in the same ferrum-edge mode"
     );
+}
+
+/// ferrum-edge resolves `-m mesh` through the same workload-identity gate a
+/// mesh node runs at startup and refuses ("mesh mode has no workload
+/// identity") before it ever parses the document handed to `-c`. A CI runner
+/// has no mesh node's SVID material, so the mesh pass needs ferrum-edge's own
+/// validation-only opt-out or every repository declaring a `MeshConfig`
+/// fragment fails on the execution context instead of on its content.
+#[test]
+fn mesh_validation_context_is_the_documented_no_ca_opt_out() {
+    assert_eq!(MESH_ALLOW_NO_CA_ENV, "FERRUM_MESH_ALLOW_NO_CA");
+    assert_eq!(
+        validation_context_env(MESH_VALIDATE_MODE),
+        vec![("FERRUM_MESH_ALLOW_NO_CA", "true")]
+    );
+}
+
+/// The gateway pass has no identity gate to relax, and a gateway document must
+/// never be graded under a relaxed mesh context. `-m file` therefore inherits
+/// the scrubbed environment and nothing else.
+#[test]
+fn gateway_validation_context_injects_nothing() {
+    assert!(
+        validation_context_env(GATEWAY_VALIDATE_MODE).is_empty(),
+        "{:?}",
+        validation_context_env(GATEWAY_VALIDATE_MODE)
+    );
+    // Any mode that is not the mesh pass is treated the same way: the context
+    // is an allow-list keyed on one exact mode, not a default.
+    assert!(validation_context_env("dp").is_empty());
+    assert!(validation_context_env("").is_empty());
+}
+
+/// A validator stub that reports the mode it was given and whether the mesh
+/// validation-only opt-out reached its environment.
+#[cfg(unix)]
+const REPORT_MESH_CONTEXT: &str = "#!/bin/sh\nprintf 'mode=%s no_ca=%s\\n' \"$3\" \"${FERRUM_MESH_ALLOW_NO_CA-unset}\"\n";
+
+#[cfg(unix)]
+#[test]
+fn mesh_validator_child_receives_the_no_ca_context() {
+    use gitforgeops::config::MeshConfigSpec;
+    use gitforgeops::validate::run_mesh_validation;
+
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "mesh-context", REPORT_MESH_CONTEXT);
+    let binary = validator.to_str().unwrap();
+
+    let result = run_mesh_validation(&MeshConfigSpec::default(), binary).unwrap();
+
+    assert!(result.success, "{result:?}");
+    assert_eq!(result.stdout.trim(), "mode=mesh no_ca=true");
+}
+
+#[cfg(unix)]
+#[test]
+fn gateway_validator_child_never_receives_the_no_ca_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "gateway-context", REPORT_MESH_CONTEXT);
+
+    let result = run_validation(&Default::default(), validator.to_str().unwrap()).unwrap();
+
+    assert!(result.success, "{result:?}");
+    assert_eq!(result.stdout.trim(), "mode=file no_ca=unset");
+}
+
+/// The context relaxes *where* the document may be validated, never *what*
+/// counts as valid: a rejected mesh document is still a failed run, and the
+/// validator's own diagnostic is surfaced unchanged. If a ferrum-edge build
+/// ever refuses the variable itself, that refusal arrives the same way.
+#[cfg(unix)]
+#[test]
+fn the_no_ca_context_does_not_soften_a_rejected_mesh_document() {
+    use gitforgeops::config::MeshConfigSpec;
+    use gitforgeops::validate::run_mesh_validation;
+
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(
+        dir.path(),
+        "mesh-reject",
+        "#!/bin/sh\necho \"no_ca=${FERRUM_MESH_ALLOW_NO_CA-unset}\" >&2\necho 'error: mesh.workloads[0]: unknown field' >&2\nexit 1\n",
+    );
+    let binary = validator.to_str().unwrap();
+
+    let result = run_mesh_validation(&MeshConfigSpec::default(), binary).unwrap();
+
+    assert!(!result.success);
+    assert_eq!(result.exit_code, 1);
+    assert!(result.stderr.contains("no_ca=true"), "{}", result.stderr);
+    assert!(result.stderr.contains("unknown"), "{}", result.stderr);
 }
 
 fn result(success: bool, stdout: &str, stderr: &str) -> ValidationResult {

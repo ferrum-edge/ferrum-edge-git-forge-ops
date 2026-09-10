@@ -102,6 +102,48 @@ where
         .collect()
 }
 
+/// The one environment variable gitforgeops sets *itself* on a validator
+/// child, and only under [`MESH_VALIDATE_MODE`].
+///
+/// ferrum-edge's `-m mesh` resolution runs the same identity gate a mesh node
+/// runs at startup: with no file-based gateway SVID material
+/// (`FERRUM_GATEWAY_SVID_CERT_PATH` / `_KEY_PATH` / `_TRUST_BUNDLE_PATH`) it
+/// refuses with *"mesh mode has no workload identity"* — before it ever looks
+/// at the document handed to `-c`. A CI runner grading a pull request has no
+/// mesh node's identity and must not be asked to have one, so a repository
+/// declaring any `MeshConfig` fragment would fail every `validate`, `plan`,
+/// `review` and file-mode `apply` on the execution context rather than on its
+/// own content.
+///
+/// `FERRUM_MESH_ALLOW_NO_CA=true` is ferrum-edge's own documented
+/// validation-only opt-out for exactly that: it relaxes the workload-identity
+/// requirement while leaving the mesh document's parse → normalize →
+/// `validate_mesh_fields` → slice-derivation pipeline untouched, so a
+/// malformed policy or schema is still rejected.
+pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
+
+/// The explicit, trusted validation-only context for a validator child in
+/// `mode`, applied **after** [`scrubbed_env_names`] has removed every
+/// inherited `FERRUM_*` variable.
+///
+/// This is an allow-list of constants, not a pass-through: the parent's own
+/// `FERRUM_MESH_ALLOW_NO_CA` is scrubbed like everything else and cannot
+/// influence the child either way. Gateway validation gets nothing — `-m file`
+/// has no identity gate, and a gateway document must never be graded under a
+/// relaxed mesh context.
+///
+/// Nothing here reaches `apply`'s runtime settings: it is set on the
+/// `ferrum-edge validate` child process only, and the published mesh document
+/// is byte-for-byte unaffected. If an older or newer ferrum-edge rejects the
+/// variable, that refusal is the child's own stderr and is surfaced unchanged.
+pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
+    if mode == MESH_VALIDATE_MODE {
+        vec![(MESH_ALLOW_NO_CA_ENV, "true")]
+    } else {
+        Vec::new()
+    }
+}
+
 /// True when `path` names an existing regular file that is actually
 /// executable. `which` failing does not by itself mean the binary is missing
 /// (Windows, stripped-down containers), but a plain `Path::exists()` check
@@ -212,6 +254,11 @@ fn run_gateway_validation(
 /// unpredictable name: mesh documents do carry SPIFFE identities, trust
 /// bundles and workload addresses, which is not information to leave in a
 /// world-readable shared temp directory either.
+///
+/// This is the one invocation that carries a [`validation_context_env`]
+/// entry: `-m mesh` refuses on the absence of a workload identity before it
+/// reads the document, and a CI runner is not a mesh node. See
+/// [`MESH_ALLOW_NO_CA_ENV`].
 pub fn run_mesh_validation(
     mesh: &crate::config::MeshConfigSpec,
     binary_path: &str,
@@ -284,6 +331,12 @@ fn run_validate_command(
     ));
     for name in scrubbed_env_names(std::env::vars().map(|(name, _)| name)) {
         command.env_remove(name);
+    }
+    // Order is load-bearing: every inherited `FERRUM_*` name is removed
+    // first, then this mode's own validation-only context is set, so the
+    // child sees exactly the constants below and nothing the parent chose.
+    for (name, value) in validation_context_env(mode) {
+        command.env(name, value);
     }
 
     let output = command.output();
