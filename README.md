@@ -1054,7 +1054,7 @@ That is the shape ferrum-edge's mesh loader reads as "no mesh policy" — its `M
 
 Retraction only ever touches a destination gitforgeops can prove it published. Two independent gates:
 
-- **Provenance.** `.state/<env>.json` records `mesh_document_path` — the destination this repository publishes to — and a file whose bytes are exactly what this build's renderer emits is recognised as one of ours even before the ledger has an entry (repositories that published under an older release still converge). Anything else — a hand-written document, a repointed path, somebody else's file — is reported and left untouched.
+- **Provenance.** `.state/<env>.json` records `mesh_document_path` — the destination this repository publishes to. Retraction requires that repository-specific ledger attribution; canonical renderer output alone cannot prove ownership. A destination without the matching ledger entry is reported and left untouched.
 - **Scope.** A `FERRUM_NAMESPACE`-filtered run narrows which fragments are loaded at all, and the mesh document is mesh-wide, so "no fragments selected" is never read as "the repository declares none". A filtered run reports the skip and publishes nothing.
 
 An api-mode `apply` neither publishes nor retracts (there is no mesh admin API); it prints its usual notice. A repository that has never published a mesh document creates nothing.

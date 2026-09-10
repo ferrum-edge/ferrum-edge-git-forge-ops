@@ -880,19 +880,19 @@ fn a_repository_that_never_published_a_mesh_document_retracts_nothing() {
 }
 
 #[test]
-fn a_document_this_renderer_produced_is_attributed_without_a_ledger_entry() {
-    // The ledger only exists from the first apply that ran a build carrying
-    // it. A repository that published under an older build, then deleted its
-    // last fragment, still has to converge.
+fn a_renderer_compatible_document_is_not_attributed_without_a_ledger_entry() {
+    // Canonical formatting is reproducible across repositories and therefore
+    // cannot prove which repository owns a destination.
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("mesh.yaml");
     let path = target.to_str().unwrap();
     apply_mesh_file(&one_workload(), path).unwrap();
+    let original = read(&target);
 
     let publication = reconcile_mesh_file(None, path, whole_repository(false));
 
-    assert_eq!(publication.unwrap(), MeshPublication::Retracted);
-    assert_eq!(read(&target), empty_mesh_document());
+    assert_eq!(publication.unwrap(), MeshPublication::Unattributed);
+    assert_eq!(read(&target), original);
 }
 
 #[test]
@@ -1171,7 +1171,7 @@ fn cli_never_publishes_a_mesh_document_for_a_repository_that_declares_none() {
 
 #[cfg(unix)]
 #[test]
-fn cli_export_retracts_with_and_without_materialize() {
+fn cli_export_does_not_retract_without_ledger_attribution() {
     for materialize in [false, true] {
         let repo = MeshRepo::new(true);
         let mut args = vec!["export", "--output", "export.yaml"];
@@ -1180,13 +1180,17 @@ fn cli_export_retracts_with_and_without_materialize() {
         }
 
         repo.run(&args, &[]);
-        assert!(repo.published_mesh().contains("sa/api"), "{args:?}");
+        let published = repo.published_mesh();
+        assert!(published.contains("sa/api"), "{args:?}");
 
         repo.remove_fragment();
-        let retracted = repo.run(&args, &[]);
+        let skipped = repo.run(&args, &[]);
 
-        assert!(retracted.contains("RETRACT mesh"), "{args:?}: {retracted}");
-        assert_eq!(repo.published_mesh(), empty_mesh_document(), "{args:?}");
+        assert!(
+            skipped.contains("not a document gitforgeops"),
+            "{args:?}: {skipped}"
+        );
+        assert_eq!(repo.published_mesh(), published, "{args:?}");
     }
 }
 
