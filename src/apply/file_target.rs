@@ -171,35 +171,6 @@ fn render_mesh_retraction() -> crate::error::Result<String> {
     render_mesh_yaml(&MeshConfigSpec::default())
 }
 
-/// The `{version, mesh}` shape, re-read to prove a destination is one of ours.
-#[derive(serde::Deserialize)]
-struct PublishedMeshDocument {
-    version: String,
-    mesh: MeshConfigSpec,
-}
-
-/// True when `path` holds bytes [`render_mesh_yaml`] itself produced.
-///
-/// The state ledger is the primary attribution record, but it only exists from
-/// the first apply that ran a gitforgeops build carrying it — a repository
-/// that published mesh documents under an older build, then removed its last
-/// fragment, would otherwise never converge. Round-tripping the destination
-/// through the very renderer that writes it is the second, offline signal:
-/// byte-identity means the file carries exactly a `version` and a `mesh`
-/// section this build would emit, with no extra keys, no comments and no
-/// hand-formatting. Anything else — a foreign file, an operator's own
-/// document, an unreadable path — answers `false` and is left alone.
-fn is_self_published_mesh_document(path: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(document) = serde_yaml::from_str::<PublishedMeshDocument>(&contents) else {
-        return false;
-    };
-    document.version == MESH_DOCUMENT_VERSION
-        && render_mesh_yaml(&document.mesh).is_ok_and(|rendered| rendered == contents)
-}
-
 /// Decide what [`reconcile_mesh_file`] would do, without writing anything.
 ///
 /// `plan` and `review` call this so a preview and the apply it previews cannot
@@ -221,7 +192,7 @@ pub fn plan_mesh_publication(
     if !scope.covers_repository {
         return Ok(MeshPublication::NarrowedScope);
     }
-    if !scope.ledger_attributed && !is_self_published_mesh_document(path) {
+    if !scope.ledger_attributed {
         return Ok(MeshPublication::Unattributed);
     }
 
