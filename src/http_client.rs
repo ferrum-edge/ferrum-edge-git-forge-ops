@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::EnvConfig;
+use crate::diagnostics::{safe, safe_line};
 use crate::jwt::{self, JwtOptions};
 
 /// Page size requested from paginated list endpoints. The server clamps to
@@ -402,9 +403,23 @@ impl AdminClient {
         // refusal, because that document becomes permanent repo state.
         if let Some(notice) = snapshot.seal_violation_notice() {
             eprintln!(
-                "Warning: GET /backup for namespace '{namespace}' returned a count seal that does not match the document ({notice}). The seal was discarded; resource data is used as received."
+                "Warning: GET /backup for namespace '{}' returned a count seal that does not match the document ({}). The seal was discarded; resource data is used as received.",
+                safe(namespace),
+                safe_line(notice)
             );
         }
+        Ok(snapshot)
+    }
+
+    /// Fetch a backup that will be used to authorize gateway or ownership
+    /// mutations. Unlike read-only live comparisons, mutation paths must not
+    /// act on resource arrays that disagree with the gateway's count seal.
+    pub async fn get_backup_snapshot_for_mutation(
+        &self,
+        namespace: &str,
+    ) -> crate::error::Result<BackupSnapshot> {
+        let snapshot = self.get_backup_snapshot(namespace).await?;
+        snapshot.require_consistent_seal(namespace)?;
         Ok(snapshot)
     }
 
@@ -1211,12 +1226,13 @@ impl BackupExtras {
 ///   permanent desired state. A seal that does not match means the source may
 ///   be truncated, and publishing a partial tree is unrecoverable, so it is a
 ///   hard error.
-/// * **Live reads** (`diff`, `plan`, `apply`, drift-check) run against a
+/// * **Read-only live comparisons** (`diff`, `plan`, review, drift-check) run against a
 ///   gateway whose seal is emitted by a different codebase on every request.
 ///   A gateway that omits `counts.upstreams`, or a cached-fallback export that
 ///   elides `api_specs` while retaining `counts.api_specs`, would otherwise
-///   take every one of those commands down over metadata that no decision is
-///   made from. Record the disagreement, drop the seal, and keep going.
+///   take those commands down over metadata that no mutation is authorized
+///   from. Record the disagreement, drop the seal, and keep going. Apply and
+///   API-target mutation paths re-establish strictness before using the data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealStrictness {
     /// Import: a disagreeing seal fails the read.
@@ -1416,6 +1432,16 @@ impl BackupSnapshot {
             return None;
         }
         Some(self.seal_violations.join("; "))
+    }
+
+    /// Refuse to use a potentially truncated live backup for a mutation.
+    pub fn require_consistent_seal(&self, namespace: &str) -> crate::error::Result<()> {
+        if let Some(notice) = self.seal_violation_notice() {
+            return Err(crate::error::Error::Config(format!(
+                "refusing to mutate namespace '{namespace}': the backup's count seal does not match the document it sealed ({notice}). The snapshot may be truncated; retry after the gateway returns a consistent backup"
+            )));
+        }
+        Ok(())
     }
 }
 

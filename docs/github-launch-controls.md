@@ -72,6 +72,20 @@ gateway mutation. A protected `main` branch correctly rejects a direct push by
 `github-actions[bot]`, so the workflows mint a short-lived installation token
 for a dedicated App instead.
 
+The required `state-guard-reject-state-edits` check protects both the exact
+Git path `.state` and every descendant, including current and previous rename
+paths regardless of file type. A repair requires a fresh
+`gitforgeops/state-override` label event for the current head by an actor with
+current write, maintain, or admin permission. Incomplete file enumeration also
+requires that authorization. Keep both `/.state` and `/.state/` in CODEOWNERS;
+the trusted static-validation classifier must include both scopes as well.
+
+The runtime independently requires `.state` to be a real directory and state
+and lock entries to be regular files. Symlinks and intermediate environment
+paths are refused even after a state override. Missing state still supports
+first apply. Use an isolated trusted checkout: the metadata checks do not
+prevent a concurrent local process from replacing checked entries during use.
+
 Create and install a GitHub App with:
 
 - repository access limited to this repository;

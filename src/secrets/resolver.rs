@@ -1,4 +1,5 @@
 use crate::config::{GatewayConfig, GatewayMode};
+use crate::diagnostics::safe_line;
 
 use super::bundle::CredentialBundle;
 use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
@@ -1450,7 +1451,7 @@ fn push_warning(report: &mut ResolveReport, message: String) {
         return;
     }
     if warn_once(&message) {
-        eprintln!("Warning: {message}");
+        eprintln!("Warning: {}", safe_line(&message));
     }
     report.warnings.push(message);
 }
@@ -1462,7 +1463,7 @@ fn push_slot_remap(report: &mut ResolveReport, message: String) {
         return;
     }
     if warn_once(&message) {
-        eprintln!("Credential slot remap: {message}");
+        eprintln!("Credential slot remap: {}", safe_line(&message));
     }
     report.slot_remaps.push(message);
 }

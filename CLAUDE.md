@@ -642,7 +642,15 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
-- `src/error.rs` — unified `Error` enum via `thiserror`
+- `src/diagnostics.rs` — the shared log sanitizer (`sanitize` / `sanitize_line` / `sanitize_block`
+  and their `safe*` `Display` adapters) every diagnostic routes untrusted ids, namespaces,
+  plugin names, YAML paths and gateway-sourced text through: control characters and line
+  separators become `U+FFFD`, output is bounded, and no rendered line may start with `::`, so
+  repository YAML cannot forge a GitHub Actions workflow command in a job log. `import::
+  diagnostic_metadata` delegates here; `validate`'s GitHub-annotation format does not (it emits
+  real commands and escapes their data itself), and the PR comment keeps its own markdown escaping
+- `src/error.rs` — unified `Error` enum via `thiserror`; every variant renders its untrusted
+  payload through `diagnostics`, so an `Error`'s `Display` is safe at any print site
 
 ### Key Design Principles
 
