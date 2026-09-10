@@ -1078,11 +1078,25 @@ impl MeshRepo {
         std::fs::remove_file(fragment).expect("remove the last mesh fragment");
     }
 
+    /// Swap in a different stub `ferrum-edge`.
+    fn set_validator(&self, script: &str) {
+        std::fs::write(&self.validator, script).expect("stub");
+        set_executable(&self.validator);
+    }
+
     /// Run the binary hermetically: the child inherits only PATH/HOME/TMPDIR
     /// plus the `FERRUM_*` variables named here, so an ambient
     /// `FERRUM_GATEWAY_URL` in a developer shell cannot make a file-mode test
     /// talk to a gateway. Returns stdout and stderr combined.
     fn run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> String {
+        let (success, combined) = self.try_run(args, extra_env);
+        assert!(success, "{args:?} failed: {combined}");
+        combined
+    }
+
+    /// Same, but for the runs that are supposed to fail: returns whether the
+    /// command succeeded alongside its output.
+    fn try_run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> (bool, String) {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
         command.args(args).current_dir(self.dir.path()).env_clear();
         for name in ["PATH", "HOME", "TMPDIR"] {
@@ -1101,9 +1115,7 @@ impl MeshRepo {
         let output = command.output().expect("run gitforgeops");
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{stdout}{stderr}");
-        assert!(output.status.success(), "{args:?} failed: {combined}");
-        combined
+        (output.status.success(), format!("{stdout}{stderr}"))
     }
 }
 
@@ -1222,4 +1234,95 @@ fn cli_namespace_filtered_runs_never_retract() {
 
     assert!(filtered.contains("namespace-filtered run"), "{filtered}");
     assert_eq!(repo.published_mesh(), published);
+}
+
+// ── The mesh validator runs without a mesh node's identity ────────────────
+//
+// ferrum-edge resolves `-m mesh` through the same workload-identity gate a
+// mesh node runs at startup: with no file-based gateway SVID material it
+// refuses before it ever parses the document handed to `-c`. A CI runner
+// grading a pull request has none, so gitforgeops sets the documented
+// validation-only opt-out (`FERRUM_MESH_ALLOW_NO_CA=true`) on that child --
+// and only on that child. These stubs stand in for the real gate.
+
+/// Refuses `-m mesh` exactly the way ferrum-edge does when the validation
+/// context is missing, and accepts everything else.
+#[cfg(unix)]
+const IDENTITY_GATED_VALIDATOR: &str = concat!(
+    "#!/bin/sh\n",
+    "if [ \"$3\" = mesh ] && [ \"${FERRUM_MESH_ALLOW_NO_CA-}\" != true ]; then\n",
+    "  echo 'mesh mode has no workload identity: no file-based gateway SVID material' >&2\n",
+    "  exit 1\n",
+    "fi\n",
+    "exit 0\n",
+);
+
+/// Rejects the mesh document on its content, whatever the context.
+#[cfg(unix)]
+const MESH_REJECTING_VALIDATOR: &str = concat!(
+    "#!/bin/sh\n",
+    "if [ \"$3\" = mesh ]; then\n",
+    "  echo 'error: mesh.workloads[0].spiffe_id: invalid trust domain' >&2\n",
+    "  exit 1\n",
+    "fi\n",
+    "exit 0\n",
+);
+
+#[cfg(unix)]
+#[test]
+fn cli_validates_a_mesh_repository_without_a_workload_identity() {
+    let repo = MeshRepo::new(true);
+    repo.set_validator(IDENTITY_GATED_VALIDATOR);
+
+    let validated = repo.run(&["validate"], &[]);
+
+    assert!(validated.contains("Mesh document:"), "{validated}");
+    assert!(!validated.contains("workload identity"), "{validated}");
+}
+
+/// The same context has to reach the mesh pass `apply` runs before it
+/// publishes, or a mesh repository can validate and still never converge --
+/// including the retraction that removing the last fragment must perform.
+#[cfg(unix)]
+#[test]
+fn cli_applies_and_retracts_a_mesh_document_without_a_workload_identity() {
+    let repo = MeshRepo::new(true);
+    repo.set_validator(IDENTITY_GATED_VALIDATOR);
+
+    repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(repo.published_mesh().contains("sa/api"));
+
+    repo.remove_fragment();
+    let retracted = repo.run(&["apply", "--auto-approve"], &[]);
+
+    assert!(retracted.contains("RETRACT mesh"), "{retracted}");
+    assert_eq!(repo.published_mesh(), empty_mesh_document());
+}
+
+/// The validation context relaxes *where* the document may be graded, never
+/// *what* counts as valid: a rejected mesh document still fails `validate`,
+/// still refuses `apply`, and still publishes nothing.
+#[cfg(unix)]
+#[test]
+fn an_invalid_mesh_document_is_still_rejected_under_the_validation_context() {
+    let repo = MeshRepo::new(true);
+    repo.set_validator(MESH_REJECTING_VALIDATOR);
+
+    let (validated, validate_output) = repo.try_run(&["validate"], &[]);
+    assert!(!validated, "{validate_output}");
+    assert!(
+        validate_output.contains("invalid trust domain"),
+        "{validate_output}"
+    );
+
+    let (applied, apply_output) = repo.try_run(&["apply", "--auto-approve"], &[]);
+    assert!(!applied, "{apply_output}");
+    assert!(
+        apply_output.contains("mesh validation failed"),
+        "{apply_output}"
+    );
+    assert!(
+        !repo.mesh_document().exists(),
+        "a refused apply must publish nothing"
+    );
 }
