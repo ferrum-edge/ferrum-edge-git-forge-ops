@@ -737,7 +737,8 @@ fn gateway_validation_context_injects_nothing() {
 /// A validator stub that reports the mode it was given and whether the mesh
 /// validation-only opt-out reached its environment.
 #[cfg(unix)]
-const REPORT_MESH_CONTEXT: &str = "#!/bin/sh\nprintf 'mode=%s no_ca=%s\\n' \"$3\" \"${FERRUM_MESH_ALLOW_NO_CA-unset}\"\n";
+const REPORT_MESH_CONTEXT: &str =
+    "#!/bin/sh\nprintf 'mode=%s no_ca=%s\\n' \"$3\" \"${FERRUM_MESH_ALLOW_NO_CA-unset}\"\n";
 
 #[cfg(unix)]
 #[test]
