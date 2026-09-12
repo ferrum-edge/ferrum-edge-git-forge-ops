@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use gitforgeops::policy::github_override::NO_PR_OVERRIDE_NOTE;
 use tempfile::TempDir;
 
 /// Consumer declaring a committed, literal API key. This is the shape
@@ -1020,6 +1021,10 @@ fn plan_exits_nonzero_on_a_blocking_policy_violation() {
         out.contains("apply is blocked by 1 class(es)"),
         "plan must print the summary line: {out}"
     );
+    assert!(
+        out.contains(NO_PR_OVERRIDE_NOTE),
+        "local plan must name the CI/PR-only override docs: {out}"
+    );
 
     // And apply agrees, which is the property the shared computation exists
     // to keep true.
@@ -1030,10 +1035,14 @@ fn plan_exits_nonzero_on_a_blocking_policy_violation() {
         stdout(&applied),
         stderr(&applied)
     );
+    let applied_err = stderr(&applied);
     assert!(
-        stderr(&applied).contains("unresolved policy violation"),
-        "{}",
-        stderr(&applied)
+        applied_err.contains("unresolved policy violation"),
+        "{applied_err}"
+    );
+    assert!(
+        applied_err.contains(NO_PR_OVERRIDE_NOTE),
+        "local apply must name the CI/PR-only override docs: {applied_err}"
     );
 }
 
