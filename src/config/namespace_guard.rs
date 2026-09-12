@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{GatewayConfig, schema::Resource};
+use crate::config::{schema::Resource, GatewayConfig};
 use crate::diagnostics::{sanitize, sanitize_line};
 use crate::policy::Severity;
 
@@ -49,8 +49,6 @@ pub struct NamespaceScope {
     /// Namespaces `GET /namespaces` listed for this token, populated only
     /// when filtered live inventory was empty and the listing succeeded.
     pub live_namespaces: Vec<String>,
-}
-
 }
 
 impl NamespaceScope {
@@ -285,7 +283,10 @@ pub fn merge_scope_json(
             );
         }
         None => {
-            object.insert("empty_namespace_filter".to_string(), serde_json::Value::Null);
+            object.insert(
+                "empty_namespace_filter".to_string(),
+                serde_json::Value::Null,
+            );
         }
     }
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| formatted.to_string())

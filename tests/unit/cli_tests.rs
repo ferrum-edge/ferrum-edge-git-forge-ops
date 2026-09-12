@@ -1,5 +1,5 @@
 use clap::Parser;
-use gitforgeops::cli::{Cli, Commands, EnvsFormat, ValidateFormat};
+use gitforgeops::cli::{Cli, Commands, EnvsFormat, ReportFormat, ValidateFormat};
 
 #[test]
 fn cli_import_from_api_is_a_flag() {
@@ -91,6 +91,8 @@ fn cli_rejects_conflicting_import_sources() {
 fn cli_rejects_unknown_format_values() {
     assert!(Cli::try_parse_from(["gitforgeops", "validate", "--format", "jsn"]).is_err());
     assert!(Cli::try_parse_from(["gitforgeops", "envs", "--format", "yaml"]).is_err());
+    assert!(Cli::try_parse_from(["gitforgeops", "plan", "--format", "jsn"]).is_err());
+    assert!(Cli::try_parse_from(["gitforgeops", "diff", "--format", "yaml"]).is_err());
 }
 
 #[test]
@@ -137,16 +139,27 @@ fn cli_accepts_documented_format_values() {
 
     let plan = Cli::try_parse_from(["gitforgeops", "plan", "--format", "json"]).unwrap();
     match plan.command {
-        Commands::Plan { format } => assert!(matches!(format, gitforgeops::cli::ReportFormat::Json)),
+        Commands::Plan { format } => assert!(matches!(format, ReportFormat::Json)),
         _ => panic!("expected plan command"),
     }
 
     let diff = Cli::try_parse_from(["gitforgeops", "diff", "--format", "json"]).unwrap();
     match diff.command {
-        Commands::Diff { format, .. } => {
-            assert!(matches!(format, gitforgeops::cli::ReportFormat::Json))
-        }
+        Commands::Diff { format, .. } => assert!(matches!(format, ReportFormat::Json)),
         _ => panic!("expected diff command"),
+    }
+}
+
+#[test]
+fn cli_plan_and_diff_default_to_text() {
+    for command in ["plan", "diff"] {
+        let cli = Cli::try_parse_from(["gitforgeops", command]).unwrap();
+        match cli.command {
+            Commands::Plan { format } | Commands::Diff { format, .. } => {
+                assert!(matches!(format, ReportFormat::Text));
+            }
+            _ => panic!("expected plan or diff command"),
+        }
     }
 }
 

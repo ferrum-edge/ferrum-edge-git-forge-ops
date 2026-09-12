@@ -23,6 +23,20 @@ use gitforgeops::state::StateFile;
 use gitforgeops::validate;
 use gitforgeops::verdict::{self, ApplyGateInputs};
 
+// Keep human-readable reports on stderr when stdout carries a JSON document.
+macro_rules! reportln {
+    ($json_mode:expr) => {
+        reportln!($json_mode, "");
+    };
+    ($json_mode:expr, $($args:tt)*) => {
+        if $json_mode {
+            eprintln!($($args)*);
+        } else {
+            println!($($args)*);
+        }
+    };
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = cli::Cli::parse();
@@ -202,8 +216,7 @@ fn load_and_assemble_all(
     // mesh fragment's directory is its only namespace handle) and to gateway
     // resources afterwards, on their effective namespace (which a spec may
     // override).
-    let (on_disk_count, on_disk_namespaces) =
-        config::NamespaceScope::on_disk_inventory(&resources);
+    let (on_disk_count, on_disk_namespaces) = config::NamespaceScope::on_disk_inventory(&resources);
     let assembled =
         config::assemble_with_namespace_filter(resources, resolved.namespace_filter.as_deref())?;
     let gateway_config =
@@ -250,7 +263,11 @@ fn load_and_assemble_for(
 }
 
 fn print_namespace_finding(finding: &config::NamespaceFilterFinding) {
-    let stream = if finding.is_error() { "Error" } else { "Warning" };
+    let stream = if finding.is_error() {
+        "Error"
+    } else {
+        "Warning"
+    };
     eprintln!("{stream}: {}", safe_block(&finding.message));
 }
 
@@ -322,7 +339,10 @@ fn print_or_collect_scope_json(
                 );
             }
             None => {
-                object.insert("empty_namespace_filter".to_string(), serde_json::Value::Null);
+                object.insert(
+                    "empty_namespace_filter".to_string(),
+                    serde_json::Value::Null,
+                );
             }
         }
         if let Some(fields) = extra.as_object() {
@@ -883,28 +903,34 @@ fn spec_owned_blocks_sync(spec_owned: &[diff::SpecOwnedResource]) -> bool {
     spec_owned.iter().any(|s| s.is_conflict())
 }
 
-/// Render the spec-owned bucket for `diff` / `plan` stdout.
+/// Render the spec-owned bucket for text-mode previews on stdout.
 ///
 /// Mirrors the unmanaged block: a header, then one line per resource. Unlike
 /// unmanaged, it is NOT gated on `ownership.drift_report` — a repo declaring a
 /// resource an API spec owns is a correctness problem in both ownership modes,
 /// not drift noise an operator may want muted.
 fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
+    print_spec_owned_report(spec_owned, false);
+}
+
+fn print_spec_owned_report(spec_owned: &[diff::SpecOwnedResource], json_mode: bool) {
     if spec_owned.is_empty() {
         return;
     }
-    println!("=== Spec-owned Resources ===");
+    reportln!(json_mode, "=== Spec-owned Resources ===");
     // With `--confirm-api-spec-deletion` these are not "never touched" — the
     // run is about to delete the non-conflicting ones, and they appear as
     // DELETE entries in the change list above. Saying otherwise while deleting
     // them is the worst of both.
     if spec_owned.iter().any(|s| s.pruned) {
-        println!(
+        reportln!(
+            json_mode,
             "(carry an `api_spec_id`; --confirm-api-spec-deletion is set, so the ones marked \
              DELETE below WILL be deleted by this run)"
         );
     } else {
-        println!(
+        reportln!(
+            json_mode,
             "(carry an `api_spec_id`; provisioned by an OpenAPI spec import, never touched here)"
         );
     }
@@ -916,7 +942,8 @@ fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
         } else {
             ""
         };
-        println!(
+        reportln!(
+            json_mode,
             "  {} {} ({}) spec={}{}",
             safe(&s.kind),
             safe(&s.id),
@@ -925,7 +952,7 @@ fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
             note
         );
     }
-    println!();
+    reportln!(json_mode);
 }
 
 /// Reserved rule id recorded in the state file's override ledger when a
@@ -1077,19 +1104,24 @@ fn mesh_retraction_line(
 fn report_plan_validation(
     label: &str,
     result: &Result<validate::ValidationResult, gitforgeops::error::Error>,
+    json_mode: bool,
 ) -> bool {
     match result {
         Ok(r) => {
             if r.success {
-                println!("{label}: PASSED");
+                reportln!(json_mode, "{label}: PASSED");
             } else {
-                println!("{label}: FAILED");
-                print!("{}", safe_block(&r.stderr));
+                reportln!(json_mode, "{label}: FAILED");
+                if json_mode {
+                    eprint!("{}", safe_block(&r.stderr));
+                } else {
+                    print!("{}", safe_block(&r.stderr));
+                }
             }
             r.success
         }
         Err(e) => {
-            println!("{label}: ERROR ({})", safe_block(e));
+            reportln!(json_mode, "{label}: ERROR ({})", safe_block(e));
             false
         }
     }
@@ -1128,7 +1160,10 @@ fn cmd_validate(
         None => None,
     };
 
-    if desired_finding.as_ref().is_some_and(|finding| finding.is_error()) {
+    if desired_finding
+        .as_ref()
+        .is_some_and(|finding| finding.is_error())
+    {
         result.success = false;
         result.exit_code = config::EMPTY_NAMESPACE_EXIT_CODE;
     }
@@ -1337,29 +1372,34 @@ async fn cmd_diff(
                 desired_finding.as_ref(),
                 serde_json::json!({ "in_sync": false, "diff_count": 0 }),
             );
-            if desired_finding.as_ref().is_some_and(|finding| finding.is_error()) {
+            if desired_finding
+                .as_ref()
+                .is_some_and(|finding| finding.is_error())
+            {
                 process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
             }
             return Err(error.into());
         }
     };
-    let mut namespace_pairs = match load_namespace_pairs_for(&client, &desired, &namespaces, false)
-        .await
-    {
-        Ok(pairs) => pairs,
-        Err(error) => {
-            print_or_collect_scope_json(
-                json_mode,
-                &namespace_scope,
-                desired_finding.as_ref(),
-                serde_json::json!({ "in_sync": false, "diff_count": 0 }),
-            );
-            if desired_finding.as_ref().is_some_and(|finding| finding.is_error()) {
-                process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
+    let mut namespace_pairs =
+        match load_namespace_pairs_for(&client, &desired, &namespaces, false).await {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                print_or_collect_scope_json(
+                    json_mode,
+                    &namespace_scope,
+                    desired_finding.as_ref(),
+                    serde_json::json!({ "in_sync": false, "diff_count": 0 }),
+                );
+                if desired_finding
+                    .as_ref()
+                    .is_some_and(|finding| finding.is_error())
+                {
+                    process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-    };
+        };
     let live_count: usize = namespace_pairs
         .iter()
         .map(|pair| config::gateway_resource_count(&pair.actual))
@@ -1563,8 +1603,9 @@ async fn cmd_plan(
     let policy_cfg = policy::load_policies()?;
     let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-    println!("=== Environment ===");
-    println!(
+    reportln!(json_mode, "=== Environment ===");
+    reportln!(
+        json_mode,
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
         safe(&resolved.name),
         safe(resolved.overlay.as_deref().unwrap_or("<none>")),
@@ -1572,21 +1613,21 @@ async fn cmd_plan(
         resolved.apply_strategy,
         resolved.ownership.mode,
     );
-    println!("{}", namespace_scope.text_line());
-    println!();
+    reportln!(json_mode, "{}", namespace_scope.text_line());
+    reportln!(json_mode);
 
-    println!("=== Validation ===");
+    reportln!(json_mode, "=== Validation ===");
     let val_result = validate::run_validation_with_report(
         &desired,
         &env_config.edge_binary_path,
         &secret_report,
     );
-    let mut validation_ok = report_plan_validation("gateway", &val_result);
+    let mut validation_ok = report_plan_validation("gateway", &val_result, json_mode);
     if let Some(mesh) = &desired_mesh {
         let mesh_result = validate::run_mesh_validation(mesh, &env_config.edge_binary_path);
-        validation_ok &= report_plan_validation("mesh", &mesh_result);
+        validation_ok &= report_plan_validation("mesh", &mesh_result, json_mode);
     }
-    println!();
+    reportln!(json_mode);
 
     // Counts only: mesh resources have no live gateway API to diff against, so
     // they never appear under "=== Changes ===". A pending retraction is
@@ -1611,23 +1652,24 @@ async fn cmd_plan(
         mesh_retraction_line(publication, &env_config.mesh_file_output_path, true)
     });
     if desired_mesh.is_some() || mesh_retraction_preview.is_some() {
-        println!("=== Mesh ===");
+        reportln!(json_mode, "=== Mesh ===");
         match (&desired_mesh, &mesh_retraction_preview) {
-            (Some(mesh), _) => println!(
+            (Some(mesh), _) => reportln!(
+                json_mode,
                 "mesh: {} (published to {})\n",
                 safe_line(mesh_summary_line(mesh)),
                 env_config.mesh_file_output_path
             ),
-            (None, Some(line)) => println!("{}\n", safe_block(line)),
+            (None, Some(line)) => reportln!(json_mode, "{}\n", safe_block(line)),
             (None, None) => {}
         }
     }
 
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
-        println!("=== Credentials ===");
-        println!("{}\n", safe_block(note));
+        reportln!(json_mode, "=== Credentials ===");
+        reportln!(json_mode, "{}\n", safe_block(note));
         if let Some(note) = secret_report.unresolved_comparison_note() {
-            println!("{}\n", safe_block(note));
+            reportln!(json_mode, "{}\n", safe_block(note));
         }
     }
 
@@ -1637,21 +1679,22 @@ async fn cmd_plan(
     let remap_blocked =
         verdict::slot_remap_blocker(&secret_report, allow_credential_slot_remap).is_some();
     if !secret_report.slot_remaps.is_empty() {
-        println!("=== Credential Slot Remaps ===");
+        reportln!(json_mode, "=== Credential Slot Remaps ===");
         for remap in &secret_report.slot_remaps {
-            println!("  {}", safe_line(remap));
+            reportln!(json_mode, "  {}", safe_line(remap));
         }
         if remap_blocked {
-            println!(
+            reportln!(
+                json_mode,
                 "\n{} slot reassignment(s) block apply. Rotate the affected slot in place before \
                  removing the entry, or re-run with --allow-credential-slot-remap to accept the \
                  reassignment.",
                 secret_report.slot_remaps.len()
             );
         } else {
-            println!("\nAccepted via --allow-credential-slot-remap.");
+            reportln!(json_mode, "\nAccepted via --allow-credential-slot-remap.");
         }
-        println!();
+        reportln!(json_mode);
     }
 
     let mut adoptions = Vec::new();
@@ -1719,8 +1762,8 @@ async fn cmd_plan(
     };
 
     if let Some(note) = &provenance_note {
-        println!("=== Live Data Provenance ===");
-        println!("WARNING: {}\n", safe_block(note));
+        reportln!(json_mode, "=== Live Data Provenance ===");
+        reportln!(json_mode, "WARNING: {}\n", safe_block(note));
     }
 
     let live_warning = namespace_scope.live_warning();
@@ -1728,28 +1771,29 @@ async fn cmd_plan(
         print_live_filter_warning(warning);
     }
     if namespace_scope.live_count.is_some() {
-        println!("{}", namespace_scope.text_line());
+        reportln!(json_mode, "{}", namespace_scope.text_line());
     }
     if desired_finding.is_some() || live_warning.is_some() {
-        println!("=== Namespace Filter ===");
+        reportln!(json_mode, "=== Namespace Filter ===");
         if let Some(finding) = &desired_finding {
-            println!(
+            reportln!(
+                json_mode,
                 "  [{}] {}",
                 finding.severity_label(),
                 safe_block(&finding.message)
             );
         }
         if let Some(warning) = &live_warning {
-            println!("  [warning] {}", safe_block(warning));
+            reportln!(json_mode, "  [warning] {}", safe_block(warning));
         }
-        println!();
+        reportln!(json_mode);
     }
 
-    println!("=== Changes ===");
+    reportln!(json_mode, "=== Changes ===");
     if !actual_available {
-        println!("SKIPPED (no live config available)\n");
+        reportln!(json_mode, "SKIPPED (no live config available)\n");
     } else if diffs.is_empty() && adoptions.is_empty() {
-        println!("None (in sync)\n");
+        reportln!(json_mode, "None (in sync)\n");
     } else {
         for d in &diffs {
             let action = match d.action {
@@ -1757,58 +1801,62 @@ async fn cmd_plan(
                 diff::DiffAction::Modify => "MODIFY",
                 diff::DiffAction::Delete => "DELETE",
             };
-            println!("  {} {} {}", action, safe(&d.kind), safe(&d.id));
+            reportln!(json_mode, "  {} {} {}", action, safe(&d.kind), safe(&d.id));
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if !adoptions.is_empty() {
-        println!("{}", apply::ADOPTION_PREVIEW_NOTICE);
+        reportln!(json_mode, "{}", apply::ADOPTION_PREVIEW_NOTICE);
         for candidate in &adoptions {
-            println!(
+            reportln!(
+                json_mode,
                 "  ADOPT {} {} ({})",
                 safe(&candidate.kind),
                 safe(&candidate.id),
                 safe(&candidate.namespace)
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
-        println!("{}\n", safe_block(note));
+        reportln!(json_mode, "{}\n", safe_block(note));
     }
 
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
-        println!("=== Unmanaged Resources ===");
-        println!(
+        reportln!(json_mode, "=== Unmanaged Resources ===");
+        reportln!(
+            json_mode,
             "(mode={:?}; these exist on the gateway but were never managed by this repo)",
             resolved.ownership.mode
         );
         for u in &unmanaged {
-            println!(
+            reportln!(
+                json_mode,
                 "  {} {} ({})",
                 safe(&u.kind),
                 safe(&u.id),
                 safe(&u.namespace)
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
-    print_spec_owned(&spec_owned);
+    print_spec_owned_report(&spec_owned, json_mode);
 
     if !breaking.is_empty() {
-        println!("=== Breaking Changes ===");
+        reportln!(json_mode, "=== Breaking Changes ===");
         for bc in &breaking {
-            println!(
+            reportln!(
+                json_mode,
                 "  {} {}: {}",
                 safe(&bc.kind),
                 safe(&bc.id),
                 safe_line(&bc.reason)
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     let bp_findings = diff::check_best_practices(&desired);
@@ -1866,9 +1914,10 @@ async fn cmd_plan(
     // security_findings was computed pre-resolve above; reuse it here.
     let security_gate = verdict::security_blocker(&security_findings, security_overridden);
     if !security_findings.is_empty() {
-        println!("=== Security Findings ===");
+        reportln!(json_mode, "=== Security Findings ===");
         for sf in &security_findings {
-            println!(
+            reportln!(
+                json_mode,
                 "  [{}] {} {}: {}",
                 safe(&sf.severity),
                 safe(&sf.kind),
@@ -1879,7 +1928,8 @@ async fn cmd_plan(
         if let Some(gate) = security_gate {
             // Same set `apply` refuses on, so the preview and the post-merge
             // apply cannot disagree about whether this repo is applyable.
-            println!(
+            reportln!(
+                json_mode,
                 "\n{} error-severity finding(s) block apply. Consumer credentials belong in the \
                  broker as ${{gh-env-secret:...}} placeholders; a literal value in repository YAML \
                  is a committed secret. Identity halves (basicauth username, mtls_auth identity) \
@@ -1887,30 +1937,32 @@ async fn cmd_plan(
                 gate.count
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if !bp_findings.is_empty() {
-        println!("=== Best Practice Recommendations ===");
+        reportln!(json_mode, "=== Best Practice Recommendations ===");
         for bp in &bp_findings {
-            println!(
+            reportln!(
+                json_mode,
                 "  {} {}: {}",
                 safe(&bp.kind),
                 safe(&bp.id),
                 safe_line(&bp.message)
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if !policy_findings.is_empty() {
-        println!("=== Policy Violations ===");
+        reportln!(json_mode, "=== Policy Violations ===");
         for pf in &policy_findings {
             let overridden = match &pf.overridden_by {
                 Some(by) => format!(" (overridden by @{})", safe(by)),
                 None => String::new(),
             };
-            println!(
+            reportln!(
+                json_mode,
                 "  [{}] {}: {} {} ({}): {}{}",
                 pf.severity.as_str(),
                 safe(&pf.rule_id),
@@ -1921,12 +1973,12 @@ async fn cmd_plan(
                 overridden
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if let Some(note) = &override_note {
-        println!("=== Override ===");
-        println!("{}\n", safe_block(note));
+        reportln!(json_mode, "=== Override ===");
+        reportln!(json_mode, "{}\n", safe_block(note));
     }
 
     // Plan's exit code is the preview's verdict: non-zero for everything that
@@ -1971,24 +2023,26 @@ async fn cmd_plan(
         .as_ref()
         .is_some_and(|finding| finding.is_error());
     if offline_summary.is_some() || !conflict_namespaces.is_empty() || empty_namespace_error {
-        println!("=== Apply Blockers ===");
+        reportln!(json_mode, "=== Apply Blockers ===");
         for blocker in &blockers {
-            println!("  {}", safe_block(blocker.summary()));
+            reportln!(json_mode, "  {}", safe_block(blocker.summary()));
         }
         if !conflict_namespaces.is_empty() {
-            println!(
+            reportln!(
+                json_mode,
                 "  API-spec ownership conflicts block apply in namespace(s): {}. Remove the competing repository declarations or reconcile ownership with the API spec.",
                 safe(conflict_namespaces.into_iter().collect::<Vec<_>>().join(", "))
             );
         }
         if empty_namespace_error {
-            println!(
+            reportln!(
+                json_mode,
                 "  empty-namespace-filter (1): namespace filter selected 0 desired resources while the on-disk tree is non-empty; pass --allow-empty-namespace to continue (exit {})",
                 config::EMPTY_NAMESPACE_EXIT_CODE
             );
         }
         if let Some(summary) = offline_summary {
-            println!("\n{}", safe_block(summary));
+            reportln!(json_mode, "\n{}", safe_block(summary));
         }
         process::exit(1);
     }

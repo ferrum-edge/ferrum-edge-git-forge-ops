@@ -66,7 +66,11 @@ fn zero_survivors_is_an_error_severity_finding() {
     let finding = scope.desired_finding(false).expect("mismatch");
     assert_eq!(finding.severity, Severity::Error);
     assert!(finding.is_error());
-    assert!(finding.message.contains("does-not-exist"), "{}", finding.message);
+    assert!(
+        finding.message.contains("does-not-exist"),
+        "{}",
+        finding.message
+    );
     assert!(finding.message.contains("ferrum"), "{}", finding.message);
     assert!(finding.message.contains("on_disk=3"), "{}", finding.message);
     assert!(finding.message.contains("desired=0"), "{}", finding.message);
@@ -165,6 +169,9 @@ fn from_loaded_counts_resources() {
     assert!(scope.on_disk_namespaces.is_empty());
     assert!(!scope.empty_desired_mismatch());
 }
+
+#[test]
+fn json_fields_include_namespace_counts() {
     let mut scope = NamespaceScope::with_desired(
         Some("typo"),
         vec!["ferrum".to_string()],
@@ -299,10 +306,7 @@ fn assert_mismatch_text(output: &Output) {
 #[test]
 fn validate_zero_survivors_exits_error() {
     let repo = Repo::with_proxy();
-    let output = repo.run(
-        &["validate"],
-        &[("FERRUM_NAMESPACE", "does-not-exist")],
-    );
+    let output = repo.run(&["validate"], &[("FERRUM_NAMESPACE", "does-not-exist")]);
     assert!(!output.status.success(), "{}", stdout(&output));
     assert_eq!(output.status.code(), Some(EMPTY_NAMESPACE_EXIT_CODE));
     assert_mismatch_text(&output);
@@ -338,7 +342,11 @@ fn validate_matching_namespace_is_unchanged() {
         stdout(&output),
         stderr(&output)
     );
-    assert!(stdout(&output).contains("Validation passed"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("Validation passed"),
+        "{}",
+        stdout(&output)
+    );
     assert!(!stderr(&output).contains("selected 0 desired resources"));
 }
 
@@ -346,10 +354,7 @@ fn validate_matching_namespace_is_unchanged() {
 #[test]
 fn validate_empty_tree_is_not_a_mismatch() {
     let repo = Repo::empty_tree();
-    let output = repo.run(
-        &["validate"],
-        &[("FERRUM_NAMESPACE", "does-not-exist")],
-    );
+    let output = repo.run(&["validate"], &[("FERRUM_NAMESPACE", "does-not-exist")]);
     assert!(
         output.status.success(),
         "{} {}",
@@ -411,7 +416,10 @@ fn plan_opt_out_is_a_warning() {
         stderr(&output)
     );
     let combined = format!("{}{}", stdout(&output), stderr(&output));
-    assert!(combined.contains("warning") || combined.contains("Warning"), "{combined}");
+    assert!(
+        combined.contains("warning") || combined.contains("Warning"),
+        "{combined}"
+    );
 }
 
 #[cfg(unix)]
@@ -451,14 +459,34 @@ fn plan_json_includes_namespace_counts() {
         &[("FERRUM_NAMESPACE", "does-not-exist")],
     );
     assert!(!output.status.success());
-    let body = stdout(&output);
-    let json_at = body.rfind("\n{").map(|idx| idx + 1).unwrap_or(0);
     let value: serde_json::Value =
-        serde_json::from_str(body[json_at..].trim()).expect("trailing json");
+        serde_json::from_slice(&output.stdout).expect("JSON-only stdout");
     assert_eq!(value["namespace"], "does-not-exist");
     assert_eq!(value["desired_count"], 0);
     assert_eq!(value["on_disk_count"], 1);
     assert_eq!(value["empty_namespace_filter"], "error");
+    assert_eq!(value["apply_blocked"], true);
+    assert!(stderr(&output).contains("=== Apply Blockers ==="));
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_json_validation_failure_keeps_report_on_stderr() {
+    let repo = Repo::with_proxy();
+    std::fs::write(
+        &repo.validator,
+        "#!/bin/sh\necho 'error: invalid proxy' >&2\nexit 1\n",
+    )
+    .expect("failing validator");
+    let output = repo.run(&["plan", "--format", "json"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON-only stdout");
+    assert_eq!(value["apply_blocked"], true);
+    let report = stderr(&output);
+    assert!(report.contains("gateway: FAILED"), "{report}");
+    assert!(report.contains("error: invalid proxy"), "{report}");
+    assert!(report.contains("=== Apply Blockers ==="), "{report}");
 }
 
 struct LiveRepo {
@@ -546,9 +574,7 @@ fn spawn_live_stub(
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 requests.lock().unwrap().push(request.clone());
                 let body = if request.contains("GET /namespaces") {
-                    namespaces_page(
-                        &listed.iter().map(String::as_str).collect::<Vec<_>>(),
-                    )
+                    namespaces_page(&listed.iter().map(String::as_str).collect::<Vec<_>>())
                 } else {
                     namespaces
                         .iter()
@@ -714,4 +740,65 @@ fn plan_live_filter_miss_is_named_when_desired_matches() {
         "{combined}"
     );
     assert!(!combined.contains("empty-namespace-filter (1)"));
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_and_diff_json_stdout_parse_with_live_filter_warnings() {
+    let repo = LiveRepo::new(
+        &[("resources/ferrum/proxies/app.yaml", PROXY)],
+        Vec::new(),
+        vec!["other".to_string()],
+    );
+    for (args, expected_exit) in [
+        (vec!["plan", "--format", "json"], 0),
+        (vec!["diff", "--format", "json", "--exit-on-drift"], 2),
+    ] {
+        let output = repo.run(&args, &[("FERRUM_NAMESPACE", "ferrum")]);
+        assert_eq!(output.status.code(), Some(expected_exit), "{output:?}");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("JSON-only stdout");
+        assert_eq!(value["namespace"], "ferrum");
+        assert_eq!(value["desired_count"], 1);
+        assert_eq!(value["live_count"], 0);
+        assert_eq!(value["empty_namespace_filter"], serde_json::Value::Null);
+        assert_eq!(value["live_filter_matched_nothing"], true);
+        assert!(value["live_filter_warning"].is_string());
+        assert!(stderr(&output).contains("matched 0 live resources"));
+        if args[0] == "plan" {
+            assert_eq!(value["apply_blocked"], false);
+            assert!(stderr(&output).contains("=== Environment ==="));
+            assert!(stderr(&output).contains("gateway: PASSED"));
+        } else {
+            assert_eq!(value["in_sync"], false);
+            assert_eq!(value["diff_count"], 1);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_json_spec_owned_conflict_keeps_report_on_stderr() {
+    let mut proxy = live_proxy("app", "ferrum");
+    proxy["api_spec_id"] = serde_json::json!("spec");
+    let repo = LiveRepo::new(
+        &[("resources/ferrum/proxies/app.yaml", PROXY)],
+        vec![("ferrum".to_string(), backup(serde_json::json!([proxy])))],
+        vec!["ferrum".to_string()],
+    );
+    let output = repo.run(
+        &["plan", "--format", "json"],
+        &[("FERRUM_NAMESPACE", "ferrum")],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON-only stdout");
+    assert_eq!(value["apply_blocked"], true);
+    let report = stderr(&output);
+    assert!(report.contains("=== Spec-owned Resources ==="), "{report}");
+    assert!(
+        report.contains("[CONFLICT: also declared in this repo]"),
+        "{report}"
+    );
+    assert!(report.contains("=== Apply Blockers ==="), "{report}");
 }
