@@ -1469,6 +1469,46 @@ fn split_batch_on_empty_input_produces_no_requests() {
 }
 
 #[test]
+fn split_batch_keeps_proxy_plugin_components_together_without_reordering_associations() {
+    let mut first = proxy("p1");
+    first.plugins = serde_json::from_value(serde_json::json!([
+        {"plugin_config_id": "shared"}, {"plugin_config_id": "scoped"},
+    ]))
+    .unwrap();
+    let mut second = proxy("p2");
+    second.plugins = serde_json::from_value(serde_json::json!([
+        {"plugin_config_id": "shared"},
+    ]))
+    .unwrap();
+    let batch = BatchCreate {
+        upstreams: vec![upstream("u1")],
+        proxies: vec![first, second, proxy("independent")],
+        plugin_configs: serde_json::from_value(serde_json::json!([
+            {
+                "id": "scoped", "namespace": "team-alpha", "plugin_name": "cors",
+                "scope": "proxy", "proxy_id": "p1", "config": {},
+            },
+            {
+                "id": "shared", "namespace": "team-alpha", "plugin_name": "cors",
+                "scope": "proxy_group", "config": {},
+            },
+        ]))
+        .unwrap(),
+        ..Default::default()
+    };
+    // Even a deliberately tiny budget cannot split a dependency component.
+    let chunks = split_batch(batch, 600).unwrap();
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(chunks[0].upstreams[0].id, "u1");
+    assert_eq!(chunks[1].proxies.len(), 2);
+    assert_eq!(chunks[1].plugin_configs.len(), 2);
+    assert_eq!(chunks[2].proxies[0].id, "independent");
+    assert_eq!(chunks.iter().map(BatchCreate::len).sum::<usize>(), 6);
+    assert_eq!(chunks[1].proxies[0].plugins[0].plugin_config_id, "shared");
+    assert_eq!(chunks[1].proxies[0].plugins[1].plugin_config_id, "scoped");
+}
+
+#[test]
 fn batch_counts_mirror_the_payload() {
     let batch = BatchCreate {
         upstreams: vec![upstream("u1"), upstream("u2")],

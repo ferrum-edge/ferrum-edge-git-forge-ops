@@ -1710,12 +1710,13 @@ impl BatchCreate {
 /// Split a batch so no single request exceeds the gateway's 1 MiB body cap.
 ///
 /// Items are packed in dependency order (upstreams and consumers, then
-/// proxies, then plugin configs), so a chunk boundary never puts a proxy in an
-/// earlier request than the upstream it references. Each chunk is still
+/// plugin/proxy groups). Associated proxies and plugin configs in this batch
+/// stay in one transaction: scoped configs require their proxy to exist and
+/// proxies require their referenced configs. Each chunk is still
 /// all-or-nothing on its own; the caller reports partial progress if a later
 /// chunk fails.
 ///
-/// A single item larger than the cap is emitted in a chunk of its own — the
+/// A single dependency group larger than the cap is emitted on its own — the
 /// gateway will reject it with 413, which is a clearer diagnostic than a
 /// silent drop.
 ///
@@ -1724,55 +1725,109 @@ impl BatchCreate {
 /// entire payload (on top of the caller's clone out of `desired`).
 pub fn split_batch(batch: BatchCreate, max_bytes: usize) -> crate::error::Result<Vec<BatchCreate>> {
     let budget = max_bytes.saturating_sub(BATCH_ENVELOPE_OVERHEAD).max(1);
-
-    enum Item {
-        Upstream(Upstream),
-        Consumer(Consumer),
-        Proxy(Proxy),
-        PluginConfig(PluginConfig),
-    }
-
-    let mut ordered: Vec<(Item, usize)> = Vec::with_capacity(batch.len());
-    for u in batch.upstreams {
-        let size = serde_json::to_vec(&u)?.len();
-        ordered.push((Item::Upstream(u), size));
-    }
-    for c in batch.consumers {
-        let size = serde_json::to_vec(&c)?.len();
-        ordered.push((Item::Consumer(c), size));
-    }
-    for p in batch.proxies {
-        let size = serde_json::to_vec(&p)?.len();
-        ordered.push((Item::Proxy(p), size));
-    }
-    for pc in batch.plugin_configs {
-        let size = serde_json::to_vec(&pc)?.len();
-        ordered.push((Item::PluginConfig(pc), size));
-    }
-
     let mut chunks: Vec<BatchCreate> = Vec::new();
     let mut current = BatchCreate::default();
     let mut current_bytes = 0usize;
 
-    for (item, size) in ordered {
-        // `+ 1` accounts for the array separator between entries.
-        if !current.is_empty() && current_bytes + size + 1 > budget {
+    for group in batch_dependency_groups(batch) {
+        // Counting a complete envelope per group is conservative and keeps
+        // the actual merged body below the cap whenever each group fits.
+        let size = serde_json::to_vec(&group)?.len();
+        if !current.is_empty() && current_bytes + size > budget {
             chunks.push(std::mem::take(&mut current));
             current_bytes = 0;
         }
-        match item {
-            Item::Upstream(u) => current.upstreams.push(u),
-            Item::Consumer(c) => current.consumers.push(c),
-            Item::Proxy(p) => current.proxies.push(p),
-            Item::PluginConfig(pc) => current.plugin_configs.push(pc),
-        }
-        current_bytes += size + 1;
+        current.upstreams.extend(group.upstreams);
+        current.consumers.extend(group.consumers);
+        current.plugin_configs.extend(group.plugin_configs);
+        current.proxies.extend(group.proxies);
+        current_bytes += size;
     }
 
     if !current.is_empty() {
         chunks.push(current);
     }
     Ok(chunks)
+}
+
+/// Connected proxy/plugin create components must never cross a chunk boundary.
+fn batch_dependency_groups(batch: BatchCreate) -> Vec<BatchCreate> {
+    fn root(parents: &mut [usize], mut index: usize) -> usize {
+        while parents[index] != index {
+            parents[index] = parents[parents[index]];
+            index = parents[index];
+        }
+        index
+    }
+
+    let mut groups = Vec::new();
+    for upstream in batch.upstreams {
+        groups.push(BatchCreate {
+            upstreams: vec![upstream],
+            ..Default::default()
+        });
+    }
+    for consumer in batch.consumers {
+        groups.push(BatchCreate {
+            consumers: vec![consumer],
+            ..Default::default()
+        });
+    }
+    let plugin_count = batch.plugin_configs.len();
+    let mut parents: Vec<_> = (0..plugin_count + batch.proxies.len()).collect();
+    let plugins: std::collections::BTreeMap<_, _> = batch
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| ((p.namespace.as_str(), p.id.as_str()), i))
+        .collect();
+    let proxies: std::collections::BTreeMap<_, _> = batch
+        .proxies
+        .iter()
+        .enumerate()
+        .map(|(i, p)| ((p.namespace.as_str(), p.id.as_str()), plugin_count + i))
+        .collect();
+    let mut join = |a, b| {
+        let a = root(&mut parents, a);
+        let b = root(&mut parents, b);
+        parents[b] = a;
+    };
+    for (i, proxy) in batch.proxies.iter().enumerate() {
+        for association in &proxy.plugins {
+            if let Some(&plugin) = plugins.get(&(
+                proxy.namespace.as_str(),
+                association.plugin_config_id.as_str(),
+            )) {
+                join(plugin, plugin_count + i);
+            }
+        }
+    }
+    for (i, plugin) in batch.plugin_configs.iter().enumerate() {
+        if let Some(proxy) = plugin
+            .proxy_id
+            .as_deref()
+            .and_then(|id| proxies.get(&(plugin.namespace.as_str(), id)))
+        {
+            join(i, *proxy);
+        }
+    }
+    let mut connected = std::collections::BTreeMap::<usize, BatchCreate>::new();
+    for (i, plugin) in batch.plugin_configs.into_iter().enumerate() {
+        connected
+            .entry(root(&mut parents, i))
+            .or_default()
+            .plugin_configs
+            .push(plugin);
+    }
+    for (i, proxy) in batch.proxies.into_iter().enumerate() {
+        connected
+            .entry(root(&mut parents, plugin_count + i))
+            .or_default()
+            .proxies
+            .push(proxy);
+    }
+    groups.extend(connected.into_values());
+    groups
 }
 
 // --- Health ------------------------------------------------------------------

@@ -393,6 +393,14 @@ matching Edge's auto-attachment and avoiding repeated Proxy drift or a false
 "No auth plugin" warning. Disabled configs still get an association but do not
 count as authentication.
 
+Association comparison uses `plugin_config_id` sets; payloads keep assembled
+order. Incremental writes run upstreams/consumers → plugins → proxies, with
+deletes reversed. After scoped plugin writes, an authoritative backup skips
+already-matching proxy updates while preserving required ownership assertions.
+New proxies and new scoped plugins share a create transaction, even in mixed
+namespaces; chunking and fallback never separate that cycle. Failed writes
+defer namespace pruning; failed proxy deletions retain referenced plugins.
+
 `scope: global` applies without an association; `scope: proxy_group` still
 requires explicit `Proxy.plugins` entries and no `proxy_id`. An explicit
 reference to a missing config, a global config, or a config whose
@@ -1191,10 +1199,10 @@ Incremental apply sorts the diff into dependency order rather than by kind, beca
 | Rank | Operations |
 |---|---|
 | 0 | Add/Modify Upstream, Add/Modify Consumer |
-| 1 | Add/Modify Proxy |
-| 2 | Add/Modify PluginConfig |
-| 3 | Delete PluginConfig |
-| 4 | Delete Proxy |
+| 1 | Add/Modify PluginConfig |
+| 2 | Add/Modify Proxy (including new proxy/scoped-plugin create batches) |
+| 3 | Delete Proxy |
+| 4 | Delete PluginConfig |
 | 5 | Delete Upstream, Delete Consumer |
 
 Deletes come *after* adds and modifies: an upstream can only be removed once nothing references it (`DELETE /upstreams/{id}` answers 409 while a proxy still points at it), so the proxy modify that drops the reference has to land first.
@@ -1205,7 +1213,7 @@ This preserves an incumbent when a replacement fails, but does **not** make a re
 
 Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-side cascade defaults to on and would delete the last-referenced hand-owned upstream along with the proxy — an invisible deletion that makes the next diff-driven `DELETE /upstreams/{id}` answer 404. gitforgeops owns the upstream lifecycle through its own diff and issues that delete itself.
 
-When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — one transactional, all-or-nothing call, chunked below the gateway's 1 MiB body cap. Any Modify or Delete in the set disqualifies it (`/batch` is create-only), and a 501 falls back to per-resource creates.
+When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — transactional, all-or-nothing calls chunked below the gateway's 1 MiB body cap. Associated proxy/plugin create groups stay in one chunk. A 501 or definitive validation rejection permits independent per-resource creates, but a new proxy and its new scoped plugins require a successful transaction; an unsupported or oversized cycle is reported without publishing a partially configured proxy. Mixed namespaces use create batches only for those cycles, after independent writes. Retargeting an existing plugin to a brand-new proxy cannot use create-only `/batch`; establish the target first or use exclusive `full_replace` for an atomic graph change.
 
 #### Ordering between runs: the environment lock and the freshness guard
 

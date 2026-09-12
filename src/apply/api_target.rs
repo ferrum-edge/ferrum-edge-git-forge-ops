@@ -4,8 +4,8 @@ use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstre
 use crate::config::ApplyStrategy;
 use crate::diagnostics::{safe, safe_line};
 use crate::diff::resource_diff::{
-    compute_diff_with_options, state_key, DiffAction, DiffOptions, DiffResult, OwnershipScope,
-    ResourceDiff, SpecOwnedResource,
+    compare_fields, compute_diff_with_options, normalize_associations_for_comparison, state_key,
+    DiffAction, DiffOptions, DiffResult, OwnershipScope, ResourceDiff, SpecOwnedResource,
 };
 use crate::http_client::{
     self, AdminClient, BackupExtras, BatchCreate, DeleteOutcome, BATCH_MAX_BODY_BYTES,
@@ -57,7 +57,8 @@ pub struct ApplyResult {
     /// be called out — see [`all_deletes_missing_warning`].
     pub deletes_missing: usize,
     /// Planned deletes not attempted because an Add/Modify failed in the same
-    /// namespace. They never enter `applied_incremental`, preserving ownership.
+    /// namespace or a referencing proxy could not be deleted. They never enter
+    /// `applied_incremental`, preserving ownership.
     pub deletes_deferred: usize,
     pub unmanaged_skipped: usize,
     /// Live resources owned by an API-spec import that this run deliberately
@@ -164,10 +165,10 @@ pub fn all_deletes_missing_warning(
 /// | Rank | Operations                                  |
 /// |------|---------------------------------------------|
 /// | 0    | Add/Modify Upstream, Add/Modify Consumer    |
-/// | 1    | Add/Modify Proxy                            |
-/// | 2    | Add/Modify PluginConfig                     |
-/// | 3    | Delete PluginConfig                         |
-/// | 4    | Delete Proxy                                |
+/// | 1    | Add/Modify PluginConfig                     |
+/// | 2    | Add/Modify Proxy                            |
+/// | 3    | Delete Proxy                                |
+/// | 4    | Delete PluginConfig                         |
 /// | 5    | Delete Upstream, Delete Consumer            |
 ///
 /// Deletes go *after* adds/modifies rather than before: an upstream can only
@@ -177,17 +178,20 @@ pub fn all_deletes_missing_warning(
 /// say) conflicts. Any failed Add/Modify defers this namespace's deletes,
 /// preserving the incumbent; an unchanged retry still conflicts until the
 /// operator resolves the routing conflict. This is not an atomic swap.
+/// New proxies and their new scoped configs form a cycle: neither can be
+/// created individually first. `apply_incremental` batches those together at
+/// rank 2, after independent plugin writes, without stripping associations.
 pub fn operation_rank(action: &DiffAction, kind: &str) -> u8 {
     match action {
         DiffAction::Add | DiffAction::Modify => match kind {
             "Upstream" | "Consumer" => 0,
-            "Proxy" => 1,
-            "PluginConfig" => 2,
+            "PluginConfig" => 1,
+            "Proxy" => 2,
             _ => 2,
         },
         DiffAction::Delete => match kind {
-            "PluginConfig" => 3,
-            "Proxy" => 4,
+            "Proxy" => 3,
+            "PluginConfig" => 4,
             "Upstream" | "Consumer" => 5,
             _ => 3,
         },
@@ -214,7 +218,7 @@ pub fn incremental_prune_notice(
         && diffs.iter().any(|d| matches!(d.action, DiffAction::Delete))
     {
         Some(
-            "Incremental deletes are conditional: any failed Add/Modify defers all deletes in that namespace. A same-route rename requires resolving the routing conflict; an unchanged retry cannot complete it.",
+            "Incremental deletes are conditional: any failed Add/Modify defers all deletes in that namespace; a failed proxy deletion also retains its referenced plugins. A same-route rename requires resolving the routing conflict; an unchanged retry cannot complete it.",
         )
     } else {
         None
@@ -562,6 +566,7 @@ fn is_fatal(error: &crate::error::Error) -> bool {
     matches!(
         error,
         crate::error::Error::GatewayReadOnly(_)
+            | crate::error::Error::BackupNamespace(_)
             | crate::error::Error::StaleGatewayView(_)
             | crate::error::Error::RestoreNeedsManualRecovery(_)
             | crate::error::Error::UnsupportedBackupSections(_)
@@ -1172,7 +1177,7 @@ async fn apply_incremental(
         );
     }
     diffs.extend(assertions);
-    let diffs = order_diffs(diffs);
+    let mut diffs = order_diffs(diffs);
 
     for message in spec_owned_skip_messages(&spec_owned) {
         eprintln!("[{}] {}", safe(namespace), safe_line(&message));
@@ -1186,6 +1191,19 @@ async fn apply_incremental(
     };
 
     let index = DesiredIndex::build(desired);
+    let cyclic_creates = cyclic_create_diffs(&diffs, &index);
+    let cyclic_keys: BTreeSet<_> = cyclic_creates
+        .iter()
+        .map(|d| state_key(&d.namespace, &d.kind, &d.id))
+        .collect();
+    // Defer the complete create cycle until independent plugin writes land.
+    diffs.sort_by_key(|d| {
+        if cyclic_keys.contains(&state_key(&d.namespace, &d.kind, &d.id)) {
+            2
+        } else {
+            operation_rank(&d.action, &d.kind)
+        }
+    });
 
     // Pure-Add namespaces take the transactional bulk path. `POST /batch` is
     // create-only and all-or-nothing (never 207), so any Modify or Delete in
@@ -1236,6 +1254,10 @@ async fn apply_incremental(
     // established. This flag belongs to this namespace only; failed deletes
     // do not prevent other deletes from being attempted.
     let mut writes_failed = false;
+    let mut cyclic_pending = !cyclic_creates.is_empty();
+    let mut failed_plugins = BTreeSet::new();
+    let mut failed_proxy_deletions = BTreeSet::new();
+    let mut changed_proxy_associations = BTreeSet::new();
     for diff in &diffs {
         if diff.namespace != namespace {
             return Err(crate::error::Error::BackupNamespace(format!(
@@ -1244,6 +1266,64 @@ async fn apply_incremental(
             )));
         }
         let namespace = diff.namespace.as_str();
+        if cyclic_pending
+            && (operation_rank(&diff.action, &diff.kind) >= 2
+                || cyclic_keys.contains(&state_key(namespace, &diff.kind, &diff.id)))
+        {
+            cyclic_pending = false;
+            let failed_dependency = cyclic_creates.iter().any(|d| {
+                d.kind == "Proxy"
+                    && index
+                        .proxies
+                        .get(&(d.namespace.as_str(), d.id.as_str()))
+                        .is_some_and(|proxy| proxy_has_failed_plugin(proxy, &failed_plugins))
+            });
+            let batched = if failed_dependency {
+                Err(failed_plugin_dependency())
+            } else {
+                try_batch_create(&cyclic_creates, &index, client, namespace).await
+            };
+            match batched {
+                Ok(Some(batched)) => {
+                    writes_failed |= !batched.errors.is_empty();
+                    for pending in &cyclic_creates {
+                        if pending.kind == "PluginConfig"
+                            && !batched
+                                .applied_incremental
+                                .iter()
+                                .any(|op| op.kind == pending.kind && op.id == pending.id)
+                        {
+                            failed_plugins.insert(pending.id.clone());
+                        }
+                    }
+                    result.created += batched.created;
+                    result.applied_incremental.extend(batched.applied_incremental);
+                    result.errors.extend(batched.errors);
+                    if batched.fatal_error.is_some() {
+                        result.fatal_error = batched.fatal_error;
+                        return Ok(result);
+                    }
+                }
+                Ok(None) => {
+                    writes_failed = true;
+                    result.errors.push(
+                        "new proxies and scoped plugins require transactional POST /batch support"
+                            .to_string(),
+                    );
+                }
+                Err(error) if is_fatal(&error) => {
+                    result.fatal_error = Some(error.to_string());
+                    return Ok(result);
+                }
+                Err(error) => {
+                    writes_failed = true;
+                    result.errors.push(error.to_string());
+                }
+            }
+        }
+        if cyclic_keys.contains(&state_key(namespace, &diff.kind, &diff.id)) {
+            continue;
+        }
         if writes_failed && matches!(diff.action, DiffAction::Delete) {
             result.deletes_deferred += 1;
             eprintln!(
@@ -1254,15 +1334,42 @@ async fn apply_incremental(
             );
             continue;
         }
+        if diff.action == DiffAction::Delete
+            && diff.kind == "PluginConfig"
+            && actual.proxies.iter().any(|proxy| {
+                failed_proxy_deletions.contains(&proxy.id)
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == diff.id)
+            })
+        {
+            result.deletes_deferred += 1;
+            eprintln!(
+                "[{}] DEFER DELETE PluginConfig `{}`: a referencing proxy could not be deleted; managed ledger entry preserved.",
+                safe(namespace),
+                safe(&diff.id)
+            );
+            continue;
+        }
         let key = (diff.namespace.as_str(), diff.id.as_str());
         let outcome = match (&diff.action, diff.kind.as_str()) {
             (DiffAction::Add, "Proxy") => match index.proxies.get(&key) {
+                Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
+                    Err(failed_plugin_dependency())
+                }
                 Some(p) => create_with_reconciliation(client, namespace, CreateResource::Proxy(p))
                     .await
                     .map(applied),
                 None => continue,
             },
             (DiffAction::Modify, "Proxy") => match index.proxies.get(&key) {
+                Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
+                    Err(failed_plugin_dependency())
+                }
+                Some(p) if changed_proxy_associations.contains(&diff.id) => {
+                    update_proxy_after_plugins(p, client, namespace, ownership_scope, options).await
+                }
                 Some(p) => client.update_proxy(p, namespace).await.map(applied),
                 None => continue,
             },
@@ -1326,7 +1433,37 @@ async fn apply_incremental(
         };
 
         match outcome {
+            Ok(OpOutcome::Unchanged) => {
+                eprintln!(
+                    "[{}] Proxy `{}` already matches after plugin writes; no proxy update needed",
+                    safe(namespace),
+                    safe(&diff.id)
+                );
+                if !options
+                    .managed_ledger
+                    .contains(&state_key(namespace, "Proxy", &diff.id))
+                {
+                    result.adopted.push(AppliedOp {
+                        kind: diff.kind.clone(),
+                        namespace: diff.namespace.clone(),
+                        id: diff.id.clone(),
+                        action: DiffAction::Modify,
+                    });
+                }
+            }
             Ok(op) => {
+                if diff.kind == "PluginConfig" && diff.action != DiffAction::Delete {
+                    for plugin in actual
+                        .plugin_configs
+                        .iter()
+                        .filter(|plugin| plugin.id == diff.id)
+                        .chain(index.plugin_configs.get(&key).copied())
+                    {
+                        if let Some(proxy_id) = &plugin.proxy_id {
+                            changed_proxy_associations.insert(proxy_id.clone());
+                        }
+                    }
+                }
                 match diff.action {
                     DiffAction::Add => result.created += 1,
                     DiffAction::Modify => result.updated += 1,
@@ -1356,20 +1493,18 @@ async fn apply_incremental(
             // it indistinguishable from a per-resource failure, so the run
             // carried on into the next namespace collecting the same 403 over
             // and over.
-            Err(e @ crate::error::Error::GatewayReadOnly(_)) => {
-                result.fatal_error = Some(e.to_string());
-                return Ok(result);
-            }
-            Err(
-                e @ (crate::error::Error::CommittedNotLive { .. }
-                | crate::error::Error::AmbiguousMutation(_)),
-            ) => {
+            Err(e) if is_fatal(&e) => {
                 result.fatal_error = Some(e.to_string());
                 return Ok(result);
             }
             Err(e) => {
                 if matches!(diff.action, DiffAction::Add | DiffAction::Modify) {
                     writes_failed = true;
+                    if diff.kind == "PluginConfig" {
+                        failed_plugins.insert(diff.id.clone());
+                    }
+                } else if diff.kind == "Proxy" {
+                    failed_proxy_deletions.insert(diff.id.clone());
                 }
                 result.errors.push(format!(
                     "{} {} {}: {}",
@@ -1406,6 +1541,90 @@ async fn apply_incremental(
     Ok(result)
 }
 
+fn proxy_has_failed_plugin(proxy: &Proxy, failed_plugins: &BTreeSet<String>) -> bool {
+    proxy
+        .plugins
+        .iter()
+        .any(|association| failed_plugins.contains(&association.plugin_config_id))
+}
+
+fn failed_plugin_dependency() -> crate::error::Error {
+    crate::error::Error::Config(
+        "proxy write not attempted because a referenced PluginConfig write failed".to_string(),
+    )
+}
+
+/// Re-read after Edge's transactional attachment/detachment. Never infer a
+/// successful proxy reconciliation from the plugin response alone. A shared
+/// unowned or pending row still needs its explicit ownership assertion.
+async fn update_proxy_after_plugins(
+    proxy: &Proxy,
+    client: &AdminClient,
+    namespace: &str,
+    ownership_scope: OwnershipScope<'_>,
+    options: &ApplyOptions,
+) -> crate::error::Result<OpOutcome> {
+    let snapshot = client.get_backup_snapshot_for_mutation(namespace).await?;
+    ensure_authoritative_view(client)?;
+    let live = snapshot
+        .config
+        .proxies
+        .iter()
+        .find(|live| live.namespace == namespace && live.id == proxy.id)
+        .ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "proxy `{}` disappeared after plugin writes; re-run apply",
+                proxy.id
+            ))
+        })?;
+    if let Some(spec_id) = &live.api_spec_id {
+        return Err(crate::error::Error::Config(format!(
+            "proxy `{}` became owned by API spec `{spec_id}` after plugin writes; no proxy update was attempted. Re-run apply to reassess namespace ownership",
+            proxy.id
+        )));
+    }
+    let key = state_key(namespace, "Proxy", &proxy.id);
+    let needs_assertion = options.pending_create_assertions.contains(&key)
+        || matches!(ownership_scope, OwnershipScope::Shared { .. })
+            && !options.managed_ledger.contains(&key);
+    if !needs_assertion && compare_fields("Proxy", proxy, live).is_empty() {
+        return Ok(OpOutcome::Unchanged);
+    }
+    client.update_proxy(proxy, namespace).await.map(applied)
+}
+
+/// New scoped configs and their new target proxies need a create transaction,
+/// even when other changes make the namespace ineligible for the bulk path.
+fn cyclic_create_diffs(diffs: &[ResourceDiff], index: &DesiredIndex<'_>) -> Vec<ResourceDiff> {
+    let new_proxies: BTreeSet<_> = diffs
+        .iter()
+        .filter(|d| d.action == DiffAction::Add && d.kind == "Proxy")
+        .map(|d| (d.namespace.as_str(), d.id.as_str()))
+        .collect();
+    let mut keys = BTreeSet::new();
+    for diff in diffs
+        .iter()
+        .filter(|d| d.action == DiffAction::Add && d.kind == "PluginConfig")
+    {
+        let key = (diff.namespace.as_str(), diff.id.as_str());
+        if let Some(proxy_id) = index
+            .plugin_configs
+            .get(&key)
+            .and_then(|plugin| plugin.proxy_id.as_deref())
+        {
+            if new_proxies.contains(&(diff.namespace.as_str(), proxy_id)) {
+                keys.insert(state_key(&diff.namespace, "PluginConfig", &diff.id));
+                keys.insert(state_key(&diff.namespace, "Proxy", proxy_id));
+            }
+        }
+    }
+    diffs
+        .iter()
+        .filter(|d| keys.contains(&state_key(&d.namespace, &d.kind, &d.id)))
+        .cloned()
+        .collect()
+}
+
 /// One repository-declared row that is already live, already identical, and
 /// absent from the ownership ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1437,9 +1656,10 @@ pub struct AdoptionCandidate {
 ///   ownership modes; adopting one would put a row the repo must never delete
 ///   inside the delete fence.
 ///
-/// Adoption requires strict equality (apart from server timestamps). Unlike
-/// pending-create recovery, an arbitrary pre-existing row may carry fields the
-/// repository does not own, and the ownership PUT must not erase them.
+/// Adoption requires strict equality (apart from timestamps and association
+/// order). Unlike pending-create recovery, an arbitrary pre-existing row may
+/// carry fields the repository does not own, and the ownership PUT must not
+/// erase them.
 pub fn adoption_candidates(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
@@ -1684,6 +1904,8 @@ async fn adopt_matching_rows(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpOutcome {
     Applied,
+    /// Plugin writes already established the desired proxy associations.
+    Unchanged,
     /// A DELETE the gateway answered 404 — tolerated, but counted.
     AlreadyGone,
 }
@@ -1801,30 +2023,34 @@ impl<'a> CreateResource<'a> {
     /// Whether an adoption PUT can serialize this desired row without dropping
     /// anything currently present on the gateway.
     fn safe_to_overwrite(self, actual: &GatewayConfig) -> bool {
-        fn matches<T: serde::Serialize>(live: Option<&T>, desired: &T) -> bool {
-            live.is_some_and(|live| resource_values_equal(desired, live))
+        fn matches<T: serde::Serialize>(kind: &str, live: Option<&T>, desired: &T) -> bool {
+            live.is_some_and(|live| resource_values_equal(kind, desired, live))
         }
 
         match self {
             Self::Proxy(desired) => matches(
+                self.kind(),
                 actual.proxies.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
                 desired,
             ),
             Self::Consumer(desired) => matches(
+                self.kind(),
                 actual.consumers.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
                 desired,
             ),
             Self::Upstream(desired) => matches(
+                self.kind(),
                 actual.upstreams.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
                 desired,
             ),
             Self::PluginConfig(desired) => matches(
+                self.kind(),
                 actual.plugin_configs.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
@@ -1840,34 +2066,38 @@ impl<'a> CreateResource<'a> {
     /// holds the identity but not what we sent, and `Exact` is the only one
     /// that permits recording the create as landed.
     fn live_match(self, actual: &GatewayConfig) -> LiveMatch {
-        fn classify<T: serde::Serialize>(live: Option<&T>, desired: &T) -> LiveMatch {
+        fn classify<T: serde::Serialize>(kind: &str, live: Option<&T>, desired: &T) -> LiveMatch {
             match live {
                 None => LiveMatch::Absent,
-                Some(live) if resource_values_match(desired, live) => LiveMatch::Exact,
+                Some(live) if resource_values_match(kind, desired, live) => LiveMatch::Exact,
                 Some(_) => LiveMatch::Different,
             }
         }
 
         match self {
             Self::Proxy(desired) => classify(
+                self.kind(),
                 actual.proxies.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
                 desired,
             ),
             Self::Consumer(desired) => classify(
+                self.kind(),
                 actual.consumers.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
                 desired,
             ),
             Self::Upstream(desired) => classify(
+                self.kind(),
                 actual.upstreams.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
                 desired,
             ),
             Self::PluginConfig(desired) => classify(
+                self.kind(),
                 actual.plugin_configs.iter().find(|candidate| {
                     candidate.namespace == desired.namespace && candidate.id == desired.id
                 }),
@@ -1999,8 +2229,9 @@ fn create_outcome_is_ambiguous(error: &crate::error::Error) -> bool {
 ///
 /// So: every key the desired document serializes must be present in the live
 /// row with the same value, recursively through nested objects. Arrays and
-/// scalars still compare exactly — a differing target list or timeout is a
-/// real difference, not a gateway default. Extra keys on the live side are
+/// scalars still compare exactly, except Proxy.plugins association sets. A
+/// differing target list or timeout is a real difference, not a gateway default.
+/// Extra keys on the live side are
 /// ignored. `created_at` / `updated_at` are dropped outright: the desired side
 /// omits them unless the repository declares them, and the gateway always
 /// stamps them on the live side, so a comparison that kept them would read
@@ -2009,37 +2240,29 @@ fn create_outcome_is_ambiguous(error: &crate::error::Error) -> bool {
 /// This is not an ownership proof and is never used as one: the callers follow
 /// a positive match with an idempotent PUT that overwrites the row with the
 /// desired content before anything enters the managed delete fence.
-fn resource_values_match<T: serde::Serialize>(desired: &T, live: &T) -> bool {
-    fn without_server_timestamps<T: serde::Serialize>(value: &T) -> Option<serde_json::Value> {
-        let mut value = serde_json::to_value(value).ok()?;
-        if let Some(map) = value.as_object_mut() {
-            map.remove("created_at");
-            map.remove("updated_at");
-        }
-        Some(value)
-    }
-
-    match (
-        without_server_timestamps(desired),
-        without_server_timestamps(live),
-    ) {
+fn resource_values_match<T: serde::Serialize>(kind: &str, desired: &T, live: &T) -> bool {
+    match (comparison_value(kind, desired), comparison_value(kind, live)) {
         (Some(desired), Some(live)) => json_contains(&desired, &live),
         _ => false,
     }
 }
 
-/// Strict equality for adoption, ignoring only server-owned timestamps.
-fn resource_values_equal<T: serde::Serialize>(desired: &T, live: &T) -> bool {
-    fn without_server_timestamps<T: serde::Serialize>(value: &T) -> Option<serde_json::Value> {
-        let mut value = serde_json::to_value(value).ok()?;
-        if let Some(map) = value.as_object_mut() {
-            map.remove("created_at");
-            map.remove("updated_at");
-        }
-        Some(value)
+/// Strict equality for adoption, apart from timestamps and association order.
+fn resource_values_equal<T: serde::Serialize>(kind: &str, desired: &T, live: &T) -> bool {
+    match (comparison_value(kind, desired), comparison_value(kind, live)) {
+        (Some(desired), Some(live)) => desired == live,
+        _ => false,
     }
+}
 
-    without_server_timestamps(desired) == without_server_timestamps(live)
+fn comparison_value<T: serde::Serialize>(kind: &str, value: &T) -> Option<serde_json::Value> {
+    let mut value = serde_json::to_value(value).ok()?;
+    if let Some(map) = value.as_object_mut() {
+        map.remove("created_at");
+        map.remove("updated_at");
+    }
+    normalize_associations_for_comparison(kind, &mut value);
+    Some(value)
 }
 
 /// `live` carries every key/value in `desired`, recursively.
@@ -2051,9 +2274,8 @@ fn json_contains(desired: &serde_json::Value, live: &serde_json::Value) -> bool 
                     .is_some_and(|found| json_contains(value, found))
             })
         }
-        // Arrays are ordered, meaningful config (targets, plugin
-        // associations, credential entries); a shorter or reordered live list
-        // is a real difference.
+        // Association sets were normalized at the resource boundary; other
+        // arrays (targets, credential entries, opaque config) stay ordered.
         (desired, live) => desired == live,
     }
 }
@@ -2227,10 +2449,9 @@ pub fn format_prune_percentage(delete_count: usize, denominator: usize) -> Strin
 
 /// Collect a pure-Add diff into a `POST /batch` payload and send it.
 ///
-/// Returns `Ok(None)` when the gateway answered 501 on the *first* chunk
-/// (standalone MongoDB has no multi-document transaction and nothing landed),
-/// signalling the caller to fall back to per-resource creates for the whole
-/// namespace.
+/// Returns `Ok(None)` when the gateway answered 501 on the *first* chunk and
+/// there are no proxy/scoped-plugin cycles, signalling the caller to fall back
+/// to per-resource creates. Cycles must remain atomic even on fallback.
 ///
 /// A documented, definitive rejection (400/409/413/422) proves the transaction
 /// did not commit, so that chunk and the remainder may be decomposed into named
@@ -2263,9 +2484,16 @@ async fn try_batch_create(
                     .applied_incremental
                     .extend(chunk_ops(chunk, namespace));
             }
-            // 501 on the first chunk: nothing landed anywhere, so the caller
-            // can take the whole namespace down the per-resource path.
-            Ok(None) if position == 0 => return Ok(None),
+            // 501 on the first chunk: nothing landed. Only acyclic graphs can
+            // take the whole namespace down the per-resource path.
+            Ok(None)
+                if position == 0
+                    && chunks
+                        .iter()
+                        .all(|chunk| batch_cycle_proxy_ids(chunk).is_empty()) =>
+            {
+                return Ok(None);
+            }
             Ok(None) => {
                 eprintln!(
                     "[{}] gateway returned 501 for POST /batch after {} resource(s); \
@@ -2462,6 +2690,7 @@ async fn assert_batch_ownership(
     namespace: &str,
     result: &mut ApplyResult,
 ) {
+    let mut failed_plugins = BTreeSet::new();
     for resource in &batch.upstreams {
         let outcome = client.update_upstream(resource, namespace).await;
         record_create(result, outcome, "Upstream", &resource.id, namespace);
@@ -2476,16 +2705,23 @@ async fn assert_batch_ownership(
             return;
         }
     }
-    for resource in &batch.proxies {
-        let outcome = client.update_proxy(resource, namespace).await;
-        record_create(result, outcome, "Proxy", &resource.id, namespace);
+    for resource in &batch.plugin_configs {
+        let outcome = client.update_plugin_config(resource, namespace).await;
+        if outcome.is_err() {
+            failed_plugins.insert(resource.id.clone());
+        }
+        record_create(result, outcome, "PluginConfig", &resource.id, namespace);
         if result.fatal_error.is_some() {
             return;
         }
     }
-    for resource in &batch.plugin_configs {
-        let outcome = client.update_plugin_config(resource, namespace).await;
-        record_create(result, outcome, "PluginConfig", &resource.id, namespace);
+    for resource in &batch.proxies {
+        let outcome = if proxy_has_failed_plugin(resource, &failed_plugins) {
+            Err(failed_plugin_dependency())
+        } else {
+            client.update_proxy(resource, namespace).await
+        };
+        record_create(result, outcome, "Proxy", &resource.id, namespace);
         if result.fatal_error.is_some() {
             return;
         }
@@ -2525,9 +2761,19 @@ fn collect_batch(diffs: &[ResourceDiff], index: &DesiredIndex<'_>) -> BatchCreat
     batch
 }
 
-/// Replay chunks as per-resource `POST`s, in the same dependency order the
-/// batch packer used (upstreams and consumers, then proxies, then plugin
-/// configs), so a proxy never precedes the upstream it references.
+fn batch_cycle_proxy_ids(batch: &BatchCreate) -> BTreeSet<&str> {
+    let proxies: BTreeSet<_> = batch.proxies.iter().map(|p| p.id.as_str()).collect();
+    batch
+        .plugin_configs
+        .iter()
+        .filter_map(|plugin| plugin.proxy_id.as_deref())
+        .filter(|id| proxies.contains(id))
+        .collect()
+}
+
+/// Replay independent creates in dependency order. A new proxy and its scoped
+/// configs cannot be replayed individually: doing so would either reference a
+/// missing row or expose the proxy without its intended authentication.
 ///
 /// Stops early on a run-wide or ambiguous mutation failure; ordinary
 /// per-resource validation failures are recorded and the walk continues.
@@ -2537,7 +2783,14 @@ async fn create_individually(
     namespace: &str,
     result: &mut ApplyResult,
 ) {
+    let mut failed_plugins = BTreeSet::new();
     for chunk in chunks {
+        let cycles = batch_cycle_proxy_ids(chunk);
+        for id in &cycles {
+            result.errors.push(format!(
+                "Proxy {id} and its new scoped PluginConfig(s) require a successful transactional POST /batch; no individual create was attempted for this cycle. Use a transaction-capable gateway and keep the dependency group below the batch body limit."
+            ));
+        }
         for u in &chunk.upstreams {
             let outcome =
                 create_with_reconciliation(client, namespace, CreateResource::Upstream(u)).await;
@@ -2554,19 +2807,32 @@ async fn create_individually(
                 return;
             }
         }
-        for p in &chunk.proxies {
+        for pc in &chunk.plugin_configs {
+            if pc.proxy_id.as_deref().is_some_and(|id| cycles.contains(id)) {
+                failed_plugins.insert(pc.id.clone());
+                continue;
+            }
             let outcome =
-                create_with_reconciliation(client, namespace, CreateResource::Proxy(p)).await;
-            record_create(result, outcome, "Proxy", &p.id, namespace);
+                create_with_reconciliation(client, namespace, CreateResource::PluginConfig(pc))
+                    .await;
+            if outcome.is_err() {
+                failed_plugins.insert(pc.id.clone());
+            }
+            record_create(result, outcome, "PluginConfig", &pc.id, namespace);
             if result.fatal_error.is_some() {
                 return;
             }
         }
-        for pc in &chunk.plugin_configs {
-            let outcome =
-                create_with_reconciliation(client, namespace, CreateResource::PluginConfig(pc))
-                    .await;
-            record_create(result, outcome, "PluginConfig", &pc.id, namespace);
+        for p in &chunk.proxies {
+            if cycles.contains(p.id.as_str()) {
+                continue;
+            }
+            let outcome = if proxy_has_failed_plugin(p, &failed_plugins) {
+                Err(failed_plugin_dependency())
+            } else {
+                create_with_reconciliation(client, namespace, CreateResource::Proxy(p)).await
+            };
+            record_create(result, outcome, "Proxy", &p.id, namespace);
             if result.fatal_error.is_some() {
                 return;
             }

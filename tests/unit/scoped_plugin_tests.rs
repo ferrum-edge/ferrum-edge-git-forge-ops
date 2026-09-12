@@ -126,6 +126,56 @@ fn explicit_and_derived_associations_are_deduplicated_without_losing_entries() {
 }
 
 #[test]
+fn association_comparison_is_a_set_without_changing_export_order() {
+    let desired = assemble(vec![
+        proxy(&["b"]),
+        plugin("a", "proxy", Some("api")),
+        plugin("b", "proxy", Some("api")),
+    ])
+    .unwrap()
+    .gateway;
+    let mut live = desired.clone();
+    live.proxies[0].plugins.reverse();
+    assert!(compute_diff(&desired, &live).is_empty());
+    let shared = compute_diff_with_ownership(&desired, &live, Some(&Default::default()));
+    assert!(shared.diffs.is_empty());
+    assert!(shared.unmanaged.is_empty());
+
+    let exported = gitforgeops::apply::render_file_yaml(&desired).unwrap();
+    let exported: GatewayConfig = serde_yaml::from_str(&exported).unwrap();
+    assert_eq!(association_ids(&exported.proxies[0]), vec!["b", "a"]);
+    assert_eq!(association_ids(&desired.proxies[0]), vec!["b", "a"]);
+    assert!(compute_diff(&exported, &live).is_empty());
+
+    live.proxies[0].plugins.pop();
+    let missing = compute_diff(&desired, &live);
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].details[0].field, "plugins");
+    let extra = compute_diff(&live, &desired);
+    assert_eq!(extra.len(), 1);
+    assert_eq!(extra[0].details[0].field, "plugins");
+}
+
+#[test]
+fn opaque_plugin_arrays_remain_order_sensitive() {
+    let mut desired = assemble(vec![proxy(&[]), plugin("auth", "proxy", Some("api"))])
+        .unwrap()
+        .gateway;
+    desired.plugin_configs[0].config = json!({
+        "plugins": [{"plugin_config_id": "a"}, {"plugin_config_id": "b"}],
+    });
+    let mut live = desired.clone();
+    live.plugin_configs[0].config["plugins"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    let drift = compute_diff(&desired, &live);
+    assert_eq!(drift.len(), 1);
+    assert_eq!(drift[0].kind, "PluginConfig");
+    assert_eq!(drift[0].details[0].field, "config");
+}
+
+#[test]
 fn derived_order_is_independent_of_resource_order_and_normalization_is_idempotent() {
     let resources = vec![
         proxy(&[]),
