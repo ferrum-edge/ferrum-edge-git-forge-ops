@@ -133,7 +133,14 @@ fn cli_accepts_documented_format_values() {
 
     let review = Cli::try_parse_from(["gitforgeops", "review", "--require-live"]).unwrap();
     match review.command {
-        Commands::Review { require_live, .. } => assert!(require_live),
+        Commands::Review {
+            require_live,
+            fail_on_blockers,
+            ..
+        } => {
+            assert!(require_live);
+            assert!(!fail_on_blockers);
+        }
         _ => panic!("expected review command"),
     }
 
@@ -228,6 +235,45 @@ fn cli_accepts_nontransactional_plugin_attach_opt_in() {
             ..
         }
     ));
+}
+
+#[test]
+fn cli_accepts_review_fail_on_blockers_opt_in() {
+    let default = Cli::try_parse_from(["gitforgeops", "review"]).unwrap();
+    match default.command {
+        Commands::Review {
+            fail_on_blockers,
+            require_live,
+            pr,
+        } => {
+            assert!(!fail_on_blockers);
+            assert!(!require_live);
+            assert!(pr.is_none());
+        }
+        _ => panic!("expected review command"),
+    }
+
+    let flagged = Cli::try_parse_from([
+        "gitforgeops",
+        "review",
+        "--fail-on-blockers",
+        "--require-live",
+        "--pr",
+        "7",
+    ])
+    .unwrap();
+    match flagged.command {
+        Commands::Review {
+            fail_on_blockers,
+            require_live,
+            pr,
+        } => {
+            assert!(fail_on_blockers);
+            assert!(require_live);
+            assert_eq!(pr, Some(7));
+        }
+        _ => panic!("expected review command"),
+    }
 }
 
 #[test]

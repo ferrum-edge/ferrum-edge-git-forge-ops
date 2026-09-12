@@ -9,15 +9,19 @@ pub mod scrubber;
 pub(crate) mod service_discovery;
 
 pub use allocator::{
-    allocate_and_deliver, generate_credential_value, generate_credential_value_typed,
-    rotate_and_deliver, AllocateOutcome, AllocatedSlot, AllocationFailure,
+    allocate_and_deliver, allocate_and_deliver_at, generate_credential_value,
+    generate_credential_value_typed, rotate_and_deliver, rotate_and_deliver_at, AllocateOutcome,
+    AllocatedSlot, AllocationFailure,
 };
 pub use bundle::{
     load_bundles_from_env, merge_bundles, parse_bundles_from_json, serialize_bundle,
     CredentialBundle, LoadedBundles,
 };
 pub use delivery::{deliver_to_author, DeliveryResult};
-pub use github_api::{fetch_public_key, put_environment_secret, EnvSecretPublicKey};
+pub use github_api::{
+    fetch_public_key, fetch_public_key_at, put_environment_secret, put_environment_secret_at,
+    EnvSecretPublicKey, DEFAULT_GITHUB_API_BASE,
+};
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 pub use resolver::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,

@@ -824,6 +824,8 @@ spec:
 
 Placeholders are the only supported on-disk form, and that is enforced rather than advised. Before it reads the credential bundle, contacts a gateway, allocates a slot, or publishes a file, `apply` audits the **unresolved** document and refuses every error-severity security finding — a credential string that is not a `${gh-env-secret:...}` placeholder is a secret committed to the repository, and applying it would publish it. `plan` exits non-zero on the same set, so a preview never disagrees with the post-merge apply, and the PR comment marks the findings as blocking. The escape hatch is the same one policy violations use: the `gitforgeops/policy-override` label, added by an account with `write` permission (see [Override flow](#override-flow-b2-label--permission)). Use it to land an emergency change, not as a way to keep literals in the tree.
 
+The same rule applies to repository fixtures. `tests/fixtures/simple-config/` ships `${gh-env-secret:alloc=require}` so copying the sample into `resources/` cannot recreate a committed secret (`alloc=generate` is the first-apply form in `resources/ferrum/consumers/_example.yaml`). `tests/fixtures/literal-credential/` is the deliberate negative case used by tests that assert the error-severity refusal; it is not a sample. `tests/fixtures/companion-schema/` also uses placeholders only.
+
 ### Credential shapes
 
 ferrum-edge recognizes exactly five credential types, and each one is an **array** of entries:
@@ -1143,7 +1145,7 @@ An api-mode `apply` neither publishes nor retracts (there is no mesh admin API);
 
 `validate`, `plan`, and `apply` run a **second** validation pass, `ferrum-edge validate -m mesh`, against the rendered document (byte-for-byte what gets published, `version` stamp included). That pass runs the same parse → normalize → validate → slice-derivation pipeline a mesh node runs at startup. It only runs when the repo actually declares mesh fragments.
 
-`tests/fixtures/companion-schema/` is a serde every-field mirror and is **not** a working mesh document — `ferrum-edge validate -m mesh` rejects it by design (missing workload `selector`, mutually exclusive TLS fields, and similar). `tests/fixtures/mesh-minimal/` is the opposite contract: a MeshConfig with a required `selector` and the smallest workload/service set that validator must accept. `tests/unit/mesh_minimal_tests.rs` pins that fixture; keep `companion-schema/` unchanged when editing it.
+`tests/fixtures/companion-schema/` is a serde every-field mirror and is **not** a working mesh document — `ferrum-edge validate -m mesh` rejects it by design (missing workload `selector`, mutually exclusive TLS fields, and similar). `tests/fixtures/mesh-minimal/` is the opposite contract: a MeshConfig with a required `selector` and the smallest workload/service set that validator must accept. `tests/unit/mesh_minimal_tests.rs` pins that fixture; keep `companion-schema/` unchanged when editing it. Gateway samples follow the same placeholder rule as operator trees: `tests/fixtures/simple-config/` is brokered, and `tests/fixtures/literal-credential/` exists only so the security gate still has a committed literal to refuse.
 
 **The mesh pass carries one explicit environment variable, and only that pass.** ferrum-edge resolves `-m mesh` through the same workload-identity gate a mesh node resolves at startup: with no file-based gateway SVID material (`FERRUM_GATEWAY_SVID_CERT_PATH` / `_KEY_PATH` / `_TRUST_BUNDLE_PATH`) it refuses with *"mesh mode has no workload identity"* **before** it parses the document handed to `-c`. A CI runner grading a pull request has no mesh node's identity and should not be given one, so gitforgeops sets ferrum-edge's own validation-only opt-out, `FERRUM_MESH_ALLOW_NO_CA=true`, on that child process — after the `FERRUM_*` scrub, so the value is gitforgeops' constant and never the parent's. Three things it deliberately is not: it is not set for the gateway pass (`-m file` has no identity gate), it is not a pass-through (a `FERRUM_MESH_ALLOW_NO_CA` in the calling environment is scrubbed like every other inherited variable), and it never reaches a runtime `run -m mesh` or the published document — mesh nodes still enforce their own identity, and the bytes gitforgeops writes are unchanged. What it relaxes is *where* a document may be graded, not *what* counts as valid: a malformed policy or schema is rejected exactly as before, and a ferrum-edge build that refuses the variable itself surfaces its own error unchanged.
 
@@ -1388,10 +1390,13 @@ request at a time:
   `FERRUM_GATEWAY_CA_CERT`, not behind a disabled check. A name that merely
   resolves to a loopback address does not qualify: DNS is not a trust
   boundary.
-- **GitHub API calls are always `https://api.github.com`.** The host is
-  compiled in, not configurable, so PR comments, override checks, credential
-  delivery, and Environment-secret writes have no cleartext path to
-  misconfigure.
+- **GitHub API calls default to `https://api.github.com`.** The production
+  host is compiled in (`DEFAULT_GITHUB_API_BASE`), not taken from process
+  environment, so PR comments, override checks, credential delivery, and
+  Environment-secret writes have no cleartext path to misconfigure. The
+  Environment-secret adapters accept an explicit API origin only so unit tests
+  can inject an in-process loopback stub; production callers pass the compiled-in
+  HTTPS origin. There is no `FERRUM_*` / `GITFORGEOPS_*` override for this host.
 
 Consequently the `rust/cleartext-transmission` sites CodeQL reports in
 `src/http_client.rs` — one per request method, all of them reading the same
@@ -1459,6 +1464,7 @@ Runtime variables supported by the binary include:
 | `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown **top-level** `spec` fields verbatim instead of rejecting them, for a gateway newer than this release. Nested unknown fields stay fatal either way. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones). |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Legacy/env-driven strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
 | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same opt-in as `apply --allow-nontransactional-plugin-attach`: on batch 501/413, publish a new proxy before attaching its new scoped plugins. Accepts `true`, `false`, `1`, `0`; invalid values fail. |
+| `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same opt-in as `review --fail-on-blockers`: exit 1 when the same offline apply blockers that make `plan` exit 1 are present. Default `review` stays 0; the PR comment is identical either way. Accepts `true`, `false`, `1`, `0`; invalid values fail. |
 | `FERRUM_OVERLAY` | — | Legacy overlay selector used only without repo config/env selection. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode output path. Bundled file-mode apply sets this to `assembled/<env>.yaml`. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`, and retracted (rewritten as `mesh: {}`, never deleted) when the last `MeshConfig` fragment is removed. Separate document, separate path — see [Mesh configuration](#mesh-configuration). Bundled workflows set `assembled/<env>-mesh.yaml`. |
@@ -1495,7 +1501,7 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--credential-bundle-output PRIVATE_PATH] \
   [--accept-unknown-field NAME] \
   [--allow-plaintext-plugin-config PLUGIN_NAME]  # --from-api requires an explicit namespace filter
-gitforgeops review [--pr N] [--require-live]
+gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops rotate --consumer ID --credential KEY \
   [--namespace NS] [--recipient GH_LOGIN]
@@ -1548,6 +1554,7 @@ Notes:
 Set the missing variable in the deployment context or seed the credential bundle.
 Use `diff` for a comparison that does not preview credential allocation.
 
+- **`review`'s exit code is not the apply gate** unless `--fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`) is set, or `--require-live` comparison/delivery fails. Default `review` still prints the Apply-blocked verdict (literal secrets, required slots, schema/policy/security, slot remaps) and exits 0 so existing comment-only jobs stay green. `--fail-on-blockers` uses the same `src/verdict.rs` `apply_blockers` computation as `plan`, so the two cannot disagree; the PR comment is identical with or without the flag. The bundled `validate-pr.yml` static review and `trusted-pr-review.yml` live review do not pass the flag: static review is comment output (`if: always()`), and trusted live review fails on `--require-live` comparison or undelivered comment. A matrix job that needs `plan`'s offline apply gate should pass `--fail-on-blockers`. Pending allocations still fail default `review` when the provisioning variables are absent, matching `plan`.
 - **`diff --exit-on-drift` exits `2` on drift**, `1` on an ordinary error, `0` when in sync, and prints the categories that produced the verdict. Drift is: managed resources added/modified, managed resources deleted, unmanaged resources on the gateway — each honoring its `ownership.drift_alert_on` flag — **or** an unresolved API-spec ownership conflict. That last category has no mute flag: a live `api_spec_id`-tagged row this repo also declares is two owners writing one row, and `apply` blocks the namespace over it. Informational spec-owned rows the repo does *not* declare stay non-blocking, and a conflict in one namespace never stops the others from being compared.
 - API import requires `FERRUM_NAMESPACE` (or the selected environment's namespace filter), mints an exact namespace-scoped JWT, and imports one namespace at a time. This fails closed on gateways that require namespace claims: an unscoped `GET /namespaces` intentionally returns an empty list and therefore cannot safely drive an all-namespace import.
 - `review --require-live` returns non-zero after rendering the fallback report if either the gateway comparison was unavailable or the required PR comment could not be posted. The trusted PR workflow uses it; secretless static review intentionally keeps comment delivery best-effort. Review comments are UTF-8-safe and capped below GitHub's API limit, with explicit omission counts. In authoritative live comparisons, `review`, `diff` and `plan` exclude only broker-controlled leaves that remain unresolved after loading credentials, whether the file or inline bundle is absent, empty, unrelated, partial or populated. This covers Consumer credentials, plugin config and modeled service-discovery secrets. Masking uses the resolution report's canonical slots, so even seeded values that resemble broker placeholders remain comparable. Modeled service-discovery tokens are redacted in diff output regardless of their syntax. Resolved-secret differences, literal siblings, extra entries, shape changes, adds/deletes and all nonsecret fields remain authoritative. Notices count unresolved leaves without assuming the whole bundle is unavailable. This prevents permanent false drift from unseeded slots in `drift-check`; missing required values still block `plan` and actual `apply`. Cached comparisons retain their existing approximate/skipped behavior.
@@ -1706,6 +1713,10 @@ remaps, and missing required credentials when bundle evidence is available.
 The 60,000-byte comment limit may shorten detailed listings, but these counts
 survive. The footer names the sections whose detail was reduced or omitted;
 use smaller namespace-scoped reviews to inspect that detail.
+
+`--fail-on-blockers` changes only the process exit code. The comment above is
+the same with or without the flag: do not treat a green `review` step as an
+apply gate unless that flag (or `--require-live` failures) is in use.
 
 ```markdown
 Environment: `staging` · Ownership: `Shared` · Strategy: `Incremental`

@@ -909,7 +909,7 @@ fn assemble_emits_canonical_array_credentials_from_the_fixture() {
     let creds = &config.consumers[0].credentials;
     assert_eq!(
         creds["keyauth"],
-        serde_json::json!([{"key": "alice-secret-key-12345"}]),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
         "assemble must hand downstream diff/apply the array form the gateway returns"
     );
 }

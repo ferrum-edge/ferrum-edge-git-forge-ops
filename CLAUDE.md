@@ -43,7 +43,10 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--credential-bundle-output PRIVATE_PATH] \
   [--accept-unknown-field NAME] \                         # --output-dir required + must be empty; API import requires an explicit namespace filter;
   [--allow-plaintext-plugin-config PLUGIN_NAME]           # both acknowledgement flags are repeatable and fail closed without them
-gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
+gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
+                                                          # Post PR comment; optionally require live comparison.
+                                                          # Exit stays 0 on offline apply blockers unless
+                                                          # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
   [--namespace NS] [--recipient GH_LOGIN]
@@ -467,7 +470,9 @@ decidable *without* a gateway, as `Vec<ApplyBlocker>` over seven
 `BlockerKind`s: `Validation`, `Security`, `Policy`, `RequiredCredentials`,
 `SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
-non-empty. `cmd_apply` calls the *same per-class predicates*
+non-empty. `review --fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`)
+uses that same computation for its exit code; default `review` still renders
+the blocked verdict and exits 0. `cmd_apply` calls the *same per-class predicates*
 (`security_blocker`, `policy_blocker`, `required_credentials_blocker`,
 `validation_blocker`, `credential_provisioning_blockers`) at its own gate points rather than the aggregate, because
 its ordering is load-bearing — the security audit has to refuse before the
@@ -719,6 +724,7 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)
 - `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` (default `false`; `true|false|1|0`) — same explicit 501/413 fallback as `apply --allow-nontransactional-plugin-attach`; publishes a new proxy before its new scoped plugins and warns about temporary exposure.
+- `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` (default `false`; `true|false|1|0`) — same opt-in as `review --fail-on-blockers`: exit 1 when the same offline apply blockers that make `plan` exit 1 are present. Default `review` stays 0; the PR comment is identical either way.
 - `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge; a configured missing directory is fatal — `resolved::validate_overlay_selection` reports it up front naming the environment, the overlay and the declaring file)
 - `FERRUM_EDGE_BINARY_PATH` (default `ferrum-edge` on `$PATH`)
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)
@@ -737,12 +743,12 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 ## Testing
 
 - `tests/unit_tests.rs` is the single integration test binary; submodules live under `tests/unit/*.rs` and register in `tests/unit/mod.rs`.
-- Fixtures under `tests/fixtures/` (`simple-config/`, `overlay-test/`, `companion-schema/`, `mesh-minimal/`).
+- Fixtures under `tests/fixtures/` (`simple-config/`, `overlay-test/`, `companion-schema/`, `mesh-minimal/`, `literal-credential/`). Fixtures never carry literal consumer secrets: `simple-config/` uses `${gh-env-secret:alloc=require}`; `literal-credential/` is the negative case for the security gate.
 - `companion-schema/` holds one file per kind populating **every** field mirrored in `src/config/schema.rs`. `tests/unit/companion_schema_tests.rs` loads it strictly, assembles it, round-trips it through export, and — by reading the struct definitions out of `schema.rs` — fails when a newly mirrored field is not exercised there. Add new mirrored fields to that fixture in the same PR. Values are illustrative, not a working gateway or mesh document.
 - `mesh-minimal/` is the opposite mesh contract: a MeshConfig with a required workload `selector` and the smallest workload/service set `ferrum-edge validate -m mesh` accepts. `tests/unit/mesh_minimal_tests.rs` loads it strictly and asserts the rendered `{version, mesh}` document still carries that selector. Keep `companion-schema/` unchanged when editing this fixture.
 - New test file: create `tests/unit/<name>.rs` AND add `mod <name>;` to `tests/unit/mod.rs`.
 - `tempfile` crate for filesystem tests.
-- No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking.
+- No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking. GitHub Environment Secret adapters (`fetch_public_key` / `put_environment_secret`) are driven against an in-process loopback stub in `tests/unit/github_api_tests.rs` by injecting a test-only API origin (`fetch_public_key_at` / `put_environment_secret_at` / `allocate_and_deliver_at` / `rotate_and_deliver_at`). Production wrappers keep the compiled-in `https://api.github.com` origin; there is no environment-variable override.
 
 ## Development Guidelines
 

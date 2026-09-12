@@ -15,7 +15,8 @@ use gitforgeops::review::pr_comment::{
     MAX_REVIEW_COMMENT_BYTES,
 };
 use gitforgeops::review::{
-    enforce_live_comparison, redact_comparison_error, stale_live_view_error, STALE_LIVE_VIEW_REASON,
+    enforce_live_comparison, enforce_offline_blockers, redact_comparison_error,
+    stale_live_view_error, STALE_LIVE_VIEW_REASON,
 };
 use gitforgeops::secrets::ResolveReport;
 
@@ -1464,6 +1465,17 @@ fn cached_backup_degrades_the_review_and_fails_require_live() {
 fn live_comparison_enforcement_is_scoped_to_require_live() {
     assert!(enforce_live_comparison(true, None).is_ok());
     assert!(enforce_live_comparison(false, Some(STALE_LIVE_VIEW_REASON)).is_ok());
+}
+
+#[test]
+fn offline_blocker_enforcement_is_opt_in() {
+    use gitforgeops::verdict::validation_blocker;
+
+    let blockers = vec![validation_blocker(false).expect("validation failure is a blocker")];
+    assert!(enforce_offline_blockers(false, &blockers).is_ok());
+    let err = enforce_offline_blockers(true, &blockers).unwrap_err();
+    assert!(err.to_string().contains("apply is blocked by"), "{err}");
+    assert!(enforce_offline_blockers(true, &[]).is_ok());
 }
 
 #[test]
