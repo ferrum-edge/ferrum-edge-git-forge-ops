@@ -1200,9 +1200,11 @@ fn credential_migration_bundle_rejects_dotdot_after_symlink_into_worktree() {
 #[test]
 fn imported_resource_yaml_is_byte_deterministic() {
     let mut config = make_test_config();
+    // Two recognized types, inserted out of order, so map ordering is what the
+    // byte comparison exercises.
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
-        "zeta": [{"token": "z"}],
-        "alpha": [{"token": "a"}]
+        "mtls_auth": [{"identity": "z"}],
+        "basicauth": [{"username": "a", "password": "x"}]
     }))
     .unwrap();
     let left = tempfile::tempdir().unwrap();

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::config::schema::{
-    GatewayConfig, Resource, is_known_credential_type, unknown_credential_type_message,
+    is_known_credential_type, unknown_credential_type_message, GatewayConfig, Resource,
 };
 use crate::http_client::BackupSnapshot;
 use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
