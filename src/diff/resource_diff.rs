@@ -656,6 +656,13 @@ pub(crate) fn compare_fields<T: serde::Serialize + PassthroughFields>(
 ) -> Vec<FieldChange> {
     let mut desired_val = serde_json::to_value(desired).unwrap_or_default();
     let mut actual_val = serde_json::to_value(actual).unwrap_or_default();
+    // Compare sorted copies, but report association changes in wire order.
+    let original_plugins = (kind == "Proxy").then(|| {
+        (
+            desired_val.get("plugins").cloned().unwrap_or_default(),
+            actual_val.get("plugins").cloned().unwrap_or_default(),
+        )
+    });
     normalize_associations_for_comparison(kind, &mut desired_val);
     normalize_associations_for_comparison(kind, &mut actual_val);
 
@@ -673,6 +680,14 @@ pub(crate) fn compare_fields<T: serde::Serialize + PassthroughFields>(
             }
             let a_val = a_map.get(key).unwrap_or(&serde_json::Value::Null);
             if d_val != a_val {
+                let (d_val, a_val) = if key == "plugins" {
+                    original_plugins
+                        .as_ref()
+                        .map(|(desired, actual)| (desired, actual))
+                        .unwrap_or((d_val, a_val))
+                } else {
+                    (d_val, a_val)
+                };
                 changes.push(FieldChange {
                     field: key.clone(),
                     old_value: serde_json::to_string(a_val).unwrap_or_default(),
@@ -718,6 +733,5 @@ pub(crate) fn normalize_associations_for_comparison(kind: &str, value: &mut serd
                         .and_then(serde_json::Value::as_str),
                 )
         });
-        plugins.dedup_by(|a, b| a.get("plugin_config_id") == b.get("plugin_config_id"));
     }
 }

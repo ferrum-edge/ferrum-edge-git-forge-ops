@@ -1751,7 +1751,7 @@ pub fn split_batch(batch: BatchCreate, max_bytes: usize) -> crate::error::Result
 }
 
 /// Connected proxy/plugin create components must never cross a chunk boundary.
-fn batch_dependency_groups(batch: BatchCreate) -> Vec<BatchCreate> {
+fn batch_dependency_groups(mut batch: BatchCreate) -> Vec<BatchCreate> {
     fn root(parents: &mut [usize], mut index: usize) -> usize {
         while parents[index] != index {
             parents[index] = parents[parents[index]];
@@ -1760,6 +1760,20 @@ fn batch_dependency_groups(batch: BatchCreate) -> Vec<BatchCreate> {
         index
     }
 
+    // Stable component roots and payload order regardless of caller input.
+    // Association order inside each proxy remains untouched.
+    batch
+        .upstreams
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+    batch
+        .consumers
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+    batch
+        .plugin_configs
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+    batch
+        .proxies
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
     let mut groups = Vec::new();
     for upstream in batch.upstreams {
         groups.push(BatchCreate {
@@ -1803,6 +1817,9 @@ fn batch_dependency_groups(batch: BatchCreate) -> Vec<BatchCreate> {
         }
     }
     for (i, plugin) in batch.plugin_configs.iter().enumerate() {
+        if plugin.scope != crate::config::schema::PluginScope::Proxy {
+            continue;
+        }
         if let Some(proxy) = plugin
             .proxy_id
             .as_deref()

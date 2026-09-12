@@ -1497,7 +1497,14 @@ fn split_batch_keeps_proxy_plugin_components_together_without_reordering_associa
         ..Default::default()
     };
     // Even a deliberately tiny budget cannot split a dependency component.
+    let mut reordered = batch.clone();
+    reordered.proxies.reverse();
+    reordered.plugin_configs.reverse();
     let chunks = split_batch(batch, 600).unwrap();
+    assert_eq!(
+        serde_json::to_value(split_batch(reordered, 600).unwrap()).unwrap(),
+        serde_json::to_value(&chunks).unwrap()
+    );
     assert_eq!(chunks.len(), 3);
     assert_eq!(chunks[0].upstreams[0].id, "u1");
     assert_eq!(chunks[1].proxies.len(), 2);

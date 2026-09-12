@@ -93,11 +93,13 @@ async fn main() {
             auto_approve,
             allow_large_prune,
             confirm_api_spec_deletion,
+            allow_nontransactional_plugin_attach,
         } => {
             cmd_apply(
                 auto_approve,
                 allow_large_prune,
                 confirm_api_spec_deletion,
+                allow_nontransactional_plugin_attach,
                 explicit_env.as_deref(),
                 resolve_options,
             )
@@ -1443,6 +1445,9 @@ async fn cmd_diff(
         managed.as_ref(),
         diff::DiffOptions::default(),
     );
+    let diffs = apply::order_incremental_diffs(diffs, &desired);
+    let plugin_attach_notice =
+        apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
 
     let in_sync = diffs.is_empty() && unmanaged.is_empty() && !spec_owned_blocks_sync(&spec_owned);
     print_or_collect_scope_json(
@@ -1453,6 +1458,7 @@ async fn cmd_diff(
             "in_sync": in_sync && cached_namespaces.is_empty(),
             "diff_count": diffs.len(),
             "live_filter_warning": live_warning,
+            "plugin_attach_notice": plugin_attach_notice,
         }),
     );
     if let Some(finding) = &desired_finding {
@@ -1525,6 +1531,9 @@ async fn cmd_diff(
     }
 
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
+        println!("{}\n", safe_block(note));
+    }
+    if let Some(note) = plugin_attach_notice {
         println!("{}\n", safe_block(note));
     }
 
@@ -1601,7 +1610,16 @@ async fn cmd_plan(
     // literals to the auditor. Running pre-resolve keeps the audit on
     // the repo's actual committed state.
     let policy_cfg = policy::load_policies()?;
-    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    let security_findings = diff::audit_security_with_scope(
+        &desired,
+        policy_cfg.as_ref(),
+        match resolved.ownership.mode {
+            OwnershipMode::Shared => diff::OwnershipScope::Shared {
+                previously_managed: &HashSet::new(),
+            },
+            OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
+        },
+    );
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
     reportln!(json_mode, "=== Environment ===");
     reportln!(
@@ -1761,6 +1779,10 @@ async fn cmd_plan(
         }
     };
 
+    let diffs = apply::order_incremental_diffs(diffs, &desired);
+    let plugin_attach_notice =
+        apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
+
     if let Some(note) = &provenance_note {
         reportln!(json_mode, "=== Live Data Provenance ===");
         reportln!(json_mode, "WARNING: {}\n", safe_block(note));
@@ -1821,6 +1843,9 @@ async fn cmd_plan(
     }
 
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
+        reportln!(json_mode, "{}\n", safe_block(note));
+    }
+    if let Some(note) = plugin_attach_notice {
         reportln!(json_mode, "{}\n", safe_block(note));
     }
 
@@ -2009,6 +2034,7 @@ async fn cmd_plan(
             desired_finding.as_ref(),
             serde_json::json!({
                 "live_filter_warning": live_warning,
+                "plugin_attach_notice": plugin_attach_notice,
                 "apply_blocked": offline_summary.is_some()
                     || !conflict_namespaces.is_empty()
                     || desired_finding.as_ref().is_some_and(|finding| finding.is_error()),
@@ -2051,10 +2077,13 @@ async fn cmd_apply(
     auto_approve: bool,
     allow_large_prune: bool,
     confirm_api_spec_deletion: bool,
+    allow_nontransactional_plugin_attach: bool,
     explicit_env: Option<&str>,
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let allow_nontransactional_plugin_attach = allow_nontransactional_plugin_attach
+        || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
@@ -2074,7 +2103,16 @@ async fn cmd_apply(
     // publish — is what makes it impossible for an apply to publish a secret
     // that was committed to the repository.
     let policy_cfg = policy::load_policies()?;
-    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    let security_findings = diff::audit_security_with_scope(
+        &desired,
+        policy_cfg.as_ref(),
+        match resolved.ownership.mode {
+            OwnershipMode::Shared => diff::OwnershipScope::Shared {
+                previously_managed: &HashSet::new(),
+            },
+            OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
+        },
+    );
     print_security_findings(&security_findings);
     // The same predicate `plan` previews with. `apply` evaluates the override
     // separately below (it needs the approver's name for the state ledger), so
@@ -2344,7 +2382,7 @@ async fn cmd_apply(
                 let (pending, adoptions) =
                     ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy);
                 diffs.extend(pending);
-                let diffs = apply::order_diffs(diffs);
+                let diffs = apply::order_incremental_diffs(diffs, &desired);
 
                 if diffs.is_empty()
                     && unmanaged.is_empty()
@@ -2359,6 +2397,13 @@ async fn cmd_apply(
                     return Ok(());
                 }
                 println!("Will apply {} change(s):", diffs.len());
+                if let Some(note) = apply::incremental_plugin_attach_notice(
+                    &resolved.apply_strategy,
+                    &diffs,
+                    &desired,
+                ) {
+                    println!("{}", safe_block(note));
+                }
                 for d in &diffs {
                     let action = match d.action {
                         diff::DiffAction::Add => "ADD",
@@ -2457,6 +2502,7 @@ async fn cmd_apply(
                     pending_create_assertions: state.pending_creates.clone(),
                     managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
+                    allow_nontransactional_plugin_attach,
                 },
             )
             .await?;
@@ -2657,6 +2703,7 @@ async fn cmd_apply(
                     pending_create_assertions: state.pending_creates.clone(),
                     managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
+                    allow_nontransactional_plugin_attach,
                 },
             )
             .await?;
@@ -2987,7 +3034,16 @@ async fn cmd_review(
     // Audit pre-resolve so placeholder-resolved values aren't misreported as
     // literal credentials (see cmd_plan for full rationale).
     let policy_cfg = policy::load_policies()?;
-    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    let security_findings = diff::audit_security_with_scope(
+        &desired,
+        policy_cfg.as_ref(),
+        match resolved.ownership.mode {
+            OwnershipMode::Shared => diff::OwnershipScope::Shared {
+                previously_managed: &HashSet::new(),
+            },
+            OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
+        },
+    );
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
     let bundle_loaded = credential_bundle_loaded(&env_config);
 
@@ -3090,6 +3146,8 @@ async fn cmd_review(
         }
     };
 
+    let diffs = apply::order_incremental_diffs(diffs, &desired);
+
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
@@ -3125,6 +3183,12 @@ async fn cmd_review(
         &format!("{:?}", resolved.ownership.mode),
         &format!("{:?}", resolved.apply_strategy),
     );
+    if let Some(note) =
+        apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired)
+    {
+        ownership_note.push_str(note);
+        ownership_note.push_str("\n\n");
+    }
     // A pending mesh retraction is a change to a live control document that
     // never shows up under "Changes" — mesh has no live gateway API to diff
     // against. It rides on the environment banner rather than as a late

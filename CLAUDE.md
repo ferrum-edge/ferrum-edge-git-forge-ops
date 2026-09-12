@@ -37,7 +37,8 @@ gitforgeops plan [--format text|json]                     # Validate + diff + br
                                                           # Includes adoption; exits 1 on offline apply blockers,
                                                           # invalid backup namespaces, or live ownership conflicts
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
-  [--confirm-api-spec-deletion]                           # Apply incrementally (CRUD) or full-replace (/restore)
+  [--confirm-api-spec-deletion] \
+  [--allow-nontransactional-plugin-attach]                # Apply incrementally (CRUD) or full-replace (/restore)
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--credential-bundle-output PRIVATE_PATH] \
   [--accept-unknown-field NAME] \                         # --output-dir required + must be empty; API import requires an explicit namespace filter;
@@ -106,7 +107,9 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               inference; merge_mesh_fragments concatenates lists
                               and errors on conflicting singletons;
                               normalize_consumer_credentials folds bare-object
-                              credentials into the canonical array form)
+                              credentials into the canonical array form;
+                              normalize_proxy_plugin_associations derives scoped
+                              attachments after effective namespace inference)
   → secrets::resolve_secrets (replace ${gh-env-secret:...} placeholders in-memory
                               from FERRUM_CREDS_JSON_FILE or FERRUM_CREDS_JSON,
                               across consumer credentials, plugin config and the
@@ -161,10 +164,23 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 
 ### Apply Strategies
 
-- **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → plugin config → proxy, then deletes in reverse). Proxy association comparisons use ID sets without changing payload order. A fresh backup after scoped plugin writes suppresses proxy updates that already converged, while preserving required ownership assertions. Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to independent per-resource creates on 501. New proxies and their new scoped plugins require one create transaction, even in mixed namespaces; dependency groups never split across chunks or fall back to a partially configured proxy. Failed proxy deletions defer deletion of their referenced plugins.
+- **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → plugin config → proxy, then deletes in reverse). Association comparison sorts IDs without deduplicating live data; payloads and printed changes retain original order. One fresh backup per namespace after scoped plugin writes suppresses proxy updates that already converged, while preserving required ownership assertions (including ledger adoption of unchanged exclusive rows). Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to independent per-resource creates on 501. New proxies and their new scoped plugins require one create transaction by default, even in mixed namespaces. Dependency groups never split across chunks and are deterministic across input ordering. `order_incremental_diffs` shares cycle ordering with plan/review/apply previews, which explain the batch requirement and opt-in below. Failed proxy deletions defer deletion of their referenced plugins: Edge detaches references when deleting a plugin rather than rejecting the delete, so this order preserves a surviving proxy's protection.
 - **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. The body carries the repo's desired rows **plus the complete live spec-owned graph**: `/restore` validates `api_specs.items` against the tagged proxies/upstreams/plugin configs in the same payload and rejects either half on its own, and it re-creates the documents verbatim rather than re-extracting resources from them, so carrying both cannot duplicate rows. An **empty** spec section and all `gateway_trust_bundles` are omitted instead — the gateway reads `items: []` as an intentional wipe but an absent section as "count the live specs and answer 409", and an absent trust section as "leave trust exactly as it is", so omission is what preserves a concurrent update. `--confirm-api-spec-deletion` is the only path that drops the graph (trust bundles still survive). A graph that cannot be proven complete, a repo/spec ID conflict, cached data, or an unfamiliar top-level backup section fails before mutation. Because a non-empty `api_specs` section is a wipe-and-reinsert rather than a merge — and the admin API exposes no `ETag`/`If-Match`/revision a client could use as a precondition — the section is re-read (`GET /backup`) immediately before the POST and the restore is abandoned for that namespace if any spec document changed since the payload was built. That narrows the lost-update window from the whole prepare phase to one round-trip; it cannot close it, because nothing holds the gateway's namespace admission lock across two client calls.
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
+
+`apply --allow-nontransactional-plugin-attach`, also honoured through the strictly
+parsed `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH=true` (default false),
+permits proxy-then-plugin creates only after batch 501/413. It prints a clear
+warning that the proxy is briefly published without its scoped plugin. Only the
+new cyclic associations are omitted from the initial proxy POST; other
+dependencies and all intended associations in desired state remain intact.
+Failed attachment exits nonzero, preserves successful ownership records, and
+defers pruning; the proxy can remain exposed until repair. Other batch rejection
+statuses and ambiguous responses cannot use this exception. Retargeting an
+existing plugin to a brand-new proxy still fails: Edge rejects the plugin update,
+the dependent proxy create is withheld, and pruning is deferred, even with this
+flag. Stage the target separately or use exclusive full replace.
 
 Incremental Add/Modify failures defer every planned Delete in that namespace,
 including failed pending-create ownership assertions. Remaining writes and other
@@ -412,6 +428,20 @@ reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
 where a scoped plugin config replaces a global one of the same `plugin_name`).
 Rules that reason about plugins go through it rather than hard-coding names.
 
+The pre-resolve security audit (`audit_security_with_scope`) classifies plugin
+association conflicts using the environment's ownership mode. References to a
+declared global config or a proxy-scoped config targeting another/no proxy are
+errors in both modes. Every `proxy_group` config with `proxy_id` is also an error,
+whether associated or not. A reference absent from this repository namespace is
+a warning under `OwnershipScope::Shared` and an error under `Exclusive`.
+Remediation is to declare the config here or confirm external ownership; never
+detach a working association merely to silence a missing-declaration warning.
+Assembly keeps invalid references visible. Edge stores disabled proxy-scoped
+associations (they do not satisfy auth checks), removes global associations on
+plugin writes and rejects explicit global references. Import therefore preserves
+valid Edge graphs without special rewrites. The report-free security wrappers
+assume a complete document (exclusive); CLI plan/apply/review pass actual scope.
+
 Severity `error` blocks `apply` unless overridden. Override requires the current
 configured PR label, its latest labeler's current permission ≥
 `overrides.required_permission` (default `write`), and that account's latest
@@ -639,8 +669,8 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 - `src/main.rs` — async Tokio entry, command dispatch
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
-- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
-- `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs`, `best_practice.rs`
+- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
+- `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
@@ -688,6 +718,7 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_ALLOW_UNKNOWN_FIELDS` (default `false`) — keep unknown top-level `spec` fields verbatim instead of rejecting them; nested unknowns stay fatal. For a gateway newer than this release.
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)
+- `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` (default `false`; `true|false|1|0`) — same explicit 501/413 fallback as `apply --allow-nontransactional-plugin-attach`; publishes a new proxy before its new scoped plugins and warns about temporary exposure.
 - `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge; a configured missing directory is fatal — `resolved::validate_overlay_selection` reports it up front naming the environment, the overlay and the declaring file)
 - `FERRUM_EDGE_BINARY_PATH` (default `ferrum-edge` on `$PATH`)
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)

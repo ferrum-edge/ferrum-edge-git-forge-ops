@@ -2570,7 +2570,7 @@ async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_unt
 #[tokio::test]
 async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespaces() {
     for mixed in [false, true] {
-        for batch_status in [200, 400, 501] {
+        for batch_status in [200, 400, 413, 501] {
             let desired = scoped_plugin_desired();
             let actual = GatewayConfig {
                 proxies: if mixed {
@@ -2617,6 +2617,428 @@ async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespace
             assert_eq!(body["plugin_configs"][0]["proxy_id"], "p1");
         }
     }
+}
+
+#[tokio::test]
+async fn opted_in_batch_fallback_publishes_proxy_then_attaches_scoped_plugin() {
+    for mixed in [false, true] {
+        for batch_status in [400, 413, 501] {
+            let desired = scoped_plugin_desired();
+            let actual = GatewayConfig {
+                proxies: if mixed {
+                    vec![proxy("old", "team-alpha", None)]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let (url, requests) = spawn_recording_gateway(vec![(
+                "POST /batch".into(),
+                batch_status,
+                r#"{"error":"batch rejected"}"#.into(),
+                vec![],
+            )]);
+            let result = apply_api(
+                &desired,
+                &stub_client(url),
+                &["team-alpha".into()],
+                OwnershipScope::Exclusive,
+                Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+                None,
+                &ApplyOptions {
+                    allow_nontransactional_plugin_attach: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let permitted = batch_status != 400;
+            let mut expected = vec!["POST /batch HTTP/1.1"];
+            if permitted {
+                expected.extend([
+                    "POST /proxies HTTP/1.1",
+                    "POST /plugins/config HTTP/1.1",
+                ]);
+                if mixed {
+                    expected.push("DELETE /proxies/old?cleanup_orphaned_upstream=false HTTP/1.1");
+                }
+            }
+            assert_eq!(mutation_lines(&requests), expected);
+            assert_eq!(result.created, if permitted { 2 } else { 0 });
+            assert_eq!(result.errors.is_empty(), permitted);
+            assert_eq!(result.deletes_deferred, usize::from(mixed && !permitted));
+            if permitted {
+                let requests = requests.lock().unwrap();
+                let request = requests
+                    .iter()
+                    .find(|request| request.starts_with("POST /proxies "))
+                    .unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(body["plugins"], serde_json::json!([]));
+                assert_eq!(desired.proxies[0].plugins[0].plugin_config_id, "pc1");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_opted_in_attachment_preserves_proxy_ownership_and_defers_pruning() {
+    let desired = scoped_plugin_desired();
+    let actual = GatewayConfig {
+        proxies: vec![proxy("old", "team-alpha", None)],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        ("POST /plugins/config".into(), 400, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions {
+            allow_nontransactional_plugin_attach: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.created, 1);
+    assert_eq!(result.applied_incremental[0].kind, "Proxy");
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(result.deletes_deferred, 1);
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /batch HTTP/1.1",
+            "POST /proxies HTTP/1.1",
+            "POST /plugins/config HTTP/1.1",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn opted_in_proxy_create_preserves_external_associations_and_gates_failed_targets() {
+    for proxy_status in [200, 400] {
+        let mut desired = scoped_plugin_desired();
+        let association = gitforgeops::config::schema::PluginAssociation {
+            plugin_config_id: "shared-cors".into(),
+        };
+        desired.proxies[0].plugins.push(association);
+        let mut shared = plugin_config("shared-cors", "team-alpha", "unused", None);
+        shared.scope = gitforgeops::config::schema::PluginScope::ProxyGroup;
+        shared.proxy_id = None;
+        let actual = GatewayConfig {
+            plugin_configs: vec![shared],
+            ..Default::default()
+        };
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("POST /batch".into(), 501, "{}".into(), vec![]),
+            ("POST /proxies".into(), proxy_status, "{}".into(), vec![]),
+        ]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Shared {
+                previously_managed: &HashSet::new(),
+            },
+            Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+            None,
+            &ApplyOptions {
+                allow_nontransactional_plugin_attach: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut expected = vec!["POST /batch HTTP/1.1", "POST /proxies HTTP/1.1"];
+        if proxy_status == 200 {
+            expected.push("POST /plugins/config HTTP/1.1");
+            assert!(result.errors.is_empty());
+        } else {
+            assert_eq!(result.created, 0);
+            assert_eq!(result.errors.len(), 2);
+        }
+        assert_eq!(mutation_lines(&requests), expected);
+        let requests = requests.lock().unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.starts_with("POST /proxies "))
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["plugins"],
+            serde_json::json!([{"plugin_config_id": "shared-cors"}])
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure() {
+    let desired = scoped_plugin_desired();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("POST /batch".into(), 503, "{}".into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&desired),
+            vec![],
+        ),
+        ("PUT /plugins/config/pc1".into(), 500, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Shared {
+            previously_managed: &HashSet::new(),
+        },
+        Some(&BTreeMap::from([(
+            "team-alpha".into(),
+            GatewayConfig::default(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.fatal_error.is_none());
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(result.created, 1);
+    assert_eq!(result.applied_incremental[0].kind, "Proxy");
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /batch HTTP/1.1",
+            "PUT /plugins/config/pc1 HTTP/1.1",
+            "PUT /proxies/p1 HTTP/1.1",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn one_post_plugin_snapshot_adopts_all_unchanged_exclusive_proxies() {
+    let mut desired = scoped_plugin_desired();
+    desired.proxies.push(proxy("p2", "team-alpha", None));
+    desired
+        .plugin_configs
+        .push(plugin_config("pc2", "team-alpha", "p2", None));
+    gitforgeops::config::assembler::normalize_proxy_plugin_associations(&mut desired);
+    let mut actual = desired.clone();
+    actual.plugin_configs.clear();
+    for proxy in &mut actual.proxies {
+        proxy.plugins.clear();
+    }
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "GET /backup".into(),
+        200,
+        backup_body(&desired),
+        vec![],
+    )]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty());
+    assert_eq!(result.updated, 0);
+    assert_eq!(result.created, 2);
+    assert_eq!(result.adopted.len(), 2);
+    assert!(result.adopted.iter().all(|op| op.kind == "Proxy"));
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /plugins/config HTTP/1.1",
+            "POST /plugins/config HTTP/1.1"
+        ]
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("GET /backup"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn existing_plugin_retarget_to_new_proxy_fails_closed_even_with_opt_in() {
+    let desired = scoped_plugin_desired();
+    let mut actual = desired.clone();
+    actual.proxies[0].id = "old".into();
+    actual.plugin_configs[0].proxy_id = Some("old".into());
+    for allow in [false, true] {
+        let (url, requests) = spawn_recording_gateway(vec![(
+            "PUT /plugins/config/pc1".into(),
+            400,
+            r#"{"error":"target proxy does not exist"}"#.into(),
+            vec![],
+        )]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([("team-alpha".into(), actual.clone())])),
+            None,
+            &ApplyOptions {
+                allow_nontransactional_plugin_attach: allow,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.errors.len(), 2);
+        assert!(result.errors[0].contains("target proxy does not exist"));
+        assert_eq!(result.deletes_deferred, 1);
+        assert!(result.applied_incremental.is_empty());
+        assert_eq!(
+            mutation_lines(&requests),
+            vec!["PUT /plugins/config/pc1 HTTP/1.1"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_proxy_scope_with_stray_target_does_not_enter_batch_only_path() {
+    use gitforgeops::config::schema::PluginScope;
+
+    for scope in [PluginScope::Global, PluginScope::ProxyGroup] {
+        let mut desired = scoped_plugin_desired();
+        desired.plugin_configs[0].scope = scope;
+        desired.proxies[0].plugins.clear();
+        let diffs = gitforgeops::diff::compute_diff(&desired, &GatewayConfig::default());
+        assert!(gitforgeops::apply::incremental_plugin_attach_notice(
+            &Default::default(),
+            &diffs,
+            &desired,
+        )
+        .is_none());
+        // The API-target library does not replace the CLI's schema/security
+        // gate. This isolates dependency classification for malformed targets.
+        let (url, requests) = spawn_recording_gateway(vec![(
+            "POST /batch".into(),
+            501,
+            "{}".into(),
+            vec![],
+        )]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([(
+                "team-alpha".into(),
+                GatewayConfig::default(),
+            )])),
+            None,
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            mutation_lines(&requests),
+            vec![
+                "POST /batch HTTP/1.1",
+                "POST /plugins/config HTTP/1.1",
+                "POST /proxies HTTP/1.1",
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fallback() {
+    use gitforgeops::apply::{incremental_plugin_attach_notice, order_incremental_diffs};
+    use gitforgeops::review::pr_comment::{
+        build_review_comment_v2_with_status, ReviewValidationStatus,
+    };
+
+    let mut desired = scoped_plugin_desired();
+    let mut independent = plugin_config("independent", "team-alpha", "unused", None);
+    independent.scope = gitforgeops::config::schema::PluginScope::Global;
+    independent.proxy_id = None;
+    desired.plugin_configs.push(independent);
+    let actual = GatewayConfig {
+        proxies: vec![proxy("old", "team-alpha", None)],
+        ..Default::default()
+    };
+    let mut old = actual.proxies[0].clone();
+    old.backend_port = 9090;
+    desired.proxies.push(old);
+    let diffs = order_incremental_diffs(
+        gitforgeops::diff::compute_diff(&desired, &actual),
+        &desired,
+    );
+    assert_eq!(
+        diffs
+            .iter()
+            .map(|diff| diff.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["independent", "pc1", "p1", "old"]
+    );
+    let note =
+        incremental_plugin_attach_notice(&Default::default(), &diffs, &desired).unwrap();
+    let review = build_review_comment_v2_with_status(
+        ReviewValidationStatus::Passed,
+        "",
+        &diffs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some(note),
+        &Default::default(),
+        false,
+    );
+    assert!(review.contains("POST /batch"));
+    assert!(review.contains("--allow-nontransactional-plugin-attach"));
+    assert!(review.contains("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH=true"));
+    assert!(review.contains("briefly published without its scoped plugin"));
+    assert!(
+        incremental_plugin_attach_notice(&ApplyStrategy::FullReplace, &diffs, &desired).is_none()
+    );
+    let (url, requests) = spawn_recording_gateway(vec![]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty());
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /plugins/config HTTP/1.1",
+            "POST /batch HTTP/1.1",
+            "PUT /proxies/old HTTP/1.1",
+        ]
+    );
 }
 
 fn ledger_of(ops: &[gitforgeops::apply::AppliedOp], desired: &GatewayConfig) -> StateFile {

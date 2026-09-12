@@ -22,6 +22,7 @@ fn clear_env() {
         "FERRUM_NAMESPACE",
         "FERRUM_GATEWAY_MODE",
         "FERRUM_APPLY_STRATEGY",
+        "GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH",
         "FERRUM_OVERLAY",
         "FERRUM_FILE_OUTPUT_PATH",
         "FERRUM_MESH_FILE_OUTPUT_PATH",
@@ -47,6 +48,31 @@ fn clear_env() {
     ] {
         std::env::remove_var(var);
     }
+}
+
+#[test]
+fn nontransactional_plugin_attach_env_is_explicit_and_strict() {
+    let _guard = env_guard();
+    clear_env();
+    let config = load_env_config().unwrap();
+    assert!(!config.allow_nontransactional_plugin_attach);
+    for (value, enabled) in [
+        ("true", true),
+        ("1", true),
+        ("false", false),
+        ("0", false),
+        ("", false),
+    ] {
+        std::env::set_var("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH", value);
+        let config = load_env_config().unwrap();
+        assert_eq!(config.allow_nontransactional_plugin_attach, enabled);
+    }
+    std::env::set_var("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH", "yes");
+    assert!(load_env_config()
+        .unwrap_err()
+        .to_string()
+        .contains("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH"));
+    clear_env();
 }
 
 #[test]

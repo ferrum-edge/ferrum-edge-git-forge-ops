@@ -4,7 +4,8 @@ use gitforgeops::config::assembler::normalize_proxy_plugin_associations;
 use gitforgeops::config::schema::{GatewayConfig, Proxy, Resource};
 use gitforgeops::config::{apply_overlay, assemble};
 use gitforgeops::diff::resource_diff::{compute_diff, compute_diff_with_ownership, DiffAction};
-use gitforgeops::diff::security::{audit_security, security_blockers};
+use gitforgeops::diff::security::{audit_security, audit_security_with_scope, security_blockers};
+use gitforgeops::diff::OwnershipScope;
 use gitforgeops::policy::{evaluate_policies, PolicyConfig};
 use serde_json::json;
 
@@ -176,6 +177,35 @@ fn opaque_plugin_arrays_remain_order_sensitive() {
 }
 
 #[test]
+fn live_duplicate_associations_are_drift_and_changes_preserve_wire_order() {
+    let desired = assemble(vec![
+        proxy(&["b", "a"]),
+        plugin("a", "proxy", Some("api")),
+        plugin("b", "proxy", Some("api")),
+    ])
+    .unwrap()
+    .gateway;
+    let mut live = desired.clone();
+    let duplicate = live.proxies[0].plugins[1].clone();
+    live.proxies[0].plugins.push(duplicate);
+    let changes = compute_diff(&desired, &live);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].details[0].field, "plugins");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&changes[0].details[0].old_value).unwrap(),
+        json!([
+            {"plugin_config_id": "b"},
+            {"plugin_config_id": "a"},
+            {"plugin_config_id": "a"},
+        ])
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&changes[0].details[0].new_value).unwrap(),
+        json!([{"plugin_config_id": "b"}, {"plugin_config_id": "a"}])
+    );
+}
+
+#[test]
 fn derived_order_is_independent_of_resource_order_and_normalization_is_idempotent() {
     let resources = vec![
         proxy(&[]),
@@ -296,7 +326,6 @@ fn mismatched_explicit_associations_remain_visible_and_block_apply() {
         ("proxy", None),
         ("global", None),
         ("global", Some("api")),
-        ("proxy_group", Some("api")),
     ] {
         for enabled in [true, false] {
             let mut auth = plugin("auth", scope, proxy_id);
@@ -317,6 +346,14 @@ fn mismatched_explicit_associations_remain_visible_and_block_apply() {
             assert_eq!(blockers[0].severity, "error");
             assert_eq!(blockers[0].id, "api");
             assert_eq!(blockers[0].namespace, "team-alpha");
+            let shared_findings = audit_security_with_scope(
+                &config,
+                None,
+                OwnershipScope::Shared {
+                    previously_managed: &Default::default(),
+                },
+            );
+            assert_eq!(security_blockers(&shared_findings).len(), 1);
             assert!(blockers[0]
                 .message
                 .contains("invalid plugin association auth"));
@@ -339,10 +376,69 @@ fn explicit_reference_cannot_resolve_a_plugin_in_another_namespace() {
     assert_eq!(blockers.len(), 1);
     assert!(blockers[0]
         .message
-        .contains("no PluginConfig with that ID exists in this namespace"));
+        .contains("no PluginConfig with that ID is declared in this repository namespace"));
     assert!(findings
         .iter()
         .any(|finding| finding.message.contains("No auth plugin")));
+}
+
+#[test]
+fn undeclared_associations_warn_in_shared_and_block_in_exclusive() {
+    let config = assemble(vec![proxy(&["shared-cors"])]).unwrap().gateway;
+    let managed = Default::default();
+    for (scope, severity) in [
+        (
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            },
+            "warning",
+        ),
+        (OwnershipScope::Exclusive, "error"),
+    ] {
+        let findings = audit_security_with_scope(&config, None, scope);
+        let association = findings
+            .iter()
+            .find(|finding| finding.message.contains("shared-cors"))
+            .unwrap();
+        assert_eq!(association.severity, severity);
+        assert!(association
+            .message
+            .contains("confirm it is owned elsewhere"));
+        assert!(!association.message.contains("remove"));
+        assert_eq!(
+            security_blockers(&findings).len(),
+            usize::from(severity == "error")
+        );
+    }
+    assert_eq!(association_ids(&config.proxies[0]), vec!["shared-cors"]);
+}
+
+#[test]
+fn proxy_group_target_conflict_blocks_even_without_any_explicit_association() {
+    for associated in [false, true] {
+        let config = assemble(vec![
+            proxy(if associated { &["auth"] } else { &[] }),
+            plugin("auth", "proxy_group", Some("api")),
+        ])
+        .unwrap()
+        .gateway;
+        let managed = Default::default();
+        for scope in [
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            },
+            OwnershipScope::Exclusive,
+        ] {
+            let findings = audit_security_with_scope(&config, None, scope);
+            let blockers = security_blockers(&findings);
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].kind, "PluginConfig");
+            assert_eq!(blockers[0].id, "auth");
+            assert!(blockers[0]
+                .message
+                .contains("requires proxy_id to be omitted"));
+        }
+    }
 }
 
 #[test]
