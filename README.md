@@ -1424,7 +1424,7 @@ Runtime variables supported by the binary include:
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_ENV` | — | Environment selected from `.gitforgeops/config.yaml`; overridden by global `--env`. |
-| `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all namespaces. |
+| `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all namespaces. `validate`, `plan`, and `diff` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` (CLI-only) demotes that to a warning. |
 | `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown **top-level** `spec` fields verbatim instead of rejecting them, for a gateway newer than this release. Nested unknown fields stay fatal either way. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones). |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Legacy/env-driven strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
 | `FERRUM_OVERLAY` | — | Legacy overlay selector used only without repo config/env selection. |
@@ -1451,12 +1451,12 @@ is `PASSED`.
 
 ## CLI reference
 
-All commands accept `--env <name>` and `--allow-credential-slot-remap` globally.
+All commands accept `--env <name>`, `--allow-credential-slot-remap`, and `--allow-empty-namespace` globally.
 
 ```
 gitforgeops validate [--format text|json|github|github-annotations]
-gitforgeops diff [--exit-on-drift]
-gitforgeops plan
+gitforgeops diff [--exit-on-drift] [--format text|json]
+gitforgeops plan [--format text|json]
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
 gitforgeops export [--output PATH] [--materialize] [--encrypt-to GH_LOGIN]
 gitforgeops import --from-api | --from-file PATH --output-dir DIR \
@@ -1505,6 +1505,7 @@ Notes:
 - `--confirm-api-spec-deletion` is the opt-in for touching resources the gateway's OpenAPI spec importer owns: a namespace with live API specs otherwise rejects `full_replace`, and exclusive incremental apply otherwise skips tagged resources. Repository/spec identity conflicts always block the whole apply before unrelated writes; the confirmation flag is not a way to make two owners share one row.
 - `--allow-large-prune` acknowledges only the configured deletion percentage. A cached (`X-Data-Source: cached`) backup blocks every mutation and has no override because API-spec ownership is unknown.
 - `--allow-credential-slot-remap` accepts a credential-array shape change that reassigns a stored broker slot. Slot identity is the entry's array index, so shrinking a multi-entry credential hands the retired slot's value to whichever entry shifts into its index. The safe sequence is `gitforgeops rotate --credential <type>/[N]/<key>` first, remove the entry second; see [Hazard: entry position is the slot identity](#hazard-entry-position-is-the-slot-identity). There is deliberately no environment variable for it — accepting a credential reassignment is a per-run decision, not a repository setting.
+- `--allow-empty-namespace` accepts a namespace filter that selected zero desired resources while the on-disk tree is non-empty. Without it, `validate`, `plan`, and `diff` refuse that mismatch as an error-severity finding and exit `1` (the same ordinary-error code as other fail-closed findings; not the drift code `2`). The diagnostic names the active namespace, the namespaces present on disk, and the desired/on-disk counts. `--format json` adds those fields without renaming existing keys. `plan` and `diff` also warn when filtered live inventory is empty solely because the filter matched no live namespace, while `GET /namespaces` still lists others; that live miss is a warning unless the desired set is also empty. There is deliberately no environment variable for it. An empty resource tree is not a mismatch.
 - **`plan` exits non-zero for every offline reason `apply` refuses.** The two commands share one computation (`src/verdict.rs`), so a clean plan cannot promise an apply that deterministically fails. The classes are: schema validation (gateway or mesh) failing or not running; an error-severity finding from the pre-resolve security audit; an error-severity policy violation that no override cleared; an `alloc=require` credential slot with no bundle value; an unacknowledged credential-slot remap; and missing provisioning environment variables when credentials await allocation. Every one is printed in full first, then an `=== Apply Blockers ===` section names each class, its count and its remedy, followed by a one-line summary — the exit code carries nothing the operator has not already seen. Warning-severity findings never block. Slots awaiting `alloc=generate` are ordinary work only when `FERRUM_GH_PROVISIONER_TOKEN` and `GITHUB_REPOSITORY` are present. `plan` and `review` report each missing variable and exit 1; apply keeps the same refusal text and allocation ordering. Presence is checked offline; token validity still requires GitHub. Seeded slots need neither variable. Overrides are evaluated exactly as `apply` evaluates them, and fail closed: an absent PR, an unverified permission, or an unreachable GitHub API leaves every blocking finding standing. Gates that need a live gateway (large-prune threshold, stale-view block, per-resource write failures) are deliberately outside this set — a preview cannot decide them, and an empty blocker list promises only that nothing decidable *from the repository* stops an apply.
 
 | Provisioning blocker | Applies when allocation is pending |

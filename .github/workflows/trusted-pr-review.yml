@@ -233,10 +233,13 @@ jobs:
           # the current and previous resource/overlay paths from the stable PR
           # file snapshot. FERRUM_NAMESPACE later narrows both desired loading
           # and the JWT `ns` claim, so an untrusted YAML namespace override
-          # cannot turn live review into a cross-namespace read primitive. New
-          # namespaces receive static validation only until their directory is
-          # trusted on main. Protected config-only changes remain static-only
-          # because privileged review replaces candidate `.gitforgeops` files.
+          # cannot turn live review into a cross-namespace read primitive.
+          # Matrix namespaces come from protected-branch resource directories;
+          # a mistyped filter now fails `validate` closed (exit 1) rather than
+          # going green against an empty desired set. New namespaces receive
+          # static validation only until their directory is trusted on main.
+          # Protected config-only changes remain static-only because privileged
+          # review replaces candidate `.gitforgeops` files.
           targets=$(python3 trusted/.github/scripts/pr_input.py targets \
             trusted "$scopes" "$RUNNER_TEMP/trusted-changed-paths.json")
           echo "Trusted source SHA: ${{ steps.metadata.outputs.trusted_sha }}"

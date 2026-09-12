@@ -28,6 +28,10 @@ pub struct AssembledOutput {
     /// Directory namespace and diagnostic label of each selected mesh fragment.
     /// Retained across merging; namespaces inside mesh entries are not scope.
     pub mesh_sources: Vec<(String, String)>,
+    /// Filter diagnosis populated by the CLI load boundary. Assembly itself
+    /// leaves this at [`Default`]; `load_and_assemble_all` fills it after
+    /// overlays and namespace selection.
+    pub namespace_scope: super::namespace_guard::NamespaceScope,
 }
 
 impl AssembledOutput {
@@ -129,6 +133,7 @@ pub fn assemble_with_namespace_filter(
         gateway: config,
         mesh: merge_mesh_fragments(mesh_fragments)?,
         mesh_sources,
+        namespace_scope: super::namespace_guard::NamespaceScope::default(),
     })
 }
 

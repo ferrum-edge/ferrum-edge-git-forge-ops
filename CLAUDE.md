@@ -22,12 +22,18 @@ is a per-run decision, not a repository setting. The safe alternative is
 slot-addressed rotation: `gitforgeops rotate --credential <type>/[N]/<key>`
 first, remove the entry second.
 
+`--allow-empty-namespace` is the same kind of CLI-only acknowledgement. A
+mistyped `FERRUM_NAMESPACE` that selects zero desired resources while the
+on-disk tree is non-empty is an error-severity finding on `validate`,
+`plan`, and `diff` (exit 1, not the drift code 2). The flag demotes that
+finding to a warning. There is no environment variable for it.
+
 ```bash
 gitforgeops validate [--format text|json|github|github-annotations] # Assemble + shell to `ferrum-edge validate`
 gitforgeops export [--output PATH]                        # Emit flat YAML (placeholders preserved) + mesh doc
 gitforgeops export --materialize [--encrypt-to GH_LOGIN]  # Resolve creds; age-encrypt output (file mode stage 2)
-gitforgeops diff [--exit-on-drift]                        # Compare desired vs live gateway (/backup)
-gitforgeops plan                                          # Validate + diff + breaking + security + best-practice + policy
+gitforgeops diff [--exit-on-drift] [--format text|json]    # Compare desired vs live gateway (/backup)
+gitforgeops plan [--format text|json]                     # Validate + diff + breaking + security + best-practice + policy
                                                           # Includes adoption; exits 1 on offline apply blockers,
                                                           # invalid backup namespaces, or live ownership conflicts
 gitforgeops apply [--auto-approve] [--allow-large-prune] \
@@ -189,7 +195,7 @@ Publication is a **reconciliation**, not a conditional write: `apply::reconcile_
 ### Namespace Handling
 
 - Directory-inferred: `resources/<ns>/…` → resource `namespace: <ns>` unless the spec overrides with a non-default value.
-- `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset.
+- `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset. `validate`, `plan`, and `diff` fail closed when the filter selects zero desired resources while the on-disk tree contains at least one resource; `--allow-empty-namespace` (CLI-only) demotes that to a warning. When filtered live inventory is empty solely because the filter matched no live namespace, `plan` and `diff` say so in text and JSON.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
 - `BackupSnapshot::from_scoped_body` validates every resource's explicit wire namespace
   before deserialization can default it. Missing or foreign namespaces refuse the
@@ -678,7 +684,7 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_ADMIN_JWT_ROLE` (default `admin`) — `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only
 - `FERRUM_ADMIN_JWT_AUDIENCE` (default unset) — `aud` is emitted only when set; a gateway with no audience rejects tokens carrying it
 - `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`) — must be within the gateway's `FERRUM_ADMIN_JWT_MAX_TTL`
-- `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace)
+- `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace). `validate`, `plan`, and `diff` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` (CLI-only, no env var) demotes that refusal to a warning.
 - `FERRUM_ALLOW_UNKNOWN_FIELDS` (default `false`) — keep unknown top-level `spec` fields verbatim instead of rejecting them; nested unknowns stay fatal. For a gateway newer than this release.
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)

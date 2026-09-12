@@ -1,5 +1,5 @@
 use clap::Parser;
-use gitforgeops::cli::{Cli, Commands, EnvsFormat, ValidateFormat};
+use gitforgeops::cli::{Cli, Commands, EnvsFormat, ReportFormat, ValidateFormat};
 
 #[test]
 fn cli_import_from_api_is_a_flag() {
@@ -91,6 +91,8 @@ fn cli_rejects_conflicting_import_sources() {
 fn cli_rejects_unknown_format_values() {
     assert!(Cli::try_parse_from(["gitforgeops", "validate", "--format", "jsn"]).is_err());
     assert!(Cli::try_parse_from(["gitforgeops", "envs", "--format", "yaml"]).is_err());
+    assert!(Cli::try_parse_from(["gitforgeops", "plan", "--format", "jsn"]).is_err());
+    assert!(Cli::try_parse_from(["gitforgeops", "diff", "--format", "yaml"]).is_err());
 }
 
 #[test]
@@ -133,6 +135,31 @@ fn cli_accepts_documented_format_values() {
     match review.command {
         Commands::Review { require_live, .. } => assert!(require_live),
         _ => panic!("expected review command"),
+    }
+
+    let plan = Cli::try_parse_from(["gitforgeops", "plan", "--format", "json"]).unwrap();
+    match plan.command {
+        Commands::Plan { format } => assert!(matches!(format, ReportFormat::Json)),
+        _ => panic!("expected plan command"),
+    }
+
+    let diff = Cli::try_parse_from(["gitforgeops", "diff", "--format", "json"]).unwrap();
+    match diff.command {
+        Commands::Diff { format, .. } => assert!(matches!(format, ReportFormat::Json)),
+        _ => panic!("expected diff command"),
+    }
+}
+
+#[test]
+fn cli_plan_and_diff_default_to_text() {
+    for command in ["plan", "diff"] {
+        let cli = Cli::try_parse_from(["gitforgeops", command]).unwrap();
+        match cli.command {
+            Commands::Plan { format } | Commands::Diff { format, .. } => {
+                assert!(matches!(format, ReportFormat::Text));
+            }
+            _ => panic!("expected plan or diff command"),
+        }
     }
 }
 
@@ -219,6 +246,35 @@ fn cli_exposes_the_credential_slot_remap_opt_in_globally() {
         let cli = Cli::try_parse_from(argv.clone())
             .unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
         assert!(cli.allow_credential_slot_remap, "{argv:?}");
+    }
+}
+
+#[test]
+fn cli_exposes_the_empty_namespace_opt_in_globally() {
+    // Continuing against an empty selection is a per-run decision, so the
+    // acknowledgement is CLI-only (no env var) and reachable before or after
+    // the subcommand, matching `--allow-credential-slot-remap`.
+    let default = Cli::try_parse_from(["gitforgeops", "validate"]).unwrap();
+    assert!(
+        !default.allow_empty_namespace,
+        "an empty namespace filter must be refused unless explicitly accepted"
+    );
+
+    for argv in [
+        vec!["gitforgeops", "validate", "--allow-empty-namespace"],
+        vec!["gitforgeops", "--allow-empty-namespace", "validate"],
+        vec!["gitforgeops", "plan", "--allow-empty-namespace"],
+        vec!["gitforgeops", "diff", "--allow-empty-namespace"],
+        vec![
+            "gitforgeops",
+            "diff",
+            "--exit-on-drift",
+            "--allow-empty-namespace",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(argv.clone())
+            .unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
+        assert!(cli.allow_empty_namespace, "{argv:?}");
     }
 }
 
