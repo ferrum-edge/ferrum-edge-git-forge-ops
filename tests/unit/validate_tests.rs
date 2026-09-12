@@ -815,9 +815,39 @@ fn format_results_without_mesh_is_unchanged() {
         OutputFormat::GithubAnnotations,
     ] {
         assert_eq!(
-            format_results(&gateway, None, format.clone()),
+            format_results(&gateway, None, format),
             format_result(&gateway, format)
         );
+    }
+}
+
+#[test]
+fn validation_json_with_namespace_scope_is_one_document() {
+    let scope = gitforgeops::config::NamespaceScope::with_desired(
+        Some("does-not-exist"),
+        vec!["ferrum".to_string()],
+        1,
+        &Default::default(),
+        0,
+    );
+    let finding = scope.desired_finding(false);
+    let gateway = result(false, "Spec: rejected\n", "error: bad \"value\"\n");
+    for mesh in [None, Some(result(true, "Mesh: OK\n", ""))] {
+        let formatted = format_results(&gateway, mesh.as_ref(), OutputFormat::Json);
+        let output = gitforgeops::config::merge_scope_json(&formatted, &scope, finding.as_ref());
+        let value: serde_json::Value = serde_json::from_str(&output).expect("JSON-only output");
+        assert_eq!(value["success"], false);
+        let gateway_value = if mesh.is_some() {
+            &value["gateway"]
+        } else {
+            &value
+        };
+        assert_eq!(gateway_value["exit_code"], 1);
+        assert_eq!(gateway_value["stdout"], gateway.stdout);
+        assert_eq!(gateway_value["stderr"], gateway.stderr);
+        assert_eq!(value["namespace"], "does-not-exist");
+        assert_eq!(value["desired_count"], 0);
+        assert_eq!(value["empty_namespace_filter"], "error");
     }
 }
 

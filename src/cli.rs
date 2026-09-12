@@ -33,6 +33,14 @@ pub struct Cli {
     /// `export --materialize` and `rotate` all go through.
     #[arg(long, global = true)]
     pub allow_credential_slot_remap: bool,
+
+    /// Accept a namespace filter that selected zero desired resources while
+    /// the on-disk tree is non-empty. Without this flag `validate`, `plan`,
+    /// and `diff` refuse that mismatch as an error-severity finding (exit 1).
+    /// There is deliberately no environment variable — continuing against an
+    /// empty selection is a per-run decision, not a repository setting.
+    #[arg(long, global = true)]
+    pub allow_empty_namespace: bool,
 }
 
 #[derive(Subcommand)]
@@ -59,8 +67,13 @@ pub enum Commands {
     Diff {
         #[arg(long)]
         exit_on_drift: bool,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
     },
-    Plan {},
+    Plan {
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+    },
     Apply {
         #[arg(long)]
         auto_approve: bool,
@@ -166,4 +179,12 @@ pub enum ValidateFormat {
 pub enum EnvsFormat {
     Json,
     Text,
+}
+
+/// Machine-readable report for `plan` and `diff`. `validate` keeps its own
+/// [`ValidateFormat`] because it also emits GitHub Actions annotations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReportFormat {
+    Text,
+    Json,
 }
