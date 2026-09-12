@@ -1734,7 +1734,11 @@ fn review_exits_zero_by_default_when_the_verdict_says_apply_is_blocked() {
         stdout(&output),
         stderr(&output)
     );
-    assert!(stdout(&output).contains("Apply is blocked"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("Apply is blocked"),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]
@@ -1755,14 +1759,26 @@ fn review_fail_on_blockers_exits_one_when_apply_is_blocked() {
         "the rendered verdict must be identical with or without the flag"
     );
     assert!(stdout(&flagged).contains("Apply is blocked"));
-    assert!(stderr(&flagged).contains("apply is blocked by"), "{}", stderr(&flagged));
+    assert!(
+        stderr(&flagged).contains("apply is blocked by"),
+        "{}",
+        stderr(&flagged)
+    );
 }
 
 #[test]
 fn review_fail_on_blockers_env_matches_the_cli_flag() {
     let repo = Repo::with_consumer(LITERAL_CONSUMER);
-    let output = repo.run(&["review"], &[("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "true")]);
-    assert!(!output.status.success(), "{} {}", stdout(&output), stderr(&output));
+    let output = repo.run(
+        &["review"],
+        &[("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "true")],
+    );
+    assert!(
+        !output.status.success(),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
     assert!(stdout(&output).contains("Apply is blocked"));
 }
 
@@ -1774,7 +1790,12 @@ fn review_fail_on_blockers_exits_zero_when_nothing_blocks() {
         &["review", "--fail-on-blockers"],
         &[("FERRUM_CREDS_JSON", BUNDLE)],
     );
-    assert!(defaulted.status.success(), "{} {}", stdout(&defaulted), stderr(&defaulted));
+    assert!(
+        defaulted.status.success(),
+        "{} {}",
+        stdout(&defaulted),
+        stderr(&defaulted)
+    );
     assert!(
         flagged.status.success(),
         "no offline blocker: {} {}",
@@ -1782,7 +1803,11 @@ fn review_fail_on_blockers_exits_zero_when_nothing_blocks() {
         stderr(&flagged)
     );
     assert_eq!(stdout(&defaulted), stdout(&flagged));
-    assert!(!stdout(&flagged).contains("Apply is blocked"), "{}", stdout(&flagged));
+    assert!(
+        !stdout(&flagged).contains("Apply is blocked"),
+        "{}",
+        stdout(&flagged)
+    );
 }
 
 #[test]
@@ -1801,5 +1826,9 @@ fn review_fail_on_blockers_covers_missing_required_slots() {
         stderr(&flagged)
     );
     assert_eq!(stdout(&defaulted), stdout(&flagged));
-    assert!(stdout(&flagged).contains("Apply is blocked"), "{}", stdout(&flagged));
+    assert!(
+        stdout(&flagged).contains("Apply is blocked"),
+        "{}",
+        stdout(&flagged)
+    );
 }
