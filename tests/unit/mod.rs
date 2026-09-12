@@ -14,6 +14,7 @@ mod json_output_tests;
 mod jwt_tests;
 mod loader_tests;
 mod log_injection_tests;
+mod mesh_minimal_tests;
 mod mesh_tests;
 mod override_tests;
 mod ownership_tests;

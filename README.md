@@ -713,6 +713,16 @@ overrides:
 
 ### Override flow (B2: label + permission)
 
+#### Overrides are evaluated only on a GitHub pull request
+
+Policy error overrides (`gitforgeops/policy-override` plus the permission and revision-bound review checks) run only when gitforgeops can associate a GitHub pull request with the current commit — typically `GITFORGEOPS_PR_NUMBER` in CI, or the PR GitHub links to `GITHUB_SHA` on a post-merge apply. Local `plan`/`apply` runs, and any other invocation without that association, leave every blocking finding standing and print:
+
+> No PR is associated with this commit; overrides were not evaluated. Policy overrides are evaluated only on a GitHub pull request; see README.md#overrides-are-evaluated-only-on-a-github-pull-request.
+
+That is intentional. There is **no** environment variable, flag, or offline escape hatch: an override path that worked without a PR would weaken the production safety boundary (the same label + current permission + revision-bound review checks that CI enforces).
+
+To exercise the override path, open a pull request against a **disposable fork** (or a throwaway branch on a template copy of this repository), add the configured label, and submit the revision-bound review from an account with `write` permission (or higher). Use the real GitHub flow; do not try to simulate it locally.
+
 1. Someone with `write` repo permission (or higher — configurable) adds the `gitforgeops/policy-override` label to the PR.
 2. That same account submits a PR review on the current head, using **Comment** or **Approve**, with the entire body `gitforgeops-override gitforgeops/policy-override` (substitute your configured label). An ordinary approval is not an override request. The review's GitHub `commit_id` binds the request to that revision; a label event's `commit_id` is not a labeled-at head. See [GitHub review semantics](https://docs.github.com/en/rest/pulls/reviews) and [issue event semantics](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types).
 3. On the next run, gitforgeops verifies the current label, latest labeler, current permission, and that account's latest submitted review. The review must explicitly authorize the current PR head. A later push, dismissed review, rejection, or ordinary submitted review requires a new explicit override review. Missing evidence, incomplete pagination, and API failures leave blockers enforced. Existing label-only overrides must migrate to this review flow.
@@ -1069,6 +1079,8 @@ An api-mode `apply` neither publishes nor retracts (there is no mesh admin API);
 ### Validation, and the absence of a mesh admin API
 
 `validate`, `plan`, and `apply` run a **second** validation pass, `ferrum-edge validate -m mesh`, against the rendered document (byte-for-byte what gets published, `version` stamp included). That pass runs the same parse → normalize → validate → slice-derivation pipeline a mesh node runs at startup. It only runs when the repo actually declares mesh fragments.
+
+`tests/fixtures/companion-schema/` is a serde every-field mirror and is **not** a working mesh document — `ferrum-edge validate -m mesh` rejects it by design (missing workload `selector`, mutually exclusive TLS fields, and similar). `tests/fixtures/mesh-minimal/` is the opposite contract: a MeshConfig with a required `selector` and the smallest workload/service set that validator must accept. `tests/unit/mesh_minimal_tests.rs` pins that fixture; keep `companion-schema/` unchanged when editing it.
 
 **The mesh pass carries one explicit environment variable, and only that pass.** ferrum-edge resolves `-m mesh` through the same workload-identity gate a mesh node resolves at startup: with no file-based gateway SVID material (`FERRUM_GATEWAY_SVID_CERT_PATH` / `_KEY_PATH` / `_TRUST_BUNDLE_PATH`) it refuses with *"mesh mode has no workload identity"* **before** it parses the document handed to `-c`. A CI runner grading a pull request has no mesh node's identity and should not be given one, so gitforgeops sets ferrum-edge's own validation-only opt-out, `FERRUM_MESH_ALLOW_NO_CA=true`, on that child process — after the `FERRUM_*` scrub, so the value is gitforgeops' constant and never the parent's. Three things it deliberately is not: it is not set for the gateway pass (`-m file` has no identity gate), it is not a pass-through (a `FERRUM_MESH_ALLOW_NO_CA` in the calling environment is scrubbed like every other inherited variable), and it never reaches a runtime `run -m mesh` or the published document — mesh nodes still enforce their own identity, and the bytes gitforgeops writes are unchanged. What it relaxes is *where* a document may be graded, not *what* counts as valid: a malformed policy or schema is rejected exactly as before, and a ferrum-edge build that refuses the variable itself surfaces its own error unchanged.
 

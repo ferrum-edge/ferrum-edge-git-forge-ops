@@ -5,6 +5,13 @@ use crate::config::EnvConfig;
 
 use super::config::OverrideConfig;
 
+/// Printed by `plan` and `apply` when blocking findings exist but no GitHub
+/// pull request is associated with the commit. Overrides stay CI/PR-only;
+/// there is no local or environment-variable escape hatch. See
+/// `README.md#overrides-are-evaluated-only-on-a-github-pull-request`.
+pub const NO_PR_OVERRIDE_NOTE: &str =
+    "No PR is associated with this commit; overrides were not evaluated. Policy overrides are evaluated only on a GitHub pull request; see README.md#overrides-are-evaluated-only-on-a-github-pull-request.";
+
 #[derive(Debug, Clone)]
 pub struct OverrideDecision {
     pub active: bool,

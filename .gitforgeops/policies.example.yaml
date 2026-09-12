@@ -169,9 +169,17 @@ policies:
     enabled: false
     severity: error
 
-# Policy override — the latest labeler must hold `required_permission` and
-# submit a current-head PR review with body `gitforgeops-override <require_label>`.
-# Actual source/configuration must match that reviewed revision. See README.
+# Policy override — evaluated only when a GitHub pull request is associated
+# with the commit (CI/PR-only). There is no local or environment-variable
+# escape hatch. To exercise the path, open a PR against a disposable fork,
+# add this label, and submit the revision-bound review from an account
+# that currently holds `required_permission`. Local plan/apply leave
+# every blocking finding standing. See README "Overrides are evaluated
+# only on a GitHub pull request".
+#
+# The latest labeler must hold `required_permission` and submit a
+# current-head PR review with body `gitforgeops-override <require_label>`.
+# Actual source/configuration must match that reviewed revision.
 overrides:
   require_label: gitforgeops/policy-override
   required_permission: write     # admin | maintain | write
