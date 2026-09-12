@@ -1,0 +1,10 @@
+# Intentionally illegal on-disk form. This fixture exists so the security
+# gate still has a committed literal to refuse. Do not copy into resources/.
+kind: Consumer
+spec:
+  id: "consumer-literal"
+  username: "literal"
+  credentials:
+    # Canonical array-of-entries form — this is what `GET /backup` returns.
+    keyauth:
+      - key: "fixture-only-literal-not-a-secret"
