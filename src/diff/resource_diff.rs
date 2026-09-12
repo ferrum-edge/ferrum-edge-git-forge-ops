@@ -713,7 +713,10 @@ pub(crate) fn normalize_associations_for_comparison(kind: &str, value: &mut serd
         plugins.sort_by(|a, b| {
             a.get("plugin_config_id")
                 .and_then(serde_json::Value::as_str)
-                .cmp(&b.get("plugin_config_id").and_then(serde_json::Value::as_str))
+                .cmp(
+                    &b.get("plugin_config_id")
+                        .and_then(serde_json::Value::as_str),
+                )
         });
         plugins.dedup_by(|a, b| a.get("plugin_config_id") == b.get("plugin_config_id"));
     }

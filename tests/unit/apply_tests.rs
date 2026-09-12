@@ -2295,9 +2295,11 @@ fn adoption_and_pending_recovery_ignore_only_association_order() {
     assert!(candidates.iter().any(|candidate| candidate.kind == "Proxy"));
     live.proxies[0].plugins.pop();
     assert!(pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha").is_empty());
-    assert!(adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new())
-        .iter()
-        .all(|candidate| candidate.kind != "Proxy"));
+    assert!(
+        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new())
+            .iter()
+            .all(|candidate| candidate.kind != "Proxy")
+    );
 }
 
 #[tokio::test]
@@ -2317,7 +2319,12 @@ async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_no
         }
         let (url, requests) = spawn_recording_gateway(vec![
             ("GET /health".into(), 200, HEALTHY.into(), vec![]),
-            ("GET /backup".into(), 200, backup_body(&after_plugin), vec![]),
+            (
+                "GET /backup".into(),
+                200,
+                backup_body(&after_plugin),
+                vec![],
+            ),
         ]);
         let key = state_key("team-alpha", "Proxy", "p1");
         let managed = HashSet::from([key.clone()]);
@@ -2411,7 +2418,10 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
     assert!(result.errors.is_empty());
     assert_eq!(
         mutation_lines(&requests),
-        vec!["PUT /plugins/config/pc1 HTTP/1.1", "PUT /proxies/p1 HTTP/1.1"]
+        vec![
+            "PUT /plugins/config/pc1 HTTP/1.1",
+            "PUT /proxies/p1 HTTP/1.1"
+        ]
     );
 }
 
@@ -2439,7 +2449,10 @@ async fn failed_plugin_write_blocks_its_proxy_and_defers_pruning() {
     )
     .await
     .unwrap();
-    assert_eq!(mutation_lines(&requests), vec!["POST /plugins/config HTTP/1.1"]);
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["POST /plugins/config HTTP/1.1"]
+    );
     assert_eq!(result.errors.len(), 2);
     assert_eq!(result.deletes_deferred, 1);
     assert!(result.applied_incremental.is_empty());
@@ -2459,7 +2472,10 @@ async fn failed_proxy_delete_retains_its_plugin_and_ledger() {
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), scoped_plugin_desired())])),
+        Some(&BTreeMap::from([(
+            "team-alpha".into(),
+            scoped_plugin_desired(),
+        )])),
         None,
         &ApplyOptions::default(),
     )

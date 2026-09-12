@@ -1297,7 +1297,9 @@ async fn apply_incremental(
                         }
                     }
                     result.created += batched.created;
-                    result.applied_incremental.extend(batched.applied_incremental);
+                    result
+                        .applied_incremental
+                        .extend(batched.applied_incremental);
                     result.errors.extend(batched.errors);
                     if batched.fatal_error.is_some() {
                         result.fatal_error = batched.fatal_error;
@@ -2241,7 +2243,10 @@ fn create_outcome_is_ambiguous(error: &crate::error::Error) -> bool {
 /// a positive match with an idempotent PUT that overwrites the row with the
 /// desired content before anything enters the managed delete fence.
 fn resource_values_match<T: serde::Serialize>(kind: &str, desired: &T, live: &T) -> bool {
-    match (comparison_value(kind, desired), comparison_value(kind, live)) {
+    match (
+        comparison_value(kind, desired),
+        comparison_value(kind, live),
+    ) {
         (Some(desired), Some(live)) => json_contains(&desired, &live),
         _ => false,
     }
@@ -2249,7 +2254,10 @@ fn resource_values_match<T: serde::Serialize>(kind: &str, desired: &T, live: &T)
 
 /// Strict equality for adoption, apart from timestamps and association order.
 fn resource_values_equal<T: serde::Serialize>(kind: &str, desired: &T, live: &T) -> bool {
-    match (comparison_value(kind, desired), comparison_value(kind, live)) {
+    match (
+        comparison_value(kind, desired),
+        comparison_value(kind, live),
+    ) {
         (Some(desired), Some(live)) => desired == live,
         _ => false,
     }
