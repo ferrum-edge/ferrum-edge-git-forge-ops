@@ -8,6 +8,7 @@ mod diff_exit_tests;
 mod diff_tests;
 mod env_tests;
 mod file_target_tests;
+mod github_api_tests;
 mod http_client_tests;
 mod import_tests;
 mod json_output_tests;

@@ -10,7 +10,7 @@ use super::bundle::{
     merge_bundles, reserve_shard, serialize_bundle, shard_secret_name, CredentialBundle,
 };
 use super::delivery::{deliver_to_author, DeliveryResult};
-use super::github_api::{fetch_public_key, put_environment_secret};
+use super::github_api::{fetch_public_key_at, put_environment_secret_at, DEFAULT_GITHUB_API_BASE};
 use super::placeholder::PlaceholderAlloc;
 use super::resolver::{
     check_generation_allowed, credential_type_from_slot, current_gateway_mode, ResolveReport,
@@ -95,6 +95,36 @@ impl From<crate::error::Error> for AllocationFailure {
 #[allow(clippy::too_many_arguments)]
 pub async fn allocate_and_deliver(
     client: &Client,
+    repo: &str,
+    environment: &str,
+    provisioner_token: &str,
+    pr_author: Option<&str>,
+    report: &ResolveReport,
+    shards: &mut BTreeMap<u32, CredentialBundle>,
+    shard_count: &mut u32,
+) -> Result<AllocateOutcome, AllocationFailure> {
+    allocate_and_deliver_at(
+        client,
+        DEFAULT_GITHUB_API_BASE,
+        repo,
+        environment,
+        provisioner_token,
+        pr_author,
+        report,
+        shards,
+        shard_count,
+    )
+    .await
+}
+
+/// [`allocate_and_deliver`] against an explicit GitHub API origin.
+///
+/// Production callers use [`allocate_and_deliver`], which pins
+/// [`DEFAULT_GITHUB_API_BASE`]. Tests inject an in-process loopback origin.
+#[allow(clippy::too_many_arguments)]
+pub async fn allocate_and_deliver_at(
+    client: &Client,
+    api_base: &str,
     repo: &str,
     environment: &str,
     provisioner_token: &str,
@@ -230,7 +260,7 @@ pub async fn allocate_and_deliver(
         by_shard.entry(p.shard).or_default().push(p);
     }
 
-    let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
+    let pubkey = fetch_public_key_at(client, api_base, repo, environment, provisioner_token)
         .await
         .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
 
@@ -254,8 +284,9 @@ pub async fn allocate_and_deliver(
         };
         let secret_name = shard_secret_name(shard);
 
-        match put_environment_secret(
+        match put_environment_secret_at(
             client,
+            api_base,
             repo,
             environment,
             &secret_name,
@@ -308,6 +339,38 @@ pub async fn rotate_and_deliver(
     shards: &mut BTreeMap<u32, CredentialBundle>,
     shard_count: &mut u32,
 ) -> Result<AllocatedSlot, AllocationFailure> {
+    rotate_and_deliver_at(
+        client,
+        DEFAULT_GITHUB_API_BASE,
+        repo,
+        environment,
+        provisioner_token,
+        recipient_login,
+        slot,
+        length_bytes,
+        shards,
+        shard_count,
+    )
+    .await
+}
+
+/// [`rotate_and_deliver`] against an explicit GitHub API origin.
+///
+/// Production callers use [`rotate_and_deliver`], which pins
+/// [`DEFAULT_GITHUB_API_BASE`]. Tests inject an in-process loopback origin.
+#[allow(clippy::too_many_arguments)]
+pub async fn rotate_and_deliver_at(
+    client: &Client,
+    api_base: &str,
+    repo: &str,
+    environment: &str,
+    provisioner_token: &str,
+    recipient_login: Option<&str>,
+    slot: &str,
+    length_bytes: usize,
+    shards: &mut BTreeMap<u32, CredentialBundle>,
+    shard_count: &mut u32,
+) -> Result<AllocatedSlot, AllocationFailure> {
     let partial = AllocateOutcome::default();
 
     // Rotation publishes Consumers only. Reserved resource slots and every
@@ -325,7 +388,7 @@ pub async fn rotate_and_deliver(
     let serialized = serialize_bundle(&staged_bundle)
         .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
-    let pubkey = fetch_public_key(client, repo, environment, provisioner_token)
+    let pubkey = fetch_public_key_at(client, api_base, repo, environment, provisioner_token)
         .await
         .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
@@ -364,8 +427,9 @@ pub async fn rotate_and_deliver(
         delivered,
     };
 
-    put_environment_secret(
+    put_environment_secret_at(
         client,
+        api_base,
         repo,
         environment,
         &secret_name,

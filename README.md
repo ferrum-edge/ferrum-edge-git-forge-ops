@@ -1388,10 +1388,13 @@ request at a time:
   `FERRUM_GATEWAY_CA_CERT`, not behind a disabled check. A name that merely
   resolves to a loopback address does not qualify: DNS is not a trust
   boundary.
-- **GitHub API calls are always `https://api.github.com`.** The host is
-  compiled in, not configurable, so PR comments, override checks, credential
-  delivery, and Environment-secret writes have no cleartext path to
-  misconfigure.
+- **GitHub API calls default to `https://api.github.com`.** The production
+  host is compiled in (`DEFAULT_GITHUB_API_BASE`), not taken from process
+  environment, so PR comments, override checks, credential delivery, and
+  Environment-secret writes have no cleartext path to misconfigure. The
+  Environment-secret adapters accept an explicit API origin only so unit tests
+  can inject an in-process loopback stub; production callers pass the compiled-in
+  HTTPS origin. There is no `FERRUM_*` / `GITFORGEOPS_*` override for this host.
 
 Consequently the `rust/cleartext-transmission` sites CodeQL reports in
 `src/http_client.rs` — one per request method, all of them reading the same
