@@ -43,7 +43,10 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--credential-bundle-output PRIVATE_PATH] \
   [--accept-unknown-field NAME] \                         # --output-dir required + must be empty; API import requires an explicit namespace filter;
   [--allow-plaintext-plugin-config PLUGIN_NAME]           # both acknowledgement flags are repeatable and fail closed without them
-gitforgeops review [--pr N] [--require-live]              # Post PR comment; optionally require live comparison
+gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
+                                                          # Post PR comment; optionally require live comparison.
+                                                          # Exit stays 0 on offline apply blockers unless
+                                                          # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
   [--namespace NS] [--recipient GH_LOGIN]
@@ -467,7 +470,9 @@ decidable *without* a gateway, as `Vec<ApplyBlocker>` over seven
 `BlockerKind`s: `Validation`, `Security`, `Policy`, `RequiredCredentials`,
 `SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
-non-empty. `cmd_apply` calls the *same per-class predicates*
+non-empty. `review --fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`)
+uses that same computation for its exit code; default `review` still renders
+the blocked verdict and exits 0. `cmd_apply` calls the *same per-class predicates*
 (`security_blocker`, `policy_blocker`, `required_credentials_blocker`,
 `validation_blocker`, `credential_provisioning_blockers`) at its own gate points rather than the aggregate, because
 its ordering is load-bearing — the security audit has to refuse before the
@@ -719,6 +724,7 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)
 - `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` (default `false`; `true|false|1|0`) — same explicit 501/413 fallback as `apply --allow-nontransactional-plugin-attach`; publishes a new proxy before its new scoped plugins and warns about temporary exposure.
+- `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` (default `false`; `true|false|1|0`) — same opt-in as `review --fail-on-blockers`: exit 1 when the same offline apply blockers that make `plan` exit 1 are present. Default `review` stays 0; the PR comment is identical either way.
 - `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge; a configured missing directory is fatal — `resolved::validate_overlay_selection` reports it up front naming the environment, the overlay and the declaring file)
 - `FERRUM_EDGE_BINARY_PATH` (default `ferrum-edge` on `$PATH`)
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)
