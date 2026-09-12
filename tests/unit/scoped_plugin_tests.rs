@@ -267,7 +267,9 @@ fn mismatched_explicit_associations_remain_visible_and_block_apply() {
             assert_eq!(blockers[0].severity, "error");
             assert_eq!(blockers[0].id, "api");
             assert_eq!(blockers[0].namespace, "team-alpha");
-            assert!(blockers[0].message.contains("invalid plugin association auth"));
+            assert!(blockers[0]
+                .message
+                .contains("invalid plugin association auth"));
             if scope == "proxy" {
                 assert!(findings.iter().any(|finding| {
                     finding.id == "api" && finding.message.contains("No auth plugin")
