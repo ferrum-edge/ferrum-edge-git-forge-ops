@@ -145,8 +145,10 @@ fn resolved_credentials_are_redacted_but_other_diagnostics_survive() {
     }
 }
 
-/// F1: the fixture repo commits a literal `keyauth.key`. That used to blank
-/// the whole stream on every fork PR; now only the key is redacted.
+/// F1: a committed literal `keyauth.key` is redacted from validator
+/// diagnostics, and everything else the validator said survives. The
+/// `simple-config` sample is brokered; this uses an inline document so the
+/// scrubber still has a known secret to match.
 #[cfg(unix)]
 #[test]
 fn literal_fixture_credentials_do_not_blank_the_diagnostics() {
