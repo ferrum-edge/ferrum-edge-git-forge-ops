@@ -830,3 +830,26 @@ fn mesh_config_id_is_absent_from_a_default_fragment() {
     assert!(spec.is_empty());
     assert_eq!(serde_yaml::to_string(&spec).unwrap().trim(), "{}");
 }
+
+#[test]
+fn known_credential_types_match_the_ferrum_edge_builtin_set() {
+    assert_eq!(
+        KNOWN_CREDENTIAL_TYPES,
+        ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"]
+    );
+    for known in KNOWN_CREDENTIAL_TYPES {
+        assert!(is_known_credential_type(known));
+    }
+    assert!(!is_known_credential_type("api_key"));
+    assert!(!is_known_credential_type("basic_auth"));
+    assert!(!is_known_credential_type("KEYAUTH"));
+    assert_eq!(suggest_credential_type("api_key"), Some("keyauth"));
+    assert_eq!(suggest_credential_type("API_KEY"), Some("keyauth"));
+    assert_eq!(suggest_credential_type("basic_auth"), Some("basicauth"));
+    assert_eq!(suggest_credential_type("vendor_token"), None);
+    let message = unknown_credential_type_message("api_key", "app", "ferrum");
+    assert!(message.contains("Unknown credential type 'api_key'"));
+    assert!(message.contains("on consumer app in namespace ferrum"));
+    assert!(message.contains("did you mean 'keyauth'"));
+    assert!(message.contains(&recognized_credential_types_list()));
+}

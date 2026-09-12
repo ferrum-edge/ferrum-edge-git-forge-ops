@@ -1,3 +1,4 @@
+use crate::config::schema::{is_known_credential_type, unknown_credential_type_message};
 use crate::config::{GatewayConfig, GatewayMode};
 use crate::diagnostics::safe_line;
 
@@ -468,8 +469,7 @@ fn lookup_exact_slot_value<'a>(
 /// `<ns>/<id>/foo~1bar`) and a literal object key spelled exactly `[1]` can't
 /// be addressed from the CLI. There is no CLI escape syntax because routing a
 /// user-typed `~1` through `escape_slot_component` would double-escape the
-/// `~` to `~01`. Neither shape occurs in ferrum-edge's credential schema; if
-/// you hit it in a custom credential type, rename the key.
+/// `~` to `~01`. Neither shape occurs in ferrum-edge's credential schema.
 pub fn slot_path(namespace: &str, consumer_id: &str, cred_key: &str) -> String {
     let mut components: Vec<SlotComponent<'_>> = vec![
         SlotComponent::Literal(namespace),
@@ -534,6 +534,30 @@ pub(crate) fn is_identity_credential_leaf(credential_type: &str, leaf: Option<&s
         (credential_type, leaf),
         ("basicauth", Some("username")) | ("mtls_auth", Some("identity"))
     )
+}
+
+/// Refuse Consumer credential map keys Ferrum Edge will never authenticate.
+///
+/// Same closed set as the pre-resolve security audit
+/// ([`crate::config::schema::KNOWN_CREDENTIAL_TYPES`]). Structural: it does
+/// not depend on allocation mode, gateway mode, or bundle contents. Lenient
+/// rotate preflight uses this too — an unknown type is not a generation
+/// constraint.
+pub fn validate_known_credential_types(cfg: &GatewayConfig) -> crate::error::Result<()> {
+    for consumer in &cfg.consumers {
+        for credential_type in consumer.credentials.keys() {
+            if !is_known_credential_type(credential_type) {
+                return Err(crate::error::Error::Config(
+                    unknown_credential_type_message(
+                        credential_type,
+                        &consumer.id,
+                        &consumer.namespace,
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject broker syntax in public credential identities before any bundle
@@ -930,9 +954,9 @@ pub fn report_secrets_with_options(
 /// but the preflight walks the *whole* assembled config to find it — so an
 /// unrelated consumer holding, say, a `len=16` `jwt` generate placeholder
 /// would abort a rotation that has nothing to do with it. Structural errors
-/// (identity placeholders, malformed placeholders, `[REDACTED]` bundle values,
-/// slot collisions) are still hard failures in both variants, because those
-/// make the report itself untrustworthy.
+/// (unknown credential types, identity placeholders, malformed placeholders,
+/// `[REDACTED]` bundle values, slot collisions) are still hard failures in
+/// both variants, because those make the report itself untrustworthy.
 ///
 /// `plan`/`diff`/`apply` keep using strict [`report_secrets`]: there the
 /// constraint really is fatal, since apply would otherwise write a GitHub
@@ -977,6 +1001,7 @@ fn report_secrets_with_mode_inner(
     constraints: ConstraintMode,
     options: ResolveOptions,
 ) -> crate::error::Result<ResolveReport> {
+    validate_known_credential_types(cfg)?;
     validate_identity_placeholders(cfg)?;
     let mut report = ResolveReport::default();
     for consumer in &cfg.consumers {
@@ -1050,13 +1075,15 @@ fn report_secrets_with_mode_inner(
 ///
 /// ferrum-edge treats an omitted credential type asymmetrically on write:
 /// omitting `keyauth`, `jwt`, `hmac_auth` or `mtls_auth` **deletes** the
-/// stored entries, while omitting `basicauth` or any unrecognized type
-/// **preserves** them. So a repo YAML that drops a `keyauth` block silently
-/// revokes those API keys on the next apply, but dropping a `basicauth` block
-/// leaves the password in place and gitforgeops will report it as unmanaged
-/// drift forever. Removing a credential you actually want gone therefore
-/// needs an explicit empty array (`keyauth: []`) for the delete-on-omit
-/// types, and a gateway-side removal for `basicauth`.
+/// stored entries, while omitting `basicauth` **preserves** them. A repo YAML
+/// that drops a `keyauth` block silently revokes those API keys on the next
+/// apply, but dropping a `basicauth` block leaves the password in place and
+/// gitforgeops will report it as unmanaged drift forever. Removing a
+/// credential you actually want gone therefore needs an explicit empty array
+/// (`keyauth: []`) for the delete-on-omit types, and a gateway-side removal
+/// for `basicauth`. Unknown credential map keys are refused before this walk,
+/// so gitforgeops cannot create a custom type the gateway would store without
+/// authenticating.
 pub fn resolve_secrets(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
@@ -1090,6 +1117,7 @@ pub fn resolve_secrets_with_mode_and_options(
     mode: GatewayMode,
     options: ResolveOptions,
 ) -> crate::error::Result<ResolveReport> {
+    validate_known_credential_types(cfg)?;
     validate_identity_placeholders(cfg)?;
     let mut candidate = cfg.clone();
     let report = resolve_secrets_in_place(&mut candidate, bundle, mode, options)?;
