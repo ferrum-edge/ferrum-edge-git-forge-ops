@@ -456,11 +456,12 @@ fn merge_mesh_singleton<T: PartialEq + std::fmt::Debug>(
 /// # Round-trip hazard
 ///
 /// Omitting `keyauth`, `jwt`, `hmac_auth` or `mtls_auth` from a consumer
-/// **deletes** those entries on the gateway; omitting `basicauth` or an
-/// unrecognized type **preserves** what is already stored. Normalization does
-/// not change which keys are present, so it cannot itself delete anything —
-/// but it is worth knowing that an empty array (`keyauth: []`) is the
-/// explicit "remove these" spelling, not a no-op.
+/// **deletes** those entries on the gateway; omitting `basicauth`
+/// **preserves** what is already stored. Unknown map keys are refused by
+/// validate/plan/broker before apply. Normalization does not change which
+/// keys are present, so it cannot itself delete anything — but it is worth
+/// knowing that an empty array (`keyauth: []`) is the explicit "remove
+/// these" spelling, not a no-op.
 pub fn normalize_consumer_credentials(config: &mut GatewayConfig) {
     for consumer in config.consumers.iter_mut() {
         for value in consumer.credentials.values_mut() {

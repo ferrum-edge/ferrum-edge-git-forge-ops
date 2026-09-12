@@ -114,6 +114,19 @@ pub fn audit_security_with_policy(
 
     for consumer in &config.consumers {
         for (cred_type, cred_value) in &consumer.credentials {
+            if !crate::config::schema::is_known_credential_type(cred_type) {
+                findings.push(SecurityFinding::error(
+                    "Consumer",
+                    &consumer.id,
+                    &consumer.namespace,
+                    crate::config::schema::unknown_credential_type_message(
+                        cred_type,
+                        &consumer.id,
+                        &consumer.namespace,
+                    ),
+                ));
+                continue;
+            }
             check_literal_credentials(
                 &consumer.id,
                 &consumer.namespace,
@@ -564,8 +577,9 @@ fn check_literal_service_discovery_secrets(
 /// distinction is the whole point of the function:
 ///
 /// * `credential_type` is the **structural** top-level key of the credential
-///   map (`basicauth`, `mtls_auth`, `keyauth`, or a custom type). It never
-///   changes.
+///   map (`basicauth`, `mtls_auth`, `keyauth`). Unknown keys are rejected
+///   before this walk, so a custom type never reaches leaf classification.
+///   It never changes.
 /// * `leaf` is the enclosing object key of the string being classified
 ///   (`None` for a bare string). An array index does not change which field a
 ///   leaf is, so it carries through array recursion unchanged — the same rule
@@ -574,9 +588,8 @@ fn check_literal_service_discovery_secrets(
 ///   (`mtls_auth[0].identity`) and is not consulted for any decision.
 ///
 /// Only `(credential_type, leaf)` decides the identity exemption, so
-/// `basicauth[0].username` is exempt while a custom credential type's
-/// `username` — which the broker would happily manage and the gateway has no
-/// public-half contract for — still blocks.
+/// `basicauth[0].username` is exempt while the same leaf name under another
+/// recognized type is still a secret. Unknown map keys never get here.
 fn check_literal_credentials(
     consumer_id: &str,
     namespace: &str,

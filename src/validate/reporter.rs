@@ -64,7 +64,8 @@ pub fn format_results(
                 "gateway": result_json(gateway),
                 "mesh": result_json(mesh),
             });
-            serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+            crate::json_output::pretty(&json)
+                .unwrap_or_else(|_| crate::json_output::terminate("{}".to_string()))
         }
         OutputFormat::GithubAnnotations => {
             let mut output = format_github_annotations(gateway);
@@ -134,7 +135,8 @@ fn result_json(result: &ValidationResult) -> serde_json::Value {
 
 fn format_json(result: &ValidationResult) -> String {
     // Safe: serde_json::to_string_pretty on a Value always succeeds
-    serde_json::to_string_pretty(&result_json(result)).unwrap_or_else(|_| "{}".to_string())
+    crate::json_output::pretty(&result_json(result))
+        .unwrap_or_else(|_| crate::json_output::terminate("{}".to_string()))
 }
 
 fn format_github_annotations(result: &ValidationResult) -> String {

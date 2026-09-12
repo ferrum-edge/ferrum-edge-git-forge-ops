@@ -9,9 +9,10 @@ literal-identity remedy without printing the supplied value or placeholder.
 
 Literal identities remain readable in resource files and validator diagnostics.
 Import keeps them literal; the security audit does not flag them as committed
-secrets. A `username` under a custom credential type still follows the secret
-rules. Classification uses the structural credential type and enclosing object
-key, with array indexes carrying the key unchanged.
+secrets. Unknown Consumer credential map keys are refused before leaf
+classification. Classification of recognized types uses the structural
+credential type and enclosing object key, with array indexes carrying the key
+unchanged.
 
 ## Migration for the next release
 
