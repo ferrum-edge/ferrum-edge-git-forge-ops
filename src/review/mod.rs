@@ -107,6 +107,26 @@ pub fn enforce_comment_delivery(
     Ok(())
 }
 
+/// Opt-in process-status gate for the same offline apply blockers `plan` uses.
+///
+/// The PR comment is already rendered from the findings; this only changes
+/// the exit code. Default review stays 0 so existing CI that keys off
+/// `review`'s status is not an apply gate. [`crate::verdict::apply_blockers`]
+/// is the shared computation so `--fail-on-blockers` cannot disagree with
+/// `plan`.
+pub fn enforce_offline_blockers(
+    fail_on_blockers: bool,
+    blockers: &[crate::verdict::ApplyBlocker],
+) -> crate::error::Result<()> {
+    if !fail_on_blockers {
+        return Ok(());
+    }
+    if let Some(summary) = crate::verdict::blocker_summary(blockers) {
+        return Err(crate::error::Error::Config(summary));
+    }
+    Ok(())
+}
+
 /// Combined gateway and optional mesh validation for the reviewer's verdict.
 #[derive(Debug)]
 pub struct ReviewValidation {

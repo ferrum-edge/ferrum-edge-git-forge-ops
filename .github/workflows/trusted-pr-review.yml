@@ -414,6 +414,9 @@ jobs:
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+        # Process gate is `--require-live` (comparison + comment delivery).
+        # Offline apply blockers are rendered in the PR comment; this job
+        # does not pass `--fail-on-blockers`, which would change the gate.
         run: >-
           ../review-bin/gitforgeops review
           --pr "$GITFORGEOPS_PR_NUMBER"

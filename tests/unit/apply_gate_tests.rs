@@ -1723,3 +1723,83 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
     assert!(seeded.status.success(), "{}", stdout(&seeded));
     assert!(!stdout(&seeded).contains("Apply Blockers"));
 }
+
+#[test]
+fn review_exits_zero_by_default_when_the_verdict_says_apply_is_blocked() {
+    let repo = Repo::with_consumer(LITERAL_CONSUMER);
+    let output = repo.run(&["review"], &[]);
+    assert!(
+        output.status.success(),
+        "default review must stay 0: {} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("Apply is blocked"), "{}", stdout(&output));
+}
+
+#[test]
+fn review_fail_on_blockers_exits_one_when_apply_is_blocked() {
+    let repo = Repo::with_consumer(LITERAL_CONSUMER);
+    let defaulted = repo.run(&["review"], &[]);
+    let flagged = repo.run(&["review", "--fail-on-blockers"], &[]);
+    assert!(defaulted.status.success(), "{}", stdout(&defaulted));
+    assert!(
+        !flagged.status.success(),
+        "flag must use plan's offline blockers: {} {}",
+        stdout(&flagged),
+        stderr(&flagged)
+    );
+    assert_eq!(
+        stdout(&defaulted),
+        stdout(&flagged),
+        "the rendered verdict must be identical with or without the flag"
+    );
+    assert!(stdout(&flagged).contains("Apply is blocked"));
+    assert!(stderr(&flagged).contains("apply is blocked by"), "{}", stderr(&flagged));
+}
+
+#[test]
+fn review_fail_on_blockers_env_matches_the_cli_flag() {
+    let repo = Repo::with_consumer(LITERAL_CONSUMER);
+    let output = repo.run(&["review"], &[("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "true")]);
+    assert!(!output.status.success(), "{} {}", stdout(&output), stderr(&output));
+    assert!(stdout(&output).contains("Apply is blocked"));
+}
+
+#[test]
+fn review_fail_on_blockers_exits_zero_when_nothing_blocks() {
+    let repo = Repo::with_consumer(BROKERED_CONSUMER);
+    let defaulted = repo.run(&["review"], &[("FERRUM_CREDS_JSON", BUNDLE)]);
+    let flagged = repo.run(
+        &["review", "--fail-on-blockers"],
+        &[("FERRUM_CREDS_JSON", BUNDLE)],
+    );
+    assert!(defaulted.status.success(), "{} {}", stdout(&defaulted), stderr(&defaulted));
+    assert!(
+        flagged.status.success(),
+        "no offline blocker: {} {}",
+        stdout(&flagged),
+        stderr(&flagged)
+    );
+    assert_eq!(stdout(&defaulted), stdout(&flagged));
+    assert!(!stdout(&flagged).contains("Apply is blocked"), "{}", stdout(&flagged));
+}
+
+#[test]
+fn review_fail_on_blockers_covers_missing_required_slots() {
+    let repo = Repo::with_consumer(BROKERED_CONSUMER);
+    let defaulted = repo.run(&["review"], &[("FERRUM_CREDS_JSON", "{}")]);
+    let flagged = repo.run(
+        &["review", "--fail-on-blockers"],
+        &[("FERRUM_CREDS_JSON", "{}")],
+    );
+    assert!(defaulted.status.success(), "{}", stdout(&defaulted));
+    assert!(
+        !flagged.status.success(),
+        "{} {}",
+        stdout(&flagged),
+        stderr(&flagged)
+    );
+    assert_eq!(stdout(&defaulted), stdout(&flagged));
+    assert!(stdout(&flagged).contains("Apply is blocked"), "{}", stdout(&flagged));
+}

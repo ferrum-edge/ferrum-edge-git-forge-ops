@@ -44,7 +44,8 @@ async fn main() {
     // `--allow-credential-slot-remap` downgrades the credential-slot-remap
     // refusal to a report. The reporting commands (`diff`, `plan`, `review`)
     // always resolve in reporting mode so they can render the hazard
-    // themselves; `plan` then supplies its own non-zero exit.
+    // themselves; `plan` then supplies its own non-zero exit. `review`
+    // stays exit 0 unless `--fail-on-blockers` (or the matching env) is set.
     let resolve_options =
         secrets::ResolveOptions::allowing_slot_remap(cli.allow_credential_slot_remap);
 
@@ -124,8 +125,19 @@ async fn main() {
             )
             .await
         }
-        cli::Commands::Review { pr, require_live } => {
-            cmd_review(pr, require_live, explicit_env.as_deref()).await
+        cli::Commands::Review {
+            pr,
+            require_live,
+            fail_on_blockers,
+        } => {
+            cmd_review(
+                pr,
+                require_live,
+                fail_on_blockers,
+                cli.allow_credential_slot_remap,
+                explicit_env.as_deref(),
+            )
+            .await
         }
         cli::Commands::Envs {
             format,
@@ -405,9 +417,10 @@ fn load_credential_bundles(
 /// would replace a diff, a plan or a PR comment with one error line, and the
 /// hazard would be the only thing the reviewer could not see in context. Each
 /// caller decides what the report means — `plan` exits non-zero, `review`
-/// renders it as blocking, `diff` keeps reporting drift. The refusal itself
-/// belongs to the mutating paths (`apply`, `export --materialize`, `rotate`),
-/// which resolve with the operator's own [`secrets::ResolveOptions`].
+/// renders it as blocking (and `--fail-on-blockers` then exits non-zero),
+/// `diff` keeps reporting drift. The refusal itself belongs to the mutating
+/// paths (`apply`, `export --materialize`, `rotate`), which resolve with the
+/// operator's own [`secrets::ResolveOptions`].
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
@@ -3017,6 +3030,8 @@ async fn cmd_import(
 async fn cmd_review(
     pr: Option<u64>,
     require_live: bool,
+    fail_on_blockers: bool,
+    allow_credential_slot_remap: bool,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if require_live && pr.is_none() {
@@ -3027,6 +3042,7 @@ async fn cmd_review(
         .into());
     }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let fail_on_blockers = fail_on_blockers || env_config.review_fail_on_blockers;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut desired = assembled.gateway;
     // PR review preview must match apply's real validation surface, so a
@@ -3215,6 +3231,22 @@ async fn cmd_review(
         env_config.github_provisioner_token.is_some(),
         env_config.github_repository.is_some(),
     );
+    let security_overridden = override_decision
+        .as_ref()
+        .is_some_and(|decision| decision.active);
+    // Same computation `plan` uses for its exit code. The comment below is
+    // built from the findings themselves, not from this vec, so
+    // `--fail-on-blockers` cannot change what the reviewer reads.
+    let blockers = verdict::apply_blockers(ApplyGateInputs {
+        validation_ok: matches!(validation_status, review::ReviewValidationStatus::Passed),
+        security_findings: &security_findings,
+        security_overridden,
+        policy_findings: &policy_findings,
+        secret_report: &secret_report,
+        allow_credential_slot_remap,
+        provisioner_token_present: env_config.github_provisioner_token.is_some(),
+        github_repository_present: env_config.github_repository.is_some(),
+    });
 
     let comment = review::pr_comment::build_review_comment_with_preview(
         validation_status,
@@ -3281,6 +3313,7 @@ async fn cmd_review(
     // what the reviewer has to act on.
     review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
+    review::enforce_offline_blockers(fail_on_blockers, &blockers)?;
 
     if let Some(summary) = verdict::blocker_summary(&provisioning_blockers) {
         return Err(summary.into());

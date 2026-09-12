@@ -5,8 +5,10 @@
 //!
 //! * [`apply_blockers`] — every fail-closed gate `apply` refuses on that is
 //!   decidable *without* a gateway. `plan` evaluates the whole set and exits
-//!   non-zero on any of them; `apply` enforces the same per-class predicates
-//!   one at a time, in the order that preserves its own fail-fast guarantees
+//!   non-zero on any of them; `review --fail-on-blockers` uses the same set
+//!   for its process exit (default `review` stays 0). `apply` enforces the
+//!   same per-class predicates one at a time, in the order that preserves
+//!   its own fail-fast guarantees
 //!   (the security audit must refuse before the credential bundle is read, the
 //!   required-slot check before the first gateway call, and so on). Sharing
 //!   the predicates rather than the control flow is what keeps a clean `plan`

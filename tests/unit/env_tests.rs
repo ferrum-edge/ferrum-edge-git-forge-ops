@@ -23,6 +23,7 @@ fn clear_env() {
         "FERRUM_GATEWAY_MODE",
         "FERRUM_APPLY_STRATEGY",
         "GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH",
+        "GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS",
         "FERRUM_OVERLAY",
         "FERRUM_FILE_OUTPUT_PATH",
         "FERRUM_MESH_FILE_OUTPUT_PATH",
@@ -72,6 +73,31 @@ fn nontransactional_plugin_attach_env_is_explicit_and_strict() {
         .unwrap_err()
         .to_string()
         .contains("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH"));
+    clear_env();
+}
+
+#[test]
+fn review_fail_on_blockers_env_is_explicit_and_strict() {
+    let _guard = env_guard();
+    clear_env();
+    let config = load_env_config().unwrap();
+    assert!(!config.review_fail_on_blockers);
+    for (value, enabled) in [
+        ("true", true),
+        ("1", true),
+        ("false", false),
+        ("0", false),
+        ("", false),
+    ] {
+        std::env::set_var("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", value);
+        let config = load_env_config().unwrap();
+        assert_eq!(config.review_fail_on_blockers, enabled);
+    }
+    std::env::set_var("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "yes");
+    assert!(load_env_config()
+        .unwrap_err()
+        .to_string()
+        .contains("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS"));
     clear_env();
 }
 
