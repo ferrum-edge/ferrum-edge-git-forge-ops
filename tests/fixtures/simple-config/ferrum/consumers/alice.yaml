@@ -4,8 +4,14 @@ spec:
   username: "alice"
   credentials:
     # Canonical array-of-entries form — this is what `GET /backup` returns.
+    # Placeholders are the only supported on-disk form. Copying this sample
+    # into `resources/` cannot commit a secret.
+    #
+    # `alloc=require` means the slot must already exist in FERRUM_CREDS_BUNDLE.
+    # Switch to `alloc=generate` (see resources/ferrum/consumers/_example.yaml)
+    # for first-apply allocation. Slot: ferrum/consumer-alice/keyauth/key
     keyauth:
-      - key: "alice-secret-key-12345"
+      - key: "${gh-env-secret:alloc=require}"
     # basicauth in file mode needs a precomputed hash; the broker cannot
     # generate one (see resources/ferrum/consumers/_example.yaml).
     # basicauth:

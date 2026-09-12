@@ -46,3 +46,10 @@ Placeholders (`${gh-env-secret:...}`) are the only supported on-disk form for
 consumer credentials; never commit literal secrets or unencrypted
 materialized exports. Keep gateway and credential-broker secrets in GitHub
 Environment secrets scoped to the environment that uses them.
+
+Repository fixtures follow the same rule. `tests/fixtures/simple-config/`
+is the copy-paste sample and ships `${gh-env-secret:alloc=require}` (switch
+to `alloc=generate` for first-apply allocation — see
+`resources/ferrum/consumers/_example.yaml`). The only on-disk literal is
+`tests/fixtures/literal-credential/`, a negative case that `plan` / `apply`
+must refuse; it is not a sample.
