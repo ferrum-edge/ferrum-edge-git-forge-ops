@@ -862,8 +862,9 @@ pub struct Consumer {
     ///
     /// Serde still accepts any map key so a typo round-trips into diagnostics
     /// instead of disappearing at parse. [`KNOWN_CREDENTIAL_TYPES`] is the
-    /// closed set Ferrum Edge authenticates; `validate`, `plan`, and the
-    /// credential broker refuse every other key before apply.
+    /// closed set Ferrum Edge authenticates; `validate`, `plan`, `import`, and
+    /// the credential broker refuse every other key before apply or
+    /// publication.
     #[serde(default)]
     pub credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -886,7 +887,8 @@ pub struct Consumer {
 /// Matches OpenAPI `BuiltInCredentialType` / runtime `ALLOWED_CREDENTIAL_TYPES`
 /// exactly: `basicauth`, `keyauth`, `jwt`, `hmac_auth`, `mtls_auth`. The
 /// gateway will store any other map key as an opaque custom type, but auth
-/// plugins never index those keys, so gitforgeops refuses them before apply.
+/// plugins never index those keys, so gitforgeops refuses them before apply
+/// and before import writes a tree or migration bundle.
 pub const KNOWN_CREDENTIAL_TYPES: [&str; 5] =
     ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
 

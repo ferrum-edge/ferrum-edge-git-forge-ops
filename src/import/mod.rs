@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::config::schema::{GatewayConfig, Resource};
+use crate::config::schema::{
+    GatewayConfig, Resource, is_known_credential_type, unknown_credential_type_message,
+};
 use crate::http_client::BackupSnapshot;
 use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
@@ -400,6 +402,13 @@ fn diagnostic_metadata(value: &str) -> String {
 /// `--accept-unknown-field <NAME>` (with `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
 /// is the documented way to accept one after reading the source.
 ///
+/// # Unknown Consumer credential types fail closed
+///
+/// A `credentials` map key outside [`crate::config::schema::KNOWN_CREDENTIAL_TYPES`]
+/// is refused before any tree file or migration bundle is written. Ferrum Edge
+/// never authenticates those keys, so there is nothing worth migrating and no
+/// acknowledgement flag. Remove the type on the gateway and re-import.
+///
 /// # Unbrokered plugin config fails closed
 ///
 /// A plugin this build has no schema for is classified by the key/URL
@@ -424,12 +433,14 @@ pub fn split_config(
     )
 }
 
-/// Two operator acknowledgements gate this path, and both are evaluated
-/// before a single file is staged.
+/// Fail-closed gates on this path are evaluated before a single file is staged.
 ///
 /// `passthrough_policy` governs top-level resource fields this build does not
 /// model (`--accept-unknown-field` plus `FERRUM_ALLOW_UNKNOWN_FIELDS`); an
 /// unacknowledged one aborts the whole import.
+///
+/// Unknown Consumer `credentials` map keys abort with no acknowledgement flag:
+/// Ferrum Edge never authenticates them, so there is nothing worth migrating.
 ///
 /// `allow_plaintext_plugin_config` holds exact `plugin_name`s whose
 /// unbrokered config strings the operator has reviewed and
@@ -446,6 +457,7 @@ pub(crate) fn split_config_with_inventory(
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
+    reject_import_unknown_credential_types(&safe_config)?;
     let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
@@ -717,6 +729,48 @@ fn reject_import_passthrough_fields(
     }
 
     Ok(())
+}
+
+/// Refuse Consumer `credentials` map keys Ferrum Edge never authenticates,
+/// before any import output (including a migration bundle) is planned or
+/// published.
+///
+/// Every offender is listed. Diagnostics are built from
+/// [`unknown_credential_type_message`] so they name the key, consumer,
+/// namespace, and recognized set, and suggest the canonical spelling for
+/// known misspellings. There is no acknowledgement flag: a type that never
+/// authenticates has nothing worth migrating.
+fn reject_import_unknown_credential_types(config: &GatewayConfig) -> crate::error::Result<()> {
+    let mut offenders: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    for consumer in &config.consumers {
+        for credential_type in consumer.credentials.keys() {
+            if !is_known_credential_type(credential_type) {
+                offenders.insert((
+                    consumer.namespace.as_str(),
+                    consumer.id.as_str(),
+                    credential_type.as_str(),
+                ));
+            }
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = String::from(
+        "refusing to import unknown Consumer credential types: a type Ferrum Edge never \
+         authenticates has nothing worth migrating. Remove it on the gateway and re-import. \
+         Nothing has been written.",
+    );
+    for (namespace, consumer_id, credential_type) in offenders {
+        message.push_str("\n  ");
+        message.push_str(&unknown_credential_type_message(
+            credential_type,
+            consumer_id,
+            namespace,
+        ));
+    }
+    Err(crate::error::Error::Config(message))
 }
 
 /// Human-readable list of the acknowledged unmodelled fields that were carried
