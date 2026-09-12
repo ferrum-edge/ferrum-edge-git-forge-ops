@@ -293,13 +293,12 @@ fn check_proxy_plugin_associations(
             },
         };
         if let Some(reason) = reason {
-            let severity = if plugin.is_none()
-                && matches!(ownership_scope, OwnershipScope::Shared { .. })
-            {
-                "warning"
-            } else {
-                BLOCKING_SEVERITY
-            };
+            let severity =
+                if plugin.is_none() && matches!(ownership_scope, OwnershipScope::Shared { .. }) {
+                    "warning"
+                } else {
+                    BLOCKING_SEVERITY
+                };
             let remedy = if plugin.is_none() {
                 "declare the config in this repository or confirm it is owned elsewhere"
             } else {

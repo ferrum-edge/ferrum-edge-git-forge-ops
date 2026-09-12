@@ -1,5 +1,6 @@
 use gitforgeops::apply::{apply_file, spec_owned_skip_messages, ApplyResult};
 use gitforgeops::config::schema::{GatewayConfig, Proxy};
+use gitforgeops::config::ApplyStrategy;
 use gitforgeops::diff::SpecOwnedResource;
 
 #[test]
@@ -2655,10 +2656,7 @@ async fn opted_in_batch_fallback_publishes_proxy_then_attaches_scoped_plugin() {
             let permitted = batch_status != 400;
             let mut expected = vec!["POST /batch HTTP/1.1"];
             if permitted {
-                expected.extend([
-                    "POST /proxies HTTP/1.1",
-                    "POST /plugins/config HTTP/1.1",
-                ]);
+                expected.extend(["POST /proxies HTTP/1.1", "POST /plugins/config HTTP/1.1"]);
                 if mixed {
                     expected.push("DELETE /proxies/old?cleanup_orphaned_upstream=false HTTP/1.1");
                 }
@@ -2784,12 +2782,7 @@ async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure
     let desired = scoped_plugin_desired();
     let (url, requests) = spawn_recording_gateway(vec![
         ("POST /batch".into(), 503, "{}".into(), vec![]),
-        (
-            "GET /backup".into(),
-            200,
-            backup_body(&desired),
-            vec![],
-        ),
+        ("GET /backup".into(), 200, backup_body(&desired), vec![]),
         ("PUT /plugins/config/pc1".into(), 500, "{}".into(), vec![]),
     ]);
     let result = apply_api(
@@ -2930,12 +2923,8 @@ async fn non_proxy_scope_with_stray_target_does_not_enter_batch_only_path() {
         .is_none());
         // The API-target library does not replace the CLI's schema/security
         // gate. This isolates dependency classification for malformed targets.
-        let (url, requests) = spawn_recording_gateway(vec![(
-            "POST /batch".into(),
-            501,
-            "{}".into(),
-            vec![],
-        )]);
+        let (url, requests) =
+            spawn_recording_gateway(vec![("POST /batch".into(), 501, "{}".into(), vec![])]);
         let result = apply_api(
             &desired,
             &stub_client(url),
@@ -2981,10 +2970,8 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     let mut old = actual.proxies[0].clone();
     old.backend_port = 9090;
     desired.proxies.push(old);
-    let diffs = order_incremental_diffs(
-        gitforgeops::diff::compute_diff(&desired, &actual),
-        &desired,
-    );
+    let diffs =
+        order_incremental_diffs(gitforgeops::diff::compute_diff(&desired, &actual), &desired);
     assert_eq!(
         diffs
             .iter()
@@ -2992,8 +2979,7 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
             .collect::<Vec<_>>(),
         vec!["independent", "pc1", "p1", "old"]
     );
-    let note =
-        incremental_plugin_attach_notice(&Default::default(), &diffs, &desired).unwrap();
+    let note = incremental_plugin_attach_notice(&Default::default(), &diffs, &desired).unwrap();
     let review = build_review_comment_v2_with_status(
         ReviewValidationStatus::Passed,
         "",

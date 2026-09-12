@@ -1610,12 +1610,13 @@ async fn cmd_plan(
     // literals to the auditor. Running pre-resolve keeps the audit on
     // the repo's actual committed state.
     let policy_cfg = policy::load_policies()?;
+    let no_ledger = HashSet::new();
     let security_findings = diff::audit_security_with_scope(
         &desired,
         policy_cfg.as_ref(),
         match resolved.ownership.mode {
             OwnershipMode::Shared => diff::OwnershipScope::Shared {
-                previously_managed: &HashSet::new(),
+                previously_managed: &no_ledger,
             },
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
@@ -2082,8 +2083,8 @@ async fn cmd_apply(
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let allow_nontransactional_plugin_attach = allow_nontransactional_plugin_attach
-        || env_config.allow_nontransactional_plugin_attach;
+    let allow_nontransactional_plugin_attach =
+        allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
@@ -2103,12 +2104,13 @@ async fn cmd_apply(
     // publish — is what makes it impossible for an apply to publish a secret
     // that was committed to the repository.
     let policy_cfg = policy::load_policies()?;
+    let no_ledger = HashSet::new();
     let security_findings = diff::audit_security_with_scope(
         &desired,
         policy_cfg.as_ref(),
         match resolved.ownership.mode {
             OwnershipMode::Shared => diff::OwnershipScope::Shared {
-                previously_managed: &HashSet::new(),
+                previously_managed: &no_ledger,
             },
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
@@ -3034,12 +3036,13 @@ async fn cmd_review(
     // Audit pre-resolve so placeholder-resolved values aren't misreported as
     // literal credentials (see cmd_plan for full rationale).
     let policy_cfg = policy::load_policies()?;
+    let no_ledger = HashSet::new();
     let security_findings = diff::audit_security_with_scope(
         &desired,
         policy_cfg.as_ref(),
         match resolved.ownership.mode {
             OwnershipMode::Shared => diff::OwnershipScope::Shared {
-                previously_managed: &HashSet::new(),
+                previously_managed: &no_ledger,
             },
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },

@@ -1447,7 +1447,8 @@ async fn apply_incremental(
                         }
                         Some(Err(error)) => Err(crate::error::Error::Config(error.clone())),
                         None => Err(crate::error::Error::Config(
-                            "post-plugin backup unavailable; proxy update not attempted".to_string(),
+                            "post-plugin backup unavailable; proxy update not attempted"
+                                .to_string(),
                         )),
                     }
                 }
@@ -2952,12 +2953,8 @@ async fn create_individually(
             let outcome = if proxy_has_failed_plugin(p, &failed_plugins) {
                 Err(failed_plugin_dependency())
             } else {
-                create_with_reconciliation(
-                    client,
-                    namespace,
-                    CreateResource::Proxy(&initial_proxy),
-                )
-                .await
+                create_with_reconciliation(client, namespace, CreateResource::Proxy(&initial_proxy))
+                    .await
             };
             if outcome.is_err() {
                 failed_proxies.insert(p.id.as_str());
