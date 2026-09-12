@@ -205,8 +205,7 @@ fn load_bundles_handles_file_path_route() {
 fn load_bundles_parses_merged_map() {
     let raw = r#"{
         "FERRUM_CREDS_BUNDLE": "{\"ferrum/app/api_key\":\"v1\"}",
-        "FERRUM_CREDS_BUNDLE_1": "{\"ferrum/app2/api_key\":\"v2\"}",
-        "UNRELATED_SECRET": "ignored"
+        "FERRUM_CREDS_BUNDLE_1": "{\"ferrum/app2/api_key\":\"v2\"}"
     }"#;
     let (merged, per_shard) = load_bundles_from_env(raw).unwrap();
     assert_eq!(merged.get("ferrum/app/api_key"), Some(&"v1".to_string()));
@@ -215,6 +214,69 @@ fn load_bundles_parses_merged_map() {
     assert_eq!(per_shard.len(), 2);
     assert!(per_shard.contains_key(&0));
     assert!(per_shard.contains_key(&1));
+}
+
+#[test]
+fn load_bundles_empty_object_is_an_empty_bundle() {
+    let (merged, per_shard) = load_bundles_from_env("{}").unwrap();
+    assert!(merged.is_empty());
+    assert!(per_shard.is_empty());
+}
+
+#[test]
+fn load_bundles_rejects_flat_slot_map() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    let raw = r#"{"ferrum/consumer-alice/keyauth/key":"x"}"#;
+    let err = load_bundles_from_env(raw).unwrap_err().to_string();
+    assert!(
+        err.contains("contributed no shards"),
+        "expected fail-closed empty-shard error, got: {err}"
+    );
+    assert!(
+        err.contains("FERRUM_CREDS_BUNDLE"),
+        "expected wrapper key shape in error, got: {err}"
+    );
+    assert!(
+        err.contains("ferrum/consumer-alice/keyauth/key"),
+        "expected first offending key, got: {err}"
+    );
+    assert!(
+        parse_bundles_from_json(raw).is_err(),
+        "parse path must refuse the same flat map"
+    );
+}
+
+#[test]
+fn load_bundles_warns_on_unrecognized_keys_beside_shards() {
+    use gitforgeops::secrets::bundle::{parse_bundles_from_json, unrecognized_bundle_keys_warning};
+
+    let raw = r#"{
+        "FERRUM_CREDS_BUNDLE": {"ferrum/app/api_key":"v1"},
+        "UNRELATED_SECRET": "ignored",
+        "ALSO_NOT_A_SHARD": "nope"
+    }"#;
+    let loaded = parse_bundles_from_json(raw).unwrap();
+    assert_eq!(
+        loaded.merged.get("ferrum/app/api_key"),
+        Some(&"v1".to_string())
+    );
+    assert_eq!(loaded.per_shard.len(), 1);
+    assert_eq!(
+        loaded.unrecognized_keys,
+        vec![
+            "ALSO_NOT_A_SHARD".to_string(),
+            "UNRELATED_SECRET".to_string(),
+        ]
+    );
+    let warning = unrecognized_bundle_keys_warning(&loaded.unrecognized_keys);
+    assert!(warning.contains("FERRUM_CREDS_BUNDLE"));
+    assert!(warning.contains("UNRELATED_SECRET"), "{warning}");
+    assert!(warning.contains("ALSO_NOT_A_SHARD"), "{warning}");
+
+    let (merged, per_shard) = load_bundles_from_env(raw).unwrap();
+    assert_eq!(merged.get("ferrum/app/api_key"), Some(&"v1".to_string()));
+    assert_eq!(per_shard.len(), 1);
 }
 
 #[test]

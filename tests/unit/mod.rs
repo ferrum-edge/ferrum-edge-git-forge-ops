@@ -10,6 +10,7 @@ mod env_tests;
 mod file_target_tests;
 mod http_client_tests;
 mod import_tests;
+mod json_output_tests;
 mod jwt_tests;
 mod loader_tests;
 mod log_injection_tests;

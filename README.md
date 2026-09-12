@@ -1347,8 +1347,8 @@ See `.env.example`. Essentials for running `gitforgeops` on your laptop:
 
 - `FERRUM_ENV=<name>` — pick an environment from `.gitforgeops/config.yaml`
 - `FERRUM_GATEWAY_URL` + `FERRUM_ADMIN_JWT_SECRET` — connect to a live gateway (the URL must be `https://` unless `FERRUM_ALLOW_INSECURE_HTTP=true`)
-- `FERRUM_CREDS_JSON_FILE` — preferred path to a JSON file containing `FERRUM_CREDS_BUNDLE*` values
-- `FERRUM_CREDS_JSON` — inline equivalent for small local apply tests
+- `FERRUM_CREDS_JSON_FILE` — preferred path to a JSON file wrapping slot maps under `FERRUM_CREDS_BUNDLE` / `FERRUM_CREDS_BUNDLE_N` (same shape as GitHub Environment Secrets)
+- `FERRUM_CREDS_JSON` — inline equivalent for small local tests, e.g. `{"FERRUM_CREDS_BUNDLE":{"<slot>":"<value>"}}`. A flat slot map is rejected.
 
 Runtime variables supported by the binary include:
 

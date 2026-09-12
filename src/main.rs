@@ -2908,7 +2908,7 @@ fn cmd_envs(
                 namespaces: None,
             }],
         };
-        println!("{}", serde_json::to_string(&scopes)?);
+        print!("{}", gitforgeops::json_output::compact(&scopes)?);
         return Ok(());
     }
     let names = match repo {
@@ -2922,7 +2922,7 @@ fn cmd_envs(
             }
         }
         cli::EnvsFormat::Json => {
-            println!("{}", serde_json::to_string(&names)?);
+            print!("{}", gitforgeops::json_output::compact(&names)?);
         }
     }
     Ok(())

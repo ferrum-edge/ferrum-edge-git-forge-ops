@@ -12,7 +12,10 @@ pub use allocator::{
     allocate_and_deliver, generate_credential_value, generate_credential_value_typed,
     rotate_and_deliver, AllocateOutcome, AllocatedSlot, AllocationFailure,
 };
-pub use bundle::{load_bundles_from_env, merge_bundles, serialize_bundle, CredentialBundle};
+pub use bundle::{
+    load_bundles_from_env, merge_bundles, parse_bundles_from_json, serialize_bundle,
+    CredentialBundle, LoadedBundles,
+};
 pub use delivery::{deliver_to_author, DeliveryResult};
 pub use github_api::{fetch_public_key, put_environment_secret, EnvSecretPublicKey};
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
