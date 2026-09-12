@@ -748,7 +748,7 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 - `mesh-minimal/` is the opposite mesh contract: a MeshConfig with a required workload `selector` and the smallest workload/service set `ferrum-edge validate -m mesh` accepts. `tests/unit/mesh_minimal_tests.rs` loads it strictly and asserts the rendered `{version, mesh}` document still carries that selector. Keep `companion-schema/` unchanged when editing this fixture.
 - New test file: create `tests/unit/<name>.rs` AND add `mod <name>;` to `tests/unit/mod.rs`.
 - `tempfile` crate for filesystem tests.
-- No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking.
+- No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking. GitHub Environment Secret adapters (`fetch_public_key` / `put_environment_secret`) are driven against an in-process loopback stub in `tests/unit/github_api_tests.rs` by injecting a test-only API origin (`fetch_public_key_at` / `put_environment_secret_at` / `allocate_and_deliver_at` / `rotate_and_deliver_at`). Production wrappers keep the compiled-in `https://api.github.com` origin; there is no environment-variable override.
 
 ## Development Guidelines
 
