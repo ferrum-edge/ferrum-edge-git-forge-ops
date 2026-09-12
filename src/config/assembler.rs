@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-use super::schema::{BackendScheme, GatewayConfig, MeshConfigSpec, Resource};
+use super::schema::{
+    BackendScheme, GatewayConfig, MeshConfigSpec, PluginAssociation, PluginScope, Resource,
+};
 use super::strict::{self, LoadOptions};
 
 /// Everything one load+assemble pass produces.
@@ -58,8 +60,9 @@ impl AssembledOutput {
 /// namespace, unless the spec already has a non-default namespace explicitly
 /// set, then canonicalizes consumer credentials via
 /// [`normalize_consumer_credentials`] and proxy backend schemes via
-/// [`normalize_proxy_backend_schemes`]. Mesh fragments are merged by
-/// [`merge_mesh_fragments`].
+/// [`normalize_proxy_backend_schemes`], then derives proxy-scoped plugin
+/// associations via [`normalize_proxy_plugin_associations`]. Mesh fragments
+/// are merged by [`merge_mesh_fragments`].
 pub fn assemble(resources: Vec<(String, Resource)>) -> crate::error::Result<AssembledOutput> {
     assemble_with_namespace_filter(resources, None)
 }
@@ -124,6 +127,7 @@ pub fn assemble_with_namespace_filter(
 
     normalize_consumer_credentials(&mut config);
     normalize_proxy_backend_schemes(&mut config);
+    normalize_proxy_plugin_associations(&mut config);
 
     Ok(AssembledOutput {
         gateway: config,
@@ -131,6 +135,49 @@ pub fn assemble_with_namespace_filter(
         mesh_sources,
         namespace_scope: super::namespace_guard::NamespaceScope::default(),
     })
+}
+
+/// Derive the associations ferrum-edge stores when a proxy-scoped plugin is
+/// written. Run after overlays and namespace inference, before comparison,
+/// security/policy analysis, export or apply, so they all see the same graph.
+///
+/// Keep explicit associations in their authored order (first occurrence wins)
+/// and append missing derived IDs in lexical order, independent of resource
+/// load order. Disabled configs still have stored associations; whether they
+/// execute is decided by `plugin_catalog::effective_plugins`.
+///
+/// Only a `scope: proxy` config in the proxy's effective namespace contributes
+/// an association. Global and proxy-group configs are never auto-attached.
+/// Explicit invalid references are retained for validation/security findings,
+/// not silently repaired. Repeating normalization is a no-op.
+pub fn normalize_proxy_plugin_associations(config: &mut GatewayConfig) {
+    let mut scoped: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
+    for plugin in &config.plugin_configs {
+        if plugin.scope == PluginScope::Proxy {
+            if let Some(proxy_id) = plugin.proxy_id.as_deref() {
+                scoped
+                    .entry((plugin.namespace.as_str(), proxy_id))
+                    .or_default()
+                    .insert(plugin.id.as_str());
+            }
+        }
+    }
+
+    for proxy in &mut config.proxies {
+        let mut seen = HashSet::new();
+        proxy
+            .plugins
+            .retain(|association| seen.insert(association.plugin_config_id.clone()));
+        if let Some(plugin_ids) = scoped.get(&(proxy.namespace.as_str(), proxy.id.as_str())) {
+            for plugin_id in plugin_ids {
+                if seen.insert((*plugin_id).to_string()) {
+                    proxy.plugins.push(PluginAssociation {
+                        plugin_config_id: (*plugin_id).to_string(),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Fold every `MeshConfig` fragment into the single document a mesh node

@@ -358,6 +358,69 @@ the moment someone opens the folder and no commit can remove them for good.
 The trusted-review archive applies the same rules — the same two lists — before
 it crosses the privileged data boundary.
 
+### Plugin configs and proxy associations
+
+A `PluginConfig` with `scope: proxy` and `proxy_id` automatically contributes
+`{plugin_config_id: <its id>}` to that proxy's `plugins` list during assembly.
+The plugin and proxy must share the same effective namespace. For example,
+these files under `resources/team-alpha/` are sufficient:
+
+```yaml
+# proxies/orders.yaml
+kind: Proxy
+spec:
+  id: orders
+  listen_path: /orders
+  backend_host: orders.internal
+  backend_port: 443
+---
+# plugins/orders-keyauth.yaml
+kind: PluginConfig
+spec:
+  id: orders-keyauth
+  plugin_name: key_auth
+  scope: proxy
+  proxy_id: orders
+  config: {}
+```
+
+Explicit dual declaration remains allowed: the proxy may also declare
+`plugins: [{plugin_config_id: orders-keyauth}]`. Assembly keeps explicit
+entries in their original order, removes duplicate IDs, and appends missing
+derived IDs in lexical order after overlays and namespace inference. Export,
+apply, diff, plan, and security/policy checks all use this assembled list,
+matching Edge's auto-attachment and avoiding repeated Proxy drift or a false
+"No auth plugin" warning. Disabled configs still get an association but do not
+count as authentication.
+
+Association comparison ignores ID order while retaining duplicate counts, so
+live duplicates remain correctable drift. Payloads and printed old/new values
+keep their original order. Incremental writes run upstreams/consumers → plugins
+→ proxies, with deletes reversed. One authoritative backup per namespace after
+plugin writes skips already-matching proxy updates while preserving required
+ownership assertions. New proxies and new scoped plugins share a create
+transaction, even in mixed namespaces; the explicit 501/413 fallback opt-in
+below permits two-step attachment. Plan, review and apply preview the same order
+and call out create cycles and their batch requirement. Failed writes defer
+namespace pruning; failed proxy deletions retain referenced plugins.
+
+`scope: global` applies without an association; `scope: proxy_group` still
+requires explicit `Proxy.plugins` entries and no `proxy_id`. An explicit
+reference to a global config or a declared config whose `scope`/`proxy_id`
+conflicts with the association is an error-severity security finding in both
+ownership modes. Every `proxy_group` config carrying `proxy_id` is also an error,
+even when no proxy explicitly references it. A config absent from this repository
+namespace is a **warning in shared mode** and an **error in exclusive mode**:
+shared repositories may reference live configs owned by other tooling. Declare
+the config in this repository or confirm it is owned elsewhere; do not remove a
+working live association to silence the warning. Assembly retains references
+for diagnosis. Edge stores disabled proxy-scoped associations, removes global
+associations on plugin writes, and rejects explicit global associations, so API
+imports of valid Edge graphs need no special association rewrite.
+To detach a proxy-scoped plugin, remove or retarget its `PluginConfig` and
+remove any explicit association; clearing `Proxy.plugins` alone does not
+detach a config that still points at the proxy.
+
 ### Supported fields, and what happens to unsupported ones
 
 The typed companion schema rejects unknown wrapper, resource, and nested object
@@ -1135,7 +1198,7 @@ Retried:
 
 Never retried:
 
-- **HTTP 501** — a standalone-MongoDB gateway (no multi-document transactions) will answer it forever. For `POST /batch` this is not even an error: apply falls back to per-resource creates.
+- **HTTP 501** — a standalone-MongoDB gateway (no multi-document transactions) will answer it forever. `POST /batch` falls back to independent per-resource creates; proxy/scoped-plugin cycles require the explicit opt-in described below.
 - **Every error response from non-idempotent create and batch POSTs** — a gateway or intermediary can return an error after commit. Gitforgeops sends the POST once, then fetches an authoritative backup after an ambiguous response, and treats the three possible answers differently: the exact desired resource (or complete batch) live → an idempotent PUT declares repository ownership, and only then is the create recorded; nothing under that id on a fresh, database-backed backup → the write provably did not commit, so it is an ordinary per-resource failure and the run keeps going; a row that exists but is not what we sent, or no usable verification at all → the run stops for reconciliation. The ownership PUT *declares* the repository as the row's writer; it cannot prove who created it, which is exactly why equality alone never grants deletion authority. A batch is decomposed into individual creates only for documented definitive rejections (400/409/413/422), never for transport/5xx ambiguity.
 - **`applied: false` in the body** — the write is durably committed but not live on the running gateway. Re-sending re-applies an already-committed write; check gateway health instead. Surfaces as a `CommittedNotLive` error naming the gateway's `reason` (`config_rejected` / `reload_timeout` / `sequence_unavailable`).
 - **`/restore` failures other than the explicit pre-commit connectivity case** — restore is destructive and not generally idempotent. A 500 with `rollback: incomplete` or `unknown_outcome` additionally surfaces as manual-recovery-required because the namespace may be partially restored.
@@ -1164,10 +1227,10 @@ Incremental apply sorts the diff into dependency order rather than by kind, beca
 | Rank | Operations |
 |---|---|
 | 0 | Add/Modify Upstream, Add/Modify Consumer |
-| 1 | Add/Modify Proxy |
-| 2 | Add/Modify PluginConfig |
-| 3 | Delete PluginConfig |
-| 4 | Delete Proxy |
+| 1 | Add/Modify PluginConfig |
+| 2 | Add/Modify Proxy (including new proxy/scoped-plugin create batches) |
+| 3 | Delete Proxy |
+| 4 | Delete PluginConfig |
 | 5 | Delete Upstream, Delete Consumer |
 
 Deletes come *after* adds and modifies: an upstream can only be removed once nothing references it (`DELETE /upstreams/{id}` answers 409 while a proxy still points at it), so the proxy modify that drops the reference has to land first.
@@ -1178,7 +1241,27 @@ This preserves an incumbent when a replacement fails, but does **not** make a re
 
 Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-side cascade defaults to on and would delete the last-referenced hand-owned upstream along with the proxy — an invisible deletion that makes the next diff-driven `DELETE /upstreams/{id}` answer 404. gitforgeops owns the upstream lifecycle through its own diff and issues that delete itself.
 
-When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — one transactional, all-or-nothing call, chunked below the gateway's 1 MiB body cap. Any Modify or Delete in the set disqualifies it (`/batch` is create-only), and a 501 falls back to per-resource creates.
+When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — transactional, all-or-nothing calls chunked below the gateway's 1 MiB body cap. Associated proxy/plugin create groups stay in one chunk, with deterministic grouping across reordered input. A 501 or definitive validation rejection permits independent per-resource creates. By default, a new proxy and its new scoped plugins require a successful transaction; an unsupported or oversized cycle is reported without publishing a partially configured proxy. Mixed namespaces use create batches only for those cycles, after independent writes.
+
+Use a transaction-capable gateway for atomic creation. On gateways that return
+**501 or 413**, `gitforgeops apply --allow-nontransactional-plugin-attach` (or
+`GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH=true`) explicitly permits
+creating the proxy first, then creating its new scoped plugin configs. Apply
+prints a warning: **the proxy is briefly published without its scoped plugin**,
+including authentication or other protection it provides. If attachment fails,
+the proxy remains published without that protection; apply exits nonzero,
+preserves ownership of successful creates, and defers namespace pruning. Repair
+the attachment immediately. The flag defaults to false and does not permit cycle
+fallback on other validation errors or ambiguous responses.
+
+Retargeting an existing plugin to a brand-new proxy cannot use create-only
+`POST /batch`. Edge rejects that plugin update; incremental apply then withholds
+the dependent proxy create and defers pruning, even with the opt-in. Establish
+the target in a separate apply first, or use exclusive `full_replace` for an
+atomic graph change. Edge's plugin delete operation detaches
+live references rather than rejecting them. GitForgeOps deliberately deletes
+proxies first and retains plugins when a proxy deletion fails, preserving the
+surviving proxy's protection.
 
 #### Ordering between runs: the environment lock and the freshness guard
 
@@ -1375,6 +1458,7 @@ Runtime variables supported by the binary include:
 | `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all namespaces. `validate`, `plan`, and `diff` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` (CLI-only) demotes that to a warning. |
 | `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown **top-level** `spec` fields verbatim instead of rejecting them, for a gateway newer than this release. Nested unknown fields stay fatal either way. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones). |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Legacy/env-driven strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
+| `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same opt-in as `apply --allow-nontransactional-plugin-attach`: on batch 501/413, publish a new proxy before attaching its new scoped plugins. Accepts `true`, `false`, `1`, `0`; invalid values fail. |
 | `FERRUM_OVERLAY` | — | Legacy overlay selector used only without repo config/env selection. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode output path. Bundled file-mode apply sets this to `assembled/<env>.yaml`. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`, and retracted (rewritten as `mesh: {}`, never deleted) when the last `MeshConfig` fragment is removed. Separate document, separate path — see [Mesh configuration](#mesh-configuration). Bundled workflows set `assembled/<env>-mesh.yaml`. |

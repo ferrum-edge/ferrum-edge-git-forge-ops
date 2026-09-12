@@ -182,10 +182,12 @@ fn cli_apply_exposes_the_api_spec_deletion_opt_in() {
             auto_approve,
             allow_large_prune,
             confirm_api_spec_deletion,
+            allow_nontransactional_plugin_attach,
         } => {
             assert!(auto_approve);
             assert!(!allow_large_prune);
             assert!(!confirm_api_spec_deletion);
+            assert!(!allow_nontransactional_plugin_attach);
         }
         _ => panic!("expected apply command"),
     }
@@ -209,6 +211,23 @@ fn cli_apply_exposes_the_api_spec_deletion_opt_in() {
         }
         _ => panic!("expected apply command"),
     }
+}
+
+#[test]
+fn cli_accepts_nontransactional_plugin_attach_opt_in() {
+    let cli = Cli::try_parse_from([
+        "gitforgeops",
+        "apply",
+        "--allow-nontransactional-plugin-attach",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Apply {
+            allow_nontransactional_plugin_attach: true,
+            ..
+        }
+    ));
 }
 
 #[test]

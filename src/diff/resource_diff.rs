@@ -541,7 +541,7 @@ fn diff_collection<T: serde::Serialize + PassthroughFields>(
                     });
                     continue;
                 }
-                let mut details = compare_fields(*desired_res, *actual_res);
+                let mut details = compare_fields(kind, *desired_res, *actual_res);
                 // Redact at construction, not at print time: a `FieldChange`
                 // is rendered by plan/diff stdout *and* by the PR comment, and
                 // a secret that never enters the struct cannot be forgotten by
@@ -649,12 +649,22 @@ fn diff_collection<T: serde::Serialize + PassthroughFields>(
 /// gateway re-adds its own field) and `drift-check --exit-on-drift` would never
 /// go green again. Same rule as unmanaged resources: what the repo never
 /// claimed, the repo does not reconcile.
-fn compare_fields<T: serde::Serialize + PassthroughFields>(
+pub(crate) fn compare_fields<T: serde::Serialize + PassthroughFields>(
+    kind: &str,
     desired: &T,
     actual: &T,
 ) -> Vec<FieldChange> {
-    let desired_val = serde_json::to_value(desired).unwrap_or_default();
-    let actual_val = serde_json::to_value(actual).unwrap_or_default();
+    let mut desired_val = serde_json::to_value(desired).unwrap_or_default();
+    let mut actual_val = serde_json::to_value(actual).unwrap_or_default();
+    // Compare sorted copies, but report association changes in wire order.
+    let original_plugins = (kind == "Proxy").then(|| {
+        (
+            desired_val.get("plugins").cloned().unwrap_or_default(),
+            actual_val.get("plugins").cloned().unwrap_or_default(),
+        )
+    });
+    normalize_associations_for_comparison(kind, &mut desired_val);
+    normalize_associations_for_comparison(kind, &mut actual_val);
 
     let mut changes = Vec::new();
     if desired_val == actual_val {
@@ -670,6 +680,14 @@ fn compare_fields<T: serde::Serialize + PassthroughFields>(
             }
             let a_val = a_map.get(key).unwrap_or(&serde_json::Value::Null);
             if d_val != a_val {
+                let (d_val, a_val) = if key == "plugins" {
+                    original_plugins
+                        .as_ref()
+                        .map(|(desired, actual)| (desired, actual))
+                        .unwrap_or((d_val, a_val))
+                } else {
+                    (d_val, a_val)
+                };
                 changes.push(FieldChange {
                     field: key.clone(),
                     old_value: serde_json::to_string(a_val).unwrap_or_default(),
@@ -697,4 +715,23 @@ fn compare_fields<T: serde::Serialize + PassthroughFields>(
     }
 
     changes
+}
+
+/// Edge stores associations without a defined read order. Normalize only a
+/// serialized comparison copy of Proxy.plugins; wire/export order and every
+/// other array (including opaque plugin config) remain meaningful and intact.
+pub(crate) fn normalize_associations_for_comparison(kind: &str, value: &mut serde_json::Value) {
+    if kind != "Proxy" {
+        return;
+    }
+    if let Some(serde_json::Value::Array(plugins)) = value.get_mut("plugins") {
+        plugins.sort_by(|a, b| {
+            a.get("plugin_config_id")
+                .and_then(serde_json::Value::as_str)
+                .cmp(
+                    &b.get("plugin_config_id")
+                        .and_then(serde_json::Value::as_str),
+                )
+        });
+    }
 }

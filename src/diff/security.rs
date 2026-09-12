@@ -1,6 +1,7 @@
-use crate::config::schema::{PluginConfig, Proxy};
+use crate::config::schema::{PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
 use crate::diagnostics::{sanitize, sanitize_line};
+use crate::diff::resource_diff::OwnershipScope;
 use crate::plugin_catalog::{
     allows_uninspectable_body, cfg_array, cfg_bool, cfg_str, effective_plugins, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_retired, retired_replacement,
@@ -96,6 +97,16 @@ pub fn audit_security_with_policy(
     config: &GatewayConfig,
     policy: Option<&PolicyConfig>,
 ) -> Vec<SecurityFinding> {
+    audit_security_with_scope(config, policy, OwnershipScope::Exclusive)
+}
+
+/// Audit a repository's view of the graph. Shared repositories may reference
+/// live plugin configs owned elsewhere; declared conflicts still block apply.
+pub fn audit_security_with_scope(
+    config: &GatewayConfig,
+    policy: Option<&PolicyConfig>,
+    ownership_scope: OwnershipScope<'_>,
+) -> Vec<SecurityFinding> {
     let mut findings = Vec::new();
 
     let auth_names: Vec<String> = match policy {
@@ -141,6 +152,7 @@ pub fn audit_security_with_policy(
 
     for proxy in &config.proxies {
         check_proxy(config, proxy, &auth_names, &mut findings);
+        check_proxy_plugin_associations(config, proxy, ownership_scope, &mut findings);
     }
 
     // An Upstream carries the same TLS-verification flag as a Proxy, and a
@@ -255,6 +267,57 @@ fn check_proxy(
     }
 }
 
+/// Association errors must remain visible after assembly derives valid scoped
+/// attachments. Check disabled configs too: their stored graph still has to
+/// agree with scope, even though they cannot satisfy the auth check.
+fn check_proxy_plugin_associations(
+    config: &GatewayConfig,
+    proxy: &Proxy,
+    ownership_scope: OwnershipScope<'_>,
+    findings: &mut Vec<SecurityFinding>,
+) {
+    for association in &proxy.plugins {
+        let plugin_id = &association.plugin_config_id;
+        let plugin = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.namespace == proxy.namespace && plugin.id == *plugin_id);
+        let reason = match plugin {
+            None => Some("no PluginConfig with that ID is declared in this repository namespace"),
+            Some(plugin) => match plugin.scope {
+                PluginScope::Global => Some("scope: global cannot be explicitly associated"),
+                PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) => {
+                    Some("scope: proxy requires proxy_id to match this proxy")
+                }
+                _ => None,
+            },
+        };
+        if let Some(reason) = reason {
+            let severity =
+                if plugin.is_none() && matches!(ownership_scope, OwnershipScope::Shared { .. }) {
+                    "warning"
+                } else {
+                    BLOCKING_SEVERITY
+                };
+            let remedy = if plugin.is_none() {
+                "declare the config in this repository or confirm it is owned elsewhere"
+            } else {
+                "correct the declared PluginConfig scope/proxy_id to match the intended association"
+            };
+            findings.push(SecurityFinding::new(
+                severity,
+                "Proxy",
+                &proxy.id,
+                &proxy.namespace,
+                format!(
+                    "proxy {} in namespace {} has invalid plugin association {plugin_id}: {reason}; {remedy}",
+                    proxy.id, proxy.namespace
+                ),
+            ));
+        }
+    }
+}
+
 /// Is this `allowed_origins` entry the any-origin wildcard? CORS origins are
 /// either bare strings or match objects, so `"*"` and `{exact: "*"}` are the
 /// same policy written two ways.
@@ -273,6 +336,17 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     let id = plugin.id.as_str();
     let ns = plugin.namespace.as_str();
     let name = plugin.plugin_name.as_str();
+
+    if plugin.scope == PluginScope::ProxyGroup && plugin.proxy_id.is_some() {
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            id,
+            ns,
+            format!(
+                "plugin config {id} in namespace {ns} has scope: proxy_group with a proxy_id; scope: proxy_group requires proxy_id to be omitted, with targets declared through Proxy.plugins"
+            ),
+        ));
+    }
 
     // Name checks apply regardless of `enabled`: a retired name is a fatal
     // gateway load error for the whole config, not a skipped plugin.

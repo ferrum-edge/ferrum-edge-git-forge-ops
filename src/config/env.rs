@@ -81,6 +81,8 @@ pub struct EnvConfig {
     pub gateway_mode: GatewayMode,
     /// How to apply config changes.
     pub apply_strategy: ApplyStrategy,
+    /// Permit nontransactional proxy/plugin attachment on batch 501/413.
+    pub allow_nontransactional_plugin_attach: bool,
     /// Overlay name to apply (e.g. `production`, `staging`).
     pub overlay: Option<String>,
     /// Selected environment name (from repo config). Takes precedence over `overlay` if set.
@@ -170,6 +172,7 @@ impl Default for EnvConfig {
             admin_jwt_ttl_secs: DEFAULT_JWT_TTL_SECS,
             namespace_filter: None,
             allow_unknown_fields: false,
+            allow_nontransactional_plugin_attach: false,
             gateway_mode: GatewayMode::default(),
             apply_strategy: ApplyStrategy::default(),
             overlay: None,
@@ -213,6 +216,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_ADMIN_JWT_TTL_SECS`  | `admin_jwt_ttl_secs` | `3600`                         |
 /// | `FERRUM_NAMESPACE`           | `namespace_filter` | `None`                           |
 /// | `FERRUM_ALLOW_UNKNOWN_FIELDS`| `allow_unknown_fields` | `false` (unknown fields are rejected) |
+/// | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `allow_nontransactional_plugin_attach` | `false` (batch cycles require transactions) |
 /// | `FERRUM_GATEWAY_MODE`        | `gateway_mode`     | `api`                            |
 /// | `FERRUM_APPLY_STRATEGY`      | `apply_strategy`   | `incremental`                    |
 /// | `FERRUM_OVERLAY`             | `overlay`          | `None`                           |
@@ -298,6 +302,10 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         )?,
         namespace_filter: non_empty_env("FERRUM_NAMESPACE"),
         allow_unknown_fields: parse_bool_env("FERRUM_ALLOW_UNKNOWN_FIELDS", false)?,
+        allow_nontransactional_plugin_attach: parse_bool_env(
+            "GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH",
+            false,
+        )?,
         gateway_mode,
         apply_strategy,
         overlay: non_empty_env("FERRUM_OVERLAY"),

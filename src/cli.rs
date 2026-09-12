@@ -88,6 +88,11 @@ pub enum Commands {
         /// Destructive: without this flag `apply` preserves them.
         #[arg(long)]
         confirm_api_spec_deletion: bool,
+        /// Permit proxy-then-plugin creates after POST /batch returns 501/413.
+        /// The proxy is briefly published without its scoped plugin. Also set
+        /// by GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH=true.
+        #[arg(long)]
+        allow_nontransactional_plugin_attach: bool,
     },
     Import {
         /// Import one API namespace. Requires FERRUM_NAMESPACE or an
