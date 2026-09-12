@@ -508,6 +508,118 @@ fn plan_exits_nonzero_on_a_literal_consumer_credential() {
     );
 }
 
+const UNKNOWN_API_KEY_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    api_key:
+      - key: "${gh-env-secret:alloc=require}"
+"#;
+
+const UNKNOWN_BASIC_AUTH_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    basic_auth:
+      - username: app
+        password: "${gh-env-secret:alloc=require}"
+"#;
+
+const UNKNOWN_VENDOR_TOKEN_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    vendor_token:
+      - key: "${gh-env-secret:alloc=require}"
+"#;
+
+const UNKNOWN_API_KEY_BUNDLE: &str =
+    r#"{"FERRUM_CREDS_BUNDLE": {"ferrum/app/api_key/key": "bundle-value"}}"#;
+
+fn combined_output(output: &Output) -> String {
+    format!("{}\n{}", stdout(output), stderr(output))
+}
+
+fn assert_unknown_credential_refusal(output: &Output, unknown: &str, suggestion: Option<&str>) {
+    assert!(
+        !output.status.success(),
+        "unknown credential type {unknown} must fail closed; stdout={} stderr={}",
+        stdout(output),
+        stderr(output)
+    );
+    let diagnostic = combined_output(output);
+    assert!(
+        diagnostic.contains(&format!("Unknown credential type '{unknown}'")),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("on consumer app in namespace ferrum"),
+        "{diagnostic}"
+    );
+    for known in ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"] {
+        assert!(
+            diagnostic.contains(known),
+            "recognized set must name {known}: {diagnostic}"
+        );
+    }
+    match suggestion {
+        Some(canonical) => assert!(
+            diagnostic.contains(&format!("did you mean '{canonical}'")),
+            "{diagnostic}"
+        ),
+        None => assert!(!diagnostic.contains("did you mean"), "{diagnostic}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_plan_and_apply_refuse_unknown_credential_map_keys() {
+    let repo = Repo::with_consumer(UNKNOWN_API_KEY_CONSUMER);
+    let env = [("FERRUM_CREDS_JSON", UNKNOWN_API_KEY_BUNDLE)];
+
+    let validate = repo.run(&["validate"], &env);
+    assert_unknown_credential_refusal(&validate, "api_key", Some("keyauth"));
+    assert!(!repo.published().exists());
+
+    let plan = repo.run(&["plan"], &env);
+    assert_unknown_credential_refusal(&plan, "api_key", Some("keyauth"));
+    assert!(!repo.published().exists());
+
+    let apply = repo.run(&["apply", "--auto-approve"], &env);
+    assert_unknown_credential_refusal(&apply, "api_key", Some("keyauth"));
+    assert!(
+        stderr(&apply).contains("Refusing to apply")
+            || stderr(&apply).contains("error-severity"),
+        "apply must refuse the way other error-severity findings do: {}",
+        stderr(&apply)
+    );
+    assert!(
+        !repo.published().exists(),
+        "a refused apply must publish nothing"
+    );
+
+    let basic = Repo::with_consumer(UNKNOWN_BASIC_AUTH_CONSUMER);
+    assert_unknown_credential_refusal(
+        &basic.run(&["validate"], &[]),
+        "basic_auth",
+        Some("basicauth"),
+    );
+    assert_unknown_credential_refusal(&basic.run(&["plan"], &[]), "basic_auth", Some("basicauth"));
+    let basic_apply = basic.run(&["apply", "--auto-approve"], &[]);
+    assert_unknown_credential_refusal(&basic_apply, "basic_auth", Some("basicauth"));
+    assert!(!basic.published().exists());
+
+    let vendor = Repo::with_consumer(UNKNOWN_VENDOR_TOKEN_CONSUMER);
+    assert_unknown_credential_refusal(&vendor.run(&["validate"], &[]), "vendor_token", None);
+    assert_unknown_credential_refusal(&vendor.run(&["plan"], &[]), "vendor_token", None);
+    let vendor_apply = vendor.run(&["apply", "--auto-approve"], &[]);
+    assert_unknown_credential_refusal(&vendor_apply, "vendor_token", None);
+    assert!(!vendor.published().exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn file_apply_standins_validate_the_publication_document_not_the_resolved_report() {

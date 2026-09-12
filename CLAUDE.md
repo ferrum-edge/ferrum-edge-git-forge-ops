@@ -479,7 +479,11 @@ from `(namespace, consumer_id, cred_key)` — never hand-written.
 
 ferrum-edge recognizes exactly five credential types, each an **array** of
 entries (`KNOWN_CREDENTIAL_TYPES`): `basicauth`, `keyauth`, `jwt`, `hmac_auth`,
-`mtls_auth`. The array form is canonical — `/backup` always returns it, so a
+`mtls_auth`. Unknown Consumer `credentials` map keys (for example `api_key`,
+`basic_auth`) fail closed in `validate`, `plan`, and the credential broker with
+an error-severity finding that names the unknown key, the consumer, and the
+recognized set (`api_key` → `keyauth`, `basic_auth` → `basicauth`). The array
+form is canonical — `/backup` always returns it, so a
 bare object is permanent false drift; the assembler normalizes the object form
 on load. Slot paths elide `ArrayIndex(0)` so the normalization doesn't rename
 (and orphan) already-allocated slots; entries ≥1 get a `[N]` segment. Older
@@ -490,7 +494,7 @@ secrets** — the public halves of their credentials, which the broker cannot
 generate and a resource file cannot omit and still say which credential it
 describes. `secrets::resolver::is_identity_credential_leaf(credential_type,
 leaf)` is the single classifier, keyed on the credential type *and* the leaf
-key together (a `username` under a custom credential type is still a secret).
+key together. Unknown map keys are refused before this classifier runs.
 The resolver's whole-document `validate_identity_placeholders` preflight rejects
 broker syntax in these leaves before either the read-only (including lenient)
 or mutating walk. The CLI also calls it after overlay/namespace selection in
@@ -654,7 +658,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 ### Key Design Principles
 
-1. **Fail-closed typed schema, explicit opaque islands** — wrapper/resource/nested keys unknown to this companion version are rejected with source file + YAML path before lossy re-serialization. Intentionally free-form plugin `config`, credential maps, and per-item mesh values round-trip unchanged to the authoritative gateway validator.
+1. **Fail-closed typed schema, explicit opaque islands** — wrapper/resource/nested keys unknown to this companion version are rejected with source file + YAML path before lossy re-serialization. Intentionally free-form plugin `config`, credential *entry values*, and per-item mesh values round-trip unchanged to the authoritative gateway validator. Consumer credential *map keys* are the closed Ferrum Edge built-in set (`KNOWN_CREDENTIAL_TYPES`); unknown keys fail closed before apply.
    The one escape hatch is `FERRUM_ALLOW_UNKNOWN_FIELDS=true` (`config::LoadOptions`, threaded from `main` — never read from the process env inside the parse path): unknown **top-level** `spec` fields land in a `#[serde(flatten)]` `extra: BTreeMap` (`schema::PassthroughFields`) and flow through overlay merge → export → diff → apply verbatim, with one `Warning:` per file on **stderr** (stdout carries the exported YAML). Nested unknowns stay fatal in both modes — `serde_ignored` still sees them, because `flatten` only intercepts keys the struct did not claim. A pass-through key present only on the *live* side is not drift (`compare_fields` skips it); declaring a key in the repo is how the repo takes ownership of it. **`import` inverts this**: the value came from the gateway rather than the operator, and the credential broker only redacts leaves it models, so a non-empty `extra` on an importable resource is refused (`import::reject_import_passthrough_fields`) rather than written into the tree. `import --accept-unknown-field NAME` (repeatable) is the per-field acknowledgement, and it additionally requires `FERRUM_ALLOW_UNKNOWN_FIELDS=true` — otherwise the strict loader would reject the files import just wrote. `ImportPassthroughPolicy` carries both; `split_config` (the library entry point) is `strict()`. Acknowledged fields are named on stderr via `ImportResult::acknowledged_passthrough_notice`, and error text passes resource ids and field names through `diagnostic_metadata` because both come from an untrusted backup.
    Two corollaries of the same no-silent-rewrites rule: YAML merge keys (`<<:`) are unsupported and surface as unknown field `.spec.<<`, and opaque islands are **JSON-shaped**, so a non-string YAML mapping key is rejected (`strict::reject_non_string_keys`) rather than stringified.
    Deterministic output depends on this too: every map serialized into the exported document or an API body is a `BTreeMap`. `HashMap` re-seeds `RandomState` per instance, so the same input would export different bytes every run.

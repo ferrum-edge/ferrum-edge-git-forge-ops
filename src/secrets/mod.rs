@@ -21,10 +21,10 @@ pub use resolver::{
     capture_and_redact_import_service_discovery_secrets, report_secrets, report_secrets_lenient,
     report_secrets_with_mode, report_secrets_with_mode_and_options, report_secrets_with_options,
     resolve_secrets, resolve_secrets_with_mode, resolve_secrets_with_mode_and_options,
-    resolve_secrets_with_options, slot_path, PluginConfigCapture, ResolveOptions, ResolveReport,
-    ResolveResult, SlotRemapPolicy, SlotStatus, UnbrokeredPluginConfig,
-    IMPORT_REQUIRED_PLACEHOLDER, MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES,
-    MIN_ENTROPY_BYTES_FOR_32_CHARS, REDACTED_SENTINEL,
+    resolve_secrets_with_options, slot_path, validate_known_credential_types,
+    PluginConfigCapture, ResolveOptions, ResolveReport, ResolveResult, SlotRemapPolicy,
+    SlotStatus, UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER, MAX_CREDENTIAL_VALUE_CHARS,
+    MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS, REDACTED_SENTINEL,
 };
 pub use scrubber::{
     is_reencoding_hazard, ScrubbedOutput, SecretScrubber, SuppressionReason, FRAGMENT_SCAN_LENGTH,

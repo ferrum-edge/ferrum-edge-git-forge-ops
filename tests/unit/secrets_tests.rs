@@ -356,19 +356,19 @@ fn resolver_replaces_known_slot_and_reports_resolved() {
         updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=require}".to_string()),
     );
     cfg.consumers.push(consumer);
 
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/api_key".to_string(), "abcdef".to_string());
+    bundle.insert("ferrum/app/keyauth".to_string(), "abcdef".to_string());
 
     let report = resolve_secrets(&mut cfg, &bundle).unwrap();
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].status, SlotStatus::Resolved);
     assert_eq!(
-        cfg.consumers[0].credentials.get("api_key").unwrap(),
+        cfg.consumers[0].credentials.get("keyauth").unwrap(),
         &serde_json::Value::String("abcdef".to_string())
     );
 }
@@ -388,7 +388,7 @@ fn resolver_reports_missing_required() {
         updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=require}".to_string()),
     );
     cfg.consumers.push(consumer);
@@ -420,7 +420,7 @@ fn report_secrets_does_not_mutate_config() {
     };
     let placeholder = "${gh-env-secret:alloc=require}";
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String(placeholder.to_string()),
     );
     cfg.consumers.push(consumer);
@@ -428,7 +428,7 @@ fn report_secrets_does_not_mutate_config() {
     let mut bundle = BTreeMap::new();
     // Populate a matching bundle entry — resolve_secrets WOULD replace this,
     // but report_secrets must leave it alone.
-    bundle.insert("ferrum/app/api_key".to_string(), "real-secret".to_string());
+    bundle.insert("ferrum/app/keyauth".to_string(), "real-secret".to_string());
 
     let report = report_secrets(&cfg, &bundle).unwrap();
 
@@ -438,7 +438,7 @@ fn report_secrets_does_not_mutate_config() {
 
     // Critical: `cfg` was NOT mutated.
     assert_eq!(
-        cfg.consumers[0].credentials.get("api_key").unwrap(),
+        cfg.consumers[0].credentials.get("keyauth").unwrap(),
         &serde_json::Value::String(placeholder.to_string()),
         "report_secrets must not replace placeholders; doing so would leak credentials into the committed file-mode YAML"
     );
@@ -463,7 +463,7 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
     };
     let placeholder = "${gh-env-secret:alloc=generate}";
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String(placeholder.to_string()),
     );
     cfg.consumers.push(consumer);
@@ -501,14 +501,14 @@ fn resolver_replaces_rotate_placeholder_with_bundle_value() {
         updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=rotate}".to_string()),
     );
     cfg.consumers.push(consumer);
 
     let mut bundle = BTreeMap::new();
     bundle.insert(
-        "ferrum/app/api_key".to_string(),
+        "ferrum/app/keyauth".to_string(),
         "current-allocated-value".to_string(),
     );
 
@@ -520,7 +520,7 @@ fn resolver_replaces_rotate_placeholder_with_bundle_value() {
         "rotate placeholder with a bundle entry should classify as Resolved (same as generate)"
     );
     assert_eq!(
-        cfg.consumers[0].credentials.get("api_key").unwrap(),
+        cfg.consumers[0].credentials.get("keyauth").unwrap(),
         &serde_json::Value::String("current-allocated-value".to_string()),
         "rotate placeholder should resolve to the bundle value"
     );
@@ -544,7 +544,7 @@ fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
         updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=rotate}".to_string()),
     );
     cfg.consumers.push(consumer);
@@ -570,7 +570,7 @@ fn resolver_reports_needs_allocation_for_generate() {
         updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
     );
     cfg.consumers.push(consumer);
@@ -581,11 +581,9 @@ fn resolver_reports_needs_allocation_for_generate() {
 }
 
 #[test]
-fn flat_and_nested_credentials_produce_distinct_slots() {
-    // Escaped component paths keep a flat key `basic_auth.password` distinct
-    // from a nested `basic_auth: { password: ... }` credential. The flat key
-    // stays a single component (literal dot kept), and the nested path uses
-    // two components.
+fn flat_leaf_and_nested_credentials_produce_distinct_slots() {
+    // A dotted leaf under a recognized type stays one component (literal dot
+    // kept). A nested object under another recognized type uses two components.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
         extra: Default::default(),
@@ -598,12 +596,14 @@ fn flat_and_nested_credentials_produce_distinct_slots() {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     };
-    // Flat top-level key with a literal dot in its name.
-    consumer.credentials.insert(
-        "basic_auth.password".to_string(),
+    let mut dotted_leaf = serde_json::Map::new();
+    dotted_leaf.insert(
+        "key.suffix".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
     );
-    // Nested object with the same logical dotted-name.
+    consumer
+        .credentials
+        .insert("keyauth".to_string(), serde_json::Value::Object(dotted_leaf));
     let mut nested = serde_json::Map::new();
     nested.insert(
         "password".to_string(),
@@ -611,7 +611,7 @@ fn flat_and_nested_credentials_produce_distinct_slots() {
     );
     consumer
         .credentials
-        .insert("basic_auth".to_string(), serde_json::Value::Object(nested));
+        .insert("basicauth".to_string(), serde_json::Value::Object(nested));
     cfg.consumers.push(consumer);
 
     let bundle = BTreeMap::new();
@@ -619,11 +619,11 @@ fn flat_and_nested_credentials_produce_distinct_slots() {
     let slots: Vec<_> = report.results.iter().map(|r| r.slot.as_str()).collect();
     assert_eq!(slots.len(), 2, "each placeholder should get its own slot");
     assert!(
-        slots.contains(&"ferrum/app/basic_auth.password"),
-        "flat key slot missing from {slots:?}"
+        slots.contains(&"ferrum/app/keyauth/key.suffix"),
+        "dotted leaf slot missing from {slots:?}"
     );
     assert!(
-        slots.contains(&"ferrum/app/basic_auth/password"),
+        slots.contains(&"ferrum/app/basicauth/password"),
         "nested path slot missing from {slots:?}"
     );
 }
@@ -649,13 +649,13 @@ fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
     );
     consumer
         .credentials
-        .insert("basic_auth".to_string(), serde_json::Value::Object(nested));
+        .insert("basicauth".to_string(), serde_json::Value::Object(nested));
     cfg.consumers.push(consumer);
 
     // Legacy bundle key used by pre-migration resolver behavior.
     let mut bundle = BTreeMap::new();
     bundle.insert(
-        "ferrum/app/basic_auth.password".to_string(),
+        "ferrum/app/basicauth.password".to_string(),
         "legacy-secret".to_string(),
     );
 
@@ -663,7 +663,7 @@ fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].status, SlotStatus::Resolved);
     assert_eq!(
-        cfg.consumers[0].credentials.get("basic_auth").unwrap(),
+        cfg.consumers[0].credentials.get("basicauth").unwrap(),
         &serde_json::Value::Object({
             let mut m = serde_json::Map::new();
             m.insert(
@@ -694,7 +694,7 @@ fn slot_components_escape_slash_and_tilde_in_names() {
         updated_at: Some(chrono::Utc::now()),
     };
     consumer.credentials.insert(
-        "api_key".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
     );
     cfg.consumers.push(consumer);
@@ -703,7 +703,7 @@ fn slot_components_escape_slash_and_tilde_in_names() {
     let report = resolve_secrets(&mut cfg, &bundle).unwrap();
     assert_eq!(report.results.len(), 1);
     // `~` → `~0`, `/` → `~1`
-    assert_eq!(report.results[0].slot, "ns~0with~0tilde/weird~1id/api_key");
+    assert_eq!(report.results[0].slot, "ns~0with~0tilde/weird~1id/keyauth");
 }
 
 #[test]
@@ -731,7 +731,7 @@ fn object_key_with_bracket_distinct_from_array_index() {
         serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
     );
     consumer.credentials.insert(
-        "literal".to_string(),
+        "keyauth".to_string(),
         serde_json::Value::Object(bracket_obj),
     );
     // Object with a literal "[1]" key.
@@ -741,12 +741,12 @@ fn object_key_with_bracket_distinct_from_array_index() {
         serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
     );
     consumer.credentials.insert(
-        "literal_one".to_string(),
+        "jwt".to_string(),
         serde_json::Value::Object(bracket_obj_one),
     );
     // Actual array with placeholder elements at index 0 and index 1.
     consumer.credentials.insert(
-        "arr".to_string(),
+        "hmac_auth".to_string(),
         serde_json::Value::Array(vec![
             serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
             serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
@@ -762,20 +762,20 @@ fn object_key_with_bracket_distinct_from_array_index() {
     // emits `[N]` via the SlotComponent::ArrayIndex path without escape,
     // so the two forms remain distinct.
     assert!(
-        slots.contains(&"ferrum/app/literal/~20]"),
+        slots.contains(&"ferrum/app/keyauth/~20]"),
         "literal [0] key should escape bracket: {slots:?}"
     );
     assert!(
-        slots.contains(&"ferrum/app/literal_one/~21]"),
+        slots.contains(&"ferrum/app/jwt/~21]"),
         "literal [1] key should escape bracket: {slots:?}"
     );
     // Index 0 is elided (legacy-compatible name); index 1 keeps its bracket.
     assert!(
-        slots.contains(&"ferrum/app/arr"),
+        slots.contains(&"ferrum/app/hmac_auth"),
         "array index 0 should be elided: {slots:?}"
     );
     assert!(
-        slots.contains(&"ferrum/app/arr/[1]"),
+        slots.contains(&"ferrum/app/hmac_auth/[1]"),
         "array index 1 should emit literal [1]: {slots:?}"
     );
 }
@@ -817,9 +817,9 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
 
     let placeholder = || serde_json::Value::String("${gh-env-secret:alloc=require}".to_string());
 
-    // Case 1: flat top-level string credential → slot_path("api_key").
+    // Case 1: flat top-level string credential → slot_path("keyauth").
     {
-        let cfg = config_with_credential("api_key", placeholder());
+        let cfg = config_with_credential("keyauth", placeholder());
         let walker_slot = report_secrets(&cfg, &BTreeMap::new())
             .unwrap()
             .results
@@ -827,7 +827,7 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
             .next()
             .unwrap()
             .slot;
-        let cli_slot = slot_path("ferrum", "app", "api_key");
+        let cli_slot = slot_path("ferrum", "app", "keyauth");
         assert_eq!(walker_slot, cli_slot, "flat top-level key");
     }
 
@@ -838,7 +838,7 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
     {
         let mut nested = serde_json::Map::new();
         nested.insert("password".to_string(), placeholder());
-        let cfg = config_with_credential("basic_auth", serde_json::Value::Object(nested));
+        let cfg = config_with_credential("basicauth", serde_json::Value::Object(nested));
         let walker_slot = report_secrets(&cfg, &BTreeMap::new())
             .unwrap()
             .results
@@ -846,15 +846,17 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
             .next()
             .unwrap()
             .slot;
-        let cli_slot = slot_path("ferrum", "app", "basic_auth/password");
+        let cli_slot = slot_path("ferrum", "app", "basicauth/password");
         assert_eq!(walker_slot, cli_slot, "nested object credential");
     }
 
-    // Case 3: top-level key with `~` character. Walker treats it as a
-    // single literal and escapes `~` → `~0`. CLI sees no `/`, so it also
-    // produces a single literal segment with the same escape.
+    // Case 3: leaf key with `~` character. Walker treats it as a
+    // single literal and escapes `~` → `~0`. CLI sees no extra `/` in the
+    // leaf, so it also produces a single literal segment with the same escape.
     {
-        let cfg = config_with_credential("foo~bar", placeholder());
+        let mut nested = serde_json::Map::new();
+        nested.insert("foo~bar".to_string(), placeholder());
+        let cfg = config_with_credential("keyauth", serde_json::Value::Object(nested));
         let walker_slot = report_secrets(&cfg, &BTreeMap::new())
             .unwrap()
             .results
@@ -862,8 +864,8 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
             .next()
             .unwrap()
             .slot;
-        let cli_slot = slot_path("ferrum", "app", "foo~bar");
-        assert_eq!(walker_slot, cli_slot, "top-level key containing ~");
+        let cli_slot = slot_path("ferrum", "app", "keyauth/foo~bar");
+        assert_eq!(walker_slot, cli_slot, "leaf key containing ~");
     }
 }
 
@@ -1079,30 +1081,14 @@ fn literal_identity_classification_stays_consistent_across_broker_audit_and_impo
         "mtls_auth".to_string(),
         serde_json::json!([{"identity": "public-client.example"}]),
     );
-    // A same-named leaf under an unknown type remains a secret.
-    cfg.consumers[0].credentials.insert(
-        "custom".to_string(),
-        serde_json::json!({"username": REQUIRE}),
-    );
-    let bundle = BTreeMap::from([(
-        "ferrum/app/custom/username".to_string(),
-        "synthetic-custom-secret".to_string(),
-    )]);
     assert!(gitforgeops::diff::audit_security(&cfg).is_empty());
-    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
-    assert_eq!(report.results.len(), 1);
-    assert_eq!(report.results[0].slot, "ferrum/app/custom/username");
+    let report = resolve_secrets(&mut cfg, &BTreeMap::new()).unwrap();
+    assert!(report.results.is_empty());
     let scrubber = SecretScrubber::from_gateway_config_with_report(&cfg, &report);
-    let output = scrubber.scrub_streams(
-        "public-login public-client.example synthetic-custom-secret",
-        "",
-    );
-    assert_eq!(
-        output.stdout,
-        "public-login public-client.example [REDACTED]"
-    );
+    let output = scrubber.scrub_streams("public-login public-client.example", "");
+    assert_eq!(output.stdout, "public-login public-client.example");
     let captured = capture_and_redact_import_credentials(&mut cfg).unwrap();
-    assert_eq!(captured, bundle);
+    assert!(captured.is_empty());
     assert_eq!(
         cfg.consumers[0].credentials["basicauth"][0]["username"],
         "public-login"
@@ -1111,6 +1097,88 @@ fn literal_identity_classification_stays_consistent_across_broker_audit_and_impo
         cfg.consumers[0].credentials["mtls_auth"][0]["identity"],
         "public-client.example"
     );
+}
+
+fn unknown_credential_resolve_error(unknown: &str) -> String {
+    let mut cfg = consumer_with(
+        unknown,
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    resolve_secrets(&mut cfg, &BTreeMap::new())
+        .expect_err("unknown credential types must fail closed")
+        .to_string()
+}
+
+fn assert_unknown_credential_diagnostic(diagnostic: &str, unknown: &str, suggestion: Option<&str>) {
+    assert!(
+        diagnostic.contains(&format!("Unknown credential type '{unknown}'")),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("on consumer app in namespace ferrum"),
+        "{diagnostic}"
+    );
+    for known in ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"] {
+        assert!(
+            diagnostic.contains(known),
+            "recognized set must name {known}: {diagnostic}"
+        );
+    }
+    match suggestion {
+        Some(canonical) => assert!(
+            diagnostic.contains(&format!("did you mean '{canonical}'")),
+            "{diagnostic}"
+        ),
+        None => assert!(!diagnostic.contains("did you mean"), "{diagnostic}"),
+    }
+}
+
+#[test]
+fn broker_refuses_unknown_credential_types_and_suggests_known_misspellings() {
+    use gitforgeops::secrets::{
+        report_secrets, report_secrets_lenient, validate_known_credential_types,
+    };
+
+    let mut seeded = consumer_with(
+        "api_key",
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    let bundle = BTreeMap::from([(
+        "ferrum/app/api_key/key".to_string(),
+        "bundle-value".to_string(),
+    )]);
+    let before = seeded.clone();
+    let resolve_err = resolve_secrets(&mut seeded, &bundle)
+        .expect_err("broker must not apply an unknown type even with a seeded bundle")
+        .to_string();
+    assert_unknown_credential_diagnostic(&resolve_err, "api_key", Some("keyauth"));
+    assert_eq!(
+        seeded.consumers[0].credentials,
+        before.consumers[0].credentials,
+        "mutating resolve must leave the input unchanged on unknown types"
+    );
+
+    let report_err = report_secrets(&before, &bundle)
+        .expect_err("report_secrets must refuse unknown types")
+        .to_string();
+    assert_unknown_credential_diagnostic(&report_err, "api_key", Some("keyauth"));
+
+    let lenient_err = report_secrets_lenient(&before, &bundle)
+        .expect_err("lenient rotate preflight must still refuse unknown types")
+        .to_string();
+    assert_unknown_credential_diagnostic(&lenient_err, "api_key", Some("keyauth"));
+
+    let basic = unknown_credential_resolve_error("basic_auth");
+    assert_unknown_credential_diagnostic(&basic, "basic_auth", Some("basicauth"));
+
+    let vendor = unknown_credential_resolve_error("vendor_token");
+    assert_unknown_credential_diagnostic(&vendor, "vendor_token", None);
+
+    let cfg = consumer_with(
+        "keyauth",
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
+    validate_known_credential_types(&cfg).expect("recognized types are accepted");
 }
 
 #[test]

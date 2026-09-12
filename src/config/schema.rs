@@ -859,6 +859,11 @@ pub struct Consumer {
     /// [`UpstreamTarget::tags`], with a second one: the credential broker
     /// walks this map to derive slot names, and a stable walk keeps the
     /// per-run ordering of allocations and of the review comment reproducible.
+    ///
+    /// Serde still accepts any map key so a typo round-trips into diagnostics
+    /// instead of disappearing at parse. [`KNOWN_CREDENTIAL_TYPES`] is the
+    /// closed set Ferrum Edge authenticates; `validate`, `plan`, and the
+    /// credential broker refuse every other key before apply.
     #[serde(default)]
     pub credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -874,6 +879,61 @@ pub struct Consumer {
     /// serializes byte-identically to one without this field.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Built-in Ferrum Edge Consumer credential types.
+///
+/// Matches OpenAPI `BuiltInCredentialType` / runtime `ALLOWED_CREDENTIAL_TYPES`
+/// exactly: `basicauth`, `keyauth`, `jwt`, `hmac_auth`, `mtls_auth`. The
+/// gateway will store any other map key as an opaque custom type, but auth
+/// plugins never index those keys, so gitforgeops refuses them before apply.
+pub const KNOWN_CREDENTIAL_TYPES: [&str; 5] =
+    ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
+
+/// Docs / marketing-site spellings that look like credential types but are
+/// never authenticated by Ferrum Edge. Suggestion text is the only use.
+const CREDENTIAL_TYPE_SUGGESTIONS: &[(&str, &str)] = &[
+    ("api_key", "keyauth"),
+    ("basic_auth", "basicauth"),
+];
+
+/// True only for an exact built-in type key. Case variants and aliases are
+/// unknown types: `key_auth` is not `keyauth`.
+pub fn is_known_credential_type(key: &str) -> bool {
+    KNOWN_CREDENTIAL_TYPES.contains(&key)
+}
+
+/// Canonical type to suggest for a known misspelling, if any.
+pub fn suggest_credential_type(unknown: &str) -> Option<&'static str> {
+    CREDENTIAL_TYPE_SUGGESTIONS
+        .iter()
+        .copied()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(unknown))
+        .map(|(_, canonical)| canonical)
+}
+
+/// Comma-separated recognized set for diagnostics. Order matches
+/// [`KNOWN_CREDENTIAL_TYPES`].
+pub fn recognized_credential_types_list() -> String {
+    KNOWN_CREDENTIAL_TYPES.join(", ")
+}
+
+/// Error-severity diagnostic naming the unknown key, the consumer, and the
+/// recognized set. Known misspellings include a `did you mean` hint.
+pub fn unknown_credential_type_message(
+    unknown: &str,
+    consumer_id: &str,
+    namespace: &str,
+) -> String {
+    let recognized = recognized_credential_types_list();
+    let mut message = format!(
+        "Unknown credential type '{unknown}' on consumer {consumer_id} in namespace {namespace}; \
+         Ferrum Edge authenticates only {recognized}"
+    );
+    if let Some(suggestion) = suggest_credential_type(unknown) {
+        message.push_str(&format!(" (did you mean '{suggestion}'?)"));
+    }
+    message
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
