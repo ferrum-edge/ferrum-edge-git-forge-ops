@@ -143,6 +143,13 @@ pub enum Commands {
         /// Intended for the trusted, credentialed PR-review workflow.
         #[arg(long)]
         require_live: bool,
+        /// Exit 1 when the same offline apply blockers that make `plan`
+        /// exit 1 are present. Default review stays 0 so existing CI that
+        /// keys off the process status is unchanged; the PR comment is
+        /// identical either way. Also set by
+        /// GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true.
+        #[arg(long)]
+        fail_on_blockers: bool,
     },
     /// Emit JSON listing environments declared in repo config (used by CI matrix).
     Envs {

@@ -83,6 +83,10 @@ pub struct EnvConfig {
     pub apply_strategy: ApplyStrategy,
     /// Permit nontransactional proxy/plugin attachment on batch 501/413.
     pub allow_nontransactional_plugin_attach: bool,
+    /// Exit 1 from `review` when the same offline apply blockers that make
+    /// `plan` exit 1 are present. Default stays 0 for compatibility; the
+    /// rendered comment is unchanged.
+    pub review_fail_on_blockers: bool,
     /// Overlay name to apply (e.g. `production`, `staging`).
     pub overlay: Option<String>,
     /// Selected environment name (from repo config). Takes precedence over `overlay` if set.
@@ -173,6 +177,7 @@ impl Default for EnvConfig {
             namespace_filter: None,
             allow_unknown_fields: false,
             allow_nontransactional_plugin_attach: false,
+            review_fail_on_blockers: false,
             gateway_mode: GatewayMode::default(),
             apply_strategy: ApplyStrategy::default(),
             overlay: None,
@@ -217,6 +222,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_NAMESPACE`           | `namespace_filter` | `None`                           |
 /// | `FERRUM_ALLOW_UNKNOWN_FIELDS`| `allow_unknown_fields` | `false` (unknown fields are rejected) |
 /// | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `allow_nontransactional_plugin_attach` | `false` (batch cycles require transactions) |
+/// | `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `review_fail_on_blockers` | `false` (`review` exit stays 0 on offline apply blockers) |
 /// | `FERRUM_GATEWAY_MODE`        | `gateway_mode`     | `api`                            |
 /// | `FERRUM_APPLY_STRATEGY`      | `apply_strategy`   | `incremental`                    |
 /// | `FERRUM_OVERLAY`             | `overlay`          | `None`                           |
@@ -306,6 +312,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
             "GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH",
             false,
         )?,
+        review_fail_on_blockers: parse_bool_env("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", false)?,
         gateway_mode,
         apply_strategy,
         overlay: non_empty_env("FERRUM_OVERLAY"),

@@ -1461,6 +1461,7 @@ Runtime variables supported by the binary include:
 | `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown **top-level** `spec` fields verbatim instead of rejecting them, for a gateway newer than this release. Nested unknown fields stay fatal either way. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones). |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Legacy/env-driven strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
 | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same opt-in as `apply --allow-nontransactional-plugin-attach`: on batch 501/413, publish a new proxy before attaching its new scoped plugins. Accepts `true`, `false`, `1`, `0`; invalid values fail. |
+| `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same opt-in as `review --fail-on-blockers`: exit 1 when the same offline apply blockers that make `plan` exit 1 are present. Default `review` stays 0; the PR comment is identical either way. Accepts `true`, `false`, `1`, `0`; invalid values fail. |
 | `FERRUM_OVERLAY` | — | Legacy overlay selector used only without repo config/env selection. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode output path. Bundled file-mode apply sets this to `assembled/<env>.yaml`. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`, and retracted (rewritten as `mesh: {}`, never deleted) when the last `MeshConfig` fragment is removed. Separate document, separate path — see [Mesh configuration](#mesh-configuration). Bundled workflows set `assembled/<env>-mesh.yaml`. |
@@ -1497,7 +1498,7 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--credential-bundle-output PRIVATE_PATH] \
   [--accept-unknown-field NAME] \
   [--allow-plaintext-plugin-config PLUGIN_NAME]  # --from-api requires an explicit namespace filter
-gitforgeops review [--pr N] [--require-live]
+gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops rotate --consumer ID --credential KEY \
   [--namespace NS] [--recipient GH_LOGIN]
@@ -1550,6 +1551,7 @@ Notes:
 Set the missing variable in the deployment context or seed the credential bundle.
 Use `diff` for a comparison that does not preview credential allocation.
 
+- **`review`'s exit code is not the apply gate** unless `--fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`) is set, or `--require-live` comparison/delivery fails. Default `review` still prints the Apply-blocked verdict (literal secrets, required slots, schema/policy/security, slot remaps) and exits 0 so existing comment-only jobs stay green. `--fail-on-blockers` uses the same `src/verdict.rs` `apply_blockers` computation as `plan`, so the two cannot disagree; the PR comment is identical with or without the flag. The bundled `validate-pr.yml` static review and `trusted-pr-review.yml` live review do not pass the flag: static review is comment output (`if: always()`), and trusted live review fails on `--require-live` comparison or undelivered comment. A matrix job that needs `plan`'s offline apply gate should pass `--fail-on-blockers`. Pending allocations still fail default `review` when the provisioning variables are absent, matching `plan`.
 - **`diff --exit-on-drift` exits `2` on drift**, `1` on an ordinary error, `0` when in sync, and prints the categories that produced the verdict. Drift is: managed resources added/modified, managed resources deleted, unmanaged resources on the gateway — each honoring its `ownership.drift_alert_on` flag — **or** an unresolved API-spec ownership conflict. That last category has no mute flag: a live `api_spec_id`-tagged row this repo also declares is two owners writing one row, and `apply` blocks the namespace over it. Informational spec-owned rows the repo does *not* declare stay non-blocking, and a conflict in one namespace never stops the others from being compared.
 - API import requires `FERRUM_NAMESPACE` (or the selected environment's namespace filter), mints an exact namespace-scoped JWT, and imports one namespace at a time. This fails closed on gateways that require namespace claims: an unscoped `GET /namespaces` intentionally returns an empty list and therefore cannot safely drive an all-namespace import.
 - `review --require-live` returns non-zero after rendering the fallback report if either the gateway comparison was unavailable or the required PR comment could not be posted. The trusted PR workflow uses it; secretless static review intentionally keeps comment delivery best-effort. Review comments are UTF-8-safe and capped below GitHub's API limit, with explicit omission counts. In authoritative live comparisons, `review`, `diff` and `plan` exclude only broker-controlled leaves that remain unresolved after loading credentials, whether the file or inline bundle is absent, empty, unrelated, partial or populated. This covers Consumer credentials, plugin config and modeled service-discovery secrets. Masking uses the resolution report's canonical slots, so even seeded values that resemble broker placeholders remain comparable. Modeled service-discovery tokens are redacted in diff output regardless of their syntax. Resolved-secret differences, literal siblings, extra entries, shape changes, adds/deletes and all nonsecret fields remain authoritative. Notices count unresolved leaves without assuming the whole bundle is unavailable. This prevents permanent false drift from unseeded slots in `drift-check`; missing required values still block `plan` and actual `apply`. Cached comparisons retain their existing approximate/skipped behavior.
@@ -1708,6 +1710,10 @@ remaps, and missing required credentials when bundle evidence is available.
 The 60,000-byte comment limit may shorten detailed listings, but these counts
 survive. The footer names the sections whose detail was reduced or omitted;
 use smaller namespace-scoped reviews to inspect that detail.
+
+`--fail-on-blockers` changes only the process exit code. The comment above is
+the same with or without the flag: do not treat a green `review` step as an
+apply gate unless that flag (or `--require-live` failures) is in use.
 
 ```markdown
 Environment: `staging` · Ownership: `Shared` · Strategy: `Incremental`
