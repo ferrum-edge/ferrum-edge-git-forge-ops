@@ -89,24 +89,36 @@ pub fn assemble_with_namespace_filter(
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.proxies.push(spec);
             }
             Resource::Consumer { mut spec } => {
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.consumers.push(spec);
             }
             Resource::Upstream { mut spec } => {
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.upstreams.push(spec);
             }
             Resource::PluginConfig { mut spec } => {
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.plugin_configs.push(spec);
             }
             Resource::MeshConfig { id, spec } => {

@@ -1920,6 +1920,23 @@ fails to connect. Add `live_review: false` to every file-mode environment (and
 to any environment without a reachable Admin API) before upgrading — see
 [Repo configuration](#repo-configuration-gitforgeopsconfigyaml).
 
+## Resource attribution
+
+Assembled proxies, consumers, upstreams, and plugin configurations include
+`labels: {provisioned-by: ferrum-edge-git-forge-ops}`. The same desired state
+is used by validation, plan/diff/review, export/file mode, incremental/batch
+apply, and full replacement. Existing `provisioned-by` values (for example,
+imported resources created by Nexus) and other declared labels are preserved.
+Declare additional labels under `spec.labels`; overlays merge them normally.
+The first reconciliation adds attribution to previously unlabeled declarations.
+
+Labels require the Ferrum Edge resource-labels feature. Upgrade the gateway
+and the `ferrum-edge validate` binary before upgrading Git Forge Ops. These
+labels are informational; the state ledger and API-spec ownership rules remain
+the authority for adoption, reconciliation, and deletion. Mesh fragments are
+separate mesh documents and do not receive gateway resource labels.
+
+
 ## License
 
 PolyForm Noncommercial License 1.0.0

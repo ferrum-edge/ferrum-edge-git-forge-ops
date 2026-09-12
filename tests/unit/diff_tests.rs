@@ -20,6 +20,7 @@ fn mask_without_bundle(desired: &GatewayConfig, actual: &mut GatewayConfig) {
 
 fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
     Proxy {
+        labels: Default::default(),
         extra: Default::default(),
         id: id.to_string(),
         name: None,
@@ -81,6 +82,7 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
 
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: id.to_string(),
         username: username.to_string(),
@@ -340,6 +342,7 @@ fn make_plugin_config(
     scope: PluginScope,
 ) -> PluginConfig {
     PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
@@ -368,6 +371,7 @@ fn make_upstream(id: &str, target_count: usize) -> Upstream {
         })
         .collect();
     Upstream {
+        labels: Default::default(),
         extra: Default::default(),
         id: id.to_string(),
         name: None,

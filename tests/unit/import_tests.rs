@@ -13,6 +13,7 @@ fn strict_passthrough() -> gitforgeops::import::ImportPassthroughPolicy {
 fn make_test_config() -> GatewayConfig {
     GatewayConfig {
         proxies: vec![Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: "proxy-test".to_string(),
             name: Some("Test".to_string()),
@@ -71,6 +72,7 @@ fn make_test_config() -> GatewayConfig {
             updated_at: Some(chrono::Utc::now()),
         }],
         consumers: vec![Consumer {
+            labels: Default::default(),
             extra: Default::default(),
             id: "consumer-test".to_string(),
             username: "testuser".to_string(),
@@ -709,6 +711,7 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         "protocol": "grpc"
     });
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "otel-main".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -795,6 +798,7 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     let bundle_path = destination_parent.path().join("secret-migration.json");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "custom".to_string(),
         plugin_name: "enterprise_custom".to_string(),
@@ -860,6 +864,7 @@ fn builtin_plugin_import_raises_no_review_notice() {
     let bundle_path = destination_parent.path().join("secret-migration.json");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "otel".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -898,6 +903,7 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "spec-otel".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -1858,6 +1864,7 @@ fn migration_bundle_paths_normalize_dotdot_under_a_missing_ancestor() {
 
 fn consul_upstream(token: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         extra: Default::default(),
         id: "orders".to_string(),
         name: None,
@@ -2035,6 +2042,7 @@ fn unknown_plugin_backup(source_dir: &std::path::Path) -> PathBuf {
     let backup_path = source_dir.join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "custom".to_string(),
         plugin_name: "enterprise_custom".to_string(),
@@ -2171,6 +2179,7 @@ fn builtin_plugins_without_secret_looking_leaves_import_silently() {
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "otel".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -2207,6 +2216,7 @@ fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf
     let backup_path = source.join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "builtin".to_string(),
         plugin_name: plugin_name.to_string(),
