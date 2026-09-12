@@ -591,8 +591,7 @@ fn validate_plan_and_apply_refuse_unknown_credential_map_keys() {
     let apply = repo.run(&["apply", "--auto-approve"], &env);
     assert_unknown_credential_refusal(&apply, "api_key", Some("keyauth"));
     assert!(
-        stderr(&apply).contains("Refusing to apply")
-            || stderr(&apply).contains("error-severity"),
+        stderr(&apply).contains("Refusing to apply") || stderr(&apply).contains("error-severity"),
         "apply must refuse the way other error-severity findings do: {}",
         stderr(&apply)
     );

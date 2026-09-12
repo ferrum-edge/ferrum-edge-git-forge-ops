@@ -1052,7 +1052,8 @@ fn unknown_credential_types_block_before_leaf_classification() {
         "api_key",
         serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
     )]);
-    let api_blockers = security_blockers(&audit_security(&api_key));
+    let api_findings = audit_security(&api_key);
+    let api_blockers = security_blockers(&api_findings);
     assert_eq!(api_blockers.len(), 1, "{api_blockers:?}");
     assert_eq!(api_blockers[0].severity, "error");
     assert_eq!(api_blockers[0].kind, "Consumer");
@@ -1089,7 +1090,8 @@ fn unknown_credential_types_block_before_leaf_classification() {
         "basic_auth",
         serde_json::json!([{"password": "${gh-env-secret:alloc=require}"}]),
     )]);
-    let basic_blockers = security_blockers(&audit_security(&basic_auth));
+    let basic_findings = audit_security(&basic_auth);
+    let basic_blockers = security_blockers(&basic_findings);
     assert_eq!(basic_blockers.len(), 1, "{basic_blockers:?}");
     assert!(
         basic_blockers[0]
@@ -1103,7 +1105,8 @@ fn unknown_credential_types_block_before_leaf_classification() {
         "vendor_token",
         serde_json::json!([{"username": "alice", "identity": "client.example"}]),
     )]);
-    let vendor_blockers = security_blockers(&audit_security(&vendor));
+    let vendor_findings = audit_security(&vendor);
+    let vendor_blockers = security_blockers(&vendor_findings);
     assert_eq!(vendor_blockers.len(), 1, "{vendor_blockers:?}");
     assert!(
         vendor_blockers[0]

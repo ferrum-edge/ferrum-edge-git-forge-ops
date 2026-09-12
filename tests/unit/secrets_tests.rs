@@ -601,9 +601,10 @@ fn flat_leaf_and_nested_credentials_produce_distinct_slots() {
         "key.suffix".to_string(),
         serde_json::Value::String("${gh-env-secret:alloc=generate}".to_string()),
     );
-    consumer
-        .credentials
-        .insert("keyauth".to_string(), serde_json::Value::Object(dotted_leaf));
+    consumer.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::Value::Object(dotted_leaf),
+    );
     let mut nested = serde_json::Map::new();
     nested.insert(
         "password".to_string(),
@@ -1153,8 +1154,7 @@ fn broker_refuses_unknown_credential_types_and_suggests_known_misspellings() {
         .to_string();
     assert_unknown_credential_diagnostic(&resolve_err, "api_key", Some("keyauth"));
     assert_eq!(
-        seeded.consumers[0].credentials,
-        before.consumers[0].credentials,
+        seeded.consumers[0].credentials, before.consumers[0].credentials,
         "mutating resolve must leave the input unchanged on unknown types"
     );
 

@@ -547,11 +547,13 @@ pub fn validate_known_credential_types(cfg: &GatewayConfig) -> crate::error::Res
     for consumer in &cfg.consumers {
         for credential_type in consumer.credentials.keys() {
             if !is_known_credential_type(credential_type) {
-                return Err(crate::error::Error::Config(unknown_credential_type_message(
-                    credential_type,
-                    &consumer.id,
-                    &consumer.namespace,
-                )));
+                return Err(crate::error::Error::Config(
+                    unknown_credential_type_message(
+                        credential_type,
+                        &consumer.id,
+                        &consumer.namespace,
+                    ),
+                ));
             }
         }
     }

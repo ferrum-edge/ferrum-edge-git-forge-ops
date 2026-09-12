@@ -892,10 +892,8 @@ pub const KNOWN_CREDENTIAL_TYPES: [&str; 5] =
 
 /// Docs / marketing-site spellings that look like credential types but are
 /// never authenticated by Ferrum Edge. Suggestion text is the only use.
-const CREDENTIAL_TYPE_SUGGESTIONS: &[(&str, &str)] = &[
-    ("api_key", "keyauth"),
-    ("basic_auth", "basicauth"),
-];
+const CREDENTIAL_TYPE_SUGGESTIONS: &[(&str, &str)] =
+    &[("api_key", "keyauth"), ("basic_auth", "basicauth")];
 
 /// True only for an exact built-in type key. Case variants and aliases are
 /// unknown types: `key_auth` is not `keyauth`.
