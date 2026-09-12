@@ -695,8 +695,9 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 ## Testing
 
 - `tests/unit_tests.rs` is the single integration test binary; submodules live under `tests/unit/*.rs` and register in `tests/unit/mod.rs`.
-- Fixtures under `tests/fixtures/` (`simple-config/`, `overlay-test/`, `companion-schema/`).
-- `companion-schema/` holds one file per kind populating **every** field mirrored in `src/config/schema.rs`. `tests/unit/companion_schema_tests.rs` loads it strictly, assembles it, round-trips it through export, and — by reading the struct definitions out of `schema.rs` — fails when a newly mirrored field is not exercised there. Add new mirrored fields to that fixture in the same PR.
+- Fixtures under `tests/fixtures/` (`simple-config/`, `overlay-test/`, `companion-schema/`, `mesh-minimal/`).
+- `companion-schema/` holds one file per kind populating **every** field mirrored in `src/config/schema.rs`. `tests/unit/companion_schema_tests.rs` loads it strictly, assembles it, round-trips it through export, and — by reading the struct definitions out of `schema.rs` — fails when a newly mirrored field is not exercised there. Add new mirrored fields to that fixture in the same PR. Values are illustrative, not a working gateway or mesh document.
+- `mesh-minimal/` is the opposite mesh contract: a MeshConfig with a required workload `selector` and the smallest workload/service set `ferrum-edge validate -m mesh` accepts. `tests/unit/mesh_minimal_tests.rs` loads it strictly and asserts the rendered `{version, mesh}` document still carries that selector. Keep `companion-schema/` unchanged when editing this fixture.
 - New test file: create `tests/unit/<name>.rs` AND add `mod <name>;` to `tests/unit/mod.rs`.
 - `tempfile` crate for filesystem tests.
 - No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking.

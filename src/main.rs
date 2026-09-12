@@ -1593,10 +1593,7 @@ async fn cmd_plan(
                 }
             },
             None => {
-                override_note = Some(
-                    "No PR is associated with this commit; overrides were not evaluated."
-                        .to_string(),
-                );
+                override_note = Some(policy::github_override::NO_PR_OVERRIDE_NOTE.to_string());
             }
         }
     }
@@ -1798,7 +1795,7 @@ async fn cmd_apply(
                     }
                     Some(_) => {}
                     None => {
-                        eprintln!("(no PR associated with this commit; overrides not evaluated)")
+                        eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE)
                     }
                 }
                 return Err("unresolved security findings".into());
@@ -1927,7 +1924,7 @@ async fn cmd_apply(
                     eprintln!("(override inactive: {})", safe_block(&d.reason));
                 }
             } else {
-                eprintln!("(no PR associated with this commit; overrides not evaluated)");
+                eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE);
             }
             return Err("unresolved policy violations".into());
         }
