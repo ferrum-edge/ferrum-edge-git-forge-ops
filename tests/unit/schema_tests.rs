@@ -853,3 +853,35 @@ fn known_credential_types_match_the_ferrum_edge_builtin_set() {
     assert!(message.contains("did you mean 'keyauth'"));
     assert!(message.contains(&recognized_credential_types_list()));
 }
+
+#[test]
+fn resource_labels_are_typed_metadata_on_every_gateway_kind() {
+    let labels = serde_json::json!({"provisioned-by":"ferrum-foundry","team":"platform"});
+    for (kind, mut spec) in [
+        (
+            "Proxy",
+            serde_json::json!({"backend_host":"example.com","backend_port":443}),
+        ),
+        ("Consumer", serde_json::json!({"username":"alice"})),
+        ("Upstream", serde_json::json!({"targets":[]})),
+        (
+            "PluginConfig",
+            serde_json::json!({"plugin_name":"cors","scope":"global"}),
+        ),
+    ] {
+        spec["labels"] = labels.clone();
+        let resource: gitforgeops::config::schema::Resource =
+            serde_json::from_value(serde_json::json!({"kind":kind,"spec":spec})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&resource).unwrap()["spec"]["labels"],
+            labels
+        );
+        spec["labels"] = serde_json::json!({"team":42});
+        assert!(
+            serde_json::from_value::<gitforgeops::config::schema::Resource>(
+                serde_json::json!({"kind":kind,"spec":spec})
+            )
+            .is_err()
+        );
+    }
+}

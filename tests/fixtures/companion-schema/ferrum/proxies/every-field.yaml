@@ -3,6 +3,8 @@
 # for the two deliberate omissions (`api_spec_id`, `extra`).
 kind: Proxy
 spec:
+  labels:
+    team: platform
   id: every-field-proxy
   name: Every Field Proxy
   namespace: ferrum

@@ -56,6 +56,7 @@ fn consumer_config(credentials: serde_json::Value) -> gitforgeops::config::schem
 
     GatewayConfig {
         consumers: vec![Consumer {
+            labels: Default::default(),
             extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
@@ -333,6 +334,7 @@ fn resolved_plugin_config_secrets_are_redacted() {
     let secret = "honeycomb-team-key-must-not-be-echoed";
     let config = GatewayConfig {
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             extra: Default::default(),
             id: "otel".to_string(),
             plugin_name: "otel_tracing".to_string(),
@@ -531,6 +533,7 @@ fn consumer_config_for_standins(
 
     GatewayConfig {
         consumers: vec![Consumer {
+            labels: Default::default(),
             extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
@@ -952,6 +955,7 @@ fn plugin_config_for(
 
     GatewayConfig {
         plugin_configs: vec![PluginConfig {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             plugin_name: plugin_name.to_string(),
@@ -1338,6 +1342,7 @@ fn plugin_config_stand_ins_are_shape_aware_and_input_only() {
     };
 
     let plugin = |id: &str, plugin_name: &str, config: serde_json::Value| PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),

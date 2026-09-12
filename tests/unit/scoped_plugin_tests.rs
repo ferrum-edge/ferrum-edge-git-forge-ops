@@ -67,6 +67,7 @@ fn scoped_config_without_explicit_association_converges_to_live_backup() {
         "proxies": [{
             "id": "api",
             "namespace": "team-alpha",
+            "labels": {"provisioned-by":"ferrum-edge-git-forge-ops"},
             "listen_path": "/api",
             "backend_host": "api.internal",
             "backend_port": 443,
@@ -78,6 +79,7 @@ fn scoped_config_without_explicit_association_converges_to_live_backup() {
         "plugin_configs": [{
             "id": "auth",
             "namespace": "team-alpha",
+            "labels": {"provisioned-by":"ferrum-edge-git-forge-ops"},
             "plugin_name": "key_auth",
             "scope": "proxy",
             "proxy_id": "api",
@@ -460,4 +462,17 @@ fn derivation_uses_the_overlaid_plugin_target() {
     let config = assemble(resources).unwrap().gateway;
     assert!(config.proxies[0].plugins.is_empty());
     assert_eq!(association_ids(&config.proxies[1]), vec!["auth"]);
+}
+
+#[test]
+fn unlabeled_declared_resources_report_label_drift_then_converge() {
+    let desired = assemble(vec![proxy(&[])]).unwrap().gateway;
+    let mut live = desired.clone();
+    live.proxies[0].labels.clear();
+    let drift = compute_diff(&desired, &live);
+    assert_eq!(drift.len(), 1);
+    assert_eq!(drift[0].action, DiffAction::Modify);
+    assert_eq!(drift[0].details[0].field, "labels");
+    live.proxies[0].labels = desired.proxies[0].labels.clone();
+    assert!(compute_diff(&desired, &live).is_empty());
 }

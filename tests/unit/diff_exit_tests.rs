@@ -74,6 +74,7 @@ fn live_proxy(
 ) -> serde_json::Value {
     serde_json::json!({
         "id": id,
+        "labels": {"provisioned-by":"ferrum-edge-git-forge-ops"},
         "namespace": namespace,
         "backend_scheme": "https",
         "backend_host": if namespace == "ferrum" { "app.internal" } else { "other.internal" },
@@ -315,6 +316,7 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                         "config": {"authorization": "synthetic-bearer-0001", "protocol": "grpc"}
                     }]
                 });
+                label_live_fixture(&mut live);
                 match change {
                     "resolved" => {
                         live["consumers"][0]["credentials"]["keyauth"][0]["key"] =
@@ -532,6 +534,7 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
                 let target_index = target % leaves.len();
                 for different in [false, true] {
                     let mut live = declared.clone();
+                    label_live_fixture(&mut live);
                     let mut slots = serde_json::Map::new();
                     for (index, &(kind, pointer, suffix)) in leaves.iter().enumerate() {
                         *live[kind][0].pointer_mut(pointer).unwrap() = LIVE.into();
@@ -1096,5 +1099,18 @@ environments:
             }
         }
         assert_eq!(before, repo.snapshot());
+    }
+}
+
+// These fixtures represent resources after an ordinary successful apply. Keep
+// attribution present so the tests isolate their intended credential/ownership
+// drift rather than the first-upgrade label backfill.
+fn label_live_fixture(live: &mut serde_json::Value) {
+    for kind in ["proxies", "consumers", "upstreams", "plugin_configs"] {
+        if let Some(items) = live.get_mut(kind).and_then(serde_json::Value::as_array_mut) {
+            for item in items {
+                item["labels"] = serde_json::json!({"provisioned-by":"ferrum-edge-git-forge-ops"});
+            }
+        }
     }
 }

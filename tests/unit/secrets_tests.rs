@@ -407,6 +407,7 @@ fn pick_shard_returns_none_only_when_all_shards_full() {
 fn resolver_replaces_known_slot_and_reports_resolved() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -439,6 +440,7 @@ fn resolver_replaces_known_slot_and_reports_resolved() {
 fn resolver_reports_missing_required() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -470,6 +472,7 @@ fn report_secrets_does_not_mutate_config() {
 
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -513,6 +516,7 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
     // and is safe to commit.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -552,6 +556,7 @@ fn resolver_replaces_rotate_placeholder_with_bundle_value() {
     // something apply/diff does automatically.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -595,6 +600,7 @@ fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
     // first-apply generate.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -621,6 +627,7 @@ fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
 fn resolver_reports_needs_allocation_for_generate() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -648,6 +655,7 @@ fn flat_leaf_and_nested_credentials_produce_distinct_slots() {
     // kept). A nested object under another recognized type uses two components.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -695,6 +703,7 @@ fn flat_leaf_and_nested_credentials_produce_distinct_slots() {
 fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -746,6 +755,7 @@ fn slot_components_escape_slash_and_tilde_in_names() {
     // keep the encoding injective.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "weird/id".to_string(),
         username: "weird/id".to_string(),
@@ -777,6 +787,7 @@ fn object_key_with_bracket_distinct_from_array_index() {
     // a placeholder at index 0 produce distinct slots.
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -863,6 +874,7 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
     fn config_with_credential(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
         let mut cfg = GatewayConfig::default();
         let mut consumer = Consumer {
+            labels: Default::default(),
             extra: Default::default(),
             id: "app".to_string(),
             username: "app".to_string(),
@@ -1004,6 +1016,7 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
 fn consumer_with(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -2385,6 +2398,7 @@ fn upstream_with_consul_token(token: Option<&str>) -> gitforgeops::config::schem
     };
 
     Upstream {
+        labels: Default::default(),
         extra: Default::default(),
         id: "orders".to_string(),
         name: None,

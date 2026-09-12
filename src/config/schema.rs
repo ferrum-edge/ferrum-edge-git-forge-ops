@@ -702,6 +702,9 @@ impl_passthrough_fields!(Proxy, Consumer, Upstream, PluginConfig);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proxy {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -848,6 +851,9 @@ pub struct Proxy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Consumer {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub username: String,
@@ -938,6 +944,9 @@ pub fn unknown_credential_type_message(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstream {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -990,6 +999,9 @@ pub struct Upstream {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub plugin_name: String,

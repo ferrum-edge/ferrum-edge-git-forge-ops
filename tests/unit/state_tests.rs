@@ -213,6 +213,7 @@ fn scoped_record_preserves_entries_outside_scope() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             name: None,
@@ -909,6 +910,7 @@ fn record_op_preserves_state_for_failed_delete() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             name: None,
@@ -1050,6 +1052,7 @@ fn record_op_preserves_state_for_failed_delete() {
         .resources
         .insert(app_key.clone(), "sha256:STALE".to_string());
     let consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
