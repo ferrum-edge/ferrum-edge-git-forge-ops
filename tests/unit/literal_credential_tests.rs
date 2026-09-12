@@ -75,7 +75,9 @@ fn literal_credential_fixture_blocks_apply_without_echoing_the_value() {
     );
     for finding in &findings {
         assert!(
-            !finding.message.contains("fixture-only-literal-not-a-secret"),
+            !finding
+                .message
+                .contains("fixture-only-literal-not-a-secret"),
             "findings must not echo the committed value: {}",
             finding.message
         );
