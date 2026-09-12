@@ -516,7 +516,11 @@ impl LiveRepo {
         std::fs::write(&validator, "#!/bin/sh\nexit 0\n").expect("stub");
         set_executable(&validator);
         let url = spawn_live_stub(backups, listed_namespaces, Arc::new(Mutex::new(Vec::new())));
-        Self { dir, url, validator }
+        Self {
+            dir,
+            url,
+            validator,
+        }
     }
 
     fn run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
