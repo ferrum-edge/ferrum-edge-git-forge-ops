@@ -311,7 +311,9 @@ pub fn effective_priority(plugin: &PluginConfig) -> u16 {
 ///
 /// `proxy`-scoped instances must both name the proxy *and* be listed in the
 /// proxy's `plugins:` association list; `proxy_group`-scoped instances are
-/// attached purely by association.
+/// attached purely by association. Assembly derives the former list from
+/// proxy-scoped configs, matching the gateway's auto-attachment on write; keep
+/// both checks here so a config targeting another proxy never counts as auth.
 fn is_scoped_to(plugin: &PluginConfig, proxy: &Proxy) -> bool {
     match plugin.scope {
         PluginScope::Global => false,

@@ -358,6 +358,50 @@ the moment someone opens the folder and no commit can remove them for good.
 The trusted-review archive applies the same rules — the same two lists — before
 it crosses the privileged data boundary.
 
+### Plugin configs and proxy associations
+
+A `PluginConfig` with `scope: proxy` and `proxy_id` automatically contributes
+`{plugin_config_id: <its id>}` to that proxy's `plugins` list during assembly.
+The plugin and proxy must share the same effective namespace. For example,
+these files under `resources/team-alpha/` are sufficient:
+
+```yaml
+# proxies/orders.yaml
+kind: Proxy
+spec:
+  id: orders
+  listen_path: /orders
+  backend_host: orders.internal
+  backend_port: 443
+---
+# plugins/orders-keyauth.yaml
+kind: PluginConfig
+spec:
+  id: orders-keyauth
+  plugin_name: key_auth
+  scope: proxy
+  proxy_id: orders
+  config: {}
+```
+
+Explicit dual declaration remains allowed: the proxy may also declare
+`plugins: [{plugin_config_id: orders-keyauth}]`. Assembly keeps explicit
+entries in their original order, removes duplicate IDs, and appends missing
+derived IDs in lexical order after overlays and namespace inference. Export,
+apply, diff, plan, and security/policy checks all use this assembled list,
+matching Edge's auto-attachment and avoiding repeated Proxy drift or a false
+"No auth plugin" warning. Disabled configs still get an association but do not
+count as authentication.
+
+`scope: global` applies without an association; `scope: proxy_group` still
+requires explicit `Proxy.plugins` entries and no `proxy_id`. An explicit
+reference to a missing config, a global config, or a config whose
+`scope`/`proxy_id` conflicts with the association is an error-severity security
+finding. Assembly retains that reference so the conflict can be corrected.
+To detach a proxy-scoped plugin, remove or retarget its `PluginConfig` and
+remove any explicit association; clearing `Proxy.plugins` alone does not
+detach a config that still points at the proxy.
+
 ### Supported fields, and what happens to unsupported ones
 
 The typed companion schema rejects unknown wrapper, resource, and nested object

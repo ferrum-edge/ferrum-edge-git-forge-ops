@@ -1,4 +1,4 @@
-use crate::config::schema::{PluginConfig, Proxy};
+use crate::config::schema::{PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
 use crate::diagnostics::{sanitize, sanitize_line};
 use crate::plugin_catalog::{
@@ -163,6 +163,7 @@ fn check_proxy(
     auth_names: &[String],
     findings: &mut Vec<SecurityFinding>,
 ) {
+    check_proxy_plugin_associations(config, proxy, findings);
     let effective = effective_plugins(config, proxy);
 
     let auth_plugins: Vec<&&PluginConfig> = effective
@@ -239,6 +240,47 @@ fn check_proxy(
                 proxy.id, proxy.namespace
             ),
         ));
+    }
+}
+
+/// Association errors must remain visible after assembly derives valid scoped
+/// attachments. Check disabled configs too: their stored graph still has to
+/// agree with scope, even though they cannot satisfy the auth check.
+fn check_proxy_plugin_associations(
+    config: &GatewayConfig,
+    proxy: &Proxy,
+    findings: &mut Vec<SecurityFinding>,
+) {
+    for association in &proxy.plugins {
+        let plugin_id = &association.plugin_config_id;
+        let plugin = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.namespace == proxy.namespace && plugin.id == *plugin_id);
+        let reason = match plugin {
+            None => Some("no PluginConfig with that ID exists in this namespace"),
+            Some(plugin) => match plugin.scope {
+                PluginScope::Global => Some("scope: global cannot be explicitly associated"),
+                PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) => {
+                    Some("scope: proxy requires proxy_id to match this proxy")
+                }
+                PluginScope::ProxyGroup if plugin.proxy_id.is_some() => {
+                    Some("scope: proxy_group requires proxy_id to be omitted")
+                }
+                _ => None,
+            },
+        };
+        if let Some(reason) = reason {
+            findings.push(SecurityFinding::error(
+                "Proxy",
+                &proxy.id,
+                &proxy.namespace,
+                format!(
+                    "proxy {} in namespace {} has invalid plugin association {plugin_id}: {reason}; correct the PluginConfig scope/proxy_id or remove the explicit plugins entry",
+                    proxy.id, proxy.namespace
+                ),
+            ));
+        }
     }
 }
 
