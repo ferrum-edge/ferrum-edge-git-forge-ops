@@ -235,6 +235,11 @@ impl Default for EnvConfig {
 /// | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS`  | `github_connect_timeout_secs`  | `10`        |
 /// | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`  | `github_request_timeout_secs`  | `30`        |
 /// | `FERRUM_GATEWAY_MAX_RETRIES`          | `gateway_max_retries`          | `3`         |
+///
+/// `FERRUM_NAMESPACE` is a filter, not an allow-empty switch. `validate`,
+/// `plan`, and `diff` refuse a filter that selects zero desired resources while
+/// the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` is the
+/// CLI-only acknowledgement that demotes that finding to a warning.
 pub fn load_env_config() -> crate::error::Result<EnvConfig> {
     let gateway_mode = match normalized_env("FERRUM_GATEWAY_MODE").as_deref() {
         None | Some("api") => GatewayMode::Api,

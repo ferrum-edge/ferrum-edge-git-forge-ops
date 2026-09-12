@@ -2,7 +2,7 @@ use super::runner::ValidationResult;
 use crate::diagnostics::sanitize_block;
 
 /// Output format for validation results.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     /// Human-readable text output.
     Text,
@@ -198,4 +198,11 @@ fn escape_workflow_command_data(value: &str) -> String {
         .replace('%', "%25")
         .replace('\r', "%0D")
         .replace('\n', "%0A")
+}
+
+/// One GitHub Actions workflow command. Used by `validate --format
+/// github-annotations` for findings the reporter did not parse out of the
+/// validator's streams (the empty-namespace-filter guard).
+pub fn workflow_annotation(level: &str, message: &str) -> String {
+    format!("::{level} ::{}\n", escape_workflow_command_data(message))
 }

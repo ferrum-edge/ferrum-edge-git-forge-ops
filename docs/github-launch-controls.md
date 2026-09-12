@@ -429,7 +429,10 @@ After merging the workflow changes and configuring the controls:
    requires environment approval, prints the trusted source SHA and target
    namespace, intersects each environment's protected ownership/filter scope,
    uses protected-branch environment/policy files, and posts the live
-   comparison with `FERRUM_NAMESPACE` set. Make the gateway unreachable and
+   comparison with `FERRUM_NAMESPACE` set. A mistyped namespace filter now
+   fails `validate` / `plan` / `diff` closed (exit 1) instead of succeeding
+   against an empty desired set; the bundled workflows set the filter to a
+   protected-branch resource namespace. Make the gateway unreachable and
    confirm the trusted job fails rather than posting a successful skipped
    comparison.
 3. Open a fork PR. It must receive static validation only; the trusted prepare

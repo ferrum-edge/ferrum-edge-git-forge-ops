@@ -815,7 +815,7 @@ fn format_results_without_mesh_is_unchanged() {
         OutputFormat::GithubAnnotations,
     ] {
         assert_eq!(
-            format_results(&gateway, None, format.clone()),
+            format_results(&gateway, None, format),
             format_result(&gateway, format)
         );
     }

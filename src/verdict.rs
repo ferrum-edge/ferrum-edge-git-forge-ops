@@ -29,10 +29,12 @@ use crate::secrets::ResolveReport;
 /// Process exit code for `diff --exit-on-drift` when the live gateway and the
 /// repository disagree.
 ///
-/// Distinct from `1` (which every command uses for an ordinary error) so a
-/// scheduled drift monitor can tell "the gateway drifted" from "the run
-/// failed". `drift-check.yml` treats any non-zero exit as a failed check, so
-/// the distinction is for humans and for anything that inspects `$?`.
+/// Distinct from `1` (which every command uses for an ordinary error,
+/// including an empty-namespace-filter mismatch — see
+/// [`crate::config::EMPTY_NAMESPACE_EXIT_CODE`]) so a scheduled drift monitor
+/// can tell "the gateway drifted" from "the run failed". `drift-check.yml`
+/// treats any non-zero exit as a failed check, so the distinction is for
+/// humans and for anything that inspects `$?`.
 pub const DRIFT_EXIT_CODE: i32 = 2;
 
 /// One class of fail-closed refusal, decidable without a gateway.
