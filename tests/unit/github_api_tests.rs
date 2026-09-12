@@ -8,8 +8,8 @@ use base64::Engine;
 use gitforgeops::error::Error;
 use gitforgeops::secrets::{
     allocate_and_deliver_at, fetch_public_key_at, parse_placeholder, put_environment_secret_at,
-    rotate_and_deliver_at, slot_path, EnvSecretPublicKey, ResolveReport, ResolveResult,
-    SlotStatus, DEFAULT_GITHUB_API_BASE,
+    rotate_and_deliver_at, slot_path, EnvSecretPublicKey, ResolveReport, ResolveResult, SlotStatus,
+    DEFAULT_GITHUB_API_BASE,
 };
 
 const REPO: &str = "test/fixture";
@@ -70,7 +70,10 @@ fn spawn_github_stub(routes: Vec<(String, u16, String)>) -> (String, Arc<Mutex<V
                     Some(request) => request,
                     None => return,
                 };
-                requests.lock().expect("record request").push(request.clone());
+                requests
+                    .lock()
+                    .expect("record request")
+                    .push(request.clone());
                 let (status, body) = routes
                     .iter()
                     .find(|(needle, _, _)| request.contains(needle))
@@ -217,9 +220,15 @@ async fn fetch_public_key_decodes_the_environment_key() {
 #[tokio::test]
 async fn fetch_public_key_accepts_a_trailing_slash_on_the_api_base() {
     let (api_base, requests) = spawn_github_stub(vec![(public_key_path(), 200, public_key_body())]);
-    let key = fetch_public_key_at(&test_client(), &format!("{api_base}/"), REPO, ENVIRONMENT, TOKEN)
-        .await
-        .expect("trailing-slash origin");
+    let key = fetch_public_key_at(
+        &test_client(),
+        &format!("{api_base}/"),
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+    )
+    .await
+    .expect("trailing-slash origin");
     assert_eq!(key.key_id, KEY_ID);
     assert_eq!(requests.lock().expect("recorded").len(), 1);
 }
@@ -228,7 +237,11 @@ async fn fetch_public_key_accepts_a_trailing_slash_on_the_api_base() {
 async fn fetch_public_key_maps_github_error_statuses() {
     for (status, body, needle) in [
         (401, "{\"message\":\"Bad credentials\"}", "Bad credentials"),
-        (403, "{\"message\":\"Must have admin rights\"}", "admin rights"),
+        (
+            403,
+            "{\"message\":\"Must have admin rights\"}",
+            "admin rights",
+        ),
         (404, "{\"message\":\"Not Found\"}", "Not Found"),
         (
             422,
@@ -280,7 +293,8 @@ async fn fetch_public_key_rejects_a_payload_missing_the_key_field() {
 #[tokio::test]
 async fn put_environment_secret_sends_a_sealed_box_and_key_id() {
     for status in [201_u16, 204] {
-        let (api_base, requests) = spawn_github_stub(vec![(put_secret_path(), status, String::new())]);
+        let (api_base, requests) =
+            spawn_github_stub(vec![(put_secret_path(), status, String::new())]);
         put_environment_secret_at(
             &test_client(),
             &api_base,
@@ -322,7 +336,11 @@ async fn put_environment_secret_sends_a_sealed_box_and_key_id() {
 async fn put_environment_secret_maps_github_error_statuses() {
     for (status, body, needle) in [
         (401, "{\"message\":\"Bad credentials\"}", "Bad credentials"),
-        (403, "{\"message\":\"Must have admin rights\"}", "admin rights"),
+        (
+            403,
+            "{\"message\":\"Must have admin rights\"}",
+            "admin rights",
+        ),
         (404, "{\"message\":\"Not Found\"}", "Not Found"),
         (
             422,
@@ -331,7 +349,8 @@ async fn put_environment_secret_maps_github_error_statuses() {
         ),
         (500, "{\"message\":\"Internal Server Error\"}", "Internal"),
     ] {
-        let (api_base, requests) = spawn_github_stub(vec![(put_secret_path(), status, body.to_string())]);
+        let (api_base, requests) =
+            spawn_github_stub(vec![(put_secret_path(), status, body.to_string())]);
         let err = put_environment_secret_at(
             &test_client(),
             &api_base,
@@ -355,11 +374,9 @@ async fn put_environment_secret_maps_github_error_statuses() {
 
 #[test]
 fn seal_secret_rejects_invalid_base64_and_wrong_length_keys() {
-    let invalid = gitforgeops::secrets::github_api::seal_secret(
-        "!!!not-base64!!!",
-        PLAINTEXT.as_bytes(),
-    )
-    .expect_err("invalid base64");
+    let invalid =
+        gitforgeops::secrets::github_api::seal_secret("!!!not-base64!!!", PLAINTEXT.as_bytes())
+            .expect_err("invalid base64");
     assert!(invalid.to_string().contains("decode pubkey"), "{invalid}");
 
     let short = base64::engine::general_purpose::STANDARD.encode([0x01_u8, 0x02, 0x03]);
@@ -367,11 +384,9 @@ fn seal_secret_rejects_invalid_base64_and_wrong_length_keys() {
         .expect_err("wrong length");
     assert!(wrong_len.to_string().contains("32-byte"), "{wrong_len}");
 
-    let sealed = gitforgeops::secrets::github_api::seal_secret(
-        &fixture_pubkey_b64(),
-        PLAINTEXT.as_bytes(),
-    )
-    .expect("fixture key seals");
+    let sealed =
+        gitforgeops::secrets::github_api::seal_secret(&fixture_pubkey_b64(), PLAINTEXT.as_bytes())
+            .expect("fixture key seals");
     assert_ne!(sealed, PLAINTEXT);
     assert!(!sealed.contains(PLAINTEXT));
     base64::engine::general_purpose::STANDARD

@@ -40,8 +40,7 @@ pub async fn fetch_public_key(
     environment: &str,
     token: &str,
 ) -> crate::error::Result<EnvSecretPublicKey> {
-    fetch_public_key_at(client, DEFAULT_GITHUB_API_BASE, repo, environment, token)
-        .await
+    fetch_public_key_at(client, DEFAULT_GITHUB_API_BASE, repo, environment, token).await
 }
 
 /// [`fetch_public_key`] against an explicit API origin.
