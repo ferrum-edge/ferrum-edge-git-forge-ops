@@ -203,6 +203,10 @@ fn hostile_consumer() -> Consumer {
         "keyauth".to_string(),
         serde_json::json!([{"key": "literal-committed-secret"}]),
     );
+    consumer.credentials.insert(
+        HOSTILE.to_string(),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    );
     consumer
 }
 

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 
+use crate::diagnostics::safe_line;
+
 /// The maximum bytes we will pack into a single bundle before splitting to a
 /// new shard. GitHub's hard limit is 48 KB; we stay under at 40 KB so reads
 /// and writes always have headroom.
@@ -39,15 +41,47 @@ pub const MAX_BUNDLE_SHARDS: u32 = 16;
 /// (`<namespace>/<id>/<cred_key>`), values are plaintext secret material.
 pub type CredentialBundle = BTreeMap<String, String>;
 
-/// Parse `FERRUM_CREDS_JSON` (a JSON object of `{ "BUNDLE_0": {...}, "BUNDLE_1": {...} }`)
+/// Parsed `FERRUM_CREDS_JSON` / `FERRUM_CREDS_JSON_FILE` document.
+///
+/// `unrecognized_keys` are top-level keys that are not
+/// `FERRUM_CREDS_BUNDLE` / `FERRUM_CREDS_BUNDLE_N`. An empty object leaves
+/// this empty; a non-empty object that contributes no shards is refused
+/// before a [`LoadedBundles`] is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedBundles {
+    pub merged: CredentialBundle,
+    pub per_shard: BTreeMap<u32, CredentialBundle>,
+    pub unrecognized_keys: Vec<String>,
+}
+
+/// Parse `FERRUM_CREDS_JSON` (a JSON object of
+/// `{ "FERRUM_CREDS_BUNDLE": {...}, "FERRUM_CREDS_BUNDLE_1": {...} }`)
 /// loaded by the workflow into a merged map and a per-shard map.
 ///
 /// Returns `(merged, per_shard)`. The `merged` map is flat (`slot → value`) for
 /// resolution. The `per_shard` map keeps the original shard structure for
 /// read-modify-write operations during allocation/rotation.
+///
+/// A non-empty object that contributes no recognized shard keys is a
+/// configuration error — a flat slot map is the usual footgun. Unrecognized
+/// keys alongside valid shards produce a warning. An empty object `{}`
+/// still loads as an empty bundle.
 pub fn load_bundles_from_env(
     raw: &str,
 ) -> crate::error::Result<(CredentialBundle, BTreeMap<u32, CredentialBundle>)> {
+    let loaded = parse_bundles_from_json(raw)?;
+    if !loaded.unrecognized_keys.is_empty() {
+        eprintln!(
+            "Warning: {}",
+            safe_line(unrecognized_bundle_keys_warning(&loaded.unrecognized_keys))
+        );
+    }
+    Ok((loaded.merged, loaded.per_shard))
+}
+
+/// Parse the wrapper document without emitting warnings, so tests can assert
+/// on unrecognized top-level keys.
+pub fn parse_bundles_from_json(raw: &str) -> crate::error::Result<LoadedBundles> {
     let outer: serde_json::Value = serde_json::from_str(raw)?;
     let obj = outer.as_object().ok_or_else(|| {
         crate::error::Error::Config("FERRUM_CREDS_JSON is not a JSON object".to_string())
@@ -56,11 +90,15 @@ pub fn load_bundles_from_env(
     let mut per_shard: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
     let mut merged: CredentialBundle = BTreeMap::new();
     let mut slot_sources: BTreeMap<String, u32> = BTreeMap::new();
+    let mut unrecognized_keys: Vec<String> = Vec::new();
 
     for (secret_name, secret_value) in obj {
         let shard_idx = match parse_shard_index(secret_name) {
             Some(n) => n,
-            None => continue,
+            None => {
+                unrecognized_keys.push(secret_name.clone());
+                continue;
+            }
         };
         let inner: CredentialBundle = match secret_value {
             serde_json::Value::String(s) if s.is_empty() => BTreeMap::new(),
@@ -88,7 +126,35 @@ pub fn load_bundles_from_env(
         per_shard.insert(shard_idx, inner);
     }
 
-    Ok((merged, per_shard))
+    unrecognized_keys.sort();
+
+    if !obj.is_empty() && per_shard.is_empty() {
+        let first = unrecognized_keys
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<none>");
+        return Err(crate::error::Error::Config(format!(
+            "FERRUM_CREDS_JSON is a non-empty object but contributed no shards; \
+             expected top-level keys FERRUM_CREDS_BUNDLE or FERRUM_CREDS_BUNDLE_N \
+             wrapping a slot map ({{ \"FERRUM_CREDS_BUNDLE\": {{ \"<slot>\": \"<value>\" }} }}), \
+             first unrecognized key: {first}"
+        )));
+    }
+
+    Ok(LoadedBundles {
+        merged,
+        per_shard,
+        unrecognized_keys,
+    })
+}
+
+/// Warning text when some shards loaded but other top-level keys were ignored.
+pub fn unrecognized_bundle_keys_warning(keys: &[String]) -> String {
+    format!(
+        "FERRUM_CREDS_JSON ignored unrecognized top-level key(s); \
+         expected FERRUM_CREDS_BUNDLE / FERRUM_CREDS_BUNDLE_N, found: {}",
+        keys.join(", ")
+    )
 }
 
 fn parse_shard_index(secret_name: &str) -> Option<u32> {

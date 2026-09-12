@@ -1045,29 +1045,86 @@ fn every_other_credential_secret_still_blocks() {
 }
 
 #[test]
-fn identity_key_names_under_an_unrelated_credential_type_still_block() {
-    // The exemption keys on (credential type, leaf), never on the leaf alone.
-    // A custom credential type has no public-half contract with the gateway,
-    // so a string called `username` or `identity` there is exactly the
-    // committed secret the gate is for.
-    let config = config_with_credentials(&[(
+fn unknown_credential_types_block_before_leaf_classification() {
+    use gitforgeops::diff::security_blockers;
+
+    let api_key = config_with_credentials(&[(
+        "api_key",
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+    )]);
+    let api_findings = audit_security(&api_key);
+    let api_blockers = security_blockers(&api_findings);
+    assert_eq!(api_blockers.len(), 1, "{api_blockers:?}");
+    assert_eq!(api_blockers[0].severity, "error");
+    assert_eq!(api_blockers[0].kind, "Consumer");
+    assert_eq!(api_blockers[0].id, "app");
+    assert_eq!(api_blockers[0].namespace, "ferrum");
+    assert!(
+        api_blockers[0]
+            .message
+            .contains("Unknown credential type 'api_key'"),
+        "{}",
+        api_blockers[0].message
+    );
+    assert!(
+        api_blockers[0]
+            .message
+            .contains("on consumer app in namespace ferrum"),
+        "{}",
+        api_blockers[0].message
+    );
+    assert!(
+        api_blockers[0].message.contains("did you mean 'keyauth'"),
+        "{}",
+        api_blockers[0].message
+    );
+    for known in ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"] {
+        assert!(
+            api_blockers[0].message.contains(known),
+            "recognized set must name {known}: {}",
+            api_blockers[0].message
+        );
+    }
+
+    let basic_auth = config_with_credentials(&[(
+        "basic_auth",
+        serde_json::json!([{"password": "${gh-env-secret:alloc=require}"}]),
+    )]);
+    let basic_findings = audit_security(&basic_auth);
+    let basic_blockers = security_blockers(&basic_findings);
+    assert_eq!(basic_blockers.len(), 1, "{basic_blockers:?}");
+    assert!(
+        basic_blockers[0]
+            .message
+            .contains("did you mean 'basicauth'"),
+        "{}",
+        basic_blockers[0].message
+    );
+
+    let vendor = config_with_credentials(&[(
         "vendor_token",
         serde_json::json!([{"username": "alice", "identity": "client.example"}]),
     )]);
-
-    let blockers = literal_credential_blockers(&config);
-    assert_eq!(blockers.len(), 2, "{blockers:?}");
+    let vendor_findings = audit_security(&vendor);
+    let vendor_blockers = security_blockers(&vendor_findings);
+    assert_eq!(vendor_blockers.len(), 1, "{vendor_blockers:?}");
     assert!(
-        blockers
-            .iter()
-            .any(|m| m.contains("vendor_token[0].username")),
-        "{blockers:?}"
+        vendor_blockers[0]
+            .message
+            .contains("Unknown credential type 'vendor_token'"),
+        "{}",
+        vendor_blockers[0].message
     );
     assert!(
-        blockers
+        !vendor_blockers[0].message.contains("did you mean"),
+        "{}",
+        vendor_blockers[0].message
+    );
+    assert!(
+        !vendor_blockers
             .iter()
-            .any(|m| m.contains("vendor_token[0].identity")),
-        "{blockers:?}"
+            .any(|finding| finding.message.contains("Literal credential")),
+        "unknown types fail on the map key, not each leaf: {vendor_blockers:?}"
     );
 }
 

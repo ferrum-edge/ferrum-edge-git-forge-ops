@@ -887,6 +887,37 @@ fn format_results_json_conjoins_success() {
     assert_eq!(json["mesh"]["stderr"], "boom");
 }
 
+fn assert_json_stdout_ends_with_one_newline(output: &str) {
+    assert!(
+        output.ends_with('\n'),
+        "JSON stdout must end with a newline: {output:?}"
+    );
+    assert!(
+        !output.ends_with("\n\n"),
+        "JSON stdout must not end with extra newlines: {output:?}"
+    );
+    serde_json::from_str::<serde_json::Value>(output).expect("JSON stdout must parse");
+}
+
+#[test]
+fn format_json_ends_with_exactly_one_newline() {
+    let output = format_result(&result(true, "Spec: OK\n", ""), OutputFormat::Json);
+    assert_json_stdout_ends_with_one_newline(&output);
+}
+
+#[test]
+fn format_results_json_ends_with_exactly_one_newline() {
+    let single = format_results(&result(true, "", ""), None, OutputFormat::Json);
+    assert_json_stdout_ends_with_one_newline(&single);
+
+    let both = format_results(
+        &result(true, "", ""),
+        Some(&result(false, "", "boom")),
+        OutputFormat::Json,
+    );
+    assert_json_stdout_ends_with_one_newline(&both);
+}
+
 #[test]
 fn format_results_github_annotations_cover_both_documents() {
     let output = format_results(
