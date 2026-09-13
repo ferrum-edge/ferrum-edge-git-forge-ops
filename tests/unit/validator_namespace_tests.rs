@@ -67,7 +67,10 @@ impl Repo {
         }
         repo.write("expected-namespaces", &namespaces.join("\n"));
         // Auto-discovery must never load this unrelated settings file.
-        repo.write("ferrum.conf", "FERRUM_MODE=database\nFERRUM_DB_PORT=invalid\n");
+        repo.write(
+            "ferrum.conf",
+            "FERRUM_MODE=database\nFERRUM_DB_PORT=invalid\n",
+        );
         repo
     }
 
@@ -111,7 +114,10 @@ spec:
             .env("FERRUM_GATEWAY_MODE", "file")
             .env("FERRUM_EDGE_BINARY_PATH", &self.validator)
             .env("FERRUM_FILE_OUTPUT_PATH", self.published())
-            .env("FERRUM_MESH_FILE_OUTPUT_PATH", self.dir.path().join("mesh.yaml"))
+            .env(
+                "FERRUM_MESH_FILE_OUTPUT_PATH",
+                self.dir.path().join("mesh.yaml"),
+            )
             .env("FERRUM_MODE", "database")
             .env("FERRUM_CONF_PATH", "must-not-load.conf")
             .env("FERRUM_NAMESPACE_FILE", "must-not-load.namespace")
@@ -181,13 +187,24 @@ fn assert_command_contract(namespaces: &[&str], invalid: Option<&str>, binary: O
                 if args[0] == "validate" && invalid.is_none() && binary.is_some() {
                     let stdout = report["stdout"].as_str().unwrap();
                     for namespace in namespaces {
-                        assert!(stdout.contains(&format!("Namespace: {namespace}")), "{text}");
+                        assert!(
+                            stdout.contains(&format!("Namespace: {namespace}")),
+                            "{text}"
+                        );
                     }
-                    assert_eq!(stdout.matches("Proxies: 1").count(), namespaces.len(), "{text}");
+                    assert_eq!(
+                        stdout.matches("Proxies: 1").count(),
+                        namespaces.len(),
+                        "{text}"
+                    );
                 }
             }
             "review" => {
-                let status = if invalid.is_some() { "FAILED" } else { "PASSED" };
+                let status = if invalid.is_some() {
+                    "FAILED"
+                } else {
+                    "PASSED"
+                };
                 assert!(text.contains(&format!("Validation: {status}")), "{text}");
             }
             "apply" => {
@@ -384,7 +401,10 @@ fn namespace_labels_do_not_change_annotation_severity() {
     let annotations = format_result(&result, OutputFormat::GithubAnnotations);
     assert!(!annotations.contains("::error"), "{annotations}");
     assert_eq!(annotations.matches("::warning").count(), 2, "{annotations}");
-    assert!(annotations.contains("[namespace \"errors\"]"), "{annotations}");
+    assert!(
+        annotations.contains("[namespace \"errors\"]"),
+        "{annotations}"
+    );
 }
 
 fn real_validator() -> Option<PathBuf> {
