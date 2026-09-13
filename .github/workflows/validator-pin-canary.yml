@@ -40,7 +40,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify the reviewed validator digest still resolves
+      - name: Verify the reviewed validator digest and resource-label support
         id: verify
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -49,11 +49,16 @@ jobs:
           status=0
           bash .github/scripts/install-ferrum-edge.sh \
             "$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?
+          echo "pin_status=$status" >>"$GITHUB_OUTPUT"
+          if [ "$status" -eq 0 ]; then
+            bash .github/scripts/check-validator-resource-labels.sh \
+              "$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?
+          fi
           echo "status=$status" >>"$GITHUB_OUTPUT"
 
       - name: Compute the current upstream allowlist line
         id: refresh
-        if: steps.verify.outputs.status != '0'
+        if: steps.verify.outputs.pin_status != '0'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -77,25 +82,31 @@ jobs:
           cat >issue-body.md <<EOF
           $ISSUE_MARKER
 
-          The reviewed digest allowlist no longer covers the build upstream is
-          publishing. Every workflow that runs \`ferrum-edge validate\` fails
-          until the allowlist is refreshed.
+          The validator pairing check failed: either the reviewed digest no
+          longer covers the upstream build, or the verified binary rejected
+          the minimal fixture with labels on all four gateway resource kinds.
+          See the canary log for the original diagnostic. Git Forge Ops always
+          emits resource labels and requires a build including ferrum-edge#5483.
 
-          Review the upstream build, then append this exact line to
-          \`.github/ferrum-edge-checksums.txt\`:
+          When the digest is stale, the candidate line below is computed from
+          the publisher checksum. Review the upstream build before appending
+          it to \`.github/ferrum-edge-checksums.txt\`:
 
           \`\`\`
           $ALLOWLIST_LINE
           \`\`\`
 
-          Or regenerate it locally:
+          If no line is shown, installation succeeded but label validation
+          failed. Do not re-approve the same incompatible build; select an
+          upstream build with resource-label support. Regenerate a candidate:
 
           \`\`\`bash
           bash .github/scripts/refresh-ferrum-edge-pin.sh --append
           \`\`\`
 
-          Keep the previous line so in-flight pull requests still running the
-          older binary stay green.
+          Keep previous approved digests. The PR's required static-validation
+          check must also accept the labeled fixture before the new pairing
+          can merge; an allowlist entry alone does not prove compatibility.
 
           Canary run: $RUN_URL
           EOF
@@ -124,12 +135,12 @@ jobs:
             | awk -F'\t' -v title="$ISSUE_TITLE" '$2 == title { print $1; exit }')
           if [ -n "$number" ]; then
             gh issue close "$number" --repo "$REPO" \
-              --comment 'The reviewed digest allowlist now covers the build upstream is publishing.'
+              --comment 'The reviewed digest resolves and the verified validator accepts resource labels on all four gateway resource kinds.'
             echo "::notice::Closed resolved tracking issue #$number."
           fi
 
-      - name: Fail when the pin is stale
+      - name: Fail when the validator pairing is invalid
         if: steps.verify.outputs.status != '0'
         run: |
-          echo "::error::The reviewed validator digest allowlist is stale; see the tracking issue."
+          echo "::error::The reviewed validator digest or resource-label compatibility check failed; see the tracking issue."
           exit 1

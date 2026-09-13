@@ -1914,7 +1914,20 @@ result through normal review.
 on demand). When the allowlist has gone stale it opens — or updates — a single
 tracking issue titled *Refresh the pinned ferrum-edge validator digest*
 containing the exact line to add and the command above, and closes that issue
-once the allowlist covers the current build again.
+once the allowlist covers the current build and the verified binary accepts
+resource labels. After installation it validates
+`.github/fixtures/validator-resource-labels.yaml`, a minimal offline document
+with a labeled Proxy, Consumer, Upstream and PluginConfig. A schema rejection
+also fails the canary and keeps the tracking issue open; refreshing a digest
+alone does not establish compatibility.
+
+The same fixture check runs in `validate-pr.yml`, after checksum verification
+and before resource validation. A separate pairing job runs on **every PR**,
+including pin-only and code-only changes and repositories with no environments
+or resources. The required `gitforgeops-required-static-validation` status
+requires that job to pass even when declarative validation is skipped. The
+installer still comes from the protected branch and checks the candidate's
+allowlist; the label probe runs without the installer token.
 
 ## Upgrading
 
@@ -1942,8 +1955,23 @@ Declare additional labels under `spec.labels`; overlays merge them normally.
 The first reconciliation adds attribution to previously unlabeled declarations.
 
 Labels require the Ferrum Edge resource-labels feature. Upgrade the gateway
-and the `ferrum-edge validate` binary before upgrading Git Forge Ops. These
-labels are informational; the state ledger and API-spec ownership rules remain
+and the `ferrum-edge validate` binary before upgrading Git Forge Ops. Support
+landed in [ferrum-edge#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483);
+released 0.9.4 and earlier do not support these labels. Labels stay always on.
+
+If the validator rejects the unknown `labels` field on a gateway resource,
+Git Forge Ops reports `gitforgeops error [validator-resource-labels]`, names
+the validator binary path (resolved through the existing PATH lookup when
+available), and explains how to upgrade both Edge binaries. If you cannot
+upgrade Edge yet, pin Git Forge Ops to a revision before #218. The original
+Edge diagnostic remains available after the usual secret scrubbing, in text,
+JSON and GitHub annotations. `plan` reports a validation blocker; `review`
+marks validation FAILED and apply blocked (`--fail-on-blockers` exits 1).
+File-mode `apply` refuses publication. Mesh errors and unrelated unknown
+fields retain their ordinary diagnostics. The pinned-validator pairing checks
+above enforce label acceptance before merge as well as in the daily canary.
+
+These labels are informational; the state ledger and API-spec ownership rules remain
 the authority for adoption, reconciliation, and deletion. Mesh fragments are
 separate mesh documents and do not receive gateway resource labels.
 
