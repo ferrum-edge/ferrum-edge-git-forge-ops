@@ -28,6 +28,10 @@ on-disk tree is non-empty is an error-severity finding on `validate`,
 `plan`, and `diff` (exit 1, not the drift code 2). The flag demotes that
 finding to a warning. There is no environment variable for it.
 
+`gitforgeops --version` / `-V` print the Cargo package version. `gitforgeops
+version` adds build-time git commit and `git describe` metadata when the binary
+was built from a checkout (`unknown` when `.git` was absent).
+
 ```bash
 gitforgeops validate [--format text|json|github|github-annotations] # Assemble + shell to `ferrum-edge validate`
 gitforgeops export [--output PATH]                        # Emit flat YAML (placeholders preserved) + mesh doc
@@ -48,6 +52,7 @@ gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
                                                           # Exit stays 0 on offline apply blockers unless
                                                           # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
+gitforgeops version [--format text|json]                 # Cargo package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
   [--namespace NS] [--recipient GH_LOGIN]
 ```
@@ -673,7 +678,8 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 ### Source Layout
 
 - `src/main.rs` — async Tokio entry, command dispatch
-- `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
+- `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `version`, `rotate`)
+- `src/version.rs` — `--version` / `version` identity (Cargo package version plus `build.rs` git metadata)
 - `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
