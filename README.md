@@ -1510,7 +1510,7 @@ is `PASSED`.
 
 ## CLI reference
 
-All commands accept `--env <name>`, `--allow-credential-slot-remap`, and `--allow-empty-namespace` globally.
+All commands accept `--env <name>`, `--allow-credential-slot-remap`, and `--allow-empty-namespace` globally. `--version` / `-V` print the Cargo package version.
 
 ```
 gitforgeops validate [--format text|json|github|github-annotations]
@@ -1524,6 +1524,7 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--allow-plaintext-plugin-config PLUGIN_NAME]  # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
+gitforgeops version [--format text|json] # package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \
   [--namespace NS] [--recipient GH_LOGIN]
 ```

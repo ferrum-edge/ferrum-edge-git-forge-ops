@@ -34,3 +34,4 @@ mod state_tests;
 mod validate_tests;
 mod validator_namespace_tests;
 mod verdict_tests;
+mod version_tests;
