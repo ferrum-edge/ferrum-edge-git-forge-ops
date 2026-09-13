@@ -11,7 +11,9 @@ use crate::secrets::SecretScrubber;
 /// `ferrum-edge validate` has no machine-readable output mode — it prints
 /// plain text and exits 0 (success) or 1 (failure). Everything structured
 /// (text / JSON / GitHub annotations) is produced gitforgeops-side by
-/// [`crate::validate::reporter`] from these raw fields.
+/// [`crate::validate::reporter`] from these fields. Child streams are secret
+/// scrubbed; a recognized resource-label rejection also prepends an actionable
+/// compatibility error to stderr, retaining the original Edge diagnostic.
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
     pub success: bool,
@@ -332,7 +334,17 @@ fn run_validate_command(
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
     let which_result = Command::new("which").arg(binary_path).output();
-    let binary_exists = match which_result {
+    // Reuse the existing lookup for diagnostics; no version subprocess or
+    // version-number assumption can establish resource-label capability.
+    let binary_in_use = which_result
+        .as_ref()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| std::str::from_utf8(&output.stdout).ok())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(binary_path);
+    let binary_exists = match &which_result {
         Ok(output) => output.status.success(),
         Err(_) => {
             // "which" might not exist (Windows); try running the binary directly
@@ -408,7 +420,7 @@ fn run_validate_command(
         None => scrubber.scrub_streams(&stdout, &stderr),
     };
     let stdout = scrubbed.stdout;
-    let stderr = scrubbed.stderr;
+    let mut stderr = scrubbed.stderr;
 
     // ferrum-edge validate's public contract is 0 for accepted input and 1
     // for schema rejection. Any other code (including -1 for termination by
@@ -419,6 +431,14 @@ fn run_validate_command(
             code: exit_code,
             stderr: bounded_process_diagnostic(&stderr),
         });
+    }
+
+    if mode == GATEWAY_VALIDATE_MODE && exit_code == 1 {
+        if let Some(diagnostic) =
+            super::compatibility::resource_labels_diagnostic(&stdout, &stderr, binary_in_use)
+        {
+            stderr = diagnostic;
+        }
     }
 
     Ok(ValidationResult {

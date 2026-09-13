@@ -176,6 +176,36 @@ already run by then:
   `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced without
   mangling the report.
 
+### Resource attribution and validator compatibility
+
+The assembler always emits `labels: {provisioned-by: ferrum-edge-git-forge-ops}`
+on Proxy, Consumer, Upstream and PluginConfig, preserving existing labels and
+an existing origin. There is no opt-out. Upgrade the gateway and validation
+binary to a build including ferrum-edge#5483 before upgrading Git Forge Ops;
+released Edge 0.9.4 and earlier lack this capability.
+
+`validate::compatibility` recognizes only a failed gateway validator's unknown
+`labels` field diagnostic, prefixed `Validation error: Spec validation failed:`,
+with the expected-field signature of one of those four resource kinds. It
+prepends `gitforgeops error [validator-resource-labels]` with the validator
+path, the upgrade remedy, and the alternative of pinning Git Forge Ops before
+#218. The existing `which` lookup supplies the path when available; no version
+probe or version-number gate is added. Original child output survives the
+usual secret scrubbing/withholding. All validation formats carry the message,
+`plan` and `review` retain their validation-blocker verdicts, and file apply
+refuses before publication. Mesh and unrelated schema errors are unchanged.
+
+After the installer verifies publisher and allowlisted SHA-256 digests,
+`check-validator-resource-labels.sh` validates the minimal four-kind fixture
+at `.github/fixtures/validator-resource-labels.yaml` with empty settings and a
+clean environment. The daily validator-pin canary fails and keeps its tracking
+issue open for either a stale digest or failed label acceptance. PR validation
+runs the same probe, including an unconditional `validator-pairing` job required
+by `gitforgeops-required-static-validation` even on pin-only/code-only PRs or
+empty repositories. The installer uses trusted code and the candidate allowlist
+in the secretless PR job; the probe receives no GitHub token. An approved digest
+is necessary but does not itself prove schema compatibility.
+
 ### Gateway Modes
 
 - **api** — push to admin REST (POST creates, PUT updates, DELETE removes, POST `/batch` for pure-add namespaces, or POST `/restore` for full-replace)
