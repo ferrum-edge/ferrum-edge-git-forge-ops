@@ -149,7 +149,7 @@ fn format_github_annotations(result: &ValidationResult) -> String {
             continue;
         }
 
-        let lower = trimmed.to_lowercase();
+        let lower = without_namespace_label(trimmed).to_lowercase();
         if lower.contains("error") {
             output.push_str(&format!(
                 "::error ::{}\n",
@@ -170,7 +170,7 @@ fn format_github_annotations(result: &ValidationResult) -> String {
             continue;
         }
 
-        let lower = trimmed.to_lowercase();
+        let lower = without_namespace_label(trimmed).to_lowercase();
         if lower.contains("error") {
             output.push_str(&format!(
                 "::error ::{}\n",
@@ -193,6 +193,26 @@ fn format_github_annotations(result: &ValidationResult) -> String {
     }
 
     output
+}
+
+/// Classify the child's diagnostic, retaining the runner's namespace label
+/// only in the emitted annotation. A namespace named `errors` must not turn
+/// every labeled line into an error. Runner labels use Rust debug quoting.
+fn without_namespace_label(line: &str) -> &str {
+    let Some(tail) = line.strip_prefix("[namespace \"") else {
+        return line;
+    };
+    let mut escaped = false;
+    for (index, character) in tail.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return tail[index + 1..].strip_prefix("] ").unwrap_or(line);
+        }
+    }
+    line
 }
 
 fn escape_workflow_command_data(value: &str) -> String {
