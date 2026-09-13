@@ -158,6 +158,25 @@ fn exact_edge_diagnostic_without_location_is_recognized_on_either_stream() {
 }
 
 #[test]
+fn json_log_wrapped_edge_diagnostic_is_recognized() {
+    // A piped `ferrum-edge validate` (the only way the runner invokes it) wraps
+    // the diagnostic in its JSON log envelope, with the field list followed by
+    // the closing quote instead of a location suffix.
+    for fields in RESOURCE_FIELDS {
+        let diagnostic = format!(
+            "{{\"timestamp\":\"2026-09-13T10:10:50.968311Z\",\"level\":\"ERROR\",\
+             \"fields\":{{\"message\":\"{PREFIX}{fields}\"}},\"target\":\"ferrum_edge\"}}"
+        );
+        let repo = Repo::new(&diagnostic, 1, false);
+        let binary = repo.validator.to_str().unwrap();
+        let result = run_validation(&GatewayConfig::default(), binary).unwrap();
+        assert!(!result.success);
+        repo.assert_remedy(&result.stderr);
+        assert!(result.stderr.contains(&diagnostic), "{}", result.stderr);
+    }
+}
+
+#[test]
 fn labels_rejection_blocks_plan_and_review_and_preserves_file_apply_output() {
     let diagnostic = edge_error(RESOURCE_FIELDS[1]);
     // Edge builds may emit their error on either stream. Both must reach

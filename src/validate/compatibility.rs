@@ -10,10 +10,22 @@ fn resource_labels_rejection(stream: &str) -> Option<&str> {
     const PREFIX: &str = "Validation error: Spec validation failed: unknown field `labels`, \
                           expected one of ";
     stream.lines().find(|line| {
-        let Some(expected) = line.trim().strip_prefix(PREFIX) else {
+        // Edge prints the diagnostic bare on a TTY and wrapped in its JSON log
+        // envelope (`{"timestamp":…,"level":"ERROR","fields":{"message":"…"}}`)
+        // when stdout is a pipe, which is how the runner always invokes it. Accept
+        // exactly those two shapes; a line that merely echoes the text elsewhere
+        // (quoted YAML, a comment, a different key) is not a rejection.
+        let trimmed = line.trim();
+        let Some(start) = trimmed.find(PREFIX) else {
             return false;
         };
-        // Serde appends location text after the final field. Only consume
+        let envelope = &trimmed[..start];
+        if !envelope.is_empty() && !envelope.ends_with("\"message\":\"") {
+            return false;
+        }
+        let expected = &trimmed[start + PREFIX.len()..];
+        // Serde appends location text after the final field, and the JSON
+        // envelope closes the string right after it. Only consume
         // comma-separated, backtick-quoted field names, never arbitrary text
         // elsewhere in the diagnostic or another line of echoed YAML.
         let mut fields = Vec::new();
@@ -27,7 +39,11 @@ fn resource_labels_rejection(stream: &str) -> Option<&str> {
             };
             fields.push(field);
             let Some(next) = tail.strip_prefix(", ") else {
-                if !tail.is_empty() && !tail.starts_with(" at line ") {
+                let terminated = tail.is_empty()
+                    || tail.starts_with(" at line ")
+                    || tail.starts_with('"')
+                    || tail.starts_with("\\\"");
+                if !terminated {
                     return false;
                 }
                 break;
