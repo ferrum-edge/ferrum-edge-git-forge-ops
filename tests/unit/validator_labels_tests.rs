@@ -179,7 +179,10 @@ fn labels_rejection_blocks_plan_and_review_and_preserves_file_apply_output() {
             assert!(detail.contains("gateway: FAILED"), "{detail}");
             assert!(detail.contains("validation (1)"), "{detail}");
         }
-        for (args, code) in [(vec!["review"], 0), (vec!["review", "--fail-on-blockers"], 1)] {
+        for (args, code) in [
+            (vec!["review"], 0),
+            (vec!["review", "--fail-on-blockers"], 1),
+        ] {
             let output = repo.run(&args);
             assert_eq!(output.status.code(), Some(code), "{}", stderr(&output));
             let rendered = stdout(&output);
