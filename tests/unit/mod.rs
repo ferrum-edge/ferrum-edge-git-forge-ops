@@ -32,4 +32,5 @@ mod secrets_tests;
 mod serde_default_tests;
 mod state_tests;
 mod validate_tests;
+mod validator_namespace_tests;
 mod verdict_tests;

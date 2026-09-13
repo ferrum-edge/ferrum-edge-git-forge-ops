@@ -724,8 +724,8 @@ fn mesh_validation_context_is_the_documented_no_ca_opt_out() {
 }
 
 /// The gateway pass has no identity gate to relax, and a gateway document must
-/// never be graded under a relaxed mesh context. `-m file` therefore inherits
-/// the scrubbed environment and nothing else.
+/// never be graded under a relaxed mesh context. `-m file` gets no constant
+/// identity overrides; its namespace is derived separately from the document.
 #[test]
 fn gateway_validation_context_injects_nothing() {
     assert!(
