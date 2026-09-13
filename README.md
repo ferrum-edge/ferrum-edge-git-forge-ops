@@ -1157,9 +1157,12 @@ An empty document still receives one validation pass. The parent refusal for a
 mistyped namespace filter that selects no desired resources remains in force;
 the child never receives Edge's `--allow-empty-namespace` flag.
 
-Hosted Rust CI runs namespace contract tests against the checksum-pinned Edge
-binary installed by the same trusted installer as PR static validation. These
-tests skip when `GITFORGEOPS_TEST_EDGE_BINARY` is unset.
+The namespace contract tests in `tests/unit/validator_namespace_tests.rs` also
+run against a real Edge binary when `GITFORGEOPS_TEST_EDGE_BINARY` points at
+one, and skip otherwise. Hosted Rust CI will set it from the checksum-pinned
+validator once that pin is a build with resource-label support (see
+[Resource attribution](#resource-attribution) and issue #223); the pinned
+September 5 build rejects the labels every assembled document now carries.
 
 `validate`, `plan`, and `apply` run a **second** validation pass, `ferrum-edge validate -m mesh`, against the rendered document (byte-for-byte what gets published, `version` stamp included). That pass runs the same parse → normalize → validate → slice-derivation pipeline a mesh node runs at startup. It only runs when the repo actually declares mesh fragments.
 
