@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     name = "gitforgeops",
-    about = "GitOps for Ferrum Edge gateway configuration"
+    about = "GitOps for Ferrum Edge gateway configuration",
+    version
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -160,6 +161,11 @@ pub enum Commands {
         #[arg(long)]
         include_scopes: bool,
     },
+    /// Print the Cargo package version and build-time git metadata.
+    Version {
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+    },
     /// Rotate a Consumer credential slot in api mode. Requires provisioner token.
     Rotate {
         #[arg(long)]
@@ -193,8 +199,8 @@ pub enum EnvsFormat {
     Text,
 }
 
-/// Machine-readable report for `plan` and `diff`. `validate` keeps its own
-/// [`ValidateFormat`] because it also emits GitHub Actions annotations.
+/// Machine-readable report for `plan`, `diff`, and `version`. `validate` keeps
+/// its own [`ValidateFormat`] because it also emits GitHub Actions annotations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ReportFormat {
     Text,
