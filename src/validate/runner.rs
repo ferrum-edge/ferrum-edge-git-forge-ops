@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use crate::config::GatewayConfig;
+use crate::config::{collect_namespaces, GatewayConfig};
 use crate::secrets::SecretScrubber;
 
 /// Result of running `ferrum-edge validate`.
@@ -104,8 +104,8 @@ where
         .collect()
 }
 
-/// The one environment variable gitforgeops sets *itself* on a validator
-/// child, and only under [`MESH_VALIDATE_MODE`].
+/// The validation-only identity opt-out gitforgeops sets *itself* on a
+/// validator child, and only under [`MESH_VALIDATE_MODE`].
 ///
 /// ferrum-edge's `-m mesh` resolution runs the same identity gate a mesh node
 /// runs at startup: with no file-based gateway SVID material
@@ -130,9 +130,9 @@ pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
 ///
 /// This is an allow-list of constants, not a pass-through: the parent's own
 /// `FERRUM_MESH_ALLOW_NO_CA` is scrubbed like everything else and cannot
-/// influence the child either way. Gateway validation gets nothing — `-m file`
-/// has no identity gate, and a gateway document must never be graded under a
-/// relaxed mesh context.
+/// influence the child either way. Gateway validation gets no constant
+/// identity overrides — `-m file` has no identity gate. Its `FERRUM_NAMESPACE`
+/// is set separately from the assembled document, never the parent's filter.
 ///
 /// Nothing here reaches `apply`'s runtime settings: it is set on the
 /// `ferrum-edge validate` child process only, and the published mesh document
@@ -186,7 +186,11 @@ fn private_temp_file(
 
 /// Assemble a temporary YAML spec from `GatewayConfig`, shell out to
 /// `ferrum-edge validate -m file -s <empty settings> -c <spec>`, and return
-/// the validation result.
+/// the validation result. Every namespace present in the assembled gateway
+/// document gets an explicit child `FERRUM_NAMESPACE`, in lexical order.
+/// Edge filters before checking cross-resource references and uniqueness, so
+/// validating only its default `ferrum` slice would leave other slices unchecked.
+/// An empty document still gets one pass under an explicit `ferrum` context.
 ///
 /// The spec is written through `tempfile` (0600 on unix, unpredictable name,
 /// removed on drop along every path) because callers resolve credential
@@ -241,7 +245,38 @@ fn run_gateway_validation(
     // Stand-ins are fabricated here and go no further than `spec_file` below.
     let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
     let yaml = serde_yaml::to_string(standins.as_ref().unwrap_or(config))?;
-    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, scrubber)
+    let mut namespaces = collect_namespaces(config);
+    if namespaces.is_empty() {
+        // Empty documents still need schema/settings validation. This does
+        // not acknowledge a typoed parent filter: NamespaceScope owns that gate.
+        namespaces.push("ferrum".to_string());
+    }
+    let annotate_namespace = namespaces.len() > 1;
+    let mut combined = ValidationResult {
+        success: true,
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: 0,
+    };
+    for namespace in namespaces {
+        // Keep the full document: Edge owns both pre-filter field validation
+        // and post-filter graph validation. Never opt out of its empty filter gate.
+        let result = run_validate_command(
+            GATEWAY_VALIDATE_MODE,
+            &yaml,
+            binary_path,
+            scrubber,
+            Some(&namespace),
+            annotate_namespace,
+        )?;
+        if !result.success {
+            combined.success = false;
+            combined.exit_code = result.exit_code;
+        }
+        combined.stdout.push_str(&result.stdout);
+        combined.stderr.push_str(&result.stderr);
+    }
+    Ok(combined)
 }
 
 /// Validate the standalone mesh document with
@@ -275,6 +310,8 @@ pub fn run_mesh_validation(
         &yaml,
         binary_path,
         &SecretScrubber::default(),
+        None,
+        false,
     )
 }
 
@@ -292,6 +329,8 @@ fn run_validate_command(
     yaml: &str,
     binary_path: &str,
     scrubber: &SecretScrubber,
+    namespace: Option<&str>,
+    annotate_namespace: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
     let which_result = Command::new("which").arg(binary_path).output();
@@ -346,9 +385,12 @@ fn run_validate_command(
     }
     // Order is load-bearing: every inherited `FERRUM_*` name is removed
     // first, then this mode's own validation-only context is set, so the
-    // child sees exactly the constants below and nothing the parent chose.
+    // child sees only our constants and document-derived namespace.
     for (name, value) in validation_context_env(mode) {
         command.env(name, value);
+    }
+    if let Some(namespace) = namespace {
+        command.env("FERRUM_NAMESPACE", namespace);
     }
 
     let output = command.output();
@@ -365,10 +407,18 @@ fn run_validate_command(
     // matched reliably in re-encoded output, a value that survived verbatim,
     // or a surviving fragment of one all withhold both streams and say which
     // it was. Everything else comes back scrubbed and readable.
-    let scrubbed = scrubber.scrub_streams(
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Label every diagnostic line in a multi-namespace run so text, JSON and
+    // GitHub annotations retain its context. Label before scrubbing: even a
+    // namespace can coincide with a credential. Single-pass output is unchanged.
+    let scrubbed = match namespace.filter(|_| annotate_namespace) {
+        Some(namespace) => scrubber.scrub_streams(
+            &namespace_output(namespace, &stdout),
+            &namespace_output(namespace, &stderr),
+        ),
+        None => scrubber.scrub_streams(&stdout, &stderr),
+    };
     let stdout = scrubbed.stdout;
     let mut stderr = scrubbed.stderr;
 
@@ -397,6 +447,15 @@ fn run_validate_command(
         stderr,
         exit_code,
     })
+}
+
+fn namespace_output(namespace: &str, output: &str) -> String {
+    let mut labeled = String::new();
+    for line in output.lines() {
+        // Debug quoting keeps hostile newlines in a namespace on one line.
+        labeled.push_str(&format!("[namespace {namespace:?}] {line}\n"));
+    }
+    labeled
 }
 
 fn bounded_process_diagnostic(diagnostic: &str) -> String {

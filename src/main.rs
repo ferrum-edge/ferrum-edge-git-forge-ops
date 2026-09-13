@@ -143,6 +143,7 @@ async fn main() {
             format,
             include_scopes,
         } => cmd_envs(format, include_scopes),
+        cli::Commands::Version { format } => cmd_version(format),
         cli::Commands::Rotate {
             consumer,
             credential,
@@ -3320,6 +3321,15 @@ async fn cmd_review(
     }
     if let Some(error) = validation_execution_error {
         return Err(format!("validator execution failed during review: {error}").into());
+    }
+    Ok(())
+}
+
+fn cmd_version(format: cli::ReportFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let info = gitforgeops::version::BuildInfo::current();
+    match format {
+        cli::ReportFormat::Text => print!("{}", info.render_text()),
+        cli::ReportFormat::Json => print!("{}", info.render_json()?),
     }
     Ok(())
 }

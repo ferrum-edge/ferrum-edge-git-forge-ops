@@ -28,6 +28,10 @@ on-disk tree is non-empty is an error-severity finding on `validate`,
 `plan`, and `diff` (exit 1, not the drift code 2). The flag demotes that
 finding to a warning. There is no environment variable for it.
 
+`gitforgeops --version` / `-V` print the Cargo package version. `gitforgeops
+version` adds build-time git commit and `git describe` metadata when the binary
+was built from a checkout (`unknown` when `.git` was absent).
+
 ```bash
 gitforgeops validate [--format text|json|github|github-annotations] # Assemble + shell to `ferrum-edge validate`
 gitforgeops export [--output PATH]                        # Emit flat YAML (placeholders preserved) + mesh doc
@@ -48,6 +52,7 @@ gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
                                                           # Exit stays 0 on offline apply blockers unless
                                                           # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
+gitforgeops version [--format text|json]                 # Cargo package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
   [--namespace NS] [--recipient GH_LOGIN]
 ```
@@ -130,8 +135,21 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               mesh doc → FERRUM_MESH_FILE_OUTPUT_PATH)
 ```
 
-Two things happen at the `validate` hand-off that exist nowhere else in the
-pipeline, both because resolution has already run by then:
+The shared validator runner used by `validate`, `plan`, `review`, and `apply`
+hands the full assembled gateway document to `ferrum-edge validate -m file`
+once per distinct effective resource namespace, in lexical order. Every child
+uses an empty settings file and scrubs inherited `FERRUM_*` variables before
+setting its own `FERRUM_NAMESPACE` from the document. Edge filters before
+cross-resource checks, so every selected namespace must get a pass, whether or
+not `ferrum` appears. A truly empty document still gets one explicit `ferrum`
+pass; the parent `NamespaceScope` refusal for typoed filters remains in force.
+The runner never passes Edge's `--allow-empty-namespace`. Schema failures are
+combined across all passes, with namespace labels on multi-pass diagnostics
+before secret scrubbing, preserving text/JSON/GitHub annotation formats. Mesh
+keeps its separate `-m mesh` pass and validation-only identity context.
+
+Two additional things happen at the `validate` hand-off because resolution has
+already run by then:
 
 - `validate::with_validation_standins` replaces credential leaves that are
   *still* `${gh-env-secret:…}` placeholders with a deterministic fake
@@ -245,6 +263,7 @@ Publication is a **reconciliation**, not a conditional write: `apply::reconcile_
 
 - Directory-inferred: `resources/<ns>/…` → resource `namespace: <ns>` unless the spec overrides with a non-default value.
 - `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset. `validate`, `plan`, and `diff` fail closed when the filter selects zero desired resources while the on-disk tree contains at least one resource; `--allow-empty-namespace` (CLI-only) demotes that to a warning. When filtered live inventory is empty solely because the filter matched no live namespace, `plan` and `diff` say so in text and JSON.
+- Gateway validator children derive their explicit `FERRUM_NAMESPACE` from the assembled resources after selection and overlays. The parent's filter is never forwarded; every selected effective namespace is validated.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
 - `BackupSnapshot::from_scoped_body` validates every resource's explicit wire namespace
   before deserialization can default it. Missing or foreign namespaces refuse the
@@ -703,7 +722,8 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 ### Source Layout
 
 - `src/main.rs` — async Tokio entry, command dispatch
-- `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `rotate`)
+- `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `version`, `rotate`)
+- `src/version.rs` — `--version` / `version` identity (Cargo package version plus `build.rs` git metadata)
 - `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
@@ -711,7 +731,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
 - `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output, plus the fail-closed policy — `is_reencoding_hazard` values withhold the stream outright, single-line re-encodings (base64/percent/JSON-escape/single-quoted YAML) are matched as needles, and a surviving `FRAGMENT_SCAN_LENGTH`-byte run that is not also in the scrubbed document withholds; `scrub_streams` is the one decision point), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `service_discovery.rs` (modeled `Upstream.service_discovery` secret table + slot derivation), `resolver.rs` (walks consumers, plugin config and service discovery, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
-- `src/validate/` — `standin.rs` (validator-only stand-ins for unresolved broker placeholders; URL shapes for endpoint-typed plugin fields via `secrets::plugin_config::{endpoint_paths, endpoint_scheme}`), `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `validation_context_env` sets the one variable gitforgeops adds back after that scrub — `FERRUM_MESH_ALLOW_NO_CA=true` (`MESH_ALLOW_NO_CA_ENV`), mesh pass only, because `-m mesh` refuses on a missing workload identity before it reads the document and a CI runner is not a mesh node; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
+- `src/validate/` — `standin.rs` (validator-only stand-ins for unresolved broker placeholders; URL shapes for endpoint-typed plugin fields via `secrets::plugin_config::{endpoint_paths, endpoint_scheme}`), `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec. Gateway passes explicitly set each document namespace through `FERRUM_NAMESPACE` and aggregate diagnostics in lexical namespace order before reporting. `validation_context_env` sets `FERRUM_MESH_ALLOW_NO_CA=true` (`MESH_ALLOW_NO_CA_ENV`) for the separate mesh pass only, because `-m mesh` refuses on a missing workload identity before it reads the document and a CI runner is not a mesh node. Every child's output and namespace labels pass through `SecretScrubber`; `reporter.rs` formats text/JSON/GitHub annotations for the gateway aggregate and optional mesh result.
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections; `ImportPassthroughPolicy` + `reject_import_passthrough_fields` fail closed on unmodelled top-level fields unless each is acknowledged with `--accept-unknown-field` *and* `FERRUM_ALLOW_UNKNOWN_FIELDS=true`; `reject_import_unknown_credential_types` refuses unrecognized Consumer credential map keys before publication, with no acknowledgement flag)
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal
@@ -777,6 +797,7 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 - `companion-schema/` holds one file per kind populating **every** field mirrored in `src/config/schema.rs`. `tests/unit/companion_schema_tests.rs` loads it strictly, assembles it, round-trips it through export, and — by reading the struct definitions out of `schema.rs` — fails when a newly mirrored field is not exercised there. Add new mirrored fields to that fixture in the same PR. Values are illustrative, not a working gateway or mesh document.
 - `mesh-minimal/` is the opposite mesh contract: a MeshConfig with a required workload `selector` and the smallest workload/service set `ferrum-edge validate -m mesh` accepts. `tests/unit/mesh_minimal_tests.rs` loads it strictly and asserts the rendered `{version, mesh}` document still carries that selector. Keep `companion-schema/` unchanged when editing this fixture.
 - New test file: create `tests/unit/<name>.rs` AND add `mod <name>;` to `tests/unit/mod.rs`.
+- `validator_namespace_tests.rs` exercises the shared command paths with a namespace-checking stub and, when `GITFORGEOPS_TEST_EDGE_BINARY` names a real Edge binary, the real validator; the real-binary tests skip when it is absent. Wire it into `rust-ci.yml` (trusted installer, candidate checksum allowlist, same pin as `validate-pr.yml`) only once the pinned validator accepts resource labels (issue #223); the current pin rejects every assembled document.
 - `tempfile` crate for filesystem tests.
 - No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking. GitHub Environment Secret adapters (`fetch_public_key` / `put_environment_secret`) are driven against an in-process loopback stub in `tests/unit/github_api_tests.rs` by injecting a test-only API origin (`fetch_public_key_at` / `put_environment_secret_at` / `allocate_and_deliver_at` / `rotate_and_deliver_at`). Production wrappers keep the compiled-in `https://api.github.com` origin; there is no environment-variable override.
 

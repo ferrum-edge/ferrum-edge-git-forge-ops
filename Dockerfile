@@ -18,7 +18,7 @@ RUN set -eu; \
     /opt/override-git/loader --library-path /opt/override-git/lib \
         /opt/override-git/git --version
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 RUN cargo build --release --locked
 

@@ -1143,6 +1143,27 @@ An api-mode `apply` neither publishes nor retracts (there is no mesh admin API);
 
 ### Validation, and the absence of a mesh admin API
 
+`validate`, `plan`, `review`, and `apply` share one gateway validator runner.
+It passes the full assembled document to `ferrum-edge validate -m file` once
+per distinct effective namespace, in lexical order. Each child gets an empty
+settings file and an explicit `FERRUM_NAMESPACE` derived from that document
+after inherited `FERRUM_*` variables are scrubbed. This validates custom
+namespaces and every slice of a multi-namespace document, including documents
+with no `ferrum` namespace. The overall result fails if any slice fails;
+multi-pass diagnostics include namespace labels in text, JSON, and GitHub
+annotations. Credentials remain scrubbed from those diagnostics.
+
+An empty document still receives one validation pass. The parent refusal for a
+mistyped namespace filter that selects no desired resources remains in force;
+the child never receives Edge's `--allow-empty-namespace` flag.
+
+The namespace contract tests in `tests/unit/validator_namespace_tests.rs` also
+run against a real Edge binary when `GITFORGEOPS_TEST_EDGE_BINARY` points at
+one, and skip otherwise. Hosted Rust CI will set it from the checksum-pinned
+validator once that pin is a build with resource-label support (see
+[Resource attribution](#resource-attribution) and issue #223); the pinned
+September 5 build rejects the labels every assembled document now carries.
+
 `validate`, `plan`, and `apply` run a **second** validation pass, `ferrum-edge validate -m mesh`, against the rendered document (byte-for-byte what gets published, `version` stamp included). That pass runs the same parse → normalize → validate → slice-derivation pipeline a mesh node runs at startup. It only runs when the repo actually declares mesh fragments.
 
 `tests/fixtures/companion-schema/` is a serde every-field mirror and is **not** a working mesh document — `ferrum-edge validate -m mesh` rejects it by design (missing workload `selector`, mutually exclusive TLS fields, and similar). `tests/fixtures/mesh-minimal/` is the opposite contract: a MeshConfig with a required `selector` and the smallest workload/service set that validator must accept. `tests/unit/mesh_minimal_tests.rs` pins that fixture; keep `companion-schema/` unchanged when editing it. Gateway samples follow the same placeholder rule as operator trees: `tests/fixtures/simple-config/` is brokered, and `tests/fixtures/literal-credential/` exists only so the security gate still has a committed literal to refuse.
@@ -1489,7 +1510,7 @@ is `PASSED`.
 
 ## CLI reference
 
-All commands accept `--env <name>`, `--allow-credential-slot-remap`, and `--allow-empty-namespace` globally.
+All commands accept `--env <name>`, `--allow-credential-slot-remap`, and `--allow-empty-namespace` globally. `--version` / `-V` print the Cargo package version.
 
 ```
 gitforgeops validate [--format text|json|github|github-annotations]
@@ -1503,6 +1524,7 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--allow-plaintext-plugin-config PLUGIN_NAME]  # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
+gitforgeops version [--format text|json] # package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \
   [--namespace NS] [--recipient GH_LOGIN]
 ```

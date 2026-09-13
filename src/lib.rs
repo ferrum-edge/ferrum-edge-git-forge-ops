@@ -16,3 +16,4 @@ pub mod secrets;
 pub mod state;
 pub mod validate;
 pub mod verdict;
+pub mod version;
