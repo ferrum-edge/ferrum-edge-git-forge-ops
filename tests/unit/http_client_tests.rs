@@ -1207,10 +1207,9 @@ fn file_resource_count_seal_allows_only_an_omitted_zero_upstream_count() {
     assert!(error.contains("resource_counts.upstreams"), "{error}");
 }
 
-/// F4: the count seal is metadata no live decision is made from, and it is
-/// emitted by a gateway build this one does not control. A live `GET /backup`
-/// that disagrees must not take `diff`/`plan`/`apply`/drift-check down — it
-/// records the disagreement, drops the seal, and hands over the resources.
+/// Read-only live comparisons preserve compatibility with seal variants, but
+/// mutation paths must reject every mismatch before trusting the resource
+/// arrays as authoritative.
 #[test]
 fn live_backup_reads_downgrade_count_seal_mismatches_to_advisories() {
     for body in [
@@ -1244,6 +1243,12 @@ fn live_backup_reads_downgrade_count_seal_mismatches_to_advisories() {
             "the disagreement must still be recorded: {body}"
         );
         assert!(snapshot.seal_violation_notice().is_some());
+        let mutation_error = snapshot
+            .require_consistent_seal("ferrum")
+            .expect_err("a mismatched seal must never authorize a mutation")
+            .to_string();
+        assert!(mutation_error.contains("refusing to mutate namespace 'ferrum'"));
+        assert!(mutation_error.contains("snapshot may be truncated"));
         // A seal that disagrees is discarded rather than half-retained.
         assert!(snapshot.counts.is_none() || snapshot.resource_counts.is_none());
 
@@ -1265,6 +1270,9 @@ fn live_backup_reads_keep_a_seal_that_agrees() {
     .unwrap();
 
     assert!(snapshot.seal_violations.is_empty());
+    snapshot
+        .require_consistent_seal("ferrum")
+        .expect("an agreeing seal is safe for mutation");
     assert_eq!(snapshot.counts.unwrap()["proxies"], 0);
 }
 
@@ -1458,6 +1466,53 @@ fn split_batch_on_empty_input_produces_no_requests() {
     assert!(split_batch(BatchCreate::default(), BATCH_MAX_BODY_BYTES)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn split_batch_keeps_proxy_plugin_components_together_without_reordering_associations() {
+    let mut first = proxy("p1");
+    first.plugins = serde_json::from_value(serde_json::json!([
+        {"plugin_config_id": "shared"}, {"plugin_config_id": "scoped"},
+    ]))
+    .unwrap();
+    let mut second = proxy("p2");
+    second.plugins = serde_json::from_value(serde_json::json!([
+        {"plugin_config_id": "shared"},
+    ]))
+    .unwrap();
+    let batch = BatchCreate {
+        upstreams: vec![upstream("u1")],
+        proxies: vec![first, second, proxy("independent")],
+        plugin_configs: serde_json::from_value(serde_json::json!([
+            {
+                "id": "scoped", "namespace": "team-alpha", "plugin_name": "cors",
+                "scope": "proxy", "proxy_id": "p1", "config": {},
+            },
+            {
+                "id": "shared", "namespace": "team-alpha", "plugin_name": "cors",
+                "scope": "proxy_group", "config": {},
+            },
+        ]))
+        .unwrap(),
+        ..Default::default()
+    };
+    // Even a deliberately tiny budget cannot split a dependency component.
+    let mut reordered = batch.clone();
+    reordered.proxies.reverse();
+    reordered.plugin_configs.reverse();
+    let chunks = split_batch(batch, 600).unwrap();
+    assert_eq!(
+        serde_json::to_value(split_batch(reordered, 600).unwrap()).unwrap(),
+        serde_json::to_value(&chunks).unwrap()
+    );
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(chunks[0].upstreams[0].id, "u1");
+    assert_eq!(chunks[1].proxies.len(), 2);
+    assert_eq!(chunks[1].plugin_configs.len(), 2);
+    assert_eq!(chunks[2].proxies[0].id, "independent");
+    assert_eq!(chunks.iter().map(BatchCreate::len).sum::<usize>(), 6);
+    assert_eq!(chunks[1].proxies[0].plugins[0].plugin_config_id, "shared");
+    assert_eq!(chunks[1].proxies[0].plugins[1].plugin_config_id, "scoped");
 }
 
 #[test]
@@ -1679,4 +1734,34 @@ fn convergence_summary_orders_by_instant_not_string() {
         summary.contains("oldest last_sync_at 2025-01-15T09:30:00Z"),
         "{summary}"
     );
+}
+
+#[test]
+fn scoped_backup_requires_explicit_matching_namespace_for_every_resource_kind() {
+    use gitforgeops::http_client::BackupSnapshot;
+
+    for section in ["proxies", "consumers", "upstreams", "plugin_configs"] {
+        for namespace in ["ferrum", "team"] {
+            for wire_namespace in [None, Some("foreign"), Some(namespace)] {
+                let mut row = serde_json::json!({
+                    "id": "row", "username": "row", "targets": [],
+                    "plugin_name": "key_auth", "scope": "global"
+                });
+                if let Some(value) = wire_namespace {
+                    row["namespace"] = value.into();
+                }
+                let mut body = serde_json::json!({});
+                body[section] = serde_json::json!([row]);
+                let result = BackupSnapshot::from_scoped_body(&body.to_string(), namespace);
+                assert_eq!(
+                    result.is_ok(),
+                    wire_namespace == Some(namespace),
+                    "{result:?}"
+                );
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("row"));
+                }
+            }
+        }
+    }
 }

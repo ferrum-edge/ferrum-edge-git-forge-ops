@@ -5,6 +5,8 @@
 # credential must never appear in a repository tree, fixtures included.
 kind: Consumer
 spec:
+  labels:
+    team: platform
   id: every-field-consumer
   username: every-field
   namespace: ferrum

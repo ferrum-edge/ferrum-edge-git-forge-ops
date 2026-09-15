@@ -62,9 +62,50 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertEqual(state["matched_paths"], [".state/production.json"])
         self.assertEqual(rust["matched_paths"], ["src/main.rs"])
         self.assertEqual(
-            declarative["matched_paths"], ["resources/team/proxies/api.yaml"]
+            declarative["matched_paths"],
+            [".state/production.json", "resources/team/proxies/api.yaml"],
         )
         self.assertTrue(state["complete"])
+
+    def test_exact_state_path_is_protected_for_all_change_types(self):
+        records = [
+            {"filename": ".state", "status": "added"},
+            {"filename": ".state", "status": "modified"},
+            {"filename": ".state", "status": "removed"},
+            {
+                "filename": "old-state",
+                "previous_filename": ".state",
+                "status": "renamed",
+            },
+            {
+                "filename": ".state",
+                "previous_filename": "old-state",
+                "status": "renamed",
+            },
+        ]
+        # GitHub's file list does not expose the Git mode. Protect this name
+        # regardless of whether the tree entry is a file or a symlink.
+        for record in records:
+            for area in ("state", "declarative"):
+                with self.subTest(record=record, area=area):
+                    result = changed_files.analyze([[record]], 1, area)
+                    self.assertTrue(result["complete"])
+                    self.assertTrue(result["matches"])
+                    self.assertEqual(result["matched_paths"], [".state"])
+
+    def test_state_scope_does_not_include_similarly_named_paths(self):
+        for path in (".state-backup", ".state.json", "docs/.state"):
+            for area in ("state", "declarative"):
+                with self.subTest(path=path, area=area):
+                    result = changed_files.analyze([[{"filename": path}]], 1, area)
+                    self.assertFalse(result["matches"])
+
+    def test_incomplete_state_and_validation_scope_fail_closed(self):
+        for area in ("state", "declarative"):
+            for path in (".state", "README.md"):
+                with self.subTest(area=area, path=path):
+                    result = changed_files.analyze([[{"filename": path}]], 2, area)
+                    self.assertFalse(result["complete"])
 
     def test_incomplete_pagination_is_explicit(self):
         result = changed_files.analyze([[{"filename": "README.md"}]], 2, "rust")

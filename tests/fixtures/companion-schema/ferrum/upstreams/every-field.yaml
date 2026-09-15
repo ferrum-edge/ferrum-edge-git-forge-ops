@@ -4,6 +4,8 @@
 # all four here is what makes this file cover every mirrored type.
 kind: Upstream
 spec:
+  labels:
+    team: platform
   id: every-field-upstream
   name: Every Field Upstream
   namespace: ferrum

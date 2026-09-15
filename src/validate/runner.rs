@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use crate::config::GatewayConfig;
+use crate::config::{collect_namespaces, GatewayConfig};
 use crate::secrets::SecretScrubber;
 
 /// Result of running `ferrum-edge validate`.
@@ -102,6 +102,48 @@ where
         .collect()
 }
 
+/// The validation-only identity opt-out gitforgeops sets *itself* on a
+/// validator child, and only under [`MESH_VALIDATE_MODE`].
+///
+/// ferrum-edge's `-m mesh` resolution runs the same identity gate a mesh node
+/// runs at startup: with no file-based gateway SVID material
+/// (`FERRUM_GATEWAY_SVID_CERT_PATH` / `_KEY_PATH` / `_TRUST_BUNDLE_PATH`) it
+/// refuses with *"mesh mode has no workload identity"* — before it ever looks
+/// at the document handed to `-c`. A CI runner grading a pull request has no
+/// mesh node's identity and must not be asked to have one, so a repository
+/// declaring any `MeshConfig` fragment would fail every `validate`, `plan`,
+/// `review` and file-mode `apply` on the execution context rather than on its
+/// own content.
+///
+/// `FERRUM_MESH_ALLOW_NO_CA=true` is ferrum-edge's own documented
+/// validation-only opt-out for exactly that: it relaxes the workload-identity
+/// requirement while leaving the mesh document's parse → normalize →
+/// `validate_mesh_fields` → slice-derivation pipeline untouched, so a
+/// malformed policy or schema is still rejected.
+pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
+
+/// The explicit, trusted validation-only context for a validator child in
+/// `mode`, applied **after** [`scrubbed_env_names`] has removed every
+/// inherited `FERRUM_*` variable.
+///
+/// This is an allow-list of constants, not a pass-through: the parent's own
+/// `FERRUM_MESH_ALLOW_NO_CA` is scrubbed like everything else and cannot
+/// influence the child either way. Gateway validation gets no constant
+/// identity overrides — `-m file` has no identity gate. Its `FERRUM_NAMESPACE`
+/// is set separately from the assembled document, never the parent's filter.
+///
+/// Nothing here reaches `apply`'s runtime settings: it is set on the
+/// `ferrum-edge validate` child process only, and the published mesh document
+/// is byte-for-byte unaffected. If an older or newer ferrum-edge rejects the
+/// variable, that refusal is the child's own stderr and is surfaced unchanged.
+pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
+    if mode == MESH_VALIDATE_MODE {
+        vec![(MESH_ALLOW_NO_CA_ENV, "true")]
+    } else {
+        Vec::new()
+    }
+}
+
 /// True when `path` names an existing regular file that is actually
 /// executable. `which` failing does not by itself mean the binary is missing
 /// (Windows, stripped-down containers), but a plain `Path::exists()` check
@@ -142,7 +184,11 @@ fn private_temp_file(
 
 /// Assemble a temporary YAML spec from `GatewayConfig`, shell out to
 /// `ferrum-edge validate -m file -s <empty settings> -c <spec>`, and return
-/// the validation result.
+/// the validation result. Every namespace present in the assembled gateway
+/// document gets an explicit child `FERRUM_NAMESPACE`, in lexical order.
+/// Edge filters before checking cross-resource references and uniqueness, so
+/// validating only its default `ferrum` slice would leave other slices unchecked.
+/// An empty document still gets one pass under an explicit `ferrum` context.
 ///
 /// The spec is written through `tempfile` (0600 on unix, unpredictable name,
 /// removed on drop along every path) because callers resolve credential
@@ -172,10 +218,63 @@ pub fn run_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config(config);
+    run_gateway_validation(config, binary_path, &scrubber, None)
+}
+
+/// Validate a resolved snapshot using both literal-secret classification and
+/// the corresponding resolver report as redaction and stand-in provenance.
+/// Resolved and unreported slots are validated verbatim, even if their actual
+/// values have placeholder syntax. Only reported unresolved slots get fakes.
+pub fn run_validation_with_report(
+    config: &GatewayConfig,
+    binary_path: &str,
+    report: &crate::secrets::ResolveReport,
+) -> crate::error::Result<ValidationResult> {
+    let scrubber = SecretScrubber::from_gateway_config_with_report(config, report);
+    run_gateway_validation(config, binary_path, &scrubber, Some(report))
+}
+
+fn run_gateway_validation(
+    config: &GatewayConfig,
+    binary_path: &str,
+    scrubber: &SecretScrubber,
+    report: Option<&crate::secrets::ResolveReport>,
+) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
-    let standins = crate::validate::standin::with_validation_standins(config);
+    let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
     let yaml = serde_yaml::to_string(standins.as_ref().unwrap_or(config))?;
-    run_validate_command(GATEWAY_VALIDATE_MODE, &yaml, binary_path, &scrubber)
+    let mut namespaces = collect_namespaces(config);
+    if namespaces.is_empty() {
+        // Empty documents still need schema/settings validation. This does
+        // not acknowledge a typoed parent filter: NamespaceScope owns that gate.
+        namespaces.push("ferrum".to_string());
+    }
+    let annotate_namespace = namespaces.len() > 1;
+    let mut combined = ValidationResult {
+        success: true,
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: 0,
+    };
+    for namespace in namespaces {
+        // Keep the full document: Edge owns both pre-filter field validation
+        // and post-filter graph validation. Never opt out of its empty filter gate.
+        let result = run_validate_command(
+            GATEWAY_VALIDATE_MODE,
+            &yaml,
+            binary_path,
+            scrubber,
+            Some(&namespace),
+            annotate_namespace,
+        )?;
+        if !result.success {
+            combined.success = false;
+            combined.exit_code = result.exit_code;
+        }
+        combined.stdout.push_str(&result.stdout);
+        combined.stderr.push_str(&result.stderr);
+    }
+    Ok(combined)
 }
 
 /// Validate the standalone mesh document with
@@ -190,6 +289,11 @@ pub fn run_validation(
 /// unpredictable name: mesh documents do carry SPIFFE identities, trust
 /// bundles and workload addresses, which is not information to leave in a
 /// world-readable shared temp directory either.
+///
+/// This is the one invocation that carries a [`validation_context_env`]
+/// entry: `-m mesh` refuses on the absence of a workload identity before it
+/// reads the document, and a CI runner is not a mesh node. See
+/// [`MESH_ALLOW_NO_CA_ENV`].
 pub fn run_mesh_validation(
     mesh: &crate::config::MeshConfigSpec,
     binary_path: &str,
@@ -204,6 +308,8 @@ pub fn run_mesh_validation(
         &yaml,
         binary_path,
         &SecretScrubber::default(),
+        None,
+        false,
     )
 }
 
@@ -221,6 +327,8 @@ fn run_validate_command(
     yaml: &str,
     binary_path: &str,
     scrubber: &SecretScrubber,
+    namespace: Option<&str>,
+    annotate_namespace: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
     let which_result = Command::new("which").arg(binary_path).output();
@@ -263,6 +371,15 @@ fn run_validate_command(
     for name in scrubbed_env_names(std::env::vars().map(|(name, _)| name)) {
         command.env_remove(name);
     }
+    // Order is load-bearing: every inherited `FERRUM_*` name is removed
+    // first, then this mode's own validation-only context is set, so the
+    // child sees only our constants and document-derived namespace.
+    for (name, value) in validation_context_env(mode) {
+        command.env(name, value);
+    }
+    if let Some(namespace) = namespace {
+        command.env("FERRUM_NAMESPACE", namespace);
+    }
 
     let output = command.output();
 
@@ -278,10 +395,18 @@ fn run_validate_command(
     // matched reliably in re-encoded output, a value that survived verbatim,
     // or a surviving fragment of one all withhold both streams and say which
     // it was. Everything else comes back scrubbed and readable.
-    let scrubbed = scrubber.scrub_streams(
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Label every diagnostic line in a multi-namespace run so text, JSON and
+    // GitHub annotations retain its context. Label before scrubbing: even a
+    // namespace can coincide with a credential. Single-pass output is unchanged.
+    let scrubbed = match namespace.filter(|_| annotate_namespace) {
+        Some(namespace) => scrubber.scrub_streams(
+            &namespace_output(namespace, &stdout),
+            &namespace_output(namespace, &stderr),
+        ),
+        None => scrubber.scrub_streams(&stdout, &stderr),
+    };
     let stdout = scrubbed.stdout;
     let stderr = scrubbed.stderr;
 
@@ -302,6 +427,15 @@ fn run_validate_command(
         stderr,
         exit_code,
     })
+}
+
+fn namespace_output(namespace: &str, output: &str) -> String {
+    let mut labeled = String::new();
+    for line in output.lines() {
+        // Debug quoting keeps hostile newlines in a namespace on one line.
+        labeled.push_str(&format!("[namespace {namespace:?}] {line}\n"));
+    }
+    labeled
 }
 
 fn bounded_process_diagnostic(diagnostic: &str) -> String {

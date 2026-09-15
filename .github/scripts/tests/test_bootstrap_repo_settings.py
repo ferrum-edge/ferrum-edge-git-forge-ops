@@ -267,6 +267,41 @@ class IdempotencyTests(unittest.TestCase):
         self.assertEqual(api.writes, [])
         self.assertEqual([step.details for step in plan.steps if step.details], [])
 
+    def test_existing_approval_requirements_are_removed_without_changing_ci(self):
+        responses = configured_responses()
+        main = responses[f"repos/{REPO}/rulesets/7"]
+        review = next(rule for rule in main["rules"] if rule["type"] == "pull_request")
+        review["parameters"].update(
+            required_approving_review_count=1,
+            require_code_owner_review=True,
+            require_last_push_approval=True,
+            require_extra_approval_for_unattributed_changes=True,
+        )
+        api = FakeApi(responses)
+        plan = bootstrap.build_plan(api, namespace())
+        changed = [step for step in plan.steps if step.action != bootstrap.UNCHANGED]
+        self.assertEqual([step.target for step in changed], ["main ruleset"])
+        self.assertEqual(changed[0].action, bootstrap.UPDATE)
+        body = changed[0].writes[0][2]
+        rules = {rule["type"]: rule for rule in body["rules"]}
+        self.assertEqual(
+            rules["pull_request"]["parameters"]["required_approving_review_count"], 0
+        )
+        for field in (
+            "require_code_owner_review",
+            "require_last_push_approval",
+            "require_extra_approval_for_unattributed_changes",
+        ):
+            self.assertFalse(rules["pull_request"]["parameters"][field])
+        original_checks = next(
+            rule for rule in main["rules"] if rule["type"] == "required_status_checks"
+        )
+        self.assertEqual(rules["required_status_checks"], original_checks)
+        self.assertTrue(
+            rules["pull_request"]["parameters"]["required_review_thread_resolution"]
+        )
+        self.assertEqual(api.writes, [])
+
     def test_an_unconfigured_repository_creates_or_updates_every_control(self):
         api = FakeApi({f"repos/{REPO}": {}, f"repos/{REPO}/rulesets?per_page=100": [[]]})
         plan = bootstrap.build_plan(api, namespace())

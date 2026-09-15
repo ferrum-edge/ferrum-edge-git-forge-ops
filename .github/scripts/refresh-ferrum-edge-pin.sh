@@ -7,7 +7,7 @@ set -euo pipefail
 # This is the only supported way to refresh .github/ferrum-edge-checksums.txt.
 # It resolves the asset by exact NAME, downloads it together with the
 # publisher's checksum file, and refuses to emit a line unless the two agree.
-# Appending still goes through CODEOWNER review: the allowlist is an owned path.
+# Appending still goes through exact-head root review and hosted CI.
 #
 # Usage: refresh-ferrum-edge-pin.sh [--append] [--allowlist PATH]
 
@@ -140,5 +140,5 @@ if [ "$append" = true ]; then
     exit 0
   fi
   printf '%s\n' "$record" >>"$allowlist"
-  echo "Appended the digest to $allowlist; commit it through CODEOWNER review." >&2
+  echo "Appended the digest to $allowlist; commit it through exact-head root review." >&2
 fi

@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-use super::schema::{BackendScheme, GatewayConfig, MeshConfigSpec, Resource};
+use super::schema::{
+    BackendScheme, GatewayConfig, MeshConfigSpec, PluginAssociation, PluginScope, Resource,
+};
 use super::strict::{self, LoadOptions};
 
 /// Everything one load+assemble pass produces.
@@ -23,6 +25,32 @@ pub struct AssembledOutput {
     /// `None` when the repo declares no `MeshConfig` resources at all — the
     /// signal that no mesh document should be written or validated.
     pub mesh: Option<MeshConfigSpec>,
+    /// Directory namespace and diagnostic label of each selected mesh fragment.
+    /// Retained across merging; namespaces inside mesh entries are not scope.
+    pub mesh_sources: Vec<(String, String)>,
+    /// Filter diagnosis populated by the CLI load boundary. Assembly itself
+    /// leaves this at [`Default`]; `load_and_assemble_all` fills it after
+    /// overlays and namespace selection.
+    pub namespace_scope: super::namespace_guard::NamespaceScope,
+}
+
+impl AssembledOutput {
+    /// Enforce exclusive ownership on the fragments that survived filtering.
+    pub fn validate_mesh_scope(&self, env: &str, owned: &[String]) -> crate::error::Result<()> {
+        let violations: Vec<String> = self
+            .mesh_sources
+            .iter()
+            .filter(|(namespace, _)| !owned.contains(namespace))
+            .map(|(namespace, label)| format!("MeshConfig {label} in namespace '{namespace}'"))
+            .collect();
+        if !violations.is_empty() {
+            return Err(crate::error::Error::Config(format!(
+                "exclusive env '{env}' declares ownership.namespaces={owned:?}, but desired mesh fragments include namespaces outside that list:\n  {}\nEither add the namespace to ownership.namespaces, move the fragment to an owned namespace, or switch ownership.mode to 'shared'.",
+                violations.join("\n  ")
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Assemble loaded resources into a `GatewayConfig` plus an optional merged
@@ -32,8 +60,9 @@ pub struct AssembledOutput {
 /// namespace, unless the spec already has a non-default namespace explicitly
 /// set, then canonicalizes consumer credentials via
 /// [`normalize_consumer_credentials`] and proxy backend schemes via
-/// [`normalize_proxy_backend_schemes`]. Mesh fragments are merged by
-/// [`merge_mesh_fragments`].
+/// [`normalize_proxy_backend_schemes`], then derives proxy-scoped plugin
+/// associations via [`normalize_proxy_plugin_associations`]. Mesh fragments
+/// are merged by [`merge_mesh_fragments`].
 pub fn assemble(resources: Vec<(String, Resource)>) -> crate::error::Result<AssembledOutput> {
     assemble_with_namespace_filter(resources, None)
 }
@@ -52,6 +81,7 @@ pub fn assemble_with_namespace_filter(
 ) -> crate::error::Result<AssembledOutput> {
     let mut config = GatewayConfig::default();
     let mut mesh_fragments: Vec<(String, MeshConfigSpec)> = Vec::new();
+    let mut mesh_sources = Vec::new();
 
     for (namespace, resource) in resources {
         match resource {
@@ -59,24 +89,36 @@ pub fn assemble_with_namespace_filter(
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.proxies.push(spec);
             }
             Resource::Consumer { mut spec } => {
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.consumers.push(spec);
             }
             Resource::Upstream { mut spec } => {
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.upstreams.push(spec);
             }
             Resource::PluginConfig { mut spec } => {
                 if spec.namespace == "ferrum" {
                     spec.namespace = namespace;
                 }
+                spec.labels
+                    .entry("provisioned-by".to_string())
+                    .or_insert_with(|| "ferrum-edge-git-forge-ops".to_string());
                 config.plugin_configs.push(spec);
             }
             Resource::MeshConfig { id, spec } => {
@@ -89,6 +131,7 @@ pub fn assemble_with_namespace_filter(
                     Some(id) if !id.trim().is_empty() => format!("{namespace}/mesh/{id}"),
                     _ => format!("{namespace}/mesh"),
                 };
+                mesh_sources.push((namespace, label.clone()));
                 mesh_fragments.push((label, spec));
             }
         }
@@ -96,11 +139,57 @@ pub fn assemble_with_namespace_filter(
 
     normalize_consumer_credentials(&mut config);
     normalize_proxy_backend_schemes(&mut config);
+    normalize_proxy_plugin_associations(&mut config);
 
     Ok(AssembledOutput {
         gateway: config,
         mesh: merge_mesh_fragments(mesh_fragments)?,
+        mesh_sources,
+        namespace_scope: super::namespace_guard::NamespaceScope::default(),
     })
+}
+
+/// Derive the associations ferrum-edge stores when a proxy-scoped plugin is
+/// written. Run after overlays and namespace inference, before comparison,
+/// security/policy analysis, export or apply, so they all see the same graph.
+///
+/// Keep explicit associations in their authored order (first occurrence wins)
+/// and append missing derived IDs in lexical order, independent of resource
+/// load order. Disabled configs still have stored associations; whether they
+/// execute is decided by `plugin_catalog::effective_plugins`.
+///
+/// Only a `scope: proxy` config in the proxy's effective namespace contributes
+/// an association. Global and proxy-group configs are never auto-attached.
+/// Explicit invalid references are retained for validation/security findings,
+/// not silently repaired. Repeating normalization is a no-op.
+pub fn normalize_proxy_plugin_associations(config: &mut GatewayConfig) {
+    let mut scoped: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
+    for plugin in &config.plugin_configs {
+        if plugin.scope == PluginScope::Proxy {
+            if let Some(proxy_id) = plugin.proxy_id.as_deref() {
+                scoped
+                    .entry((plugin.namespace.as_str(), proxy_id))
+                    .or_default()
+                    .insert(plugin.id.as_str());
+            }
+        }
+    }
+
+    for proxy in &mut config.proxies {
+        let mut seen = HashSet::new();
+        proxy
+            .plugins
+            .retain(|association| seen.insert(association.plugin_config_id.clone()));
+        if let Some(plugin_ids) = scoped.get(&(proxy.namespace.as_str(), proxy.id.as_str())) {
+            for plugin_id in plugin_ids {
+                if seen.insert((*plugin_id).to_string()) {
+                    proxy.plugins.push(PluginAssociation {
+                        plugin_config_id: (*plugin_id).to_string(),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Fold every `MeshConfig` fragment into the single document a mesh node
@@ -384,11 +473,12 @@ fn merge_mesh_singleton<T: PartialEq + std::fmt::Debug>(
 /// # Round-trip hazard
 ///
 /// Omitting `keyauth`, `jwt`, `hmac_auth` or `mtls_auth` from a consumer
-/// **deletes** those entries on the gateway; omitting `basicauth` or an
-/// unrecognized type **preserves** what is already stored. Normalization does
-/// not change which keys are present, so it cannot itself delete anything —
-/// but it is worth knowing that an empty array (`keyauth: []`) is the
-/// explicit "remove these" spelling, not a no-op.
+/// **deletes** those entries on the gateway; omitting `basicauth`
+/// **preserves** what is already stored. Unknown map keys are refused by
+/// validate/plan/broker before apply. Normalization does not change which
+/// keys are present, so it cannot itself delete anything — but it is worth
+/// knowing that an empty array (`keyauth: []`) is the explicit "remove
+/// these" spelling, not a no-op.
 pub fn normalize_consumer_credentials(config: &mut GatewayConfig) {
     for consumer in config.consumers.iter_mut() {
         for value in consumer.credentials.values_mut() {

@@ -72,6 +72,20 @@ gateway mutation. A protected `main` branch correctly rejects a direct push by
 `github-actions[bot]`, so the workflows mint a short-lived installation token
 for a dedicated App instead.
 
+The required `state-guard-reject-state-edits` check protects both the exact
+Git path `.state` and every descendant, including current and previous rename
+paths regardless of file type. A repair requires a fresh
+`gitforgeops/state-override` label event for the current head by an actor with
+current write, maintain, or admin permission. Incomplete file enumeration also
+requires that authorization. Keep both `/.state` and `/.state/` in CODEOWNERS;
+the trusted static-validation classifier must include both scopes as well.
+
+The runtime independently requires `.state` to be a real directory and state
+and lock entries to be regular files. Symlinks and intermediate environment
+paths are refused even after a state override. Missing state still supports
+first apply. Use an isolated trusted checkout: the metadata checks do not
+prevent a concurrent local process from replacing checked entries during use.
+
 Create and install a GitHub App with:
 
 - repository access limited to this repository;
@@ -107,9 +121,10 @@ same broad authority as a human account and the settings audit rejects it.
 Create one active branch ruleset targeting exactly the default branch, with no
 additional include or exclusion patterns. It must:
 
-- require pull requests and at least one approval;
-- require Code Owner review (`.github/CODEOWNERS` owns workflows, state,
-  reconciliation, credential code, Cargo metadata, and container inputs);
+- require pull requests, with zero required approval submissions and no Code
+  Owner, last-push, or unattributed-change approval requirement;
+- require the root orchestrator to review every changed file at the exact head
+  being merged and verify the issue, cross-repository contracts, and hosted CI;
 - require all review conversations to be resolved;
 - dismiss stale approvals when reviewable commits are pushed;
 - require branches to be tested against the latest `main` commit;
@@ -128,15 +143,16 @@ additional include or exclusion patterns. It must:
   configured as an always-on bypass. Pull-request-only human/team bypasses are
   not permitted.
 
-A solo maintainer hits an obstacle here: the ruleset requires an approving
-review and there is nobody to give one. The workaround is a second bypass actor
-— the **Repository Admin** role in `pull_request` mode — merging with
-`gh pr merge --admin`. That is what `bootstrap_repo_settings.py` configures when
-`--state-writer-app-id` is omitted, and the audit reports it as a violation
-("must have exactly one bypass actor in any mode"). It is a deliberate, visible
-deviation rather than a supported configuration, and it does not remove the need
-for the App: `apply-on-merge.yml` and `rotate.yml` fail their preflight without
-`GITFORGEOPS_STATE_APP_ID` and `GITFORGEOPS_STATE_APP_PRIVATE_KEY`.
+The root orchestrator may merge a correct PR after exact-head review, passing
+hosted CI, and resolution of every actionable review thread. A separate GitHub
+approval submission from the maintainer or a Code Owner is not required.
+`.github/CODEOWNERS` records ownership for review routing; it is not an approval
+gate. The bootstrap and settings audit preserve this policy so a later settings
+refresh does not reinstate the approval requirement. Use the ordinary protected
+merge path; no administrator bypass is needed to satisfy review requirements.
+The state-writer App is still required for state commits: `apply-on-merge.yml`
+and `rotate.yml` fail their preflight without `GITFORGEOPS_STATE_APP_ID` and
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY`.
 
 Protect release tags (`v*`) with a tag ruleset that carries the `creation`,
 `update`, and `deletion` rules, and that names **at least one** bypass actor —
@@ -146,7 +162,8 @@ the `creation` rule and no bypass actor at all, nobody can push a `v*` tag and
 the tag half of `release.yml` can never fire, so `audit_settings.py` treats an
 empty bypass list as a misconfiguration rather than as maximum strictness.
 
-The release workflow also checks that a tag commit is reachable from `main`;
+The release workflow also checks that a tag commit is reachable from the
+protected default branch;
 tag protection ensures a branch-controlled workflow cannot remove that check
 before secrets are used.
 
@@ -394,7 +411,7 @@ To refresh, review the upstream build and run:
 bash .github/scripts/refresh-ferrum-edge-pin.sh --append
 ```
 
-Commit the new line through normal CODEOWNER review and **keep the previous
+Commit the new line through exact-head root review and **keep the previous
 line**: pull requests already running the older binary stay green, and the
 installer accepts any allowlisted digest.
 
@@ -412,7 +429,10 @@ After merging the workflow changes and configuring the controls:
    requires environment approval, prints the trusted source SHA and target
    namespace, intersects each environment's protected ownership/filter scope,
    uses protected-branch environment/policy files, and posts the live
-   comparison with `FERRUM_NAMESPACE` set. Make the gateway unreachable and
+   comparison with `FERRUM_NAMESPACE` set. A mistyped namespace filter now
+   fails `validate` / `plan` / `diff` closed (exit 1) instead of succeeding
+   against an empty desired set; the bundled workflows set the filter to a
+   protected-branch resource namespace. Make the gateway unreachable and
    confirm the trusted job fails rather than posting a successful skipped
    comparison.
 3. Open a fork PR. It must receive static validation only; the trusted prepare

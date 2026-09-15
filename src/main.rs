@@ -11,6 +11,7 @@ use gitforgeops::config::{
     self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
     ResolvedEnv,
 };
+use gitforgeops::diagnostics::{safe, safe_block, safe_line};
 use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
@@ -22,6 +23,20 @@ use gitforgeops::state::StateFile;
 use gitforgeops::validate;
 use gitforgeops::verdict::{self, ApplyGateInputs};
 
+// Keep human-readable reports on stderr when stdout carries a JSON document.
+macro_rules! reportln {
+    ($json_mode:expr) => {
+        reportln!($json_mode, "");
+    };
+    ($json_mode:expr, $($args:tt)*) => {
+        if $json_mode {
+            eprintln!($($args)*);
+        } else {
+            println!($($args)*);
+        }
+    };
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = cli::Cli::parse();
@@ -29,14 +44,17 @@ async fn main() {
     // `--allow-credential-slot-remap` downgrades the credential-slot-remap
     // refusal to a report. The reporting commands (`diff`, `plan`, `review`)
     // always resolve in reporting mode so they can render the hazard
-    // themselves; `plan` then supplies its own non-zero exit.
+    // themselves; `plan` then supplies its own non-zero exit. `review`
+    // stays exit 0 unless `--fail-on-blockers` (or the matching env) is set.
     let resolve_options =
         secrets::ResolveOptions::allowing_slot_remap(cli.allow_credential_slot_remap);
 
     let result = match cli.command {
-        cli::Commands::Validate { format } => {
-            cmd_validate(validate_format(format), explicit_env.as_deref())
-        }
+        cli::Commands::Validate { format } => cmd_validate(
+            validate_format(format),
+            explicit_env.as_deref(),
+            cli.allow_empty_namespace,
+        ),
         cli::Commands::Export {
             output,
             materialize,
@@ -51,21 +69,38 @@ async fn main() {
             )
             .await
         }
-        cli::Commands::Diff { exit_on_drift } => {
-            cmd_diff(exit_on_drift, explicit_env.as_deref()).await
+        cli::Commands::Diff {
+            exit_on_drift,
+            format,
+        } => {
+            cmd_diff(
+                exit_on_drift,
+                format,
+                explicit_env.as_deref(),
+                cli.allow_empty_namespace,
+            )
+            .await
         }
-        cli::Commands::Plan {} => {
-            cmd_plan(explicit_env.as_deref(), cli.allow_credential_slot_remap).await
+        cli::Commands::Plan { format } => {
+            cmd_plan(
+                explicit_env.as_deref(),
+                cli.allow_credential_slot_remap,
+                cli.allow_empty_namespace,
+                format,
+            )
+            .await
         }
         cli::Commands::Apply {
             auto_approve,
             allow_large_prune,
             confirm_api_spec_deletion,
+            allow_nontransactional_plugin_attach,
         } => {
             cmd_apply(
                 auto_approve,
                 allow_large_prune,
                 confirm_api_spec_deletion,
+                allow_nontransactional_plugin_attach,
                 explicit_env.as_deref(),
                 resolve_options,
             )
@@ -90,13 +125,25 @@ async fn main() {
             )
             .await
         }
-        cli::Commands::Review { pr, require_live } => {
-            cmd_review(pr, require_live, explicit_env.as_deref()).await
+        cli::Commands::Review {
+            pr,
+            require_live,
+            fail_on_blockers,
+        } => {
+            cmd_review(
+                pr,
+                require_live,
+                fail_on_blockers,
+                cli.allow_credential_slot_remap,
+                explicit_env.as_deref(),
+            )
+            .await
         }
         cli::Commands::Envs {
             format,
             include_scopes,
         } => cmd_envs(format, include_scopes),
+        cli::Commands::Version { format } => cmd_version(format),
         cli::Commands::Rotate {
             consumer,
             credential,
@@ -116,7 +163,10 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        // Last line of defense for anything a printer below did not
+        // already sanitize: an error Display can carry a resource id, a
+        // YAML path or a gateway response body.
+        eprintln!("Error: {}", safe_block(&e));
         process::exit(1);
     }
 }
@@ -157,7 +207,7 @@ fn resolve_runtime(
 /// optional standalone mesh document.
 ///
 /// Most commands only care about the gateway half and take `.gateway`;
-/// `validate`, `plan`, `export` and file-mode `apply` also act on `.mesh`.
+/// `validate`, `plan`, `review`, `export` and file-mode `apply` also act on `.mesh`.
 fn load_and_assemble_all(
     resolved: &ResolvedEnv,
     env_config: &EnvConfig,
@@ -181,30 +231,145 @@ fn load_and_assemble_all(
     // mesh fragment's directory is its only namespace handle) and to gateway
     // resources afterwards, on their effective namespace (which a spec may
     // override).
+    let (on_disk_count, on_disk_namespaces) = config::NamespaceScope::on_disk_inventory(&resources);
     let assembled =
         config::assemble_with_namespace_filter(resources, resolved.namespace_filter.as_deref())?;
     let gateway_config =
         config::select_config_namespace(&assembled.gateway, resolved.namespace_filter.as_deref());
+    let namespace_scope = config::NamespaceScope::with_desired(
+        resolved.namespace_filter.as_deref(),
+        on_disk_namespaces,
+        on_disk_count,
+        &gateway_config,
+        assembled.mesh_sources.len(),
+    );
+    // Scope is checked once both kinds of namespace filtering have run, before
+    // callers can resolve credentials, validate, contact a gateway or publish.
+    enforce_exclusive_scope(resolved, &gateway_config)?;
+    if matches!(resolved.ownership.mode, OwnershipMode::Exclusive) {
+        assembled.validate_mesh_scope(
+            &resolved.name,
+            resolved.ownership.namespaces.as_deref().unwrap_or(&[]),
+        )?;
+    }
     config::validate_unique_resource_keys(&gateway_config)?;
     // `api_spec_id` is generated by the gateway's API-spec importer. Reject a
     // repository-authored tag at the shared load boundary so validate, plan,
     // diff, review, export and file-mode apply fail on the originating PR,
     // instead of waiting for post-merge API apply to discover it.
     apply::validate_no_desired_spec_tags(&gateway_config)?;
+    secrets::resolver::validate_identity_placeholders(&gateway_config)?;
     Ok(config::AssembledOutput {
         gateway: gateway_config,
         mesh: assembled.mesh,
+        mesh_sources: assembled.mesh_sources,
+        namespace_scope,
     })
 }
 
 /// [`load_and_assemble_all`] for the commands that only reconcile gateway
-/// resources. Mesh config has no live admin API, so `diff`, `review` and
-/// `rotate` have nothing to do with it.
+/// resources. Mesh config has no live admin API, so `diff` and `rotate`
+/// have nothing to do with it. Review still validates the mesh document.
 fn load_and_assemble_for(
     resolved: &ResolvedEnv,
     env_config: &EnvConfig,
 ) -> Result<GatewayConfig, Box<dyn std::error::Error>> {
     Ok(load_and_assemble_all(resolved, env_config)?.gateway)
+}
+
+fn print_namespace_finding(finding: &config::NamespaceFilterFinding) {
+    let stream = if finding.is_error() {
+        "Error"
+    } else {
+        "Warning"
+    };
+    eprintln!("{stream}: {}", safe_block(&finding.message));
+}
+
+fn print_live_filter_warning(message: &str) {
+    eprintln!("Warning: {}", safe_block(message));
+}
+
+fn attach_validate_scope(
+    formatted: String,
+    output_format: validate::OutputFormat,
+    scope: &config::NamespaceScope,
+    finding: Option<&config::NamespaceFilterFinding>,
+    live_warning: Option<&str>,
+) -> String {
+    match output_format {
+        validate::OutputFormat::Json => config::merge_scope_json(&formatted, scope, finding),
+        validate::OutputFormat::Text => {
+            let mut output = format!("{}\n", scope.text_line());
+            if let Some(finding) = finding {
+                output.push_str(&format!(
+                    "[{}] {}\n",
+                    finding.severity_label(),
+                    finding.message
+                ));
+            }
+            if let Some(warning) = live_warning {
+                output.push_str(&format!("Warning: {warning}\n"));
+            }
+            output.push_str(&formatted);
+            output
+        }
+        validate::OutputFormat::GithubAnnotations => {
+            let mut output = formatted;
+            if let Some(finding) = finding {
+                output.push_str(&validate::workflow_annotation(
+                    finding.severity_label(),
+                    &finding.message,
+                ));
+            }
+            if let Some(warning) = live_warning {
+                output.push_str(&validate::workflow_annotation("warning", warning));
+            }
+            output
+        }
+    }
+}
+
+fn print_or_collect_scope_json(
+    json_mode: bool,
+    scope: &config::NamespaceScope,
+    finding: Option<&config::NamespaceFilterFinding>,
+    extra: serde_json::Value,
+) {
+    if !json_mode {
+        println!("{}", scope.text_line());
+        return;
+    }
+    let mut document = scope.json_fields();
+    if let Some(object) = document.as_object_mut() {
+        match finding {
+            Some(finding) => {
+                object.insert(
+                    "empty_namespace_filter".to_string(),
+                    serde_json::Value::String(finding.severity_label().to_string()),
+                );
+                object.insert(
+                    "empty_namespace_filter_message".to_string(),
+                    serde_json::Value::String(finding.message.clone()),
+                );
+            }
+            None => {
+                object.insert(
+                    "empty_namespace_filter".to_string(),
+                    serde_json::Value::Null,
+                );
+            }
+        }
+        if let Some(fields) = extra.as_object() {
+            for (key, value) in fields {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_string())
+    );
 }
 
 fn load_credential_bundles(
@@ -253,9 +418,10 @@ fn load_credential_bundles(
 /// would replace a diff, a plan or a PR comment with one error line, and the
 /// hazard would be the only thing the reviewer could not see in context. Each
 /// caller decides what the report means — `plan` exits non-zero, `review`
-/// renders it as blocking, `diff` keeps reporting drift. The refusal itself
-/// belongs to the mutating paths (`apply`, `export --materialize`, `rotate`),
-/// which resolve with the operator's own [`secrets::ResolveOptions`].
+/// renders it as blocking (and `--fail-on-blockers` then exits non-zero),
+/// `diff` keeps reporting drift. The refusal itself belongs to the mutating
+/// paths (`apply`, `export --materialize`, `rotate`), which resolve with the
+/// operator's own [`secrets::ResolveOptions`].
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
@@ -270,11 +436,9 @@ fn resolve_credentials(
 
 /// Is a credential bundle available to this invocation?
 ///
-/// Without one, every broker-controlled leaf stays a placeholder string while
-/// the live gateway returns either the real value or `[REDACTED]`, so a naive
-/// comparison reports permanent false drift on credentials nobody changed.
-/// `diff::mask_indeterminate_secret_values` neutralizes exactly those leaves;
-/// this predicate decides when to apply it.
+/// Used only to describe the review's allocation-status context. Bundle
+/// presence does not determine whether individual leaves resolved and must
+/// never gate live-comparison masking.
 fn credential_bundle_loaded(env_config: &EnvConfig) -> bool {
     let has_content = |value: Option<&str>| value.is_some_and(|raw| !raw.trim().is_empty());
     has_content(env_config.creds_bundle_json_file.as_deref())
@@ -514,7 +678,7 @@ async fn surface_delivered_credentials(
         eprintln!(
             "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
             undelivered.len(),
-            undelivered.join(", ")
+            safe(undelivered.join(", "))
         );
     }
     Ok(())
@@ -533,14 +697,24 @@ async fn allocate_if_needed(
         return Ok(None);
     }
 
+    if let Some(blocker) = verdict::credential_provisioning_blockers(
+        report,
+        env_config.github_provisioner_token.is_some(),
+        env_config.github_repository.is_some(),
+    )
+    .first()
+    {
+        return Err(blocker.kind.remedy().into());
+    }
+
     let token = env_config
         .github_provisioner_token
         .as_deref()
-        .ok_or("FERRUM_GH_PROVISIONER_TOKEN not set; cannot allocate credential slots")?;
+        .ok_or(verdict::BlockerKind::ProvisionerToken.remedy())?;
     let repo = env_config
         .github_repository
         .as_deref()
-        .ok_or("GITHUB_REPOSITORY not set; cannot write to GitHub Environment Secrets")?;
+        .ok_or(verdict::BlockerKind::ProvisioningRepository.remedy())?;
 
     let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
 
@@ -613,11 +787,16 @@ async fn load_namespace_pairs_for(
     client: &AdminClient,
     desired: &GatewayConfig,
     namespaces: &[String],
+    mutation_safe: bool,
 ) -> gitforgeops::error::Result<Vec<NamespaceSnapshot>> {
     let mut pairs = Vec::new();
     for namespace in namespaces {
         let desired_namespace = config::filter_config_by_namespace(desired, namespace);
-        let snapshot = client.get_backup_snapshot(namespace).await?;
+        let snapshot = if mutation_safe {
+            client.get_backup_snapshot_for_mutation(namespace).await?
+        } else {
+            client.get_backup_snapshot(namespace).await?
+        };
         pairs.push(NamespaceSnapshot {
             namespace: namespace.clone(),
             desired: desired_namespace,
@@ -646,6 +825,36 @@ fn adoption_handled_keys(
         .map(|d| diff::resource_diff::state_key(&d.namespace, &d.kind, &d.id))
         .chain(state.pending_creates.iter().cloned())
         .collect()
+}
+
+/// Compute ownership work from the unmasked snapshot. Masking unresolved secrets
+/// is appropriate for drift display, but cannot establish equality for adoption.
+fn ownership_preview(
+    pairs: &[NamespaceSnapshot],
+    state: &StateFile,
+    strategy: &config::ApplyStrategy,
+) -> (Vec<diff::ResourceDiff>, Vec<apply::AdoptionCandidate>) {
+    if !matches!(strategy, config::ApplyStrategy::Incremental) {
+        return (Vec::new(), Vec::new());
+    }
+    let mut pending = Vec::new();
+    for pair in pairs {
+        pending.extend(apply::pending_create_assertion_diffs(
+            &pair.desired,
+            &pair.actual,
+            &state.pending_creates,
+            &pair.namespace,
+        ));
+    }
+    let (mut diffs, _, _, _) = compute_namespace_diffs(pairs, None, diff::DiffOptions::default());
+    diffs.extend(pending.iter().cloned());
+    let handled = adoption_handled_keys(&diffs, state);
+    let ledger = ledger_keys(state);
+    let adoptions = pairs
+        .iter()
+        .flat_map(|pair| apply::adoption_candidates(&pair.desired, &pair.actual, &ledger, &handled))
+        .collect();
+    (pending, adoptions)
 }
 
 fn cached_namespace_names(namespace_pairs: &[NamespaceSnapshot]) -> Vec<String> {
@@ -710,28 +919,34 @@ fn spec_owned_blocks_sync(spec_owned: &[diff::SpecOwnedResource]) -> bool {
     spec_owned.iter().any(|s| s.is_conflict())
 }
 
-/// Render the spec-owned bucket for `diff` / `plan` stdout.
+/// Render the spec-owned bucket for text-mode previews on stdout.
 ///
 /// Mirrors the unmanaged block: a header, then one line per resource. Unlike
 /// unmanaged, it is NOT gated on `ownership.drift_report` — a repo declaring a
 /// resource an API spec owns is a correctness problem in both ownership modes,
 /// not drift noise an operator may want muted.
 fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
+    print_spec_owned_report(spec_owned, false);
+}
+
+fn print_spec_owned_report(spec_owned: &[diff::SpecOwnedResource], json_mode: bool) {
     if spec_owned.is_empty() {
         return;
     }
-    println!("=== Spec-owned Resources ===");
+    reportln!(json_mode, "=== Spec-owned Resources ===");
     // With `--confirm-api-spec-deletion` these are not "never touched" — the
     // run is about to delete the non-conflicting ones, and they appear as
     // DELETE entries in the change list above. Saying otherwise while deleting
     // them is the worst of both.
     if spec_owned.iter().any(|s| s.pruned) {
-        println!(
+        reportln!(
+            json_mode,
             "(carry an `api_spec_id`; --confirm-api-spec-deletion is set, so the ones marked \
              DELETE below WILL be deleted by this run)"
         );
     } else {
-        println!(
+        reportln!(
+            json_mode,
             "(carry an `api_spec_id`; provisioned by an OpenAPI spec import, never touched here)"
         );
     }
@@ -743,12 +958,17 @@ fn print_spec_owned(spec_owned: &[diff::SpecOwnedResource]) {
         } else {
             ""
         };
-        println!(
+        reportln!(
+            json_mode,
             "  {} {} ({}) spec={}{}",
-            s.kind, s.id, s.namespace, s.api_spec_id, note
+            safe(&s.kind),
+            safe(&s.id),
+            safe(&s.namespace),
+            safe(&s.api_spec_id),
+            note
         );
     }
-    println!();
+    reportln!(json_mode);
 }
 
 /// Reserved rule id recorded in the state file's override ledger when a
@@ -773,7 +993,11 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
     for finding in &blockers {
         eprintln!(
             "  [{}] {} {} ({}): {}",
-            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+            safe(&finding.severity),
+            safe(&finding.kind),
+            safe(&finding.id),
+            safe(&finding.namespace),
+            safe_line(&finding.message)
         );
     }
     for finding in findings
@@ -782,7 +1006,11 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
     {
         eprintln!(
             "  [{}] {} {} ({}): {}",
-            finding.severity, finding.kind, finding.id, finding.namespace, finding.message
+            safe(&finding.severity),
+            safe(&finding.kind),
+            safe(&finding.id),
+            safe(&finding.namespace),
+            safe_line(&finding.message)
         );
     }
     eprintln!();
@@ -829,6 +1057,60 @@ fn mesh_summary_line(mesh: &config::MeshConfigSpec) -> String {
     }
 }
 
+/// What a mesh reconciliation in this run is allowed to conclude from "the
+/// assembler produced no mesh document".
+///
+/// Two independent facts, both required before a retraction may rewrite the
+/// destination: the ledger has to attribute the path to this repository, and
+/// the run has to have seen every fragment the repository declares.
+/// `FERRUM_NAMESPACE` narrows which fragments the assembler loads at all, and
+/// the published document is mesh-wide, so a filtered run selecting nothing is
+/// not evidence that nothing is declared.
+fn mesh_retraction_scope(
+    resolved: &ResolvedEnv,
+    state: &StateFile,
+    output_path: &str,
+) -> apply::MeshRetractionScope {
+    apply::MeshRetractionScope {
+        ledger_attributed: state.publishes_mesh_document(output_path),
+        covers_repository: resolved.namespace_filter.is_none(),
+    }
+}
+
+/// Operator-facing line for a mesh reconciliation that publishes no declared
+/// document. `None` when there is nothing worth saying (a document was
+/// published, or nothing was ever published here).
+///
+/// `preview` renders the same outcome in the future tense, so `plan` and the
+/// `apply` it previews describe one event rather than two.
+fn mesh_retraction_line(
+    publication: apply::MeshPublication,
+    output_path: &str,
+    preview: bool,
+) -> Option<String> {
+    match publication {
+        apply::MeshPublication::Published | apply::MeshPublication::NeverPublished => None,
+        apply::MeshPublication::Retracted => Some(if preview {
+            format!(
+                "RETRACT mesh: {output_path} will be rewritten as an empty mesh document (the repository declares no MeshConfig fragments)"
+            )
+        } else {
+            format!(
+                "RETRACT mesh: rewrote {output_path} as an empty mesh document (the repository declares no MeshConfig fragments)"
+            )
+        }),
+        apply::MeshPublication::AlreadyRetracted => Some(format!(
+            "RETRACT mesh: {output_path} already holds the empty mesh document (the repository declares no MeshConfig fragments)"
+        )),
+        apply::MeshPublication::Unattributed => Some(format!(
+            "Warning: the repository declares no MeshConfig fragments, but {output_path} exists and is not a document gitforgeops published; leaving it untouched. Remove it by hand once no mesh node reads it."
+        )),
+        apply::MeshPublication::NarrowedScope => Some(format!(
+            "Notice: no MeshConfig fragment is in scope for this namespace-filtered run, so {output_path} is left as published. Re-run without FERRUM_NAMESPACE to retract a mesh document the repository no longer declares."
+        )),
+    }
+}
+
 /// Print one document's plan-time validation verdict and return whether it
 /// counts as passing.
 ///
@@ -838,19 +1120,24 @@ fn mesh_summary_line(mesh: &config::MeshConfigSpec) -> String {
 fn report_plan_validation(
     label: &str,
     result: &Result<validate::ValidationResult, gitforgeops::error::Error>,
+    json_mode: bool,
 ) -> bool {
     match result {
         Ok(r) => {
             if r.success {
-                println!("{label}: PASSED");
+                reportln!(json_mode, "{label}: PASSED");
             } else {
-                println!("{label}: FAILED");
-                print!("{}", r.stderr);
+                reportln!(json_mode, "{label}: FAILED");
+                if json_mode {
+                    eprint!("{}", safe_block(&r.stderr));
+                } else {
+                    print!("{}", safe_block(&r.stderr));
+                }
             }
             r.success
         }
         Err(e) => {
-            println!("{label}: ERROR ({e})");
+            reportln!(json_mode, "{label}: ERROR ({})", safe_block(e));
             false
         }
     }
@@ -859,13 +1146,24 @@ fn report_plan_validation(
 fn cmd_validate(
     output_format: validate::OutputFormat,
     explicit_env: Option<&str>,
+    allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
-    let _ = resolve_credentials(&mut gateway_config, &env_config)?;
+    let namespace_scope = assembled.namespace_scope;
+    enforce_exclusive_scope(&resolved, &gateway_config)?;
+    let desired_finding = namespace_scope.desired_finding(allow_empty_namespace);
+    if let Some(finding) = &desired_finding {
+        print_namespace_finding(finding);
+    }
+    let secret_report = resolve_credentials(&mut gateway_config, &env_config)?;
 
-    let result = validate::run_validation(&gateway_config, &env_config.edge_binary_path)?;
+    let mut result = validate::run_validation_with_report(
+        &gateway_config,
+        &env_config.edge_binary_path,
+        &secret_report,
+    )?;
 
     // Mesh config is a second, independently-loaded document with its own
     // validator mode. Only run it when the repo actually declares mesh
@@ -878,11 +1176,30 @@ fn cmd_validate(
         None => None,
     };
 
-    let formatted = validate::format_results(&result, mesh_result.as_ref(), output_format);
+    if desired_finding
+        .as_ref()
+        .is_some_and(|finding| finding.is_error())
+    {
+        result.success = false;
+        result.exit_code = config::EMPTY_NAMESPACE_EXIT_CODE;
+    }
+
+    let formatted = attach_validate_scope(
+        validate::format_results(&result, mesh_result.as_ref(), output_format),
+        output_format,
+        &namespace_scope,
+        desired_finding.as_ref(),
+        None,
+    );
     print!("{}", formatted);
 
     // A failure in either document is a failure overall: both get published,
     // and a node refusing either one is a broken deploy.
+    if let Some(finding) = &desired_finding {
+        if finding.is_error() {
+            process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
+        }
+    }
     if !result.success {
         process::exit(result.exit_code);
     }
@@ -921,6 +1238,7 @@ async fn cmd_export(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
+    enforce_exclusive_scope(&resolved, &gateway_config)?;
 
     if materialize {
         // Fail fast if credentials cannot be fully resolved — we don't want
@@ -968,13 +1286,32 @@ async fn cmd_export(
     // the gateway file. It also carries no credential placeholders, so
     // `--materialize` / `--encrypt-to` have nothing to act on: it is always
     // published verbatim to FERRUM_MESH_FILE_OUTPUT_PATH.
-    if let Some(mesh) = &assembled.mesh {
-        apply::apply_mesh_file(mesh, &env_config.mesh_file_output_path)?;
-        eprintln!(
+    //
+    // Publication is a reconciliation, not a conditional write: a repository
+    // that deleted its last fragment has to converge the destination too, or
+    // every mesh node reading it keeps enforcing policy nobody declares any
+    // more. `export` does not write the ledger, so it reads the attribution
+    // record and leaves it alone — a retraction is idempotent, and the next
+    // `apply` records it.
+    let mesh_state = StateFile::load(&resolved.name)?;
+    let mesh_publication = apply::reconcile_mesh_file(
+        assembled.mesh.as_ref(),
+        &env_config.mesh_file_output_path,
+        mesh_retraction_scope(&resolved, &mesh_state, &env_config.mesh_file_output_path),
+    )?;
+    match &assembled.mesh {
+        Some(mesh) => eprintln!(
             "Exported mesh document to {} ({})",
             env_config.mesh_file_output_path,
-            mesh_summary_line(mesh)
-        );
+            safe_line(mesh_summary_line(mesh))
+        ),
+        None => {
+            if let Some(line) =
+                mesh_retraction_line(mesh_publication, &env_config.mesh_file_output_path, false)
+            {
+                eprintln!("{line}");
+            }
+        }
     }
 
     let plaintext_materialized = materialize && encrypt_to.is_none();
@@ -984,7 +1321,8 @@ async fn cmd_export(
             Some(delivery) => {
                 eprintln!(
                     "Encrypted to @{} (ssh key {})",
-                    delivery.login, delivery.key_fingerprint
+                    safe(&delivery.login),
+                    safe(&delivery.key_fingerprint)
                 );
                 delivery.encrypted_b64.into_bytes()
             }
@@ -1023,23 +1361,80 @@ async fn cmd_export(
 
 async fn cmd_diff(
     exit_on_drift: bool,
+    format: cli::ReportFormat,
     explicit_env: Option<&str>,
+    allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let json_mode = matches!(format, cli::ReportFormat::Json);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    let mut desired = assembled.gateway;
+    let mut namespace_scope = assembled.namespace_scope;
     enforce_exclusive_scope(&resolved, &desired)?;
-    let _ = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = credential_bundle_loaded(&env_config);
+    let desired_finding = namespace_scope.desired_finding(allow_empty_namespace);
+    if let Some(finding) = &desired_finding {
+        print_namespace_finding(finding);
+    }
+    let secret_report = resolve_credentials(&mut desired, &env_config)?;
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
-    let client = AdminClient::new_scoped(&env_config, &namespaces)?;
-    let mut namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+    let client = match AdminClient::new_scoped(&env_config, &namespaces) {
+        Ok(client) => client,
+        Err(error) => {
+            print_or_collect_scope_json(
+                json_mode,
+                &namespace_scope,
+                desired_finding.as_ref(),
+                serde_json::json!({ "in_sync": false, "diff_count": 0 }),
+            );
+            if desired_finding
+                .as_ref()
+                .is_some_and(|finding| finding.is_error())
+            {
+                process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
+            }
+            return Err(error.into());
+        }
+    };
+    let mut namespace_pairs =
+        match load_namespace_pairs_for(&client, &desired, &namespaces, false).await {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                print_or_collect_scope_json(
+                    json_mode,
+                    &namespace_scope,
+                    desired_finding.as_ref(),
+                    serde_json::json!({ "in_sync": false, "diff_count": 0 }),
+                );
+                if desired_finding
+                    .as_ref()
+                    .is_some_and(|finding| finding.is_error())
+                {
+                    process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
+                }
+                return Err(error.into());
+            }
+        };
+    let live_count: usize = namespace_pairs
+        .iter()
+        .map(|pair| config::gateway_resource_count(&pair.actual))
+        .sum();
+    namespace_scope.set_live_count(live_count);
+    if namespace_scope.filter.is_some() && live_count == 0 {
+        if let Ok(listed) = client.list_namespaces().await {
+            namespace_scope.set_live_namespaces(listed);
+        }
+    }
+    let live_warning = namespace_scope.live_warning();
+    if let Some(warning) = &live_warning {
+        print_live_filter_warning(warning);
+    }
     let cached_namespaces = cached_namespace_names(&namespace_pairs);
     if !cached_namespaces.is_empty() {
         eprintln!(
             "Warning: diff is approximate because cached backup data was served for namespace(s) {}. API-spec ownership metadata is unavailable, so spec-owned/conflict classification is incomplete; no authoritative sync or drift decision is possible until the configuration database returns.",
-            cached_namespaces.join(", ")
+            safe(cached_namespaces.join(", "))
         );
         if exit_on_drift {
             return Err(gitforgeops::error::Error::StaleGatewayView(format!(
@@ -1049,27 +1444,59 @@ async fn cmd_diff(
             .into());
         }
     }
-    // Same treatment `plan` and `review` give an unresolvable secret: with no
-    // bundle, a broker-controlled leaf is a placeholder here and a real (or
-    // `[REDACTED]`) value on the gateway, which compares as drift on every
-    // run and fails `drift-check.yml --exit-on-drift` forever. Literal
-    // siblings, extra entries, shape changes and every nonsecret field are
-    // still compared.
-    if !bundle_loaded && cached_namespaces.is_empty() {
+    // Mask only leaves still unresolved after loading any available bundle.
+    // The primitive preserves resolved values, siblings and structural drift.
+    if cached_namespaces.is_empty() {
         for pair in &mut namespace_pairs {
-            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
+            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual, &secret_report);
         }
-        eprintln!(
-            "Note: no credential bundle is available, so unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from this comparison. Everything else is compared normally."
-        );
+        if let Some(note) = secret_report.unresolved_comparison_note() {
+            eprintln!("Note: {}", safe_block(note));
+        }
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
         &namespace_pairs,
         managed.as_ref(),
         diff::DiffOptions::default(),
     );
+    let diffs = apply::order_incremental_diffs(diffs, &desired);
+    let plugin_attach_notice =
+        apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
 
-    if diffs.is_empty() && unmanaged.is_empty() && !spec_owned_blocks_sync(&spec_owned) {
+    let in_sync = diffs.is_empty() && unmanaged.is_empty() && !spec_owned_blocks_sync(&spec_owned);
+    print_or_collect_scope_json(
+        json_mode,
+        &namespace_scope,
+        desired_finding.as_ref(),
+        serde_json::json!({
+            "in_sync": in_sync && cached_namespaces.is_empty(),
+            "diff_count": diffs.len(),
+            "live_filter_warning": live_warning,
+            "plugin_attach_notice": plugin_attach_notice,
+        }),
+    );
+    if let Some(finding) = &desired_finding {
+        if finding.is_error() {
+            process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
+        }
+    }
+
+    if json_mode {
+        if exit_on_drift && cached_namespaces.is_empty() {
+            let drift = verdict::DriftVerdict::evaluate(
+                &resolved.ownership.drift_alert_on,
+                &diffs,
+                &unmanaged,
+                &spec_owned,
+            );
+            if drift.has_drift() {
+                process::exit(drift.exit_code());
+            }
+        }
+        return Ok(());
+    }
+
+    if in_sync {
         // Spec-owned rows are still reported — an operator should know a third
         // owner is in play — but they do not make the configuration
         // out-of-sync on their own.
@@ -1092,21 +1519,36 @@ async fn cmd_diff(
                 diff::DiffAction::Modify => "MODIFY",
                 diff::DiffAction::Delete => "DELETE",
             };
-            println!("  {} {} {} ({})", action, d.kind, d.id, d.namespace);
+            println!(
+                "  {} {} {} ({})",
+                action,
+                safe(&d.kind),
+                safe(&d.id),
+                safe(&d.namespace)
+            );
             for change in &d.details {
                 if diff::is_sensitive_diff_field(&d.kind, &change.field) {
                     // Consumer credentials and plugin config can carry actual
                     // secret material. Printing them here would leak to CI
                     // logs, which are visible to anyone with run access.
-                    println!("    {}: [REDACTED] -> [REDACTED]", change.field);
+                    println!("    {}: [REDACTED] -> [REDACTED]", safe(&change.field));
                 } else {
                     println!(
                         "    {}: {} -> {}",
-                        change.field, change.old_value, change.new_value
+                        safe(&change.field),
+                        safe_line(&change.old_value),
+                        safe_line(&change.new_value)
                     );
                 }
             }
         }
+    }
+
+    if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
+        println!("{}\n", safe_block(note));
+    }
+    if let Some(note) = plugin_attach_notice {
+        println!("{}\n", safe_block(note));
     }
 
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
@@ -1115,7 +1557,12 @@ async fn cmd_diff(
             resolved.ownership.mode
         );
         for u in &unmanaged {
-            println!("  {} {} ({})", u.kind, u.id, u.namespace);
+            println!(
+                "  {} {} ({})",
+                safe(&u.kind),
+                safe(&u.id),
+                safe(&u.namespace)
+            );
         }
     }
 
@@ -1140,7 +1587,7 @@ async fn cmd_diff(
     if exit_on_drift && drift.has_drift() {
         println!(
             "Drift detected ({}); exiting {}.",
-            drift.reasons().join(", "),
+            safe(drift.reasons().join(", ")),
             verdict::DRIFT_EXIT_CODE
         );
         process::exit(drift.exit_code());
@@ -1152,16 +1599,24 @@ async fn cmd_diff(
 async fn cmd_plan(
     explicit_env: Option<&str>,
     allow_credential_slot_remap: bool,
+    allow_empty_namespace: bool,
+    format: cli::ReportFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let json_mode = matches!(format, cli::ReportFormat::Json);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
+    let mut namespace_scope = assembled.namespace_scope;
     // Plan must see the same scope/validation errors as apply would hit, so
     // the preview matches reality. Without this, a plan could print "None
     // (in sync)" for an exclusive env whose filter doesn't match ownership —
     // apply would then fail when the operator tries to act on the preview.
     enforce_exclusive_scope(&resolved, &desired)?;
+    let desired_finding = namespace_scope.desired_finding(allow_empty_namespace);
+    if let Some(finding) = &desired_finding {
+        print_namespace_finding(finding);
+    }
     // Audit security BEFORE resolving credentials. audit_security flags
     // literal (non-placeholder) credential strings as a security issue
     // ("use ${...} for secrets"). If we resolve first, placeholders are
@@ -1169,47 +1624,85 @@ async fn cmd_plan(
     // literals to the auditor. Running pre-resolve keeps the audit on
     // the repo's actual committed state.
     let policy_cfg = policy::load_policies()?;
-    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    let no_ledger = HashSet::new();
+    let security_findings = diff::audit_security_with_scope(
+        &desired,
+        policy_cfg.as_ref(),
+        match resolved.ownership.mode {
+            OwnershipMode::Shared => diff::OwnershipScope::Shared {
+                previously_managed: &no_ledger,
+            },
+            OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
+        },
+    );
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
-    let bundle_loaded = credential_bundle_loaded(&env_config);
-    println!("=== Environment ===");
-    println!(
+    reportln!(json_mode, "=== Environment ===");
+    reportln!(
+        json_mode,
         "name={}  overlay={}  namespace_filter={}  strategy={:?}  ownership={:?}",
-        resolved.name,
-        resolved.overlay.as_deref().unwrap_or("<none>"),
-        resolved.namespace_filter.as_deref().unwrap_or("<all>"),
+        safe(&resolved.name),
+        safe(resolved.overlay.as_deref().unwrap_or("<none>")),
+        safe(resolved.namespace_filter.as_deref().unwrap_or("<all>")),
         resolved.apply_strategy,
         resolved.ownership.mode,
     );
-    println!();
+    reportln!(json_mode, "{}", namespace_scope.text_line());
+    reportln!(json_mode);
 
-    println!("=== Validation ===");
-    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
-    let mut validation_ok = report_plan_validation("gateway", &val_result);
+    reportln!(json_mode, "=== Validation ===");
+    let val_result = validate::run_validation_with_report(
+        &desired,
+        &env_config.edge_binary_path,
+        &secret_report,
+    );
+    let mut validation_ok = report_plan_validation("gateway", &val_result, json_mode);
     if let Some(mesh) = &desired_mesh {
         let mesh_result = validate::run_mesh_validation(mesh, &env_config.edge_binary_path);
-        validation_ok &= report_plan_validation("mesh", &mesh_result);
+        validation_ok &= report_plan_validation("mesh", &mesh_result, json_mode);
     }
-    println!();
+    reportln!(json_mode);
 
-    if let Some(mesh) = &desired_mesh {
-        // Counts only: mesh resources have no live gateway API to diff
-        // against, so they never appear under "=== Changes ===".
-        println!("=== Mesh ===");
-        println!(
-            "mesh: {} (published to {})\n",
-            mesh_summary_line(mesh),
-            env_config.mesh_file_output_path
-        );
+    // Counts only: mesh resources have no live gateway API to diff against, so
+    // they never appear under "=== Changes ===". A pending retraction is
+    // previewed here too — it is a real change to a live control document, and
+    // a preview that stayed silent about it would be the same silence the
+    // publish path used to have. Only file mode publishes (and therefore
+    // retracts) the document; an api-mode apply prints its no-mesh-API notice
+    // instead and touches nothing.
+    let mesh_publication = match env_config.gateway_mode {
+        GatewayMode::File => Some(apply::plan_mesh_publication(
+            desired_mesh.as_ref(),
+            &env_config.mesh_file_output_path,
+            mesh_retraction_scope(
+                &resolved,
+                &StateFile::load(&resolved.name)?,
+                &env_config.mesh_file_output_path,
+            ),
+        )?),
+        GatewayMode::Api => None,
+    };
+    let mesh_retraction_preview = mesh_publication.and_then(|publication| {
+        mesh_retraction_line(publication, &env_config.mesh_file_output_path, true)
+    });
+    if desired_mesh.is_some() || mesh_retraction_preview.is_some() {
+        reportln!(json_mode, "=== Mesh ===");
+        match (&desired_mesh, &mesh_retraction_preview) {
+            (Some(mesh), _) => reportln!(
+                json_mode,
+                "mesh: {} (published to {})\n",
+                safe_line(mesh_summary_line(mesh)),
+                env_config.mesh_file_output_path
+            ),
+            (None, Some(line)) => reportln!(json_mode, "{}\n", safe_block(line)),
+            (None, None) => {}
+        }
     }
 
     if let Some(note) = fmt_resolution_note(&resolved, &secret_report) {
-        println!("=== Credentials ===");
-        println!("{}\n", note);
-        if !bundle_loaded {
-            println!(
-                "Unresolved broker-controlled Consumer credential and plugin-config leaves are excluded from the live diff because no secret bundle is available; literal siblings, extra entries, shape changes, and nonsecret fields are still compared.\n"
-            );
+        reportln!(json_mode, "=== Credentials ===");
+        reportln!(json_mode, "{}\n", safe_block(note));
+        if let Some(note) = secret_report.unresolved_comparison_note() {
+            reportln!(json_mode, "{}\n", safe_block(note));
         }
     }
 
@@ -1219,43 +1712,61 @@ async fn cmd_plan(
     let remap_blocked =
         verdict::slot_remap_blocker(&secret_report, allow_credential_slot_remap).is_some();
     if !secret_report.slot_remaps.is_empty() {
-        println!("=== Credential Slot Remaps ===");
+        reportln!(json_mode, "=== Credential Slot Remaps ===");
         for remap in &secret_report.slot_remaps {
-            println!("  {remap}");
+            reportln!(json_mode, "  {}", safe_line(remap));
         }
         if remap_blocked {
-            println!(
+            reportln!(
+                json_mode,
                 "\n{} slot reassignment(s) block apply. Rotate the affected slot in place before \
                  removing the entry, or re-run with --allow-credential-slot-remap to accept the \
                  reassignment.",
                 secret_report.slot_remaps.len()
             );
         } else {
-            println!("\nAccepted via --allow-credential-slot-remap.");
+            reportln!(json_mode, "\nAccepted via --allow-credential-slot-remap.");
         }
-        println!();
+        reportln!(json_mode);
     }
 
+    let mut adoptions = Vec::new();
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces);
     let (diffs, breaking, unmanaged, spec_owned, actual_available, provenance_note) = match &client
     {
-        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces, false).await {
             Ok(mut namespace_pairs) => {
+                let live_count: usize = namespace_pairs
+                    .iter()
+                    .map(|pair| config::gateway_resource_count(&pair.actual))
+                    .sum();
+                namespace_scope.set_live_count(live_count);
+                if namespace_scope.filter.is_some() && live_count == 0 {
+                    if let Ok(listed) = c.list_namespaces().await {
+                        namespace_scope.set_live_namespaces(listed);
+                    }
+                }
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
-                    if !bundle_loaded {
-                        for pair in &mut namespace_pairs {
-                            diff::mask_indeterminate_secret_values(&desired, &mut pair.actual);
-                        }
+                    let (pending, candidates) =
+                        ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy);
+                    adoptions = candidates;
+                    for pair in &mut namespace_pairs {
+                        diff::mask_indeterminate_secret_values(
+                            &desired,
+                            &mut pair.actual,
+                            &secret_report,
+                        );
                     }
-                    let (d, b, u, s) = compute_namespace_diffs(
+                    let (mut d, b, u, s) = compute_namespace_diffs(
                         &namespace_pairs,
                         managed.as_ref(),
                         diff::DiffOptions::default(),
                     );
+                    d.extend(pending);
                     (d, b, u, s, true, None)
                 } else {
                     (
@@ -1266,32 +1777,60 @@ async fn cmd_plan(
                         false,
                         Some(format!(
                             "Live comparison skipped: cached backup data was served for namespace(s) {}. API-spec ownership is unknown until the gateway configuration database recovers.",
-                            cached.join(", ")
+                            safe(cached.join(", "))
                         )),
                     )
                 }
             }
+            Err(e @ gitforgeops::error::Error::BackupNamespace(_)) => return Err(e.into()),
             Err(e) => {
-                eprintln!("Could not fetch live config: {}", e);
+                eprintln!("Could not fetch live config: {}", safe_block(e));
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
             }
         },
         Err(e) => {
-            eprintln!("Could not create API client: {}", e);
+            eprintln!("Could not create API client: {}", safe_block(e));
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
         }
     };
 
+    let diffs = apply::order_incremental_diffs(diffs, &desired);
+    let plugin_attach_notice =
+        apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
+
     if let Some(note) = &provenance_note {
-        println!("=== Live Data Provenance ===");
-        println!("WARNING: {note}\n");
+        reportln!(json_mode, "=== Live Data Provenance ===");
+        reportln!(json_mode, "WARNING: {}\n", safe_block(note));
     }
 
-    println!("=== Changes ===");
+    let live_warning = namespace_scope.live_warning();
+    if let Some(warning) = &live_warning {
+        print_live_filter_warning(warning);
+    }
+    if namespace_scope.live_count.is_some() {
+        reportln!(json_mode, "{}", namespace_scope.text_line());
+    }
+    if desired_finding.is_some() || live_warning.is_some() {
+        reportln!(json_mode, "=== Namespace Filter ===");
+        if let Some(finding) = &desired_finding {
+            reportln!(
+                json_mode,
+                "  [{}] {}",
+                finding.severity_label(),
+                safe_block(&finding.message)
+            );
+        }
+        if let Some(warning) = &live_warning {
+            reportln!(json_mode, "  [warning] {}", safe_block(warning));
+        }
+        reportln!(json_mode);
+    }
+
+    reportln!(json_mode, "=== Changes ===");
     if !actual_available {
-        println!("SKIPPED (no live config available)\n");
-    } else if diffs.is_empty() {
-        println!("None (in sync)\n");
+        reportln!(json_mode, "SKIPPED (no live config available)\n");
+    } else if diffs.is_empty() && adoptions.is_empty() {
+        reportln!(json_mode, "None (in sync)\n");
     } else {
         for d in &diffs {
             let action = match d.action {
@@ -1299,31 +1838,65 @@ async fn cmd_plan(
                 diff::DiffAction::Modify => "MODIFY",
                 diff::DiffAction::Delete => "DELETE",
             };
-            println!("  {} {} {}", action, d.kind, d.id);
+            reportln!(json_mode, "  {} {} {}", action, safe(&d.kind), safe(&d.id));
         }
-        println!();
+        reportln!(json_mode);
+    }
+
+    if !adoptions.is_empty() {
+        reportln!(json_mode, "{}", apply::ADOPTION_PREVIEW_NOTICE);
+        for candidate in &adoptions {
+            reportln!(
+                json_mode,
+                "  ADOPT {} {} ({})",
+                safe(&candidate.kind),
+                safe(&candidate.id),
+                safe(&candidate.namespace)
+            );
+        }
+        reportln!(json_mode);
+    }
+
+    if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
+        reportln!(json_mode, "{}\n", safe_block(note));
+    }
+    if let Some(note) = plugin_attach_notice {
+        reportln!(json_mode, "{}\n", safe_block(note));
     }
 
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
-        println!("=== Unmanaged Resources ===");
-        println!(
+        reportln!(json_mode, "=== Unmanaged Resources ===");
+        reportln!(
+            json_mode,
             "(mode={:?}; these exist on the gateway but were never managed by this repo)",
             resolved.ownership.mode
         );
         for u in &unmanaged {
-            println!("  {} {} ({})", u.kind, u.id, u.namespace);
+            reportln!(
+                json_mode,
+                "  {} {} ({})",
+                safe(&u.kind),
+                safe(&u.id),
+                safe(&u.namespace)
+            );
         }
-        println!();
+        reportln!(json_mode);
     }
 
-    print_spec_owned(&spec_owned);
+    print_spec_owned_report(&spec_owned, json_mode);
 
     if !breaking.is_empty() {
-        println!("=== Breaking Changes ===");
+        reportln!(json_mode, "=== Breaking Changes ===");
         for bc in &breaking {
-            println!("  {} {}: {}", bc.kind, bc.id, bc.reason);
+            reportln!(
+                json_mode,
+                "  {} {}: {}",
+                safe(&bc.kind),
+                safe(&bc.id),
+                safe_line(&bc.reason)
+            );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     let bp_findings = diff::check_best_practices(&desired);
@@ -1370,10 +1943,7 @@ async fn cmd_plan(
                 }
             },
             None => {
-                override_note = Some(
-                    "No PR is associated with this commit; overrides were not evaluated."
-                        .to_string(),
-                );
+                override_note = Some(policy::github_override::NO_PR_OVERRIDE_NOTE.to_string());
             }
         }
     }
@@ -1381,14 +1951,22 @@ async fn cmd_plan(
     // security_findings was computed pre-resolve above; reuse it here.
     let security_gate = verdict::security_blocker(&security_findings, security_overridden);
     if !security_findings.is_empty() {
-        println!("=== Security Findings ===");
+        reportln!(json_mode, "=== Security Findings ===");
         for sf in &security_findings {
-            println!("  [{}] {} {}: {}", sf.severity, sf.kind, sf.id, sf.message);
+            reportln!(
+                json_mode,
+                "  [{}] {} {}: {}",
+                safe(&sf.severity),
+                safe(&sf.kind),
+                safe(&sf.id),
+                safe_line(&sf.message)
+            );
         }
         if let Some(gate) = security_gate {
             // Same set `apply` refuses on, so the preview and the post-merge
             // apply cannot disagree about whether this repo is applyable.
-            println!(
+            reportln!(
+                json_mode,
                 "\n{} error-severity finding(s) block apply. Consumer credentials belong in the \
                  broker as ${{gh-env-secret:...}} placeholders; a literal value in repository YAML \
                  is a committed secret. Identity halves (basicauth username, mtls_auth identity) \
@@ -1396,45 +1974,53 @@ async fn cmd_plan(
                 gate.count
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if !bp_findings.is_empty() {
-        println!("=== Best Practice Recommendations ===");
+        reportln!(json_mode, "=== Best Practice Recommendations ===");
         for bp in &bp_findings {
-            println!("  {} {}: {}", bp.kind, bp.id, bp.message);
+            reportln!(
+                json_mode,
+                "  {} {}: {}",
+                safe(&bp.kind),
+                safe(&bp.id),
+                safe_line(&bp.message)
+            );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if !policy_findings.is_empty() {
-        println!("=== Policy Violations ===");
+        reportln!(json_mode, "=== Policy Violations ===");
         for pf in &policy_findings {
             let overridden = match &pf.overridden_by {
-                Some(by) => format!(" (overridden by @{by})"),
+                Some(by) => format!(" (overridden by @{})", safe(by)),
                 None => String::new(),
             };
-            println!(
+            reportln!(
+                json_mode,
                 "  [{}] {}: {} {} ({}): {}{}",
                 pf.severity.as_str(),
-                pf.rule_id,
-                pf.kind,
-                pf.id,
-                pf.namespace,
-                pf.message,
+                safe(&pf.rule_id),
+                safe(&pf.kind),
+                safe(&pf.id),
+                safe(&pf.namespace),
+                safe_line(&pf.message),
                 overridden
             );
         }
-        println!();
+        reportln!(json_mode);
     }
 
     if let Some(note) = &override_note {
-        println!("=== Override ===");
-        println!("{note}\n");
+        reportln!(json_mode, "=== Override ===");
+        reportln!(json_mode, "{}\n", safe_block(note));
     }
 
     // Plan's exit code is the preview's verdict: non-zero for everything that
-    // would stop `apply` and is decidable without a gateway. One shared
+    // would stop `apply` and is decidable without a gateway, plus ownership
+    // conflicts proven by the authoritative live comparison above. One shared
     // computation with `apply` (see `gitforgeops::verdict`) so the two cannot
     // drift — a plan that exits 0 for a repository apply deterministically
     // refuses is the failure mode this replaces. Every blocker has already
@@ -1447,13 +2033,55 @@ async fn cmd_plan(
         policy_findings: &policy_findings,
         secret_report: &secret_report,
         allow_credential_slot_remap,
+        provisioner_token_present: env_config.github_provisioner_token.is_some(),
+        github_repository_present: env_config.github_repository.is_some(),
     });
-    if let Some(summary) = verdict::blocker_summary(&blockers) {
-        println!("=== Apply Blockers ===");
+    let offline_summary = verdict::blocker_summary(&blockers);
+    let conflict_namespaces: std::collections::BTreeSet<&str> = spec_owned
+        .iter()
+        .filter(|resource| actual_available && resource.is_conflict())
+        .map(|resource| resource.namespace.as_str())
+        .collect();
+    if json_mode {
+        print_or_collect_scope_json(
+            true,
+            &namespace_scope,
+            desired_finding.as_ref(),
+            serde_json::json!({
+                "live_filter_warning": live_warning,
+                "plugin_attach_notice": plugin_attach_notice,
+                "apply_blocked": offline_summary.is_some()
+                    || !conflict_namespaces.is_empty()
+                    || desired_finding.as_ref().is_some_and(|finding| finding.is_error()),
+            }),
+        );
+    }
+
+    let empty_namespace_error = desired_finding
+        .as_ref()
+        .is_some_and(|finding| finding.is_error());
+    if offline_summary.is_some() || !conflict_namespaces.is_empty() || empty_namespace_error {
+        reportln!(json_mode, "=== Apply Blockers ===");
         for blocker in &blockers {
-            println!("  {}", blocker.summary());
+            reportln!(json_mode, "  {}", safe_block(blocker.summary()));
         }
-        println!("\n{summary}");
+        if !conflict_namespaces.is_empty() {
+            reportln!(
+                json_mode,
+                "  API-spec ownership conflicts block apply in namespace(s): {}. Remove the competing repository declarations or reconcile ownership with the API spec.",
+                safe(conflict_namespaces.into_iter().collect::<Vec<_>>().join(", "))
+            );
+        }
+        if empty_namespace_error {
+            reportln!(
+                json_mode,
+                "  empty-namespace-filter (1): namespace filter selected 0 desired resources while the on-disk tree is non-empty; pass --allow-empty-namespace to continue (exit {})",
+                config::EMPTY_NAMESPACE_EXIT_CODE
+            );
+        }
+        if let Some(summary) = offline_summary {
+            reportln!(json_mode, "\n{}", safe_block(summary));
+        }
         process::exit(1);
     }
 
@@ -1464,10 +2092,13 @@ async fn cmd_apply(
     auto_approve: bool,
     allow_large_prune: bool,
     confirm_api_spec_deletion: bool,
+    allow_nontransactional_plugin_attach: bool,
     explicit_env: Option<&str>,
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let allow_nontransactional_plugin_attach =
+        allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
@@ -1487,7 +2118,17 @@ async fn cmd_apply(
     // publish — is what makes it impossible for an apply to publish a secret
     // that was committed to the repository.
     let policy_cfg = policy::load_policies()?;
-    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    let no_ledger = HashSet::new();
+    let security_findings = diff::audit_security_with_scope(
+        &desired,
+        policy_cfg.as_ref(),
+        match resolved.ownership.mode {
+            OwnershipMode::Shared => diff::OwnershipScope::Shared {
+                previously_managed: &no_ledger,
+            },
+            OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
+        },
+    );
     print_security_findings(&security_findings);
     // The same predicate `plan` previews with. `apply` evaluates the override
     // separately below (it needs the approver's name for the state ledger), so
@@ -1527,7 +2168,8 @@ async fn cmd_apply(
         match &override_approver {
             Some(approver) => {
                 eprintln!(
-                    "{blocker_count} error-severity security finding(s) overridden by @{approver}; continuing."
+                    "{blocker_count} error-severity security finding(s) overridden by @{}; continuing.",
+                    safe(approver)
                 );
                 overridden_for_audit.push((SECURITY_AUDIT_RULE_ID.to_string(), approver.clone()));
             }
@@ -1536,16 +2178,17 @@ async fn cmd_apply(
                     "Refusing to apply: {blocker_count} error-severity security finding(s) listed above. \
                      Consumer credentials belong in the broker as ${{gh-env-secret:...}} placeholders; a literal \
                      value in repository YAML is a committed secret and applying it publishes it to the gateway. \
-                     To override, add the '{}' label to the PR from an account with '{}' permission.",
-                    override_cfg.require_label, override_cfg.required_permission
+                     To override, add the '{}' label and submit its revision-bound override review from an account with '{}' permission.",
+                    safe(&override_cfg.require_label),
+                    safe(&override_cfg.required_permission)
                 );
                 match &override_decision {
                     Some(decision) if !decision.active => {
-                        eprintln!("(override inactive: {})", decision.reason)
+                        eprintln!("(override inactive: {})", safe_block(&decision.reason))
                     }
                     Some(_) => {}
                     None => {
-                        eprintln!("(no PR associated with this commit; overrides not evaluated)")
+                        eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE)
                     }
                 }
                 return Err("unresolved security findings".into());
@@ -1591,12 +2234,19 @@ async fn cmd_apply(
             missing.len()
         );
         for m in missing {
-            eprintln!("  {}", m.slot);
+            eprintln!("  {}", safe(&m.slot));
         }
         return Err("required credential slots are missing".into());
     }
 
-    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path)?;
+    let val_result = match env_config.gateway_mode {
+        GatewayMode::File => validate::run_validation(&desired, &env_config.edge_binary_path),
+        GatewayMode::Api => validate::run_validation_with_report(
+            &desired,
+            &env_config.edge_binary_path,
+            &secret_report,
+        ),
+    }?;
     if verdict::validation_blocker(val_result.success).is_some() {
         let formatted = validate::format_result(&val_result, validate::OutputFormat::Text);
         eprint!("{}", formatted);
@@ -1622,7 +2272,7 @@ async fn cmd_apply(
             // api-mode apply look like it delivered the mesh document.
             eprintln!(
                 "Notice: {} mesh fragment(s) assembled, but FERRUM_GATEWAY_MODE=api has no mesh push path (ferrum-edge exposes no mesh admin API). Run `gitforgeops export` or a file-mode apply to publish {} for mesh nodes.",
-                mesh_summary_line(mesh),
+                safe_line(mesh_summary_line(mesh)),
                 env_config.mesh_file_output_path
             );
         }
@@ -1655,24 +2305,29 @@ async fn cmd_apply(
                 gate.count
             );
             for b in blockers {
-                eprintln!("  [{}] {}: {}", b.severity.as_str(), b.rule_id, b.message);
+                eprintln!(
+                    "  [{}] {}: {}",
+                    b.severity.as_str(),
+                    safe(&b.rule_id),
+                    safe_line(&b.message)
+                );
             }
             if let Some(d) = &override_decision {
                 if !d.active {
-                    eprintln!("(override inactive: {})", d.reason);
+                    eprintln!("(override inactive: {})", safe_block(&d.reason));
                 }
             } else {
-                eprintln!("(no PR associated with this commit; overrides not evaluated)");
+                eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE);
             }
             return Err("unresolved policy violations".into());
         }
     }
 
-    let is_first_apply = StateFile::is_first_apply(&resolved.name);
+    let is_first_apply = StateFile::is_first_apply(&resolved.name)?;
     if is_first_apply && matches!(resolved.ownership.mode, OwnershipMode::Shared) {
         eprintln!(
             "Notice: first apply for environment '{}' in shared mode. Resources on the gateway but not in this repo will be treated as unmanaged and left alone.",
-            resolved.name
+            safe(&resolved.name)
         );
     }
 
@@ -1710,6 +2365,9 @@ async fn cmd_apply(
     let mut adopted_ops: Vec<apply::AppliedOp> = Vec::new();
     let mut fully_replaced: Vec<String> = Vec::new();
 
+    // Set by the file-mode arm below: mesh is file-only, and an api-mode
+    // apply neither publishes nor retracts the document.
+    let mut mesh_publication: Option<apply::MeshPublication> = None;
     match env_config.gateway_mode {
         GatewayMode::Api => {
             // The shared repository-load boundary already rejected
@@ -1731,40 +2389,16 @@ async fn cmd_apply(
             if !auto_approve {
                 let managed = previously_managed(&resolved, &state);
                 let namespace_pairs =
-                    load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+                    load_namespace_pairs_for(&client, &desired, &namespaces, false).await?;
                 if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                     return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
                 }
                 let (mut diffs, _, unmanaged, spec_owned) =
                     compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
-                for pair in &namespace_pairs {
-                    diffs.extend(apply::pending_create_assertion_diffs(
-                        &pair.desired,
-                        &pair.actual,
-                        &state.pending_creates,
-                        &pair.namespace,
-                    ));
-                }
-                let diffs = apply::order_diffs(diffs);
-
-                // Rows that already match live but were never claimed. They
-                // are not gateway changes, but the apply below does write to
-                // the ledger (and, in shared mode, issues an idempotent PUT),
-                // so a preview that called this "no changes" would understate
-                // the run.
-                let handled = adoption_handled_keys(&diffs, &state);
-                let managed_ledger = ledger_keys(&state);
-                let adoptions: Vec<apply::AdoptionCandidate> = namespace_pairs
-                    .iter()
-                    .flat_map(|pair| {
-                        apply::adoption_candidates(
-                            &pair.desired,
-                            &pair.actual,
-                            &managed_ledger,
-                            &handled,
-                        )
-                    })
-                    .collect();
+                let (pending, adoptions) =
+                    ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy);
+                diffs.extend(pending);
+                let diffs = apply::order_incremental_diffs(diffs, &desired);
 
                 if diffs.is_empty()
                     && unmanaged.is_empty()
@@ -1779,21 +2413,34 @@ async fn cmd_apply(
                     return Ok(());
                 }
                 println!("Will apply {} change(s):", diffs.len());
+                if let Some(note) = apply::incremental_plugin_attach_notice(
+                    &resolved.apply_strategy,
+                    &diffs,
+                    &desired,
+                ) {
+                    println!("{}", safe_block(note));
+                }
                 for d in &diffs {
                     let action = match d.action {
                         diff::DiffAction::Add => "ADD",
                         diff::DiffAction::Modify => "MODIFY",
                         diff::DiffAction::Delete => "DELETE",
                     };
-                    println!("  {} {} {}", action, d.kind, d.id);
+                    println!("  {} {} {}", action, safe(&d.kind), safe(&d.id));
+                }
+                if let Some(note) =
+                    apply::incremental_prune_notice(&resolved.apply_strategy, &diffs)
+                {
+                    println!("{}", safe_block(note));
                 }
                 if !adoptions.is_empty() {
                     println!(
                         "\n{} already-matching resource(s) would be adopted into the ownership ledger:",
                         adoptions.len()
                     );
+                    println!("{}", apply::ADOPTION_PREVIEW_NOTICE);
                     for candidate in &adoptions {
-                        println!("  ADOPT {} {}", candidate.kind, candidate.id);
+                        println!("  ADOPT {} {}", safe(&candidate.kind), safe(&candidate.id));
                     }
                 }
                 if !unmanaged.is_empty() {
@@ -1813,7 +2460,7 @@ async fn cmd_apply(
                         pending_creds.len()
                     );
                     for r in pending_creds {
-                        println!("  [new] {}", r.slot);
+                        println!("  [new] {}", safe(&r.slot));
                     }
                 }
                 println!("\nUse --auto-approve to skip this check.");
@@ -1827,7 +2474,8 @@ async fn cmd_apply(
             // allocation after this gate means a blocked apply leaves GitHub
             // env secrets untouched — otherwise we'd burn a generated value
             // that the gateway never receives.
-            let namespace_pairs = load_namespace_pairs_for(&client, &desired, &namespaces).await?;
+            let namespace_pairs =
+                load_namespace_pairs_for(&client, &desired, &namespaces, true).await?;
             if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                 // This gate intentionally precedes credential allocation. A
                 // cached backup omits API-spec ownership metadata, so no
@@ -1870,6 +2518,7 @@ async fn cmd_apply(
                     pending_create_assertions: state.pending_creates.clone(),
                     managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
+                    allow_nontransactional_plugin_attach,
                 },
             )
             .await?;
@@ -1896,7 +2545,7 @@ async fn cmd_apply(
             let reconciled_pending =
                 state.reconcile_pending_creates(&desired, &actual_by_namespace, pending_scope);
             for warning in &reconciled_pending.warnings {
-                eprintln!("Warning: {warning}");
+                eprintln!("Warning: {}", safe_block(warning));
             }
             let reconciled_absent =
                 state.reconcile_absent_managed_resources(&desired, &actual_by_namespace);
@@ -1993,11 +2642,13 @@ async fn cmd_apply(
                     match &slot.delivered {
                         Some(d) => eprintln!(
                             "  {} -> @{} (ssh {})",
-                            slot.slot, d.login, d.key_fingerprint
+                            safe(&slot.slot),
+                            safe(&d.login),
+                            safe(&d.key_fingerprint)
                         ),
                         None => eprintln!(
                             "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
-                            slot.slot
+                            safe(&slot.slot)
                         ),
                     }
                 }
@@ -2068,6 +2719,7 @@ async fn cmd_apply(
                     pending_create_assertions: state.pending_creates.clone(),
                     managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
+                    allow_nontransactional_plugin_attach,
                 },
             )
             .await?;
@@ -2075,15 +2727,16 @@ async fn cmd_apply(
             // Print counts up front so partial-success runs surface what
             // landed even when we're about to propagate an error.
             println!(
-                "Applied: {} created, {} updated, {} deleted, {} unmanaged skipped, {} spec-owned skipped",
+                "Applied: {} created, {} updated, {} deleted, {} deletes deferred, {} unmanaged skipped, {} spec-owned skipped",
                 raw.created,
                 raw.updated,
                 raw.deleted,
+                raw.deletes_deferred,
                 raw.unmanaged_skipped,
                 raw.spec_owned_skipped
             );
             if let Some(line) = apply::adoption_summary_line(raw.adopted.len()) {
-                println!("{line}");
+                println!("{}", safe_block(line));
             }
 
             // Pull the per-op records out before `into_result()` consumes
@@ -2124,10 +2777,22 @@ async fn cmd_apply(
                     pending.len()
                 );
                 for r in pending {
-                    println!("  [new] {}", r.slot);
+                    println!("  [new] {}", safe(&r.slot));
                 }
                 println!("\nUse --auto-approve to proceed.");
                 return Ok(());
+            }
+
+            // Refuse missing provisioning capability before publishing either
+            // document. Allocation itself stays after placeholder publication.
+            if let Some(blocker) = verdict::credential_provisioning_blockers(
+                &secret_report,
+                env_config.github_provisioner_token.is_some(),
+                env_config.github_repository.is_some(),
+            )
+            .first()
+            {
+                return Err(blocker.kind.remedy().into());
             }
 
             // Write the placeholder-preserving file FIRST. `desired` still
@@ -2145,13 +2810,31 @@ async fn cmd_apply(
             // resources. Mesh config holds no credential placeholders, so
             // there is no materialize step for it — what is written here is
             // final.
-            if let Some(mesh) = &desired_mesh {
-                apply::apply_mesh_file(mesh, &env_config.mesh_file_output_path)?;
-                println!(
+            //
+            // Total over `desired_mesh`: a repository that just deleted its
+            // last fragment converges the destination to the explicit empty
+            // document instead of leaving the previous one on disk (and, under
+            // `apply-on-merge.yml`, committed on the default branch) for every
+            // mesh node to keep enforcing.
+            mesh_publication = Some(apply::reconcile_mesh_file(
+                desired_mesh.as_ref(),
+                &env_config.mesh_file_output_path,
+                mesh_retraction_scope(&resolved, &state, &env_config.mesh_file_output_path),
+            )?);
+            match (&desired_mesh, mesh_publication) {
+                (Some(mesh), _) => println!(
                     "Written mesh document to {} ({})",
                     env_config.mesh_file_output_path,
-                    mesh_summary_line(mesh)
-                );
+                    safe_line(mesh_summary_line(mesh))
+                ),
+                (None, Some(publication)) => {
+                    if let Some(line) =
+                        mesh_retraction_line(publication, &env_config.mesh_file_output_path, false)
+                    {
+                        println!("{line}");
+                    }
+                }
+                (None, None) => {}
             }
 
             // Now allocate. The in-memory mutation after the disk write is
@@ -2195,6 +2878,22 @@ async fn cmd_apply(
     match env_config.gateway_mode {
         GatewayMode::File => {
             state.record(&desired, &namespaces);
+            // Attribution, not content: the ledger records *that* this
+            // repository publishes the mesh document at this path, which is
+            // the gate a later retraction has to pass. Recorded for a
+            // retraction too — the empty document sitting there is still this
+            // repository's artifact, and forgetting it would make the next run
+            // report the file it just wrote as somebody else's.
+            if matches!(
+                mesh_publication,
+                Some(
+                    apply::MeshPublication::Published
+                        | apply::MeshPublication::Retracted
+                        | apply::MeshPublication::AlreadyRetracted
+                )
+            ) {
+                state.record_mesh_publication(&env_config.mesh_file_output_path);
+            }
         }
         GatewayMode::Api => {
             for ns in &fully_replaced {
@@ -2227,17 +2926,11 @@ async fn cmd_apply(
             }
         }
     }
-    if !overridden_for_audit.is_empty() {
-        // An override belongs to the attempted commit even when the apply is
-        // partial. Prefer the workflow's immutable input SHA; falling back to
-        // last_applied first would misattribute a failed attempt to the prior
-        // successfully landed commit.
-        let commit = std::env::var("GITHUB_SHA")
-            .ok()
-            .or_else(|| state.last_applied_commit.clone())
-            .unwrap_or_default();
-        for (rule_id, approver) in &overridden_for_audit {
-            state.record_override(rule_id, &commit, approver);
+    if let Some(decision) = &override_decision {
+        // The verified actual source revision and reviewed PR head are distinct
+        // for a merge and for later generated-state-only commits.
+        for (rule_id, _) in &overridden_for_audit {
+            state.record_verified_override(rule_id, decision);
         }
     }
     state.save()?;
@@ -2318,18 +3011,18 @@ async fn cmd_import(
         );
     }
     if let Some(notice) = result.source_metadata_notice() {
-        println!("{notice}");
+        println!("{}", safe_block(notice));
     }
     if let Some(notice) = result.unmanaged_sections_notice() {
-        println!("{notice}");
+        println!("{}", safe_block(notice));
     }
     // Loud and last, so it is the final thing on screen: these are the values
     // gitforgeops could not classify and a human has to.
     if let Some(notice) = result.acknowledged_passthrough_notice() {
-        eprintln!("{notice}");
+        eprintln!("{}", safe_block(notice));
     }
     if let Some(notice) = result.custom_plugin_review_notice() {
-        eprintln!("{notice}");
+        eprintln!("{}", safe_block(notice));
     }
 
     Ok(())
@@ -2338,6 +3031,8 @@ async fn cmd_import(
 async fn cmd_review(
     pr: Option<u64>,
     require_live: bool,
+    fail_on_blockers: bool,
+    allow_credential_slot_remap: bool,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if require_live && pr.is_none() {
@@ -2348,7 +3043,9 @@ async fn cmd_review(
         .into());
     }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let mut desired = load_and_assemble_for(&resolved, &env_config)?;
+    let fail_on_blockers = fail_on_blockers || env_config.review_fail_on_blockers;
+    let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    let mut desired = assembled.gateway;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
     // apply would produce.
@@ -2356,32 +3053,32 @@ async fn cmd_review(
     // Audit pre-resolve so placeholder-resolved values aren't misreported as
     // literal credentials (see cmd_plan for full rationale).
     let policy_cfg = policy::load_policies()?;
-    let security_findings = diff::audit_security_with_policy(&desired, policy_cfg.as_ref());
+    let no_ledger = HashSet::new();
+    let security_findings = diff::audit_security_with_scope(
+        &desired,
+        policy_cfg.as_ref(),
+        match resolved.ownership.mode {
+            OwnershipMode::Shared => diff::OwnershipScope::Shared {
+                previously_managed: &no_ledger,
+            },
+            OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
+        },
+    );
     let secret_report = resolve_credentials(&mut desired, &env_config)?;
     let bundle_loaded = credential_bundle_loaded(&env_config);
 
-    let val_result = validate::run_validation(&desired, &env_config.edge_binary_path);
-    let (validation_status, validation_output, validation_execution_error) = match &val_result {
-        Ok(r) if r.success => (
-            review::ReviewValidationStatus::Passed,
-            format!("{}{}", r.stdout, r.stderr),
-            None,
-        ),
-        Ok(r) => (
-            review::ReviewValidationStatus::Rejected,
-            format!("{}{}", r.stdout, r.stderr),
-            None,
-        ),
-        Err(e) => {
-            let message = format!("Validator execution error: {e}");
-            (
-                review::ReviewValidationStatus::ExecutionError,
-                message,
-                Some(e.to_string()),
-            )
-        }
-    };
+    let review::ReviewValidation {
+        status: validation_status,
+        output: validation_output,
+        execution_error: validation_execution_error,
+    } = review::validate_for_review_with_report(
+        &desired,
+        assembled.mesh.as_ref(),
+        &env_config.edge_binary_path,
+        &secret_report,
+    );
 
+    let mut adoptions = Vec::new();
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
@@ -2393,7 +3090,7 @@ async fn cmd_review(
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
     } else {
         match &client {
-            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
+            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces, false).await {
                 // A `/backup` served from the gateway's in-memory snapshot
                 // is not the live view this review claims to publish, so
                 // the computed diff is dropped rather than presented as a
@@ -2409,33 +3106,34 @@ async fn cmd_review(
                             if !cached.is_empty() {
                                 reason.push_str(&format!(
                                     " Cached backup data was served for namespace(s) {}; API-spec ownership is unknown until the gateway configuration database recovers.",
-                                    cached.join(", ")
+                                    safe(cached.join(", "))
                                 ));
                             }
-                            eprintln!("{reason}");
+                            eprintln!("{}", safe_block(&reason));
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
                         }
                         None => {
-                            // Same treatment `plan` and `diff` give an
-                            // unresolvable secret: with no bundle loaded a
-                            // broker-controlled leaf is still a placeholder
-                            // here and a real (or `[REDACTED]`) value on the
-                            // gateway, so comparing them would publish
-                            // permanent false drift — and echo the live value
-                            // into a world-readable PR comment.
-                            if !bundle_loaded {
-                                for pair in &mut namespace_pairs {
-                                    diff::mask_indeterminate_secret_values(
-                                        &desired,
-                                        &mut pair.actual,
-                                    );
-                                }
+                            // Bundle presence says nothing about whether a
+                            // particular leaf resolved. Use resolution provenance.
+                            let (pending, candidates) = ownership_preview(
+                                &namespace_pairs,
+                                &state,
+                                &resolved.apply_strategy,
+                            );
+                            adoptions = candidates;
+                            for pair in &mut namespace_pairs {
+                                diff::mask_indeterminate_secret_values(
+                                    &desired,
+                                    &mut pair.actual,
+                                    &secret_report,
+                                );
                             }
-                            let (d, b, u, s) = compute_namespace_diffs(
+                            let (mut d, b, u, s) = compute_namespace_diffs(
                                 &namespace_pairs,
                                 managed.as_ref(),
                                 diff::DiffOptions::default(),
                             );
+                            d.extend(pending);
                             (d, b, u, s, None)
                         }
                     }
@@ -2445,7 +3143,7 @@ async fn cmd_review(
                 // a transport error's Display carries the gateway URL —
                 // an environment secret. See `review::redact_comparison_error`.
                 Err(e) => {
-                    eprintln!("Live gateway comparison failed: {e}");
+                    eprintln!("Live gateway comparison failed: {}", safe_block(&e));
                     (
                         Vec::new(),
                         Vec::new(),
@@ -2456,7 +3154,7 @@ async fn cmd_review(
                 }
             },
             Err(e) => {
-                eprintln!("Live gateway comparison failed: {e}");
+                eprintln!("Live gateway comparison failed: {}", safe_block(e));
                 (
                     Vec::new(),
                     Vec::new(),
@@ -2468,37 +3166,90 @@ async fn cmd_review(
         }
     };
 
+    let diffs = apply::order_incremental_diffs(diffs, &desired);
+
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
-    let (policy_findings, override_reason, override_cfg) = match policy_cfg {
-        Some(policy_cfg) => {
-            let mut findings = policy::evaluate_policies(&desired, &policy_cfg);
-            let decision = match pr {
-                Some(pr_number) => {
-                    let d = policy::check_override(&env_config, &policy_cfg.overrides, pr_number)
-                        .await?;
-                    policy::github_override::apply_override(&mut findings, &d);
-                    Some(d)
-                }
-                None => None,
-            };
-            (
-                findings,
-                decision.map(|d| d.reason),
-                Some(policy_cfg.overrides),
+    let mut policy_findings = policy_cfg
+        .as_ref()
+        .map(|cfg| policy::evaluate_policies(&desired, cfg))
+        .unwrap_or_default();
+    let override_cfg = policy_cfg
+        .as_ref()
+        .map(|cfg| cfg.overrides.clone())
+        .unwrap_or_default();
+    // Apply and plan share one verified decision across policy and security.
+    // Security-only repositories also use the default override configuration.
+    let override_decision = match pr {
+        Some(pr_number)
+            if policy_cfg.is_some()
+                || verdict::security_blocker(&security_findings, false).is_some() =>
+        {
+            let decision = policy::github_override::check_review_override(
+                &env_config,
+                &override_cfg,
+                pr_number,
             )
+            .await?;
+            policy::github_override::apply_override(&mut policy_findings, &decision);
+            Some(decision)
         }
-        None => (Vec::new(), None, None),
+        _ => None,
     };
 
-    let ownership_note = review::environment_header(
+    let mut ownership_note = review::environment_header(
         &resolved.name,
         &format!("{:?}", resolved.ownership.mode),
         &format!("{:?}", resolved.apply_strategy),
     );
+    if let Some(note) =
+        apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired)
+    {
+        ownership_note.push_str(note);
+        ownership_note.push_str("\n\n");
+    }
+    // A pending mesh retraction is a change to a live control document that
+    // never shows up under "Changes" — mesh has no live gateway API to diff
+    // against. It rides on the environment banner rather than as a late
+    // section so it survives `finalize_comment`'s size bounding, which trims
+    // from the end.
+    if env_config.gateway_mode == GatewayMode::File {
+        let publication = apply::plan_mesh_publication(
+            assembled.mesh.as_ref(),
+            &env_config.mesh_file_output_path,
+            mesh_retraction_scope(&resolved, &state, &env_config.mesh_file_output_path),
+        )?;
+        if let Some(note) =
+            review::render_mesh_retraction(publication, &env_config.mesh_file_output_path)
+        {
+            ownership_note.push_str(&note);
+        }
+    }
 
-    let comment = review::build_review_comment_v2_with_status(
+    let provisioning_blockers = verdict::credential_provisioning_blockers(
+        &secret_report,
+        env_config.github_provisioner_token.is_some(),
+        env_config.github_repository.is_some(),
+    );
+    let security_overridden = override_decision
+        .as_ref()
+        .is_some_and(|decision| decision.active);
+    // Same computation `plan` uses for its exit code. The comment below is
+    // built from the findings themselves, not from this vec, so
+    // `--fail-on-blockers` cannot change what the reviewer reads.
+    let blockers = verdict::apply_blockers(ApplyGateInputs {
+        validation_ok: matches!(validation_status, review::ReviewValidationStatus::Passed),
+        security_findings: &security_findings,
+        security_overridden,
+        policy_findings: &policy_findings,
+        secret_report: &secret_report,
+        allow_credential_slot_remap,
+        provisioner_token_present: env_config.github_provisioner_token.is_some(),
+        github_repository_present: env_config.github_repository.is_some(),
+    });
+
+    let comment = review::pr_comment::build_review_comment_with_preview(
         validation_status,
         &validation_output,
         &diffs,
@@ -2508,12 +3259,17 @@ async fn cmd_review(
         &policy_findings,
         &unmanaged,
         &spec_owned,
-        override_reason.as_deref(),
-        override_cfg.as_ref(),
+        override_decision
+            .as_ref()
+            .map(|decision| decision.reason.as_str()),
+        Some(&override_cfg),
         comparison_error.as_deref(),
         Some(&ownership_note),
         &secret_report,
         bundle_loaded,
+        override_decision.as_ref(),
+        &adoptions,
+        &provisioning_blockers,
     );
 
     let mut comment_delivery_error = None;
@@ -2534,7 +3290,8 @@ async fn cmd_review(
                 }
                 Err(e) => {
                     eprintln!(
-                        "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {e}"
+                        "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {}",
+                        safe_block(&e)
                     );
                     write_review_to_step_summary(&comment)?;
                     print!("{}", review::markdown_comment_for_terminal(&comment));
@@ -2557,10 +3314,22 @@ async fn cmd_review(
     // what the reviewer has to act on.
     review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
+    review::enforce_offline_blockers(fail_on_blockers, &blockers)?;
 
-    let _ = !secret_report.results.is_empty();
+    if let Some(summary) = verdict::blocker_summary(&provisioning_blockers) {
+        return Err(summary.into());
+    }
     if let Some(error) = validation_execution_error {
         return Err(format!("validator execution failed during review: {error}").into());
+    }
+    Ok(())
+}
+
+fn cmd_version(format: cli::ReportFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let info = gitforgeops::version::BuildInfo::current();
+    match format {
+        cli::ReportFormat::Text => print!("{}", info.render_text()),
+        cli::ReportFormat::Json => print!("{}", info.render_json()?),
     }
     Ok(())
 }
@@ -2585,7 +3354,7 @@ fn cmd_envs(
                 namespaces: None,
             }],
         };
-        println!("{}", serde_json::to_string(&scopes)?);
+        print!("{}", gitforgeops::json_output::compact(&scopes)?);
         return Ok(());
     }
     let names = match repo {
@@ -2599,7 +3368,7 @@ fn cmd_envs(
             }
         }
         cli::EnvsFormat::Json => {
-            println!("{}", serde_json::to_string(&names)?);
+            print!("{}", gitforgeops::json_output::compact(&names)?);
         }
     }
     Ok(())
@@ -2614,6 +3383,9 @@ async fn cmd_rotate(
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    // Validate the whole desired input before reading a bundle or creating a
+    // state lock, including invalid identity placeholders in sibling consumers.
+    let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
 
     let repo = env_config
         .github_repository
@@ -2633,7 +3405,9 @@ async fn cmd_rotate(
 
     let _state_lock = StateFile::lock(&resolved.name)?;
     let mut state = StateFile::load(&resolved.name)?;
-    let ns = namespace.unwrap_or("ferrum");
+    let ns = namespace
+        .or(resolved.namespace_filter.as_deref())
+        .unwrap_or("ferrum");
     let slot = secrets::resolver::slot_path(ns, consumer, credential);
 
     // ALL preflight checks must run BEFORE rotate_and_deliver mutates the
@@ -2651,7 +3425,10 @@ async fn cmd_rotate(
         );
     }
 
-    let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
+    // Do not let a reserved Upstream/PluginConfig slot masquerade as a
+    // Consumer credential when the resources happen to share an id.
+    // Length is checked again below using the actual placeholder declaration.
+    secrets::allocator::check_rotation_allowed(&slot, 32, &env_config.gateway_mode)?;
 
     // Preflight 1b: in exclusive mode, the same ownership-scope rules
     // apply/diff/plan/review enforce must apply here too. A manual rotate
@@ -2683,6 +3460,11 @@ async fn cmd_rotate(
             .into());
         }
     };
+    secrets::allocator::check_rotation_allowed(
+        &slot,
+        placeholder_length,
+        &env_config.gateway_mode,
+    )?;
 
     // Preflight 3: target consumer is declared in the repo. Without this,
     // rotate_and_deliver writes a secret the gateway push will then refuse
@@ -2735,6 +3517,9 @@ async fn cmd_rotate(
     let mut shard_count = state.credential_shard_count.max(1);
 
     let client = build_github_api_client(&env_config)?;
+    // Construct the gateway client before replacing the write-only secret:
+    // invalid JWT/TLS configuration is a preflight error too.
+    let gateway_client = AdminClient::new_scoped(&env_config, [ns])?;
 
     let outcome = match secrets::rotate_and_deliver(
         &client,
@@ -2773,7 +3558,8 @@ async fn cmd_rotate(
         Some(d) => {
             println!(
                 "Delivered age-encrypted blob to @{} (ssh key {}):\n",
-                d.login, d.key_fingerprint
+                safe(&d.login),
+                safe(&d.key_fingerprint)
             );
             println!("{}", d.encrypted_b64);
         }
@@ -2786,8 +3572,8 @@ async fn cmd_rotate(
 
     // Now push to the gateway.
     let push_status = push_rotated_consumer_to_gateway(
-        &env_config,
-        &resolved,
+        &gateway_client,
+        &desired_for_check,
         &per_shard,
         ns,
         consumer,
@@ -2811,8 +3597,12 @@ async fn cmd_rotate(
                 std::env::var("GITHUB_RUN_ID").ok().as_deref(),
             );
             state.save()?;
-            println!("Rotated slot {slot} in shard {}", outcome.shard);
-            println!("Gateway consumer '{}/{}' updated.", ns, consumer);
+            println!("Rotated slot {} in shard {}", safe(&slot), outcome.shard);
+            println!(
+                "Gateway consumer '{}/{}' updated.",
+                safe(ns),
+                safe(consumer)
+            );
         }
         Err(e) => {
             // Hard-fail: the credential store and gateway are out of sync.
@@ -2833,22 +3623,26 @@ async fn cmd_rotate(
 }
 
 /// Push just the rotated consumer to the live gateway so the new credential
-/// is immediately usable. Loads desired config, resolves placeholders against
-/// the post-rotation bundle (including rotate slots), finds the target
-/// consumer, and calls `update_consumer`.
+/// is immediately usable. Reuses the preflight's desired snapshot and resolves
+/// only the target Consumer, so unrelated generation failures cannot surface
+/// after the secret has been written.
 async fn push_rotated_consumer_to_gateway(
-    env_config: &EnvConfig,
-    resolved: &ResolvedEnv,
+    client: &AdminClient,
+    desired_snapshot: &GatewayConfig,
     per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
     namespace: &str,
     consumer_id: &str,
     resolve_options: secrets::ResolveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !matches!(env_config.gateway_mode, GatewayMode::Api) {
-        return Err("rotate requires gateway_mode=api; file-mode cannot push credentials".into());
-    }
-
-    let mut desired = load_and_assemble_for(resolved, env_config)?;
+    let mut desired = GatewayConfig {
+        consumers: desired_snapshot
+            .consumers
+            .iter()
+            .filter(|c| c.namespace == namespace && c.id == consumer_id)
+            .cloned()
+            .collect(),
+        ..Default::default()
+    };
     let merged = secrets::merge_bundles(per_shard);
     // `rotate_and_deliver` just wrote the fresh value into the bundle; this
     // resolve picks it up for the consumer being pushed to the gateway. The
@@ -2887,7 +3681,6 @@ async fn push_rotated_consumer_to_gateway(
         ).into());
     }
 
-    let client = AdminClient::new_scoped(env_config, [namespace])?;
     client.update_consumer(consumer, namespace).await?;
     Ok(())
 }

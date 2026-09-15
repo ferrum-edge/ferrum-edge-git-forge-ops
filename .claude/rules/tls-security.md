@@ -15,7 +15,9 @@ paths:
 - Consumer credential slots derive from `(namespace, consumer_id, credential path)`. Preserve
   JSON-pointer-style escaping and index-zero elision so normalization cannot orphan an existing
   allocation. Older slot encodings remain read-only lookup candidates.
-- The five gateway credential types are arrays. Enforce generation constraints before mutation:
+- The five gateway credential types are arrays (`basicauth`, `keyauth`, `jwt`,
+  `hmac_auth`, `mtls_auth`). Unknown Consumer `credentials` map keys fail closed
+  before apply. Enforce generation constraints before mutation:
   JWT/HMAC secrets need the documented entropy floor; refuse generated basic-auth values in file
   mode and generated `password_hash` values everywhere; reject `[REDACTED]` bundle values.
 - Credential bundles are GitHub Environment Secrets. Parse every shard strictly, reject duplicate

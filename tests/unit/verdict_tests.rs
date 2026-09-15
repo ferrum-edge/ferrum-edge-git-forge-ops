@@ -72,6 +72,8 @@ fn clean_inputs<'a>(report: &'a ResolveReport) -> ApplyGateInputs<'a> {
         policy_findings: &[],
         secret_report: report,
         allow_credential_slot_remap: false,
+        provisioner_token_present: true,
+        github_repository_present: true,
     }
 }
 
@@ -218,6 +220,8 @@ fn every_blocker_class_is_reported_together_and_named_in_the_summary() {
         policy_findings: &policy,
         secret_report: &report,
         allow_credential_slot_remap: false,
+        provisioner_token_present: true,
+        github_repository_present: true,
     });
 
     let kinds: Vec<BlockerKind> = blockers.iter().map(|b| b.kind).collect();
@@ -230,7 +234,7 @@ fn every_blocker_class_is_reported_together_and_named_in_the_summary() {
             BlockerKind::Validation,
             BlockerKind::Policy,
         ],
-        "all five classes, in apply's own order"
+        "all applicable classes, in apply's own order"
     );
 
     let summary = blocker_summary(&blockers).expect("blocked");
@@ -389,4 +393,39 @@ fn ordinary_categories_still_honor_their_flags() {
     assert!(unmuted.managed_modified, "Add counts as modified-or-added");
     assert!(unmuted.unmanaged_added);
     assert_eq!(unmuted.exit_code(), DRIFT_EXIT_CODE);
+}
+
+#[test]
+fn provisioning_blockers_require_pending_allocations_and_missing_capability() {
+    use gitforgeops::verdict::credential_provisioning_blockers;
+
+    for pending in [false, true] {
+        let report = report(
+            if pending {
+                vec![slot(
+                    SlotStatus::NeedsAllocation,
+                    PlaceholderAlloc::Generate,
+                )]
+            } else {
+                vec![slot(SlotStatus::MissingRequired, PlaceholderAlloc::Require)]
+            },
+            vec![],
+        );
+        for token in [false, true] {
+            for repository in [false, true] {
+                let blockers = credential_provisioning_blockers(&report, token, repository);
+                let expected = if pending {
+                    usize::from(!token) + usize::from(!repository)
+                } else {
+                    0
+                };
+                assert_eq!(blockers.len(), expected);
+                for blocker in blockers {
+                    assert_eq!(blocker.count, 1);
+                    assert!(!blocker.kind.label().is_empty());
+                    assert!(blocker.kind.remedy().contains("not set"));
+                }
+            }
+        }
+    }
 }

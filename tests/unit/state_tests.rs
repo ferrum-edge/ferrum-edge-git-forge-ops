@@ -52,7 +52,7 @@ fn state_file_writes_and_reads_per_env() {
     let dir = TempDir::new().unwrap();
 
     with_cwd(dir.path(), || {
-        assert!(StateFile::is_first_apply("staging"));
+        assert!(StateFile::is_first_apply("staging").unwrap());
 
         let mut state = StateFile::load("staging").unwrap();
         state
@@ -61,12 +61,144 @@ fn state_file_writes_and_reads_per_env() {
         state.last_applied_at = Some("2026-04-23T00:00:00Z".to_string());
         state.save().unwrap();
 
-        assert!(!StateFile::is_first_apply("staging"));
-        assert!(StateFile::is_first_apply("production"));
+        assert!(!StateFile::is_first_apply("staging").unwrap());
+        assert!(StateFile::is_first_apply("production").unwrap());
 
         let reloaded = StateFile::load("staging").unwrap();
         assert_eq!(reloaded.resources.len(), 1);
         assert_eq!(reloaded.environment, "staging");
+    });
+}
+
+fn assert_state_operations_refuse(environment: &str, message: &str) {
+    let state = StateFile {
+        environment: environment.to_string(),
+        ..StateFile::default()
+    };
+    let errors = [
+        StateFile::load(environment).unwrap_err().to_string(),
+        StateFile::lock(environment).unwrap_err().to_string(),
+        state.save().unwrap_err().to_string(),
+        StateFile::is_first_apply(environment)
+            .unwrap_err()
+            .to_string(),
+    ];
+    for error in errors {
+        assert!(error.contains(message), "{error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_symlinked_state_directory() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir("outside").unwrap();
+        let state = StateFile {
+            environment: "production".to_string(),
+            resources: std::collections::HashMap::from([(
+                state_key("ferrum", "Proxy", "p1"),
+                "managed:v1".to_string(),
+            )]),
+            ..StateFile::default()
+        };
+        let original = serde_json::to_string(&state).unwrap();
+        std::fs::write("outside/production.json", &original).unwrap();
+        std::os::unix::fs::symlink("outside", ".state").unwrap();
+
+        assert_state_operations_refuse("production", ".state must be a real directory");
+        assert_eq!(
+            std::fs::read_to_string("outside/production.json").unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read_dir("outside").unwrap().count(), 1);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_dangling_state_directory_symlink() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::os::unix::fs::symlink("missing", ".state").unwrap();
+        assert_state_operations_refuse("production", ".state must be a real directory");
+        assert!(!std::path::Path::new("missing").exists());
+    });
+}
+
+#[test]
+fn state_operations_refuse_non_directory_state_path() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::write(".state", "not a directory").unwrap();
+        assert_state_operations_refuse("production", ".state must be a real directory");
+        assert_eq!(
+            std::fs::read_to_string(".state").unwrap(),
+            "not a directory"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_special_state_directory_entry() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let _socket = std::os::unix::net::UnixListener::bind(".state").unwrap();
+        assert_state_operations_refuse("production", ".state must be a real directory");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn state_operations_refuse_symlinked_children_and_nested_environment_paths() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir(".state").unwrap();
+        std::fs::create_dir("outside").unwrap();
+        std::fs::write("outside/production.json", "untouched").unwrap();
+        std::os::unix::fs::symlink("../outside", ".state/nested").unwrap();
+        assert_state_operations_refuse("nested/production", "environment name");
+
+        for target in ["../outside/production.json", "../missing"] {
+            std::os::unix::fs::symlink(target, ".state/production.json").unwrap();
+            std::os::unix::fs::symlink(target, ".state/production.lock").unwrap();
+            assert_state_operations_refuse("production", "must be a regular state file");
+            std::fs::remove_file(".state/production.json").unwrap();
+            std::fs::remove_file(".state/production.lock").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string("outside/production.json").unwrap(),
+            "untouched"
+        );
+        assert!(!std::path::Path::new("missing").exists());
+    });
+}
+
+#[test]
+fn state_operations_refuse_directories_in_place_of_files() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state/production.json").unwrap();
+        std::fs::create_dir(".state/production.lock").unwrap();
+        assert_state_operations_refuse("production", "must be a regular state file");
+    });
+}
+
+#[test]
+fn state_operations_validate_environment_names_without_creating_state() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        for environment in [
+            "",
+            "../outside",
+            "/absolute",
+            "nested/production",
+            "nested\\prod",
+        ] {
+            assert_state_operations_refuse(environment, "environment name");
+        }
+        assert!(!std::path::Path::new(".state").exists());
     });
 }
 
@@ -81,6 +213,7 @@ fn scoped_record_preserves_entries_outside_scope() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             name: None,
@@ -135,8 +268,8 @@ fn scoped_record_preserves_entries_outside_scope() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }
     }
 
@@ -244,8 +377,11 @@ fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
     state.reserve_adds(&diffs, &desired).unwrap();
 
     let mut exact_live = desired.clone();
-    exact_live.upstreams[0].created_at += chrono::Duration::seconds(5);
-    exact_live.upstreams[0].updated_at += chrono::Duration::seconds(5);
+    // The gateway stamps both fields on the live row; the desired document
+    // omits them. The subset match must still hold because timestamps are
+    // never compared.
+    exact_live.upstreams[0].created_at = Some(chrono::Utc::now());
+    exact_live.upstreams[0].updated_at = Some(chrono::Utc::now());
     let actual = BTreeMap::from([("ferrum".to_string(), exact_live)]);
 
     assert_eq!(
@@ -774,6 +910,7 @@ fn record_op_preserves_state_for_failed_delete() {
 
     fn proxy(id: &str, ns: &str) -> Proxy {
         Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             name: None,
@@ -828,8 +965,8 @@ fn record_op_preserves_state_for_failed_delete() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }
     }
 
@@ -915,6 +1052,7 @@ fn record_op_preserves_state_for_failed_delete() {
         .resources
         .insert(app_key.clone(), "sha256:STALE".to_string());
     let consumer = Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -922,8 +1060,8 @@ fn record_op_preserves_state_for_failed_delete() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     };
     let cfg = GatewayConfig {
         consumers: vec![consumer],
@@ -950,4 +1088,30 @@ fn record_op_preserves_state_for_failed_delete() {
         Some(&"sha256:OTHER".to_string()),
         "out-of-namespace entry must remain untouched"
     );
+}
+
+#[test]
+fn the_mesh_document_attribution_round_trips_and_gates_only_its_own_path() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let mut state = StateFile {
+            environment: "sandbox".to_string(),
+            ..StateFile::default()
+        };
+        // A repository that never published a mesh document attributes none,
+        // and the key stays out of the ledger entirely.
+        assert!(!state.publishes_mesh_document("assembled/sandbox-mesh.yaml"));
+        state.save().unwrap();
+        let fresh = std::fs::read_to_string(".state/sandbox.json").unwrap();
+        assert!(!fresh.contains("mesh_document_path"), "{fresh}");
+
+        state.record_mesh_publication("assembled/sandbox-mesh.yaml");
+        state.save().unwrap();
+
+        let reloaded = StateFile::load("sandbox").unwrap();
+        assert!(reloaded.publishes_mesh_document("assembled/sandbox-mesh.yaml"));
+        // Attribution is per destination: repointing the configured output
+        // path does not hand gitforgeops authority over the new one.
+        assert!(!reloaded.publishes_mesh_document("assembled/other-mesh.yaml"));
+    });
 }

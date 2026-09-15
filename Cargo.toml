@@ -5,6 +5,7 @@ edition = "2021"
 description = "GitOps workflow for managing Ferrum Edge gateway configuration via pull requests"
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/ferrum-edge/ferrum-edge-git-forge-ops"
+build = "build.rs"
 
 [[bin]]
 name = "gitforgeops"

@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::config::{GatewayConfig, MeshConfigSpec};
+use crate::diagnostics::{safe_line, safe_path};
 
 /// Top-level key holding the anti-truncation seal understood by ferrum-edge's
 /// file-mode loader.
@@ -109,6 +110,131 @@ pub fn apply_file(config: &GatewayConfig, output_path: &str) -> crate::error::Re
 /// so an in-place rewrite can cost a mesh reload just as it can a gateway one.
 pub fn apply_mesh_file(mesh: &MeshConfigSpec, output_path: &str) -> crate::error::Result<()> {
     publish_document(output_path, render_mesh_yaml(mesh)?.as_bytes())
+}
+
+/// What reconciling the mesh destination against the repository's desired
+/// state does, or would do.
+///
+/// Mesh publication is a reconciliation, not an append-only write: a
+/// repository that deletes its last `MeshConfig` fragment has to converge the
+/// published document too, or every mesh node reading it keeps enforcing
+/// policy the repository no longer declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshPublication {
+    /// The repository declares at least one fragment; the merged document is
+    /// the destination's content.
+    Published,
+    /// The repository declares no fragment and gitforgeops published the
+    /// destination: it becomes the explicit empty document
+    /// (`{version, mesh: {}}`).
+    Retracted,
+    /// Same as [`Self::Retracted`], but the destination already holds exactly
+    /// that document. Nothing is written — a mesh node reloads on any content
+    /// change, and a no-op republish is not worth one.
+    AlreadyRetracted,
+    /// The repository declares no fragment and never published this
+    /// destination. Nothing to converge.
+    NeverPublished,
+    /// The repository declares no fragment, but the destination exists and is
+    /// not a document gitforgeops published. Left untouched, and reported: the
+    /// operator repointed `FERRUM_MESH_FILE_OUTPUT_PATH` at somebody else's
+    /// file, or hand-edited this one.
+    Unattributed,
+    /// No fragment was *selected*, but the run is namespace-filtered, so
+    /// absence is not evidence of deletion — the fragments may simply live in
+    /// a namespace this run cannot see. Left untouched, and reported.
+    NarrowedScope,
+}
+
+/// What a run is allowed to conclude from "the assembler produced no mesh".
+#[derive(Debug, Clone, Copy)]
+pub struct MeshRetractionScope {
+    /// The state ledger records this destination as gitforgeops-published.
+    pub ledger_attributed: bool,
+    /// This run saw every `MeshConfig` fragment the repository declares — no
+    /// `FERRUM_NAMESPACE` filter narrowed the selection. Retraction rewrites
+    /// one mesh-wide document, so a filtered run that happens to select no
+    /// fragment must never conclude the repository declares none.
+    pub covers_repository: bool,
+}
+
+/// The document a retraction publishes: the mesh section, explicitly empty.
+///
+/// ferrum-edge's `MeshFileDocument` is `deny_unknown_fields` with a
+/// **required** `mesh` field, and every field of the mesh model itself carries
+/// `#[serde(default)]` — so `mesh: {}` is the loader's way of spelling "no
+/// mesh policy", and it survives the same `ferrum-edge validate -m mesh` pass
+/// a populated document does. Removing the file instead would not: the mesh
+/// file source bails with `mesh configuration file not found` and refuses to
+/// start, which turns a policy retraction into a node outage.
+fn render_mesh_retraction() -> crate::error::Result<String> {
+    render_mesh_yaml(&MeshConfigSpec::default())
+}
+
+/// Decide what [`reconcile_mesh_file`] would do, without writing anything.
+///
+/// `plan` and `review` call this so a preview and the apply it previews cannot
+/// disagree about a pending retraction. Reading the destination is the only
+/// side effect.
+pub fn plan_mesh_publication(
+    mesh: Option<&MeshConfigSpec>,
+    output_path: &str,
+    scope: MeshRetractionScope,
+) -> crate::error::Result<MeshPublication> {
+    if mesh.is_some() {
+        return Ok(MeshPublication::Published);
+    }
+
+    let path = Path::new(output_path);
+    if !path.exists() {
+        return Ok(MeshPublication::NeverPublished);
+    }
+    if !scope.covers_repository {
+        return Ok(MeshPublication::NarrowedScope);
+    }
+    if !scope.ledger_attributed {
+        return Ok(MeshPublication::Unattributed);
+    }
+
+    // An absent destination was handled above: there is nothing stale to
+    // retract, and fabricating an empty document where the operator has none
+    // would create a file no run ever asked for.
+    let retraction = render_mesh_retraction()?;
+    match std::fs::read(path) {
+        Ok(existing) if existing == retraction.as_bytes() => Ok(MeshPublication::AlreadyRetracted),
+        // An unreadable destination is deliberately *not* swallowed here: the
+        // publish below fails loudly rather than reporting a retraction that
+        // never happened.
+        _ => Ok(MeshPublication::Retracted),
+    }
+}
+
+/// Converge the mesh destination with the repository's desired state.
+///
+/// Unlike [`apply_mesh_file`] this is total over `mesh`: `None` (the assembler
+/// found no `MeshConfig` fragment at all) retracts a document this repository
+/// published instead of silently leaving deleted mesh policy on disk. It never
+/// removes the destination and never rewrites one it cannot attribute to
+/// gitforgeops.
+pub fn reconcile_mesh_file(
+    mesh: Option<&MeshConfigSpec>,
+    output_path: &str,
+    scope: MeshRetractionScope,
+) -> crate::error::Result<MeshPublication> {
+    let publication = plan_mesh_publication(mesh, output_path, scope)?;
+    match (publication, mesh) {
+        (MeshPublication::Published, Some(mesh)) => {
+            publish_document(output_path, render_mesh_yaml(mesh)?.as_bytes())?;
+        }
+        (MeshPublication::Retracted, _) => {
+            publish_document(output_path, render_mesh_retraction()?.as_bytes())?;
+        }
+        // `Published` without a document cannot happen — `plan_mesh_publication`
+        // returns it only for `Some` — and the remaining outcomes write nothing
+        // by definition.
+        _ => {}
+    }
+    Ok(publication)
 }
 
 /// Atomically publish arbitrary export bytes with ordinary artifact
@@ -256,8 +382,9 @@ fn sync_parent_directory(
         (Err(source), PublicationPermissions::Private) => Err(crate::error::Error::Io(source)),
         (Err(source), PublicationPermissions::Regular) => {
             eprintln!(
-                "Warning: published {} but could not fsync its directory ({source}); the file is written and renamed into place, but its directory entry may not survive a host crash.",
-                parent.display()
+                "Warning: published {} but could not fsync its directory ({}); the file is written and renamed into place, but its directory entry may not survive a host crash.",
+                safe_path(parent),
+                safe_line(&source)
             );
             Ok(())
         }

@@ -233,10 +233,13 @@ jobs:
           # the current and previous resource/overlay paths from the stable PR
           # file snapshot. FERRUM_NAMESPACE later narrows both desired loading
           # and the JWT `ns` claim, so an untrusted YAML namespace override
-          # cannot turn live review into a cross-namespace read primitive. New
-          # namespaces receive static validation only until their directory is
-          # trusted on main. Protected config-only changes remain static-only
-          # because privileged review replaces candidate `.gitforgeops` files.
+          # cannot turn live review into a cross-namespace read primitive.
+          # Matrix namespaces come from protected-branch resource directories;
+          # a mistyped filter now fails `validate` closed (exit 1) rather than
+          # going green against an empty desired set. New namespaces receive
+          # static validation only until their directory is trusted on main.
+          # Protected config-only changes remain static-only because privileged
+          # review replaces candidate `.gitforgeops` files.
           targets=$(python3 trusted/.github/scripts/pr_input.py targets \
             trusted "$scopes" "$RUNNER_TEMP/trusted-changed-paths.json")
           echo "Trusted source SHA: ${{ steps.metadata.outputs.trusted_sha }}"
@@ -396,6 +399,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITFORGEOPS_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          # Authorization compares candidate YAML bytes and protected config
+          # with the reviewed head, and executable inputs with this checkout.
+          # This path is evidence to inspect, never an authorization assertion.
+          GITFORGEOPS_OVERRIDE_SOURCE: ../trusted
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           # Optional JWT claim settings; see apply-on-merge.yml for why they
@@ -407,6 +414,9 @@ jobs:
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+        # Process gate is `--require-live` (comparison + comment delivery).
+        # Offline apply blockers are rendered in the PR comment; this job
+        # does not pass `--fail-on-blockers`, which would change the gate.
         run: >-
           ../review-bin/gitforgeops review
           --pr "$GITFORGEOPS_PR_NUMBER"

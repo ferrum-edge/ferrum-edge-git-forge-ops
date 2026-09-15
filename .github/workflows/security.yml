@@ -175,15 +175,15 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           languages: rust
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/autobuild@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
 
       - name: Analyze
-        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
 
   trivy-image:
     runs-on: ubuntu-24.04
@@ -202,14 +202,50 @@ jobs:
         run: |
           docker run --rm gitforgeops:scan --help >/dev/null
           docker run --rm --entrypoint ferrum-edge gitforgeops:scan --help >/dev/null
+          # dpkg keeps a "not-installed" stub record for a purged package that
+          # other installed packages still name in their dependencies, so a
+          # plain `dpkg-query -W` succeeds for it. Read the package's actual
+          # state instead: only an absent record or a not-installed stub is
+          # acceptable; installed, held, unpacked, half-configured,
+          # config-files and trigger states all mean the purge did not take.
           for package in apt libapt-pkg7.0 libssl3t64 openssl-provider-legacy; do
-            status=$(docker run --rm --entrypoint dpkg-query gitforgeops:scan \
-              -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)
-            if [[ "$status" == ii* ]]; then
-              echo "Purged runtime package remains installed: $package" >&2
-              exit 1
-            fi
+            state=$(docker run --rm --entrypoint dpkg-query gitforgeops:scan \
+              -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+            case "$state" in
+              ""|not-installed) ;;
+              *)
+                echo "Purged runtime package remains present ($state): $package" >&2
+                exit 1
+                ;;
+            esac
           done
+
+      - name: Build override regressions with the pinned builder
+        run: |
+          docker build --target builder -t gitforgeops:test-builder .
+          mkdir -p "$RUNNER_TEMP/override-tests"
+          docker run --rm --network none \
+            -v "$PWD/tests:/build/tests:ro" \
+            -v "$RUNNER_TEMP/override-tests:/checks" \
+            gitforgeops:test-builder sh -ec '
+              cargo test --release --locked --offline --test unit_tests --no-run
+              find /build/target/release/deps -maxdepth 1 -type f \
+                -name "unit_tests-*" -executable -exec cp "{}" /checks/unit_tests \;
+              test -x /checks/unit_tests
+            '
+
+      - name: Verify override inputs inside the shipped runtime
+        run: |
+          # Exercise actual authorization input checks, including dirty source,
+          # merged descendants and split trusted review. No network, credentials,
+          # root privilege or external checkout is needed by these fixtures.
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_SYSTEM=/dev/null \
+            -v "$RUNNER_TEMP/override-tests:/checks:ro" \
+            --entrypoint /checks/unit_tests gitforgeops:scan \
+            unit::override_tests:: --nocapture
 
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -223,6 +259,6 @@ jobs:
 
       - name: Upload Trivy SARIF
         if: ${{ always() && hashFiles('trivy-results.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           sarif_file: trivy-results.sarif

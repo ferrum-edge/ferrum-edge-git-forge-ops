@@ -5,7 +5,7 @@ name: GitForgeOps State Guard
 # widens the namespace set that gets reconciled. It is written by CI only —
 # apply-on-merge.yml and rotate.yml commit it back to main as gitforgeops[bot].
 #
-# A PR that hand-edits `.state/` is therefore a privilege escalation, not a
+# A PR that hand-edits `.state` or its descendants is a privilege escalation, not a
 # config change: forged entries name live resources as "previously managed"
 # and the next post-merge apply deletes them. This job is the fence. Keeping
 # the trust boundary here — rather than narrowing what the binary is willing
@@ -76,7 +76,7 @@ jobs:
           path: trusted-guard
           persist-credentials: false
 
-      - name: Detect .state/ changes
+      - name: Detect .state and descendant changes
         id: detect
         env:
           GH_TOKEN: ${{ github.token }}
@@ -152,7 +152,7 @@ jobs:
                     ([$records[] | .filename, (.previous_filename // empty)] | unique) as $paths
                     | {
                         complete: (($records | length) == $declared and ($records | length) < 3000),
-                        matched_paths: [$paths[] | select(startswith(".state/"))]
+                        matched_paths: [$paths[] | select(. == ".state" or startswith(".state/"))]
                       }
                   end
               end
@@ -172,10 +172,10 @@ jobs:
             echo "::warning::Changed-file pagination was incomplete; an authorized state override is required."
           elif [ "$count" -eq 0 ]; then
             echo "requires_override=false" >> "$GITHUB_OUTPUT"
-            echo "No .state/ changes in this PR."
+            echo "No .state or descendant changes in this PR."
           else
             echo "requires_override=true" >> "$GITHUB_OUTPUT"
-            echo "This PR changes ${count} current or previous path(s) under .state/:"
+            echo "This PR changes ${count} current or previous .state or descendant path(s):"
             jq -r '.matched_paths[] | "  " + @json' <<< "$result"
           fi
 
@@ -244,7 +244,7 @@ jobs:
       - name: Reject unauthorized PR-authored state changes
         if: ${{ steps.detect.outputs.requires_override == 'true' && steps.authorize.outcome != 'success' }}
         run: |
-          echo "::error::This PR modifies .state/ or exceeds GitHub's complete changed-file enumeration; an authorized override is required."
+          echo "::error::This PR modifies .state or its descendants, or exceeds GitHub's complete changed-file enumeration; an authorized override is required."
           cat >> "$GITHUB_STEP_SUMMARY" <<'MSG'
           ## Blocked: protected state scope cannot be cleared automatically
 
@@ -257,8 +257,8 @@ jobs:
           unseen tail could contain a protected state path.
 
           It is maintained by CI: `apply-on-merge.yml` and `rotate.yml` commit
-          it as `gitforgeops[bot]` after a successful run. Drop the `.state/`
-          changes from this PR and let the next apply write them.
+          it as `gitforgeops[bot]` after a successful run. Drop changes to `.state`
+          and its descendants from this PR and let the next apply write them.
 
           If you are deliberately repairing or seeding the ledger, a user with
           current `write`, `maintain`, or `admin` repository permission can add

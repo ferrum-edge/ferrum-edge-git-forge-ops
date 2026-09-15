@@ -595,6 +595,7 @@ fn make_proxy(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Proxy {
         spec: Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             name: None,
@@ -649,8 +650,8 @@ fn make_proxy(id: &str) -> Resource {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         },
     }
 }
@@ -659,6 +660,7 @@ fn make_consumer(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Consumer {
         spec: Consumer {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             username: id.to_string(),
@@ -666,8 +668,8 @@ fn make_consumer(id: &str) -> Resource {
             custom_id: None,
             credentials: Default::default(),
             acl_groups: vec![],
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         },
     }
 }
@@ -676,6 +678,7 @@ fn make_upstream(id: &str) -> Resource {
     use gitforgeops::config::schema::*;
     Resource::Upstream {
         spec: Upstream {
+            labels: Default::default(),
             extra: Default::default(),
             id: id.to_string(),
             name: None,
@@ -701,8 +704,8 @@ fn make_upstream(id: &str) -> Resource {
             backend_tls_sni: None,
             backend_tls_san_allow_list: vec![],
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         },
     }
 }
@@ -725,6 +728,7 @@ fn consumer_config_with_credentials(
     let map: std::collections::BTreeMap<String, serde_json::Value> =
         serde_json::from_value(credentials).unwrap();
     cfg.consumers.push(Consumer {
+        labels: Default::default(),
         extra: Default::default(),
         id: "app".to_string(),
         username: "app".to_string(),
@@ -732,8 +736,8 @@ fn consumer_config_with_credentials(
         custom_id: None,
         credentials: map,
         acl_groups: vec![],
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     cfg
 }
@@ -905,7 +909,7 @@ fn assemble_emits_canonical_array_credentials_from_the_fixture() {
     let creds = &config.consumers[0].credentials;
     assert_eq!(
         creds["keyauth"],
-        serde_json::json!([{"key": "alice-secret-key-12345"}]),
+        serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
         "assemble must hand downstream diff/apply the array form the gateway returns"
     );
 }
@@ -974,4 +978,45 @@ fn overlay_additive_arrays_stay_scoped_to_their_kind() {
 
     // `spec.targets` is additive by host:port:path, unchanged by mesh support.
     assert!(config.upstreams[0].targets.len() > 1);
+}
+
+#[test]
+fn provisioner_labels_round_trip_and_do_not_overwrite_imported_origins() {
+    let mut config = assemble_gateway(load_resources(&fixtures_dir()).unwrap());
+    let labels = &mut config.proxies[0].labels;
+    assert_eq!(
+        labels.get("provisioned-by").unwrap(),
+        "ferrum-edge-git-forge-ops"
+    );
+    for labels in [
+        &config.consumers[0].labels,
+        &config.upstreams[0].labels,
+        &config.plugin_configs[0].labels,
+    ] {
+        assert_eq!(
+            labels.get("provisioned-by").unwrap(),
+            "ferrum-edge-git-forge-ops"
+        );
+    }
+    config.proxies[0]
+        .labels
+        .insert("provisioned-by".into(), "ferrum-nexus".into());
+    config.proxies[0]
+        .labels
+        .insert("team".into(), "platform".into());
+    let resources = vec![(
+        "ferrum".to_string(),
+        Resource::Proxy {
+            spec: config.proxies[0].clone(),
+        },
+    )];
+    let assembled = assemble_gateway(resources);
+    assert_eq!(assembled.proxies[0].labels, config.proxies[0].labels);
+    let exported = serde_yaml::to_string(&assembled).unwrap();
+    let reloaded: GatewayConfig = serde_yaml::from_str(&exported).unwrap();
+    assert_eq!(reloaded.proxies[0].labels, config.proxies[0].labels);
+    assert_eq!(
+        serde_json::to_value(&assembled).unwrap(),
+        serde_json::to_value(&reloaded).unwrap()
+    );
 }

@@ -12,6 +12,6 @@ pub use resource_diff::{
     SpecOwnedResource, UnmanagedResource,
 };
 pub use security::{
-    audit_security, audit_security_with_policy, security_blockers, SecurityFinding,
-    BLOCKING_SEVERITY,
+    audit_security, audit_security_with_policy, audit_security_with_scope, security_blockers,
+    SecurityFinding, BLOCKING_SEVERITY,
 };

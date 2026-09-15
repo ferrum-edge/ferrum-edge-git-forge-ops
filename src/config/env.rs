@@ -81,6 +81,12 @@ pub struct EnvConfig {
     pub gateway_mode: GatewayMode,
     /// How to apply config changes.
     pub apply_strategy: ApplyStrategy,
+    /// Permit nontransactional proxy/plugin attachment on batch 501/413.
+    pub allow_nontransactional_plugin_attach: bool,
+    /// Exit 1 from `review` when the same offline apply blockers that make
+    /// `plan` exit 1 are present. Default stays 0 for compatibility; the
+    /// rendered comment is unchanged.
+    pub review_fail_on_blockers: bool,
     /// Overlay name to apply (e.g. `production`, `staging`).
     pub overlay: Option<String>,
     /// Selected environment name (from repo config). Takes precedence over `overlay` if set.
@@ -170,6 +176,8 @@ impl Default for EnvConfig {
             admin_jwt_ttl_secs: DEFAULT_JWT_TTL_SECS,
             namespace_filter: None,
             allow_unknown_fields: false,
+            allow_nontransactional_plugin_attach: false,
+            review_fail_on_blockers: false,
             gateway_mode: GatewayMode::default(),
             apply_strategy: ApplyStrategy::default(),
             overlay: None,
@@ -213,6 +221,8 @@ impl Default for EnvConfig {
 /// | `FERRUM_ADMIN_JWT_TTL_SECS`  | `admin_jwt_ttl_secs` | `3600`                         |
 /// | `FERRUM_NAMESPACE`           | `namespace_filter` | `None`                           |
 /// | `FERRUM_ALLOW_UNKNOWN_FIELDS`| `allow_unknown_fields` | `false` (unknown fields are rejected) |
+/// | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `allow_nontransactional_plugin_attach` | `false` (batch cycles require transactions) |
+/// | `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `review_fail_on_blockers` | `false` (`review` exit stays 0 on offline apply blockers) |
 /// | `FERRUM_GATEWAY_MODE`        | `gateway_mode`     | `api`                            |
 /// | `FERRUM_APPLY_STRATEGY`      | `apply_strategy`   | `incremental`                    |
 /// | `FERRUM_OVERLAY`             | `overlay`          | `None`                           |
@@ -235,6 +245,11 @@ impl Default for EnvConfig {
 /// | `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS`  | `github_connect_timeout_secs`  | `10`        |
 /// | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`  | `github_request_timeout_secs`  | `30`        |
 /// | `FERRUM_GATEWAY_MAX_RETRIES`          | `gateway_max_retries`          | `3`         |
+///
+/// `FERRUM_NAMESPACE` is a filter, not an allow-empty switch. `validate`,
+/// `plan`, and `diff` refuse a filter that selects zero desired resources while
+/// the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` is the
+/// CLI-only acknowledgement that demotes that finding to a warning.
 pub fn load_env_config() -> crate::error::Result<EnvConfig> {
     let gateway_mode = match normalized_env("FERRUM_GATEWAY_MODE").as_deref() {
         None | Some("api") => GatewayMode::Api,
@@ -293,6 +308,11 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         )?,
         namespace_filter: non_empty_env("FERRUM_NAMESPACE"),
         allow_unknown_fields: parse_bool_env("FERRUM_ALLOW_UNKNOWN_FIELDS", false)?,
+        allow_nontransactional_plugin_attach: parse_bool_env(
+            "GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH",
+            false,
+        )?,
+        review_fail_on_blockers: parse_bool_env("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", false)?,
         gateway_mode,
         apply_strategy,
         overlay: non_empty_env("FERRUM_OVERLAY"),

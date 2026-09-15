@@ -656,11 +656,16 @@ class AgentSetupTests(unittest.TestCase):
             )
             acquire = (
                 'set -e; source "$1"; acquire_worktree_dispatch_lock "$2"; '
-                'printf "acquired\\n"; sleep 30'
+                'printf "acquired\\n"; IFS= read -r release'
             )
+            # Block in a shell builtin with an open stdin pipe. With `sleep`,
+            # SIGTERM can reach bash after the readiness printf but before it
+            # forks the child; that new child misses the group signal and
+            # delays the shell's cleanup trap for the entire sleep duration.
             holder = subprocess.Popen(
                 ["bash", "-c", acquire, "bash", helper, str(linked)],
                 cwd=directory,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -669,6 +674,7 @@ class AgentSetupTests(unittest.TestCase):
             self.assertEqual(holder.stdout.readline(), "acquired\n")
             os.killpg(holder.pid, signal.SIGKILL)
             holder.wait(timeout=5)
+            holder.stdin.close()
             holder.stdout.close()
             holder.stderr.close()
 
@@ -676,7 +682,7 @@ class AgentSetupTests(unittest.TestCase):
                 [
                     "bash",
                     "-c",
-                    acquire.replace('; printf "acquired\\n"; sleep 30', ""),
+                    acquire.replace('; printf "acquired\\n"; IFS= read -r release', ""),
                     "bash",
                     helper,
                     str(linked),
@@ -702,6 +708,7 @@ class AgentSetupTests(unittest.TestCase):
                 subprocess.Popen(
                     ["bash", "-c", acquire, "bash", helper, str(linked)],
                     cwd=directory,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,

@@ -1,6 +1,7 @@
 pub mod assembler;
 pub mod env;
 pub mod loader;
+pub mod namespace_guard;
 pub mod repo_config;
 pub mod resolved;
 pub mod schema;
@@ -12,6 +13,10 @@ pub use assembler::{
 };
 pub use env::{load_env_config, ApplyStrategy, EnvConfig, GatewayMode};
 pub use loader::{load_resources, load_resources_with_options};
+pub use namespace_guard::{
+    gateway_resource_count, merge_scope_json, NamespaceFilterFinding, NamespaceScope,
+    EMPTY_NAMESPACE_EXIT_CODE,
+};
 pub use repo_config::{
     EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
 };

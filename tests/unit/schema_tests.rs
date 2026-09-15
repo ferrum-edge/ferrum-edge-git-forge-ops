@@ -463,6 +463,67 @@ spec:
 }
 
 #[test]
+fn kubernetes_service_discovery_address_type_roundtrips() {
+    let with_type = r#"
+kind: Upstream
+spec:
+  id: "pool-k8s"
+  targets: []
+  service_discovery:
+    provider: kubernetes
+    kubernetes:
+      service_name: "checkout"
+      namespace: "prod"
+      address_type: IPv6
+"#;
+    let spec = match serde_yaml::from_str::<Resource>(with_type).unwrap() {
+        Resource::Upstream { spec } => spec,
+        _ => panic!("expected Upstream"),
+    };
+    let sd = spec
+        .service_discovery
+        .as_ref()
+        .expect("service_discovery preserved");
+    let k8s = sd.kubernetes.as_ref().expect("kubernetes block preserved");
+    assert_eq!(k8s.address_type.as_deref(), Some("IPv6"));
+
+    let round = serde_yaml::to_string(&spec).unwrap();
+    let reparsed: Upstream = serde_yaml::from_str(&round).unwrap();
+    let reparsed_k8s = reparsed
+        .service_discovery
+        .expect("service_discovery preserved")
+        .kubernetes
+        .expect("kubernetes block preserved");
+    assert_eq!(reparsed_k8s.address_type.as_deref(), Some("IPv6"));
+
+    // Absent `address_type` stays absent (no fabricated default), so a
+    // kubernetes block without it round-trips unchanged.
+    let without_type = r#"
+kind: Upstream
+spec:
+  id: "pool-k8s-auto"
+  targets: []
+  service_discovery:
+    provider: kubernetes
+    kubernetes:
+      service_name: "checkout"
+"#;
+    let spec = match serde_yaml::from_str::<Resource>(without_type).unwrap() {
+        Resource::Upstream { spec } => spec,
+        _ => panic!("expected Upstream"),
+    };
+    assert_eq!(
+        spec.service_discovery
+            .as_ref()
+            .and_then(|sd| sd.kubernetes.as_ref())
+            .and_then(|k| k.address_type.as_deref()),
+        None
+    );
+    let round = serde_yaml::to_string(&spec).unwrap();
+    assert!(!round.contains("address_type"), "{round}");
+}
+
+#[test]
 fn upstream_health_check_and_cookie_extensions_roundtrip() {
     let yaml = r#"
 kind: Upstream
@@ -768,4 +829,59 @@ fn mesh_config_id_is_absent_from_a_default_fragment() {
     assert!(id.is_none());
     assert!(spec.is_empty());
     assert_eq!(serde_yaml::to_string(&spec).unwrap().trim(), "{}");
+}
+
+#[test]
+fn known_credential_types_match_the_ferrum_edge_builtin_set() {
+    assert_eq!(
+        KNOWN_CREDENTIAL_TYPES,
+        ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"]
+    );
+    for known in KNOWN_CREDENTIAL_TYPES {
+        assert!(is_known_credential_type(known));
+    }
+    assert!(!is_known_credential_type("api_key"));
+    assert!(!is_known_credential_type("basic_auth"));
+    assert!(!is_known_credential_type("KEYAUTH"));
+    assert_eq!(suggest_credential_type("api_key"), Some("keyauth"));
+    assert_eq!(suggest_credential_type("API_KEY"), Some("keyauth"));
+    assert_eq!(suggest_credential_type("basic_auth"), Some("basicauth"));
+    assert_eq!(suggest_credential_type("vendor_token"), None);
+    let message = unknown_credential_type_message("api_key", "app", "ferrum");
+    assert!(message.contains("Unknown credential type 'api_key'"));
+    assert!(message.contains("on consumer app in namespace ferrum"));
+    assert!(message.contains("did you mean 'keyauth'"));
+    assert!(message.contains(&recognized_credential_types_list()));
+}
+
+#[test]
+fn resource_labels_are_typed_metadata_on_every_gateway_kind() {
+    let labels = serde_json::json!({"provisioned-by":"ferrum-foundry","team":"platform"});
+    for (kind, mut spec) in [
+        (
+            "Proxy",
+            serde_json::json!({"backend_host":"example.com","backend_port":443}),
+        ),
+        ("Consumer", serde_json::json!({"username":"alice"})),
+        ("Upstream", serde_json::json!({"targets":[]})),
+        (
+            "PluginConfig",
+            serde_json::json!({"plugin_name":"cors","scope":"global"}),
+        ),
+    ] {
+        spec["labels"] = labels.clone();
+        let resource: gitforgeops::config::schema::Resource =
+            serde_json::from_value(serde_json::json!({"kind":kind,"spec":spec})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&resource).unwrap()["spec"]["labels"],
+            labels
+        );
+        spec["labels"] = serde_json::json!({"team":42});
+        assert!(
+            serde_json::from_value::<gitforgeops::config::schema::Resource>(
+                serde_json::json!({"kind":kind,"spec":spec})
+            )
+            .is_err()
+        );
+    }
 }

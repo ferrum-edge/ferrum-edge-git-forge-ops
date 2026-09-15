@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::EnvConfig;
+use crate::diagnostics::{safe, safe_line};
 use crate::jwt::{self, JwtOptions};
 
 /// Page size requested from paginated list endpoints. The server clamps to
@@ -394,7 +395,7 @@ impl AdminClient {
             self.saw_cached_backup.store(true, Ordering::Relaxed);
         }
 
-        let mut snapshot = BackupSnapshot::from_body(&resp.body)?;
+        let mut snapshot = BackupSnapshot::from_scoped_body(&resp.body, namespace)?;
         snapshot.cached = cached;
         // A live read never fails on the count seal (see `SealStrictness`),
         // but an operator should know the gateway's own inventory disagreed
@@ -402,9 +403,23 @@ impl AdminClient {
         // refusal, because that document becomes permanent repo state.
         if let Some(notice) = snapshot.seal_violation_notice() {
             eprintln!(
-                "Warning: GET /backup for namespace '{namespace}' returned a count seal that does not match the document ({notice}). The seal was discarded; resource data is used as received."
+                "Warning: GET /backup for namespace '{}' returned a count seal that does not match the document ({}). The seal was discarded; resource data is used as received.",
+                safe(namespace),
+                safe_line(notice)
             );
         }
+        Ok(snapshot)
+    }
+
+    /// Fetch a backup that will be used to authorize gateway or ownership
+    /// mutations. Unlike read-only live comparisons, mutation paths must not
+    /// act on resource arrays that disagree with the gateway's count seal.
+    pub async fn get_backup_snapshot_for_mutation(
+        &self,
+        namespace: &str,
+    ) -> crate::error::Result<BackupSnapshot> {
+        let snapshot = self.get_backup_snapshot(namespace).await?;
+        snapshot.require_consistent_seal(namespace)?;
         Ok(snapshot)
     }
 
@@ -1211,12 +1226,13 @@ impl BackupExtras {
 ///   permanent desired state. A seal that does not match means the source may
 ///   be truncated, and publishing a partial tree is unrecoverable, so it is a
 ///   hard error.
-/// * **Live reads** (`diff`, `plan`, `apply`, drift-check) run against a
+/// * **Read-only live comparisons** (`diff`, `plan`, review, drift-check) run against a
 ///   gateway whose seal is emitted by a different codebase on every request.
 ///   A gateway that omits `counts.upstreams`, or a cached-fallback export that
 ///   elides `api_specs` while retaining `counts.api_specs`, would otherwise
-///   take every one of those commands down over metadata that no decision is
-///   made from. Record the disagreement, drop the seal, and keep going.
+///   take those commands down over metadata that no mutation is authorized
+///   from. Record the disagreement, drop the seal, and keep going. Apply and
+///   API-target mutation paths re-establish strictness before using the data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealStrictness {
     /// Import: a disagreeing seal fails the read.
@@ -1256,6 +1272,29 @@ pub struct BackupSnapshot {
 }
 
 impl BackupSnapshot {
+    /// Validate wire identities before repository-oriented defaults can invent them.
+    pub fn from_scoped_body(body: &str, namespace: &str) -> crate::error::Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+        for section in ["proxies", "consumers", "upstreams", "plugin_configs"] {
+            if let Some(rows) = value.get(section).and_then(serde_json::Value::as_array) {
+                for row in rows {
+                    if row.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace) {
+                        let id = row
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("?");
+                        return Err(crate::error::Error::BackupNamespace(format!(
+                            "namespace-scoped backup for {namespace:?} returned {section} {id:?} \
+                             with a missing or foreign namespace; refusing the snapshot"
+                        )));
+                    }
+                }
+            }
+        }
+        Self::from_value_with_strictness(value, SealStrictness::Advisory)
+    }
+
     /// Parse a backup body. The four managed sections deserialize into the
     /// permissive `GatewayConfig`; the rest is picked out by key. Unknown
     /// future top-level sections are retained by name so full-replace can fail
@@ -1393,6 +1432,16 @@ impl BackupSnapshot {
             return None;
         }
         Some(self.seal_violations.join("; "))
+    }
+
+    /// Refuse to use a potentially truncated live backup for a mutation.
+    pub fn require_consistent_seal(&self, namespace: &str) -> crate::error::Result<()> {
+        if let Some(notice) = self.seal_violation_notice() {
+            return Err(crate::error::Error::Config(format!(
+                "refusing to mutate namespace '{namespace}': the backup's count seal does not match the document it sealed ({notice}). The snapshot may be truncated; retry after the gateway returns a consistent backup"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1661,12 +1710,13 @@ impl BatchCreate {
 /// Split a batch so no single request exceeds the gateway's 1 MiB body cap.
 ///
 /// Items are packed in dependency order (upstreams and consumers, then
-/// proxies, then plugin configs), so a chunk boundary never puts a proxy in an
-/// earlier request than the upstream it references. Each chunk is still
+/// plugin/proxy groups). Associated proxies and plugin configs in this batch
+/// stay in one transaction: scoped configs require their proxy to exist and
+/// proxies require their referenced configs. Each chunk is still
 /// all-or-nothing on its own; the caller reports partial progress if a later
 /// chunk fails.
 ///
-/// A single item larger than the cap is emitted in a chunk of its own — the
+/// A single dependency group larger than the cap is emitted on its own — the
 /// gateway will reject it with 413, which is a clearer diagnostic than a
 /// silent drop.
 ///
@@ -1675,55 +1725,126 @@ impl BatchCreate {
 /// entire payload (on top of the caller's clone out of `desired`).
 pub fn split_batch(batch: BatchCreate, max_bytes: usize) -> crate::error::Result<Vec<BatchCreate>> {
     let budget = max_bytes.saturating_sub(BATCH_ENVELOPE_OVERHEAD).max(1);
-
-    enum Item {
-        Upstream(Upstream),
-        Consumer(Consumer),
-        Proxy(Proxy),
-        PluginConfig(PluginConfig),
-    }
-
-    let mut ordered: Vec<(Item, usize)> = Vec::with_capacity(batch.len());
-    for u in batch.upstreams {
-        let size = serde_json::to_vec(&u)?.len();
-        ordered.push((Item::Upstream(u), size));
-    }
-    for c in batch.consumers {
-        let size = serde_json::to_vec(&c)?.len();
-        ordered.push((Item::Consumer(c), size));
-    }
-    for p in batch.proxies {
-        let size = serde_json::to_vec(&p)?.len();
-        ordered.push((Item::Proxy(p), size));
-    }
-    for pc in batch.plugin_configs {
-        let size = serde_json::to_vec(&pc)?.len();
-        ordered.push((Item::PluginConfig(pc), size));
-    }
-
     let mut chunks: Vec<BatchCreate> = Vec::new();
     let mut current = BatchCreate::default();
     let mut current_bytes = 0usize;
 
-    for (item, size) in ordered {
-        // `+ 1` accounts for the array separator between entries.
-        if !current.is_empty() && current_bytes + size + 1 > budget {
+    for group in batch_dependency_groups(batch) {
+        // Counting a complete envelope per group is conservative and keeps
+        // the actual merged body below the cap whenever each group fits.
+        let size = serde_json::to_vec(&group)?.len();
+        if !current.is_empty() && current_bytes + size > budget {
             chunks.push(std::mem::take(&mut current));
             current_bytes = 0;
         }
-        match item {
-            Item::Upstream(u) => current.upstreams.push(u),
-            Item::Consumer(c) => current.consumers.push(c),
-            Item::Proxy(p) => current.proxies.push(p),
-            Item::PluginConfig(pc) => current.plugin_configs.push(pc),
-        }
-        current_bytes += size + 1;
+        current.upstreams.extend(group.upstreams);
+        current.consumers.extend(group.consumers);
+        current.plugin_configs.extend(group.plugin_configs);
+        current.proxies.extend(group.proxies);
+        current_bytes += size;
     }
 
     if !current.is_empty() {
         chunks.push(current);
     }
     Ok(chunks)
+}
+
+/// Connected proxy/plugin create components must never cross a chunk boundary.
+fn batch_dependency_groups(mut batch: BatchCreate) -> Vec<BatchCreate> {
+    fn root(parents: &mut [usize], mut index: usize) -> usize {
+        while parents[index] != index {
+            parents[index] = parents[parents[index]];
+            index = parents[index];
+        }
+        index
+    }
+
+    // Stable component roots and payload order regardless of caller input.
+    // Association order inside each proxy remains untouched.
+    batch
+        .upstreams
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+    batch
+        .consumers
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+    batch
+        .plugin_configs
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+    batch
+        .proxies
+        .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
+    let mut groups = Vec::new();
+    for upstream in batch.upstreams {
+        groups.push(BatchCreate {
+            upstreams: vec![upstream],
+            ..Default::default()
+        });
+    }
+    for consumer in batch.consumers {
+        groups.push(BatchCreate {
+            consumers: vec![consumer],
+            ..Default::default()
+        });
+    }
+    let plugin_count = batch.plugin_configs.len();
+    let mut parents: Vec<_> = (0..plugin_count + batch.proxies.len()).collect();
+    let plugins: std::collections::BTreeMap<_, _> = batch
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| ((p.namespace.as_str(), p.id.as_str()), i))
+        .collect();
+    let proxies: std::collections::BTreeMap<_, _> = batch
+        .proxies
+        .iter()
+        .enumerate()
+        .map(|(i, p)| ((p.namespace.as_str(), p.id.as_str()), plugin_count + i))
+        .collect();
+    let mut join = |a, b| {
+        let a = root(&mut parents, a);
+        let b = root(&mut parents, b);
+        parents[b] = a;
+    };
+    for (i, proxy) in batch.proxies.iter().enumerate() {
+        for association in &proxy.plugins {
+            if let Some(&plugin) = plugins.get(&(
+                proxy.namespace.as_str(),
+                association.plugin_config_id.as_str(),
+            )) {
+                join(plugin, plugin_count + i);
+            }
+        }
+    }
+    for (i, plugin) in batch.plugin_configs.iter().enumerate() {
+        if plugin.scope != crate::config::schema::PluginScope::Proxy {
+            continue;
+        }
+        if let Some(proxy) = plugin
+            .proxy_id
+            .as_deref()
+            .and_then(|id| proxies.get(&(plugin.namespace.as_str(), id)))
+        {
+            join(i, *proxy);
+        }
+    }
+    let mut connected = std::collections::BTreeMap::<usize, BatchCreate>::new();
+    for (i, plugin) in batch.plugin_configs.into_iter().enumerate() {
+        connected
+            .entry(root(&mut parents, i))
+            .or_default()
+            .plugin_configs
+            .push(plugin);
+    }
+    for (i, proxy) in batch.proxies.into_iter().enumerate() {
+        connected
+            .entry(root(&mut parents, plugin_count + i))
+            .or_default()
+            .proxies
+            .push(proxy);
+    }
+    groups.extend(connected.into_values());
+    groups
 }
 
 // --- Health ------------------------------------------------------------------

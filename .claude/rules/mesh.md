@@ -17,10 +17,16 @@ paths:
   merge by `(name, namespace)`. Deep-equal duplicates deduplicate, while conflicting identities or
   singleton fields are errors naming both fragments.
 - Arrays not explicitly documented as additive replace during overlay application.
-- Respect namespace filtering before merge. No selected fragments means no mesh output document.
+- Respect namespace filtering before merge. A namespace-filtered run that selects no fragment
+  publishes nothing and must never treat the empty selection as evidence that the repository
+  declares no mesh.
 - Mesh is file-only. File-mode export/apply publishes it atomically to
   `FERRUM_MESH_FILE_OUTPUT_PATH`; API-mode apply validates it and reports that no mesh admin API
   exists rather than attempting a push.
+- Publication reconciles. Removing the last fragment retracts the destination by rewriting it as
+  `{version: '1', mesh: {}}` — never by deleting it, and never on a path gitforgeops cannot
+  attribute to itself through the state ledger or its own renderer output. Retraction failures are
+  errors, never silent successes, and `plan`, `apply`, `export` and PR review all report it.
 - Validate rendered mesh bytes through `ferrum-edge validate -m mesh` with the same scrubbed child
   environment and private temporary-file handling as gateway validation.
 - Preserve unknown mesh fields in the permissive mirror while omitting runtime-derived fields that

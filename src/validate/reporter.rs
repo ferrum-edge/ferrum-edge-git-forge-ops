@@ -1,7 +1,8 @@
 use super::runner::ValidationResult;
+use crate::diagnostics::sanitize_block;
 
 /// Output format for validation results.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     /// Human-readable text output.
     Text,
@@ -63,7 +64,8 @@ pub fn format_results(
                 "gateway": result_json(gateway),
                 "mesh": result_json(mesh),
             });
-            serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+            crate::json_output::pretty(&json)
+                .unwrap_or_else(|_| crate::json_output::terminate("{}".to_string()))
         }
         OutputFormat::GithubAnnotations => {
             let mut output = format_github_annotations(gateway);
@@ -96,16 +98,25 @@ fn format_text(result: &ValidationResult) -> String {
         output.push_str("Validation failed.\n");
     }
 
+    // The child's streams echo repository YAML back at the operator, so they
+    // carry attacker-controlled bytes into whatever reads this text — in CI,
+    // an Actions job log that parses `::…::` at the start of a line as a
+    // workflow command. `sanitize_block` keeps the report's line structure and
+    // neutralizes exactly that. The GitHub-annotation format below is
+    // deliberately left alone: it emits real workflow commands and escapes
+    // their data with `escape_workflow_command_data`.
     if !result.stdout.is_empty() {
-        output.push_str(&result.stdout);
-        if !result.stdout.ends_with('\n') {
+        let stdout = sanitize_block(&result.stdout);
+        output.push_str(&stdout);
+        if !stdout.ends_with('\n') {
             output.push('\n');
         }
     }
 
     if !result.stderr.is_empty() {
-        output.push_str(&result.stderr);
-        if !result.stderr.ends_with('\n') {
+        let stderr = sanitize_block(&result.stderr);
+        output.push_str(&stderr);
+        if !stderr.ends_with('\n') {
             output.push('\n');
         }
     }
@@ -124,7 +135,8 @@ fn result_json(result: &ValidationResult) -> serde_json::Value {
 
 fn format_json(result: &ValidationResult) -> String {
     // Safe: serde_json::to_string_pretty on a Value always succeeds
-    serde_json::to_string_pretty(&result_json(result)).unwrap_or_else(|_| "{}".to_string())
+    crate::json_output::pretty(&result_json(result))
+        .unwrap_or_else(|_| crate::json_output::terminate("{}".to_string()))
 }
 
 fn format_github_annotations(result: &ValidationResult) -> String {
@@ -137,7 +149,7 @@ fn format_github_annotations(result: &ValidationResult) -> String {
             continue;
         }
 
-        let lower = trimmed.to_lowercase();
+        let lower = without_namespace_label(trimmed).to_lowercase();
         if lower.contains("error") {
             output.push_str(&format!(
                 "::error ::{}\n",
@@ -158,7 +170,7 @@ fn format_github_annotations(result: &ValidationResult) -> String {
             continue;
         }
 
-        let lower = trimmed.to_lowercase();
+        let lower = without_namespace_label(trimmed).to_lowercase();
         if lower.contains("error") {
             output.push_str(&format!(
                 "::error ::{}\n",
@@ -183,9 +195,36 @@ fn format_github_annotations(result: &ValidationResult) -> String {
     output
 }
 
+/// Classify the child's diagnostic, retaining the runner's namespace label
+/// only in the emitted annotation. A namespace named `errors` must not turn
+/// every labeled line into an error. Runner labels use Rust debug quoting.
+fn without_namespace_label(line: &str) -> &str {
+    let Some(tail) = line.strip_prefix("[namespace \"") else {
+        return line;
+    };
+    let mut escaped = false;
+    for (index, character) in tail.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return tail[index + 1..].strip_prefix("] ").unwrap_or(line);
+        }
+    }
+    line
+}
+
 fn escape_workflow_command_data(value: &str) -> String {
     value
         .replace('%', "%25")
         .replace('\r', "%0D")
         .replace('\n', "%0A")
+}
+
+/// One GitHub Actions workflow command. Used by `validate --format
+/// github-annotations` for findings the reporter did not parse out of the
+/// validator's streams (the empty-namespace-filter guard).
+pub fn workflow_annotation(level: &str, message: &str) -> String {
+    format!("::{level} ::{}\n", escape_workflow_command_data(message))
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::GatewayConfig;
+use crate::config::{validate_env_name_is_safe_path_component, GatewayConfig};
 use crate::diff::resource_diff::{state_key, state_key_namespace};
 
 pub const STATE_DIR: &str = ".state";
@@ -29,6 +29,12 @@ pub struct OverrideRecord {
     pub commit: String,
     pub approver: String,
     pub recorded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<u64>,
 }
 
 /// Per-environment state file at `.state/<env>.json`. Written by apply +
@@ -53,6 +59,15 @@ pub struct StateFile {
     pub credential_shard_count: u32,
     #[serde(default)]
     pub overrides: Vec<OverrideRecord>,
+    /// The mesh-document destination this repository has published to, if it
+    /// ever has. It is the *attribution* record for
+    /// `FERRUM_MESH_FILE_OUTPUT_PATH`: retraction (rewriting the destination
+    /// as an empty mesh document once the last `MeshConfig` fragment is gone)
+    /// only ever touches a path gitforgeops itself wrote. Holds a path, never
+    /// any mesh content — the document is a public artifact, but the ledger is
+    /// not where it lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_document_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -62,7 +77,55 @@ pub struct StateLock {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if matches!(state_directory_exists(), Ok(true)) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Inspect the directory entry itself: following a symlink here would let an
+/// unprotected repository path supply the shared-mode ownership ledger.
+fn state_directory_exists() -> crate::error::Result<bool> {
+    match std::fs::symlink_metadata(STATE_DIR) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(crate::error::Error::Config(format!(
+            "{STATE_DIR} must be a real directory; symlinks and non-directories are refused"
+        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(crate::error::Error::Io(source)),
+    }
+}
+
+fn ensure_state_directory() -> crate::error::Result<()> {
+    if !state_directory_exists()? {
+        match std::fs::create_dir(STATE_DIR) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(crate::error::Error::Io(source)),
+        }
+    }
+    if !state_directory_exists()? {
+        return Err(crate::error::Error::Config(format!(
+            "{STATE_DIR} disappeared while preparing the state directory"
+        )));
+    }
+    Ok(())
+}
+
+/// Call only with a direct child of `.state`, after validating the environment
+/// name. No intermediate path component beneath `.state` is permitted.
+fn state_file_exists(path: &Path) -> crate::error::Result<bool> {
+    if !state_directory_exists()? {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(crate::error::Error::Config(format!(
+            "{} must be a regular state file; symlinks and non-files are refused",
+            path.display()
+        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(crate::error::Error::Io(source)),
     }
 }
 
@@ -82,6 +145,7 @@ impl Default for StateFile {
             credentials: HashMap::new(),
             credential_shard_count: default_shard_count(),
             overrides: Vec::new(),
+            mesh_document_path: None,
         }
     }
 }
@@ -92,8 +156,10 @@ impl StateFile {
     }
 
     pub fn lock(environment: &str) -> crate::error::Result<StateLock> {
-        std::fs::create_dir_all(STATE_DIR)?;
+        validate_env_name_is_safe_path_component(environment)?;
+        ensure_state_directory()?;
         let path = Path::new(STATE_DIR).join(format!("{environment}.lock"));
+        state_file_exists(&path)?;
         // This lock is deliberately fail-closed: a crashed process can leave a
         // stale file behind, and operators must remove it after inspecting the
         // recorded PID/time. Automatic stale detection is unreliable across CI
@@ -126,15 +192,16 @@ impl StateFile {
     }
 
     pub fn load(environment: &str) -> crate::error::Result<Self> {
+        validate_env_name_is_safe_path_component(environment)?;
         let path = Self::path_for(environment);
+        if !state_file_exists(&path)? {
+            return Ok(Self {
+                environment: environment.to_string(),
+                ..Self::default()
+            });
+        }
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    environment: environment.to_string(),
-                    ..Self::default()
-                });
-            }
             Err(source) => return Err(crate::error::Error::FileRead { path, source }),
         };
 
@@ -174,9 +241,11 @@ impl StateFile {
     }
 
     pub fn save(&self) -> crate::error::Result<()> {
+        validate_env_name_is_safe_path_component(&self.environment)?;
         self.validate_resource_keys()?;
-        std::fs::create_dir_all(STATE_DIR)?;
+        ensure_state_directory()?;
         let path = Self::path_for(&self.environment);
+        state_file_exists(&path)?;
         let tmp_path = path.with_extension(format!(
             "json.tmp.{}.{}",
             std::process::id(),
@@ -201,6 +270,7 @@ impl StateFile {
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
             drop(file);
+            state_file_exists(&path)?;
             std::fs::rename(&tmp_path, &path)?;
             if let Ok(dir) = std::fs::File::open(STATE_DIR) {
                 let _ = dir.sync_all();
@@ -208,7 +278,7 @@ impl StateFile {
             Ok(())
         })();
 
-        if write_result.is_err() {
+        if write_result.is_err() && matches!(state_directory_exists(), Ok(true)) {
             let _ = std::fs::remove_file(&tmp_path);
         }
 
@@ -217,9 +287,10 @@ impl StateFile {
 
     /// True when this appears to be the first apply for this environment: no
     /// prior state on disk. Used to decide whether `shared` ownership needs
-    /// a bootstrap warning.
-    pub fn is_first_apply(environment: &str) -> bool {
-        !Self::path_for(environment).exists()
+    /// a bootstrap warning. Invalid state paths are errors, not a first apply.
+    pub fn is_first_apply(environment: &str) -> crate::error::Result<bool> {
+        validate_env_name_is_safe_path_component(environment)?;
+        Ok(!state_file_exists(&Self::path_for(environment))?)
     }
 
     /// Rewrite the `resources` map with a non-secret ownership marker for every resource in
@@ -604,7 +675,57 @@ impl StateFile {
             commit: commit.to_string(),
             approver: approver.to_string(),
             recorded_at: chrono::Utc::now().to_rfc3339(),
+            pr_number: None,
+            authorized_head: None,
+            review_id: None,
         });
+    }
+
+    pub fn record_verified_override(
+        &mut self,
+        rule_id: &str,
+        decision: &crate::policy::OverrideDecision,
+    ) {
+        if let (true, Some(approver), Some(commit), Some(pr), Some(head), Some(review)) = (
+            decision.active,
+            &decision.approver,
+            &decision.applied_revision,
+            decision.pr_number,
+            &decision.authorized_head,
+            decision.review_id,
+        ) {
+            self.overrides.push(OverrideRecord {
+                rule_id: rule_id.into(),
+                commit: commit.clone(),
+                approver: approver.clone(),
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+                pr_number: Some(pr),
+                authorized_head: Some(head.clone()),
+                review_id: Some(review),
+            });
+        }
+    }
+
+    /// True when this repository is on record as the publisher of the mesh
+    /// document at `output_path`.
+    ///
+    /// Retraction is a destructive rewrite of a path the operator configured,
+    /// so it is gated on provenance rather than on the file merely being
+    /// there. An environment that never declared a `MeshConfig` fragment — or
+    /// one whose destination was repointed at a file somebody else owns —
+    /// answers `false` and is left alone.
+    pub fn publishes_mesh_document(&self, output_path: &str) -> bool {
+        self.mesh_document_path.as_deref() == Some(output_path)
+    }
+
+    /// Record `output_path` as this repository's mesh-document destination.
+    ///
+    /// Called for a retraction as well as an ordinary publish: a retracted
+    /// document is still a gitforgeops artifact sitting at that path, and
+    /// forgetting it would make the very next run report the empty document it
+    /// just wrote as somebody else's file.
+    pub fn record_mesh_publication(&mut self, output_path: &str) {
+        self.mesh_document_path = Some(output_path.to_string());
     }
 
     pub fn previously_managed_keys(&self) -> std::collections::HashSet<String> {

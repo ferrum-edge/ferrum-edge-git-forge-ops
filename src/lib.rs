@@ -1,10 +1,12 @@
 pub mod apply;
 pub mod cli;
 pub mod config;
+pub mod diagnostics;
 pub mod diff;
 pub mod error;
 pub mod http_client;
 pub mod import;
+pub mod json_output;
 pub mod jwt;
 pub mod plugin_catalog;
 pub mod policy;
@@ -14,3 +16,4 @@ pub mod secrets;
 pub mod state;
 pub mod validate;
 pub mod verdict;
+pub mod version;

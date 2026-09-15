@@ -13,6 +13,7 @@ fn strict_passthrough() -> gitforgeops::import::ImportPassthroughPolicy {
 fn make_test_config() -> GatewayConfig {
     GatewayConfig {
         proxies: vec![Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: "proxy-test".to_string(),
             name: Some("Test".to_string()),
@@ -67,10 +68,11 @@ fn make_test_config() -> GatewayConfig {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }],
         consumers: vec![Consumer {
+            labels: Default::default(),
             extra: Default::default(),
             id: "consumer-test".to_string(),
             username: "testuser".to_string(),
@@ -78,8 +80,8 @@ fn make_test_config() -> GatewayConfig {
             custom_id: None,
             credentials: std::collections::BTreeMap::new(),
             acl_groups: vec![],
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }],
         ..GatewayConfig::default()
     }
@@ -140,6 +142,67 @@ fn file_import_rejects_passthrough_fields_without_publishing_them() {
     assert!(
         !output.exists(),
         "a rejected import must not publish an output tree"
+    );
+}
+
+#[test]
+fn file_import_rejects_unknown_credential_types_without_publishing_them() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("credential-migration.json");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "keep-this-recognized-secret"}],
+        "custom": [{"nested": {"token": "must-not-be-imported"}}],
+        "api_key": [{"key": "must-not-be-imported-either"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("refusing to import unknown Consumer credential types"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "Unknown credential type 'custom' on consumer consumer-test in namespace ferrum"
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "Unknown credential type 'api_key' on consumer consumer-test in namespace ferrum"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("did you mean 'keyauth'?"), "{error}");
+    for known in ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"] {
+        assert!(
+            error.contains(known),
+            "recognized set must name {known}: {error}"
+        );
+    }
+    assert!(!error.contains("must-not-be-imported"), "{error}");
+    assert!(!error.contains("keep-this-recognized-secret"), "{error}");
+    assert!(
+        !output.exists(),
+        "a rejected import must not publish an output tree"
+    );
+    assert!(
+        !bundle_path.exists(),
+        "a rejected import must not write a migration bundle"
     );
 }
 
@@ -389,6 +452,63 @@ fn import_from_file_roundtrip() {
 }
 
 #[test]
+fn file_import_preserves_declared_timestamps_and_omits_absent_ones() {
+    let created: chrono::DateTime<chrono::Utc> = "2019-05-04T11:22:33Z".parse().unwrap();
+    let updated: chrono::DateTime<chrono::Utc> = "2021-09-12T08:15:00Z".parse().unwrap();
+
+    let mut config = make_test_config();
+    config.proxies[0].created_at = Some(created);
+    config.proxies[0].updated_at = Some(updated);
+    config.consumers[0].created_at = None;
+    config.consumers[0].updated_at = None;
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+
+    let assembled =
+        gitforgeops::config::assemble(gitforgeops::config::load_resources(&output).unwrap())
+            .unwrap()
+            .gateway;
+
+    let proxy = assembled
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "proxy-test")
+        .unwrap();
+    assert_eq!(proxy.created_at, Some(created));
+    assert_eq!(proxy.updated_at, Some(updated));
+
+    let consumer = assembled
+        .consumers
+        .iter()
+        .find(|consumer| consumer.id == "consumer-test")
+        .unwrap();
+    assert_eq!(consumer.created_at, None);
+    assert_eq!(consumer.updated_at, None);
+
+    // The written proxy file carries the gateway's real timestamps verbatim.
+    let proxy_file =
+        std::fs::read_to_string(output.join("ferrum/proxies/proxy-test.yaml")).unwrap();
+    assert!(proxy_file.contains("2019-05-04"), "{proxy_file}");
+    let consumer_file =
+        std::fs::read_to_string(output.join("ferrum/consumers/consumer-test.yaml")).unwrap();
+    assert!(!consumer_file.contains("created_at"), "{consumer_file}");
+    assert!(!consumer_file.contains("updated_at"), "{consumer_file}");
+}
+
+#[test]
 fn file_import_requires_an_explicit_private_bundle_for_live_credentials() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
@@ -490,7 +610,7 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
         "keyauth": [{"key": "first-live-key"}, {"key": "second-live-key"}],
         "jwt": [{"secret": "live-jwt-secret-that-is-long-enough"}],
-        "custom": [{"nested": {"token": "custom-live-token"}}]
+        "hmac_auth": [{"nested": {"token": "hmac-nested-token"}}]
     }))
     .unwrap();
     let original_credentials = config.consumers[0].credentials.clone();
@@ -529,8 +649,8 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
         merged,
         std::collections::BTreeMap::from([
             (
-                "ferrum/consumer-test/custom/nested/token".to_string(),
-                "custom-live-token".to_string(),
+                "ferrum/consumer-test/hmac_auth/nested/token".to_string(),
+                "hmac-nested-token".to_string(),
             ),
             (
                 "ferrum/consumer-test/jwt/secret".to_string(),
@@ -591,6 +711,7 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         "protocol": "grpc"
     });
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "otel-main".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -602,8 +723,8 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -677,6 +798,7 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     let bundle_path = destination_parent.path().join("secret-migration.json");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "custom".to_string(),
         plugin_name: "enterprise_custom".to_string(),
@@ -684,6 +806,8 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         config: serde_json::json!({
             "mode": "strict",
             "opaque": {"value": "probably-a-tuning-knob"},
+            "signing_key": "custom-unclassified-material",
+            "extra_headers": {"x-vendor-auth": "custom-unclassified-header"},
             "api_key": "live-vendor-key",
             "headers": {"x-vendor-auth": "live-vendor-header"}
         }),
@@ -693,8 +817,8 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -713,6 +837,8 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     assert!(!plugin_yaml.contains("live-vendor-header"), "{plugin_yaml}");
     // The plugin still says what it does.
     assert!(plugin_yaml.contains("strict"), "{plugin_yaml}");
+    assert!(plugin_yaml.contains("custom-unclassified-material"));
+    assert!(plugin_yaml.contains("custom-unclassified-header"));
     assert!(
         plugin_yaml.contains("probably-a-tuning-knob"),
         "{plugin_yaml}"
@@ -723,11 +849,12 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
     assert!(notice.contains("plugin_name=enterprise_custom"), "{notice}");
     assert!(notice.contains("mode"), "{notice}");
     assert!(notice.contains("opaque.value"), "{notice}");
+    assert!(notice.contains("signing_key"), "{notice}");
+    assert!(notice.contains("extra_headers.x-vendor-auth"), "{notice}");
     assert!(!notice.contains("api_key"), "{notice}");
 }
 
-/// A builtin plugin's schema rules are authoritative, so there is nothing for
-/// a human to review afterwards.
+/// Schema-covered builtin secrets are brokered without a plaintext allowance.
 #[test]
 fn builtin_plugin_import_raises_no_review_notice() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -737,6 +864,7 @@ fn builtin_plugin_import_raises_no_review_notice() {
     let bundle_path = destination_parent.path().join("secret-migration.json");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "otel".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -751,8 +879,8 @@ fn builtin_plugin_import_raises_no_review_notice() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -775,6 +903,7 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "spec-otel".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -786,8 +915,8 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
         priority_override: None,
         trigger: None,
         api_spec_id: Some("payments-v1".to_string()),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -820,7 +949,7 @@ fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
         .collect::<Vec<_>>();
     config.consumers[0]
         .credentials
-        .insert("custom".to_string(), serde_json::Value::Array(values));
+        .insert("hmac_auth".to_string(), serde_json::Value::Array(values));
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
@@ -852,6 +981,57 @@ fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
     let (merged, parsed_shards) = gitforgeops::secrets::load_bundles_from_env(&raw).unwrap();
     assert_eq!(merged.len(), 12);
     assert_eq!(parsed_shards.len(), shards.len());
+}
+
+#[test]
+fn credential_migration_bundle_refuses_unbound_shards_before_publication() {
+    use gitforgeops::secrets::bundle::{BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS};
+
+    // Each synthetic value needs its own shard. The exact supported ceiling
+    // succeeds, while one more slot must leave both destinations unpublished.
+    for count in [MAX_BUNDLE_SHARDS, MAX_BUNDLE_SHARDS + 1] {
+        let source_dir = tempfile::tempdir().unwrap();
+        let backup_path = source_dir.path().join("backup.yaml");
+        let mut config = make_test_config();
+        config.consumers[0].credentials.clear();
+        let values = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "token": format!("{}-{index}", "x".repeat(BUNDLE_SOFT_LIMIT_BYTES / 2))
+                })
+            })
+            .collect::<Vec<_>>();
+        config.consumers[0]
+            .credentials
+            .insert("hmac_auth".to_string(), serde_json::Value::Array(values));
+        std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("resources");
+        let bundle_path = destination.path().join("migration.json");
+        let result = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            Some(&bundle_path),
+            &strict_passthrough(),
+            &[],
+        );
+
+        if count == MAX_BUNDLE_SHARDS {
+            result.unwrap();
+            let raw = std::fs::read_to_string(&bundle_path).unwrap();
+            let (merged, shards) = gitforgeops::secrets::load_bundles_from_env(&raw).unwrap();
+            assert_eq!(merged.len(), count as usize);
+            assert_eq!(shards.len(), MAX_BUNDLE_SHARDS as usize);
+            assert!(shards.keys().all(|shard| *shard < MAX_BUNDLE_SHARDS));
+            assert!(output.exists());
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("MAX_BUNDLE_SHARDS"), "{error}");
+            assert!(error.contains("import"), "{error}");
+            assert!(!bundle_path.exists());
+            assert!(!output.exists());
+        }
+    }
 }
 
 #[test]
@@ -917,6 +1097,38 @@ fn credential_migration_bundle_cannot_overwrite_its_source_backup() {
     assert!(!output.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn credential_migration_bundle_cannot_alias_source_via_symlink_dotdot() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("source");
+    std::fs::create_dir_all(source_dir.join("sub")).unwrap();
+    let source = source_dir.join("backup.yaml");
+    std::fs::write(&source, "source backup").unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    symlink(source_dir.join("sub"), outside.path().join("jump")).unwrap();
+    let alias = outside.path().join("jump/../backup.yaml");
+
+    let output = root.path().join("resources");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &source,
+        &output,
+        Some(&alias),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("may not overwrite its source backup"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "source backup");
+}
+
 #[test]
 fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -949,12 +1161,56 @@ fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
     assert!(!output.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn credential_migration_bundle_rejects_dotdot_after_symlink_into_worktree() {
+    use std::os::unix::fs::symlink;
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "keyauth": [{"key": "live-production-key"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let outside = tempfile::tempdir().unwrap();
+    symlink(
+        std::env::current_dir().unwrap().join("src"),
+        outside.path().join("jump"),
+    )
+    .unwrap();
+    let unsafe_bundle = outside.path().join("jump/../never-write-credentials.json");
+
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&unsafe_bundle),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("outside every Git worktree"), "{error}");
+    assert!(!std::env::current_dir()
+        .unwrap()
+        .join("never-write-credentials.json")
+        .exists());
+    assert!(!output.exists());
+}
+
 #[test]
 fn imported_resource_yaml_is_byte_deterministic() {
     let mut config = make_test_config();
+    // Two recognized types, inserted out of order, so map ordering is what the
+    // byte comparison exercises.
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
-        "zeta": [{"token": "z"}],
-        "alpha": [{"token": "a"}]
+        "mtls_auth": [{"identity": "z"}],
+        "basicauth": [{"username": "a", "password": "x"}]
     }))
     .unwrap();
     let left = tempfile::tempdir().unwrap();
@@ -1163,10 +1419,12 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
         "keyauth": [{"key": "live-key"}, {"key": "second-key"}],
         "jwt": [{"secret": "live-jwt-secret-that-is-long-enough"}],
-        "hmac_auth": [{"secret": "live-hmac-secret-that-is-long-enough"}],
+        "hmac_auth": [{
+            "secret": "live-hmac-secret-that-is-long-enough",
+            "nested": {"token": "hmac-nested-token"},
+        }],
         "mtls_auth": [{"identity": "CN=production-client"}],
-        "basicauth": [{"password_hash": "hmac_sha256:live-hash"}],
-        "custom": [{"nested": {"token": "custom-live-token"}}]
+        "basicauth": [{"password_hash": "hmac_sha256:live-hash"}]
     }))
     .unwrap();
 
@@ -1184,7 +1442,7 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
         "live-jwt-secret-that-is-long-enough",
         "live-hmac-secret-that-is-long-enough",
         "hmac_sha256:live-hash",
-        "custom-live-token",
+        "hmac-nested-token",
     ] {
         assert!(
             !consumer.contains(secret),
@@ -1212,7 +1470,7 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
             "live-jwt-secret-that-is-long-enough",
             "live-hmac-secret-that-is-long-enough",
             "hmac_sha256:live-hash",
-            "custom-live-token",
+            "hmac-nested-token",
         ] {
             assert!(
                 !bytes
@@ -1256,7 +1514,7 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
         "keyauth": [{"key": "first"}, {"key": "second"}],
         "jwt": [{"secret": "jwt-secret"}],
-        "custom": [{"nested": {"token": "custom-secret"}}]
+        "hmac_auth": [{"nested": {"token": "hmac-nested-secret"}}]
     }))
     .unwrap();
     let original_credentials = config.consumers[0].credentials.clone();
@@ -1278,7 +1536,7 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
     assert_eq!(
         slots,
         std::collections::BTreeSet::from([
-            "ferrum/consumer-test/custom/nested/token",
+            "ferrum/consumer-test/hmac_auth/nested/token",
             "ferrum/consumer-test/jwt/secret",
             "ferrum/consumer-test/keyauth/[1]/key",
             "ferrum/consumer-test/keyauth/key",
@@ -1299,8 +1557,8 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
             "jwt-secret".to_string(),
         ),
         (
-            "ferrum/consumer-test/custom/nested/token".to_string(),
-            "custom-secret".to_string(),
+            "ferrum/consumer-test/hmac_auth/nested/token".to_string(),
+            "hmac-nested-secret".to_string(),
         ),
     ]);
     let mut round_tripped = assembled.gateway;
@@ -1322,7 +1580,7 @@ fn unsafe_credential_shape_fails_before_publishing_any_files() {
     let mut config = make_test_config();
     config.consumers[0]
         .credentials
-        .insert("custom".to_string(), serde_json::json!({"token": 1234}));
+        .insert("hmac_auth".to_string(), serde_json::json!({"token": 1234}));
 
     let error = split_config(&config, tmp.path()).unwrap_err().to_string();
     assert!(error.contains("non-string leaf"), "{error}");
@@ -1487,7 +1745,7 @@ async fn api_import_rejects_cross_namespace_resources_before_writing() {
     .await
     .unwrap_err()
     .to_string();
-    assert!(error.contains("cross-namespace import"), "{error}");
+    assert!(error.contains("refusing the snapshot"), "{error}");
     assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
 }
 
@@ -1606,6 +1864,7 @@ fn migration_bundle_paths_normalize_dotdot_under_a_missing_ancestor() {
 
 fn consul_upstream(token: &str) -> Upstream {
     Upstream {
+        labels: Default::default(),
         extra: Default::default(),
         id: "orders".to_string(),
         name: None,
@@ -1641,8 +1900,8 @@ fn consul_upstream(token: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     }
 }
 
@@ -1783,6 +2042,7 @@ fn unknown_plugin_backup(source_dir: &std::path::Path) -> PathBuf {
     let backup_path = source_dir.join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "custom".to_string(),
         plugin_name: "enterprise_custom".to_string(),
@@ -1800,8 +2060,8 @@ fn unknown_plugin_backup(source_dir: &std::path::Path) -> PathBuf {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
     backup_path
@@ -1912,14 +2172,14 @@ fn the_plaintext_allowance_matches_plugin_names_exactly() {
     }
 }
 
-/// A builtin plugin's schema rules are authoritative, so the gate never fires
-/// for one — with or without the flag.
+/// Ordinary builtin settings do not require a plaintext allowance.
 #[test]
-fn builtin_plugins_are_unaffected_by_the_plaintext_gate() {
+fn builtin_plugins_without_secret_looking_leaves_import_silently() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
         extra: Default::default(),
         id: "otel".to_string(),
         plugin_name: "otel_tracing".to_string(),
@@ -1931,8 +2191,8 @@ fn builtin_plugins_are_unaffected_by_the_plaintext_gate() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
     });
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 
@@ -1950,4 +2210,130 @@ fn builtin_plugins_are_unaffected_by_the_plaintext_gate() {
     assert!(result.custom_plugin_review_notice().is_none());
     let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/otel.yaml")).unwrap();
     assert!(plugin_yaml.contains("sample_rate"), "{plugin_yaml}");
+}
+
+fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf {
+    let backup_path = source.join("backup.yaml");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
+        extra: Default::default(),
+        id: "builtin".to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({
+            "signing_key": "synthetic-signing-material",
+            "nested": [{
+                "api_key": "synthetic-api-material",
+                "dsn": "https://user:synthetic-password@vendor.example/hook"
+            }],
+            "extra_headers": {"x-vendor-auth": "synthetic-header-material"},
+            "mode": "strict"
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
+    });
+    if plugin_name == "otel_tracing" {
+        config.plugin_configs[0].config["endpoint"] =
+            serde_json::json!("https://collector.example/v1/traces?token=synthetic-endpoint");
+    }
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    backup_path
+}
+
+#[test]
+fn builtin_unbrokered_secrets_block_before_tree_or_bundle_publication() {
+    // Exercise both a builtin without rules and one with existing schema rules.
+    for plugin_name in ["a2a_gateway", "otel_tracing"] {
+        let source = tempfile::tempdir().unwrap();
+        let backup_path = builtin_plugin_backup(source.path(), plugin_name);
+        let destination = tempfile::tempdir().unwrap();
+        for allowed in [vec![], vec![format!("{plugin_name}_other")]] {
+            let output = destination.path().join("resources");
+            let bundle_path = destination.path().join("migration.json");
+            let error = gitforgeops::import::from_file::import_from_file(
+                &backup_path,
+                &output,
+                Some(&bundle_path),
+                &strict_passthrough(),
+                &allowed,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("refusing to import plaintext plugin config"));
+            assert!(error.contains(&format!("plugin_name={plugin_name}")));
+            assert!(error.contains("PluginConfig builtin"));
+            for path in [
+                "signing_key",
+                "nested.[0].api_key",
+                "nested.[0].dsn",
+                "extra_headers.x-vendor-auth",
+            ] {
+                assert!(error.contains(path), "{error}");
+            }
+            assert!(!error.contains("synthetic-"), "{error}");
+            assert!(!output.exists());
+            assert!(!bundle_path.exists());
+        }
+    }
+}
+
+#[test]
+fn builtin_plaintext_allowance_writes_and_lists_unbrokered_paths() {
+    for plugin_name in ["a2a_gateway", "otel_tracing"] {
+        let source = tempfile::tempdir().unwrap();
+        let backup_path = builtin_plugin_backup(source.path(), plugin_name);
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("resources");
+        let bundle_path = destination.path().join("migration.json");
+        let result = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            Some(&bundle_path),
+            &strict_passthrough(),
+            &[plugin_name.to_string()],
+        )
+        .unwrap();
+
+        let expected_brokered = usize::from(plugin_name == "otel_tracing");
+        assert_eq!(result.redacted_plugin_config_values, expected_brokered);
+        let yaml = std::fs::read_to_string(output.join("ferrum/plugins/builtin.yaml")).unwrap();
+        assert!(yaml.contains("synthetic-signing-material"));
+        assert!(yaml.contains("synthetic-api-material"));
+        assert!(yaml.contains("synthetic-password"));
+        assert!(yaml.contains("synthetic-header-material"));
+        assert!(yaml.contains("mode: strict"));
+        assert!(!yaml.contains("synthetic-endpoint"));
+        if expected_brokered > 0 {
+            let bundle = std::fs::read_to_string(&bundle_path).unwrap();
+            let (values, _) = gitforgeops::secrets::load_bundles_from_env(&bundle).unwrap();
+            assert_eq!(
+                values["ferrum/builtin/@plugin-config/config/endpoint"],
+                "https://collector.example/v1/traces?token=synthetic-endpoint"
+            );
+        }
+        let notice = result
+            .custom_plugin_review_notice()
+            .expect("builtin review notice");
+        assert!(notice.contains(&format!("plugin_name={plugin_name}")));
+        assert!(notice.contains("--allow-plaintext-plugin-config"));
+        for path in [
+            "signing_key",
+            "nested.[0].api_key",
+            "nested.[0].dsn",
+            "extra_headers.x-vendor-auth",
+        ] {
+            assert!(notice.contains(path), "{notice}");
+        }
+        assert!(!notice.contains("synthetic-"), "{notice}");
+        assert!(!notice.contains("mode"), "{notice}");
+        assert!(!notice.contains("endpoint"), "{notice}");
+    }
 }

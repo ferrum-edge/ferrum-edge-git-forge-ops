@@ -13,9 +13,9 @@ impl PlaceholderAlloc {
             "generate" => Ok(Self::Generate),
             "require" => Ok(Self::Require),
             "rotate" => Ok(Self::Rotate),
-            other => Err(Error::Config(format!(
-                "unknown secret alloc mode '{other}' (expected: generate | require | rotate)"
-            ))),
+            _ => Err(Error::Config(
+                "unknown secret alloc mode (expected: generate | require | rotate)".to_string(),
+            )),
         }
     }
 }
@@ -35,6 +35,7 @@ pub struct SecretPlaceholder {
 /// The slot path is *not* part of the placeholder. Slots are always derived
 /// deterministically from the enclosing resource: `<namespace>/<id>/<cred_key>`.
 /// This keeps YAML minimal and rename-safe.
+/// Rejected pieces may contain credentials, so errors never echo their values.
 pub fn parse_placeholder(raw: &str) -> Option<crate::error::Result<SecretPlaceholder>> {
     let inner = raw.strip_prefix("${gh-env-secret:")?.strip_suffix('}')?;
 
@@ -50,9 +51,9 @@ pub fn parse_placeholder(raw: &str) -> Option<crate::error::Result<SecretPlaceho
             let (key, value) = match piece.split_once('=') {
                 Some(kv) => kv,
                 None => {
-                    return Some(Err(Error::Config(format!(
-                        "malformed secret placeholder piece '{piece}' (expected key=value)"
-                    ))))
+                    return Some(Err(Error::Config(
+                        "malformed secret placeholder piece (expected key=value)".to_string(),
+                    )))
                 }
             };
             match key.trim() {
@@ -62,21 +63,21 @@ pub fn parse_placeholder(raw: &str) -> Option<crate::error::Result<SecretPlaceho
                 },
                 "len" => match value.trim().parse::<usize>() {
                     Ok(n) if (16..=256).contains(&n) => length_bytes = n,
-                    Ok(n) => {
-                        return Some(Err(Error::Config(format!(
-                            "secret placeholder 'len={n}' out of range (16..=256)"
-                        ))))
+                    Ok(_) => {
+                        return Some(Err(Error::Config(
+                            "secret placeholder len out of range (16..=256)".to_string(),
+                        )))
                     }
                     Err(_) => {
-                        return Some(Err(Error::Config(format!(
-                            "secret placeholder 'len={value}' is not an integer"
-                        ))))
+                        return Some(Err(Error::Config(
+                            "secret placeholder len is not an integer".to_string(),
+                        )))
                     }
                 },
-                other => {
-                    return Some(Err(Error::Config(format!(
-                        "unknown secret placeholder key '{other}'"
-                    ))))
+                _ => {
+                    return Some(Err(Error::Config(
+                        "unknown secret placeholder key (expected: alloc | len)".to_string(),
+                    )))
                 }
             }
         }

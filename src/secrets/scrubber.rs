@@ -52,8 +52,11 @@ use base64::Engine;
 use crate::config::GatewayConfig;
 
 use super::placeholder::parse_placeholder;
-use super::plugin_config::{sensitive_string_paths, value_at};
-use super::resolver::is_identity_credential_leaf;
+use super::plugin_config::{sensitive_string_paths, value_at, ConfigPathComponent};
+use super::resolver::{
+    consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, ResolveReport,
+    SlotStatus,
+};
 
 /// Text substituted for every secret occurrence.
 pub const REDACTION: &str = "[REDACTED]";
@@ -84,8 +87,9 @@ pub const MIN_SCRUB_LENGTH: usize = 8;
 
 /// The secret byte sequences to remove from a child process's output.
 ///
-/// Build one with [`SecretScrubber::from_gateway_config`] *after* credential
-/// resolution, so the resolved values are the ones in hand.
+/// For a resolved snapshot use [`SecretScrubber::from_gateway_config_with_report`]
+/// so resolution provenance supplements field classification. Use
+/// [`SecretScrubber::from_gateway_config`] for unresolved repository documents.
 #[derive(Debug, Clone, Default)]
 pub struct SecretScrubber {
     /// Every byte sequence replaced by [`REDACTION`], longest first so a
@@ -186,10 +190,20 @@ impl SecretScrubber {
     ///   Consul ACL token. The validator is handed the resolved upstream, so
     ///   an error quoting the discovery block quotes the token with it.
     pub fn from_gateway_config(config: &GatewayConfig) -> Self {
+        Self::from_gateway_config_with_report(config, &ResolveReport::default())
+    }
+
+    /// Include values at every successfully resolved slot, regardless of field
+    /// classification or whether the value itself resembles a placeholder.
+    /// `config` must be the resolved snapshot paired with `report`, not a
+    /// placeholder document paired with a read-only allocation report.
+    /// No bundle values or unused slots are retained in the report.
+    pub fn from_gateway_config_with_report(config: &GatewayConfig, report: &ResolveReport) -> Self {
         let mut values = BTreeSet::new();
         collect_consumer_secrets(config, &mut values);
         collect_plugin_config_secrets(config, &mut values);
         collect_service_discovery_secrets(config, &mut values);
+        collect_resolved_secrets(config, report, &mut values);
         let mut scrubber = Self::from_values(values);
         // The document with every secret removed. Serialization failure is not
         // worth failing validation over: an empty `public_text` only makes the
@@ -356,6 +370,86 @@ impl SecretScrubber {
             stderr,
             suppressed: None,
         }
+    }
+}
+
+fn collect_resolved_secrets(
+    config: &GatewayConfig,
+    report: &ResolveReport,
+    out: &mut BTreeSet<String>,
+) {
+    let resolved: HashSet<&str> = report
+        .results
+        .iter()
+        .filter(|result| result.status == SlotStatus::Resolved)
+        .map(|result| result.slot.as_str())
+        .collect();
+    if resolved.is_empty() {
+        return;
+    }
+    for consumer in &config.consumers {
+        for (credential_type, value) in &consumer.credentials {
+            collect_resolved_leaves(value, &mut Vec::new(), out, &|path| {
+                resolved.contains(
+                    consumer_credential_slot(
+                        &consumer.namespace,
+                        &consumer.id,
+                        credential_type,
+                        path,
+                    )
+                    .as_str(),
+                )
+            });
+        }
+    }
+    for plugin in &config.plugin_configs {
+        collect_resolved_leaves(&plugin.config, &mut Vec::new(), out, &|path| {
+            resolved.contains(plugin_config_slot(&plugin.namespace, &plugin.id, path).as_str())
+        });
+    }
+    for upstream in &config.upstreams {
+        let Some(discovery) = &upstream.service_discovery else {
+            continue;
+        };
+        for field in super::service_discovery::SD_SECRET_FIELDS {
+            let slot =
+                super::service_discovery::slot(&upstream.namespace, &upstream.id, field.path);
+            if resolved.contains(slot.as_str()) {
+                if let Some(value) = super::service_discovery::secret_leaf(discovery, field.path) {
+                    if !value.is_empty() {
+                        out.insert(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_resolved_leaves(
+    value: &serde_json::Value,
+    path: &mut Vec<ConfigPathComponent>,
+    out: &mut BTreeSet<String>,
+    is_resolved: &impl Fn(&[ConfigPathComponent]) -> bool,
+) {
+    match value {
+        serde_json::Value::String(text) if !text.is_empty() && is_resolved(path) => {
+            out.insert(text.clone());
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, child) in fields {
+                path.push(ConfigPathComponent::Key(key.clone()));
+                collect_resolved_leaves(child, path, out, is_resolved);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                path.push(ConfigPathComponent::Index(index));
+                collect_resolved_leaves(child, path, out, is_resolved);
+                path.pop();
+            }
+        }
+        _ => {}
     }
 }
 

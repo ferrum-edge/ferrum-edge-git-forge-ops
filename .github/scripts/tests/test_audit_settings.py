@@ -53,8 +53,8 @@ def secure_responses():
                 {
                     "type": "pull_request",
                     "parameters": {
-                        "required_approving_review_count": 1,
-                        "require_code_owner_review": True,
+                        "required_approving_review_count": 0,
+                        "require_code_owner_review": False,
                         "required_review_thread_resolution": True,
                         "dismiss_stale_reviews_on_push": True,
                     },
@@ -162,6 +162,36 @@ class SettingsAuditTests(unittest.TestCase):
         self.assertIn("allowed Actions policy", rendered)
         self.assertIn("full-SHA pinning", rendered)
         self.assertIn("configured state-writer App", rendered)
+
+    def test_reintroduced_approval_requirements_are_reported_as_drift(self):
+        for field, value, diagnostic in (
+            ("required_approving_review_count", 1, "approval submissions"),
+            ("require_code_owner_review", True, "Code Owner approval"),
+            ("require_last_push_approval", True, "require_last_push_approval"),
+            (
+                "require_extra_approval_for_unattributed_changes",
+                True,
+                "require_extra_approval_for_unattributed_changes",
+            ),
+        ):
+            with self.subTest(field=field):
+                responses = secure_responses()
+                rules = responses["repos/acme/repo/rulesets/7"]["rules"]
+                next(rule for rule in rules if rule["type"] == "pull_request")[
+                    "parameters"
+                ][field] = value
+                with patch.object(
+                    audit_settings,
+                    "gh_json",
+                    side_effect=lambda path, paginate=False: responses[path],
+                ):
+                    audit = audit_settings.run(
+                        "acme/repo", "main", REQUIRED_CHECKS, 99, "refs/tags/v*"
+                    )
+                self.assertTrue(
+                    any(diagnostic in item for item in audit.violations),
+                    audit.violations,
+                )
 
     def test_any_additional_main_bypass_mode_fails(self):
         responses = secure_responses()

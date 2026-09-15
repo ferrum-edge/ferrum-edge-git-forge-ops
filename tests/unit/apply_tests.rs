@@ -1,5 +1,6 @@
 use gitforgeops::apply::{apply_file, spec_owned_skip_messages, ApplyResult};
 use gitforgeops::config::schema::{GatewayConfig, Proxy};
+use gitforgeops::config::ApplyStrategy;
 use gitforgeops::diff::SpecOwnedResource;
 
 #[test]
@@ -68,6 +69,7 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
     let path = tmp.path().join("nested/resources.yaml");
     let config = GatewayConfig {
         proxies: vec![Proxy {
+            labels: Default::default(),
             extra: Default::default(),
             id: "p1".to_string(),
             name: None,
@@ -122,8 +124,8 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }],
         ..GatewayConfig::default()
     };
@@ -178,8 +180,8 @@ fn adds_follow_the_dependency_graph() {
         vec![
             "Add Upstream u1",
             "Add Consumer c1",
-            "Add Proxy p1",
             "Add PluginConfig pc1",
+            "Add Proxy p1",
         ]
     );
 }
@@ -196,8 +198,8 @@ fn deletes_run_in_reverse_dependency_order() {
     assert_eq!(
         order,
         vec![
-            "Delete PluginConfig pc1",
             "Delete Proxy p1",
+            "Delete PluginConfig pc1",
             "Delete Upstream u1",
             "Delete Consumer c1",
         ]
@@ -221,9 +223,9 @@ fn a_mixed_diff_applies_writes_before_deletes() {
         order,
         vec![
             "Add Upstream new-upstream",
+            "Modify PluginConfig kept-pc",
             "Add Proxy new-proxy",
             "Modify Proxy moved-proxy",
-            "Modify PluginConfig kept-pc",
             "Delete PluginConfig stale-pc",
             "Delete Upstream old-upstream",
         ]
@@ -1173,6 +1175,66 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
             .all(|request| !request.contains("POST /upstreams")),
         "the uncertain create must not be replayed"
     );
+}
+
+#[tokio::test]
+async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
+    // A hand-authored resource carries no `created_at` / `updated_at`. Those
+    // timestamps belong to the gateway: the modify body must not assert an
+    // apply-run wall clock, and the create body must let the gateway stamp it.
+    let mut live_proxy = proxy("p1", "ferrum", None);
+    live_proxy.backend_host = "old.example".to_string();
+    live_proxy.created_at = Some(chrono::Utc::now());
+    live_proxy.updated_at = Some(chrono::Utc::now());
+
+    let desired = GatewayConfig {
+        proxies: vec![proxy("p1", "ferrum", None)],
+        upstreams: vec![upstream("u1", "ferrum")],
+        ..Default::default()
+    };
+    let live = GatewayConfig {
+        proxies: vec![live_proxy],
+        ..Default::default()
+    };
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /proxies/p1".into(), 200, "{}".into(), vec![]),
+        ("POST /upstreams".into(), 201, "{}".into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("ferrum".to_string(), live)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("apply succeeds");
+
+    assert_eq!(result.updated, 1);
+    assert_eq!(result.created, 1);
+
+    let requests = requests.lock().unwrap();
+    let put = requests
+        .iter()
+        .find(|request| request.contains("PUT /proxies/p1"))
+        .expect("modify issued");
+    let put_body = put.split_once("\r\n\r\n").expect("request body").1;
+    assert!(!put_body.contains("created_at"), "{put_body}");
+    assert!(!put_body.contains("updated_at"), "{put_body}");
+
+    let post = requests
+        .iter()
+        .find(|request| request.contains("POST /upstreams"))
+        .expect("create issued");
+    let post_body = post.split_once("\r\n\r\n").expect("request body").1;
+    assert!(!post_body.contains("created_at"), "{post_body}");
+    assert!(!post_body.contains("updated_at"), "{post_body}");
 }
 
 #[tokio::test]
@@ -2196,6 +2258,776 @@ fn backup_body(config: &GatewayConfig) -> String {
     serde_json::to_string(config).expect("backup body")
 }
 
+fn scoped_plugin_desired() -> GatewayConfig {
+    let mut desired = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", None)],
+        plugin_configs: vec![plugin_config("pc1", "team-alpha", "p1", None)],
+        ..Default::default()
+    };
+    gitforgeops::config::assembler::normalize_proxy_plugin_associations(&mut desired);
+    desired
+}
+
+fn mutation_lines(requests: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| !request.starts_with("GET "))
+        .map(|request| request.lines().next().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn adoption_and_pending_recovery_ignore_only_association_order() {
+    let mut desired = scoped_plugin_desired();
+    desired
+        .plugin_configs
+        .push(plugin_config("pc2", "team-alpha", "p1", None));
+    gitforgeops::config::assembler::normalize_proxy_plugin_associations(&mut desired);
+    let mut live = desired.clone();
+    live.proxies[0].plugins.reverse();
+    let key = state_key("team-alpha", "Proxy", "p1");
+    let pending = BTreeSet::from([key]);
+    assert_eq!(
+        pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha").len(),
+        1
+    );
+    let candidates = adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new());
+    assert!(candidates.iter().any(|candidate| candidate.kind == "Proxy"));
+    live.proxies[0].plugins.pop();
+    assert!(pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha").is_empty());
+    assert!(
+        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new())
+            .iter()
+            .all(|candidate| candidate.kind != "Proxy")
+    );
+}
+
+#[tokio::test]
+async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_noop() {
+    for (auto_attached, route_changed) in [(true, false), (true, true), (false, false)] {
+        let mut desired = scoped_plugin_desired();
+        let mut actual = desired.clone();
+        actual.plugin_configs.clear();
+        actual.proxies[0].plugins.clear();
+        let mut after_plugin = actual.clone();
+        after_plugin.plugin_configs = desired.plugin_configs.clone();
+        if auto_attached {
+            after_plugin.proxies[0].plugins = desired.proxies[0].plugins.clone();
+        }
+        if route_changed {
+            desired.proxies[0].backend_port = 9090;
+        }
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+            (
+                "GET /backup".into(),
+                200,
+                backup_body(&after_plugin),
+                vec![],
+            ),
+        ]);
+        let key = state_key("team-alpha", "Proxy", "p1");
+        let managed = HashSet::from([key.clone()]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            },
+            Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+            None,
+            &ApplyOptions {
+                managed_ledger: BTreeSet::from([key]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.fatal_error.is_none());
+        assert_eq!(result.created, 1);
+        let needs_put = !auto_attached || route_changed;
+        assert_eq!(result.updated, usize::from(needs_put));
+        let mut expected = vec!["POST /plugins/config HTTP/1.1"];
+        if needs_put {
+            expected.push("PUT /proxies/p1 HTTP/1.1");
+        }
+        assert_eq!(mutation_lines(&requests), expected);
+        let drift = gitforgeops::diff::compute_diff(&desired, &after_plugin);
+        assert_eq!(drift.is_empty(), !needs_put);
+    }
+}
+
+#[tokio::test]
+async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependency() {
+    let desired = scoped_plugin_desired();
+    for delete_proxy in [false, true] {
+        let mut detached = desired.clone();
+        detached.plugin_configs.clear();
+        detached.proxies[0].plugins.clear();
+        if delete_proxy {
+            detached.proxies.clear();
+        }
+        let (url, requests) = spawn_recording_gateway(vec![]);
+        let result = apply_api(
+            &detached,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([("team-alpha".into(), desired.clone())])),
+            None,
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            mutation_lines(&requests),
+            vec![
+                if delete_proxy {
+                    "DELETE /proxies/p1?cleanup_orphaned_upstream=false HTTP/1.1"
+                } else {
+                    "PUT /proxies/p1 HTTP/1.1"
+                },
+                "DELETE /plugins/config/pc1 HTTP/1.1",
+            ]
+        );
+    }
+
+    let mut actual = desired.clone();
+    actual.plugin_configs[0].enabled = false;
+    actual.proxies[0].backend_port = 9090;
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "GET /backup".into(),
+        200,
+        backup_body(&actual),
+        vec![],
+    )]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty());
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "PUT /plugins/config/pc1 HTTP/1.1",
+            "PUT /proxies/p1 HTTP/1.1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn failed_plugin_write_blocks_its_proxy_and_defers_pruning() {
+    let desired = scoped_plugin_desired();
+    let mut actual = desired.clone();
+    actual.plugin_configs.clear();
+    actual.proxies[0].plugins.clear();
+    actual.proxies.push(proxy("old", "team-alpha", None));
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "POST /plugins/config".into(),
+        400,
+        r#"{"error":"invalid config"}"#.into(),
+        vec![],
+    )]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["POST /plugins/config HTTP/1.1"]
+    );
+    assert_eq!(result.errors.len(), 2);
+    assert_eq!(result.deletes_deferred, 1);
+    assert!(result.applied_incremental.is_empty());
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn failed_proxy_delete_retains_its_plugin_and_ledger() {
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "DELETE /proxies/p1".into(),
+        409,
+        r#"{"error":"cannot delete proxy"}"#.into(),
+        vec![],
+    )]);
+    let result = apply_api(
+        &GatewayConfig::default(),
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([(
+            "team-alpha".into(),
+            scoped_plugin_desired(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["DELETE /proxies/p1?cleanup_orphaned_upstream=false HTTP/1.1"]
+    );
+    assert_eq!(result.deletes_deferred, 1);
+    assert!(result.applied_incremental.is_empty());
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_untrusted_views() {
+    for confirmation in [
+        "unowned",
+        "pending",
+        "cached",
+        "spec-owned",
+        "foreign",
+        "failed",
+    ] {
+        let desired = scoped_plugin_desired();
+        let mut actual = desired.clone();
+        actual.plugin_configs.clear();
+        actual.proxies[0].plugins.clear();
+        actual.proxies.push(proxy("old", "team-alpha", None));
+        let mut live = desired.clone();
+        if confirmation == "spec-owned" {
+            live.proxies[0].api_spec_id = Some("external-spec".into());
+        } else if confirmation == "foreign" {
+            live.proxies[0].namespace = "team-b".into();
+        }
+        let headers = if confirmation == "cached" {
+            vec![("X-Data-Source".into(), "cached".into())]
+        } else {
+            vec![]
+        };
+        let (url, requests) = spawn_recording_gateway(vec![(
+            "GET /backup".into(),
+            if confirmation == "failed" { 503 } else { 200 },
+            backup_body(&live),
+            headers,
+        )]);
+        let key = state_key("team-alpha", "Proxy", "p1");
+        let old = state_key("team-alpha", "Proxy", "old");
+        let managed = HashSet::from([old.clone()]);
+        let mut options = ApplyOptions {
+            managed_ledger: BTreeSet::from([old]),
+            ..Default::default()
+        };
+        if confirmation != "unowned" {
+            options.managed_ledger.insert(key.clone());
+        }
+        if confirmation == "pending" {
+            options.pending_create_assertions.insert(key);
+        }
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            },
+            Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+            None,
+            &options,
+        )
+        .await
+        .unwrap();
+        let mut expected = vec!["POST /plugins/config HTTP/1.1"];
+        if matches!(confirmation, "unowned" | "pending") {
+            expected.extend([
+                "PUT /proxies/p1 HTTP/1.1",
+                "DELETE /proxies/old?cleanup_orphaned_upstream=false HTTP/1.1",
+            ]);
+            assert!(result.errors.is_empty());
+        } else {
+            assert!(!result.errors.is_empty() || result.fatal_error.is_some());
+            assert!(result
+                .applied_incremental
+                .iter()
+                .all(|op| op.kind == "PluginConfig"));
+            assert!(result.adopted.is_empty());
+        }
+        assert_eq!(mutation_lines(&requests), expected, "{confirmation}");
+    }
+}
+
+#[tokio::test]
+async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespaces() {
+    for mixed in [false, true] {
+        for batch_status in [200, 400, 413, 501] {
+            let desired = scoped_plugin_desired();
+            let actual = GatewayConfig {
+                proxies: if mixed {
+                    vec![proxy("old", "team-alpha", None)]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let (url, requests) = spawn_recording_gateway(vec![(
+                "POST /batch".into(),
+                batch_status,
+                r#"{"created":{"proxies":1,"plugin_configs":1}}"#.into(),
+                vec![],
+            )]);
+            let result = apply_api(
+                &desired,
+                &stub_client(url),
+                &["team-alpha".into()],
+                OwnershipScope::Exclusive,
+                Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+                None,
+                &ApplyOptions::default(),
+            )
+            .await
+            .unwrap();
+            let success = batch_status == 200;
+            let mut expected = vec!["POST /batch HTTP/1.1"];
+            if mixed && success {
+                expected.push("DELETE /proxies/old?cleanup_orphaned_upstream=false HTTP/1.1");
+            }
+            assert_eq!(mutation_lines(&requests), expected);
+            assert_eq!(result.created, if success { 2 } else { 0 });
+            assert_eq!(result.deletes_deferred, usize::from(mixed && !success));
+            assert_eq!(result.errors.is_empty(), success);
+            let requests = requests.lock().unwrap();
+            let batch = requests
+                .iter()
+                .find(|r| r.starts_with("POST /batch"))
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(batch.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["proxies"][0]["plugins"][0]["plugin_config_id"], "pc1");
+            assert_eq!(body["plugin_configs"][0]["proxy_id"], "p1");
+        }
+    }
+}
+
+#[tokio::test]
+async fn opted_in_batch_fallback_publishes_proxy_then_attaches_scoped_plugin() {
+    for mixed in [false, true] {
+        for batch_status in [400, 413, 501] {
+            let desired = scoped_plugin_desired();
+            let actual = GatewayConfig {
+                proxies: if mixed {
+                    vec![proxy("old", "team-alpha", None)]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let (url, requests) = spawn_recording_gateway(vec![(
+                "POST /batch".into(),
+                batch_status,
+                r#"{"error":"batch rejected"}"#.into(),
+                vec![],
+            )]);
+            let result = apply_api(
+                &desired,
+                &stub_client(url),
+                &["team-alpha".into()],
+                OwnershipScope::Exclusive,
+                Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+                None,
+                &ApplyOptions {
+                    allow_nontransactional_plugin_attach: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let permitted = batch_status != 400;
+            let mut expected = vec!["POST /batch HTTP/1.1"];
+            if permitted {
+                expected.extend(["POST /proxies HTTP/1.1", "POST /plugins/config HTTP/1.1"]);
+                if mixed {
+                    expected.push("DELETE /proxies/old?cleanup_orphaned_upstream=false HTTP/1.1");
+                }
+            }
+            assert_eq!(mutation_lines(&requests), expected);
+            assert_eq!(result.created, if permitted { 2 } else { 0 });
+            assert_eq!(result.errors.is_empty(), permitted);
+            assert_eq!(result.deletes_deferred, usize::from(mixed && !permitted));
+            if permitted {
+                let requests = requests.lock().unwrap();
+                let request = requests
+                    .iter()
+                    .find(|request| request.starts_with("POST /proxies "))
+                    .unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(body["plugins"], serde_json::json!([]));
+                assert_eq!(desired.proxies[0].plugins[0].plugin_config_id, "pc1");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_opted_in_attachment_preserves_proxy_ownership_and_defers_pruning() {
+    let desired = scoped_plugin_desired();
+    let actual = GatewayConfig {
+        proxies: vec![proxy("old", "team-alpha", None)],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("POST /batch".into(), 501, "{}".into(), vec![]),
+        ("POST /plugins/config".into(), 400, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions {
+            allow_nontransactional_plugin_attach: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.created, 1);
+    assert_eq!(result.applied_incremental[0].kind, "Proxy");
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(result.deletes_deferred, 1);
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /batch HTTP/1.1",
+            "POST /proxies HTTP/1.1",
+            "POST /plugins/config HTTP/1.1",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn opted_in_proxy_create_preserves_external_associations_and_gates_failed_targets() {
+    for proxy_status in [200, 400] {
+        let mut desired = scoped_plugin_desired();
+        let association = gitforgeops::config::schema::PluginAssociation {
+            plugin_config_id: "shared-cors".into(),
+        };
+        desired.proxies[0].plugins.push(association);
+        let mut shared = plugin_config("shared-cors", "team-alpha", "unused", None);
+        shared.scope = gitforgeops::config::schema::PluginScope::ProxyGroup;
+        shared.proxy_id = None;
+        let actual = GatewayConfig {
+            plugin_configs: vec![shared],
+            ..Default::default()
+        };
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("POST /batch".into(), 501, "{}".into(), vec![]),
+            ("POST /proxies".into(), proxy_status, "{}".into(), vec![]),
+        ]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Shared {
+                previously_managed: &HashSet::new(),
+            },
+            Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+            None,
+            &ApplyOptions {
+                allow_nontransactional_plugin_attach: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut expected = vec!["POST /batch HTTP/1.1", "POST /proxies HTTP/1.1"];
+        if proxy_status == 200 {
+            expected.push("POST /plugins/config HTTP/1.1");
+            assert!(result.errors.is_empty());
+        } else {
+            assert_eq!(result.created, 0);
+            assert_eq!(result.errors.len(), 2);
+        }
+        assert_eq!(mutation_lines(&requests), expected);
+        let requests = requests.lock().unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.starts_with("POST /proxies "))
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["plugins"],
+            serde_json::json!([{"plugin_config_id": "shared-cors"}])
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure() {
+    let desired = scoped_plugin_desired();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("POST /batch".into(), 503, "{}".into(), vec![]),
+        ("GET /backup".into(), 200, backup_body(&desired), vec![]),
+        ("PUT /plugins/config/pc1".into(), 500, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Shared {
+            previously_managed: &HashSet::new(),
+        },
+        Some(&BTreeMap::from([(
+            "team-alpha".into(),
+            GatewayConfig::default(),
+        )])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.fatal_error.is_none());
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(result.created, 1);
+    assert_eq!(result.applied_incremental[0].kind, "Proxy");
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /batch HTTP/1.1",
+            "PUT /plugins/config/pc1 HTTP/1.1",
+            "PUT /proxies/p1 HTTP/1.1",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn one_post_plugin_snapshot_adopts_all_unchanged_exclusive_proxies() {
+    let mut desired = scoped_plugin_desired();
+    desired.proxies.push(proxy("p2", "team-alpha", None));
+    desired
+        .plugin_configs
+        .push(plugin_config("pc2", "team-alpha", "p2", None));
+    gitforgeops::config::assembler::normalize_proxy_plugin_associations(&mut desired);
+    let mut actual = desired.clone();
+    actual.plugin_configs.clear();
+    for proxy in &mut actual.proxies {
+        proxy.plugins.clear();
+    }
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "GET /backup".into(),
+        200,
+        backup_body(&desired),
+        vec![],
+    )]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty());
+    assert_eq!(result.updated, 0);
+    assert_eq!(result.created, 2);
+    assert_eq!(result.adopted.len(), 2);
+    assert!(result.adopted.iter().all(|op| op.kind == "Proxy"));
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /plugins/config HTTP/1.1",
+            "POST /plugins/config HTTP/1.1"
+        ]
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("GET /backup"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn existing_plugin_retarget_to_new_proxy_fails_closed_even_with_opt_in() {
+    let desired = scoped_plugin_desired();
+    let mut actual = desired.clone();
+    actual.proxies[0].id = "old".into();
+    actual.plugin_configs[0].proxy_id = Some("old".into());
+    for allow in [false, true] {
+        let (url, requests) = spawn_recording_gateway(vec![(
+            "PUT /plugins/config/pc1".into(),
+            400,
+            r#"{"error":"target proxy does not exist"}"#.into(),
+            vec![],
+        )]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([("team-alpha".into(), actual.clone())])),
+            None,
+            &ApplyOptions {
+                allow_nontransactional_plugin_attach: allow,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.errors.len(), 2);
+        assert!(result.errors[0].contains("target proxy does not exist"));
+        assert_eq!(result.deletes_deferred, 1);
+        assert!(result.applied_incremental.is_empty());
+        assert_eq!(
+            mutation_lines(&requests),
+            vec!["PUT /plugins/config/pc1 HTTP/1.1"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_proxy_scope_with_stray_target_does_not_enter_batch_only_path() {
+    use gitforgeops::config::schema::PluginScope;
+
+    for scope in [PluginScope::Global, PluginScope::ProxyGroup] {
+        let mut desired = scoped_plugin_desired();
+        desired.plugin_configs[0].scope = scope;
+        desired.proxies[0].plugins.clear();
+        let diffs = gitforgeops::diff::compute_diff(&desired, &GatewayConfig::default());
+        assert!(gitforgeops::apply::incremental_plugin_attach_notice(
+            &Default::default(),
+            &diffs,
+            &desired,
+        )
+        .is_none());
+        // The API-target library does not replace the CLI's schema/security
+        // gate. This isolates dependency classification for malformed targets.
+        let (url, requests) =
+            spawn_recording_gateway(vec![("POST /batch".into(), 501, "{}".into(), vec![])]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".into()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([(
+                "team-alpha".into(),
+                GatewayConfig::default(),
+            )])),
+            None,
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            mutation_lines(&requests),
+            vec![
+                "POST /batch HTTP/1.1",
+                "POST /plugins/config HTTP/1.1",
+                "POST /proxies HTTP/1.1",
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fallback() {
+    use gitforgeops::apply::{incremental_plugin_attach_notice, order_incremental_diffs};
+    use gitforgeops::review::pr_comment::{
+        build_review_comment_v2_with_status, ReviewValidationStatus,
+    };
+
+    let mut desired = scoped_plugin_desired();
+    let mut independent = plugin_config("independent", "team-alpha", "unused", None);
+    independent.scope = gitforgeops::config::schema::PluginScope::Global;
+    independent.proxy_id = None;
+    desired.plugin_configs.push(independent);
+    let actual = GatewayConfig {
+        proxies: vec![proxy("old", "team-alpha", None)],
+        ..Default::default()
+    };
+    let mut old = actual.proxies[0].clone();
+    old.backend_port = 9090;
+    desired.proxies.push(old);
+    let diffs =
+        order_incremental_diffs(gitforgeops::diff::compute_diff(&desired, &actual), &desired);
+    assert_eq!(
+        diffs
+            .iter()
+            .map(|diff| diff.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["independent", "pc1", "p1", "old"]
+    );
+    let note = incremental_plugin_attach_notice(&Default::default(), &diffs, &desired).unwrap();
+    let review = build_review_comment_v2_with_status(
+        ReviewValidationStatus::Passed,
+        "",
+        &diffs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Some(note),
+        &Default::default(),
+        false,
+    );
+    assert!(review.contains("POST /batch"));
+    assert!(review.contains("--allow-nontransactional-plugin-attach"));
+    assert!(review.contains("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH=true"));
+    assert!(review.contains("briefly published without its scoped plugin"));
+    assert!(
+        incremental_plugin_attach_notice(&ApplyStrategy::FullReplace, &diffs, &desired).is_none()
+    );
+    let (url, requests) = spawn_recording_gateway(vec![]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty());
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /plugins/config HTTP/1.1",
+            "POST /batch HTTP/1.1",
+            "PUT /proxies/old HTTP/1.1",
+        ]
+    );
+}
+
 fn ledger_of(ops: &[gitforgeops::apply::AppliedOp], desired: &GatewayConfig) -> StateFile {
     let mut state = StateFile::default();
     for op in ops {
@@ -2209,6 +3041,511 @@ fn candidate_ids(candidates: &[AdoptionCandidate]) -> Vec<String> {
         .iter()
         .map(|c| format!("{} {}", c.kind, c.id))
         .collect()
+}
+
+// Stateful loopback gateway for prune regressions. A DELETE really removes
+// the incumbent, so both the transcript and surviving state are observable.
+// HTTP route uniqueness is enforced on create/update; no atomic swap exists.
+struct PruneGatewayState {
+    live: GatewayConfig,
+    requests: Vec<(String, String, String)>,
+}
+
+fn spawn_prune_gateway(
+    live: GatewayConfig,
+    rejection: Option<(&'static str, &'static str, u16)>,
+) -> (String, Arc<Mutex<PruneGatewayState>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(Mutex::new(PruneGatewayState {
+        live,
+        requests: Vec::new(),
+    }));
+    let shared = Arc::clone(&state);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                while let Some(request) = read_request(&mut stream) {
+                    let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+                    let mut words = headers.split_whitespace();
+                    let method = words.next().unwrap();
+                    let path = words.next().unwrap().split('?').next().unwrap();
+                    let namespace = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("x-ferrum-namespace"))
+                        .map(|(_, value)| value.trim())
+                        .unwrap_or("ferrum");
+                    let (status, response) = {
+                        let mut state = shared.lock().unwrap();
+                        state
+                            .requests
+                            .push((method.into(), namespace.into(), path.into()));
+                        if method == "GET" && path == "/health" {
+                            (200, HEALTHY.to_string())
+                        } else if method == "GET" && path == "/backup" {
+                            let config = gitforgeops::config::filter_config_by_namespace(
+                                &state.live,
+                                namespace,
+                            );
+                            (200, backup_body(&config))
+                        } else if path.starts_with("/proxies") {
+                            let incoming = if matches!(method, "POST" | "PUT") {
+                                Some(serde_json::from_str::<Proxy>(body).unwrap())
+                            } else {
+                                None
+                            };
+                            let id = incoming
+                                .as_ref()
+                                .map(|proxy| proxy.id.clone())
+                                .unwrap_or_else(|| {
+                                    path.strip_prefix("/proxies/").unwrap().to_string()
+                                });
+                            if let Some((_, _, status)) =
+                                rejection.filter(|(verb, key, _)| *verb == method && *key == id)
+                            {
+                                (status, r#"{"error":"injected resource failure"}"#.into())
+                            } else if let Some(incoming) = incoming {
+                                assert_eq!(incoming.namespace, namespace);
+                                let conflict = state.live.proxies.iter().any(|proxy| {
+                                    proxy.namespace == namespace
+                                        && proxy.id != incoming.id
+                                        && proxy.hosts == incoming.hosts
+                                        && proxy.listen_path == incoming.listen_path
+                                });
+                                if conflict {
+                                    (409, r#"{"error":"proxy route already exists"}"#.into())
+                                } else {
+                                    state.live.proxies.retain(|proxy| {
+                                        proxy.namespace != namespace || proxy.id != incoming.id
+                                    });
+                                    state.live.proxies.push(incoming);
+                                    (200, "{}".into())
+                                }
+                            } else if method == "DELETE" {
+                                state
+                                    .live
+                                    .proxies
+                                    .retain(|proxy| proxy.namespace != namespace || proxy.id != id);
+                                (204, String::new())
+                            } else {
+                                panic!("unexpected proxy request: {request}");
+                            }
+                        } else {
+                            panic!("unexpected request: {request}");
+                        }
+                    };
+                    if write!(
+                        stream,
+                        "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), state)
+}
+
+fn routed_proxy(id: &str, namespace: &str, route: &str) -> Proxy {
+    let mut resource = proxy(id, namespace, None);
+    resource.listen_path = Some(route.into());
+    resource
+}
+
+fn proxy_ledger(live: &GatewayConfig) -> StateFile {
+    let ops = live
+        .proxies
+        .iter()
+        .map(|proxy| gitforgeops::apply::AppliedOp {
+            kind: "Proxy".into(),
+            namespace: proxy.namespace.clone(),
+            id: proxy.id.clone(),
+            action: DiffAction::Add,
+        })
+        .collect::<Vec<_>>();
+    ledger_of(&ops, live)
+}
+
+fn record_prune_result(state: &mut StateFile, result: &ApplyResult, desired: &GatewayConfig) {
+    for op in result.applied_incremental.iter().chain(&result.adopted) {
+        state.record_op(op, desired).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_rename_cli_preserves_incumbent_and_journal_on_unchanged_retries() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    for mode in ["shared", "exclusive"] {
+        let live = GatewayConfig {
+            proxies: vec![routed_proxy("api-v1", "ferrum", "/orders")],
+            ..Default::default()
+        };
+        let (url, gateway) = spawn_prune_gateway(live.clone(), None);
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join(".gitforgeops")).unwrap();
+        std::fs::create_dir_all(root.join(".state")).unwrap();
+        std::fs::create_dir_all(root.join("resources/ferrum/proxies")).unwrap();
+        std::fs::write(
+            root.join(".gitforgeops/config.yaml"),
+            format!(
+                "version: 1\ndefault_environment: prod\nenvironments:\n  prod:\n    apply_strategy: incremental\n    ownership:\n      mode: {mode}\n      namespaces: [ferrum]\n      large_prune_threshold_percent: 100\n"
+            ),
+        )
+        .unwrap();
+        let desired = routed_proxy("api-v2", "ferrum", "/orders");
+        std::fs::write(
+            root.join("resources/ferrum/proxies/api-v2.yaml"),
+            serde_yaml::to_string(&serde_json::json!({"kind": "Proxy", "spec": desired})).unwrap(),
+        )
+        .unwrap();
+        let mut state = proxy_ledger(&live);
+        state.environment = "prod".into();
+        state.last_applied_commit = Some("previous-clean-commit".into());
+        let state_path = root.join(".state/prod.json");
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let validator = root.join("validator");
+        std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Each run sends one POST. Deferral keeps the routing key occupied,
+        // so the second unchanged apply must fail too, preserving the journal.
+        for attempt in 1..=2 {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
+            command.current_dir(root).env_clear();
+            for name in ["PATH", "HOME", "TMPDIR"] {
+                if let Ok(value) = std::env::var(name) {
+                    command.env(name, value);
+                }
+            }
+            let output = command
+                .args(["apply", "--auto-approve"])
+                .env("FERRUM_GATEWAY_MODE", "api")
+                .env("FERRUM_GATEWAY_URL", &url)
+                .env("FERRUM_ALLOW_INSECURE_HTTP", "true")
+                .env(
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "test-secret-must-be-32-chars-long",
+                )
+                .env("FERRUM_GATEWAY_MAX_RETRIES", "0")
+                .env("FERRUM_EDGE_BINARY_PATH", &validator)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{mode}: {stdout}\n{stderr}");
+            assert!(
+                stdout.contains("0 deleted, 1 deletes deferred"),
+                "{stdout}\n{stderr}"
+            );
+            assert!(
+                stderr.contains("[ferrum] DEFER DELETE Proxy `api-v1`"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("proxy route already exists"), "{stderr}");
+            let saved: StateFile =
+                serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+            assert_eq!(saved.resources, state.resources);
+            assert_eq!(saved.last_applied_commit, state.last_applied_commit);
+            assert!(saved
+                .pending_creates
+                .contains(&state_key("ferrum", "Proxy", "api-v2")));
+            let gateway = gateway.lock().unwrap();
+            assert!(gateway
+                .requests
+                .iter()
+                .all(|(method, _, _)| method != "DELETE"));
+            assert_eq!(
+                gateway
+                    .requests
+                    .iter()
+                    .filter(|(method, _, _)| method == "POST")
+                    .count(),
+                attempt
+            );
+            assert_eq!(gateway.live.proxies.len(), 1);
+            assert_eq!(gateway.live.proxies[0].id, "api-v1");
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_proven_absent_defers_prune_without_replaying_the_post() {
+    let live = GatewayConfig {
+        proxies: vec![routed_proxy("retained", "ferrum", "/old")],
+        ..Default::default()
+    };
+    let desired = GatewayConfig {
+        proxies: vec![routed_proxy("failed-add", "ferrum", "/new")],
+        ..Default::default()
+    };
+    let (url, gateway) = spawn_prune_gateway(live, Some(("POST", "failed-add", 503)));
+    let result = apply_api(
+        &desired,
+        &stub_client_with_retries(url, 3),
+        &["ferrum".into()],
+        OwnershipScope::Exclusive,
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.deletes_deferred, 1);
+    assert!(result.fatal_error.is_none());
+    assert!(result.applied_incremental.is_empty());
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert_eq!(
+        gateway
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "POST")
+            .count(),
+        1
+    );
+    assert!(gateway.requests.iter().all(|(m, _, _)| m != "DELETE"));
+    assert_eq!(gateway.live.proxies[0].id, "retained");
+}
+
+#[tokio::test]
+async fn failed_pending_create_assertion_also_defers_prunes() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("retained", "ferrum", "/old"),
+            routed_proxy("pending", "ferrum", "/new"),
+        ],
+        ..Default::default()
+    };
+    let desired = GatewayConfig {
+        proxies: vec![live.proxies[1].clone()],
+        ..Default::default()
+    };
+    let (url, gateway) = spawn_prune_gateway(live, Some(("PUT", "pending", 422)));
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["ferrum".into()],
+        OwnershipScope::Exclusive,
+        None,
+        None,
+        &ApplyOptions {
+            pending_create_assertions: BTreeSet::from([state_key("ferrum", "Proxy", "pending")]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.deletes_deferred, 1);
+    assert!(result.applied_incremental.is_empty());
+    assert!(result.adopted.is_empty());
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert!(gateway
+        .requests
+        .iter()
+        .all(|(m, _, _)| m != "DELETE" && m != "POST"));
+    assert_eq!(gateway.live.proxies.len(), 2);
+}
+
+#[tokio::test]
+async fn failed_modify_defers_its_namespace_prunes_and_other_namespaces_progress() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("retained", "team-a", "/old"),
+            routed_proxy("fail-modify", "team-a", "/keep"),
+            routed_proxy("pruned", "team-b", "/old"),
+        ],
+        ..Default::default()
+    };
+    let mut modified = live.proxies[1].clone();
+    modified.backend_port = 9090;
+    let desired = GatewayConfig {
+        proxies: vec![
+            modified,
+            routed_proxy("added-a", "team-a", "/new"),
+            routed_proxy("added-b", "team-b", "/new"),
+        ],
+        ..Default::default()
+    };
+    let mut state = proxy_ledger(&live);
+    let managed = state.previously_managed_keys();
+    let (url, gateway) = spawn_prune_gateway(live.clone(), Some(("PUT", "fail-modify", 422)));
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-a".into(), "team-b".into()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((result.created, result.updated, result.deleted), (2, 0, 1));
+    assert_eq!(result.deletes_deferred, 1);
+    assert_eq!(result.errors.len(), 1);
+    assert!(result.errors[0].contains("[team-a] Proxy fail-modify update"));
+    record_prune_result(&mut state, &result, &desired);
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-a", "Proxy", "retained")));
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-a", "Proxy", "fail-modify")));
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-a", "Proxy", "added-a")));
+    assert!(state
+        .resources
+        .contains_key(&state_key("team-b", "Proxy", "added-b")));
+    assert!(!state
+        .resources
+        .contains_key(&state_key("team-b", "Proxy", "pruned")));
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert!(gateway
+        .requests
+        .iter()
+        .all(|(method, ns, _)| method != "DELETE" || ns != "team-a"));
+    assert!(gateway.requests.contains(&(
+        "DELETE".into(),
+        "team-b".into(),
+        "/proxies/pruned".into()
+    )));
+    assert!(gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "retained"));
+    assert!(gateway.live.proxies.iter().any(|proxy| {
+        proxy.id == "fail-modify" && proxy.backend_port == live.proxies[1].backend_port
+    }));
+    assert!(!gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "pruned"));
+}
+
+#[tokio::test]
+async fn failed_delete_keeps_its_ledger_entry_and_other_deletes_still_run() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("retained", "ferrum", "/old"),
+            routed_proxy("pruned", "ferrum", "/other"),
+        ],
+        ..Default::default()
+    };
+    let mut state = proxy_ledger(&live);
+    let managed = state.previously_managed_keys();
+    let (url, gateway) = spawn_prune_gateway(live, Some(("DELETE", "retained", 409)));
+    let desired = GatewayConfig::default();
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["ferrum".into()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.deleted, 1);
+    assert_eq!(result.deletes_deferred, 0);
+    record_prune_result(&mut state, &result, &desired);
+    assert!(state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "retained")));
+    assert!(!state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "pruned")));
+    assert!(result.into_result().is_err());
+    let gateway = gateway.lock().unwrap();
+    assert_eq!(
+        gateway
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .count(),
+        2
+    );
+    assert_eq!(gateway.live.proxies.len(), 1);
+    assert_eq!(gateway.live.proxies[0].id, "retained");
+}
+
+#[tokio::test]
+async fn successful_writes_are_followed_by_prune_and_update_the_ledger() {
+    let live = GatewayConfig {
+        proxies: vec![
+            routed_proxy("pruned", "ferrum", "/old"),
+            routed_proxy("modified", "ferrum", "/keep"),
+        ],
+        ..Default::default()
+    };
+    let mut modified = live.proxies[1].clone();
+    modified.backend_port = 9090;
+    let desired = GatewayConfig {
+        proxies: vec![modified, routed_proxy("added", "ferrum", "/new")],
+        ..Default::default()
+    };
+    let mut state = proxy_ledger(&live);
+    let managed = state.previously_managed_keys();
+    let (url, gateway) = spawn_prune_gateway(live, None);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["ferrum".into()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        None,
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap()
+    .into_result()
+    .unwrap();
+    assert_eq!((result.created, result.updated, result.deleted), (1, 1, 1));
+    assert_eq!(result.deletes_deferred, 0);
+    record_prune_result(&mut state, &result, &desired);
+    assert_eq!(state.resources.len(), 2);
+    assert!(state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "added")));
+    assert!(!state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "pruned")));
+    let gateway = gateway.lock().unwrap();
+    let mutations = gateway
+        .requests
+        .iter()
+        .filter(|(m, _, _)| m != "GET")
+        .collect::<Vec<_>>();
+    assert_eq!(mutations.len(), 3);
+    assert_eq!(mutations[2].0, "DELETE");
+    assert_eq!(gateway.live.proxies.len(), 2);
+    assert!(!gateway
+        .live
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "pruned"));
 }
 
 #[tokio::test]

@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     name = "gitforgeops",
-    about = "GitOps for Ferrum Edge gateway configuration"
+    about = "GitOps for Ferrum Edge gateway configuration",
+    version
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -33,6 +34,14 @@ pub struct Cli {
     /// `export --materialize` and `rotate` all go through.
     #[arg(long, global = true)]
     pub allow_credential_slot_remap: bool,
+
+    /// Accept a namespace filter that selected zero desired resources while
+    /// the on-disk tree is non-empty. Without this flag `validate`, `plan`,
+    /// and `diff` refuse that mismatch as an error-severity finding (exit 1).
+    /// There is deliberately no environment variable — continuing against an
+    /// empty selection is a per-run decision, not a repository setting.
+    #[arg(long, global = true)]
+    pub allow_empty_namespace: bool,
 }
 
 #[derive(Subcommand)]
@@ -59,8 +68,13 @@ pub enum Commands {
     Diff {
         #[arg(long)]
         exit_on_drift: bool,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
     },
-    Plan {},
+    Plan {
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+    },
     Apply {
         #[arg(long)]
         auto_approve: bool,
@@ -75,6 +89,11 @@ pub enum Commands {
         /// Destructive: without this flag `apply` preserves them.
         #[arg(long)]
         confirm_api_spec_deletion: bool,
+        /// Permit proxy-then-plugin creates after POST /batch returns 501/413.
+        /// The proxy is briefly published without its scoped plugin. Also set
+        /// by GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH=true.
+        #[arg(long)]
+        allow_nontransactional_plugin_attach: bool,
     },
     Import {
         /// Import one API namespace. Requires FERRUM_NAMESPACE or an
@@ -105,15 +124,16 @@ pub enum Commands {
         /// which the strict loader would reject the files import just wrote.
         #[arg(long, value_name = "NAME")]
         accept_unknown_field: Vec<String>,
-        /// Accept unclassifiable plaintext config for this plugin, by exact
+        /// Accept unbrokered plaintext config for this plugin, by exact
         /// `plugin_name`. Repeatable.
         ///
-        /// gitforgeops has no schema for a plugin it does not recognize, so
-        /// only the key/URL sensitivity heuristics run over its config; a
-        /// vendor field they do not flag would otherwise be committed to Git
-        /// as written. Without this flag such an import fails, naming every
-        /// unclassified path. Pass the plugin name once you have read that
-        /// list and confirmed none of it is a credential.
+        /// Builtin plugins require this for secret-looking key/URL heuristic
+        /// matches outside their broker rules. Custom plugins require it for
+        /// strings the heuristics do not flag. Without this flag import fails
+        /// before writing the tree or bundle and lists the paths, never values.
+        /// After reviewing the source, accept only non-credentials; accepted
+        /// paths stay literal and appear in a review notice. Schema-covered
+        /// builtin secrets and custom heuristic matches are still brokered.
         #[arg(long, value_name = "PLUGIN_NAME")]
         allow_plaintext_plugin_config: Vec<String>,
     },
@@ -124,6 +144,13 @@ pub enum Commands {
         /// Intended for the trusted, credentialed PR-review workflow.
         #[arg(long)]
         require_live: bool,
+        /// Exit 1 when the same offline apply blockers that make `plan`
+        /// exit 1 are present. Default review stays 0 so existing CI that
+        /// keys off the process status is unchanged; the PR comment is
+        /// identical either way. Also set by
+        /// GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true.
+        #[arg(long)]
+        fail_on_blockers: bool,
     },
     /// Emit JSON listing environments declared in repo config (used by CI matrix).
     Envs {
@@ -134,12 +161,22 @@ pub enum Commands {
         #[arg(long)]
         include_scopes: bool,
     },
-    /// Rotate a specific credential slot. Requires provisioner token.
+    /// Print the Cargo package version and build-time git metadata.
+    Version {
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+    },
+    /// Rotate a Consumer credential slot in api mode. Requires provisioner token.
     Rotate {
         #[arg(long)]
         consumer: String,
+        /// Consumer field: keyauth/key, jwt/secret, hmac_auth/secret or
+        /// basicauth/password; use <type>/[N]/<field> for later entries.
+        /// Hashes, identities, PluginConfig and Upstream slots cannot be rotated.
         #[arg(long)]
         credential: String,
+        /// Target namespace; defaults to the resolved environment filter
+        /// (configured namespace_filter, then FERRUM_NAMESPACE), then ferrum.
         #[arg(long)]
         namespace: Option<String>,
         /// GitHub login to deliver the rotated credential to (age-encrypted).
@@ -160,4 +197,12 @@ pub enum ValidateFormat {
 pub enum EnvsFormat {
     Json,
     Text,
+}
+
+/// Machine-readable report for `plan`, `diff`, and `version`. `validate` keeps
+/// its own [`ValidateFormat`] because it also emits GitHub Actions annotations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReportFormat {
+    Text,
+    Json,
 }

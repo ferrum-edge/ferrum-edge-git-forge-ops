@@ -59,8 +59,19 @@ impl PolicyCheck for RequireAiGuardrailsRule {
 
     fn evaluate(&self, cfg: &GatewayConfig) -> Vec<PolicyFinding> {
         let mut findings = Vec::new();
-        if !self.config.enabled || self.config.guardrail_plugin_names.is_empty() {
+        if !self.config.enabled {
             return findings;
+        }
+        if self
+            .config
+            .guardrail_plugin_names
+            .iter()
+            .all(|s| s.trim().is_empty())
+        {
+            return vec![crate::policy::empty_allowlist_finding(
+                self.rule_id(),
+                "guardrail_plugin_names",
+            )];
         }
 
         let guardrails: Vec<String> = self

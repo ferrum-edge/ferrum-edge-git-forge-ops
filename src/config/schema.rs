@@ -367,6 +367,12 @@ pub struct KubernetesConfig {
     pub service_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_name: Option<String>,
+    /// Whether the discovered address is `IPv4` or `IPv6`. Optional; `null`
+    /// (omitted) means automatic. The value is validated by `ferrum-edge
+    /// validate`, not here — like every other closed-value field this mirror
+    /// carries as a string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_selector: Option<String>,
     #[serde(default = "default_sd_poll_interval")]
@@ -696,6 +702,9 @@ impl_passthrough_fields!(Proxy, Consumer, Upstream, PluginConfig);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proxy {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -827,10 +836,10 @@ pub struct Proxy {
     pub allowed_methods: Option<Vec<String>>,
     #[serde(default)]
     pub allowed_ws_origins: Vec<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -842,6 +851,9 @@ pub struct Proxy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Consumer {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub username: String,
@@ -853,14 +865,20 @@ pub struct Consumer {
     /// [`UpstreamTarget::tags`], with a second one: the credential broker
     /// walks this map to derive slot names, and a stable walk keeps the
     /// per-run ordering of allocations and of the review comment reproducible.
+    ///
+    /// Serde still accepts any map key so a typo round-trips into diagnostics
+    /// instead of disappearing at parse. [`KNOWN_CREDENTIAL_TYPES`] is the
+    /// closed set Ferrum Edge authenticates; `validate`, `plan`, `import`, and
+    /// the credential broker refuse every other key before apply or
+    /// publication.
     #[serde(default)]
     pub credentials: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub acl_groups: Vec<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -870,8 +888,65 @@ pub struct Consumer {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// Built-in Ferrum Edge Consumer credential types.
+///
+/// Matches OpenAPI `BuiltInCredentialType` / runtime `ALLOWED_CREDENTIAL_TYPES`
+/// exactly: `basicauth`, `keyauth`, `jwt`, `hmac_auth`, `mtls_auth`. The
+/// gateway will store any other map key as an opaque custom type, but auth
+/// plugins never index those keys, so gitforgeops refuses them before apply
+/// and before import writes a tree or migration bundle.
+pub const KNOWN_CREDENTIAL_TYPES: [&str; 5] =
+    ["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
+
+/// Docs / marketing-site spellings that look like credential types but are
+/// never authenticated by Ferrum Edge. Suggestion text is the only use.
+const CREDENTIAL_TYPE_SUGGESTIONS: &[(&str, &str)] =
+    &[("api_key", "keyauth"), ("basic_auth", "basicauth")];
+
+/// True only for an exact built-in type key. Case variants and aliases are
+/// unknown types: `key_auth` is not `keyauth`.
+pub fn is_known_credential_type(key: &str) -> bool {
+    KNOWN_CREDENTIAL_TYPES.contains(&key)
+}
+
+/// Canonical type to suggest for a known misspelling, if any.
+pub fn suggest_credential_type(unknown: &str) -> Option<&'static str> {
+    CREDENTIAL_TYPE_SUGGESTIONS
+        .iter()
+        .copied()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(unknown))
+        .map(|(_, canonical)| canonical)
+}
+
+/// Comma-separated recognized set for diagnostics. Order matches
+/// [`KNOWN_CREDENTIAL_TYPES`].
+pub fn recognized_credential_types_list() -> String {
+    KNOWN_CREDENTIAL_TYPES.join(", ")
+}
+
+/// Error-severity diagnostic naming the unknown key, the consumer, and the
+/// recognized set. Known misspellings include a `did you mean` hint.
+pub fn unknown_credential_type_message(
+    unknown: &str,
+    consumer_id: &str,
+    namespace: &str,
+) -> String {
+    let recognized = recognized_credential_types_list();
+    let mut message = format!(
+        "Unknown credential type '{unknown}' on consumer {consumer_id} in namespace {namespace}; \
+         Ferrum Edge authenticates only {recognized}"
+    );
+    if let Some(suggestion) = suggest_credential_type(unknown) {
+        message.push_str(&format!(" (did you mean '{suggestion}'?)"));
+    }
+    message
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstream {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -909,10 +984,10 @@ pub struct Upstream {
     /// Admin-only ownership tag set by the spec-import API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -924,6 +999,9 @@ pub struct Upstream {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
+    /// Operator metadata, independent of routing, credentials and API-spec ownership.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub id: String,
     pub plugin_name: String,
@@ -944,10 +1022,10 @@ pub struct PluginConfig {
     /// Admin-only ownership tag set by the spec-import API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a

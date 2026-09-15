@@ -6,6 +6,8 @@
 # round-trips verbatim, validated by ferrum-edge rather than mirrored here.
 kind: PluginConfig
 spec:
+  labels:
+    team: platform
   id: every-field-plugin
   plugin_name: key_auth
   namespace: ferrum

@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 
+use crate::diagnostics::{safe_line, safe_path};
+
 use super::schema::{PassthroughFields, Resource};
 
 /// How strictly one load pass treats fields the typed mirror does not model.
@@ -407,9 +409,9 @@ fn check_passthrough_fields(
         "Warning: {}: {} unknown top-level field(s) kept verbatim because \
          FERRUM_ALLOW_UNKNOWN_FIELDS is set: {}. gitforgeops does not model these — the gateway \
          is the authority on whether they are valid.",
-        source_path.display(),
+        safe_path(source_path),
         fields.len(),
-        fields.join(", "),
+        safe_line(fields.join(", ")),
     );
     Ok(())
 }

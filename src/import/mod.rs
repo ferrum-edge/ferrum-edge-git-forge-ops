@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::config::schema::{GatewayConfig, Resource};
+use crate::config::schema::{
+    is_known_credential_type, unknown_credential_type_message, GatewayConfig, Resource,
+};
 use crate::http_client::BackupSnapshot;
+use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
     capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
@@ -129,9 +132,9 @@ pub struct ImportResult {
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
     pub sources: Vec<ImportSourceMetadata>,
-    /// Non-builtin plugins whose config strings were left in the imported
-    /// files because the sensitivity heuristics did not flag them. Surfaced
-    /// by [`ImportResult::custom_plugin_review_notice`] so an operator reads
+    /// Plugins whose config strings required explicit plaintext allowance:
+    /// builtin heuristic matches outside broker rules, or custom unflagged leaves.
+    /// Surfaced by [`ImportResult::custom_plugin_review_notice`] so an operator reads
     /// them before committing.
     ///
     /// Deliberately kept out of the import manifest: the manifest is a
@@ -231,23 +234,19 @@ impl ImportResult {
         Some(notice)
     }
 
-    /// Loud per-plugin review list for the non-builtin plugins the operator
+    /// Loud per-plugin review list for the builtin or custom plugins the operator
     /// allowed through with `--allow-plaintext-plugin-config`.
     ///
-    /// gitforgeops has no schema for a plugin it does not know, so it brokers
-    /// only what the key/URL sensitivity heuristics flag. Everything they did
-    /// not flag makes the import *fail* unless the plugin was named on the
-    /// command line (see `enforce_plaintext_plugin_config_allowance`) —
-    /// capturing `mode: strict` into a GitHub Environment Secret makes the
-    /// import unusable, and committing an unrecognized `authToken` is worse.
-    /// This notice is what the accepted case prints: the exact leaves that
-    /// were written verbatim on the operator's say-so.
+    /// Builtin heuristic matches outside broker rules and unflagged custom
+    /// strings fail import unless the plugin was named on the command line
+    /// (see `enforce_plaintext_plugin_config_allowance`). This notice lists
+    /// the exact leaves written verbatim on the operator's say-so.
     pub fn custom_plugin_review_notice(&self) -> Option<String> {
         if self.unbrokered_plugin_config.is_empty() {
             return None;
         }
         let mut notice = String::from(
-            "WARNING: these plugin config values were written verbatim because --allow-plaintext-plugin-config named their plugin. This build has no schema for them, so only key/URL heuristics ran. Confirm once more that none of them is a credential before committing:",
+            "WARNING: these plugin config values were written verbatim because --allow-plaintext-plugin-config named their plugin. These paths are secret-looking builtin fields outside this build's broker rules, or unclassified custom-plugin strings. Confirm once more that none of them is a credential before committing:",
         );
         for plugin in &self.unbrokered_plugin_config {
             let mut paths = plugin
@@ -352,23 +351,14 @@ impl ImportResult {
     }
 }
 
+/// Render one untrusted backup-sourced value for an import diagnostic.
+///
+/// Delegates to the shared log sanitizer: the treatment this function
+/// introduced (control characters folded to `U+FFFD`, bounded length) is now
+/// applied to every diagnostic that interpolates untrusted text, not just
+/// import's. See [`crate::diagnostics`].
 fn diagnostic_metadata(value: &str) -> String {
-    const MAX_CHARS: usize = 256;
-    let mut sanitized = value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .take(MAX_CHARS)
-        .collect::<String>();
-    if value.chars().count() > MAX_CHARS {
-        sanitized.push_str("[truncated]");
-    }
-    sanitized
+    crate::diagnostics::sanitize(value)
 }
 
 /// Split a flat gateway configuration into per-resource YAML files.
@@ -412,13 +402,22 @@ fn diagnostic_metadata(value: &str) -> String {
 /// `--accept-unknown-field <NAME>` (with `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
 /// is the documented way to accept one after reading the source.
 ///
-/// # Unrecognized plugins fail closed
+/// # Unknown Consumer credential types fail closed
+///
+/// A `credentials` map key outside [`crate::config::schema::KNOWN_CREDENTIAL_TYPES`]
+/// is refused before any tree file or migration bundle is written. Ferrum Edge
+/// never authenticates those keys, so there is nothing worth migrating and no
+/// acknowledgement flag. Remove the type on the gateway and re-import.
+///
+/// # Unbrokered plugin config fails closed
 ///
 /// A plugin this build has no schema for is classified by the key/URL
 /// heuristics alone, and a string they do not flag would be committed as
 /// written. This entry point allows none of that: an unclassifiable leaf is an
 /// error. The CLI's `--allow-plaintext-plugin-config <plugin_name>` is the
 /// documented way to accept them after reading the list.
+/// Builtin plugins also require this allowance for secret-looking key/URL
+/// heuristic matches outside their schema-declared broker rules.
 pub fn split_config(
     config: &GatewayConfig,
     output_dir: &Path,
@@ -434,15 +433,17 @@ pub fn split_config(
     )
 }
 
-/// Two operator acknowledgements gate this path, and both are evaluated
-/// before a single file is staged.
+/// Fail-closed gates on this path are evaluated before a single file is staged.
 ///
 /// `passthrough_policy` governs top-level resource fields this build does not
 /// model (`--accept-unknown-field` plus `FERRUM_ALLOW_UNKNOWN_FIELDS`); an
 /// unacknowledged one aborts the whole import.
 ///
+/// Unknown Consumer `credentials` map keys abort with no acknowledgement flag:
+/// Ferrum Edge never authenticates them, so there is nothing worth migrating.
+///
 /// `allow_plaintext_plugin_config` holds exact `plugin_name`s whose
-/// heuristically-unclassifiable config strings the operator has reviewed and
+/// unbrokered config strings the operator has reviewed and
 /// accepted as plaintext (`--allow-plaintext-plugin-config`). Any other plugin
 /// with such a string aborts the import too.
 pub(crate) fn split_config_with_inventory(
@@ -456,6 +457,7 @@ pub(crate) fn split_config_with_inventory(
 ) -> crate::error::Result<ImportResult> {
     let mut safe_config = config.clone();
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
+    reject_import_unknown_credential_types(&safe_config)?;
     let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
@@ -729,6 +731,48 @@ fn reject_import_passthrough_fields(
     Ok(())
 }
 
+/// Refuse Consumer `credentials` map keys Ferrum Edge never authenticates,
+/// before any import output (including a migration bundle) is planned or
+/// published.
+///
+/// Every offender is listed. Diagnostics are built from
+/// [`unknown_credential_type_message`] so they name the key, consumer,
+/// namespace, and recognized set, and suggest the canonical spelling for
+/// known misspellings. There is no acknowledgement flag: a type that never
+/// authenticates has nothing worth migrating.
+fn reject_import_unknown_credential_types(config: &GatewayConfig) -> crate::error::Result<()> {
+    let mut offenders: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    for consumer in &config.consumers {
+        for credential_type in consumer.credentials.keys() {
+            if !is_known_credential_type(credential_type) {
+                offenders.insert((
+                    consumer.namespace.as_str(),
+                    consumer.id.as_str(),
+                    credential_type.as_str(),
+                ));
+            }
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = String::from(
+        "refusing to import unknown Consumer credential types: a type Ferrum Edge never \
+         authenticates has nothing worth migrating. Remove it on the gateway and re-import. \
+         Nothing has been written.",
+    );
+    for (namespace, consumer_id, credential_type) in offenders {
+        message.push_str("\n  ");
+        message.push_str(&unknown_credential_type_message(
+            credential_type,
+            consumer_id,
+            namespace,
+        ));
+    }
+    Err(crate::error::Error::Config(message))
+}
+
 /// Human-readable list of the acknowledged unmodelled fields that were carried
 /// into the tree, so they are reviewed before the import is committed.
 fn acknowledged_passthrough_review(config: &GatewayConfig) -> Vec<String> {
@@ -752,27 +796,12 @@ fn acknowledged_passthrough_review(config: &GatewayConfig) -> Vec<String> {
 /// backup could otherwise turn one plugin into a megabyte of terminal output.
 const MAX_PATHS_PER_PLUGIN: usize = 50;
 
-/// Refuse the import unless every unrecognized plugin holding an
-/// unclassifiable config string has been named on the command line.
-///
-/// gitforgeops has no schema for such a plugin, so only the key/URL
-/// sensitivity heuristics run over its config, and a vendor field they do not
-/// recognize — `authToken`, `serviceCredential`, anything the naming
-/// conventions missed — would be committed to Git exactly as the backup
-/// returned it. The old behavior printed a warning after publishing the tree,
-/// which is the wrong order: by the time an operator reads it, the value is on
-/// disk and (once merged) in the repository's history.
-///
-/// So the default is now to fail, and the failure is recoverable in the only
-/// way that is honest — the operator reads the named paths, decides that none
-/// of them is a credential, and re-runs with
-/// `--allow-plaintext-plugin-config <plugin_name>` for each plugin they
-/// accepted. Heuristically-flagged leaves are brokered either way; the flag
-/// only governs what the heuristics could *not* judge.
-///
-/// The refusal names the plugin id, its `plugin_name`, and every unclassified
-/// path — and no values, because the whole point is that gitforgeops does not
-/// know whether they are secrets.
+/// Refuse before publication unless every plugin with unbrokered strings has
+/// been named via `--allow-plaintext-plugin-config <plugin_name>`.
+/// Builtin heuristic matches outside broker rules and unflagged custom strings
+/// require review at the source. The operator may accept non-credentials as
+/// plaintext; schema-covered builtin secrets and custom heuristic matches are
+/// brokered regardless. Diagnostics name plugin ids and paths, never values.
 fn enforce_plaintext_plugin_config_allowance(
     unbrokered: Vec<UnbrokeredPluginConfig>,
     allowed: &[String],
@@ -786,7 +815,7 @@ fn enforce_plaintext_plugin_config_allowance(
     }
 
     let mut message = String::from(
-        "refusing to import plaintext plugin config: this build has no schema for the plugin(s) below, so only the key/URL sensitivity heuristics ran, and the string values at these paths would be committed to the repository as written. Read them at the source, and if none is a credential re-run with --allow-plaintext-plugin-config <plugin_name> for each (exact plugin_name, repeatable). Nothing has been written.",
+        "refusing to import plaintext plugin config: these paths are secret-looking builtin fields outside this build's broker rules, or unclassified custom-plugin strings, and would be committed to the repository as written. Read them at the source, and if none is a credential re-run with --allow-plaintext-plugin-config <plugin_name> for each (exact plugin_name, repeatable). Nothing has been written.",
     );
     for plugin in refused {
         let mut paths = plugin
@@ -867,11 +896,8 @@ fn render_migration_bundles(captured: &CredentialBundle) -> crate::error::Result
                     <= crate::secrets::bundle::BUNDLE_SOFT_LIMIT_BYTES
             })
             .unwrap_or(shards.len() as u32);
-        if shard >= 100 {
-            return Err(crate::error::Error::Config(
-                "credential migration bundle would exceed GitHub's 100 environment-secret shard limit"
-                    .to_string(),
-            ));
+        if shard >= MAX_BUNDLE_SHARDS {
+            return Err(shard_ceiling_error(slot, "import"));
         }
         let current = shard_sizes.get(&shard).copied().unwrap_or(2);
         let projected = current + usize::from(current > 2) + entry_size;
@@ -997,49 +1023,45 @@ fn containing_git_worktree(path: &Path) -> crate::error::Result<Option<PathBuf>>
     Ok(None)
 }
 
-/// Resolve existing symlinked ancestors while still accepting a final path
-/// that does not exist yet, then normalize `.`/`..` components for a reliable
-/// containment comparison.
-///
-/// The lexical normalization runs **first**, before the canonicalize walk.
-/// `..` under an ancestor that does not exist otherwise walks the loop up to a
-/// component whose `file_name()` is `None` — a path ending in `..` has no file
-/// name — and reports "cannot resolve path … for containment validation",
-/// which says nothing about the actual problem. Collapsing the components up
-/// front turns `/nonexistent/../wanted` into `/wanted` and the check proceeds
-/// normally. Normalizing before resolution can differ from the kernel's view
-/// when a `..` crosses a symlink, but every symlinked *ancestor* that exists
-/// is still canonicalized below, and the only decision made from the result is
-/// a containment comparison that this makes stricter, not looser.
+/// Resolve path components in filesystem order, canonicalizing every existing
+/// component while still accepting a final path that does not exist yet.
+/// Processing `..` only after an existing symlink has been resolved preserves
+/// the kernel's path semantics; processing it lexically first could make the
+/// containment check inspect a different destination from the later write.
 fn resolve_for_containment(path: &Path) -> crate::error::Result<PathBuf> {
-    let absolute = lexically_normalized_absolute(path)?;
-    let mut existing = absolute.as_path();
-    let mut suffix = Vec::new();
-    let canonical = loop {
-        match std::fs::canonicalize(existing) {
-            Ok(canonical) => break canonical,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                let name = existing.file_name().ok_or_else(|| {
-                    crate::error::Error::Config(format!(
-                        "cannot resolve path {} for containment validation",
-                        path.display()
-                    ))
-                })?;
-                suffix.push(name.to_os_string());
-                existing = existing.parent().ok_or_else(|| {
-                    crate::error::Error::Config(format!(
-                        "cannot resolve path {} for containment validation",
-                        path.display()
-                    ))
-                })?;
-            }
-            Err(source) => return Err(crate::error::Error::Io(source)),
-        }
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
     };
-    Ok(suffix
-        .into_iter()
-        .rev()
-        .fold(canonical, |resolved, component| resolved.join(component)))
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(crate::error::Error::Config(format!(
+                        "path {} escapes the filesystem root",
+                        path.display()
+                    )));
+                }
+            }
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        resolved.push(name);
+                    }
+                    Err(source) => return Err(crate::error::Error::Io(source)),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Publish a complete import as one directory rename. Import is documented for

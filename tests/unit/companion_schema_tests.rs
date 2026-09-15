@@ -243,6 +243,24 @@ fn export_bytes_are_independent_of_file_creation_order() {
     assert_eq!(baseline, in_place);
 }
 
+#[test]
+fn export_without_declared_timestamps_is_byte_deterministic() {
+    let simple = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-config");
+    let render = || {
+        let assembled = assemble(load_resources(&simple).unwrap()).unwrap();
+        gitforgeops::apply::render_file_yaml(&assembled.gateway).unwrap()
+    };
+    let first = render();
+    let second = render();
+    assert_eq!(
+        first, second,
+        "loading a tree that omits timestamps must not fabricate wall-clock values"
+    );
+    // Neither serialized document invents server-owned timestamps.
+    assert!(!first.contains("created_at"), "{first}");
+    assert!(!first.contains("updated_at"), "{first}");
+}
+
 fn walk_fixture_files() -> Vec<(PathBuf, String)> {
     let root = fixture_dir();
     let mut files = Vec::new();

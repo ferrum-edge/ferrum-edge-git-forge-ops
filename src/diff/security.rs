@@ -1,5 +1,7 @@
-use crate::config::schema::{PluginConfig, Proxy};
+use crate::config::schema::{PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
+use crate::diagnostics::{sanitize, sanitize_line};
+use crate::diff::resource_diff::OwnershipScope;
 use crate::plugin_catalog::{
     allows_uninspectable_body, cfg_array, cfg_bool, cfg_str, effective_plugins, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_retired, retired_replacement,
@@ -8,6 +10,7 @@ use crate::plugin_catalog::{
 };
 use crate::policy::config::default_auth_plugin_names;
 use crate::policy::PolicyConfig;
+use crate::secrets::plugin_config::{render_config_path, sensitive_string_paths, value_at};
 use crate::secrets::resolver::is_identity_credential_leaf;
 
 #[derive(Debug, Clone)]
@@ -20,24 +23,30 @@ pub struct SecurityFinding {
 }
 
 impl SecurityFinding {
-    fn error(kind: &str, id: &str, namespace: &str, message: String) -> Self {
+    /// Build a finding, sanitizing the untrusted parts once at the point they
+    /// enter the struct.
+    ///
+    /// Every message below interpolates a repository-authored id, namespace,
+    /// plugin name or config path, and the CLI prints findings straight to
+    /// stdout/stderr. Sanitizing here rather than at each `format!` keeps the
+    /// guarantee whole: a finding can neither carry a line break into an
+    /// Actions log nor begin a line with `::`. See [`crate::diagnostics`].
+    fn new(severity: &str, kind: &str, id: &str, namespace: &str, message: String) -> Self {
         Self {
-            severity: "error".to_string(),
-            kind: kind.to_string(),
-            id: id.to_string(),
-            namespace: namespace.to_string(),
-            message,
+            severity: severity.to_string(),
+            kind: sanitize(kind),
+            id: sanitize(id),
+            namespace: sanitize(namespace),
+            message: sanitize_line(&message),
         }
     }
 
+    fn error(kind: &str, id: &str, namespace: &str, message: String) -> Self {
+        Self::new(BLOCKING_SEVERITY, kind, id, namespace, message)
+    }
+
     fn warning(kind: &str, id: &str, namespace: &str, message: String) -> Self {
-        Self {
-            severity: "warning".to_string(),
-            kind: kind.to_string(),
-            id: id.to_string(),
-            namespace: namespace.to_string(),
-            message,
-        }
+        Self::new("warning", kind, id, namespace, message)
     }
 }
 
@@ -88,6 +97,16 @@ pub fn audit_security_with_policy(
     config: &GatewayConfig,
     policy: Option<&PolicyConfig>,
 ) -> Vec<SecurityFinding> {
+    audit_security_with_scope(config, policy, OwnershipScope::Exclusive)
+}
+
+/// Audit a repository's view of the graph. Shared repositories may reference
+/// live plugin configs owned elsewhere; declared conflicts still block apply.
+pub fn audit_security_with_scope(
+    config: &GatewayConfig,
+    policy: Option<&PolicyConfig>,
+    ownership_scope: OwnershipScope<'_>,
+) -> Vec<SecurityFinding> {
     let mut findings = Vec::new();
 
     let auth_names: Vec<String> = match policy {
@@ -106,6 +125,19 @@ pub fn audit_security_with_policy(
 
     for consumer in &config.consumers {
         for (cred_type, cred_value) in &consumer.credentials {
+            if !crate::config::schema::is_known_credential_type(cred_type) {
+                findings.push(SecurityFinding::error(
+                    "Consumer",
+                    &consumer.id,
+                    &consumer.namespace,
+                    crate::config::schema::unknown_credential_type_message(
+                        cred_type,
+                        &consumer.id,
+                        &consumer.namespace,
+                    ),
+                ));
+                continue;
+            }
             check_literal_credentials(
                 &consumer.id,
                 &consumer.namespace,
@@ -120,6 +152,7 @@ pub fn audit_security_with_policy(
 
     for proxy in &config.proxies {
         check_proxy(config, proxy, &auth_names, &mut findings);
+        check_proxy_plugin_associations(config, proxy, ownership_scope, &mut findings);
     }
 
     // An Upstream carries the same TLS-verification flag as a Proxy, and a
@@ -142,6 +175,7 @@ pub fn audit_security_with_policy(
     }
 
     for plugin in &config.plugin_configs {
+        check_literal_plugin_config_secrets(plugin, &mut findings);
         check_plugin(plugin, &mut findings);
     }
 
@@ -233,6 +267,57 @@ fn check_proxy(
     }
 }
 
+/// Association errors must remain visible after assembly derives valid scoped
+/// attachments. Check disabled configs too: their stored graph still has to
+/// agree with scope, even though they cannot satisfy the auth check.
+fn check_proxy_plugin_associations(
+    config: &GatewayConfig,
+    proxy: &Proxy,
+    ownership_scope: OwnershipScope<'_>,
+    findings: &mut Vec<SecurityFinding>,
+) {
+    for association in &proxy.plugins {
+        let plugin_id = &association.plugin_config_id;
+        let plugin = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.namespace == proxy.namespace && plugin.id == *plugin_id);
+        let reason = match plugin {
+            None => Some("no PluginConfig with that ID is declared in this repository namespace"),
+            Some(plugin) => match plugin.scope {
+                PluginScope::Global => Some("scope: global cannot be explicitly associated"),
+                PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) => {
+                    Some("scope: proxy requires proxy_id to match this proxy")
+                }
+                _ => None,
+            },
+        };
+        if let Some(reason) = reason {
+            let severity =
+                if plugin.is_none() && matches!(ownership_scope, OwnershipScope::Shared { .. }) {
+                    "warning"
+                } else {
+                    BLOCKING_SEVERITY
+                };
+            let remedy = if plugin.is_none() {
+                "declare the config in this repository or confirm it is owned elsewhere"
+            } else {
+                "correct the declared PluginConfig scope/proxy_id to match the intended association"
+            };
+            findings.push(SecurityFinding::new(
+                severity,
+                "Proxy",
+                &proxy.id,
+                &proxy.namespace,
+                format!(
+                    "proxy {} in namespace {} has invalid plugin association {plugin_id}: {reason}; {remedy}",
+                    proxy.id, proxy.namespace
+                ),
+            ));
+        }
+    }
+}
+
 /// Is this `allowed_origins` entry the any-origin wildcard? CORS origins are
 /// either bare strings or match objects, so `"*"` and `{exact: "*"}` are the
 /// same policy written two ways.
@@ -251,6 +336,17 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     let id = plugin.id.as_str();
     let ns = plugin.namespace.as_str();
     let name = plugin.plugin_name.as_str();
+
+    if plugin.scope == PluginScope::ProxyGroup && plugin.proxy_id.is_some() {
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            id,
+            ns,
+            format!(
+                "plugin config {id} in namespace {ns} has scope: proxy_group with a proxy_id; scope: proxy_group requires proxy_id to be omitted, with targets declared through Proxy.plugins"
+            ),
+        ));
+    }
 
     // Name checks apply regardless of `enabled`: a retired name is a fatal
     // gateway load error for the whole config, not a skipped plugin.
@@ -447,6 +543,35 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     }
 }
 
+/// Exempt only strings the broker can resolve; lookalikes remain literals.
+fn is_broker_placeholder(value: &str) -> bool {
+    matches!(crate::secrets::parse_placeholder(value), Some(Ok(_)))
+}
+
+/// Match the import and diagnostic-scrubber classification before resolution.
+/// Disabled plugins are included because their config is still published.
+/// Findings identify the resource and field, never the classified value.
+fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
+    for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
+        let Some(serde_json::Value::String(value)) = value_at(&plugin.config, &path) else {
+            continue;
+        };
+        if is_broker_placeholder(value) {
+            continue;
+        }
+        let path = render_config_path(&path);
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            &plugin.id,
+            &plugin.namespace,
+            format!(
+                "Literal plugin-config secret in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+        ));
+    }
+}
+
 /// A modeled `Upstream.service_discovery` secret that is not a broker
 /// placeholder is a credential committed to the repository, and `apply` would
 /// publish it to the gateway. Blocking, exactly like a literal consumer
@@ -461,7 +586,7 @@ fn check_literal_service_discovery_secrets(
     findings: &mut Vec<SecurityFinding>,
 ) {
     for (field, value) in crate::secrets::service_discovery::present_secrets(upstream) {
-        if value.starts_with("${") {
+        if is_broker_placeholder(value) {
             continue;
         }
         let path = crate::secrets::service_discovery::render_path(field.path);
@@ -484,8 +609,9 @@ fn check_literal_service_discovery_secrets(
 /// distinction is the whole point of the function:
 ///
 /// * `credential_type` is the **structural** top-level key of the credential
-///   map (`basicauth`, `mtls_auth`, `keyauth`, or a custom type). It never
-///   changes.
+///   map (`basicauth`, `mtls_auth`, `keyauth`). Unknown keys are rejected
+///   before this walk, so a custom type never reaches leaf classification.
+///   It never changes.
 /// * `leaf` is the enclosing object key of the string being classified
 ///   (`None` for a bare string). An array index does not change which field a
 ///   leaf is, so it carries through array recursion unchanged — the same rule
@@ -494,9 +620,8 @@ fn check_literal_service_discovery_secrets(
 ///   (`mtls_auth[0].identity`) and is not consulted for any decision.
 ///
 /// Only `(credential_type, leaf)` decides the identity exemption, so
-/// `basicauth[0].username` is exempt while a custom credential type's
-/// `username` — which the broker would happily manage and the gateway has no
-/// public-half contract for — still blocks.
+/// `basicauth[0].username` is exempt while the same leaf name under another
+/// recognized type is still a secret. Unknown map keys never get here.
 fn check_literal_credentials(
     consumer_id: &str,
     namespace: &str,
@@ -507,7 +632,7 @@ fn check_literal_credentials(
     findings: &mut Vec<SecurityFinding>,
 ) {
     match value {
-        serde_json::Value::String(s) if !s.starts_with("${") => {
+        serde_json::Value::String(s) if !is_broker_placeholder(s) => {
             // `basicauth[].username` and `mtls_auth[].identity` are the public
             // halves of their credentials: `import` deliberately preserves
             // them verbatim, the broker refuses to generate them, and the

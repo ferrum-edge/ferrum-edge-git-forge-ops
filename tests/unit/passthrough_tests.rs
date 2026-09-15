@@ -127,9 +127,11 @@ spec:
 
 #[test]
 fn deliberately_opaque_sections_are_untouched_by_the_policy() {
-    // Plugin `config`, consumer `credentials` and mesh collection items are
-    // free-form `serde_json::Value` islands; they were never unknown-field
-    // surfaces and the pass-through must not change that.
+    // Plugin `config` values, consumer credential *entries*, and mesh collection
+    // items are free-form `serde_json::Value` islands; they were never
+    // unknown-field surfaces and the pass-through must not change that.
+    // Unknown Consumer credential *map keys* are still loadable here and are
+    // refused later by validate/plan/broker.
     let tmp = tree(&[
         (
             "ferrum/plugins/rate.yaml",
