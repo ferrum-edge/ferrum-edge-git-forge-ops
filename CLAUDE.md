@@ -8,6 +8,26 @@ Rust 2021 edition. Single binary `gitforgeops`. License: PolyForm Noncommercial 
 
 Companion to [ferrum-edge](https://github.com/ferrum-edge/ferrum-edge) — shells out to `ferrum-edge validate` for schema validation and talks to the admin REST API for live operations.
 
+## Buildout and schema policy
+
+GitForgeOps is in active buildout, before launch, with no users. Breaking
+changes are acceptable. Update the current implementation, examples, fixtures,
+tests, and documentation together; do not add compatibility layers or upgrade
+guides solely to preserve earlier buildout revisions.
+
+This repository has no database, SQL schema, or database migration runner.
+`src/config/schema.rs` is the gateway configuration mirror;
+`src/config/repo_config.rs` and `src/policy/config.rs` define repository
+configuration; `src/state.rs` defines the JSON ownership ledger. Edit those
+definitions directly. If database persistence is introduced during buildout,
+keep one complete initial schema and fold later schema changes into it instead
+of accumulating incremental migration files or alternate migration paths.
+
+Credential import bundles transfer secrets from an existing gateway into the
+broker. They are runtime import artifacts and remain outside Git worktrees.
+The companion gateway's API contract, secret handling, and ownership rules
+still apply to all buildout changes.
+
 ## Commands
 
 All commands accept `--env <name>` to select an environment declared in
@@ -338,7 +358,7 @@ passes `--allow-plaintext-plugin-config <plugin_name>` (repeatable, exact
 match), in which case they are written literally and listed in a per-plugin
 review notice. The refusal names the plugin id, `plugin_name` and every
 unclassified path, echoes no values, and writes nothing — not the tree, not
-the migration bundle. `apply` / `plan` are untouched by this gate.
+the credential import bundle. `apply` / `plan` are untouched by this gate.
 `basicauth[].username` and `mtls_auth[].identity` are never brokered in either
 path (`resolver::is_identity_credential_leaf`).
 
@@ -519,7 +539,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
 - `src/validate/` — `standin.rs` (validator-only stand-ins for unresolved broker placeholders; URL shapes for endpoint-typed plugin fields via `secrets::plugin_config::{endpoint_paths, endpoint_scheme}`), `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec, then passes the child's output through a `SecretScrubber`; `standin.rs` fabricates the validator-only credential stand-ins; `reporter.rs` formats (text/JSON/GitHub annotations) for one or both passes
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
-- `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 migration bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections; `ImportPassthroughPolicy` + `reject_import_passthrough_fields` fail closed on unmodelled top-level fields unless each is acknowledged with `--accept-unknown-field` *and* `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
+- `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 credential import bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections; `ImportPassthroughPolicy` + `reject_import_passthrough_fields` fail closed on unmodelled top-level fields unless each is acknowledged with `--accept-unknown-field` *and* `FERRUM_ALLOW_UNKNOWN_FIELDS=true`)
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
