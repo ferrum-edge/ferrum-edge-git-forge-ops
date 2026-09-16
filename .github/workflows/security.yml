@@ -247,15 +247,29 @@ jobs:
             --entrypoint /checks/unit_tests gitforgeops:scan \
             unit::override_tests:: --nocapture
 
-      - name: Scan image
+      # Two scans on purpose. The SARIF report keeps every severity visible
+      # under Code scanning, and the trivy action ignores `severity` for SARIF
+      # output unless it is told to limit the report, so an `exit-code` on that
+      # step would fail the job on a MEDIUM finding the documented gate does not
+      # cover. The gate below is the CRITICAL/HIGH fixed-vulnerability check.
+      - name: Scan image (report every severity)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: gitforgeops:scan
           format: sarif
           output: trivy-results.sarif
+          exit-code: '0'
+          ignore-unfixed: true
+
+      - name: Gate on fixed CRITICAL and HIGH vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: gitforgeops:scan
+          format: table
           severity: CRITICAL,HIGH
           exit-code: '1'
           ignore-unfixed: true
+          skip-setup-trivy: true
 
       - name: Upload Trivy SARIF
         if: ${{ always() && hashFiles('trivy-results.sarif') != '' }}
