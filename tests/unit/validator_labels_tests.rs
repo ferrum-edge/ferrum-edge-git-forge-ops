@@ -10,7 +10,7 @@ use gitforgeops::config::{GatewayConfig, MeshConfigSpec};
 use gitforgeops::validate::{run_mesh_validation, run_validation};
 use tempfile::TempDir;
 
-const FIXTURE: &str = include_str!("../../.github/fixtures/validator-resource-labels.yaml");
+const FIXTURE: &str = include_str!("../fixtures/validator-resource-labels.yaml");
 const MARKER: &str = "gitforgeops error [validator-resource-labels]";
 const PREFIX: &str = "Validation error: Spec validation failed: unknown field `labels`, \
                       expected one of ";

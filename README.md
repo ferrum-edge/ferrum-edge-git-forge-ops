@@ -1938,7 +1938,7 @@ tracking issue titled *Refresh the pinned ferrum-edge validator digest*
 containing the exact line to add and the command above, and closes that issue
 once the allowlist covers the current build and the verified binary accepts
 resource labels. After installation it validates
-`.github/fixtures/validator-resource-labels.yaml`, a minimal offline document
+`tests/fixtures/validator-resource-labels.yaml`, a minimal offline document
 with a labeled Proxy, Consumer, Upstream and PluginConfig. A schema rejection
 also fails the canary and keeps the tracking issue open; refreshing a digest
 alone does not establish compatibility.

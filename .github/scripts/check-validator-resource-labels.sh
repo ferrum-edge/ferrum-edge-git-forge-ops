@@ -10,7 +10,7 @@ if [ "$#" -ne 1 ] || [[ "$1" != /* ]] || [ ! -x "$1" ]; then
 fi
 binary=$1
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-fixture="$script_dir/../fixtures/validator-resource-labels.yaml"
+fixture="$script_dir/../../tests/fixtures/validator-resource-labels.yaml"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf -- "$tmp_dir"' EXIT
 : >"$tmp_dir/empty.conf"

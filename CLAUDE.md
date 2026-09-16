@@ -197,7 +197,7 @@ refuses before publication. Mesh and unrelated schema errors are unchanged.
 
 After the installer verifies publisher and allowlisted SHA-256 digests,
 `check-validator-resource-labels.sh` validates the minimal four-kind fixture
-at `.github/fixtures/validator-resource-labels.yaml` with empty settings and a
+at `tests/fixtures/validator-resource-labels.yaml` with empty settings and a
 clean environment. The daily validator-pin canary fails and keeps its tracking
 issue open for either a stale digest or failed label acceptance. PR validation
 runs the same probe, including an unconditional `validator-pairing` job required
