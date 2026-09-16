@@ -169,6 +169,15 @@ before secrets are used.
 
 ## 3. Protect every deployment environment
 
+Plan check first: on a private repository, GitHub Environments and their
+secrets need Pro, Team, or Enterprise, and the required reviewer this section
+sets needs Enterprise (Free, Pro, and Team offer required reviewers to public
+repositories only). The bootstrap script warns when the repository is private,
+reports an environment GitHub refuses as `FAILED`, and exits non-zero; the audit
+in §5 then reports each reviewer-less environment. The README's
+[GitHub plan requirements](../README.md#github-plan-requirements) lays out the
+public-versus-private trade-off; pick the shape before continuing.
+
 Before enabling any environment-bound workflow, copy
 `.gitforgeops/config.example.yaml` to `.gitforgeops/config.yaml`, replace its
 example entries with the real deployment environments, and commit that file.
