@@ -28,7 +28,8 @@ RUN cargo build --release --locked
 # CVE-2026-8376, CVE-2026-42496 and CVE-2026-13221 (perl-base, an Essential
 # package that cannot be purged), CVE-2026-11822 and CVE-2026-11824
 # (libsqlite3-0), CVE-2026-41992 (gzip), and CVE-2026-86145 and
-# CVE-2026-89161 (libpcre2-8-0). Each package is fetched from its immutable
+# CVE-2026-89161 (libpcre2-8-0), and CVE-2026-5450 and CVE-2026-5928 (glibc:
+# libc6 and libc-bin). Each package is fetched from its immutable
 # pool path and refused unless its digest matches the reviewed value here, so
 # the same source commit still produces the same runtime bytes and no mutable
 # package index is ever consulted. Remove this stage once a rebuilt
@@ -44,12 +45,16 @@ RUN set -eu; \
         0a459adaffd901109f7811ab65f58e7a957b4907d05539cf3d1184efdcde0468 libsqlite3-0_3.46.1-7+deb13u2_amd64.deb \
         74cf12212beee4ab8d473bdc0107abf9e8cef737492198e2f4944a19f142b0ac gzip_1.13-1+deb13u1_amd64.deb \
         1252b96a5bc44bb5db982bef8eb18e54f5047cede2aff641bce4f8e1edb91c3e libpcre2-8-0_10.46-1~deb13u2_amd64.deb \
+        967aa62605721081c3eb2a17650611a792aa802d76a6511d1840242623d204c9 libc6_2.41-12+deb13u4_amd64.deb \
+        dc8c79647fe3a5f37f72a400414f70263d0212f010ff2c09f990e30d91e38d1c libc-bin_2.41-12+deb13u4_amd64.deb \
         > SHA256SUMS ;; \
       arm64) printf '%s  %s\n' \
         4cee6f6b5b4b501d82118c56aa31bbefc2491415bc03a00e21bdacff2406b288 perl-base_5.40.1-6+deb13u1_arm64.deb \
         5b09efca71cb7a16d67f5453af3989ae1a84fe6b68c6dd3913de527cb0ca23aa libsqlite3-0_3.46.1-7+deb13u2_arm64.deb \
         02f83e5b4351ab4caa54f0405a334943dcd4986fdce740072bbda7b3c844e1f6 gzip_1.13-1+deb13u1_arm64.deb \
         e7d2c997dac145c16457be0fed3d084c98cd030bec7633eec7e5bde6dbb97712 libpcre2-8-0_10.46-1~deb13u2_arm64.deb \
+        8784eda966b189c777a384dac5ce009e8fc9b52d006926c5a013e7fa8aa688cc libc6_2.41-12+deb13u4_arm64.deb \
+        3aba9182d6989d7c512178defdcb9d02b6906816bc8b2778a82a6c39582c880c libc-bin_2.41-12+deb13u4_arm64.deb \
         > SHA256SUMS ;; \
       *) echo "unsupported target architecture: $arch" >&2; exit 1 ;; \
     esac; \
@@ -59,6 +64,7 @@ RUN set -eu; \
         libsqlite3-0_*) pool=pool/main/s/sqlite3 ;; \
         gzip_*) pool=pool/main/g/gzip ;; \
         libpcre2-8-0_*) pool=pool/main/p/pcre2 ;; \
+        libc6_*|libc-bin_*) pool=pool/main/g/glibc ;; \
         *) echo "unexpected package: $file" >&2; exit 1 ;; \
       esac; \
       curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
@@ -78,7 +84,7 @@ FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc401
 # --install` consumes only bytes the builder stage already verified against the
 # digests above; it performs no network access.
 COPY --from=builder /opt/runtime-security-updates /tmp/runtime-security-updates
-RUN dpkg --install /tmp/runtime-security-updates/*.deb \
+RUN DEBIAN_FRONTEND=noninteractive dpkg --install /tmp/runtime-security-updates/*.deb \
     && rm -rf /tmp/runtime-security-updates
 # Keep the release build a function of reviewed digests. `apt-get update` or
 # `upgrade` here would execute mutable repository state and make the same
