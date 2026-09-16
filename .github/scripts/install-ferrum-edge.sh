@@ -3,11 +3,13 @@ set -euo pipefail
 
 # Install the reviewed Ferrum Edge validator binary.
 #
-# The trust anchor is CONTENT, never a locator. Upstream publishes a single
-# rolling `latest` release whose assets are deleted and re-uploaded on every
-# build, so release ids, asset ids and tags all move underneath us. This script
-# therefore resolves the asset by its exact NAME, verifies the publisher's own
-# checksum file, and then requires the computed SHA-256 to appear in the
+# The trust anchor is CONTENT, never a locator. Upstream publishes production
+# artifacts only for version tags; assets on a given tag are immutable, and a
+# new version tag is a new candidate. GitHub's `/releases/latest` endpoint
+# returns the newest non-draft, non-prerelease release and skips prereleases
+# (including a retired rolling `latest` tag, if one still exists). This script
+# therefore resolves the candidate from that endpoint, verifies the publisher's
+# own checksum file, and then requires the computed SHA-256 to appear in the
 # reviewed allowlist at .github/ferrum-edge-checksums.txt. The bytes become
 # executable only after that allowlist match, so an unreviewed build is never
 # executed. The allowlist holds one line per approved build, so refreshing it
@@ -75,13 +77,13 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
   curl_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
 fi
 
-# Upstream ships one rolling `latest` tag. Resolve it directly, and fall back to
-# the release list so a renamed or unpublished tag degrades into "newest release
-# that still carries the asset" instead of a hard failure.
+# Resolve GitHub's newest published version release. `/releases/latest` skips
+# drafts and prereleases. Fall back to the release list, filtered the same way
+# and ordered by published_at, if that endpoint is unavailable.
 if ! curl "${curl_common[@]}" "${curl_auth[@]}" \
   -H 'Accept: application/vnd.github+json' \
-  "$releases_api/tags/latest" --output "$release_json"; then
-  echo "Rolling 'latest' release tag is unavailable; falling back to the release list." >&2
+  "$releases_api/latest" --output "$release_json"; then
+  echo "GitHub /releases/latest is unavailable; falling back to the published version-release list." >&2
   releases_json="$tmp_dir/releases.json"
   curl "${curl_common[@]}" "${curl_auth[@]}" \
     -H 'Accept: application/vnd.github+json' \
@@ -89,6 +91,7 @@ if ! curl "${curl_common[@]}" "${curl_auth[@]}" \
   jq --arg name "$asset" '
     [ .[]
       | select(.draft | not)
+      | select(.prerelease | not)
       | select([.assets[]?.name] | index($name) != null)
     ]
     | sort_by(.published_at)

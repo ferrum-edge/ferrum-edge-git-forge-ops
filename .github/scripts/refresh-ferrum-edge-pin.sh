@@ -2,12 +2,17 @@
 set -euo pipefail
 
 # Print (and optionally append) the reviewed digest allowlist line for the
-# Ferrum Edge validator build upstream is publishing right now.
+# newest published Ferrum Edge version release.
 #
 # This is the only supported way to refresh .github/ferrum-edge-checksums.txt.
-# It resolves the asset by exact NAME, downloads it together with the
+# Upstream publishes production artifacts only for version tags; assets on a
+# given tag are immutable, and a new version tag is a new candidate. Content,
+# not the tag, remains the pin: this script resolves GitHub's newest non-draft,
+# non-prerelease release, downloads the asset by exact NAME together with the
 # publisher's checksum file, and refuses to emit a line unless the two agree.
-# Appending still goes through exact-head root review and hosted CI.
+# The emitted record names the version tag (for example
+# `# 2026-09-14T02:44:07Z release v0.9.5`). Appending still goes through
+# exact-head root review and hosted CI.
 #
 # Usage: refresh-ferrum-edge-pin.sh [--append] [--allowlist PATH]
 
@@ -33,7 +38,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -h | --help)
-      sed -n '4,15p' "${BASH_SOURCE[0]}"
+      sed -n '4,17p' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
@@ -62,8 +67,8 @@ fi
 
 if ! curl "${curl_common[@]}" "${curl_auth[@]}" \
   -H 'Accept: application/vnd.github+json' \
-  "$releases_api/tags/latest" --output "$release_json"; then
-  echo "Rolling 'latest' release tag is unavailable; falling back to the release list." >&2
+  "$releases_api/latest" --output "$release_json"; then
+  echo "GitHub /releases/latest is unavailable; falling back to the published version-release list." >&2
   releases_json="$tmp_dir/releases.json"
   curl "${curl_common[@]}" "${curl_auth[@]}" \
     -H 'Accept: application/vnd.github+json' \
@@ -71,6 +76,7 @@ if ! curl "${curl_common[@]}" "${curl_auth[@]}" \
   jq --arg name "$asset" '
     [ .[]
       | select(.draft | not)
+      | select(.prerelease | not)
       | select([.assets[]?.name] | index($name) != null)
     ]
     | sort_by(.published_at)
