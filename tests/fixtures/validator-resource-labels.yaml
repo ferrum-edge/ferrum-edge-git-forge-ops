@@ -1,0 +1,39 @@
+# Small, offline gateway document: every attributed resource kind must parse
+# and validate. No broker placeholders or live credentials are needed.
+version: '1'
+proxies:
+  - id: labels-proxy
+    namespace: ferrum
+    labels:
+      provisioned-by: ferrum-edge-git-forge-ops
+    listen_path: /labels-canary
+    backend_scheme: https
+    backend_host: example.invalid
+    backend_port: 443
+consumers:
+  - id: labels-consumer
+    username: labels-canary
+    namespace: ferrum
+    labels:
+      provisioned-by: ferrum-edge-git-forge-ops
+upstreams:
+  - id: labels-upstream
+    name: labels-canary
+    namespace: ferrum
+    labels:
+      provisioned-by: ferrum-edge-git-forge-ops
+    algorithm: round_robin
+    targets:
+      - host: example.invalid
+        port: 443
+        weight: 1
+plugin_configs:
+  - id: labels-plugin
+    plugin_name: key_auth
+    namespace: ferrum
+    labels:
+      provisioned-by: ferrum-edge-git-forge-ops
+    scope: global
+    enabled: true
+    config:
+      key_location: header:X-API-Key

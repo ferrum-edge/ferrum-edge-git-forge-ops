@@ -87,7 +87,8 @@ impl BlockerKind {
                 "GITHUB_REPOSITORY not set; cannot write to GitHub Environment Secrets"
             }
             BlockerKind::Validation => {
-                "the assembled document does not validate; fix the reported schema errors"
+                "validation did not pass; resolve the reported schema or validator \
+                 compatibility errors"
             }
             BlockerKind::Security => {
                 "error-severity security finding(s); move committed secrets into the broker as \

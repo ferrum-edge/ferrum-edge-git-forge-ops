@@ -1,3 +1,4 @@
+mod compatibility;
 pub mod reporter;
 pub mod runner;
 pub mod standin;
