@@ -15,7 +15,7 @@ CHECKSUM_ASSET_ID = "540524071"
 
 # The installer reaches the network only through curl, so a fake curl on PATH
 # makes every case below hermetic: no upstream release is contacted, and the
-# rolling `latest` release can be reshaped per test.
+# published version release can be reshaped per test.
 FAKE_CURL = """#!/usr/bin/env python3
 import os
 import pathlib
@@ -32,8 +32,8 @@ for required in ("--proto", "--tlsv1.2", "--fail"):
 url = next(arg for arg in argv if arg.startswith('https://'))
 output = pathlib.Path(argv[argv.index('--output') + 1])
 
-if url.endswith('/releases/tags/latest'):
-    if os.environ.get('FAKE_TAG_MISSING'):
+if url.endswith('/releases/latest'):
+    if os.environ.get('FAKE_LATEST_MISSING'):
         raise SystemExit(22)
     output.write_text(os.environ['FAKE_RELEASE_JSON'])
 elif url.endswith('/releases?per_page=5'):
@@ -50,12 +50,20 @@ else:
 """ % ASSET
 
 
-def release(assets=(ASSET, f"{ASSET}.sha256"), tag="latest"):
+def release(
+    assets=(ASSET, f"{ASSET}.sha256"),
+    tag="v0.9.5",
+    *,
+    draft=False,
+    prerelease=False,
+    published_at="2026-09-02T03:02:29Z",
+):
     ids = {ASSET: BINARY_ASSET_ID, f"{ASSET}.sha256": CHECKSUM_ASSET_ID}
     return {
         "tag_name": tag,
-        "draft": False,
-        "published_at": "2026-09-02T03:02:29Z",
+        "draft": draft,
+        "prerelease": prerelease,
+        "published_at": published_at,
         "assets": [
             {"name": name, "url": f"{ASSET_BASE}/{ids[name]}"} for name in assets
         ],
@@ -72,7 +80,7 @@ class InstallerTests(unittest.TestCase):
         github_token: str | None = None,
         release_json: dict | None = None,
         release_list_json: list | None = None,
-        tag_missing: bool = False,
+        latest_missing: bool = False,
         symlink_allowlist: bool = False,
     ):
         with tempfile.TemporaryDirectory() as temp:
@@ -98,8 +106,8 @@ class InstallerTests(unittest.TestCase):
             )
             if release_list_json is not None:
                 environment["FAKE_RELEASE_LIST_JSON"] = json.dumps(release_list_json)
-            if tag_missing:
-                environment["FAKE_TAG_MISSING"] = "1"
+            if latest_missing:
+                environment["FAKE_LATEST_MISSING"] = "1"
             if github_token is not None:
                 environment["GITHUB_TOKEN"] = github_token
                 environment["FAKE_EXPECT_AUTH"] = f"Authorization: Bearer {github_token}"
@@ -125,7 +133,7 @@ class InstallerTests(unittest.TestCase):
     def allowlist(*digests: str) -> str:
         header = "# Reviewed SHA-256 allowlist.\n\n"
         body = "".join(
-            f"{digest}  {ASSET}  # 2026-09-0{index + 1}T00:00:00Z release latest\n"
+            f"{digest}  {ASSET}  # 2026-09-0{index + 1}T00:00:00Z release v0.9.5\n"
             for index, digest in enumerate(digests)
         )
         return header + body
@@ -230,27 +238,64 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(installed)
         self.assertIn("symlink", result.stderr)
 
-    def test_release_list_fallback_when_the_rolling_tag_is_gone(self):
-        binary = b"resolved from the release list"
+    def test_release_list_fallback_skips_prerelease_and_draft_and_picks_newest_published(self):
+        binary = b"resolved from the version-release list"
         digest = hashlib.sha256(binary).hexdigest()
         result, installed = self.run_installer(
             binary,
             digest,
             self.allowlist(digest),
-            tag_missing=True,
+            latest_missing=True,
             release_list_json=[
+                release(
+                    tag="v0.9.6-rc.1",
+                    prerelease=True,
+                    published_at="2026-09-15T00:00:00Z",
+                ),
+                release(
+                    tag="v0.9.6",
+                    draft=True,
+                    published_at="2026-09-16T00:00:00Z",
+                ),
                 {
                     "tag_name": "older",
                     "draft": False,
+                    "prerelease": False,
                     "published_at": "2026-08-01T00:00:00Z",
                     "assets": [],
                 },
-                release(tag="rebuilt"),
+                release(tag="v0.9.4", published_at="2026-09-09T00:00:00Z"),
+                release(tag="v0.9.5", published_at="2026-09-14T02:44:07Z"),
             ],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(installed)
-        self.assertIn("rebuilt", result.stdout)
+        self.assertIn("v0.9.5", result.stdout)
+        self.assertIn("2026-09-14T02:44:07Z", result.stdout)
+        self.assertNotIn("v0.9.6", result.stdout)
+        self.assertNotIn("v0.9.4", result.stdout)
+
+    def test_prerelease_latest_is_never_selected_even_when_newest(self):
+        binary = b"versioned release not rolling latest"
+        digest = hashlib.sha256(binary).hexdigest()
+        result, installed = self.run_installer(
+            binary,
+            digest,
+            self.allowlist(digest),
+            latest_missing=True,
+            release_list_json=[
+                release(
+                    tag="latest",
+                    prerelease=True,
+                    published_at="2026-09-16T00:00:00Z",
+                ),
+                release(tag="v0.9.5", published_at="2026-09-14T02:44:07Z"),
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(installed)
+        self.assertIn("v0.9.5", result.stdout)
+        self.assertNotIn("from release latest", result.stdout)
 
     def test_asset_url_outside_the_upstream_repository_is_refused(self):
         binary = b"never downloaded"

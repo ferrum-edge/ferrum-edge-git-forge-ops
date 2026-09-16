@@ -285,13 +285,14 @@ order — deep detail for each control lives in
 
 12. **Take on the validator pin refresh.** `.github/ferrum-edge-checksums.txt`
     lists the SHA-256 of every approved `ferrum-edge` build, and the installer
-    refuses to execute bytes that are not on it. Upstream republishes one rolling
-    `latest` release, so the pin goes stale on upstream's schedule.
-    `validator-pin-canary.yml` runs daily and opens (or updates) a single tracking
-    issue with the line to add. To refresh, review the upstream build, then
-    `bash .github/scripts/refresh-ferrum-edge-pin.sh --append` and merge through
-    exact-head root review — **keeping the previous line**, so in-flight pull
-    requests running the older binary stay green. See
+    refuses to execute bytes that are not on it. Upstream publishes production
+    artifacts only for version tags; assets on a given tag are immutable, and a
+    new version tag is a new candidate, so the pin goes stale when a new version
+    is published. `validator-pin-canary.yml` runs daily and opens (or updates) a
+    single tracking issue with the line to add. To refresh, review the upstream
+    build, then `bash .github/scripts/refresh-ferrum-edge-pin.sh --append` and
+    merge through exact-head root review — **keeping the previous line**, so
+    in-flight pull requests running the older binary stay green. See
     [Validator digest pinning](#validator-digest-pinning).
 
 13. **Add resources and open the first pull request.** Files go under
@@ -1948,9 +1949,11 @@ If you'd rather not depend on the upstream image (air-gapped env, vendored build
 ### Validator digest pinning
 
 The validator binary is pinned by **content**, never by a locator. Upstream
-ferrum-edge publishes a single rolling `latest` release and deletes plus
-re-uploads its assets on every build, so release ids, asset ids and tags all
-move underneath a consumer. Only the bytes are stable.
+ferrum-edge publishes production artifacts only for version tags. Assets on a
+given tag are immutable; a new version tag is a new candidate. GitHub's
+`/releases/latest` endpoint returns the newest non-draft, non-prerelease
+release and skips prereleases, so a retired rolling `latest` tag cannot starve
+versioned builds. Only the bytes are the trust anchor.
 
 `.github/ferrum-edge-checksums.txt` is the allowlist. One record per approved
 build:
@@ -1960,8 +1963,9 @@ build:
 ```
 
 `.github/scripts/install-ferrum-edge.sh` resolves the release through
-`releases/tags/latest` (falling back to the release list), finds the asset and
-its `.sha256` companion by exact **name**, downloads both over
+`releases/latest` (falling back to the newest non-draft, non-prerelease
+release that still carries the asset), finds the asset and its `.sha256`
+companion by exact **name**, downloads both over
 `--proto '=https' --tlsv1.2 --fail`, verifies the publisher's own checksum, and
 then requires the computed digest to appear in the allowlist. Only after that
 match does it `install -m 0755`. A build the repository has not reviewed is
@@ -1980,15 +1984,15 @@ bash .github/scripts/refresh-ferrum-edge-pin.sh          # print the line
 bash .github/scripts/refresh-ferrum-edge-pin.sh --append # append it in place
 ```
 
-The script downloads the current asset, cross-checks it against the publisher's
-checksum file, and refuses to emit a line if the two disagree. Commit the
-result through normal review.
+The script downloads the current published version release, cross-checks it
+against the publisher's checksum file, and refuses to emit a line if the two
+disagree. Commit the result through normal review.
 
 `validator-pin-canary.yml` runs the installer daily from the default branch (and
 on demand). When the allowlist has gone stale it opens — or updates — a single
 tracking issue titled *Refresh the pinned ferrum-edge validator digest*
 containing the exact line to add and the command above, and closes that issue
-once the allowlist covers the current build again.
+once the allowlist covers the current version release again.
 
 ## Upgrading
 

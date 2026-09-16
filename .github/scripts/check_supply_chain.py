@@ -660,8 +660,8 @@ def digest_allowlist_violations(text: str) -> list[str]:
     """The validator is pinned by content, so the allowlist must stay exact.
 
     One `<sha256>  <asset>` record per approved build, comments allowed, and no
-    locator fields: release ids, asset ids and tags all move underneath us when
-    upstream re-uploads its rolling release.
+    locator fields: a new version tag is a new candidate, but the pin remains
+    the digest. Tags name the candidate; content is the trust anchor.
     """
     violations: list[str] = []
     digests: list[str] = []
@@ -1341,6 +1341,8 @@ def main(argv: list[str] | None = None) -> int:
         "--proto '=https'",
         "--tlsv1.2",
         "--fail",
+        '"$releases_api/latest"',
+        "select(.prerelease | not)",
         '"$releases_api?per_page=5"',
         "select(.name == $name)",
         "install -m 0755",
@@ -1349,16 +1351,6 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"install-ferrum-edge.sh: missing required validator installer control {required!r}"
             )
-    # Upstream ferrum-edge retired its rolling `latest` prerelease in favour of
-    # immutable version-tag releases. Either resolution keeps the content pin
-    # intact; the candidate must still name the releases API through one of
-    # the two GitHub endpoints rather than an arbitrary locator.
-    release_resolutions = ('"$releases_api/latest"', '"$releases_api/tags/latest"')
-    if not any(marker in installer for marker in release_resolutions):
-        violations.append(
-            "install-ferrum-edge.sh: missing required validator installer control "
-            + " or ".join(repr(marker) for marker in release_resolutions)
-        )
     for workflow_name in (
         "apply-on-merge.yml",
         "drift-check.yml",
