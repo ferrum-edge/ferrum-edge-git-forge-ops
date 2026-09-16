@@ -963,6 +963,24 @@ def build_plan(api: GitHubApi, args) -> Plan:
     environments = [] if args.template_repo else resolve_environments(args)
     reviewers = resolve_reviewers(api, args) if environments else []
 
+    # GitHub Environments, environment secrets, and deployment branch policies
+    # exist on private repositories only from Pro upwards, and required
+    # reviewers on a private repository need Enterprise. Say so up front, so a
+    # FAILED environment step below is read as a plan limit, not a typo.
+    repository = optional_get(api, f"repos/{repo}") or {}
+    if environments and repository.get("private") is True:
+        plan.warnings.append(
+            f"{repo} is a private repository. GitHub Environments, environment "
+            "secrets, and deployment branch policies need GitHub Pro, Team, or "
+            "Enterprise there, and the required reviewers this baseline sets "
+            "need GitHub Enterprise (on Free, Pro, and Team they are available "
+            "to public repositories only). On a plan without them the "
+            "environment steps fail with GitHub's error, this script exits "
+            "non-zero, and the settings audit reports every environment without "
+            "a reviewer. Pick the repository shape first; see README: GitHub "
+            "plan requirements."
+        )
+
     plan.steps.extend(step_repository_variables(api, repo, args))
     plan.steps.extend(step_actions_permissions(api, repo))
     plan.steps.extend(step_workflow_permissions(api, repo))
