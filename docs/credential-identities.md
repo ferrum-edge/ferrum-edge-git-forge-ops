@@ -14,11 +14,12 @@ classification. Classification of recognized types uses the structural
 credential type and enclosing object key, with array indexes carrying the key
 unchanged.
 
-## Migration for the next release
+## Correcting identity placeholders
 
-Previously seeded identity placeholders are deliberately no longer accepted.
-Generation was already forbidden; this change also refuses loading an existing
-bundle value and refuses inspect-only previews of an invalid identity.
+Identity fields require literal values, including during buildout. A seeded
+bundle value does not make a placeholder valid: generation, resolution, and
+inspect-only previews all reject an identity placeholder. Correct an invalid
+configuration as follows:
 
 1. Replace each identity placeholder in resources and overlays with the intended
    public login or certificate identity. Keep the credential array order stable.
