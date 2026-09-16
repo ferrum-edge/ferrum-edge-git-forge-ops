@@ -384,24 +384,25 @@ bypass.
 ## 6. Keep the validator digest allowlist fresh
 
 The `ferrum-edge` validator is pinned by **content**, not by a locator. Upstream
-publishes one rolling `latest` release and deletes plus re-uploads its assets on
-every build, so release ids, asset ids and tags all move. Nothing on the GitHub
-side selects a validator version: `.github/ferrum-edge-checksums.txt` lists the
-approved SHA-256 digests, and `.github/scripts/install-ferrum-edge.sh` refuses to
-make downloaded bytes executable unless the digest is on that list. There is no
-`FERRUM_EDGE_VERSION` variable to set, and `check_supply_chain.py` fails CI if a
-workflow reintroduces one.
+publishes production artifacts only for version tags. Assets on a given tag are
+immutable; a new version tag is a new candidate. GitHub's `/releases/latest`
+endpoint returns the newest non-draft, non-prerelease release. Nothing on the
+GitHub side selects a validator version: `.github/ferrum-edge-checksums.txt`
+lists the approved SHA-256 digests, and `.github/scripts/install-ferrum-edge.sh`
+refuses to make downloaded bytes executable unless the digest is on that list.
+There is no `FERRUM_EDGE_VERSION` variable to set, and `check_supply_chain.py`
+fails CI if a workflow reintroduces one.
 
-Because the pin tracks content, it goes stale whenever upstream rebuilds — on
-upstream's schedule, not yours. `validator-pin-canary.yml` runs the installer
-daily from the default branch (plus `workflow_dispatch`), and needs no
-configuration:
+Because the pin tracks content, it goes stale whenever upstream publishes a new
+version tag — on upstream's schedule, not yours. `validator-pin-canary.yml` runs
+the installer daily from the default branch (plus `workflow_dispatch`), and
+needs no configuration:
 
 - On a stale pin it opens, or updates, exactly one tracking issue titled
   *Refresh the pinned ferrum-edge validator digest*. The body carries the exact
   allowlist line to commit and the command that regenerates it.
-- Once the allowlist covers the current build again, the canary closes that
-  issue.
+- Once the allowlist covers the current version release again, the canary
+  closes that issue.
 - It holds `contents: read` plus `issues: write` and never touches a deployment
   environment or a gateway credential.
 

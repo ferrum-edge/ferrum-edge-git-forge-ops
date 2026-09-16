@@ -2,11 +2,14 @@
 #
 # Format: <64 lowercase hex sha256>  ferrum-edge-linux-x86_64  # <date/note>
 #
-# Upstream publishes a single rolling `latest` release and deletes plus
-# re-uploads its assets on every build, so release ids, asset ids and tags are
-# all mutable. Content is the only stable pin. `install-ferrum-edge.sh` resolves
-# the asset by name, verifies the publisher's own checksum, and then refuses to
-# make the bytes executable unless the digest appears below.
+# Upstream publishes production artifacts only for version tags. Assets on a
+# given tag are immutable; a new version tag is a new candidate. GitHub's
+# `/releases/latest` endpoint returns the newest non-draft, non-prerelease
+# release and skips prereleases, so a retired rolling `latest` tag cannot
+# starve versioned builds. Content is the only stable pin.
+# `install-ferrum-edge.sh` resolves that candidate, verifies the publisher's
+# own checksum, and then refuses to make the bytes executable unless the
+# digest appears below.
 #
 # Keep one line per approved build. Retaining the previous line means a refresh
 # does not break in-flight pull requests that still run against the older

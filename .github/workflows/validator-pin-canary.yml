@@ -1,9 +1,11 @@
 name: GitForgeOps Validator Pin Canary
 
-# Upstream ferrum-edge republishes its rolling `latest` release on every build,
-# so the reviewed digest allowlist goes stale on upstream's schedule rather than
-# ours. This canary notices that the same day instead of when the next pull
-# request fails, and it hands a maintainer the exact reviewed line to commit.
+# Upstream ferrum-edge publishes production artifacts only for version tags.
+# Assets on a given tag are immutable; a new version tag is a new candidate, so
+# the reviewed digest allowlist goes stale when a new version is published
+# rather than on a rolling rebuild. This canary notices that the same day
+# instead of when the next pull request fails, and it hands a maintainer the
+# exact reviewed line to commit.
 on:
   schedule:
     - cron: '17 7 * * *'
@@ -77,9 +79,11 @@ jobs:
           cat >issue-body.md <<EOF
           $ISSUE_MARKER
 
-          The reviewed digest allowlist no longer covers the build upstream is
-          publishing. Every workflow that runs \`ferrum-edge validate\` fails
-          until the allowlist is refreshed.
+          The reviewed digest allowlist no longer covers the newest published
+          version release. Assets on a given version tag are immutable; a new
+          version tag is a new candidate, and the allowlist still lists one line
+          per approved build. Every workflow that runs \`ferrum-edge validate\`
+          fails until the allowlist is refreshed.
 
           Review the upstream build, then append this exact line to
           \`.github/ferrum-edge-checksums.txt\`:
