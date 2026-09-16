@@ -1,6 +1,6 @@
 # Ferrum Edge GitForgeOps
 
-GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge) gateway configuration via pull requests. This repository is a template: copy it, configure it, and get a full multi-environment pipeline — PR-based submission, policy-aware review, scoped apply, credential brokering, and drift monitoring — **without** leaving GitHub's free tier and **without** any third-party secret manager. Start at [Set up your own repository](#set-up-your-own-repository).
+GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge) gateway configuration via pull requests. This repository is a template: copy it, configure it, and get a full multi-environment pipeline — PR-based submission, policy-aware review, scoped apply, credential brokering, and drift monitoring — built on GitHub-native Actions, Environments, Secrets, and APIs, **without** any third-party secret manager. Which GitHub plan you need depends on repository visibility and the deployment protections you enable; read [GitHub plan requirements](#github-plan-requirements) before choosing a repository shape, then start at [Set up your own repository](#set-up-your-own-repository).
 
 ## Development status
 
@@ -26,7 +26,47 @@ baseline. See the [contributor policy](CLAUDE.md#buildout-and-schema-policy).
 - **In-GitHub credential broker** — consumer secrets never live in the repo. Placeholders (`${gh-env-secret:alloc=generate}`) are resolved from GitHub Environment Secrets at apply time. New values are generated, libsodium-sealed, written to env secrets via the REST API, and age-encrypted to the PR author's SSH key for one-time delivery.
 - **Mesh configuration as fragments** — `kind: MeshConfig` files under `resources/<ns>/mesh/` merge into one standalone `{version, mesh}` document for file-protocol mesh nodes, validated with `ferrum-edge validate -m mesh`.
 - **Drift detection with awareness of ownership** — scheduled comparisons surface changes on both sides, filtering the noise based on the env's configured mode.
-- **Free-tier only** — GitHub Secrets, GitHub Environments, GitHub Actions, GitHub API. No Vault, no AWS, no 1Password required.
+- **GitHub-native only** — GitHub Secrets, GitHub Environments, GitHub Actions, GitHub API. No Vault, no AWS, no 1Password required. Plan requirements depend on repository visibility; see [GitHub plan requirements](#github-plan-requirements).
+
+## GitHub plan requirements
+
+The documented setup uses three GitHub features whose availability depends on
+the repository's visibility and plan. Checked against GitHub's documentation on
+[managing environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments),
+[deployment protection rules](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
+and [Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
+on September 16, 2026; confirm against those pages, since plan features change.
+
+| Control this workflow uses | Public repository | Private or internal repository |
+|---|---|---|
+| GitHub Environments and environment secrets (per-environment gateway credentials, the credential broker's storage) | All current plans, including Free | Pro, Team, or Enterprise; **not available on Free** |
+| Deployment branch policy (apply only from protected branches) | All current plans | Pro, Team, or Enterprise |
+| Required reviewers on environments (the human approval gate before apply, live review, and rotate) | All current plans | **Enterprise only**; not available on Free, Pro, or Team |
+| GitHub Actions minutes (PR validation, apply, nightly drift check, weekly settings audit) | Free on standard GitHub-hosted runners | Included minutes depend on plan; usage beyond them is billed |
+
+The setup below creates a **private** repository (step 1) and gates every apply
+behind a **required reviewer** (step 8). That exact combination needs GitHub
+Enterprise. On Free, Pro, or Team you have two shapes, and each is a deliberate
+trade-off rather than a shortcut:
+
+- **Public repository.** Every control in the table works on any current plan.
+  Your gateway configuration YAML — routes, hostnames, plugin settings — is
+  public. Credential *values* stay out of the repository because the broker
+  holds them in environment secrets, but treat the topology as disclosed
+  before choosing this shape.
+- **Private repository on Pro or Team.** Environments, secrets, and branch
+  policy work; required reviewers do not, so applies run without a human
+  approval gate. `bootstrap_repo_settings.py` reports the environment step as
+  `FAILED` with GitHub's error and exits non-zero, and `settings-audit.yml`
+  reports every environment without a reviewer as a violation on each weekly
+  run. Neither pretends the control is in place. A private repository on Free
+  cannot configure environments at all, so the credential broker and
+  per-environment secrets do not work there.
+
+Do not work around a missing control by removing the reviewer requirement from
+the audit or by moving gateway credentials into repository secrets: the
+reviewer is what keeps a merged PR from reaching production unattended, and
+repository secrets are released to any branch a collaborator can push.
 
 ## Set up your own repository
 
@@ -44,6 +84,10 @@ order — deep detail for each control lives in
    gh repo create acme/gateway-config \
      --template ferrum-edge/ferrum-edge-git-forge-ops --private
    ```
+
+   Choose the visibility deliberately: `--private` as shown needs GitHub Pro or
+   Team for the environments in step 8 and GitHub Enterprise for their required
+   reviewers. See [GitHub plan requirements](#github-plan-requirements).
 
    A fork works too, but prefer the template: a fork's pull requests default to
    targeting *this* upstream repository, and GitHub disables scheduled workflows
@@ -171,7 +215,11 @@ order — deep detail for each control lives in
    administration-read audit token and no gateway credential — including the
    `default` one GitHub creates on some repositories: the settings audit holds
    **every** listed environment to these rules (waiving only the reviewer rules
-   for `settings-audit`, which deploys nothing).
+   for `settings-audit`, which deploys nothing). On a private repository the
+   required reviewer needs GitHub Enterprise; on other plans GitHub rejects the
+   environment update, the bootstrap reports `FAILED`, and the audit stays red.
+   Change the repository shape rather than dropping the reviewer — see
+   [GitHub plan requirements](#github-plan-requirements).
 
 9. **Add the per-environment secrets.** Settings → Environments → *name* →
    Environment secrets, or `gh secret set NAME --env <name>`:

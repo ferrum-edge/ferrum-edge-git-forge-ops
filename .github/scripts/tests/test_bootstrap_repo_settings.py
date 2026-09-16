@@ -586,6 +586,38 @@ class TemplateModeTests(unittest.TestCase):
         self.assertIn("contradict each other", buffer.getvalue())
 
 
+class PlanRequirementTests(unittest.TestCase):
+    def test_a_private_repository_with_environments_warns_about_plan_limits(self):
+        responses = configured_responses(environments=("production",))
+        responses[f"repos/{REPO}"] = dict(responses[f"repos/{REPO}"], private=True)
+        api = FakeApi(responses)
+        plan = bootstrap.build_plan(api, namespace(environment=["production"]))
+        rendered = "\n".join(plan.warnings)
+        self.assertIn("private repository", rendered)
+        self.assertIn("GitHub Enterprise", rendered)
+        self.assertIn("exits non-zero", rendered)
+
+    def test_a_public_repository_does_not_warn_about_plan_limits(self):
+        responses = configured_responses(environments=("production",))
+        responses[f"repos/{REPO}"] = dict(responses[f"repos/{REPO}"], private=False)
+        api = FakeApi(responses)
+        plan = bootstrap.build_plan(api, namespace(environment=["production"]))
+        self.assertFalse(
+            any("private repository" in warning for warning in plan.warnings),
+            plan.warnings,
+        )
+
+    def test_a_private_template_repository_does_not_warn(self):
+        responses = configured_responses(template=True)
+        responses[f"repos/{REPO}"] = dict(responses[f"repos/{REPO}"], private=True)
+        api = FakeApi(responses)
+        plan = bootstrap.build_plan(api, namespace(template_repo=True, state_writer_app_id=None))
+        self.assertFalse(
+            any("private repository" in warning for warning in plan.warnings),
+            plan.warnings,
+        )
+
+
 class EnvironmentTests(unittest.TestCase):
     def test_environments_are_created_from_config_yaml_with_reviewers(self):
         with tempfile.TemporaryDirectory() as directory:
