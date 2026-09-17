@@ -944,6 +944,7 @@ def main(argv: list[str] | None = None) -> int:
         ("state-guard.yml", "GitForgeOps State Guard"),
         ("validate-pr.yml", "GitForgeOps PR Static Validation"),
         ("validator-pin-canary.yml", "GitForgeOps Validator Pin Canary"),
+        ("base-image-pin-canary.yml", "GitForgeOps Base Image Pin Canary"),
     ):
         workflow_text = (workflows / workflow_name).read_text(encoding="utf-8")
         violations.extend(
