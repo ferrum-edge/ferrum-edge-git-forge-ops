@@ -1,0 +1,136 @@
+name: GitForgeOps Base Image Pin Canary
+
+# The runtime stage pins a digest of the Debian base and then installs reviewed
+# point-release packages by exact version and SHA-256, because that digest
+# predates the fixes. The stage is temporary by design, and three things end it:
+# the base catches up (retire the stage), Debian publishes a newer point release
+# (refresh the pins), or the archive drops a superseded .deb (the image build
+# fails on a 404). A comment cannot notice any of them. The `trivy-image` gate
+# notices the middle one, but only by turning every pull request red — which is
+# how the perl-base and libsqlite3 gap was found. This canary checks the moving
+# tag daily and hands a maintainer the exact next step instead.
+on:
+  schedule:
+    - cron: '41 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: base-image-pin-canary
+  cancel-in-progress: false
+
+jobs:
+  base-image-pin-canary:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    env:
+      ISSUE_TITLE: Refresh or retire the pinned runtime base image packages
+      ISSUE_MARKER: '<!-- gitforgeops:base-image-pin-canary -->'
+    steps:
+      - name: Require protected default branch
+        env:
+          SOURCE_REF: ${{ github.ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          [ "$SOURCE_REF" = "$EXPECTED_REF" ] || {
+            echo "::error::The base image pin canary may run only from $EXPECTED_REF."
+            exit 1
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The Dockerfile is the single source of truth for which image to scan:
+      # a tag repeated here could drift from the one the runtime actually uses.
+      - name: Resolve the runtime base image tag
+        id: base
+        run: |
+          set -euo pipefail
+          ref=$(python3 .github/scripts/check_base_image_pin.py --print-base-ref)
+          printf 'ref=%s\n' "$ref" >>"$GITHUB_OUTPUT"
+          echo "::notice::Scanning the moving tag $ref."
+
+      - name: Scan the current base image tag
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.base.outputs.ref }}
+          format: json
+          output: base-image-scan.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      # The checker exits non-zero when the pins no longer cover the base, so it
+      # cannot end the job here: the tracking issue below is the point of the run.
+      - name: Compare the pinned packages with the base image
+        id: evaluate
+        run: |
+          set -uo pipefail
+          python3 .github/scripts/check_base_image_pin.py \
+            --trivy-report base-image-scan.json \
+            --report-file base-image-pin-report.md
+          status=$?
+          echo "checker_status=$status" >>"$GITHUB_OUTPUT"
+          # 0 is "nothing to do" or "retirable", 1 is "the pins no longer cover
+          # the base". Anything else is the checker failing to run at all, and
+          # then there is no report for the tracking issue to carry.
+          if [ "$status" -gt 1 ]; then
+            echo "::error::The base image pin checker could not run (exit $status)."
+            exit "$status"
+          fi
+
+      - name: Open or update the tracking issue
+        if: steps.evaluate.outputs.state != 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n\n' "$ISSUE_MARKER"
+            cat base-image-pin-report.md
+            printf '\nCanary run: %s\n' "$RUN_URL"
+          } >issue-body.md
+
+          number=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null) | [.number, .title] | @tsv' \
+            | awk -F'\t' -v title="$ISSUE_TITLE" '$2 == title { print $1; exit }')
+
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$REPO" --body-file issue-body.md
+            echo "::notice::Updated tracking issue #$number."
+          else
+            gh issue create --repo "$REPO" --title "$ISSUE_TITLE" --body-file issue-body.md
+            echo "::notice::Opened a tracking issue for the runtime base image pins."
+          fi
+
+      - name: Close a resolved tracking issue
+        if: steps.evaluate.outputs.state == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          number=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null) | [.number, .title] | @tsv' \
+            | awk -F'\t' -v title="$ISSUE_TITLE" '$2 == title { print $1; exit }')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --repo "$REPO" \
+              --comment 'Every fixed CRITICAL/HIGH finding on the base image is covered by a pinned or purged package, and every pinned .deb is still in the Debian pool.'
+            echo "::notice::Closed resolved tracking issue #$number."
+          fi
+
+      # A redundant stage is cleanup, not breakage: it opens an issue without
+      # turning the canary red. Pins that no longer cover the base, or a .deb
+      # that has left the pool, break the image build and do fail the run.
+      - name: Fail when the pinned packages no longer cover the base image
+        if: steps.evaluate.outputs.state == 'stale'
+        run: |
+          echo "::error::The pinned runtime packages no longer cover the base image; see the tracking issue."
+          exit 1
