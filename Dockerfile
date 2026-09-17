@@ -34,6 +34,12 @@ RUN cargo build --release --locked
 # the same source commit still produces the same runtime bytes and no mutable
 # package index is ever consulted. Remove this stage once a rebuilt
 # `debian:trixie-slim` digest carries these versions (issue #228).
+#
+# `base-image-pin-canary.yml` watches the moving tag daily and opens a tracking
+# issue when this stage becomes redundant, when Debian publishes a point release
+# newer than a version below, or when the archive drops one of these files and
+# the build would fail on a 404. Keep the version, the digest and the pool entry
+# for BOTH architectures in step whenever a line here changes.
 ARG TARGETARCH
 RUN set -eu; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
