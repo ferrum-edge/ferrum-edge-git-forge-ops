@@ -42,8 +42,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify the reviewed validator digest and resource-label support
-        id: verify
+      - name: Verify the reviewed validator digest
+        id: install
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -51,16 +51,23 @@ jobs:
           status=0
           bash .github/scripts/install-ferrum-edge.sh \
             "$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?
-          echo "pin_status=$status" >>"$GITHUB_OUTPUT"
-          if [ "$status" -eq 0 ]; then
-            bash .github/scripts/check-validator-resource-labels.sh \
-              "$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?
-          fi
+          echo "status=$status" >>"$GITHUB_OUTPUT"
+
+      # Keep the downloaded executable out of the token-bearing install process
+      # tree: env -i protects only its direct environment, not Linux /proc.
+      - name: Verify resource-label support without a GitHub token
+        id: verify
+        if: steps.install.outputs.status == '0'
+        run: |
+          set -uo pipefail
+          status=0
+          bash .github/scripts/check-validator-resource-labels.sh \
+            "$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?
           echo "status=$status" >>"$GITHUB_OUTPUT"
 
       - name: Compute the current upstream allowlist line
         id: refresh
-        if: steps.verify.outputs.pin_status != '0'
+        if: steps.install.outputs.status != '0'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -73,7 +80,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       - name: Open or update the tracking issue
-        if: steps.verify.outputs.status != '0'
+        if: steps.install.outputs.status != '0' || steps.verify.outputs.status != '0'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -130,7 +137,7 @@ jobs:
           fi
 
       - name: Close a resolved tracking issue
-        if: steps.verify.outputs.status == '0'
+        if: steps.install.outputs.status == '0' && steps.verify.outputs.status == '0'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -146,7 +153,7 @@ jobs:
           fi
 
       - name: Fail when the validator pairing is invalid
-        if: steps.verify.outputs.status != '0'
+        if: steps.install.outputs.status != '0' || steps.verify.outputs.status != '0'
         run: |
           echo "::error::The reviewed validator digest or resource-label compatibility check failed; see the tracking issue."
           exit 1

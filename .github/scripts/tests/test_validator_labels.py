@@ -99,22 +99,24 @@ class ValidatorLabelsTests(unittest.TestCase):
 
     def test_canary_checks_capability_only_after_verified_install(self):
         workflow = (ROOT / ".github/workflows/validator-pin-canary.yml").read_text()
+        install = workflow.split("        id: install\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
         verify = workflow.split("        id: verify\n", 1)[1].split(
             "\n      - name:", 1
         )[0]
-        self.assertLess(
-            verify.index("install-ferrum-edge.sh"),
-            verify.index('if [ "$status" -eq 0 ]; then'),
-        )
-        self.assertIn('echo "pin_status=$status" >>"$GITHUB_OUTPUT"', verify)
+        self.assertIn("install-ferrum-edge.sh", install)
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", install)
+        self.assertNotIn("check-validator-resource-labels.sh", install)
+        self.assertNotIn("GITHUB_TOKEN", verify)
+        self.assertIn("if: steps.install.outputs.status == '0'", verify)
         self.assertIn('"$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?', verify)
         self.assertIn("check-validator-resource-labels.sh", verify)
-        self.assertLess(
-            verify.index("check-validator-resource-labels.sh"),
-            verify.index('echo "status=$status" >>"$GITHUB_OUTPUT"'),
+        self.assertIn("if: steps.install.outputs.status != '0'", workflow)
+        self.assertIn(
+            "if: steps.install.outputs.status == '0' && steps.verify.outputs.status == '0'",
+            workflow,
         )
-        self.assertIn("if: steps.verify.outputs.pin_status != '0'", workflow)
-        self.assertIn("if: steps.verify.outputs.status == '0'", workflow)
 
 
 if __name__ == "__main__":
