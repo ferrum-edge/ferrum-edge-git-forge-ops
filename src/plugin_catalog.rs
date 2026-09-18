@@ -2,8 +2,10 @@
 //!
 //! Mirrors `ferrum_edge::plugins::BUILTIN_PLUGIN_REGISTRATIONS` (82 accepted
 //! `plugin_name` strings) plus the `priorities` constant block. Anything not
-//! listed here falls through to the gateway's custom-plugin registry, which
-//! logs `Unknown plugin: {name}` and runs at [`DEFAULT_PRIORITY`].
+//! listed here falls through to the gateway's custom-plugin registry. If no
+//! custom registration matches, the gateway emits a sanitized unknown-plugin
+//! warning and rejects configuration validation. Unknown names retain
+//! [`DEFAULT_PRIORITY`] for scope and priority analysis.
 //!
 //! Two names are *retired and reserved*: the gateway refuses to load a config
 //! that mentions them at all. Both were fail-closed plugins, so a config that
