@@ -335,6 +335,8 @@ fn next_page_offset_overflow_is_an_error_not_a_complete_inventory() {
 
 #[tokio::test]
 async fn namespace_walk_repeated_pages_is_bounded_before_deduplication_and_import() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     for total in [None, Some(9_000_000_000_i64)] {
         // Two deliberately oversized pages exercise the actual production cap
         // without 100,000 requests or a test-only runtime limit override.
@@ -342,28 +344,31 @@ async fn namespace_walk_repeated_pages_is_bounded_before_deduplication_and_impor
         if let Some(total) = total {
             body["pagination"] = serde_json::json!({"total": total});
         }
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            for offset in [0, 50_000] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut byte = [0_u8; 1];
-                while !request.ends_with(b"\r\n\r\n") {
-                    stream.read_exact(&mut byte).unwrap();
-                    request.push(byte[0]);
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                for offset in [0, 50_000] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    assert!(request
+                        .starts_with(&format!("GET /namespaces?offset={offset}&limit=1000 ")));
+                    let body = body.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
                 }
-                let request = String::from_utf8(request).unwrap();
-                assert!(request
-                    .starts_with(&format!("GET /namespaces?offset={offset}&limit=1000 ")));
-                let body = body.to_string();
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
+            })
+            .await
+            .expect("namespace fixture did not receive its two complete requests");
         });
         let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
         let output = tempfile::tempdir().unwrap();
@@ -385,7 +390,7 @@ async fn namespace_walk_repeated_pages_is_bounded_before_deduplication_and_impor
             "{error}"
         );
         assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
-        server.join().unwrap();
+        server.await.unwrap();
     }
 }
 

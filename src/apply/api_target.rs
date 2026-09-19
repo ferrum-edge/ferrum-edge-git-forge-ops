@@ -3078,14 +3078,14 @@ fn chunk_ops(chunk: &BatchCreate, namespace: &str) -> Vec<AppliedOp> {
 #[cfg(test)]
 mod prepared_apply_tests {
     use super::*;
-    use std::io::{Read, Write};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // This invariant cannot be broken through apply_api today. Exercise its
     // private, real aggregation loop after preparing all namespaces, without
     // adding a production fault-injection option or a public test-only API.
     #[tokio::test]
     async fn missing_prepared_restore_preserves_completed_namespace_and_failed_verdict() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = AdminClient::new_scoped(
             &crate::config::EnvConfig {
                 gateway_url: Some(format!("http://{}", listener.local_addr().unwrap())),
@@ -3125,28 +3125,33 @@ mod prepared_apply_tests {
         .unwrap();
         assert_eq!(prepared.full_replaces.len(), 3);
         assert!(prepared.full_replaces.remove("beta").is_some());
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                stream.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            let headers = String::from_utf8(request).unwrap();
-            assert!(headers.starts_with("POST /restore?confirm=true "));
-            assert!(headers.contains("x-ferrum-namespace: alpha\r\n"));
-            let length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("content-length: ")
-                        .map(|value| value.parse().unwrap())
-                })
-                .unwrap();
-            stream.read_exact(&mut vec![0_u8; length]).unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}")
-                .unwrap();
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                assert!(headers.starts_with("POST /restore?confirm=true "));
+                assert!(headers.contains("x-ferrum-namespace: alpha\r\n"));
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .map(|value| value.parse().unwrap())
+                    })
+                    .unwrap();
+                stream.read_exact(&mut vec![0_u8; length]).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("restore fixture did not receive its complete request");
         });
         let result = apply_prepared(
             &desired,
@@ -3157,7 +3162,7 @@ mod prepared_apply_tests {
             &options,
         )
         .await;
-        server.join().unwrap();
+        server.await.unwrap();
         assert_eq!(result.created, 1);
         assert_eq!(result.fully_replaced_namespaces, vec!["alpha"]);
         assert!(result.applied_incremental.is_empty());
