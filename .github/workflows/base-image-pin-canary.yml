@@ -1,14 +1,16 @@
 name: GitForgeOps Base Image Pin Canary
 
-# The runtime stage pins a digest of the Debian base and then installs reviewed
-# point-release packages by exact version and SHA-256, because that digest
-# predates the fixes. The stage is temporary by design, and three things end it:
-# the base catches up (retire the stage), Debian publishes a newer point release
-# (refresh the pins), or the archive drops a superseded .deb (the image build
-# fails on a 404). A comment cannot notice any of them. The `trivy-image` gate
-# notices the middle one, but only by turning every pull request red — which is
-# how the perl-base and libsqlite3 gap was found. This canary checks the moving
-# tag daily and hands a maintainer the exact next step instead.
+# The runtime stage pins a digest of the Debian base. A temporary
+# `runtime-security-updates` builder stage may install reviewed point-release
+# packages by exact version and SHA-256 when that digest predates the fixes.
+# Four things the canary has to notice: the base catches up (retire the stage),
+# Debian publishes a newer point release (refresh the pins), the archive drops
+# a superseded .deb (the image build fails on a 404), or a later tag reports a
+# fix after the stage has already been retired (reintroduce the pins). A
+# comment cannot notice any of them. The `trivy-image` gate notices a gap, but
+# only by turning every pull request red — which is how the perl-base and
+# libsqlite3 gap was found. This canary checks the moving tag daily and hands
+# a maintainer the exact next step instead.
 on:
   schedule:
     - cron: '41 7 * * *'

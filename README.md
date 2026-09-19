@@ -1933,6 +1933,13 @@ The Ferrum Edge, Rust, and Debian stages are pinned by multi-architecture
 manifest digest. Update those references through reviewed Dependabot PRs; do
 not reintroduce a floating build argument for an executable base.
 
+Do not `apt-get update` or `upgrade` in the runtime: the same commit must
+produce the same bytes. `dpkg --purge` removes apt and unused TLS packages
+from the reviewed base. `base-image-pin-canary.yml` watches the moving Debian
+tag daily. Reintroduce a temporary digest-pinned point-release package stage
+only when that canary reports a fixed CRITICAL/HIGH the rebuilt base does not
+yet carry; never pull those fixes through apt.
+
 ## Build, test, lint
 
 ```
