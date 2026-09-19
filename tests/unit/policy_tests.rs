@@ -3150,7 +3150,11 @@ fn plugin_name_admission_errors_are_reported_once_by_security_for_every_policy_c
                 }
             }
             let security = audit_security_with_policy(&cfg, Some(&PolicyConfig::default()));
-            assert_eq!(security_blockers(&security).len(), 1, "default policy: {name}");
+            assert_eq!(
+                security_blockers(&security).len(),
+                1,
+                "default policy: {name}"
+            );
             assert!(evaluate_policies(&cfg, &PolicyConfig::default()).is_empty());
         }
     }

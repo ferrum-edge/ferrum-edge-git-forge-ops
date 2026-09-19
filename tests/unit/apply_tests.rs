@@ -2585,7 +2585,8 @@ async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespace
             let (url, requests) = spawn_recording_gateway(vec![(
                 "POST /batch".into(),
                 batch_status,
-                r#"{"created":{"proxies":1,"plugin_configs":1,"consumers":0,"upstreams":0}}"#.into(),
+                r#"{"created":{"proxies":1,"plugin_configs":1,"consumers":0,"upstreams":0}}"#
+                    .into(),
                 vec![],
             )]);
             let result = apply_api(

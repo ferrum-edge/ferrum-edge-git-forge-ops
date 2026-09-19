@@ -4,9 +4,9 @@ use crate::diagnostics::{sanitize, sanitize_line};
 use crate::diff::resource_diff::OwnershipScope;
 use crate::plugin_catalog::{
     allows_uninspectable_body, cfg_array, cfg_bool, cfg_str, effective_plugins, effective_scheme,
-    has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired, retired_replacement,
-    scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body,
-    RetiredRemediation, RETIRED_PLUGIN_NAMES,
+    has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
+    retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive,
+    waf_skips_oversized_body, RetiredRemediation, RETIRED_PLUGIN_NAMES,
 };
 use crate::policy::config::default_auth_plugin_names;
 use crate::policy::PolicyConfig;

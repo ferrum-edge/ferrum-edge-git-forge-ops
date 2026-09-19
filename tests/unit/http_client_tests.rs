@@ -292,7 +292,10 @@ fn next_page_offset_advances_until_the_total_is_covered() {
         next_page_offset(100, 100, 100, Some(250), 200).unwrap(),
         Some(200)
     );
-    assert_eq!(next_page_offset(200, 50, 100, Some(250), 250).unwrap(), None);
+    assert_eq!(
+        next_page_offset(200, 50, 100, Some(250), 250).unwrap(),
+        None
+    );
     assert_eq!(next_page_offset(0, 100, 100, Some(80), 100).unwrap(), None);
     assert_eq!(next_page_offset(0, 0, 100, Some(500), 0).unwrap(), None);
 }
@@ -300,7 +303,10 @@ fn next_page_offset_advances_until_the_total_is_covered() {
 #[test]
 fn next_page_offset_without_envelope_requires_a_short_page() {
     assert_eq!(next_page_offset(0, 100, 100, None, 100).unwrap(), Some(100));
-    assert_eq!(next_page_offset(100, 100, 100, None, 200).unwrap(), Some(200));
+    assert_eq!(
+        next_page_offset(100, 100, 100, None, 200).unwrap(),
+        Some(200)
+    );
     assert_eq!(next_page_offset(0, 12, 100, None, 12).unwrap(), None);
     assert_eq!(next_page_offset(100, 99, 100, None, 199).unwrap(), None);
 }
@@ -319,7 +325,10 @@ fn next_page_offset_cap_requires_completion_evidence_with_or_without_total() {
         next_page_offset(99_900, 100, 100, Some(100_000), 100_000).unwrap(),
         None
     );
-    assert_eq!(next_page_offset(99_901, 99, 100, None, 100_000).unwrap(), None);
+    assert_eq!(
+        next_page_offset(99_901, 99, 100, None, 100_000).unwrap(),
+        None
+    );
     // A misleading small total cannot excuse an oversized page either.
     assert!(next_page_offset(0, 100_001, 100, Some(1), 100_001).is_err());
     assert!(next_page_offset(0, usize::MAX, 100, None, usize::MAX).is_err());

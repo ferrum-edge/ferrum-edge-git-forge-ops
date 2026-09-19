@@ -3146,7 +3146,9 @@ mod prepared_apply_tests {
                     .unwrap();
                 stream.read_exact(&mut vec![0_u8; length]).await.unwrap();
                 stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
+                    )
                     .await
                     .unwrap();
             })
