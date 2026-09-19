@@ -3006,7 +3006,12 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     assert!(
         incremental_plugin_attach_notice(&ApplyStrategy::FullReplace, &diffs, &desired).is_none()
     );
-    let (url, requests) = spawn_recording_gateway(vec![]);
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "POST /batch".into(),
+        200,
+        r#"{"created":{"proxies":1,"plugin_configs":1,"consumers":0,"upstreams":0}}"#.into(),
+        vec![],
+    )]);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -3018,7 +3023,10 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     )
     .await
     .unwrap();
-    assert!(result.errors.is_empty());
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    assert_eq!(result.created, 3);
+    assert_eq!(result.updated, 1);
     assert_eq!(
         mutation_lines(&requests),
         vec![
