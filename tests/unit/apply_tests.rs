@@ -2300,11 +2300,14 @@ fn adoption_and_pending_recovery_ignore_only_association_order() {
         adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new()).unwrap();
     assert!(candidates.iter().any(|candidate| candidate.kind == "Proxy"));
     live.proxies[0].plugins.pop();
-    assert!(pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha")
-        .unwrap()
-        .is_empty());
     assert!(
-        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new()).unwrap()
+        pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new())
+            .unwrap()
             .iter()
             .all(|candidate| candidate.kind != "Proxy")
     );

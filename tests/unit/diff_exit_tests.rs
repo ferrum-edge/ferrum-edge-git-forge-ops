@@ -1009,7 +1009,7 @@ fn duplicate_backup_identities_refuse_cli_comparison_and_mutation() {
                 &["plan"],
                 &["plan", "--format", "json"],
                 &["apply", "--auto-approve", "--allow-large-prune"],
-                &["review", "--require-live"],
+                &["review", "--require-live", "--pr", "1"],
                 &["review"],
             ] {
                 let output = repo.run_with_env(args, &[("FERRUM_NAMESPACE", namespace)]);
@@ -1022,7 +1022,10 @@ fn duplicate_backup_identities_refuse_cli_comparison_and_mutation() {
                     "{out}\n{err}"
                 );
                 assert!(err.contains("duplicate resource key"), "{out}\n{err}");
-                assert!(!out.contains(SECRET) && !err.contains(SECRET), "{out}\n{err}");
+                assert!(
+                    !out.contains(SECRET) && !err.contains(SECRET),
+                    "{out}\n{err}"
+                );
                 if args[0] == "review" {
                     assert!(
                         out.contains("backup contained duplicate resource identities"),
