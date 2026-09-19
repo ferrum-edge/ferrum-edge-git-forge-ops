@@ -64,12 +64,21 @@ pub const REDACTION: &str = "[REDACTED]";
 /// Length of the sliding window used to detect a *partial* secret that
 /// survived scrubbing.
 ///
-/// Twelve bytes is long enough that ordinary diagnostic prose does not collide
-/// with a credential by accident, and short enough that a value split across a
-/// wrapped line or broken up by escaping still leaves a detectable run. The
-/// scan runs on the already-scrubbed text, so a hit means an encoding the
-/// needle list does not cover reproduced part of a secret verbatim.
-pub const FRAGMENT_SCAN_LENGTH: usize = 12;
+/// Pinned to [`MIN_SCRUB_LENGTH`] so every value substring replacement is
+/// allowed to touch also gets fragment coverage. A longer window would leave a
+/// band of values — long enough for a needle, too short to yield a single
+/// window — with no second line of defence at all: a rendering the needle list
+/// does not reproduce would pass straight through. Values *below* the floor
+/// have no windows either, but they are checked verbatim by
+/// [`SecretScrubber::leaks`], which withholds the stream outright.
+///
+/// Eight bytes is short enough that a value broken up by escaping still leaves
+/// a detectable run, and long enough that ordinary diagnostic prose does not
+/// collide with a credential by accident — and [`SecretScrubber::leaks_fragment`]
+/// discards any run the scrubbed document already contains. The scan runs on
+/// the already-scrubbed text, so a hit means an encoding the needle list does
+/// not cover reproduced part of a secret verbatim.
+pub const FRAGMENT_SCAN_LENGTH: usize = MIN_SCRUB_LENGTH;
 
 /// Shortest secret value that is removed by substring replacement.
 ///
@@ -84,6 +93,13 @@ pub const FRAGMENT_SCAN_LENGTH: usize = 12;
 /// the caller fall back to suppressing the stream entirely. The threshold only
 /// chooses which of the two protections applies, never whether one applies.
 pub const MIN_SCRUB_LENGTH: usize = 8;
+
+/// No scrubbable value may be too short to produce a fragment window: every
+/// value long enough to be replaced by a needle must also be long enough for
+/// [`SecretScrubber::leaks_fragment`] to check what the replacement left
+/// behind. Raising [`FRAGMENT_SCAN_LENGTH`] above [`MIN_SCRUB_LENGTH`] would
+/// reopen that band, so it is a compile error.
+const _: () = assert!(MIN_SCRUB_LENGTH >= FRAGMENT_SCAN_LENGTH);
 
 /// The secret byte sequences to remove from a child process's output.
 ///
@@ -136,11 +152,12 @@ impl SuppressionReason {
         match self {
             Self::NotSafelyScrubbable => {
                 "Validator diagnostics were withheld: a resolved secret is not safely scrubbable. \
-                 Its value contains a newline, a quote or backslash, a '#', a ': ' sequence, or \
-                 leading/trailing whitespace — characters a validator re-encodes when it quotes \
-                 the document back (YAML block scalar, escaped string, wrapped line), so removing \
-                 the exact bytes would leave fragments behind. Rotate the value to a single-line \
-                 secret without those characters to get diagnostics back.\n"
+                 Its value contains a newline, a quote or backslash, a '#', a ': ' sequence, \
+                 leading/trailing whitespace, a control character, or a non-ASCII character — \
+                 characters a validator re-encodes when it quotes the document back (YAML block \
+                 scalar, escaped string, wrapped line), so removing the exact bytes would leave \
+                 fragments behind. Rotate the value to a single-line printable-ASCII secret \
+                 without those characters to get diagnostics back.\n"
             }
             Self::ResidualValue => {
                 "Validator diagnostics were withheld: a credential value survived redaction, so \
@@ -149,7 +166,7 @@ impl SuppressionReason {
                  credential, or move the literal value into the ${gh-env-secret:...} broker.\n"
             }
             Self::ResidualFragment => {
-                "Validator diagnostics were withheld: a 12-byte run of a resolved secret survived \
+                "Validator diagnostics were withheld: a run of a resolved secret survived \
                  redaction. The validator reproduced part of the value in an encoding this build \
                  does not recognize, so the stream was dropped rather than printed with a fragment \
                  of a live credential in it.\n"
@@ -470,28 +487,45 @@ fn collect_resolved_leaves(
 /// * **`: `** — the YAML mapping indicator, same consequence.
 /// * **leading or trailing whitespace** — invisible in a plain scalar, so
 ///   emitters quote it, and readers routinely trim it.
+/// * **any control character, anywhere in the value** — C0, DEL and the C1
+///   block. A YAML emitter descended from libyaml spells these with its own
+///   escapes: ESC as `\e`, U+0001 as `\x01`, DEL as `\x7F`, U+0085 as `\N`.
+///   JSON spells the same bytes `\u001b` / `\u0001` / `\u007f`, so the two
+///   schemes coincide only on `\t`, `\n` and `\r`, so the `json_escaped`
+///   needle reproduces none of the rest.
+/// * **any non-ASCII character, anywhere in the value** — U+2028 and U+2029
+///   are line breaks the same emitters write as `\L` / `\P` (and a reader
+///   folds); every other non-ASCII character is escaped as `\uXXXX` whenever
+///   the emitter is not writing unicode output, while `serde_json` emits it
+///   verbatim. Either way no needle matches the emitted form.
 ///
 /// A value carrying any of them makes [`SecretScrubber::scrub_streams`]
 /// withhold the stream outright. That is the fail-closed half of the design:
 /// the alternative is printing output that *looks* redacted while a
 /// re-encoded copy of a private key sits in it.
 ///
-/// Everything outside this set stays on one line through every emitter this
-/// code has to deal with, which is why the common single-line API key, JWT or
-/// HMAC secret keeps its diagnostics.
+/// Everything outside this set is printable ASCII that stays on one line
+/// through every emitter this code has to deal with, which is why the common
+/// single-line API key, JWT or HMAC secret keeps its diagnostics.
 pub fn is_reencoding_hazard(value: &str) -> bool {
     value.contains(['\n', '\r', '"', '\'', '\\', '#'])
         || value.contains(": ")
         || value.starts_with(char::is_whitespace)
         || value.ends_with(char::is_whitespace)
+        || value
+            .chars()
+            .any(|character| character.is_control() || !character.is_ascii())
 }
 
 /// The value as JSON would escape it, without the surrounding quotes, or
 /// `None` when that is byte-identical to the value itself.
 ///
-/// Covers a validator that reports the offending document as JSON, or as
-/// double-quoted YAML: an interior tab becomes `\t`, a control character
-/// becomes `\u00NN`.
+/// Covers a validator that reports the offending document as JSON. It does
+/// **not** cover double-quoted YAML in general: libyaml-derived emitters use
+/// their own escape table (`\e`, `\x1b`, `\N`, `\L`) and only `\t`, `\n` and
+/// `\r` spell the same way in both, so every other character JSON would write
+/// as `\u00NN` is refused by [`is_reencoding_hazard`], which withholds the
+/// stream rather than relying on this needle.
 fn json_escaped(value: &str) -> Option<String> {
     let quoted = serde_json::to_string(value).ok()?;
     let inner = quoted

@@ -360,9 +360,15 @@ fn cli_validator_uses_resolution_provenance_for_every_substituted_leaf() {
     .unwrap();
     // This value lives in an otherwise nonsensitive field. Only provenance
     // proves it came from the bundle; classifying the resolved field cannot.
-    let bundle = r#"{"FERRUM_CREDS_BUNDLE": {
-        "ferrum/opaque/@plugin-config/config/display_mode": "synthetic-provenance-only-value"
-    }}"#;
+    // It is deliberately opaque rather than prose: the scrubber withholds a
+    // stream in which any run of a secret survives, and a readable value
+    // would share runs with the stub's own diagnostic.
+    let secret = "Kp9Rt2Xq7Ln4Bv6Zs3Mw8Hd5Yj";
+    let bundle = format!(
+        r#"{{"FERRUM_CREDS_BUNDLE": {{
+        "ferrum/opaque/@plugin-config/config/display_mode": "{secret}"
+    }}}}"#
+    );
     for mode in ["api", "file"] {
         for args in [
             vec!["validate"],
@@ -375,16 +381,16 @@ fn cli_validator_uses_resolution_provenance_for_every_substituted_leaf() {
             }
             let output = repo.run(
                 &args,
-                &[("FERRUM_GATEWAY_MODE", mode), ("FERRUM_CREDS_JSON", bundle)],
+                &[
+                    ("FERRUM_GATEWAY_MODE", mode),
+                    ("FERRUM_CREDS_JSON", bundle.as_str()),
+                ],
             );
             let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
             if args[0] != "review" {
                 assert!(!output.status.success());
             }
-            assert!(
-                !diagnostic.contains("synthetic-provenance-only-value"),
-                "{diagnostic}"
-            );
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
             assert!(
                 diagnostic.contains("[REDACTED]"),
                 "{mode} {args:?}: {diagnostic}"
