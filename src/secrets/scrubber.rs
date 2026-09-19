@@ -491,7 +491,7 @@ fn collect_resolved_leaves(
 ///   block. A YAML emitter descended from libyaml spells these with its own
 ///   escapes: ESC as `\e`, U+0001 as `\x01`, DEL as `\x7F`, U+0085 as `\N`.
 ///   JSON spells the same bytes `\u001b` / `\u0001` / `\u007f`, so the two
-///   schemes coincide only on `\t`, `\n` and `\r`, so the `json_escaped`
+///   schemes coincide only on `\t`, `\n` and `\r`, and the `json_escaped`
 ///   needle reproduces none of the rest.
 /// * **any non-ASCII character, anywhere in the value** — U+2028 and U+2029
 ///   are line breaks the same emitters write as `\L` / `\P` (and a reader

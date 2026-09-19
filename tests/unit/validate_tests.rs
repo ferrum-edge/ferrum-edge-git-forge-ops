@@ -1617,19 +1617,23 @@ fn control_and_non_ascii_secrets_are_reencoding_hazards() {
 #[cfg(unix)]
 #[test]
 fn a_secret_carrying_a_control_or_non_ascii_character_withholds_the_stream() {
-    for secret in [
+    for (case, secret) in [
         "Ax7Kd9QpLm2Rn4Tv\u{1b}6Wy8Zb0Ce3Fh5Jk",
         "Ax7Kd9QpLm2Rn4Tv\u{7f}6Wy8Zb0Ce3Fh5Jk",
         "Ax7Kd9QpLm2Rn4Tv\u{85}6Wy8Zb0Ce3Fh5Jk",
         "Ax7Kd9QpLm2Rn4Tv\u{2028}6Wy8Zb0Ce3Fh5Jk",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
         let dir = tempfile::tempdir().unwrap();
         let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
 
         let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
 
-        assert_eq!(result.stdout, "", "{secret:?}");
+        // Name the case by index: the panic message must not print the secret.
+        assert_eq!(result.stdout, "", "case {case}");
         assert!(
             result.stderr.contains("not safely scrubbable"),
             "{}",
