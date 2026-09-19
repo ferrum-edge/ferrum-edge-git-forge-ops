@@ -170,11 +170,9 @@ pub const RETIRED_PLUGIN_NAMES: &[&str] = &["oauth2_auth", "semantic_ai_firewall
 
 /// What to do about a retired plugin name — the *fact*, not the sentence.
 ///
-/// The security audit and the `plugin_name_is_known` policy rule both tell the
-/// operator how to fix a retired name, in their own voice (lowercase clause
-/// versus imperative remediation line). Only the mapping from retired name to
-/// successor is shared knowledge, so that is what lives here; each consumer
-/// still phrases its own finding.
+/// The catalog maps each retired name to its successor or removal status.
+/// The security audit uses this mapping to tell operators how to fix retired
+/// names and owns the wording of the resulting finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetiredRemediation {
     /// The plugin's job moved to one of these successors.
