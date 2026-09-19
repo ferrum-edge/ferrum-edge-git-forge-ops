@@ -127,6 +127,88 @@ class SupplyChainPolicyTests(unittest.TestCase):
             action.write_text("name: sample\n", encoding="utf-8")
             self.assertEqual(check_supply_chain.action_files(root), [action])
 
+    def test_cargo_audit_install_is_pinned_unconditional_and_uncached(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text()
+        self.assertEqual(check_supply_chain.cargo_audit_install_violations(workflow), [])
+        for old, new in (
+            (check_supply_chain.CARGO_AUDIT_ACTION, "taiki-e/install-action@v2"),
+            ("tool: cargo-audit@0.22.1", "tool: cargo-audit@latest"),
+            ("tool: cargo-audit@0.22.1", "tool: cargo-audit@0.22.2"),
+            ("checksum: true", "checksum: false"),
+            ("          checksum: true\n", ""),
+            ("fallback: none", "fallback: cargo-install"),
+            ("          fallback: none\n", ""),
+            ("      - name: Install cargo-audit\n",
+             "      - name: Install cargo-audit\n        if: false\n"),
+            ("      - name: Install cargo-audit\n",
+             "      - name: Install cargo-audit\n        continue-on-error: true\n"),
+        ):
+            with self.subTest(new=new):
+                changed = workflow.replace(old, new, 1)
+                self.assertNotEqual(changed, workflow)
+                self.assertTrue(check_supply_chain.cargo_audit_install_violations(changed))
+
+        for extra in (
+            "      - uses: actions/cache@" + "a" * 40 + "\n"
+            "        with:\n          path: ~/.cargo/bin\n          key: old-auditor\n",
+            "      - name: Registry fallback\n"
+            "        run: cargo install cargo-audit --version 0.22.1 --locked\n",
+        ):
+            with self.subTest(extra=extra):
+                changed = workflow.replace(
+                    "      - name: Install cargo-audit\n",
+                    extra + "      - name: Install cargo-audit\n",
+                    1,
+                )
+                self.assertTrue(check_supply_chain.cargo_audit_install_violations(changed))
+
+    def test_cargo_audit_install_policy_is_enforced_by_the_trusted_checker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary))
+            path = root / ".github/workflows/security.yml"
+            path.write_text(path.read_text().replace("checksum: true", "checksum: false", 1))
+            (root / ".github/scripts/check_supply_chain.py").write_text(
+                "raise SystemExit(0)\n"
+            )
+            self.assertTrue(any("with checksums" in item for item in self._violations(root)))
+
+    def test_security_push_filter_covers_each_policy_only_change(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text()
+        self.assertEqual(check_supply_chain.security_push_trigger_violations(workflow), [])
+        for path in check_supply_chain.SECURITY_PUSH_POLICY_PATHS:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as temporary:
+                root = self._mirror_repo(Path(temporary))
+                candidate = root / ".github/workflows/security.yml"
+                # A mention in another event or a comment cannot cover a push.
+                changed = workflow.replace(f"      - '{path}'\n", "", 1)
+                changed = changed.replace(
+                    "  pull_request:\n",
+                    f"  pull_request:\n    paths:\n      - '{path}'\n",
+                    1,
+                )
+                changed += f"\n# Required push input: {path}\n"
+                candidate.write_text(changed)
+                self.assertIn(
+                    f"security.yml: push paths must explicitly include {path}",
+                    self._violations(root),
+                )
+
+    def test_security_push_filter_rejects_missing_trigger_and_exclusions(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text()
+        for old, new in (
+            ("  push:\n", "  workflow_dispatch:\n"),
+            ("  push:\n    branches: [main]", "  push:\n    branches: [develop]"),
+            ("    paths:\n", "    paths-ignore:\n"),
+            ("      - '.github/CODEOWNERS'\n",
+             "      - '.github/CODEOWNERS'\n      - '!.github/**'\n"),
+        ):
+            with self.subTest(new=new):
+                self.assertTrue(
+                    check_supply_chain.security_push_trigger_violations(
+                        workflow.replace(old, new, 1)
+                    )
+                )
+
     def test_security_policy_must_execute_the_default_branch_checker(self):
         secure = "\n".join(
             [
@@ -280,6 +362,97 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 ),
                 violations,
             )
+
+    def test_each_validator_job_requires_the_trusted_probe_and_checkout(self):
+        workflow = (ROOT / ".github/workflows/validate-pr.yml").read_text()
+        self.assertEqual(check_supply_chain.trusted_validator_probe_violations(workflow), [])
+        for job_name in ("validate", "validator-pairing"):
+            job = check_supply_chain.workflow_job(workflow, job_name)
+            for old, new in (
+                ("bash trusted-validator/.github/scripts/check-validator-resource-labels.sh",
+                 "bash .github/scripts/check-validator-resource-labels.sh"),
+                ("bash trusted-validator/.github/scripts/check-validator-resource-labels.sh",
+                 "# bash trusted-validator/.github/scripts/check-validator-resource-labels.sh"),
+                ("      - name: Require resource-label compatibility\n",
+                 "      - name: Require resource-label compatibility\n        if: false\n"),
+                ("      - name: Require resource-label compatibility\n",
+                 "      - name: Require resource-label compatibility\n        continue-on-error: true\n"),
+                ("      - name: Require resource-label compatibility\n",
+                 "      - name: Require resource-label compatibility\n"
+                 "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"),
+                ("ref: ${{ github.event.repository.default_branch }}",
+                 "ref: ${{ github.event.pull_request.head.sha }}"),
+                ("path: trusted-validator", "path: candidate-validator"),
+                ("            .github/ferrum-edge-checksums.txt\n",
+                 "            trusted-validator/.github/ferrum-edge-checksums.txt\n"),
+                ('            "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge"\n',
+                 '            "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge" || true\n'),
+            ):
+                with self.subTest(job=job_name, new=new):
+                    changed_job = job.replace(old, new, 1)
+                    self.assertNotEqual(changed_job, job)
+                    changed = workflow.replace(job, changed_job, 1)
+                    violations = check_supply_chain.trusted_validator_probe_violations(changed)
+                    self.assertTrue(
+                        any(f": {job_name} " in item for item in violations), violations
+                    )
+
+    def test_validator_probe_cannot_be_missing_duplicated_or_run_before_install(self):
+        workflow = (ROOT / ".github/workflows/validate-pr.yml").read_text()
+        probe = (
+            "      - name: Require resource-label compatibility\n"
+            "        run: |\n"
+            "          bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \\\n"
+            '            "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge"\n'
+        )
+        for job_name, install_name in (
+            ("validate", "Download verified ferrum-edge binary"),
+            ("validator-pairing", "Download pairing validator"),
+        ):
+            job = check_supply_chain.workflow_job(workflow, job_name)
+            self.assertIn(probe, job)
+            for changed in (
+                job.replace(probe, "", 1),
+                job.replace(probe, probe + probe, 1),
+                job.replace(probe, "", 1).replace(
+                    f"      - name: {install_name}\n",
+                    probe + f"      - name: {install_name}\n", 1,
+                ),
+            ):
+                with self.subTest(job=job_name, changed=changed):
+                    self.assertTrue(check_supply_chain.trusted_validator_probe_violations(
+                        workflow.replace(job, changed, 1)
+                    ))
+
+    def test_candidate_probe_and_checker_cannot_approve_themselves(self):
+        for job_name in ("validate", "validator-pairing"):
+            with self.subTest(job=job_name), tempfile.TemporaryDirectory() as temporary:
+                root = self._mirror_repo(Path(temporary))
+                path = root / ".github/workflows/validate-pr.yml"
+                workflow = path.read_text()
+                job = check_supply_chain.workflow_job(workflow, job_name)
+                changed = job.replace(
+                    "bash trusted-validator/.github/scripts/check-validator-resource-labels.sh",
+                    "bash .github/scripts/check-validator-resource-labels.sh",
+                    1,
+                )
+                path.write_text(workflow.replace(job, changed, 1))
+                (root / ".github/scripts/check-validator-resource-labels.sh").write_text(
+                    "#!/bin/sh\nexit 0\n"
+                )
+                (root / ".github/ferrum-edge-checksums.txt").write_text(
+                    "f" * 64 + "  ferrum-edge-linux-x86_64\n"
+                )
+                (root / ".github/scripts/check_supply_chain.py").write_text(
+                    "raise SystemExit(0)\n"
+                )
+                # _violations executes SCRIPT outside the candidate root, as
+                # the protected-branch workflow does. Candidate code is data.
+                self.assertIn(
+                    f"validate-pr.yml: {job_name} must run the trusted resource-label probe "
+                    "without a bypass or token",
+                    self._violations(root),
+                )
 
     def test_candidate_branch_classifier_fails_even_when_trusted_text_remains(self):
         text = """

@@ -1,4 +1,6 @@
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -84,6 +86,9 @@ class ValidatorLabelsTests(unittest.TestCase):
         self.assertNotIn("continue-on-error:", pairing)
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", pairing)
         self.assertIn("bash trusted-validator/.github/scripts/install-ferrum-edge.sh", pairing)
+        self.assertIn(
+            "bash trusted-validator/.github/scripts/check-validator-resource-labels.sh", pairing
+        )
         self.assertIn("            .github/ferrum-edge-checksums.txt\n", pairing)
         self.assertLess(
             pairing.index("install-ferrum-edge.sh"),
@@ -96,6 +101,47 @@ class ValidatorLabelsTests(unittest.TestCase):
             gate.index('[ "$PAIRING_RESULT" = success ] || {'),
             gate.index('if [ "$RELEVANT" != true ]; then'),
         )
+
+    def test_candidate_probe_and_fixture_cannot_approve_an_incompatible_validator(self):
+        workflow = (ROOT / ".github/workflows/validate-pr.yml").read_text()
+        for job_name in ("validate", "validator-pairing"):
+            with self.subTest(job=job_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for prefix in (root, root / "trusted-validator"):
+                    (prefix / ".github/scripts").mkdir(parents=True)
+                    (prefix / "tests/fixtures").mkdir(parents=True)
+                shutil.copy2(CHECK, root / "trusted-validator/.github/scripts" / CHECK.name)
+                fixture = "tests/fixtures/validator-resource-labels.yaml"
+                shutil.copy2(ROOT / fixture, root / "trusted-validator" / fixture)
+                (root / ".github/scripts" / CHECK.name).write_text(
+                    "#!/bin/sh\necho candidate-probe-approved\nexit 0\n"
+                )
+                (root / fixture).write_text("version: '1'\n")
+                binary = root / "ferrum-edge"
+                binary.write_text(
+                    "#!/bin/sh\n"
+                    "if grep -q 'provisioned-by:' \"$7\"; then\n"
+                    "  echo incompatible-labels >&2\n  exit 1\nfi\nexit 0\n"
+                )
+                binary.chmod(0o755)
+                job = workflow.split(f"\n  {job_name}:\n", 1)[1]
+                job = re.split(r"^  \S", job, maxsplit=1, flags=re.MULTILINE)[0]
+                invocation = re.search(
+                    r"^          bash (\S*check-validator-resource-labels\.sh) ",
+                    job,
+                    re.MULTILINE,
+                )
+                self.assertIsNotNone(invocation)
+                result = subprocess.run(
+                    ["bash", invocation.group(1), str(binary)],
+                    cwd=root,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("incompatible-labels", result.stderr)
+                self.assertNotIn("candidate-probe-approved", result.stdout)
 
     def test_canary_checks_capability_only_after_verified_install(self):
         workflow = (ROOT / ".github/workflows/validator-pin-canary.yml").read_text()

@@ -167,9 +167,11 @@ jobs:
             "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge" \
             .github/ferrum-edge-checksums.txt
 
+      # The probe also selects its fixture relative to the trusted script.
+      # Candidate code or fixtures cannot approve a candidate digest.
       - name: Require resource-label compatibility
         run: |
-          bash .github/scripts/check-validator-resource-labels.sh \
+          bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \
             "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge"
 
       - name: Install Rust toolchain
@@ -225,9 +227,10 @@ jobs:
             "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge" \
             .github/ferrum-edge-checksums.txt
 
+      # Keep both the probe and its script-relative fixture on the trusted ref.
       - name: Require resource-label compatibility
         run: |
-          bash .github/scripts/check-validator-resource-labels.sh \
+          bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \
             "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge"
 
   gitforgeops-required-static-validation:

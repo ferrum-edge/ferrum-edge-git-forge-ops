@@ -23,6 +23,9 @@ on:
       - '.github/workflows/**'
       - '.github/scripts/**'
       - '.github/dependabot.yml'
+      - '.github/cargo-audit-policy.json'
+      - '.github/ferrum-edge-checksums.txt'
+      - '.github/CODEOWNERS'
   schedule:
     - cron: '17 9 * * 1'
 
@@ -103,8 +106,6 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-    env:
-      CARGO_AUDIT_VERSION: 0.22.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -123,24 +124,14 @@ jobs:
         with:
           toolchain: 1.98.0
 
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-          key: ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-
-            ${{ runner.os }}-cargo-audit-
-
+      # Always install from the pinned action's checksum manifest. Do not
+      # restore the former cargo-audit cache: it included ~/.cargo/bin.
       - name: Install cargo-audit
-        run: |
-          if ! cargo audit --version | grep -q "$CARGO_AUDIT_VERSION"; then
-            cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --force
-          fi
-          cargo audit --version
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-audit@0.22.1
+          checksum: true
+          fallback: none
 
       - name: Test audit policy gate
         env:
