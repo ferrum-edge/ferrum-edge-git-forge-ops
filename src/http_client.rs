@@ -1401,6 +1401,7 @@ impl BackupSnapshot {
 
         let config: GatewayConfig = serde_json::from_value(value)
             .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
+        crate::config::validate_unique_live_resource_keys(&config)?;
         let mut seal_violations = Vec::new();
         counts = canonicalize_count_seal(
             "counts",

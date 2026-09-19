@@ -223,7 +223,10 @@ fn load_and_assemble_all(
     let mut resources = config::load_resources_with_options(&resources_dir, load_options)?;
 
     if let Some(ref overlay_name) = resolved.overlay {
-        let overlay_dir = PathBuf::from(config::OVERLAYS_ROOT).join(overlay_name);
+        let overlay_dir = config::resolved::overlay_directory(
+            &PathBuf::from(config::OVERLAYS_ROOT),
+            overlay_name,
+        )?;
         config::apply_overlay_with_options(&mut resources, &overlay_dir, load_options)?;
     }
 
@@ -833,9 +836,9 @@ fn ownership_preview(
     pairs: &[NamespaceSnapshot],
     state: &StateFile,
     strategy: &config::ApplyStrategy,
-) -> (Vec<diff::ResourceDiff>, Vec<apply::AdoptionCandidate>) {
+) -> gitforgeops::error::Result<(Vec<diff::ResourceDiff>, Vec<apply::AdoptionCandidate>)> {
     if !matches!(strategy, config::ApplyStrategy::Incremental) {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut pending = Vec::new();
     for pair in pairs {
@@ -844,17 +847,22 @@ fn ownership_preview(
             &pair.actual,
             &state.pending_creates,
             &pair.namespace,
-        ));
+        )?);
     }
-    let (mut diffs, _, _, _) = compute_namespace_diffs(pairs, None, diff::DiffOptions::default());
+    let (mut diffs, _, _, _) = compute_namespace_diffs(pairs, None, diff::DiffOptions::default())?;
     diffs.extend(pending.iter().cloned());
     let handled = adoption_handled_keys(&diffs, state);
     let ledger = ledger_keys(state);
-    let adoptions = pairs
-        .iter()
-        .flat_map(|pair| apply::adoption_candidates(&pair.desired, &pair.actual, &ledger, &handled))
-        .collect();
-    (pending, adoptions)
+    let mut adoptions = Vec::new();
+    for pair in pairs {
+        adoptions.extend(apply::adoption_candidates(
+            &pair.desired,
+            &pair.actual,
+            &ledger,
+            &handled,
+        )?);
+    }
+    Ok((pending, adoptions))
 }
 
 fn cached_namespace_names(namespace_pairs: &[NamespaceSnapshot]) -> Vec<String> {
@@ -864,6 +872,13 @@ fn cached_namespace_names(namespace_pairs: &[NamespaceSnapshot]) -> Vec<String> 
         .map(|pair| pair.namespace.clone())
         .collect()
 }
+
+type NamespaceDiffs = (
+    Vec<diff::ResourceDiff>,
+    Vec<diff::BreakingChange>,
+    Vec<diff::UnmanagedResource>,
+    Vec<diff::SpecOwnedResource>,
+);
 
 /// `options` mirrors the apply-time decisions that change which entries the
 /// diff materializes. Preview-only commands (`diff`, `plan`, `review`) pass the
@@ -875,12 +890,7 @@ fn compute_namespace_diffs(
     namespace_pairs: &[NamespaceSnapshot],
     previously_managed: Option<&HashSet<String>>,
     options: diff::DiffOptions,
-) -> (
-    Vec<diff::ResourceDiff>,
-    Vec<diff::BreakingChange>,
-    Vec<diff::UnmanagedResource>,
-    Vec<diff::SpecOwnedResource>,
-) {
+) -> gitforgeops::error::Result<NamespaceDiffs> {
     let mut diffs = Vec::new();
     let mut breaking = Vec::new();
     let mut unmanaged = Vec::new();
@@ -893,7 +903,7 @@ fn compute_namespace_diffs(
 
     for pair in namespace_pairs {
         let result =
-            diff::compute_diff_with_options(&pair.desired, &pair.actual, ownership_scope, options);
+            diff::compute_diff_with_options(&pair.desired, &pair.actual, ownership_scope, options)?;
         let namespace_breaking =
             diff::detect_breaking_changes(&result.diffs, &pair.desired, &pair.actual);
 
@@ -903,7 +913,7 @@ fn compute_namespace_diffs(
         breaking.extend(namespace_breaking);
     }
 
-    (diffs, breaking, unmanaged, spec_owned)
+    Ok((diffs, breaking, unmanaged, spec_owned))
 }
 
 /// True when the spec-owned bucket holds something an operator must resolve
@@ -1458,7 +1468,7 @@ async fn cmd_diff(
         &namespace_pairs,
         managed.as_ref(),
         diff::DiffOptions::default(),
-    );
+    )?;
     let diffs = apply::order_incremental_diffs(diffs, &desired);
     let plugin_attach_notice =
         apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
@@ -1752,7 +1762,7 @@ async fn cmd_plan(
                 let cached = cached_namespace_names(&namespace_pairs);
                 if cached.is_empty() {
                     let (pending, candidates) =
-                        ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy);
+                        ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy)?;
                     adoptions = candidates;
                     for pair in &mut namespace_pairs {
                         diff::mask_indeterminate_secret_values(
@@ -1765,7 +1775,7 @@ async fn cmd_plan(
                         &namespace_pairs,
                         managed.as_ref(),
                         diff::DiffOptions::default(),
-                    );
+                    )?;
                     d.extend(pending);
                     (d, b, u, s, true, None)
                 } else {
@@ -1782,7 +1792,8 @@ async fn cmd_plan(
                     )
                 }
             }
-            Err(e @ gitforgeops::error::Error::BackupNamespace(_)) => return Err(e.into()),
+            Err(e @ gitforgeops::error::Error::BackupNamespace(_))
+            | Err(e @ gitforgeops::error::Error::DuplicateLiveResource(_)) => return Err(e.into()),
             Err(e) => {
                 eprintln!("Could not fetch live config: {}", safe_block(e));
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
@@ -2394,9 +2405,9 @@ async fn cmd_apply(
                     return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
                 }
                 let (mut diffs, _, unmanaged, spec_owned) =
-                    compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
+                    compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options)?;
                 let (pending, adoptions) =
-                    ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy);
+                    ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy)?;
                 diffs.extend(pending);
                 let diffs = apply::order_incremental_diffs(diffs, &desired);
 
@@ -2554,7 +2565,7 @@ async fn cmd_apply(
             }
             let managed = previously_managed(&resolved, &state);
             let (diffs, _, _, _) =
-                compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options);
+                compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options)?;
             let delete_count = diffs
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
@@ -3119,7 +3130,7 @@ async fn cmd_review(
                                 &namespace_pairs,
                                 &state,
                                 &resolved.apply_strategy,
-                            );
+                            )?;
                             adoptions = candidates;
                             for pair in &mut namespace_pairs {
                                 diff::mask_indeterminate_secret_values(
@@ -3132,7 +3143,7 @@ async fn cmd_review(
                                 &namespace_pairs,
                                 managed.as_ref(),
                                 diff::DiffOptions::default(),
-                            );
+                            )?;
                             d.extend(pending);
                             (d, b, u, s, None)
                         }

@@ -976,7 +976,8 @@ fn review_comment_cap_renders_the_same_prefix_across_runs() {
 
     let render = || {
         let result =
-            compute_diff_with_ownership(&desired, &actual, Some(&std::collections::HashSet::new()));
+            compute_diff_with_ownership(&desired, &actual, Some(&std::collections::HashSet::new()))
+                .unwrap();
         build_review_comment_v2(
             true,
             "",

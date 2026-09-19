@@ -217,6 +217,9 @@ impl RepoConfig {
             // that may hit shell command lines before `ResolvedEnv::validate`
             // runs, so the guard belongs at load time too.
             super::resolved::validate_env_name_is_safe_path_component(name)?;
+            if let Some(overlay) = &env.overlay {
+                super::resolved::validate_overlay_name(overlay)?;
+            }
 
             if matches!(env.ownership.mode, OwnershipMode::Exclusive)
                 && env

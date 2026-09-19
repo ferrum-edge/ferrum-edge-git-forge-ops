@@ -107,6 +107,16 @@ pub fn split_config_by_namespace(
     }
 }
 
+/// Reject ambiguous live identities before comparison or ownership decisions.
+/// Diagnostics include keys only, never resource bodies or credential values.
+pub fn validate_unique_live_resource_keys(config: &GatewayConfig) -> crate::error::Result<()> {
+    validate_unique_resource_keys(config).map_err(|error| {
+        crate::error::Error::DuplicateLiveResource(format!(
+            "invalid live snapshot: {error}; refusing duplicate live resource identities"
+        ))
+    })
+}
+
 pub fn validate_unique_resource_keys(config: &GatewayConfig) -> crate::error::Result<()> {
     let mut seen = BTreeSet::new();
 

@@ -157,6 +157,10 @@ fn untrusted_error_variants_cannot_emit_a_workflow_command() {
     check("NoResourcesDir", Error::NoResourcesDir(path));
     check("Config", Error::Config(bad.clone()));
     check("BackupNamespace", Error::BackupNamespace(bad.clone()));
+    check(
+        "DuplicateLiveResource",
+        Error::DuplicateLiveResource(bad.clone()),
+    );
     check("StaleGatewayView", Error::StaleGatewayView(bad.clone()));
     check("AmbiguousMutation", Error::AmbiguousMutation(bad.clone()));
     check("GatewayReadOnly", Error::GatewayReadOnly(bad.clone()));
