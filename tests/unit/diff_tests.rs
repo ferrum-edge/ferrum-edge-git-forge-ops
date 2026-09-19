@@ -118,7 +118,7 @@ fn credential_indeterminate_review_masks_only_matching_consumer_values() {
     };
 
     mask_without_bundle(&desired, &mut actual);
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert_eq!(diffs[0].kind, "Consumer");
     assert!(
@@ -162,7 +162,7 @@ fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
     };
 
     mask_without_bundle(&desired, &mut actual);
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert!(
         diffs[0]
@@ -211,7 +211,7 @@ fn placeholder_syntax_without_unresolved_provenance_does_not_authorize_masking()
         &gitforgeops::secrets::ResolveReport::default(),
     );
     assert_eq!(serde_json::to_value(&actual).unwrap(), before);
-    assert_eq!(compute_diff(&desired, &actual).len(), 3);
+    assert_eq!(compute_diff(&desired, &actual).unwrap().len(), 3);
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn credential_indeterminate_review_masks_only_placeholder_leaves() {
     };
 
     mask_without_bundle(&desired, &mut actual);
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert!(
         diffs[0]
@@ -291,14 +291,14 @@ fn unmasked_broker_controlled_leaves_are_permanent_false_drift() {
     };
 
     // What `diff` reported before it masked: two changes nobody made.
-    assert_eq!(compute_diff(&desired, &actual).len(), 2);
+    assert_eq!(compute_diff(&desired, &actual).unwrap().len(), 2);
 
     mask_without_bundle(&desired, &mut actual);
 
     assert!(
-        compute_diff(&desired, &actual).is_empty(),
+        compute_diff(&desired, &actual).unwrap().is_empty(),
         "{:?}",
-        compute_diff(&desired, &actual)
+        compute_diff(&desired, &actual).unwrap()
     );
 }
 
@@ -326,7 +326,7 @@ fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
     };
 
     mask_without_bundle(&desired, &mut actual);
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 1, "{:?}", diffs);
     assert_eq!(diffs[0].details.len(), 1, "{:?}", diffs[0].details);
     assert_eq!(diffs[0].details[0].field, "config");
@@ -403,7 +403,7 @@ fn diff_detects_added_proxy() {
     };
     let actual = GatewayConfig::default();
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 1);
     assert!(matches!(diffs[0].action, DiffAction::Add));
     assert_eq!(diffs[0].id, "p1");
@@ -417,7 +417,7 @@ fn diff_detects_deleted_proxy() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 1);
     assert!(matches!(diffs[0].action, DiffAction::Delete));
 }
@@ -433,7 +433,7 @@ fn diff_detects_modified_proxy() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 1);
     assert!(matches!(diffs[0].action, DiffAction::Modify));
 }
@@ -444,7 +444,7 @@ fn diff_identical_configs_empty() {
         proxies: vec![make_proxy("p1", "/api", "localhost")],
         ..GatewayConfig::default()
     };
-    let diffs = compute_diff(&config, &config);
+    let diffs = compute_diff(&config, &config).unwrap();
     assert!(diffs.is_empty());
 }
 
@@ -465,7 +465,7 @@ fn diff_treats_same_id_in_different_namespaces_as_distinct() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert_eq!(diffs.len(), 2);
     assert!(diffs
         .iter()
@@ -491,7 +491,8 @@ fn shared_diff_honors_managed_state_keys() {
         OwnershipScope::Shared {
             previously_managed: &previously_managed,
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(result.diffs.len(), 1);
     assert!(matches!(result.diffs[0].action, DiffAction::Delete));
@@ -505,7 +506,7 @@ fn breaking_detects_deleted_proxy() {
         proxies: vec![make_proxy("p1", "/api", "localhost")],
         ..GatewayConfig::default()
     };
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     let breaking = detect_breaking_changes(&diffs, &desired, &actual);
     assert!(!breaking.is_empty());
     assert!(breaking[0].reason.to_lowercase().contains("delet"));
@@ -521,7 +522,7 @@ fn breaking_detects_listen_path_change() {
         proxies: vec![make_proxy("p1", "/old-path", "localhost")],
         ..GatewayConfig::default()
     };
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     let breaking = detect_breaking_changes(&diffs, &desired, &actual);
     assert!(!breaking.is_empty());
     assert!(breaking[0].reason.to_lowercase().contains("listen_path"));
@@ -542,7 +543,7 @@ fn breaking_reasons_for_proxy_change(mutate: impl Fn(&mut Proxy)) -> Vec<String>
         proxies: vec![actual_proxy],
         ..GatewayConfig::default()
     };
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     detect_breaking_changes(&diffs, &desired, &actual)
         .into_iter()
         .map(|bc| bc.reason)
@@ -585,7 +586,7 @@ fn schemeless_desired_proxy_is_not_a_breaking_change_against_a_resolved_live_sch
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     let reasons: Vec<String> = detect_breaking_changes(&diffs, &desired, &actual)
         .into_iter()
         .map(|bc| bc.reason)
@@ -620,7 +621,7 @@ fn assembled_schemeless_proxy_diffs_clean_against_a_resolved_live_gateway() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert!(
         diffs.is_empty(),
         "assembled desired config must converge with the live gateway: {diffs:?}"
@@ -703,7 +704,7 @@ fn breaking_auth_plugin_deletion_scoped_by_namespace() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     let breaking = detect_breaking_changes(&diffs, &desired, &actual);
 
     // Only the team-alpha deletion should be flagged as breaking — the
@@ -1458,7 +1459,7 @@ fn spec_owned_upstream_is_not_pruned_by_plain_compute_diff() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     assert!(
         diffs.is_empty(),
         "spec-owned upstream must not produce a Delete: {diffs:?}"
@@ -1476,7 +1477,7 @@ fn spec_owned_plugin_config_is_bucketed_not_deleted() {
         ..GatewayConfig::default()
     };
 
-    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive).unwrap();
     assert!(result.diffs.is_empty(), "{:?}", result.diffs);
     assert_eq!(result.spec_owned.len(), 1);
     assert_eq!(result.spec_owned[0].kind, "PluginConfig");
@@ -1493,7 +1494,7 @@ fn consumers_are_never_classified_as_spec_owned() {
         ..GatewayConfig::default()
     };
 
-    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive).unwrap();
     assert!(result.spec_owned.is_empty());
     assert_eq!(result.diffs.len(), 1);
     assert!(matches!(result.diffs[0].action, DiffAction::Delete));
@@ -1515,7 +1516,7 @@ fn spec_owned_upstream_declared_in_repo_suppresses_modify() {
         ..GatewayConfig::default()
     };
 
-    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive);
+    let result = compute_diff_with_scope(&desired, &actual, OwnershipScope::Exclusive).unwrap();
     assert!(
         result.diffs.is_empty(),
         "no Modify against a spec-owned row: {:?}",
@@ -1575,7 +1576,7 @@ fn service_discovery_diff_redacts_the_token_but_shows_the_address() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     let change = diffs
         .iter()
         .flat_map(|diff| &diff.details)
@@ -1623,7 +1624,7 @@ fn service_discovery_diff_redacts_placeholder_shaped_tokens() {
         ..GatewayConfig::default()
     };
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     let change = diffs
         .iter()
         .flat_map(|diff| &diff.details)
@@ -1670,7 +1671,7 @@ fn masking_aligns_the_discovery_token_only() {
     );
     assert_eq!(consul.address, "https://consul.old.test:8501");
 
-    let diffs = compute_diff(&desired, &actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
     let change = diffs
         .iter()
         .flat_map(|diff| &diff.details)

@@ -13,6 +13,9 @@ pub enum Error {
     #[error("{}", safe_block(.0))]
     BackupNamespace(String),
 
+    #[error("{}", safe_block(.0))]
+    DuplicateLiveResource(String),
+
     #[error("failed to read file {}: {}", safe_path(path), safe(source))]
     FileRead {
         path: PathBuf,

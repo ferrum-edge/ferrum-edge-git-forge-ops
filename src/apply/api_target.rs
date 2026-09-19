@@ -563,7 +563,7 @@ async fn prepare_apply(
                 "internal error: authoritative backup for namespace `{namespace}` was not prepared"
             ))
         })?;
-        if let Some(conflict) = spec_owned_conflict_block(&desired_namespace, actual, namespace) {
+        if let Some(conflict) = spec_owned_conflict_block(&desired_namespace, actual, namespace)? {
             prepared.blocked.insert(namespace.clone(), conflict);
             continue;
         }
@@ -599,13 +599,13 @@ fn spec_owned_conflict_block(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
     namespace: &str,
-) -> Option<String> {
+) -> crate::error::Result<Option<String>> {
     let result = compute_diff_with_options(
         desired,
         actual,
         OwnershipScope::Exclusive,
         DiffOptions::default(),
-    );
+    )?;
     let conflicts = result
         .spec_conflicts()
         .map(|resource| {
@@ -616,12 +616,12 @@ fn spec_owned_conflict_block(
         })
         .collect::<Vec<_>>();
     if conflicts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(format!(
+    Ok(Some(format!(
         "refusing apply for namespace `{namespace}`: repository declarations conflict with live API-spec-owned resources: {}. Remove the repository declaration or manage the row through the API spec importer. No resource in this namespace was written; other namespaces were reconciled normally",
         conflicts.join(", ")
-    ))
+    )))
 }
 
 /// Errors that make continuing to the next namespace pointless or unsafe.
@@ -634,6 +634,7 @@ fn is_fatal(error: &crate::error::Error) -> bool {
         error,
         crate::error::Error::GatewayReadOnly(_)
             | crate::error::Error::BackupNamespace(_)
+            | crate::error::Error::DuplicateLiveResource(_)
             | crate::error::Error::StaleGatewayView(_)
             | crate::error::Error::RestoreNeedsManualRecovery(_)
             | crate::error::Error::UnsupportedBackupSections(_)
@@ -906,6 +907,7 @@ pub fn preserve_spec_owned_graph(
     namespace: &str,
 ) -> crate::error::Result<GatewayConfig> {
     validate_no_desired_spec_tags(desired)?;
+    crate::config::validate_unique_live_resource_keys(actual)?;
     let api_specs = parse_api_spec_owners(extras, namespace)?;
     let api_spec_ids = api_specs.keys().cloned().collect::<BTreeSet<_>>();
     let mut referenced_spec_ids = BTreeSet::new();
@@ -1228,13 +1230,13 @@ async fn apply_incremental(
         DiffOptions {
             prune_spec_owned: options.confirm_api_spec_deletion,
         },
-    );
+    )?;
     let assertions = pending_create_assertion_diffs(
         desired,
         actual,
         &options.pending_create_assertions,
         namespace,
-    );
+    )?;
     for assertion in &assertions {
         eprintln!(
             "[{}] asserting repository ownership of pending {} `{}` with an idempotent update",
@@ -1768,7 +1770,8 @@ pub fn adoption_candidates(
     actual: &GatewayConfig,
     managed_ledger: &BTreeSet<String>,
     handled: &BTreeSet<String>,
-) -> Vec<AdoptionCandidate> {
+) -> crate::error::Result<Vec<AdoptionCandidate>> {
+    crate::config::validate_unique_live_resource_keys(actual)?;
     let mut candidates = Vec::new();
     let mut consider = |resource: CreateResource<'_>, namespace: &str| {
         let kind = resource.kind();
@@ -1803,7 +1806,7 @@ pub fn adoption_candidates(
         consider(CreateResource::PluginConfig(resource), &resource.namespace);
     }
 
-    candidates
+    Ok(candidates)
 }
 
 /// Does the live `(namespace, kind, id)` carry an `api_spec_id`? Consumers are
@@ -1874,7 +1877,13 @@ async fn adopt_matching_rows(
         .map(|d| state_key(&d.namespace, &d.kind, &d.id))
         .chain(options.pending_create_assertions.iter().cloned())
         .collect();
-    let candidates = adoption_candidates(desired, actual, &options.managed_ledger, &handled);
+    let candidates = match adoption_candidates(desired, actual, &options.managed_ledger, &handled) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            result.fatal_error = Some(error.to_string());
+            return;
+        }
+    };
     if candidates.is_empty() {
         return;
     }
@@ -1913,6 +1922,10 @@ async fn adopt_matching_rows(
                     return;
                 }
                 Ok(snapshot) => Some(snapshot.config),
+                Err(error) if is_fatal(&error) => {
+                    result.fatal_error = Some(error.to_string());
+                    return;
+                }
                 Err(error) => {
                     skip_all(
                         result,
@@ -2397,7 +2410,8 @@ pub fn pending_create_assertion_diffs(
     actual: &GatewayConfig,
     pending: &BTreeSet<String>,
     namespace: &str,
-) -> Vec<ResourceDiff> {
+) -> crate::error::Result<Vec<ResourceDiff>> {
+    crate::config::validate_unique_live_resource_keys(actual)?;
     let mut assertions = Vec::new();
     let mut add = |kind: &str, id: &str| {
         assertions.push(ResourceDiff {
@@ -2440,7 +2454,7 @@ pub fn pending_create_assertion_diffs(
         }
     }
 
-    assertions
+    Ok(assertions)
 }
 
 /// One operator-facing line per spec-owned live resource the run touched.

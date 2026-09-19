@@ -304,6 +304,134 @@ environments:
 }
 
 #[test]
+fn overlay_selection_rejects_paths_before_loading_and_preserves_logical_environments() {
+    let repo = Repo::new(&["alpha"], None, None);
+    // These invalid selections all resolve to existing directories without the guard.
+    std::fs::create_dir(repo.dir.path().join("overlays")).unwrap();
+    for name in [".", "..", "../resources", repo.dir.path().to_str().unwrap()] {
+        for source in ["environment", "repo"] {
+            repo.write(
+                ".gitforgeops/config.yaml",
+                &serde_json::json!({"environments": {"logical-prod": {
+                    "overlay": if source == "repo" { Some(name) } else { None }
+                }}})
+                .to_string(),
+            );
+            for args in [
+                &["export", "--env", "logical-prod"][..],
+                &["validate", "--env", "logical-prod"],
+                &["apply", "--env", "logical-prod", "--auto-approve"],
+            ] {
+                let output = repo.run(args, &[("FERRUM_OVERLAY", name)]);
+                assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+                assert!(output_text(&output).contains("overlay name"));
+                assert_eq!(
+                    std::fs::read_to_string(repo.dir.path().join("calls")).unwrap(),
+                    ""
+                );
+                assert!(!repo.published().exists());
+            }
+        }
+    }
+
+    repo.write(
+        ".gitforgeops/config.yaml",
+        "environments:\n  logical-prod:\n    overlay: release_1-blue\n",
+    );
+    repo.write(
+        "overlays/release_1-blue/alpha/proxies/app.yaml",
+        "kind: Proxy\nspec:\n  id: app\n  backend_port: 9202\n",
+    );
+    let output = repo.run(&["export", "--env", "logical-prod"], &[]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    let config: GatewayConfig = serde_yaml::from_slice(&output.stdout).unwrap();
+    assert_eq!(config.proxies[0].backend_port, 9202);
+
+    std::os::unix::fs::symlink(
+        repo.dir.path().join("overlays/release_1-blue"),
+        repo.dir.path().join("overlays/link"),
+    )
+    .unwrap();
+    repo.write(
+        ".gitforgeops/config.yaml",
+        "environments:\n  logical-prod:\n    overlay: link\n",
+    );
+    let output = repo.run(&["export", "--env", "logical-prod"], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output_text(&output).contains("symbolic links are not allowed"));
+}
+
+#[test]
+fn which_receives_literal_binary_names_after_the_option_terminator() {
+    let repo = Repo::new(&["alpha"], None, None);
+    let bin = repo.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let which = bin.join("which");
+    // Fixed work, shell builtins only; record actual argv in the CLI child without
+    // changing the parallel test process's PATH. Missing names return immediately.
+    std::fs::write(
+        &which,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$#" "$@" > "$WHICH_ARGV_LOG"
+[ "$#" = 2 ] && [ "$1" = -- ] || exit 0
+case "$2" in
+    --validator|--missing-after-probe|'validator;touch marker') printf '%s/%s\n' "$PATH" "$2" ;;
+    *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&which, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["--validator", "validator;touch marker"] {
+        let path = bin.join(name);
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$VALIDATOR_ARGV_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let which_log = repo.dir.path().join("which-argv");
+    let validator_log = repo.dir.path().join("validator-argv");
+    for name in [
+        "--help",
+        "-n",
+        "--missing-after-probe",
+        "--validator",
+        "validator;touch marker",
+    ] {
+        for command in ["validate", "plan", "review"] {
+            let output = repo.run(
+                &[command],
+                &[
+                    ("PATH", bin.to_str().unwrap()),
+                    ("FERRUM_EDGE_BINARY_PATH", name),
+                    ("WHICH_ARGV_LOG", which_log.to_str().unwrap()),
+                    ("VALIDATOR_ARGV_LOG", validator_log.to_str().unwrap()),
+                ],
+            );
+            let exists = matches!(name, "--validator" | "validator;touch marker");
+            assert_eq!(output.status.success(), exists, "{}", output_text(&output));
+            assert_eq!(
+                std::fs::read_to_string(&which_log).unwrap(),
+                format!("2\n--\n{name}\n")
+            );
+            if exists {
+                let argv = std::fs::read_to_string(&validator_log).unwrap();
+                assert!(argv.starts_with("validate\n-m\nfile\n-s\n"), "{argv}");
+                let args: Vec<_> = argv.lines().collect();
+                assert_eq!(args.len(), 7, "{argv}");
+                assert_eq!(args[5], "-c", "{argv}");
+            } else if command == "review" {
+                assert!(output_text(&output).contains("Validation: ERROR"));
+            }
+            assert!(!repo.dir.path().join("marker").exists());
+        }
+    }
+}
+
+#[test]
 fn multiple_gateway_namespaces_leave_mesh_second_pass_intact() {
     let repo = Repo::new(&["zeta", "alpha"], None, None);
     repo.write(

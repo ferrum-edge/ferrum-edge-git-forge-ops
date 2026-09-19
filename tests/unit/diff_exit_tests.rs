@@ -990,6 +990,98 @@ fn malformed_backup_namespaces_refuse_diff_plan_and_apply_without_mutations() {
 
 #[cfg(unix)]
 #[test]
+fn duplicate_backup_identities_refuse_cli_comparison_and_mutation() {
+    use super::live_duplicate_tests::{duplicate_backup, KINDS, SECRET};
+
+    for (section, _) in KINDS {
+        for namespace in ["ferrum", "team-b"] {
+            let path = format!("resources/{namespace}/proxies/app.yaml");
+            let repo = Repo::new(
+                &[(&path, FERRUM_PROXY)],
+                vec![(
+                    namespace.into(),
+                    duplicate_backup(section, namespace).to_string(),
+                )],
+            );
+            for args in [
+                &["diff", "--exit-on-drift"][..],
+                &["diff", "--format", "json", "--exit-on-drift"],
+                &["plan"],
+                &["plan", "--format", "json"],
+                &["apply", "--auto-approve", "--allow-large-prune"],
+                &["review", "--require-live", "--pr", "1"],
+                &["review"],
+            ] {
+                let output = repo.run_with_env(args, &[("FERRUM_NAMESPACE", namespace)]);
+                let out = stdout(&output);
+                let err = stderr(&output);
+                let optional_review = args == ["review"];
+                assert_eq!(
+                    output.status.code(),
+                    Some(i32::from(!optional_review)),
+                    "{out}\n{err}"
+                );
+                assert!(err.contains("duplicate resource key"), "{out}\n{err}");
+                assert!(
+                    !out.contains(SECRET) && !err.contains(SECRET),
+                    "{out}\n{err}"
+                );
+                if args[0] == "review" {
+                    assert!(
+                        out.contains("backup contained duplicate resource identities"),
+                        "{out}"
+                    );
+                    assert!(out.contains("Live gateway comparison skipped"), "{out}");
+                }
+            }
+            let requests = repo.requests.lock().unwrap();
+            assert!(requests
+                .iter()
+                .any(|request| request.starts_with("GET /backup")));
+            assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        }
+    }
+}
+
+#[test]
+fn namespace_filter_does_not_fetch_an_unselected_duplicate_backup() {
+    use super::live_duplicate_tests::{duplicate_backup, KINDS};
+
+    for (section, _) in KINDS {
+        let repo = Repo::new(
+            &[
+                ("resources/ferrum/proxies/app.yaml", FERRUM_PROXY),
+                ("resources/team-b/proxies/other.yaml", TEAM_B_PROXY),
+            ],
+            vec![
+                (
+                    "ferrum".into(),
+                    backup(serde_json::json!([live_proxy("app", "ferrum", 8080, None)])),
+                ),
+                (
+                    "team-b".into(),
+                    duplicate_backup(section, "team-b").to_string(),
+                ),
+            ],
+        );
+        let output = repo.run_with_env(
+            &["diff", "--exit-on-drift"],
+            &[("FERRUM_NAMESPACE", "ferrum")],
+        );
+        assert!(
+            output.status.success(),
+            "{} {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let requests = repo.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| !request.contains("team-b")));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn plan_and_review_preview_adoption_and_its_delete_fence_in_both_modes() {
     for mode in ["shared", "exclusive"] {
         let config = format!(

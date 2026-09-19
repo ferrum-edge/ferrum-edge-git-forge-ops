@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::env::{ApplyStrategy, EnvConfig};
 use super::repo_config::{
@@ -38,6 +38,9 @@ impl ResolvedEnv {
         // overwrite files outside .state/ (particularly dangerous in CI
         // runs that auto-commit bot changes back to main).
         validate_env_name_is_safe_path_component(&self.name)?;
+        if let Some(overlay) = &self.overlay {
+            validate_overlay_name(overlay)?;
+        }
 
         if matches!(self.ownership.mode, OwnershipMode::Shared)
             && matches!(self.apply_strategy, ApplyStrategy::FullReplace)
@@ -75,9 +78,18 @@ impl ResolvedEnv {
 /// metacharacters, whitespace, path separators, and traversal segments by
 /// construction.
 pub fn validate_env_name_is_safe_path_component(name: &str) -> crate::error::Result<()> {
+    validate_component_name("environment", name)
+}
+
+/// Overlay selections are names beneath the overlay root, never paths.
+pub fn validate_overlay_name(name: &str) -> crate::error::Result<()> {
+    validate_component_name("overlay", name)
+}
+
+fn validate_component_name(kind: &str, name: &str) -> crate::error::Result<()> {
     if name.is_empty() || name.len() > 64 {
         return Err(crate::error::Error::Config(format!(
-            "environment name {name:?} must be 1..=64 characters."
+            "{kind} name {name:?} must be 1..=64 characters."
         )));
     }
     let ok = name
@@ -85,11 +97,17 @@ pub fn validate_env_name_is_safe_path_component(name: &str) -> crate::error::Res
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if !ok {
         return Err(crate::error::Error::Config(format!(
-            "environment name {name:?} contains disallowed characters. \
+            "{kind} name {name:?} contains disallowed characters. \
              Accepted: ASCII letters, digits, '-', '_'."
         )));
     }
     Ok(())
+}
+
+/// Validate before joining, including for callers constructing `ResolvedEnv` directly.
+pub fn overlay_directory(root: &Path, name: &str) -> crate::error::Result<PathBuf> {
+    validate_overlay_name(name)?;
+    Ok(root.join(name))
 }
 
 /// Resolve the active environment for this run.
@@ -177,7 +195,7 @@ pub fn validate_overlay_selection(
         return Ok(());
     };
 
-    let overlay_dir = overlays_root.join(overlay);
+    let overlay_dir = overlay_directory(overlays_root, overlay)?;
     if overlay_dir.is_dir() {
         return Ok(());
     }

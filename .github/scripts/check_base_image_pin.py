@@ -2,25 +2,29 @@
 """Decide whether the Dockerfile's pinned runtime security packages are still
 needed, still sufficient, and still fetchable.
 
-The runtime stage pins a digest of the Debian base and then installs a reviewed
-set of point-release packages by exact version and SHA-256, because the pinned
-base predates those fixes. That stage is temporary by design: it has to go once
-a rebuilt base carries the same versions. Left to a comment, "remove this once
-the base catches up" is noticed when a pull request turns red, which is how the
-perl-base and libsqlite3 gap was found.
+The runtime stage pins a digest of the Debian base. A temporary
+`runtime-security-updates` builder stage may then install a reviewed set of
+point-release packages by exact version and SHA-256 when that digest predates
+the fixes. The stage is gone once a rebuilt base carries those versions, and it
+has to come back if a later tag reports a fix the digest-pinned base does not
+yet carry. Left to a comment, either change is noticed when a pull request
+turns red, which is how the perl-base and libsqlite3 gap was found.
 
 This checker reads the Dockerfile as the single source of truth and compares it
 with a Trivy report for the *moving* base tag. Three outcomes:
 
-  retire  the current base tag reports no fixed CRITICAL/HIGH vulnerability, so
-          the package stage is redundant and the digest can be bumped to it
+  retire  the Dockerfile still pins packages, and the current base tag reports
+          no fixed CRITICAL/HIGH vulnerability, so the package stage is
+          redundant and the digest can be bumped to the moving tag
   stale   the base reports a fix this repository does not cover — a newer point
-          release than the pinned version, or a package that is neither pinned
-          nor purged from the runtime image — or a pinned .deb has left the
-          Debian pool, which fails the image build on a 404 that reads like
-          nothing to do with this stage
+          release than the pinned version, a package that is neither pinned
+          nor purged from the runtime image (including when the stage has
+          already been retired), or a pinned .deb has left the Debian pool,
+          which fails the image build on a 404 that reads like nothing to do
+          with this stage
   ok      every reported fix is covered by a pinned package or by one the
-          runtime purges, and every pinned .deb is still in the pool
+          runtime purges, every pinned .deb is still in the pool, and a
+          retired stage stays retired while the base remains clean
 
 Nothing here needs Docker: it consumes a Trivy JSON report produced by the
 canary workflow, so the canary and the `trivy-image` gate judge the same data.
@@ -319,6 +323,7 @@ class Report:
     redundant_pins: list[str] = field(default_factory=list)
     missing_from_pool: list[str] = field(default_factory=list)
     unverified_pool: list[str] = field(default_factory=list)
+    has_pins: bool = False
 
     @property
     def digest_moved(self) -> bool:
@@ -326,7 +331,7 @@ class Report:
 
 
 def classify(findings: list[Finding], pin: BasePin) -> Report:
-    report = Report(image=pin.image, pinned_digest=pin.digest)
+    report = Report(image=pin.image, pinned_digest=pin.digest, has_pins=bool(pin.packages))
     pinned = pin.versions_by_name()
     purged = set(pin.purged)
     reported = {finding.package for finding in findings}
@@ -359,7 +364,7 @@ def classify(findings: list[Finding], pin: BasePin) -> Report:
 
     if report.uncovered or report.stale_pins:
         report.state = "stale"
-    elif not findings:
+    elif pin.packages and not findings:
         report.state = "retire"
     return report
 
@@ -413,13 +418,20 @@ def check_pool(pin: BasePin, report: Report, *, fetch=head_status) -> None:
 
 HEADLINE = {
     "ok": "The pinned runtime security packages are still required and still sufficient.",
+    "ok-retired": "The digest-pinned runtime base needs no point-release package stage.",
     "retire": "The base image has caught up: the pinned package stage can be retired.",
     "stale": "The pinned runtime security packages no longer cover the base image.",
 }
 
 
+def headline(report: Report) -> str:
+    if report.state == "ok" and not report.has_pins:
+        return HEADLINE["ok-retired"]
+    return HEADLINE[report.state]
+
+
 def render(report: Report) -> str:
-    lines = [HEADLINE[report.state], ""]
+    lines = [headline(report), ""]
     lines.append(f"- Runtime base image: `{report.image}`")
     lines.append(f"- Digest pinned in the Dockerfile: `{report.pinned_digest}`")
     lines.append(f"- Digest the `{report.image}` tag resolves to now: `{report.current_digest or 'unknown'}`")
@@ -471,13 +483,24 @@ def render(report: Report) -> str:
         lines += [f"- {entry}" for entry in report.missing_from_pool] + [""]
 
     if report.stale_pins or report.uncovered or report.missing_from_pool:
-        lines += [
-            "Refresh a pin by replacing the version and SHA-256 for **every**",
-            "architecture in the Dockerfile's `SHA256SUMS` block, from the package's",
-            "immutable pool path. Do not reach for `apt` in the image: the release",
-            "stages are required to build from reviewed digests only.",
-            "",
-        ]
+        if report.has_pins:
+            lines += [
+                "Refresh a pin by replacing the version and SHA-256 for **every**",
+                "architecture in the Dockerfile's `SHA256SUMS` block, from the package's",
+                "immutable pool path. Do not reach for `apt` in the image: the release",
+                "stages are required to build from reviewed digests only.",
+                "",
+            ]
+        else:
+            lines += [
+                "Reintroduce the reviewed `runtime-security-updates` builder stage:",
+                "pin each affected package by exact version and SHA-256 from its",
+                "immutable pool path for **every** architecture, `COPY` the verified",
+                "`.deb` files into the runtime, and `dpkg --install` them before the",
+                "`dpkg --purge` step. Do not reach for `apt` in the image: the release",
+                "stages are required to build from reviewed digests only.",
+                "",
+            ]
 
     if report.redundant_pins:
         lines += [

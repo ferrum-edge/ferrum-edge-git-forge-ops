@@ -404,7 +404,11 @@ overlays can narrow lists such as `allowed_methods`, `hosts`,
 additive and merge by item identity, as are a mesh fragment's `spec.workloads`
 (by `spiffe_id`) and `spec.services` (by `name` + `namespace`).
 
-Input loading is fail-closed and deterministic. A selected overlay must exist —
+Input loading is fail-closed and deterministic. Overlay names in repository
+configuration and `FERRUM_OVERLAY` use 1–64 ASCII letters, digits, `-`, or `_`.
+They select a single directory under `overlays/`; paths and traversal segments
+are rejected before joining or reading the selected directory. Logical environment
+names may differ from their overlay names. A selected overlay must exist —
 the check runs before any resource file is read and names the environment, the
 overlay, and the file that declared the selection;
 every resource/overlay path is sorted before parsing; walker errors propagate;
@@ -1880,6 +1884,13 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 
 Exit codes: `0` in sync, `2` drift, `1` the run itself failed (unreachable gateway, cached backup, bad configuration). `drift-check.yml` fails the step on any non-zero exit.
 
+Duplicate live `(namespace, id)` identities within any of the four resource kinds
+invalidate the entire backup, including identical duplicate rows. `diff`, `plan`
+and `apply` fail; review withholds the comparison and `review --require-live`
+fails. Import also refuses duplicate backup rows before publishing files. The same
+checks cover direct diff and ownership APIs and fresh confirmation reads. Diagnostics
+name resource keys without including resource bodies or credential values.
+
 ```bash
 # Run once manually from the Actions tab, or via CLI:
 gitforgeops --env production diff --exit-on-drift
@@ -1932,6 +1943,13 @@ docker run --rm -v $(pwd):/repo gitforgeops --env staging validate
 The Ferrum Edge, Rust, and Debian stages are pinned by multi-architecture
 manifest digest. Update those references through reviewed Dependabot PRs; do
 not reintroduce a floating build argument for an executable base.
+
+Do not `apt-get update` or `upgrade` in the runtime: the same commit must
+produce the same bytes. `dpkg --purge` removes apt and unused TLS packages
+from the reviewed base. `base-image-pin-canary.yml` watches the moving Debian
+tag daily. Reintroduce a temporary digest-pinned point-release package stage
+only when that canary reports a fixed CRITICAL/HIGH the rebuilt base does not
+yet carry; never pull those fixes through apt.
 
 ## Build, test, lint
 

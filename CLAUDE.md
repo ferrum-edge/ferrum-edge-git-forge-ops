@@ -228,9 +228,13 @@ clean environment. The daily validator-pin canary fails and keeps its tracking
 issue open for either a stale digest or failed label acceptance. PR validation
 runs the same probe, including an unconditional `validator-pairing` job required
 by `gitforgeops-required-static-validation` even on pin-only/code-only PRs or
-empty repositories. The installer uses trusted code and the candidate allowlist
-in the secretless PR job; the probe receives no GitHub token. An approved digest
-is necessary but does not itself prove schema compatibility.
+empty repositories. Both jobs use the installer, compatibility probe, and its
+script-relative fixture from the protected default-branch `trusted-validator`
+checkout, with the candidate allowlist. The trusted supply-chain checker
+enforces both jobs' commands and ordering; candidate probe/checker changes
+cannot approve themselves. The installer keeps its read-only token; the probe
+receives no GitHub token. An approved digest is necessary but does not itself
+prove schema compatibility.
 
 ### Gateway Modes
 

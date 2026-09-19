@@ -58,6 +58,21 @@ RUN dpkg --purge --force-depends \\
 ENTRYPOINT ["/app/gitforgeops"]
 """
 
+RETIRED_DOCKERFILE = """\
+FROM ferrumedge/ferrum-edge:latest@sha256:aaaa AS ferrum-edge
+
+FROM rust:1.98.0-bookworm@sha256:bbbb AS builder
+RUN cargo build --release --locked
+
+FROM debian:trixie-slim@sha256:cccc
+RUN dpkg --purge --force-depends \\
+    apt \\
+    libapt-pkg7.0 \\
+    libssl3t64 \\
+    openssl-provider-legacy
+ENTRYPOINT ["/app/gitforgeops"]
+"""
+
 
 def report_document(vulnerabilities, digest="sha256:cccc"):
     return {
@@ -141,6 +156,15 @@ class DockerfileParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_base_image_pin.parse_dockerfile("FROM debian:trixie-slim\n")
 
+    def test_a_retired_dockerfile_has_no_packages_and_keeps_the_purge(self):
+        pin = check_base_image_pin.parse_dockerfile(RETIRED_DOCKERFILE)
+        self.assertEqual(pin.packages, [])
+        self.assertEqual(pin.pools, {})
+        self.assertEqual(pin.mirror, "")
+        self.assertEqual(
+            sorted(pin.purged), ["apt", "libapt-pkg7.0", "libssl3t64", "openssl-provider-legacy"]
+        )
+
 
 class RealDockerfileTests(unittest.TestCase):
     """The parser is only useful if it keeps matching the file it reads."""
@@ -156,10 +180,39 @@ class RealDockerfileTests(unittest.TestCase):
 
     def test_the_purge_list_is_read(self):
         self.assertIn("libssl3t64", self.pin.purged)
+        instructions = "\n".join(
+            line
+            for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        self.assertIn("dpkg --purge", instructions)
+
+    def test_the_live_dockerfile_has_retired_the_package_stage(self):
+        self.assertEqual(self.pin.packages, [])
+        self.assertEqual(self.pin.pools, {})
+        self.assertEqual(self.pin.mirror, "")
+        self.assertEqual(self.pin.versions_by_name(), {})
+        instructions = "\n".join(
+            line
+            for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("runtime-security-updates", instructions)
+        self.assertNotIn("dpkg --install", instructions)
+        self.assertNotEqual(
+            self.pin.digest,
+            "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
+        )
+        self.assertEqual(
+            self.pin.digest,
+            "sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a",
+        )
 
     def test_every_pinned_package_carries_both_architectures_and_a_pool(self):
+        # Completeness guard if the temporary stage is reintroduced: both
+        # architectures and a pool directory must stay in step. The live
+        # Dockerfile currently has no pins (issue #257).
         versions = self.pin.versions_by_name()
-        self.assertTrue(versions, "no pinned packages were parsed")
         for name, by_arch in versions.items():
             self.assertEqual(
                 sorted(by_arch), ["amd64", "arm64"], f"{name} is not pinned for both architectures"
@@ -245,6 +298,34 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(len(report.covered_by_purge), 1)
         self.assertEqual(report.uncovered, [])
 
+    def test_a_retired_stage_with_a_clean_base_is_ok_not_retirable(self):
+        pin = check_base_image_pin.parse_dockerfile(RETIRED_DOCKERFILE)
+        findings, _ = check_base_image_pin.parse_trivy_report(report_document([]))
+        report = check_base_image_pin.classify(findings, pin)
+        self.assertEqual(report.state, "ok")
+        self.assertFalse(report.has_pins)
+        self.assertEqual(report.redundant_pins, [])
+
+    def test_a_retired_stage_still_covers_a_purged_package(self):
+        pin = check_base_image_pin.parse_dockerfile(RETIRED_DOCKERFILE)
+        findings, _ = check_base_image_pin.parse_trivy_report(
+            report_document([vulnerability("libssl3t64", "3.5.7-1~deb13u2")])
+        )
+        report = check_base_image_pin.classify(findings, pin)
+        self.assertEqual(report.state, "ok")
+        self.assertEqual(len(report.covered_by_purge), 1)
+        self.assertEqual(report.uncovered, [])
+
+    def test_a_retired_stage_is_stale_when_a_new_finding_is_neither_pinned_nor_purged(self):
+        pin = check_base_image_pin.parse_dockerfile(RETIRED_DOCKERFILE)
+        findings, _ = check_base_image_pin.parse_trivy_report(
+            report_document([vulnerability("perl-base", "5.40.1-6+deb13u2")])
+        )
+        report = check_base_image_pin.classify(findings, pin)
+        self.assertEqual(report.state, "stale")
+        self.assertFalse(report.has_pins)
+        self.assertIn("neither pinned nor purged", report.uncovered[0])
+
     def test_a_pin_that_lags_on_one_architecture_is_stale(self):
         dockerfile = DOCKERFILE.replace(
             "3333333333333333333333333333333333333333333333333333333333333333 "
@@ -307,18 +388,43 @@ class RenderTests(unittest.TestCase):
         self.assertIn("The tag has been rebuilt since the pin.", text)
 
     def test_the_stale_report_explains_how_to_refresh_a_pin(self):
-        report = check_base_image_pin.Report(state="stale", image="debian:trixie-slim")
+        report = check_base_image_pin.Report(
+            state="stale", image="debian:trixie-slim", has_pins=True
+        )
         report.stale_pins = ["CVE-2026-1 HIGH perl-base 5.40.1-6 -> 5.40.1-6+deb13u2 (amd64: pinned 5.40.1-6+deb13u1)"]
         text = check_base_image_pin.render(report)
         self.assertIn("every**", text)
         self.assertIn("immutable pool path", text)
+        self.assertIn("SHA256SUMS", text)
+
+    def test_a_retired_ok_report_does_not_ask_to_delete_a_missing_stage(self):
+        report = check_base_image_pin.Report(
+            state="ok",
+            image="debian:trixie-slim",
+            pinned_digest="sha256:cccc",
+            current_digest="sha256:cccc",
+            has_pins=False,
+        )
+        text = check_base_image_pin.render(report)
+        self.assertIn("needs no point-release package stage", text)
+        self.assertNotIn("can be retired", text)
+        self.assertNotIn("Delete the `runtime-security-updates`", text)
+
+    def test_a_stale_report_without_pins_explains_how_to_reintroduce_the_stage(self):
+        report = check_base_image_pin.Report(
+            state="stale", image="debian:trixie-slim", has_pins=False
+        )
+        report.uncovered = ["CVE-2026-1 HIGH perl-base 5.40.1-6 -> 5.40.1-6+deb13u2 (neither pinned nor purged)"]
+        text = check_base_image_pin.render(report)
+        self.assertIn("Reintroduce the reviewed `runtime-security-updates` builder stage", text)
+        self.assertNotIn("SHA256SUMS", text)
 
 
 class MainTests(unittest.TestCase):
-    def run_main(self, vulnerabilities, extra_args=()):
+    def run_main(self, vulnerabilities, extra_args=(), dockerfile=DOCKERFILE):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "Dockerfile").write_text(DOCKERFILE, encoding="utf-8")
+            (root / "Dockerfile").write_text(dockerfile, encoding="utf-8")
             report_path = root / "scan.json"
             report_path.write_text(json.dumps(report_document(vulnerabilities)), encoding="utf-8")
             body = root / "report.md"
@@ -351,6 +457,11 @@ class MainTests(unittest.TestCase):
         code, body = self.run_main([vulnerability("perl-base", "5.40.1-6+deb13u2")])
         self.assertEqual(code, 1)
         self.assertIn("no longer cover the base image", body)
+
+    def test_a_retired_dockerfile_with_a_clean_base_exits_zero_as_ok(self):
+        code, body = self.run_main([], dockerfile=RETIRED_DOCKERFILE)
+        self.assertEqual(code, 0)
+        self.assertIn("needs no point-release package stage", body)
 
     def test_print_base_ref_emits_the_tag_without_a_digest(self):
         with tempfile.TemporaryDirectory() as directory:

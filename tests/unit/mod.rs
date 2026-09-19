@@ -14,6 +14,7 @@ mod import_tests;
 mod json_output_tests;
 mod jwt_tests;
 mod literal_credential_tests;
+mod live_duplicate_tests;
 mod loader_tests;
 mod log_injection_tests;
 mod mesh_minimal_tests;
