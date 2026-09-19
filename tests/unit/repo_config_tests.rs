@@ -617,3 +617,77 @@ fn an_environment_without_an_overlay_is_never_checked() {
     assert!(resolved.overlay.is_none());
     validate_overlay_selection(&resolved, None, std::path::Path::new("/nonexistent")).unwrap();
 }
+
+#[test]
+fn overlay_names_are_bounded_components_at_every_selection_boundary() {
+    use gitforgeops::config::resolved::overlay_directory;
+    use gitforgeops::config::{resolve_env, validate_overlay_selection, EnvConfig};
+
+    let root = tempfile::tempdir().unwrap();
+    let too_long = "a".repeat(65);
+    for name in [
+        "",
+        ".",
+        "..",
+        "../outside",
+        "a/../b",
+        "a/b",
+        "/tmp",
+        "a\\b",
+        "C:\\tmp",
+        "a\0b",
+        "a\nb",
+        " staging",
+        "staging ",
+        "é",
+        "stage.prod",
+        &too_long,
+    ] {
+        // JSON is also YAML and preserves null/control bytes as escaped input.
+        let file = write_repo_config(
+            &serde_json::json!({"environments": {"production": {"overlay": name}}}).to_string(),
+        );
+        let error = RepoConfig::load_from_path(file.path()).unwrap_err();
+        assert!(error.to_string().contains("overlay name"), "{error}");
+
+        let env = EnvConfig {
+            overlay: Some(name.to_string()),
+            ..EnvConfig::default()
+        };
+        assert!(resolve_env(None, &env, Some("production")).is_err());
+        assert!(overlay_directory(root.path(), name).is_err());
+
+        // A direct caller can construct or modify ResolvedEnv without resolve_env.
+        let mut resolved = resolve_env(None, &EnvConfig::default(), None).unwrap();
+        resolved.overlay = Some(name.to_string());
+        let error = validate_overlay_selection(&resolved, None, root.path()).unwrap_err();
+        assert!(error.to_string().contains("overlay name"), "{error}");
+        assert!(!error.to_string().contains("does not exist"), "{error}");
+    }
+
+    for name in ["a", "Stage-1_blue", &"a".repeat(64)] {
+        std::fs::create_dir(root.path().join(name)).unwrap();
+        let file = write_repo_config(
+            &serde_json::json!({"environments": {"production": {"overlay": name}}}).to_string(),
+        );
+        let repo = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+        let env = EnvConfig {
+            overlay: Some("../ignored-fallback".to_string()),
+            ..EnvConfig::default()
+        };
+        let resolved = resolve_env(Some(&repo), &env, Some("production")).unwrap();
+        assert_eq!(resolved.name, "production");
+        assert_eq!(resolved.overlay.as_deref(), Some(name));
+        validate_overlay_selection(&resolved, Some(&repo), root.path()).unwrap();
+        assert_eq!(
+            overlay_directory(root.path(), name).unwrap(),
+            root.path().join(name)
+        );
+        let env = EnvConfig {
+            overlay: Some(name.to_string()),
+            ..EnvConfig::default()
+        };
+        let resolved = resolve_env(None, &env, Some("logical-env")).unwrap();
+        validate_overlay_selection(&resolved, None, root.path()).unwrap();
+    }
+}

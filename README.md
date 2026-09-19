@@ -404,7 +404,11 @@ overlays can narrow lists such as `allowed_methods`, `hosts`,
 additive and merge by item identity, as are a mesh fragment's `spec.workloads`
 (by `spiffe_id`) and `spec.services` (by `name` + `namespace`).
 
-Input loading is fail-closed and deterministic. A selected overlay must exist —
+Input loading is fail-closed and deterministic. Overlay names in repository
+configuration and `FERRUM_OVERLAY` use 1–64 ASCII letters, digits, `-`, or `_`.
+They select a single directory under `overlays/`; paths and traversal segments
+are rejected before joining or reading the selected directory. Logical environment
+names may differ from their overlay names. A selected overlay must exist —
 the check runs before any resource file is read and names the environment, the
 overlay, and the file that declared the selection;
 every resource/overlay path is sorted before parsing; walker errors propagate;
@@ -1879,6 +1883,13 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - API-spec ownership conflicts are drift in **both** modes and cannot be muted: `apply` refuses the namespace, so a monitor that reported success would be reporting on a gateway nobody can reconcile.
 
 Exit codes: `0` in sync, `2` drift, `1` the run itself failed (unreachable gateway, cached backup, bad configuration). `drift-check.yml` fails the step on any non-zero exit.
+
+Duplicate live `(namespace, id)` identities within any of the four resource kinds
+invalidate the entire backup, including identical duplicate rows. `diff`, `plan`
+and `apply` fail; review withholds the comparison and `review --require-live`
+fails. Import also refuses duplicate backup rows before publishing files. The same
+checks cover direct diff and ownership APIs and fresh confirmation reads. Diagnostics
+name resource keys without including resource bodies or credential values.
 
 ```bash
 # Run once manually from the Actions tab, or via CLI:

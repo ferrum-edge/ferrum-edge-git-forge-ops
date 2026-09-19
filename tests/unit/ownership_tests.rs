@@ -91,7 +91,7 @@ fn exclusive_mode_deletes_admin_added_resource() {
         proxy("admin-added", "ferrum"),
     ]);
 
-    let result = compute_diff_with_ownership(&desired, &actual, None);
+    let result = compute_diff_with_ownership(&desired, &actual, None).unwrap();
 
     assert!(
         result.unmanaged.is_empty(),
@@ -117,7 +117,7 @@ fn shared_mode_leaves_admin_added_resource_untouched() {
     let mut managed = HashSet::new();
     managed.insert(state_key("ferrum", "Proxy", "from-repo"));
 
-    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
 
     assert_eq!(result.unmanaged.len(), 1);
     assert_eq!(result.unmanaged[0].id, "admin-added");
@@ -138,7 +138,7 @@ fn shared_mode_deletes_resource_previously_managed_now_removed_from_repo() {
     let mut managed = HashSet::new();
     managed.insert(state_key("ferrum", "Proxy", "was-in-repo"));
 
-    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
 
     let deletes: Vec<_> = result
         .diffs
@@ -195,7 +195,8 @@ fn shared_mode_iterates_previously_managed_namespaces_even_when_desired_is_empty
         &desired_for_team_alpha,
         &actual_for_team_alpha,
         Some(&managed),
-    );
+    )
+    .unwrap();
 
     assert!(result.unmanaged.is_empty());
     let deletes: Vec<_> = result
@@ -221,7 +222,8 @@ fn exclusive_mode_with_explicit_namespaces_iterates_empty_namespaces() {
     let actual_for_team_alpha = gateway_with(vec![proxy("stale", "team-alpha")]);
 
     // Exclusive mode — pass None for previously_managed.
-    let result = compute_diff_with_ownership(&desired_for_team_alpha, &actual_for_team_alpha, None);
+    let result =
+        compute_diff_with_ownership(&desired_for_team_alpha, &actual_for_team_alpha, None).unwrap();
 
     assert!(
         result.unmanaged.is_empty(),
@@ -246,7 +248,7 @@ fn shared_mode_first_apply_with_empty_state_skips_all_deletes() {
     ]);
 
     let managed: HashSet<String> = HashSet::new();
-    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
 
     assert_eq!(result.unmanaged.len(), 2);
     let adds: Vec<_> = result
@@ -285,7 +287,7 @@ fn shared_mode_never_deletes_spec_owned_resource() {
     managed.insert(state_key("ferrum", "Proxy", "from-repo"));
     managed.insert(state_key("ferrum", "Proxy", "from-spec"));
 
-    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
 
     assert!(
         result
@@ -317,7 +319,7 @@ fn shared_mode_reports_conflict_instead_of_modify_for_spec_owned_resource() {
     let actual = gateway_with(vec![spec_owned_proxy("shared-id", "ferrum", "spec-9")]);
 
     let managed = HashSet::new();
-    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
 
     assert!(
         result.diffs.is_empty(),
@@ -339,7 +341,7 @@ fn conflict_is_reported_even_when_fields_currently_agree() {
     let desired = gateway_with(vec![proxy("shared-id", "ferrum")]);
     let actual = gateway_with(vec![spec_owned_proxy("shared-id", "ferrum", "spec-9")]);
 
-    let result = compute_diff_with_ownership(&desired, &actual, None);
+    let result = compute_diff_with_ownership(&desired, &actual, None).unwrap();
 
     assert!(result.diffs.is_empty());
     assert_eq!(result.spec_conflicts().count(), 1);
@@ -359,7 +361,8 @@ fn exclusive_mode_skips_spec_owned_prune_without_confirmation() {
         &actual,
         OwnershipScope::Exclusive,
         DiffOptions::default(),
-    );
+    )
+    .unwrap();
 
     let deletes: Vec<_> = result
         .diffs
@@ -393,7 +396,8 @@ fn exclusive_mode_prunes_spec_owned_with_confirmation() {
         DiffOptions {
             prune_spec_owned: true,
         },
-    );
+    )
+    .unwrap();
 
     let deletes: Vec<_> = result
         .diffs
@@ -428,7 +432,8 @@ fn shared_mode_ignores_prune_confirmation_for_spec_owned() {
         DiffOptions {
             prune_spec_owned: true,
         },
-    );
+    )
+    .unwrap();
 
     assert!(result.diffs.is_empty(), "got {:?}", result.diffs);
     assert_eq!(result.spec_owned.len(), 1);
@@ -451,6 +456,7 @@ fn confirmed_spec_prunes_are_visible_to_the_preview_and_the_large_prune_guard() 
 
     let delete_count = |options| {
         compute_diff_with_options(&desired, &actual, OwnershipScope::Exclusive, options)
+            .unwrap()
             .diffs
             .iter()
             .filter(|d| matches!(d.action, DiffAction::Delete))
@@ -485,7 +491,8 @@ fn informational_spec_owned_resources_leave_the_config_in_sync() {
         &actual,
         OwnershipScope::Exclusive,
         DiffOptions::default(),
-    );
+    )
+    .unwrap();
 
     assert!(result.diffs.is_empty(), "got {:?}", result.diffs);
     assert!(result.unmanaged.is_empty());
@@ -509,7 +516,8 @@ fn a_spec_owned_conflict_still_blocks_in_sync() {
         &actual,
         OwnershipScope::Exclusive,
         DiffOptions::default(),
-    );
+    )
+    .unwrap();
 
     assert_eq!(result.spec_conflicts().count(), 1);
     assert!(result.spec_owned[0].is_conflict());
@@ -526,6 +534,7 @@ fn spec_owned_bucket_is_sorted_deterministically() {
 
     let managed = HashSet::new();
     let ids: Vec<(String, String)> = compute_diff_with_ownership(&desired, &actual, Some(&managed))
+        .unwrap()
         .spec_owned
         .iter()
         .map(|s| (s.namespace.clone(), s.id.clone()))
@@ -611,7 +620,7 @@ fn diff_and_unmanaged_buckets_are_sorted_deterministically() {
     // Shared mode, nothing previously managed: every desired resource is an
     // Add and every live resource is unmanaged.
     let managed = HashSet::new();
-    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let result = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
 
     let diffs: Vec<(String, String, String)> = result
         .diffs
@@ -688,8 +697,8 @@ fn diff_order_is_stable_across_two_runs() {
     );
     let managed = HashSet::new();
 
-    let first = compute_diff_with_ownership(&desired, &actual, Some(&managed));
-    let second = compute_diff_with_ownership(&desired, &actual, Some(&managed));
+    let first = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
+    let second = compute_diff_with_ownership(&desired, &actual, Some(&managed)).unwrap();
 
     let order = |result: &DiffResult| -> Vec<(String, String, String)> {
         result

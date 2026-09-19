@@ -323,8 +323,12 @@ pub struct DiffOptions {
     pub prune_spec_owned: bool,
 }
 
-pub fn compute_diff(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<ResourceDiff> {
-    compute_diff_with_scope(desired, actual, OwnershipScope::Exclusive).diffs
+/// Compare resources only when every live identity is unambiguous.
+pub fn compute_diff(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+) -> crate::error::Result<Vec<ResourceDiff>> {
+    Ok(compute_diff_with_scope(desired, actual, OwnershipScope::Exclusive)?.diffs)
 }
 
 /// Compute a diff, honoring ownership constraints.
@@ -340,7 +344,7 @@ pub fn compute_diff_with_ownership(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
     previously_managed: Option<&HashSet<String>>,
-) -> DiffResult {
+) -> crate::error::Result<DiffResult> {
     let scope = match previously_managed {
         Some(previously_managed) => OwnershipScope::Shared { previously_managed },
         None => OwnershipScope::Exclusive,
@@ -352,7 +356,7 @@ pub fn compute_diff_with_scope(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
     ownership_scope: OwnershipScope<'_>,
-) -> DiffResult {
+) -> crate::error::Result<DiffResult> {
     compute_diff_with_options(desired, actual, ownership_scope, DiffOptions::default())
 }
 
@@ -361,7 +365,10 @@ pub fn compute_diff_with_options(
     actual: &GatewayConfig,
     ownership_scope: OwnershipScope<'_>,
     options: DiffOptions,
-) -> DiffResult {
+) -> crate::error::Result<DiffResult> {
+    // Check all four kinds before any collection can collapse a live row or
+    // yield a partial change set. Direct callers need the same backup boundary.
+    crate::config::validate_unique_live_resource_keys(actual)?;
     let mut result = DiffResult::default();
     let ctx = CollectionContext {
         ownership_scope,
@@ -427,7 +434,7 @@ pub fn compute_diff_with_options(
         .spec_owned
         .sort_by(|a, b| (&a.namespace, &a.kind, &a.id).cmp(&(&b.namespace, &b.kind, &b.id)));
 
-    result
+    Ok(result)
 }
 
 pub fn state_key(namespace: &str, kind: &str, id: &str) -> String {

@@ -513,7 +513,8 @@ fn interactive_preview_includes_pending_create_ownership_assertions() {
     let pending =
         std::collections::BTreeSet::from([state_key("team-alpha", "Upstream", "pending-upstream")]);
 
-    let assertions = pending_create_assertion_diffs(&desired, &actual, &pending, "team-alpha");
+    let assertions =
+        pending_create_assertion_diffs(&desired, &actual, &pending, "team-alpha").unwrap();
 
     assert_eq!(assertions.len(), 1);
     assert!(matches!(assertions[0].action, DiffAction::Modify));
@@ -2290,15 +2291,20 @@ fn adoption_and_pending_recovery_ignore_only_association_order() {
     let key = state_key("team-alpha", "Proxy", "p1");
     let pending = BTreeSet::from([key]);
     assert_eq!(
-        pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha").len(),
+        pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha")
+            .unwrap()
+            .len(),
         1
     );
-    let candidates = adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new());
+    let candidates =
+        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new()).unwrap();
     assert!(candidates.iter().any(|candidate| candidate.kind == "Proxy"));
     live.proxies[0].plugins.pop();
-    assert!(pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha").is_empty());
+    assert!(pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha")
+        .unwrap()
+        .is_empty());
     assert!(
-        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new())
+        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new()).unwrap()
             .iter()
             .all(|candidate| candidate.kind != "Proxy")
     );
@@ -2356,7 +2362,7 @@ async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_no
             expected.push("PUT /proxies/p1 HTTP/1.1");
         }
         assert_eq!(mutation_lines(&requests), expected);
-        let drift = gitforgeops::diff::compute_diff(&desired, &after_plugin);
+        let drift = gitforgeops::diff::compute_diff(&desired, &after_plugin).unwrap();
         assert_eq!(drift.is_empty(), !needs_put);
     }
 }
@@ -2916,7 +2922,7 @@ async fn non_proxy_scope_with_stray_target_does_not_enter_batch_only_path() {
         let mut desired = scoped_plugin_desired();
         desired.plugin_configs[0].scope = scope;
         desired.proxies[0].plugins.clear();
-        let diffs = gitforgeops::diff::compute_diff(&desired, &GatewayConfig::default());
+        let diffs = gitforgeops::diff::compute_diff(&desired, &GatewayConfig::default()).unwrap();
         assert!(gitforgeops::apply::incremental_plugin_attach_notice(
             &Default::default(),
             &diffs,
@@ -2972,8 +2978,10 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     let mut old = actual.proxies[0].clone();
     old.backend_port = 9090;
     desired.proxies.push(old);
-    let diffs =
-        order_incremental_diffs(gitforgeops::diff::compute_diff(&desired, &actual), &desired);
+    let diffs = order_incremental_diffs(
+        gitforgeops::diff::compute_diff(&desired, &actual).unwrap(),
+        &desired,
+    );
     assert_eq!(
         diffs
             .iter()
@@ -3756,7 +3764,8 @@ fn a_live_only_field_prevents_adoption() {
         ..Default::default()
     };
 
-    let candidates = adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new());
+    let candidates =
+        adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new()).unwrap();
     assert!(
         candidates.is_empty(),
         "an ownership PUT must not erase a live-only field: {candidates:?}"
@@ -3813,6 +3822,92 @@ async fn a_spec_owner_added_during_confirmation_prevents_adoption() {
     );
 }
 
+#[tokio::test]
+async fn supplied_duplicate_live_rows_refuse_both_apply_strategies_before_any_request() {
+    use super::live_duplicate_tests::{duplicate_backup, KINDS};
+
+    for (section, _) in KINDS {
+        let actual: GatewayConfig =
+            serde_json::from_value(duplicate_backup(section, "team-alpha")).unwrap();
+        for strategy in [ApplyStrategy::Incremental, ApplyStrategy::FullReplace] {
+            let (url, requests) = spawn_recording_gateway(vec![]);
+            let client = stub_client(url);
+            let actuals = BTreeMap::from([("team-alpha".to_string(), actual.clone())]);
+            let extras = BTreeMap::from([(
+                "team-alpha".to_string(),
+                gitforgeops::http_client::BackupExtras::default(),
+            )]);
+            let result = apply_api(
+                &GatewayConfig::default(),
+                &client,
+                &["team-alpha".to_string()],
+                OwnershipScope::Exclusive,
+                Some(&actuals),
+                Some(&extras),
+                &ApplyOptions {
+                    strategy,
+                    confirm_api_spec_deletion: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(gitforgeops::error::Error::DuplicateLiveResource(_))
+            ));
+            assert!(requests.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_confirmation_rows_fail_adoption_without_claiming_ownership() {
+    use super::live_duplicate_tests::{duplicate_backup, KINDS, SECRET};
+
+    for (section, _) in KINDS {
+        let confirmation = duplicate_backup(section, "team-alpha");
+        let mut one_row = confirmation.clone();
+        one_row[section].as_array_mut().unwrap().truncate(1);
+        let desired: GatewayConfig = serde_json::from_value(one_row).unwrap();
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+            ("GET /backup".into(), 200, confirmation.to_string(), vec![]),
+        ]);
+        let client = stub_client(url);
+        let fence = HashSet::new();
+        let result = apply_api(
+            &desired,
+            &client,
+            &["team-alpha".to_string()],
+            OwnershipScope::Shared {
+                previously_managed: &fence,
+            },
+            Some(&BTreeMap::from([(
+                "team-alpha".to_string(),
+                desired.clone(),
+            )])),
+            None,
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(result.adopted.is_empty());
+        assert!(result.applied_incremental.is_empty());
+        assert!(result
+            .fatal_error
+            .as_deref()
+            .unwrap()
+            .contains("duplicate resource key"));
+        let error = result.into_result().unwrap_err().to_string();
+        assert!(!error.contains(SECRET), "{error}");
+        let requests = requests.lock().unwrap();
+        assert!(requests
+            .iter()
+            .any(|request| request.starts_with("GET /backup")));
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+    }
+}
+
 #[test]
 fn spec_owned_rows_are_never_adopted() {
     // The `/api-specs` importer owns these rows in both ownership modes.
@@ -3834,7 +3929,8 @@ fn spec_owned_rows_are_never_adopted() {
         ..Default::default()
     };
 
-    let candidates = adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new());
+    let candidates =
+        adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new()).unwrap();
     assert!(
         candidates.is_empty(),
         "no spec-owned row may be adopted: {:?}",
@@ -3849,7 +3945,8 @@ fn spec_owned_rows_are_never_adopted() {
         upstreams: vec![upstream("u1", "team-alpha")],
         ..Default::default()
     };
-    let candidates = adoption_candidates(&desired, &untagged, &BTreeSet::new(), &BTreeSet::new());
+    let candidates =
+        adoption_candidates(&desired, &untagged, &BTreeSet::new(), &BTreeSet::new()).unwrap();
     assert_eq!(
         candidate_ids(&candidates),
         vec!["Upstream u1", "Proxy p1", "PluginConfig pc1"]
@@ -3867,7 +3964,7 @@ fn adoption_skips_ledger_entries_and_rows_an_operation_already_covers() {
 
     let managed = BTreeSet::from([state_key("team-alpha", "Upstream", "u1")]);
     let handled = BTreeSet::from([state_key("team-alpha", "Consumer", "c1")]);
-    let candidates = adoption_candidates(&desired, &actual, &managed, &handled);
+    let candidates = adoption_candidates(&desired, &actual, &managed, &handled).unwrap();
     assert_eq!(candidate_ids(&candidates), vec!["Upstream u2"]);
 }
 
@@ -3885,7 +3982,8 @@ fn a_row_absent_or_different_live_is_not_an_adoption_candidate() {
     };
 
     // `u1` differs (ordinary Modify), `u2` is absent (ordinary Add).
-    let candidates = adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new());
+    let candidates =
+        adoption_candidates(&desired, &actual, &BTreeSet::new(), &BTreeSet::new()).unwrap();
     assert!(candidates.is_empty(), "{:?}", candidate_ids(&candidates));
 }
 

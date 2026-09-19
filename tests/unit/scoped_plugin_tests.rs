@@ -90,8 +90,8 @@ fn scoped_config_without_explicit_association_converges_to_live_backup() {
     .unwrap();
 
     assert_eq!(association_ids(&desired.proxies[0]), vec!["auth"]);
-    assert!(compute_diff(&desired, &actual).is_empty());
-    let shared = compute_diff_with_ownership(&desired, &actual, Some(&Default::default()));
+    assert!(compute_diff(&desired, &actual).unwrap().is_empty());
+    let shared = compute_diff_with_ownership(&desired, &actual, Some(&Default::default())).unwrap();
     assert!(shared.diffs.is_empty());
     assert!(shared.unmanaged.is_empty());
     // The same assembled proxy is serialized for export and API writes.
@@ -99,11 +99,11 @@ fn scoped_config_without_explicit_association_converges_to_live_backup() {
     assert_eq!(payload["plugins"], json!([{"plugin_config_id": "auth"}]));
     let exported: GatewayConfig =
         serde_yaml::from_str(&serde_yaml::to_string(&desired).unwrap()).unwrap();
-    assert!(compute_diff(&exported, &actual).is_empty());
+    assert!(compute_diff(&exported, &actual).unwrap().is_empty());
 
     let mut missing_live_association = actual;
     missing_live_association.proxies[0].plugins.clear();
-    let drift = compute_diff(&desired, &missing_live_association);
+    let drift = compute_diff(&desired, &missing_live_association).unwrap();
     assert_eq!(drift.len(), 1);
     assert_eq!(drift[0].action, DiffAction::Modify);
     assert_eq!(drift[0].details[0].field, "plugins");
@@ -139,8 +139,8 @@ fn association_comparison_is_a_set_without_changing_export_order() {
     .gateway;
     let mut live = desired.clone();
     live.proxies[0].plugins.reverse();
-    assert!(compute_diff(&desired, &live).is_empty());
-    let shared = compute_diff_with_ownership(&desired, &live, Some(&Default::default()));
+    assert!(compute_diff(&desired, &live).unwrap().is_empty());
+    let shared = compute_diff_with_ownership(&desired, &live, Some(&Default::default())).unwrap();
     assert!(shared.diffs.is_empty());
     assert!(shared.unmanaged.is_empty());
 
@@ -148,13 +148,13 @@ fn association_comparison_is_a_set_without_changing_export_order() {
     let exported: GatewayConfig = serde_yaml::from_str(&exported).unwrap();
     assert_eq!(association_ids(&exported.proxies[0]), vec!["b", "a"]);
     assert_eq!(association_ids(&desired.proxies[0]), vec!["b", "a"]);
-    assert!(compute_diff(&exported, &live).is_empty());
+    assert!(compute_diff(&exported, &live).unwrap().is_empty());
 
     live.proxies[0].plugins.pop();
-    let missing = compute_diff(&desired, &live);
+    let missing = compute_diff(&desired, &live).unwrap();
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].details[0].field, "plugins");
-    let extra = compute_diff(&live, &desired);
+    let extra = compute_diff(&live, &desired).unwrap();
     assert_eq!(extra.len(), 1);
     assert_eq!(extra[0].details[0].field, "plugins");
 }
@@ -172,7 +172,7 @@ fn opaque_plugin_arrays_remain_order_sensitive() {
         .as_array_mut()
         .unwrap()
         .reverse();
-    let drift = compute_diff(&desired, &live);
+    let drift = compute_diff(&desired, &live).unwrap();
     assert_eq!(drift.len(), 1);
     assert_eq!(drift[0].kind, "PluginConfig");
     assert_eq!(drift[0].details[0].field, "config");
@@ -190,7 +190,7 @@ fn live_duplicate_associations_are_drift_and_changes_preserve_wire_order() {
     let mut live = desired.clone();
     let duplicate = live.proxies[0].plugins[1].clone();
     live.proxies[0].plugins.push(duplicate);
-    let changes = compute_diff(&desired, &live);
+    let changes = compute_diff(&desired, &live).unwrap();
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].details[0].field, "plugins");
     assert_eq!(
@@ -224,7 +224,7 @@ fn derived_order_is_independent_of_resource_order_and_normalization_is_idempoten
         association_ids(&first.proxies[0]),
         vec!["a-auth", "m-auth", "z-auth"]
     );
-    assert!(compute_diff(&first, &second).is_empty());
+    assert!(compute_diff(&first, &second).unwrap().is_empty());
     let before = serde_json::to_value(&second).unwrap();
     normalize_proxy_plugin_associations(&mut second);
     assert_eq!(serde_json::to_value(&second).unwrap(), before);
@@ -469,10 +469,10 @@ fn unlabeled_declared_resources_report_label_drift_then_converge() {
     let desired = assemble(vec![proxy(&[])]).unwrap().gateway;
     let mut live = desired.clone();
     live.proxies[0].labels.clear();
-    let drift = compute_diff(&desired, &live);
+    let drift = compute_diff(&desired, &live).unwrap();
     assert_eq!(drift.len(), 1);
     assert_eq!(drift[0].action, DiffAction::Modify);
     assert_eq!(drift[0].details[0].field, "labels");
     live.proxies[0].labels = desired.proxies[0].labels.clone();
-    assert!(compute_diff(&desired, &live).is_empty());
+    assert!(compute_diff(&desired, &live).unwrap().is_empty());
 }

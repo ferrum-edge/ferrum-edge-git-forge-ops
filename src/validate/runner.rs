@@ -333,7 +333,7 @@ fn run_validate_command(
     annotate_namespace: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
-    let which_result = Command::new("which").arg(binary_path).output();
+    let which_result = Command::new("which").arg("--").arg(binary_path).output();
     // Reuse the existing lookup for diagnostics; no version subprocess or
     // version-number assumption can establish resource-label capability.
     let binary_in_use = which_result

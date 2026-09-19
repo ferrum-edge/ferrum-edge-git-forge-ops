@@ -288,7 +288,7 @@ spec:
 
     // The repo declares the field, the gateway does not have it: real drift
     // the repo owns and apply can push.
-    let diffs = compute_diff(&with_field, &plain);
+    let diffs = compute_diff(&with_field, &plain).unwrap();
     assert_eq!(diffs.len(), 1, "{diffs:#?}");
     assert!(
         diffs[0]
@@ -303,7 +303,7 @@ spec:
     // never declared: not drift. Reporting it would make every gateway
     // upgrade permanent, unclearable drift on every resource.
     assert!(
-        compute_diff(&plain, &with_field).is_empty(),
+        compute_diff(&plain, &with_field).unwrap().is_empty(),
         "live-only unknown fields must not be reported as drift"
     );
 
@@ -311,7 +311,7 @@ spec:
     // that never saw an unknown field is byte-identical to one from a build
     // without the feature.
     let empty = GatewayConfig::default();
-    assert!(compute_diff(&empty, &empty).is_empty());
+    assert!(compute_diff(&empty, &empty).unwrap().is_empty());
 }
 
 /// The warning has to reach stderr: `gitforgeops export` writes the assembled
