@@ -1558,7 +1558,142 @@ fn a_surviving_fragment_of_a_secret_withholds_the_stream() {
     assert_eq!(result.stdout, "");
     assert!(!result.stderr.contains(fragment), "{}", result.stderr);
     assert!(
-        result.stderr.contains("12-byte run"),
+        result.stderr.contains("run of a resolved secret"),
+        "the notice must name the reason: {}",
+        result.stderr
+    );
+}
+
+/// The scrub floor and the fragment window are one contract, not two
+/// independent tunables: every value substring replacement is allowed to touch
+/// has to be long enough for the scan that checks what the replacement left
+/// behind. A window wider than the floor would leave a band of values with a
+/// needle and no second line of defence.
+#[test]
+fn the_fragment_window_never_exceeds_the_scrub_floor() {
+    use gitforgeops::secrets::{FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH};
+
+    // Read through bindings so this stays a runtime check; `scrubber.rs`
+    // carries the compile-time `const _: () = assert!(..)` form of the same
+    // invariant, which is what actually stops the band from reopening.
+    let floor = MIN_SCRUB_LENGTH;
+    let window = FRAGMENT_SCAN_LENGTH;
+    assert!(
+        window > 0 && floor >= window,
+        "a scrubbable value must always produce at least one fragment window: \
+         floor {floor}, window {window}"
+    );
+}
+
+/// Emitters do not agree on how to spell a control character or a non-ASCII
+/// one — a YAML writer descended from libyaml uses `\e`, `\x7F`, `\N`, `\L`,
+/// `\_` where JSON uses `\u00NN` or the raw bytes — so neither needle
+/// reproduces the emitted form and such a value cannot be substring-replaced
+/// at all.
+#[test]
+fn control_and_non_ascii_secrets_are_reencoding_hazards() {
+    use gitforgeops::secrets::is_reencoding_hazard;
+
+    for value in [
+        "Ax7Kd9QpLm2Rn4Tv\u{1b}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{01}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{7f}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{09}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{85}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{a0}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{2028}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{2029}6Wy8Zb0Ce3Fh5Jk",
+    ] {
+        assert!(is_reencoding_hazard(value), "{value:?}");
+    }
+    // Printable single-line ASCII is still scrubbed, which is the whole point.
+    assert!(!is_reencoding_hazard("Ax7Kd9QpLm2Rn4Tv6Wy8Zb0Ce3Fh5Jk"));
+}
+
+/// ...and the classification is load-bearing end to end: the validator echoes
+/// the document it was handed in whichever escape its own emitter picked, so
+/// the stream is withheld before the child runs rather than printed with a
+/// half-matched copy of the credential in it.
+#[cfg(unix)]
+#[test]
+fn a_secret_carrying_a_control_or_non_ascii_character_withholds_the_stream() {
+    for (case, secret) in [
+        "Ax7Kd9QpLm2Rn4Tv\u{1b}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{7f}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{85}6Wy8Zb0Ce3Fh5Jk",
+        "Ax7Kd9QpLm2Rn4Tv\u{2028}6Wy8Zb0Ce3Fh5Jk",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
+        let dir = tempfile::tempdir().unwrap();
+        let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+        let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+        // Name the case by index: the panic message must not print the secret.
+        assert_eq!(result.stdout, "", "case {case}");
+        assert!(
+            result.stderr.contains("not safely scrubbable"),
+            "{}",
+            result.stderr
+        );
+        // Neither the value nor either half of it either side of the escape.
+        assert!(!result.stderr.contains(secret), "{}", result.stderr);
+        for half in ["Ax7Kd9QpLm2Rn4Tv", "6Wy8Zb0Ce3Fh5Jk"] {
+            assert!(!result.stderr.contains(half), "{}", result.stderr);
+        }
+    }
+}
+
+/// Eleven bytes: above the scrub floor, below the window this build once
+/// scanned with. A control character in it is what makes the stream go, and it
+/// has to do so regardless of how short the value is.
+#[cfg(unix)]
+#[test]
+fn a_short_secret_carrying_a_control_character_withholds_the_stream() {
+    let secret = "Qp7\u{1b}Lm2Rn4T";
+    assert_eq!(secret.len(), 11);
+    let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(dir.path(), "echo-validator", ECHO_SPEC_WITH_PROXY_ERROR);
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert_eq!(result.stdout, "");
+    assert!(
+        result.stderr.contains("not safely scrubbable"),
+        "{}",
+        result.stderr
+    );
+    assert!(!result.stderr.contains("Lm2Rn4T"), "{}", result.stderr);
+}
+
+/// The band the fragment window has to cover: a ten-byte credential the
+/// validator echoes only part of. There is no needle for a truncated copy, and
+/// nothing shorter than the scrub floor to fall back on, so the surviving run
+/// is what withholds the stream.
+#[cfg(unix)]
+#[test]
+fn a_short_secret_echoed_in_part_withholds_the_stream() {
+    let secret = "Qp7Lm2Rn4T";
+    assert_eq!(secret.len(), 10);
+    let fragment = &secret[1..];
+    let config = consumer_config(serde_json::json!({"keyauth": [{"key": secret}]}));
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(
+        dir.path(),
+        "truncating-validator",
+        &format!("#!/bin/sh\necho 'error: key ends with {fragment}'\nexit 1\n"),
+    );
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert_eq!(result.stdout, "");
+    assert!(!result.stderr.contains(fragment), "{}", result.stderr);
+    assert!(
+        result.stderr.contains("run of a resolved secret"),
         "the notice must name the reason: {}",
         result.stderr
     );
