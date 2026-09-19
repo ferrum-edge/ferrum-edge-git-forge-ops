@@ -454,10 +454,13 @@ impl AdminClient {
                 .map_err(|e| crate::error::Error::HttpClient(format!("GET /namespaces: {e}")))?;
             let total = page.pagination.as_ref().map(|p| p.total);
             let received = page.data.len();
-            accumulated += received;
+            accumulated = accumulated.checked_add(received).ok_or_else(|| {
+                crate::error::Error::HttpClient("GET /namespaces: row count overflow".to_string())
+            })?;
+            let next = next_page_offset(offset, received, LIST_PAGE_LIMIT, total, accumulated)?;
             pages.push(page.data);
 
-            match next_page_offset(offset, received, LIST_PAGE_LIMIT, total, accumulated) {
+            match next {
                 Some(next) => offset = next,
                 None => break,
             }
@@ -537,11 +540,28 @@ impl AdminClient {
         self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
             .await?;
 
-        // 201 `{"created": {...}}`. A gateway that answers 200 with no body is
-        // still a success — fall back to the counts we sent.
+        // Only a complete acknowledgement proves this create transaction landed.
+        // Keep the accepted 200 variant, but do not infer success from arbitrary
+        // 2xx statuses or substitute the request's counts for missing evidence.
+        if !matches!(resp.status, 200 | 201) {
+            return Err(crate::error::Error::AmbiguousMutation(format!(
+                "POST /batch returned unexpected success status {}; verify the committed rows",
+                resp.status
+            )));
+        }
         let created = serde_json::from_str::<BatchResponse>(&resp.body)
-            .map(|r| r.created)
-            .unwrap_or_else(|_| batch.counts());
+            .map_err(|_| {
+                crate::error::Error::AmbiguousMutation(
+                    "POST /batch returned missing or malformed created counts".to_string(),
+                )
+            })?
+            .created;
+        if created != batch.counts() {
+            return Err(crate::error::Error::AmbiguousMutation(format!(
+                "POST /batch created counts {created:?} do not match submitted counts {:?}",
+                batch.counts()
+            )));
+        }
         Ok(Some(created))
     }
 
@@ -1101,59 +1121,52 @@ pub struct Page<T> {
     pub pagination: Option<Pagination>,
 }
 
-/// Hard stop on how many rows a single paginated walk will accumulate.
-///
-/// Only reachable on the envelope-less path, where there is no `total` to
-/// bound the walk: a server that ignores `offset` and keeps answering full
-/// pages would otherwise loop forever. Far above any real namespace count.
+/// Bound raw rows, including duplicates, even when a server supplies a total.
+/// A server can ignore offsets and keep returning pages with a misleading total.
 const MAX_PAGINATED_ROWS: usize = 100_000;
 
 /// Offset of the next page, or `None` when the listing is complete.
 ///
-/// Terminates on an empty page, on a non-advancing offset, and — when the
-/// gateway sends a pagination envelope — once the accumulated count covers the
-/// reported total.
-///
-/// **Without an envelope** the walk continues while each page comes back
-/// exactly full (`received == limit`). A full page with no `total` to compare
-/// against is indistinguishable from a truncated listing, and stopping there
-/// silently dropped every namespace past the first page whenever a middlebox
-/// stripped the envelope or an older build omitted it. A short page ends the
-/// walk, as does [`MAX_PAGINATED_ROWS`].
+/// An empty page or a covered total completes the listing. Without an envelope,
+/// a short page completes it; a full page needs another request. Exceeding the
+/// row bound, reaching it without completion evidence, or overflowing the next
+/// offset is an error: callers must never mistake a safety stop for inventory.
 pub fn next_page_offset(
     requested_offset: i64,
     received: usize,
     limit: i64,
     total: Option<i64>,
     accumulated: usize,
-) -> Option<i64> {
-    if received == 0 {
-        return None;
+) -> crate::error::Result<Option<i64>> {
+    let limit_error = || {
+        crate::error::Error::HttpClient(format!(
+            "GET /namespaces: pagination safety limit of {MAX_PAGINATED_ROWS} rows reached before a complete inventory could be established"
+        ))
+    };
+    if accumulated > MAX_PAGINATED_ROWS {
+        return Err(limit_error());
     }
-    let next = requested_offset.saturating_add(received as i64);
-    if next <= requested_offset {
-        return None;
+    let complete = received == 0
+        || match total {
+            Some(total) => (accumulated as u128) >= total.max(0) as u128,
+            None => limit <= 0 || (received as u128) < limit as u128,
+        };
+    if complete {
+        return Ok(None);
     }
-    match total {
-        Some(total) => {
-            if accumulated as i64 >= total {
-                return None;
-            }
-            Some(next)
-        }
-        None => {
-            if accumulated >= MAX_PAGINATED_ROWS {
-                return None;
-            }
-            // A short page is the end of the listing; an exactly-full one means
-            // there is probably more behind it.
-            if limit > 0 && received as i64 >= limit {
-                Some(next)
-            } else {
-                None
-            }
-        }
+    if accumulated == MAX_PAGINATED_ROWS {
+        return Err(limit_error());
     }
+    let next = i64::try_from(received)
+        .ok()
+        .and_then(|received| requested_offset.checked_add(received))
+        .filter(|next| *next > requested_offset)
+        .ok_or_else(|| {
+            crate::error::Error::HttpClient(
+                "GET /namespaces: pagination offset overflow; inventory is incomplete".to_string(),
+            )
+        })?;
+    Ok(Some(next))
 }
 
 /// Flatten paged results, dropping duplicates while preserving first-seen
@@ -1666,13 +1679,9 @@ pub struct BatchCreate {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 pub struct BatchCreated {
-    #[serde(default)]
     pub proxies: usize,
-    #[serde(default)]
     pub consumers: usize,
-    #[serde(default)]
     pub plugin_configs: usize,
-    #[serde(default)]
     pub upstreams: usize,
 }
 
@@ -1684,7 +1693,6 @@ impl BatchCreated {
 
 #[derive(Debug, Deserialize)]
 struct BatchResponse {
-    #[serde(default)]
     created: BatchCreated,
 }
 

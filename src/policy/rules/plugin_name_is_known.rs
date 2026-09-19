@@ -1,10 +1,7 @@
 use crate::config::GatewayConfig;
-use crate::plugin_catalog::{
-    is_builtin, is_reserved, is_retired, retired_replacement, RetiredRemediation,
-    RETIRED_PLUGIN_NAMES,
-};
+use crate::plugin_catalog::{is_builtin, is_reserved, is_retired};
 use crate::policy::config::PluginNameIsKnownRuleConfig;
-use crate::policy::{PolicyCheck, PolicyFinding, Severity};
+use crate::policy::{PolicyCheck, PolicyFinding};
 
 pub struct PluginNameIsKnownRule {
     config: PluginNameIsKnownRuleConfig,
@@ -37,53 +34,10 @@ impl PolicyCheck for PluginNameIsKnownRule {
         for plugin in &cfg.plugin_configs {
             let name = plugin.plugin_name.as_str();
 
-            // Retired and reserved names are load errors at the gateway, so
-            // they are reported at `error` regardless of configured severity —
-            // and regardless of `enabled`, because the name alone is fatal.
-            if is_retired(name) {
-                findings.push(PolicyFinding {
-                    rule_id: self.rule_id().to_string(),
-                    severity: Severity::Error,
-                    kind: "PluginConfig".to_string(),
-                    id: plugin.id.clone(),
-                    namespace: plugin.namespace.clone(),
-                    message: format!(
-                        "plugin {} in namespace {} uses plugin_name: {name}, which was retired ({}); the gateway fails to load a config that mentions it",
-                        plugin.id,
-                        plugin.namespace,
-                        RETIRED_PLUGIN_NAMES.join(", ")
-                    ),
-                    remediation: Some(match retired_replacement(name) {
-                        RetiredRemediation::ReplaceWith(successors) => {
-                            format!("Replace with {}", successors.join(" or "))
-                        }
-                        RetiredRemediation::RenamedTo(successor) => {
-                            format!("Rename to {successor}")
-                        }
-                        RetiredRemediation::Remove => "Remove this plugin config".to_string(),
-                    }),
-                    overridden_by: None,
-                });
-                continue;
-            }
-
-            if is_reserved(name) {
-                findings.push(PolicyFinding {
-                    rule_id: self.rule_id().to_string(),
-                    severity: Severity::Error,
-                    kind: "PluginConfig".to_string(),
-                    id: plugin.id.clone(),
-                    namespace: plugin.namespace.clone(),
-                    message: format!(
-                        "plugin {} in namespace {} uses plugin_name: {name}, which is reserved for mesh auto-injection and must not be configured by hand",
-                        plugin.id, plugin.namespace
-                    ),
-                    remediation: Some(
-                        "Delete this plugin config; the mesh data plane injects it when the topology requires it"
-                            .to_string(),
-                    ),
-                    overridden_by: None,
-                });
+            // The always-on security audit owns these admission errors, even
+            // for disabled instances/rules. Do not duplicate them as policy
+            // findings or let an extra-name allowlist downgrade them.
+            if is_retired(name) || is_reserved(name) {
                 continue;
             }
 

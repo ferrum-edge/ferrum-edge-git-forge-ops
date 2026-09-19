@@ -284,55 +284,129 @@ async fn admin_client_rejects_ids_over_the_length_limit() {
 
 #[test]
 fn next_page_offset_advances_until_the_total_is_covered() {
-    // 250 namespaces, page size 100: offsets 0 → 100 → 200 → done.
-    assert_eq!(next_page_offset(0, 100, 100, Some(250), 100), Some(100));
-    assert_eq!(next_page_offset(100, 100, 100, Some(250), 200), Some(200));
-    assert_eq!(next_page_offset(200, 50, 100, Some(250), 250), None);
-}
-
-#[test]
-fn next_page_offset_stops_on_an_empty_page() {
-    // Guards against a server that ignores `offset` and would otherwise loop
-    // forever returning the same (or no) rows.
-    assert_eq!(next_page_offset(0, 0, 100, Some(500), 0), None);
-}
-
-#[test]
-fn next_page_offset_continues_a_full_page_without_a_pagination_envelope() {
-    // No `pagination` key at all (an older gateway, or a middlebox that
-    // rewrote the body). An exactly-full page is indistinguishable from a
-    // truncated listing, so the walk continues — stopping here silently
-    // dropped every namespace past the first page.
-    assert_eq!(next_page_offset(0, 100, 100, None, 100), Some(100));
-    assert_eq!(next_page_offset(100, 100, 100, None, 200), Some(200));
-}
-
-#[test]
-fn next_page_offset_stops_on_a_short_page_without_an_envelope() {
-    // Fewer rows than the limit means the server had nothing more to give.
-    assert_eq!(next_page_offset(0, 12, 100, None, 12), None);
-    assert_eq!(next_page_offset(100, 99, 100, None, 199), None);
-}
-
-#[test]
-fn next_page_offset_envelope_less_walk_is_bounded() {
-    // A server that ignores `offset` answers full pages forever; the walk must
-    // still terminate rather than spinning until the CI job is killed.
-    assert_eq!(next_page_offset(100_000, 100, 100, None, 100_000), None);
-}
-
-#[test]
-fn next_page_offset_stops_when_accumulated_exceeds_total() {
-    assert_eq!(next_page_offset(0, 100, 100, Some(80), 100), None);
-}
-
-#[test]
-fn next_page_offset_stops_on_a_non_advancing_offset() {
-    // saturating_add at i64::MAX cannot move forward; refuse rather than
-    // re-request the same page forever.
     assert_eq!(
-        next_page_offset(i64::MAX, 100, 100, Some(i64::MAX), 1),
+        next_page_offset(0, 100, 100, Some(250), 100).unwrap(),
+        Some(100)
+    );
+    assert_eq!(
+        next_page_offset(100, 100, 100, Some(250), 200).unwrap(),
+        Some(200)
+    );
+    assert_eq!(next_page_offset(200, 50, 100, Some(250), 250).unwrap(), None);
+    assert_eq!(next_page_offset(0, 100, 100, Some(80), 100).unwrap(), None);
+    assert_eq!(next_page_offset(0, 0, 100, Some(500), 0).unwrap(), None);
+}
+
+#[test]
+fn next_page_offset_without_envelope_requires_a_short_page() {
+    assert_eq!(next_page_offset(0, 100, 100, None, 100).unwrap(), Some(100));
+    assert_eq!(next_page_offset(100, 100, 100, None, 200).unwrap(), Some(200));
+    assert_eq!(next_page_offset(0, 12, 100, None, 12).unwrap(), None);
+    assert_eq!(next_page_offset(100, 99, 100, None, 199).unwrap(), None);
+}
+
+#[test]
+fn next_page_offset_cap_requires_completion_evidence_with_or_without_total() {
+    for total in [None, Some(9_000_000_000), Some(i64::MAX)] {
+        assert_eq!(
+            next_page_offset(99_800, 100, 100, total, 99_900).unwrap(),
+            Some(99_900)
+        );
+        let error = next_page_offset(99_900, 100, 100, total, 100_000).unwrap_err();
+        assert!(error.to_string().contains("pagination safety limit"));
+    }
+    assert_eq!(
+        next_page_offset(99_900, 100, 100, Some(100_000), 100_000).unwrap(),
         None
+    );
+    assert_eq!(next_page_offset(99_901, 99, 100, None, 100_000).unwrap(), None);
+    // A misleading small total cannot excuse an oversized page either.
+    assert!(next_page_offset(0, 100_001, 100, Some(1), 100_001).is_err());
+    assert!(next_page_offset(0, usize::MAX, 100, None, usize::MAX).is_err());
+}
+
+#[test]
+fn next_page_offset_overflow_is_an_error_not_a_complete_inventory() {
+    for offset in [i64::MAX, i64::MAX - 50] {
+        let error = next_page_offset(offset, 100, 100, Some(i64::MAX), 100).unwrap_err();
+        assert!(error.to_string().contains("offset overflow"));
+    }
+}
+
+#[tokio::test]
+async fn namespace_walk_repeated_pages_is_bounded_before_deduplication_and_import() {
+    for total in [None, Some(9_000_000_000_i64)] {
+        // Two deliberately oversized pages exercise the actual production cap
+        // without 100,000 requests or a test-only runtime limit override.
+        let mut body = serde_json::json!({"data": vec!["same"; 50_000]});
+        if let Some(total) = total {
+            body["pagination"] = serde_json::json!({"total": total});
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for offset in [0, 50_000] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request
+                    .starts_with(&format!("GET /namespaces?offset={offset}&limit=1000 ")));
+                let body = body.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        // This public caller must propagate the listing failure before creating
+        // files or asking for any backup. Diff/plan use the same listing only
+        // as an optional diagnostic, and receive no partial namespace vector.
+        let error = gitforgeops::import::from_api::import_from_api(
+            &client,
+            output.path(),
+            None,
+            None,
+            &gitforgeops::import::ImportPassthroughPolicy::strict(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("pagination safety limit"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+        server.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn namespace_walk_completes_and_deduplicates_ordinary_pages() {
+    let url = spawn_stub_gateway(vec![
+        (
+            "GET /namespaces?offset=0&limit=1000 ",
+            200,
+            r#"{"data":["alpha","beta"],"pagination":{"total":4}}"#,
+        ),
+        (
+            "GET /namespaces?offset=2&limit=1000 ",
+            200,
+            r#"{"data":["beta","gamma"],"pagination":{"total":4}}"#,
+        ),
+    ]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    assert_eq!(
+        client.list_namespaces().await.unwrap(),
+        vec!["alpha", "beta", "gamma"]
     );
 }
 

@@ -655,3 +655,20 @@ fn duplicate_chargeback_instances_are_flagged() {
     };
     assert!(!bp_any(&merged, "effective api_chargeback instances"));
 }
+
+#[test]
+fn reserved_names_block_even_disabled_instances_and_preserve_security_overrides() {
+    for name in gitforgeops::plugin_catalog::RESERVED_PLUGIN_NAMES {
+        for enabled in [false, true] {
+            let mut reserved = plugin("reserved", name, serde_json::json!({}));
+            reserved.enabled = enabled;
+            let cfg = plugins_only(vec![reserved]);
+            let findings = audit_security_with_policy(&cfg, Some(&PolicyConfig::default()));
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, "error");
+            assert!(findings[0].message.contains("reserved plugin_name"));
+            assert!(gitforgeops::verdict::security_blocker(&findings, false).is_some());
+            assert!(gitforgeops::verdict::security_blocker(&findings, true).is_none());
+        }
+    }
+}
