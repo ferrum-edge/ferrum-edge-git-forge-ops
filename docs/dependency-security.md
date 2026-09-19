@@ -2,7 +2,25 @@
 
 The `Security` workflow runs `cargo audit` through
 `.github/scripts/check_cargo_audit.py` on every pull request, on pushes to
-`main` that touch build inputs, and on the weekly schedule.
+`main` that touch build inputs or security policy inputs, and on the weekly
+schedule. The push filter explicitly includes `.github/cargo-audit-policy.json`,
+`.github/ferrum-edge-checksums.txt`, and `.github/CODEOWNERS`; the supply-chain
+checker rejects removal or exclusion of those paths. This runs policy checks
+after a policy-only merge; validator compatibility remains a PR/canary check.
+
+CI installs the existing cargo-audit **0.22.1** via
+`taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af`, with
+`checksum: true` and `fallback: none`. The action pin fixes the installer code.
+Separately, its [committed cargo-audit manifest](https://github.com/taiki-e/install-action/blob/9534c84618278caac52cb373bb164ed464dbd8af/manifests/cargo-audit.json)
+records the 0.22.1 Linux x86-64 archive SHA-256
+`c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab`;
+the [installer](https://github.com/taiki-e/install-action/blob/9534c84618278caac52cb373bb164ed464dbd8af/main.sh)
+verifies that digest before extraction. The action SHA alone does not establish
+the contents or immutability of an external release asset. Disabling fallback
+refuses unsupported versions/platforms instead of installing from the registry.
+The job always installs the tool and no longer restores its former Cargo cache,
+which included executables under `~/.cargo/bin`. Policy regressions enforce the
+install method, version, checksum/fallback inputs, and absence of that cache.
 
 ## CI trust boundary
 
@@ -65,9 +83,9 @@ ignore from silently covering a different version or surviving its reason.
 
 **An expired exception blocks everything, not just the weekly job.** The
 deadline check runs on every pull request, every push to `main` that touches
-build inputs, and the scheduled run. From the day after `review_by`, the
-`Security / cargo-audit` job fails repo-wide until the entry is re-reviewed or
-removed. To make that arrival visible in advance, the gate emits a
+build or security policy inputs, and the scheduled run. From the day after
+`review_by`, the `Security / cargo-audit` job fails repo-wide until the entry is
+re-reviewed or removed. To make that arrival visible in advance, the gate emits a
 `::warning::` annotation (exit code unchanged) for any exception whose
 `review_by` is 21 days out or nearer.
 

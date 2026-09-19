@@ -61,6 +61,12 @@ ADMIN_API_WORKFLOWS = (
 )
 STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
+CARGO_AUDIT_ACTION = "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af"
+SECURITY_PUSH_POLICY_PATHS = (
+    ".github/cargo-audit-policy.json",
+    ".github/ferrum-edge-checksums.txt",
+    ".github/CODEOWNERS",
+)
 # The administration-read settings-audit token lives in its own environment, so
 # a dispatch from an unprotected ref cannot receive it. Kept in step with
 # audit_settings.SETTINGS_AUDIT_ENVIRONMENT and bootstrap_repo_settings.py.
@@ -645,6 +651,152 @@ def untrusted_pr_installer_violations(text: str) -> list[str]:
     return violations
 
 
+def workflow_job(text: str, job: str) -> str:
+    """Read one conventionally indented job; duplicate/missing jobs fail closed."""
+    matches = list(re.finditer(rf"^  {re.escape(job)}:\n", text, re.MULTILINE))
+    if len(matches) != 1:
+        return ""
+    return re.split(
+        r"^  \S|^\S", text[matches[0].end():], maxsplit=1, flags=re.MULTILINE
+    )[0]
+
+
+def policy_step(job: str, name: str) -> list[str]:
+    """Require one real step, excluding comments and adjacent unnamed steps.
+
+    These security steps intentionally have a narrow, reviewed shape. Exact
+    lines prevent a commented invocation, conditional, alternate shell, early
+    exit or swallowed failure from satisfying the executable contract.
+    """
+    steps = [
+        step
+        for step in re.split(r"^      - ", job, flags=re.MULTILINE)[1:]
+        if step.startswith(f"name: {name}\n")
+    ]
+    if len(steps) != 1:
+        return []
+    return [
+        line.split("#", 1)[0].rstrip()
+        for line in steps[0].splitlines()
+        if line.split("#", 1)[0].strip()
+    ]
+
+
+def trusted_validator_probe_violations(text: str) -> list[str]:
+    """Candidate digests must pass trusted code AND its script-relative fixture."""
+    violations: list[str] = []
+    for job_name, checkout_name, install_name in (
+        (
+            "validate",
+            "Check out trusted validator installer",
+            "Download verified ferrum-edge binary",
+        ),
+        (
+            "validator-pairing",
+            "Check out trusted pairing installer",
+            "Download pairing validator",
+        ),
+    ):
+        job = workflow_job(text, job_name)
+        prefix = f"validate-pr.yml: {job_name}"
+        checkout = policy_step(job, checkout_name)
+        if (
+            len(checkout) != 6
+            or not checkout[1].startswith("        uses: actions/checkout@")
+            or checkout[2:] != [
+                "        with:",
+                "          ref: ${{ github.event.repository.default_branch }}",
+                "          path: trusted-validator",
+                "          persist-credentials: false",
+            ]
+        ):
+            violations.append(
+                f"{prefix} requires an unconditional protected default-branch checkout"
+            )
+        install = policy_step(job, install_name)
+        if install != [
+            f"name: {install_name}",
+            "        env:",
+            "          GITHUB_TOKEN: ${{ github.token }}",
+            "        run: |",
+            "          bash trusted-validator/.github/scripts/install-ferrum-edge.sh \\",
+            '            "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge" \\',
+            "            .github/ferrum-edge-checksums.txt",
+        ]:
+            violations.append(
+                f"{prefix} must install with trusted code and the candidate allowlist"
+            )
+        probe_name = "Require resource-label compatibility"
+        if policy_step(job, probe_name) != [
+            f"name: {probe_name}",
+            "        run: |",
+            "          bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \\",
+            '            "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge"',
+        ]:
+            violations.append(
+                f"{prefix} must run the trusted resource-label probe without a bypass or token"
+            )
+        if not (
+            0 <= job.find(f"- name: {checkout_name}")
+            < job.find(f"- name: {install_name}")
+            < job.find(f"- name: {probe_name}")
+        ):
+            violations.append(f"{prefix} must check out, install, then probe the validator")
+    return violations
+
+
+def cargo_audit_install_violations(text: str) -> list[str]:
+    """Pin the installer and manifest-backed tool; never restore an executable."""
+    job = workflow_job(text, "security-cargo-audit")
+    violations: list[str] = []
+    if policy_step(job, "Install cargo-audit") != [
+        "name: Install cargo-audit",
+        f"        uses: {CARGO_AUDIT_ACTION}",
+        "        with:",
+        "          tool: cargo-audit@0.22.1",
+        "          checksum: true",
+        "          fallback: none",
+    ]:
+        violations.append(
+            "security.yml: cargo-audit 0.22.1 must use the reviewed install-action "
+            "with checksums, no fallback, and no conditional or failure bypass"
+        )
+    if any("cache" in reference.lower() for reference in USES.findall(job)):
+        violations.append("security.yml: cargo-audit must not restore the old executable cache")
+    if re.search(r"\bcargo\s+(?:install|binstall)\b", job):
+        violations.append("security.yml: cargo-audit must not use a registry install fallback")
+    if not (
+        0 <= job.find("- name: Install cargo-audit")
+        < job.find("- name: Enforce cargo audit policy")
+    ):
+        violations.append("security.yml: install cargo-audit before enforcing its policy")
+    return violations
+
+
+def security_push_trigger_violations(text: str) -> list[str]:
+    """Keep post-merge checks for policy-only changes, independently of PRs."""
+    match = re.search(r"^  push:\n((?:^    .*\n)*)", text, re.MULTILINE)
+    if match is None:
+        return ["security.yml: push trigger is missing"]
+    body = match.group(1)
+    violations: list[str] = []
+    if "    branches: [main]\n" not in body:
+        violations.append("security.yml: push trigger must target protected main")
+    paths = re.search(r"^    paths:\n((?:^      - .*\n)*)", body, re.MULTILINE)
+    entries = (
+        [] if paths is None else [
+            line[8:].split("#", 1)[0].strip().strip("'\"")
+            for line in paths.group(1).splitlines()
+        ]
+    )
+    for path in SECURITY_PUSH_POLICY_PATHS:
+        if path not in entries:
+            violations.append(f"security.yml: push paths must explicitly include {path}")
+    if "paths-ignore:" in body or any(entry.startswith("!") for entry in entries):
+        violations.append("security.yml: push paths must not exclude policy inputs")
+    return violations
+
+
 def allowlisted_validator_digests(text: str) -> list[str]:
     """Return every approved validator digest, in file order."""
     digests: list[str] = []
@@ -1186,6 +1338,8 @@ def main(argv: list[str] | None = None) -> int:
     security_workflow = (workflows / "security.yml").read_text(encoding="utf-8")
     violations.extend(trusted_supply_chain_policy_violations(security_workflow))
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
+    violations.extend(cargo_audit_install_violations(security_workflow))
+    violations.extend(security_push_trigger_violations(security_workflow))
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     if 'result=$(python3 "$helper"' not in state_guard:
         violations.append(
@@ -1205,6 +1359,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     static_review = (workflows / "validate-pr.yml").read_text(encoding="utf-8")
+    violations.extend(trusted_validator_probe_violations(static_review))
     if re.search(r"^ {4}environment\s*:", static_review, re.MULTILINE):
         violations.append("validate-pr.yml: PR-built code must not bind an Environment")
     # Match the whole `secrets` context, not just `secrets.NAME` /
