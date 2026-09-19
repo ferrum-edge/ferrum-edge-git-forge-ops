@@ -3127,25 +3127,60 @@ fn named_plugin_config(name: &str) -> GatewayConfig {
 }
 
 #[test]
-fn plugin_name_is_known_errors_on_retired_names() {
-    for name in ["oauth2_auth", "semantic_ai_firewall"] {
-        let cfg = named_plugin_config(name);
-        let findings = evaluate_policies(&cfg, &known_name_policies(vec![]));
-        assert_eq!(findings.len(), 1, "for {name}");
-        // Severity is forced to error even though the rule is configured at
-        // warning: the gateway will not load the config at all.
-        assert_eq!(findings[0].severity, Severity::Error);
-        assert!(findings[0].message.contains("retired"));
+fn plugin_name_admission_errors_are_reported_once_by_security_for_every_policy_configuration() {
+    use gitforgeops::diff::{audit_security_with_policy, security_blockers};
+    use gitforgeops::plugin_catalog::{RESERVED_PLUGIN_NAMES, RETIRED_PLUGIN_NAMES};
+
+    for name in RETIRED_PLUGIN_NAMES.iter().chain(RESERVED_PLUGIN_NAMES) {
+        for enabled in [false, true] {
+            let mut cfg = named_plugin_config(name);
+            cfg.plugin_configs[0].enabled = enabled;
+            for rule_enabled in [false, true] {
+                for severity in [Severity::Info, Severity::Warning, Severity::Error] {
+                    let mut policy = known_name_policies(vec![name.to_string()]);
+                    policy.policies.plugin_name_is_known.enabled = rule_enabled;
+                    policy.policies.plugin_name_is_known.severity = severity;
+                    let security = audit_security_with_policy(&cfg, Some(&policy));
+                    assert_eq!(security.len(), 1, "{name}");
+                    assert_eq!(security_blockers(&security).len(), 1, "{name}");
+                    assert!(
+                        evaluate_policies(&cfg, &policy).is_empty(),
+                        "no duplicate {name}"
+                    );
+                }
+            }
+            let security = audit_security_with_policy(&cfg, Some(&PolicyConfig::default()));
+            assert_eq!(
+                security_blockers(&security).len(),
+                1,
+                "default policy: {name}"
+            );
+            assert!(evaluate_policies(&cfg, &PolicyConfig::default()).is_empty());
+        }
     }
 }
 
 #[test]
-fn plugin_name_is_known_errors_on_the_reserved_mesh_plugin() {
-    let cfg = named_plugin_config("__mesh_bpf_metrics");
-    let findings = evaluate_policies(&cfg, &known_name_policies(vec![]));
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].severity, Severity::Error);
-    assert!(findings[0].message.contains("reserved"));
+fn unknown_custom_plugin_names_keep_opt_in_severity_and_allowlist_behavior() {
+    for enabled in [false, true] {
+        let mut cfg = named_plugin_config("company_sso");
+        cfg.plugin_configs[0].enabled = enabled;
+        assert!(evaluate_policies(&cfg, &PolicyConfig::default()).is_empty());
+        for severity in [Severity::Info, Severity::Warning, Severity::Error] {
+            let mut policy = known_name_policies(vec![]);
+            policy.policies.plugin_name_is_known.severity = severity;
+            let findings = evaluate_policies(&cfg, &policy);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, severity);
+            assert_eq!(findings[0].is_blocking(), severity == Severity::Error);
+            policy
+                .policies
+                .plugin_name_is_known
+                .allowed_extra_plugin_names
+                .push("COMPANY_SSO".into());
+            assert!(evaluate_policies(&cfg, &policy).is_empty());
+        }
+    }
 }
 
 #[test]

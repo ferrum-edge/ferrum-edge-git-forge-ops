@@ -1832,3 +1832,37 @@ fn review_fail_on_blockers_covers_missing_required_slots() {
         stdout(&flagged)
     );
 }
+
+#[test]
+fn reserved_plugin_names_block_public_preview_and_apply_with_default_disabled_policy() {
+    for enabled in [false, true] {
+        for rule_enabled in [false, true] {
+            let plugin = format!(
+                "kind: PluginConfig\nspec:\n  id: reserved\n  plugin_name: __mesh_bpf_metrics\n  scope: global\n  enabled: {enabled}\n  config: {{}}\n"
+            );
+            let policy = format!(
+                "version: 1\npolicies:\n  plugin_name_is_known:\n    enabled: {rule_enabled}\n    severity: warning\n    allowed_extra_plugin_names: [__mesh_bpf_metrics]\n"
+            );
+            let mut files = vec![("resources/ferrum/plugins/reserved.yaml", plugin.as_str())];
+            if rule_enabled {
+                files.push((".gitforgeops/policies.yaml", policy.as_str()));
+            }
+            let repo = Repo::with_files(&files);
+            for args in [
+                vec!["plan"],
+                vec!["review", "--fail-on-blockers"],
+                vec!["apply", "--auto-approve"],
+            ] {
+                let output = repo.run(&args, &[]);
+                let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
+                assert_eq!(output.status.code(), Some(1), "{args:?}: {diagnostic}");
+                assert!(diagnostic.contains("reserved plugin_name"), "{diagnostic}");
+                assert!(!repo.published().exists());
+                assert!(!repo.dir.path().join(".state/default.json").exists());
+            }
+            let review = repo.run(&["review"], &[]);
+            assert!(review.status.success());
+            assert!(stdout(&review).contains("Apply is blocked"));
+        }
+    }
+}

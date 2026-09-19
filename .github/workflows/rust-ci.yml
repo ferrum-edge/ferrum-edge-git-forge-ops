@@ -133,7 +133,9 @@ jobs:
 
       - name: cargo test
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
-        run: cargo test --test unit_tests
+        run: |
+          cargo test --test unit_tests
+          cargo test --lib prepared_apply_tests::missing_prepared_restore_preserves_completed_namespace_and_failed_verdict
 
   coverage:
     runs-on: ubuntu-24.04

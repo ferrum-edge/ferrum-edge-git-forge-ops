@@ -827,7 +827,7 @@ overrides:
 - `waf_enforcement` catches a `waf` plugin that is attached but not blocking: `mode` other than `enforce`, a rule pack left entirely at `monitor`, or `on_body_too_large: skip`. Optional `min_paranoia_level` (gateway accepts 1–4, defaults to 1).
 - `require_ai_guardrails` requires a proxy carrying AI traffic (any `ai_*` plugin, `mcp_gateway`, or `a2a_gateway`) to also carry an *enforcing* content guardrail — not a dry-run or warn-only one.
 - `rate_limit_completeness` catches rate limiters with no usable budget: `rate_limiting` with missing/empty `limits`, no `scope: default` entry, or an entry with neither a window+`max_requests` nor `requests_per_*`; `ai_rate_limiter` with no `token_limit`; `redis_failure_policy: local_fallback` on either. It also flags the removed top-level budget fields, which the current gateway rejects outright.
-- `plugin_name_is_known` checks `plugin_name` against the gateway's 82 built-ins plus `allowed_extra_plugin_names`. Retired names (`oauth2_auth`, `semantic_ai_firewall`) and the reserved `__mesh_bpf_metrics` always report at `error` regardless of configured severity — the gateway refuses to load a config that mentions them. Note that `jwt`, `oauth2`, and `oidc` are *not* plugin names; `jwt_auth`, `oauth2_introspection`, and `oidc_relying_party` are.
+- `plugin_name_is_known` is an opt-in check of `plugin_name` against the gateway's 82 built-ins plus `allowed_extra_plugin_names`, using the configured severity for unknown custom names. The always-on security audit rejects catalog-retired names (`oauth2_auth`, `semantic_ai_firewall`) and catalog-reserved names (`__mesh_bpf_metrics`) at `error`, even when the policy rule or plugin instance is disabled. Extra-name allowlists cannot admit these names; the rule leaves them to the audit so they are reported once. Reserved plugins belong to mesh auto-injection, not repository configuration. The existing authorized security override still applies. Note that `jwt`, `oauth2`, and `oidc` are *not* plugin names; `jwt_auth`, `oauth2_introspection`, and `oidc_relying_party` are.
 - `priority_override_range` checks `priority_override` against the gateway's accepted `0..=10000`.
 
 ### Override flow (B2: label + permission)
@@ -1262,7 +1262,7 @@ Practical limits you should know about:
 There's no hard limit in `gitforgeops` on how many resources a single PR can add, modify, or delete. The loader streams one file at a time, the assembler flattens into a `GatewayConfig` in memory (tens of MB even at tens of thousands of resources), and apply runs per namespace.
 
 - **Sequential per-resource HTTP calls in incremental mode.** One PUT / DELETE / POST per changed resource. At ~100 ms round-trip per call, 1,000 changes take roughly 2 minutes. 10,000 changes would take ~20 minutes but are not fundamentally problematic. A namespace whose diff is pure adds skips this entirely via the `POST /batch` fast path (see [Apply ordering and the batch fast path](#apply-ordering-and-the-batch-fast-path)).
-- **Full-replace mode is one HTTP call per namespace.** `FERRUM_APPLY_STRATEGY=full_replace` prebuilds and validates every namespace payload before the first mutation, then calls `POST /restore?confirm=true` once per namespace in scope. The `/restore` call is atomic for one namespace, but **atomicity does not extend across namespaces** — a runtime failure on `beta` after `alpha` succeeds leaves `alpha` replaced. Deterministic errors in any namespace, including unsupported backup sections and malformed/spec-owned graphs, now yield zero restore calls. Runtime failures still require manual reconciliation. For strict environment-wide atomicity, scope `full_replace` to a single namespace.
+- **Full-replace mode is one HTTP call per namespace.** `FERRUM_APPLY_STRATEGY=full_replace` prebuilds and validates every namespace payload before the first mutation, then calls `POST /restore?confirm=true` once per namespace in scope. The `/restore` call is atomic for one namespace, but **atomicity does not extend across namespaces** — a runtime failure on `beta` after `alpha` succeeds leaves `alpha` replaced. Deterministic errors in any namespace, including unsupported backup sections and malformed/spec-owned graphs, now yield zero restore calls. Runtime failures still require manual reconciliation. Completed namespaces retain their ledger results even if a later namespace hits an internal missing-payload invariant: the run stops with a fatal error, persists earlier successes, and does not stamp the whole commit as applied. For strict environment-wide atomicity, scope `full_replace` to a single namespace.
 - **Namespaces apply independently.** `apply_api` iterates `split_config_by_namespace` and applies each namespace in turn. A failure applying to `team-alpha` doesn't abort `team-beta` — you get per-namespace error reporting via `ApplyResult`.
 
 ### Retry behavior
@@ -1299,6 +1299,14 @@ Some failures get their own error rather than a generic HTTP one:
 
 **Partial-failure visibility** (incremental mode): errors are collected per resource rather than bailing on first failure. A run where 99 of 100 adds/updates apply cleanly but 1 hits a 400 returns an `ApplyResult` with 99 successes and 1 error; all planned deletes in the failed write's namespace are deferred and counted separately. CLI exits non-zero; you see exactly which resource failed and why. Read-only refusals, stale views, and restore-rollback damage are the exceptions — they are fatal for the whole run, because continuing to the next namespace is pointless or unsafe.
 
+Namespace discovery counts every received row, including repeats, toward a
+100,000-row safety bound even when the gateway advertises a larger total.
+Reaching the bound without evidence of completion, exceeding it, or overflowing
+the next offset returns an error instead of a truncated inventory. A complete
+listing exactly at the bound is accepted. Import propagates discovery failures
+before writing files; diff and plan use discovery only for their optional
+empty-filter diagnostic and do not install a partial namespace list.
+
 ### Apply ordering and the batch fast path
 
 Incremental apply sorts the diff into dependency order rather than by kind, because the gateway enforces referential integrity:
@@ -1321,6 +1329,17 @@ This preserves an incumbent when a replacement fails, but does **not** make a re
 Proxy deletes are issued with `cleanup_orphaned_upstream=false`. That server-side cascade defaults to on and would delete the last-referenced hand-owned upstream along with the proxy — an invisible deletion that makes the next diff-driven `DELETE /upstreams/{id}` answer 404. gitforgeops owns the upstream lifecycle through its own diff and issues that delete itself.
 
 When a namespace's diff is **pure adds**, apply takes `POST /batch` instead — transactional, all-or-nothing calls chunked below the gateway's 1 MiB body cap. Associated proxy/plugin create groups stay in one chunk, with deterministic grouping across reordered input. A 501 or definitive validation rejection permits independent per-resource creates. By default, a new proxy and its new scoped plugins require a successful transaction; an unsupported or oversized cycle is reported without publishing a partially configured proxy. Mixed namespaces use create batches only for those cycles, after independent writes.
+
+A batch is acknowledged only by HTTP 200/201 with a complete `created` object
+whose `proxies`, `consumers`, `plugin_configs`, and `upstreams` counts each match
+the submitted chunk, including zero counts. Missing, malformed, short, extra,
+or wrong-kind counts and other 2xx statuses (including 207) are ambiguous. They
+use the same authoritative, non-cached readback and ownership PUTs described
+above; the POST is never replayed and no ownership is inferred from the request
+itself. Exact readback still requires successful ownership assertions; absent
+rows leave a failed chunk, while partial/different or unverifiable rows stop the
+run. Earlier successful operations remain recordable, and failed create cycles
+retain the namespace's planned deletes.
 
 Use a transaction-capable gateway for atomic creation. On gateways that return
 **501 or 413**, `gitforgeops apply --allow-nontransactional-plugin-attach` (or

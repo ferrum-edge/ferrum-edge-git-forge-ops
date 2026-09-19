@@ -1980,7 +1980,7 @@ async fn a_spec_owned_conflict_blocks_only_the_conflicting_namespace() {
         (
             "POST /batch".into(),
             200,
-            r#"{"created":{"upstreams":1}}"#.into(),
+            r#"{"created":{"upstreams":1,"consumers":0,"proxies":0,"plugin_configs":0}}"#.into(),
             vec![],
         ),
     ]);
@@ -2585,7 +2585,8 @@ async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespace
             let (url, requests) = spawn_recording_gateway(vec![(
                 "POST /batch".into(),
                 batch_status,
-                r#"{"created":{"proxies":1,"plugin_configs":1}}"#.into(),
+                r#"{"created":{"proxies":1,"plugin_configs":1,"consumers":0,"upstreams":0}}"#
+                    .into(),
                 vec![],
             )]);
             let result = apply_api(
@@ -3005,7 +3006,12 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     assert!(
         incremental_plugin_attach_notice(&ApplyStrategy::FullReplace, &diffs, &desired).is_none()
     );
-    let (url, requests) = spawn_recording_gateway(vec![]);
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "POST /batch".into(),
+        200,
+        r#"{"created":{"proxies":1,"plugin_configs":1,"consumers":0,"upstreams":0}}"#.into(),
+        vec![],
+    )]);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -3017,7 +3023,10 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     )
     .await
     .unwrap();
-    assert!(result.errors.is_empty());
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    assert_eq!(result.created, 3);
+    assert_eq!(result.updated, 1);
     assert_eq!(
         mutation_lines(&requests),
         vec![
@@ -4027,4 +4036,253 @@ fn adoption_summary_line_is_silent_when_nothing_was_adopted() {
         adoption_summary_line(3).as_deref(),
         Some("Adopted 3 already-matching resource(s) into the ledger")
     );
+}
+
+#[tokio::test]
+async fn batch_acknowledgement_requires_matching_counts_and_a_commit_status() {
+    let exact = r#"{"created":{"proxies":0,"consumers":0,"plugin_configs":0,"upstreams":1}}"#;
+    let cases = [
+        (200, exact, true),
+        (201, exact, true),
+        (202, exact, false),
+        (204, "", false),
+        (206, exact, false),
+        (207, exact, false),
+        (299, exact, false),
+        (200, "", false),
+        (201, "not-json", false),
+        (201, "{}", false),
+        (201, r#"{"created":{}}"#, false),
+        (201, r#"{"created":{"upstreams":1}}"#, false),
+        (
+            201,
+            r#"{"created":{"proxies":0,"consumers":0,"plugin_configs":0,"upstreams":0}}"#,
+            false,
+        ),
+        (
+            201,
+            r#"{"created":{"proxies":0,"consumers":0,"plugin_configs":0,"upstreams":2}}"#,
+            false,
+        ),
+        // The total is correct but the kind is wrong.
+        (
+            201,
+            r#"{"created":{"proxies":1,"consumers":0,"plugin_configs":0,"upstreams":0}}"#,
+            false,
+        ),
+        (
+            201,
+            r#"{"created":{"proxies":0,"consumers":0,"plugin_configs":0,"upstreams":"1"}}"#,
+            false,
+        ),
+        (
+            201,
+            r#"{"created":{"proxies":0,"consumers":0,"plugin_configs":0,"upstreams":-1}}"#,
+            false,
+        ),
+        (
+            201,
+            r#"{"created":{"proxies":0,"consumers":0,"plugin_configs":0,"upstreams":1.5}}"#,
+            false,
+        ),
+        (201, r#"{"created":null}"#, false),
+    ];
+    for (status, body, acknowledged) in cases {
+        let desired = GatewayConfig {
+            upstreams: vec![upstream("u1", "team-alpha")],
+            ..Default::default()
+        };
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("POST /batch".into(), status, body.into(), vec![]),
+            (
+                "GET /backup".into(),
+                200,
+                backup_body(&GatewayConfig::default()),
+                vec![],
+            ),
+        ]);
+        let result = apply_api(
+            &desired,
+            &stub_client_with_retries(url, 3),
+            &["team-alpha".into()],
+            OwnershipScope::Exclusive,
+            Some(&empty_actuals(&["team-alpha"])),
+            None,
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.created, usize::from(acknowledged), "{status} {body}");
+        assert_eq!(result.applied_incremental.len(), usize::from(acknowledged));
+        assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+        assert_eq!(result.errors.is_empty(), acknowledged);
+        assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"]);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with("GET /backup "))
+                .count(),
+            usize::from(!acknowledged)
+        );
+        let mut state = StateFile::default();
+        record_prune_result(&mut state, &result, &desired);
+        assert_eq!(state.resources.len(), usize::from(acknowledged));
+        assert_eq!(result.into_result().is_ok(), acknowledged);
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_batch_acknowledgement_uses_authoritative_readback_and_ownership_assertions() {
+    for evidence in [
+        "exact",
+        "absent",
+        "partial",
+        "different",
+        "cached",
+        "failed",
+        "put-failed",
+    ] {
+        let desired = GatewayConfig {
+            upstreams: vec![upstream("u1", "team-alpha"), upstream("u2", "team-alpha")],
+            ..Default::default()
+        };
+        let mut live = desired.clone();
+        match evidence {
+            "absent" => live.upstreams.clear(),
+            "partial" => live.upstreams.truncate(1),
+            "different" => live.upstreams[0].targets.clear(),
+            _ => {}
+        }
+        let headers = if evidence == "cached" {
+            vec![("X-Data-Source".into(), "cached".into())]
+        } else {
+            vec![]
+        };
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("POST /batch".into(), 207, "{}".into(), vec![]),
+            (
+                "GET /backup".into(),
+                if evidence == "failed" { 403 } else { 200 },
+                backup_body(&live),
+                headers,
+            ),
+            (
+                "PUT /upstreams/u2".into(),
+                if evidence == "put-failed" { 400 } else { 200 },
+                "{}".into(),
+                vec![],
+            ),
+        ]);
+        let result = apply_api(
+            &desired,
+            &stub_client_with_retries(url, 3),
+            &["team-alpha".into()],
+            OwnershipScope::Shared {
+                previously_managed: &HashSet::new(),
+            },
+            Some(&empty_actuals(&["team-alpha"])),
+            None,
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        let expected = match evidence {
+            "exact" => 2,
+            "put-failed" => 1,
+            _ => 0,
+        };
+        assert_eq!(result.created, expected, "{evidence}");
+        assert_eq!(result.applied_incremental.len(), expected, "{evidence}");
+        assert_eq!(
+            result.fatal_error.is_some(),
+            matches!(evidence, "partial" | "different" | "cached" | "failed")
+        );
+        let mut mutations = vec!["POST /batch HTTP/1.1"];
+        if matches!(evidence, "exact" | "put-failed") {
+            mutations.extend(["PUT /upstreams/u1 HTTP/1.1", "PUT /upstreams/u2 HTTP/1.1"]);
+        }
+        assert_eq!(mutation_lines(&requests), mutations, "{evidence}");
+        let mut state = StateFile::default();
+        record_prune_result(&mut state, &result, &desired);
+        assert_eq!(state.resources.len(), expected);
+        if evidence == "put-failed" {
+            assert!(state
+                .resources
+                .contains_key(&state_key("team-alpha", "Upstream", "u1")));
+        }
+        assert_eq!(result.into_result().is_ok(), evidence == "exact");
+    }
+}
+
+#[tokio::test]
+async fn invalid_batch_acknowledgement_preserves_prior_namespace_operations() {
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("first", "alpha"), upstream("second", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        (
+            "x-ferrum-namespace: alpha".into(),
+            201,
+            r#"{"created":{"proxies":0,"consumers":0,"plugin_configs":0,"upstreams":1}}"#.into(),
+            vec![],
+        ),
+        ("POST /batch".into(), 207, "{}".into(), vec![]),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body(&GatewayConfig::default()),
+            vec![("X-Data-Source".into(), "cached".into())],
+        ),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["alpha".into(), "team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["alpha", "team-alpha"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.created, 1);
+    assert_eq!(result.applied_incremental.len(), 1);
+    assert_eq!(result.applied_incremental[0].id, "first");
+    assert!(result.fatal_error.is_some());
+    assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"; 2]);
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn uncommitted_cycle_batch_defers_deletes_after_invalid_acknowledgement() {
+    let desired = scoped_plugin_desired();
+    let actual = GatewayConfig {
+        proxies: vec![proxy("old", "team-alpha", None)],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("POST /batch".into(), 201, "{}".into(), vec![]),
+        ("GET /backup".into(), 200, backup_body(&actual), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.created, 0);
+    assert_eq!(result.deleted, 0);
+    assert_eq!(result.deletes_deferred, 1);
+    assert!(result.applied_incremental.is_empty());
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"]);
+    assert!(result.into_result().is_err());
 }

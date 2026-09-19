@@ -4,9 +4,9 @@ use crate::diagnostics::{sanitize, sanitize_line};
 use crate::diff::resource_diff::OwnershipScope;
 use crate::plugin_catalog::{
     allows_uninspectable_body, cfg_array, cfg_bool, cfg_str, effective_plugins, effective_scheme,
-    has_local_redis_fallback, is_auth_plugin, is_builtin, is_retired, retired_replacement,
-    scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body,
-    RetiredRemediation, RETIRED_PLUGIN_NAMES,
+    has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
+    retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive,
+    waf_skips_oversized_body, RetiredRemediation, RETIRED_PLUGIN_NAMES,
 };
 use crate::policy::config::default_auth_plugin_names;
 use crate::policy::PolicyConfig;
@@ -348,8 +348,8 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
         ));
     }
 
-    // Name checks apply regardless of `enabled`: a retired name is a fatal
-    // gateway load error for the whole config, not a skipped plugin.
+    // Admission checks apply even to disabled instances. These names cannot
+    // be made valid by a policy allowlist or warning severity.
     if is_retired(name) {
         findings.push(SecurityFinding::error(
             "PluginConfig",
@@ -365,6 +365,18 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
                         format!("rename it to {successor}"),
                     RetiredRemediation::Remove => "remove this plugin config".to_string(),
                 }
+            ),
+        ));
+        return;
+    }
+
+    if is_reserved(name) {
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            id,
+            ns,
+            format!(
+                "plugin {id} in namespace {ns} uses the reserved plugin_name: {name}; remove this hand-configured instance because the mesh data plane injects it when required"
             ),
         ));
         return;

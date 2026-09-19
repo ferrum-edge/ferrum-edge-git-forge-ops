@@ -379,7 +379,27 @@ pub async fn apply_api(
     )
     .await?;
     preflight_writes(client).await?;
+    Ok(apply_prepared(
+        desired,
+        client,
+        namespaces,
+        ownership_scope,
+        &prepared,
+        options,
+    )
+    .await)
+}
 
+// Keep the aggregation boundary private: preparation and write preflight must
+// finish before production callers can enter this loop.
+async fn apply_prepared(
+    desired: &GatewayConfig,
+    client: &AdminClient,
+    namespaces: &[String],
+    ownership_scope: OwnershipScope<'_>,
+    prepared: &PreparedApply,
+    options: &ApplyOptions,
+) -> ApplyResult {
     let mut aggregate = ApplyResult::default();
 
     for namespace in namespaces {
@@ -399,9 +419,10 @@ pub async fn apply_api(
                 // namespace N failed, which operators see in the aggregate
                 // error listing.
                 let Some(full_replace) = prepared.full_replaces.get(namespace) else {
-                    return Err(crate::error::Error::Config(format!(
+                    aggregate.fatal_error = Some(format!(
                         "internal error: full-replace payload for namespace `{namespace}` was not prebuilt"
-                    )));
+                    ));
+                    break;
                 };
                 match apply_full_replace(
                     full_replace,
@@ -490,7 +511,7 @@ pub async fn apply_api(
         }
     }
 
-    Ok(aggregate)
+    aggregate
 }
 
 /// Materialize the complete live view and every full-replace body before a
@@ -2568,8 +2589,7 @@ async fn try_batch_create(
     for (position, chunk) in chunks.iter().enumerate() {
         match client.post_batch(chunk, namespace).await {
             Ok(Some(_counts)) => {
-                // `/batch` is all-or-nothing and never answers 207, so a
-                // non-error response means the whole chunk landed.
+                // post_batch verified the status and every per-kind count.
                 result.created += chunk.len();
                 result
                     .applied_incremental
@@ -2619,7 +2639,10 @@ async fn try_batch_create(
                 replay_from = Some(position);
                 break;
             }
-            Err(e) if create_outcome_is_ambiguous(&e) => {
+            Err(e)
+                if matches!(e, crate::error::Error::AmbiguousMutation(_))
+                    || create_outcome_is_ambiguous(&e) =>
+            {
                 let original = e.to_string();
                 let snapshot = match client.get_backup_snapshot_for_mutation(namespace).await {
                     Ok(snapshot) if snapshot.cached => {
@@ -3050,4 +3073,126 @@ fn chunk_ops(chunk: &BatchCreate, namespace: &str) -> Vec<AppliedOp> {
                 .map(|p| op("PluginConfig", &p.id)),
         )
         .collect()
+}
+
+#[cfg(test)]
+mod prepared_apply_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // This invariant cannot be broken through apply_api today. Exercise its
+    // private, real aggregation loop after preparing all namespaces, without
+    // adding a production fault-injection option or a public test-only API.
+    #[tokio::test]
+    async fn missing_prepared_restore_preserves_completed_namespace_and_failed_verdict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = AdminClient::new_scoped(
+            &crate::config::EnvConfig {
+                gateway_url: Some(format!("http://{}", listener.local_addr().unwrap())),
+                admin_jwt_secret: Some("test-secret-must-be-32-chars-long".into()),
+                gateway_max_retries: 0,
+                ..Default::default()
+            },
+            ["alpha", "beta", "gamma"],
+        )
+        .unwrap();
+        let desired: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "upstreams": [{"id": "u1", "namespace": "alpha", "targets": []}]
+        }))
+        .unwrap();
+        let namespaces: Vec<String> = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+        let actuals = namespaces
+            .iter()
+            .map(|ns| (ns.clone(), GatewayConfig::default()))
+            .collect();
+        let extras = namespaces
+            .iter()
+            .map(|ns| (ns.clone(), BackupExtras::default()))
+            .collect();
+        let options = ApplyOptions {
+            strategy: ApplyStrategy::FullReplace,
+            ..Default::default()
+        };
+        let mut prepared = prepare_apply(
+            &desired,
+            &client,
+            &namespaces,
+            Some(&actuals),
+            Some(&extras),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.full_replaces.len(), 3);
+        assert!(prepared.full_replaces.remove("beta").is_some());
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                assert!(headers.starts_with("POST /restore?confirm=true "));
+                assert!(headers.contains("x-ferrum-namespace: alpha\r\n"));
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .map(|value| value.parse().unwrap())
+                    })
+                    .unwrap();
+                stream.read_exact(&mut vec![0_u8; length]).await.unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("restore fixture did not receive its complete request");
+        });
+        let result = apply_prepared(
+            &desired,
+            &client,
+            &namespaces,
+            OwnershipScope::Exclusive,
+            &prepared,
+            &options,
+        )
+        .await;
+        server.await.unwrap();
+        assert_eq!(result.created, 1);
+        assert_eq!(result.fully_replaced_namespaces, vec!["alpha"]);
+        assert!(result.applied_incremental.is_empty());
+        assert!(result.errors.is_empty());
+        assert!(result
+            .fatal_error
+            .as_ref()
+            .unwrap()
+            .contains("`beta` was not prebuilt"));
+        // Replay the same ledger boundary cmd_apply uses before returning its
+        // deferred failure. The previous fully-applied stamp must survive.
+        let mut state = crate::state::StateFile {
+            last_applied_commit: Some("previous-complete-commit".into()),
+            ..Default::default()
+        };
+        for namespace in &result.fully_replaced_namespaces {
+            state.record_full_replace(namespace, &desired);
+        }
+        let outcome = result.into_result();
+        state.stamp_last_applied_if_clean(outcome.is_ok());
+        assert!(outcome.unwrap_err().to_string().contains("Apply stopped"));
+        assert!(state
+            .resources
+            .contains_key(&state_key("alpha", "Upstream", "u1")));
+        assert_eq!(state.resources.len(), 1);
+        assert_eq!(
+            state.last_applied_commit.as_deref(),
+            Some("previous-complete-commit")
+        );
+    }
 }
