@@ -160,6 +160,7 @@ python3 "$ROOT/tests/lifecycle/scenarios.py" \
   --proxy-url "$PROXY_URL" \
   --upstream-url "$UPSTREAM_URL" \
   --binary "${GITFORGEOPS_BINARY:-gitforgeops}" \
+  --creds-file "$CREDS" \
   "${ONLY[@]+"${ONLY[@]}"}"
 SCENARIO_STATUS=$?
 set -e
