@@ -871,6 +871,103 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_unattended_monitoring_may_only_read_the_gateway(self):
+        # The drift check runs in an environment with no required reviewer, so
+        # its reachable authority is the whole fence. Each of these mutations
+        # hands it something it must never have.
+        workflow = (ROOT / ".github/workflows/drift-check.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.monitoring_workflow_violations(workflow), []
+        )
+        for old, new, expected in (
+            (
+                "gitforgeops diff --exit-on-drift",
+                "gitforgeops apply --auto-approve",
+                "monitoring may only run",
+            ),
+            (
+                "permissions:\n  contents: read",
+                "permissions:\n  contents: write",
+                "no write permission",
+            ),
+            (
+                "FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}",
+                "FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}",
+                "may not reach 'FERRUM_GH_PROVISIONER_TOKEN'",
+            ),
+            (
+                "FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}",
+                "GITFORGEOPS_STATE_APP_PRIVATE_KEY: "
+                "${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}",
+                "may not reach 'GITFORGEOPS_STATE_APP_PRIVATE_KEY'",
+            ),
+            (
+                "FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}",
+                "FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}",
+                "may not reach 'FERRUM_CREDS_BUNDLE'",
+            ),
+            (
+                ".github/scripts/drift_report.py",
+                ".github/scripts/something_else.py",
+                "cannot be reported as in sync",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                mutated = workflow.replace(old, new)
+                self.assertNotEqual(mutated, workflow)
+                violations = check_supply_chain.monitoring_workflow_violations(mutated)
+                self.assertTrue(
+                    any(expected in item for item in violations), violations
+                )
+
+    def test_the_monitoring_fence_is_enforced_by_the_trusted_checker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "gitforgeops diff --exit-on-drift",
+                    "gitforgeops apply --auto-approve",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("monitoring may only run" in item for item in violations), violations
+        )
+
+    def test_monitoring_is_exempt_from_the_bundle_rules_by_binding_nothing(self):
+        # A comparison does not need credential values, so the bundle stays
+        # where allocation needs it. The loader rules follow the secret
+        # binding, so an unattended monitoring job is exempt by construction
+        # rather than by being left off a list — and it is still a privileged
+        # workflow for every other rule.
+        workflow = (ROOT / ".github/workflows/drift-check.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(check_supply_chain.BUNDLE_SECRET_BINDING, workflow)
+        self.assertIn("drift-check.yml", check_supply_chain.PRIVILEGED_WORKFLOWS)
+
+        # Binding the secret again brings every bundle rule back with it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(
+                workflow.replace(
+                    "          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}",
+                    "          FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("fail-closed loader" in item for item in violations), violations
+        )
+
     def test_validate_pr_rejects_the_whole_secrets_context(self):
         # Guard the wiring, not just the regex: the real workflow text is run
         # through the same check the policy applies.
@@ -1407,56 +1504,6 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
-    def test_bundle_loader_rules_follow_the_secret_binding(self):
-        # A privileged workflow that binds no credential-bundle secret cannot
-        # mishandle one, and requiring the loader there would force a job that
-        # needs no credential values to hold every consumer secret purely to
-        # satisfy policy. One that DOES bind the secret is covered at once.
-        with tempfile.TemporaryDirectory() as directory:
-            root = self._mirror_repo(Path(directory))
-            path = root / ".github/workflows/drift-check.yml"
-            text = path.read_text(encoding="utf-8")
-            self.assertIn(check_supply_chain.BUNDLE_SECRET_BINDING, text)
-            path.write_text(
-                # Every occurrence: the first is a cross-reference in a
-                # comment, and only the invocation matters.
-                text.replace("credential_bundles.py", "something_else.py"),
-                encoding="utf-8",
-            )
-            violations = self._violations(root)
-        self.assertTrue(
-            any("fail-closed loader" in item for item in violations), violations
-        )
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = self._mirror_repo(Path(directory))
-            path = root / ".github/workflows/drift-check.yml"
-            text = path.read_text(encoding="utf-8")
-            # Remove every bundle binding AND the loader step it feeds.
-            without = "\n".join(
-                line
-                for line in text.splitlines()
-                if check_supply_chain.BUNDLE_SECRET_BINDING not in line
-                and "credential_bundles.py" not in line
-                and "ferrum-creds-" not in line
-                and "FERRUM_CREDS_JSON_FILE" not in line
-            )
-            path.write_text(without + "\n", encoding="utf-8")
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT), "--root", str(root)],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-        self.assertNotIn(
-            "fail-closed loader", result.stdout + result.stderr, "loader still required"
-        )
-        self.assertNotIn(
-            "under $RUNNER_TEMP",
-            result.stdout + result.stderr,
-            "credential file location still required",
-        )
-
     def test_apply_trigger_and_supersession_scope_must_be_one_list(self):
         # Dropping a path from the trigger while the classifier still treats it
         # as a deployment input recreates the stranded-apply bug: the merge
@@ -1564,7 +1611,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         # between jobs and never clean.
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
-            path = root / ".github/workflows/drift-check.yml"
+            path = root / ".github/workflows/rotate.yml"
             path.write_text(
                 path.read_text(encoding="utf-8").replace(
                     'creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-',

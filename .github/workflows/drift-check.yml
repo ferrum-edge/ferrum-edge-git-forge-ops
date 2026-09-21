@@ -5,6 +5,10 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch:
 
+# Monitoring reads. It never mutates a gateway, never writes the ownership
+# ledger, and never touches a credential bundle secret — `check_supply_chain.py`
+# enforces all three by rejecting the corresponding secret bindings and any
+# `gitforgeops` subcommand other than `diff` in this file.
 permissions:
   contents: read
 
@@ -26,7 +30,7 @@ jobs:
     needs: preflight
     runs-on: ubuntu-24.04
     outputs:
-      envs: ${{ steps.list.outputs.envs }}
+      scopes: ${{ steps.list.outputs.scopes }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -49,6 +53,12 @@ jobs:
       - name: Build gitforgeops
         run: cargo install --path . --locked
 
+      # The matrix carries the environment to compare AND the GitHub
+      # Environment to bind for it. They are the same name unless the
+      # environment set `monitoring.unattended: true`, in which case the binary
+      # derives `<env>-monitor` — the environment that holds gateway *read*
+      # credentials and requires no reviewer, so a nightly run is not parked
+      # waiting for a human. See docs/github-launch-controls.md §3.
       - name: Enumerate environments
         id: list
         run: |
@@ -57,27 +67,35 @@ jobs:
             echo "::error::Repository configuration is required before binding a deployment environment."
             exit 1
           }
-          envs=$(gitforgeops envs --format json | jq -c .)
+          scopes=$(gitforgeops envs --format json --include-scopes | jq -c '
+            [ .[] | {
+                environment,
+                monitoring_environment,
+                unattended_monitoring
+              } ]
+          ')
           jq -e '
             type == "array" and
-            all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))
-          ' <<< "$envs" >/dev/null || {
+            all(.[]; .environment as $e | .monitoring_environment as $m |
+              ($e | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")) and
+              ($m | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))
+          ' <<< "$scopes" >/dev/null || {
             echo "::error::Every environment must be a single safe path component."
             exit 1
           }
-          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+          echo "scopes=$scopes" >> "$GITHUB_OUTPUT"
 
   drift:
     needs: list-envs
     if: |
-      needs.list-envs.outputs.envs != '[]'
-      && needs.list-envs.outputs.envs != ''
+      needs.list-envs.outputs.scopes != '[]'
+      && needs.list-envs.outputs.scopes != ''
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        environment: ${{ fromJson(needs.list-envs.outputs.envs) }}
-    environment: ${{ matrix.environment }}
+        scope: ${{ fromJson(needs.list-envs.outputs.scopes) }}
+    environment: ${{ matrix.scope.monitoring_environment }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -130,50 +148,33 @@ jobs:
         if: steps.deployment-mode.outputs.mode == 'api'
         run: cargo install --path . --locked
 
-      - name: Load credential bundles
-        if: steps.deployment-mode.outputs.mode == 'api'
-        # Every credential-bundle secret is bound by name — never the whole
-        # `secrets` context. The shard list is capped by MAX_BUNDLE_SHARDS in
-        # src/secrets/bundle.rs and .github/scripts/credential_bundles.py; see
-        # apply-on-merge.yml for the full rationale.
-        env:
-          FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}
-          FERRUM_CREDS_BUNDLE_1: ${{ secrets.FERRUM_CREDS_BUNDLE_1 }}
-          FERRUM_CREDS_BUNDLE_2: ${{ secrets.FERRUM_CREDS_BUNDLE_2 }}
-          FERRUM_CREDS_BUNDLE_3: ${{ secrets.FERRUM_CREDS_BUNDLE_3 }}
-          FERRUM_CREDS_BUNDLE_4: ${{ secrets.FERRUM_CREDS_BUNDLE_4 }}
-          FERRUM_CREDS_BUNDLE_5: ${{ secrets.FERRUM_CREDS_BUNDLE_5 }}
-          FERRUM_CREDS_BUNDLE_6: ${{ secrets.FERRUM_CREDS_BUNDLE_6 }}
-          FERRUM_CREDS_BUNDLE_7: ${{ secrets.FERRUM_CREDS_BUNDLE_7 }}
-          FERRUM_CREDS_BUNDLE_8: ${{ secrets.FERRUM_CREDS_BUNDLE_8 }}
-          FERRUM_CREDS_BUNDLE_9: ${{ secrets.FERRUM_CREDS_BUNDLE_9 }}
-          FERRUM_CREDS_BUNDLE_10: ${{ secrets.FERRUM_CREDS_BUNDLE_10 }}
-          FERRUM_CREDS_BUNDLE_11: ${{ secrets.FERRUM_CREDS_BUNDLE_11 }}
-          FERRUM_CREDS_BUNDLE_12: ${{ secrets.FERRUM_CREDS_BUNDLE_12 }}
-          FERRUM_CREDS_BUNDLE_13: ${{ secrets.FERRUM_CREDS_BUNDLE_13 }}
-          FERRUM_CREDS_BUNDLE_14: ${{ secrets.FERRUM_CREDS_BUNDLE_14 }}
-          FERRUM_CREDS_BUNDLE_15: ${{ secrets.FERRUM_CREDS_BUNDLE_15 }}
-        run: |
-          set -euo pipefail
-          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
-          python3 .github/scripts/credential_bundles.py "$creds_file"
-          echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
-
+      # Deliberately NO credential-bundle secrets. A comparison does not need
+      # them: `diff` excludes still-unresolved broker leaves from the live
+      # comparison per leaf, so an unbrokered gateway document is compared in
+      # full and the credential values themselves are simply out of scope.
+      # Handing an unattended monitoring environment the whole credential
+      # bundle would be the opposite of "only the secret material necessary for
+      # comparison", so the bundle stays where allocation needs it: the
+      # approval-gated apply and rotate workflows.
       - name: Check drift
-        # Exit codes: 0 in sync, 2 drift, 1 the run itself failed (unreachable
-        # gateway, cached backup, bad configuration). The step fails the job on
-        # any non-zero exit, so both 1 and 2 surface — the distinction is for
-        # whoever reads the log. Drift includes API-spec ownership conflicts,
-        # which no `ownership.drift_alert_on` flag can mute because `apply`
-        # blocks the namespace over them.
+        # `gitforgeops diff --exit-on-drift`: 0 in sync, 2 drift, 1 the check
+        # itself failed (unreachable gateway, 401, cached/non-authoritative
+        # backup, bad configuration). The exit code is captured rather than
+        # allowed to fail the step, because the three cases mean three
+        # different things and only one of them is a statement about the
+        # gateway. `drift_report.py` does that classification; the aggregate
+        # job below decides the workflow's status.
+        id: check
         if: steps.deployment-mode.outputs.mode == 'api'
         env:
-          FERRUM_ENV: ${{ matrix.environment }}
+          FERRUM_ENV: ${{ matrix.scope.environment }}
           FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           # Optional JWT claim settings; see apply-on-merge.yml for why they
           # are bound explicitly and why blank means "unset", not "empty".
+          # A monitoring environment should set FERRUM_ADMIN_JWT_ROLE to the
+          # gateway's least-privileged role that can still read `GET /backup`.
           FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
           FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
           FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}
@@ -181,4 +182,97 @@ jobs:
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
           FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
-        run: gitforgeops diff --exit-on-drift
+        run: |
+          set -uo pipefail
+          status=0
+          gitforgeops diff --exit-on-drift || status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Record outcome
+        # `!cancelled()` and not `always()`: a cancelled job records nothing,
+        # and the aggregate job below reads a missing record as `not_completed`
+        # rather than as a clean check.
+        if: ${{ !cancelled() }}
+        env:
+          ENVIRONMENT: ${{ matrix.scope.environment }}
+          CHECK_ENVIRONMENT: ${{ matrix.scope.monitoring_environment }}
+          UNATTENDED: ${{ matrix.scope.unattended_monitoring }}
+          MODE: ${{ steps.deployment-mode.outputs.mode }}
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          mkdir -p drift-outcomes
+          args=(record
+            --environment "$ENVIRONMENT"
+            --check-environment "$CHECK_ENVIRONMENT"
+            --output "drift-outcomes/${ENVIRONMENT}.json")
+          [ "$UNATTENDED" = "true" ] && args+=(--unattended)
+          if [ "$MODE" = file ]; then
+            args+=(--outcome skipped
+              --detail "file mode has no live Admin API drift surface")
+          elif [ -z "${EXIT_CODE:-}" ]; then
+            args+=(--outcome failed
+              --detail "the comparison step produced no exit code")
+          else
+            args+=(--exit-code "$EXIT_CODE")
+          fi
+          python3 .github/scripts/drift_report.py "${args[@]}"
+
+      - name: Publish outcome
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: drift-outcome-${{ matrix.scope.environment }}
+          path: drift-outcomes/
+          retention-days: 30
+
+  # One stable status for the whole check. Its last successful run is the
+  # "last successful check" evidence — `audit_settings.py` reads it through the
+  # Actions API and fails when monitoring has silently stopped, which is how a
+  # cron entry alone is prevented from passing for coverage. (GitHub disables
+  # scheduled workflows in repositories that go 60 days without activity, so
+  # "the cron is still in the file" proves nothing.)
+  report:
+    needs: [list-envs, drift]
+    if: ${{ !cancelled() && needs.list-envs.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Collect outcomes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: drift-outcome-*
+          path: drift-outcomes
+          merge-multiple: true
+
+      # A matrix entry that never produced a record did not report "in sync";
+      # it did not report at all. Reconstruct those as `not_completed` so an
+      # environment held at "waiting for approval" is visible as an incomplete
+      # check rather than absent from the table.
+      - name: Reconstruct missing outcomes
+        env:
+          SCOPES: ${{ needs.list-envs.outputs.scopes }}
+        run: |
+          set -euo pipefail
+          mkdir -p drift-outcomes
+          while read -r environment check_environment unattended; do
+            [ -n "$environment" ] || continue
+            [ -f "drift-outcomes/${environment}.json" ] && continue
+            args=(record
+              --environment "$environment"
+              --check-environment "$check_environment"
+              --outcome not_completed
+              --detail "the drift job produced no outcome for this environment"
+              --output "drift-outcomes/${environment}.json")
+            [ "$unattended" = "true" ] && args+=(--unattended)
+            python3 .github/scripts/drift_report.py "${args[@]}"
+          done < <(jq -r '.[] | [.environment, .monitoring_environment, (.unattended_monitoring|tostring)] | @tsv' <<< "$SCOPES")
+
+      - name: Summarize monitoring coverage
+        run: |
+          python3 .github/scripts/drift_report.py summarize \
+            --input drift-outcomes \
+            --summary "$GITHUB_STEP_SUMMARY"

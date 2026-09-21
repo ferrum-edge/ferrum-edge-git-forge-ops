@@ -32,12 +32,38 @@ RUST_SHARD_LIMIT = re.compile(
 )
 LOADER_SHARD_LIMIT = re.compile(r"^MAX_BUNDLE_SHARDS\s*=\s*(\d+)\s*$", re.MULTILINE)
 BUNDLE_LOADER_STEP = "Load credential bundles"
+# Every workflow that binds a GitHub Environment holding gateway credentials.
 PRIVILEGED_WORKFLOWS = (
     "apply-on-merge.yml",
     "drift-check.yml",
     "materialize-file.yml",
     "rotate.yml",
 )
+# A workflow that resolves `${gh-env-secret:...}` placeholders reads the
+# credential bundle secrets, and every such workflow must use the fail-closed
+# loader. Keying the rule on the binding rather than on a hand-maintained list
+# means a workflow that needs no credential values is exempt by construction —
+# `drift-check.yml` compares without them, because unresolved broker leaves are
+# excluded from the live comparison per leaf — and one that starts binding them
+# is covered the moment it does.
+BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
+# Scheduled monitoring runs unattended in an environment with no required
+# reviewer, so the fence is what that job can reach at all: read the gateway,
+# nothing else.
+MONITORING_WORKFLOW = "drift-check.yml"
+MONITORING_FORBIDDEN_SECRETS = (
+    # Writes GitHub Environment Secrets — the credential broker's authority.
+    "FERRUM_GH_PROVISIONER_TOKEN",
+    # Mints a Contents: write token for the ownership ledger.
+    "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
+    # Reads repository administration settings.
+    "SETTINGS_AUDIT_TOKEN",
+    # Credential values, which a comparison does not need.
+    "FERRUM_CREDS_BUNDLE",
+)
+# `diff` is the only gateway operation monitoring may perform. `apply`,
+# `rotate` and `export --materialize` all mutate something.
+MONITORING_ALLOWED_COMMAND = "gitforgeops diff --exit-on-drift"
 ADMIN_JWT_SECRET_BINDING = (
     "FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}"
 )
@@ -550,6 +576,65 @@ def deployment_scope_violations(root: Path, apply_workflow: str) -> list[str]:
             f"{', '.join(repr(item) for item in extra)}, which "
             f"{DEPLOYMENT_SCOPE_SCRIPT} does not treat as a deployment input; "
             "add them to DEPLOYMENT_INPUT_PATHS or drop them from the trigger"
+        )
+    return violations
+
+
+def monitoring_workflow_violations(text: str) -> list[str]:
+    """Unattended monitoring must be able to read a gateway and nothing else.
+
+    A scheduled drift check bound to an approval-gated deployment environment
+    never runs: GitHub withholds the environment's secrets until a reviewer
+    approves the job, so a nightly run parks in "waiting for approval" and
+    inspects nothing. Moving the check into its own environment with no
+    required reviewer is what makes it unattended — and that is only
+    acceptable while the job's reachable authority is a gateway *read*.
+
+    So the fence is enforced here, statically, on top of the environment-level
+    secret-name audit: no credential-broker token, no state-writer key, no
+    administration-read token, no credential bundle, no write permission, and
+    no `gitforgeops` subcommand other than `diff`.
+    """
+    violations: list[str] = []
+    for secret in MONITORING_FORBIDDEN_SECRETS:
+        if f"secrets.{secret}" in text:
+            violations.append(
+                f"{MONITORING_WORKFLOW}: unattended monitoring may not reach "
+                f"{secret!r}; it runs in an environment with no required "
+                "reviewer, so its authority must stop at reading the gateway"
+            )
+    for command in re.findall(r"gitforgeops [a-z-]+[^\n]*", text):
+        subcommand = command.split()[1]
+        if subcommand in {"envs", "version"}:
+            # Enumeration runs in the unprivileged job that binds no
+            # environment at all.
+            continue
+        if not command.startswith(MONITORING_ALLOWED_COMMAND):
+            violations.append(
+                f"{MONITORING_WORKFLOW}: monitoring may only run "
+                f"{MONITORING_ALLOWED_COMMAND!r}; found {command!r}"
+            )
+    if MONITORING_ALLOWED_COMMAND not in text:
+        violations.append(
+            f"{MONITORING_WORKFLOW}: the drift job must run "
+            f"{MONITORING_ALLOWED_COMMAND!r}"
+        )
+    write_permission = re.compile(
+        r"^\s+(?:contents|packages|id-token|actions|pull-requests|deployments|"
+        r"issues|statuses|checks|security-events):\s*write\s*$",
+        re.MULTILINE,
+    )
+    if write_permission.search(text):
+        violations.append(
+            f"{MONITORING_WORKFLOW}: monitoring must hold no write permission"
+        )
+    # The outcome taxonomy is the other half of the ask: a check that failed,
+    # was skipped, or never ran must not read as a gateway that matched.
+    if ".github/scripts/drift_report.py" not in text:
+        violations.append(
+            f"{MONITORING_WORKFLOW}: outcomes must be classified by "
+            "drift_report.py so a failed, skipped or never-started check "
+            "cannot be reported as in sync"
         )
     return violations
 
@@ -1442,6 +1527,12 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"{privileged_workflow}: state commits must not suppress required checks with [skip ci]"
             )
+
+    violations.extend(
+        monitoring_workflow_violations(
+            (workflows / MONITORING_WORKFLOW).read_text(encoding="utf-8")
+        )
+    )
 
     for state_writer_workflow in ("apply-on-merge.yml", "rotate.yml"):
         violations.extend(

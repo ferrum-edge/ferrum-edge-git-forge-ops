@@ -1945,7 +1945,68 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - `exclusive` mode: any unmanaged resource is drift. Exit non-zero, workflow fails.
 - API-spec ownership conflicts are drift in **both** modes and cannot be muted: `apply` refuses the namespace, so a monitor that reported success would be reporting on a gateway nobody can reconcile.
 
-Exit codes: `0` in sync, `2` drift, `1` the run itself failed (unreachable gateway, cached backup, bad configuration). `drift-check.yml` fails the step on any non-zero exit.
+### Outcomes: only one of them means "in sync"
+
+`gitforgeops diff --exit-on-drift` exits `0` in sync, `2` drift, `1` when the
+run itself failed (unreachable gateway, 401, a cached/non-authoritative backup,
+bad configuration). The workflow captures that code rather than letting it fail
+the step, because the scheduled check can also end in states the binary never
+reports at all, and collapsing them all into red-or-green is how a monitoring
+setup comes to report on a gateway nobody is watching:
+
+| Outcome | Meaning |
+| --- | --- |
+| `In sync` | the gateway was read and matches the repository |
+| `Drift detected` | the gateway was read and differs |
+| `Check failed` | the check could not complete — **nothing is known about the gateway** |
+| `Skipped (file mode)` | no live Admin API to compare against; a configured absence, not a gap |
+| `Not completed` | the comparison never ran: approval pending, cancelled, or the runner was lost |
+
+`.github/scripts/drift_report.py` classifies each environment and renders the
+table into the run's job summary. `Drift detected`, `Check failed` and
+`Not completed` fail the workflow; `Skipped` does not. An environment that
+produced no record is reconstructed as `Not completed` rather than dropped from
+the table.
+
+### Unattended monitoring, and when it is approval-gated
+
+Bound to a deployment environment, the nightly check inherits that
+environment's required reviewer — and GitHub withholds an approval-gated
+environment's secrets until a human approves the job, so the run parks in
+"waiting for approval" and inspects nothing. It reports `Not completed` with
+that reason, never `In sync`.
+
+To run it unattended, opt the environment in:
+
+```yaml
+environments:
+  production:
+    monitoring:
+      unattended: true     # binds the `production-monitor` environment instead
+```
+
+`production-monitor` is created by `bootstrap_repo_settings.py` with no
+reviewer, protected branches only, and gateway **read** material only — no
+state-writer key, no provisioner token, no credential bundles (a comparison
+does not need credential values; `diff` excludes still-unresolved broker leaves
+per leaf). Three independent fences keep it that way: the settings audit
+rejects a monitoring environment holding any of those secret *names*,
+`check_supply_chain.py` rejects a `drift-check.yml` that binds them or runs any
+subcommand other than `diff`, and the config loader refuses to name a
+deployment environment into the `-monitor` suffix.
+
+One caveat worth stating plainly: Ferrum Edge signs admin tokens with a
+symmetric secret and `GET /backup` requires the `admin` role, so there is no
+token today that reads configuration but cannot write it. Treat the monitoring
+environment's signing secret as gateway-write-equivalent until Ferrum Edge
+offers a read-only admin role. If that trade-off is unacceptable, leave
+`monitoring.unattended` off; see
+[docs/github-launch-controls.md §3.1](docs/github-launch-controls.md#31-unattended-drift-monitoring).
+
+The settings audit also checks that the drift workflow has actually completed
+successfully within the last 48 hours once any environment has opted in — a
+`cron:` line is not coverage, and GitHub disables schedules on quiet
+repositories without saying so.
 
 Duplicate live `(namespace, id)` identities within any of the four resource kinds
 invalidate the entire backup, including identical duplicate rows. `diff`, `plan`

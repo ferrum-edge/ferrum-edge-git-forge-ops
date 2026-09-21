@@ -305,7 +305,8 @@ Publication is a **reconciliation**, not a conditional write: `apply::reconcile_
 ### Multi-Environment (repo config)
 
 `.gitforgeops/config.yaml` declares logical environments. Each entry picks an
-overlay, apply strategy, ownership mode, and whether live PR review is enabled.
+overlay, apply strategy, ownership mode, whether live PR review is enabled, and
+whether scheduled drift monitoring runs unattended.
 Set `live_review: false` for file-mode environments. **No gateway URL, no JWT, no
 secret names** live in this file — those come from GitHub Environment Secrets
 of the same name as the entry (e.g. `production` entry → GitHub Environment
@@ -316,6 +317,40 @@ Workflows run as a matrix over `gitforgeops envs --format json`, binding
 `environment: ${{ matrix.environment }}` to pull the scoped secrets. Concurrency
 groups serialize per-env applies so two concurrent writes to the same
 environment never interleave.
+
+#### Unattended drift monitoring
+
+`monitoring.unattended: true` on an environment makes `EnvironmentScope`
+report `monitoring_environment = "<env>-monitor"` (`MONITORING_ENVIRONMENT_SUFFIX`,
+`repo_config.rs`), and `drift-check.yml` binds that instead of the deployment
+environment. Default `false` keeps the check on the deployment environment,
+where GitHub withholds the secrets until a reviewer approves — reported
+honestly as `not_completed`, never as in sync. A deployment environment may not
+be named with the suffix: the settings audit waives its required-reviewer rule
+for exactly that shape.
+
+Three independent fences bound what the reviewer-free environment can reach:
+`audit_settings.py` rejects a `<env>-monitor` holding
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY`, `FERRUM_GH_PROVISIONER_TOKEN`,
+`SETTINGS_AUDIT_TOKEN` or `FERRUM_CREDS_BUNDLE[_N]` (secret *names* only, never
+values) and requires its base environment to exist;
+`check_supply_chain.py::monitoring_workflow_violations` rejects a
+`drift-check.yml` that binds any of those, holds a write permission, omits the
+outcome classifier, or runs a `gitforgeops` subcommand other than `diff`; and
+`drift-check.yml` binds no credential bundle at all, because `diff` excludes
+still-unresolved broker leaves from live comparison per leaf.
+`CREDENTIAL_BUNDLE_WORKFLOWS` is the bundle-reading subset of
+`PRIVILEGED_WORKFLOWS` for that reason.
+
+Outcomes come from `.github/scripts/drift_report.py`: `in_sync`, `drift`,
+`failed`, `skipped` (file mode), `not_completed`. Only `in_sync` is a successful
+comparison; `drift`/`failed`/`not_completed` block, `skipped` does not. A matrix
+entry with no record is reconstructed as `not_completed`. The settings audit
+separately reads the newest successful `drift-check.yml` run and fails when it
+is older than `--monitoring-max-age-hours` (48), so a `cron:` entry alone cannot
+pass for coverage. Ferrum Edge has no read-only admin role today, so the
+monitoring environment's JWT signing secret is gateway-write-equivalent; that
+dependency is documented rather than papered over.
 
 #### Freshness guard (the lock does not move the checkout)
 

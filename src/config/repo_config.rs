@@ -70,6 +70,47 @@ impl Default for OwnershipConfig {
     }
 }
 
+/// Reserved suffix for the GitHub Environment a scheduled drift check binds
+/// when an environment opts into unattended monitoring.
+///
+/// The name is derived rather than configured so the same string is reachable
+/// from the binary, `drift-check.yml`, `bootstrap_repo_settings.py` and
+/// `audit_settings.py` without any of them parsing another's data. The audit
+/// keys its narrow reviewer waiver on exactly this suffix, so a deployment
+/// environment may never carry it.
+pub const MONITORING_ENVIRONMENT_SUFFIX: &str = "-monitor";
+
+/// Derive the monitoring environment name for a deployment environment.
+pub fn monitoring_environment_name(environment: &str) -> String {
+    format!("{environment}{MONITORING_ENVIRONMENT_SUFFIX}")
+}
+
+// `false` is the derived default here, so this type keeps `#[derive(Default)]`
+// rather than the hand-written impl the neighbouring config structs need for
+// their non-`false`/non-zero defaults. The container-level `#[serde(default)]`
+// rule is unchanged: `{}` still deserializes to `MonitoringConfig::default()`,
+// which `tests/unit/serde_default_tests.rs` asserts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitoringConfig {
+    /// Run the scheduled drift check in `<environment>-monitor` instead of the
+    /// deployment environment.
+    ///
+    /// A deployment environment requires a reviewer, and GitHub withholds an
+    /// approval-gated environment's secrets until a human approves the job —
+    /// so a nightly drift check bound to it parks in "waiting for approval"
+    /// and inspects nothing. That is the approval boundary working as
+    /// configured, which is why this is opt-in rather than a default: turning
+    /// it on means provisioning a second GitHub Environment holding gateway
+    /// *read* credentials and nothing else, and accepting that it runs
+    /// unattended.
+    ///
+    /// Left `false`, monitoring stays bound to the deployment environment and
+    /// the check reports `not_completed` (approval pending) rather than
+    /// anything resembling "in sync".
+    pub unattended: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentConfig {
@@ -81,6 +122,7 @@ pub struct EnvironmentConfig {
     pub namespace_filter: Option<String>,
     pub apply_strategy: ApplyStrategy,
     pub ownership: OwnershipConfig,
+    pub monitoring: MonitoringConfig,
 }
 
 impl Default for EnvironmentConfig {
@@ -91,6 +133,7 @@ impl Default for EnvironmentConfig {
             namespace_filter: None,
             apply_strategy: ApplyStrategy::Incremental,
             ownership: OwnershipConfig::default(),
+            monitoring: MonitoringConfig::default(),
         }
     }
 }
@@ -125,6 +168,17 @@ pub struct EnvironmentScope {
     /// explicit filter/ownership allowlist that the caller must intersect
     /// with those directories.
     pub namespaces: Option<Vec<String>>,
+    /// The GitHub Environment a scheduled drift check should bind for this
+    /// deployment environment. Equal to `environment` unless the environment
+    /// opted into unattended monitoring, in which case it is the derived
+    /// `<environment>-monitor`. `drift-check.yml` binds this field directly,
+    /// so an environment that has not opted in keeps every existing approval
+    /// gate.
+    pub monitoring_environment: String,
+    /// Whether that monitoring environment is expected to run without a human
+    /// approval. Reported in the drift check's outcome so an approval-gated
+    /// run is never mistaken for a completed one.
+    pub unattended_monitoring: bool,
 }
 
 impl RepoConfig {
@@ -177,6 +231,12 @@ impl RepoConfig {
                     environment: name.clone(),
                     live_review: env.live_review,
                     namespaces,
+                    monitoring_environment: if env.monitoring.unattended {
+                        monitoring_environment_name(name)
+                    } else {
+                        name.clone()
+                    },
+                    unattended_monitoring: env.monitoring.unattended,
                 }
             })
             .collect()
@@ -219,6 +279,21 @@ impl RepoConfig {
             super::resolved::validate_env_name_is_safe_path_component(name)?;
             if let Some(overlay) = &env.overlay {
                 super::resolved::validate_overlay_name(overlay)?;
+            }
+
+            // `<name>-monitor` is the derived GitHub Environment a scheduled
+            // drift check binds, and the settings audit waives the required-
+            // reviewer rule for exactly that suffix. A deployment environment
+            // named `staging-monitor` would inherit that waiver and become an
+            // unreviewed gateway *write* target.
+            if name.ends_with(MONITORING_ENVIRONMENT_SUFFIX) {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': the '{MONITORING_ENVIRONMENT_SUFFIX}' suffix is \
+                     reserved for the drift-monitoring environment derived from a deployment \
+                     environment of the same base name. Rename this environment; set \
+                     `monitoring.unattended: true` on the deployment environment to create \
+                     its monitoring target."
+                )));
             }
 
             if matches!(env.ownership.mode, OwnershipMode::Exclusive)
