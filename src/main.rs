@@ -3363,6 +3363,10 @@ fn cmd_envs(
                 environment: ResolvedEnv::default_env_name(),
                 live_review: false,
                 namespaces: None,
+                // The synthetic local default is never a trusted workflow
+                // target, so it never gains a monitoring environment either.
+                monitoring_environment: ResolvedEnv::default_env_name(),
+                unattended_monitoring: false,
             }],
         };
         print!("{}", gitforgeops::json_output::compact(&scopes)?);

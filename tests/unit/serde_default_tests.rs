@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use gitforgeops::config::repo_config::{
-    DriftAlertOn, EnvironmentConfig, OwnershipConfig, RepoConfig,
+    DriftAlertOn, EnvironmentConfig, MonitoringConfig, OwnershipConfig, RepoConfig,
 };
 use gitforgeops::policy::config::{
     load_policies_from_path, OverrideConfig, PolicyConfig, PolicyRules,
@@ -43,6 +43,7 @@ fn assert_empty_document_is_default<T: Default + Serialize + DeserializeOwned>(n
 fn repo_config_types_fill_missing_keys_from_default() {
     assert_empty_document_is_default::<DriftAlertOn>("DriftAlertOn");
     assert_empty_document_is_default::<OwnershipConfig>("OwnershipConfig");
+    assert_empty_document_is_default::<MonitoringConfig>("MonitoringConfig");
     assert_empty_document_is_default::<EnvironmentConfig>("EnvironmentConfig");
     assert_empty_document_is_default::<RepoConfig>("RepoConfig");
 }
