@@ -21,7 +21,7 @@ and asserted against this file by the test suite.
 | --- | --- |
 | `create-and-route` | Do an upstream, proxy, scoped plugin and consumer actually serve authenticated traffic? |
 | `reapply-is-a-no-op` | Does applying the same desired state again change nothing — no normalization-induced false drift? |
-| `modify-and-delete-in-order` | Do modify and delete succeed in dependency-safe order, and does an unmanaged row survive shared mode? |
+| `modify-and-delete-in-order` | Do modify and delete succeed in dependency-safe order — including the large-prune guard refusing first, and `--allow-large-prune` carrying it through — and does an unmanaged row survive shared mode? |
 | `credentials-generate-and-rotate` | Does a rotated credential authenticate, does the old one stop, and does no plaintext reach a log, a commit, a comment or an artifact? |
 | `partial-failure-recovery` | Do the recovery safeguards preserve successful work and ownership across an injected partial failure and an ambiguous response? |
 | `ledger-publication-failure` | When state publication is rejected after a gateway mutation and retries are exhausted, does a fresh runner recover ownership by the documented procedure — rather than treating a runner-local ledger as durable? |
