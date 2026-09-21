@@ -434,14 +434,19 @@ def stale_deployment_guard_violations(
                 )
 
         for marker in contract["gateway"]:
+            # Present AND after the guard. "After" alone would let the step be
+            # deleted outright, and a reconciling job that never loads the
+            # credential bundle or never builds the binary is not a safer job
+            # — it is a differently broken one.
+            #
             # `rfind` within the job: an enumerator job builds the binary too,
             # and it is this job's copy that has to come from the refreshed head.
             marker_index = body.rfind(marker)
-            if marker_index >= 0 and marker_index < guard_index:
+            if not 0 <= guard_index < marker_index:
                 violations.append(
-                    f"{label}: {marker!r} must not run before the freshness guard; "
-                    "the binary, the desired state and the ledger all come from the "
-                    "refreshed protected head"
+                    f"{label}: {marker!r} must be present and must not run before "
+                    "the freshness guard; the binary, the desired state and the "
+                    "ledger all come from the refreshed protected head"
                 )
     return violations
 
@@ -1027,11 +1032,21 @@ MINT_STEP = "- name: Mint narrowly scoped state-writer token"
 
 
 def workflow_jobs(text: str) -> list[tuple[str, str]]:
-    """Every conventionally indented job, with its own body."""
+    """Every job under `jobs:`, with its own body.
+
+    Scoped to the `jobs:` mapping rather than every two-space key in the file.
+    A bare indentation match also collects `on:`'s triggers — `push`,
+    `schedule` — as "jobs", and a per-job security rule that silently runs
+    against a trigger block is a rule nobody can reason about.
+    """
+    start = re.search(r"^jobs:\s*$", text, re.MULTILINE)
+    if start is None:
+        return []
+    section = re.split(r"^\S", text[start.end():], maxsplit=1, flags=re.MULTILINE)[0]
     jobs: list[tuple[str, str]] = []
-    for match in re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", text, re.MULTILINE):
+    for match in re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", section, re.MULTILINE):
         body = re.split(
-            r"^  \S|^\S", text[match.end():], maxsplit=1, flags=re.MULTILINE
+            r"^  \S|^\S", section[match.end():], maxsplit=1, flags=re.MULTILINE
         )[0]
         jobs.append((match.group("name"), body))
     return jobs

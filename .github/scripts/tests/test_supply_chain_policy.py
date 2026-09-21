@@ -1236,6 +1236,38 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("job 'apply'" in item for item in violations), violations
         )
 
+    def test_workflow_jobs_reads_jobs_not_trigger_keys(self):
+        # A bare two-space indentation match also collects `on:`'s triggers as
+        # "jobs". A per-job security rule silently running against a trigger
+        # block is a rule nobody can reason about.
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        names = [name for name, _ in check_supply_chain.workflow_jobs(text)]
+        self.assertIn("apply", names)
+        self.assertIn("list-envs", names)
+        for trigger in ("push", "schedule", "workflow_dispatch"):
+            self.assertNotIn(trigger, names)
+
+    def test_a_gateway_step_deleted_outright_is_still_a_violation(self):
+        # "After the guard" alone would let the step be removed entirely. A
+        # reconciling job that never loads the credential bundle is not a
+        # safer job; it is a differently broken one.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        for marker in contract["gateway"]:
+            with self.subTest(marker=marker):
+                stripped = text.replace(marker, "removed-marker")
+                self.assertNotEqual(stripped, text)
+                violations = check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", stripped, contract
+                )
+                self.assertTrue(
+                    any("must be present" in item for item in violations), violations
+                )
+
     def test_a_reconciling_job_is_identified_by_the_lock_it_holds(self):
         # Identifying the set by "jobs that already carry a guard" cannot
         # report a job for *not* carrying one. The lock is the definition: a
