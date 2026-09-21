@@ -354,6 +354,30 @@ def _touched_namespaces(changed_paths_file: Path) -> set[str]:
     return namespaces
 
 
+# The `EnvironmentScope` fields `gitforgeops envs --include-scopes` emits.
+#
+# The set is closed on purpose: an unmodelled field must not be able to change
+# what live review reads, and a *silently ignored* one is how a routing key
+# gets added on one side and never honoured on the other. It is also why a new
+# field breaks here rather than somewhere subtler — `tests/test_pr_input.py`
+# reads the Rust struct and fails when these lists drift from it, so the person
+# adding a field is told to decide whether live review should route on it.
+#
+# Live review itself routes on `environment`, `live_review` and `namespaces`
+# only. The rest are other workflows' business and are accepted, not used.
+TRUSTED_SCOPE_KEYS = frozenset(
+    {
+        "environment",
+        "live_review",
+        "namespaces",
+        "monitoring_environment",
+        "unattended_monitoring",
+    }
+)
+# Serialized only when set (`skip_serializing_if`), so absence is normal.
+TRUSTED_SCOPE_OPTIONAL_KEYS = frozenset({"promotion_requires"})
+
+
 def trusted_targets(
     root: Path, environment_scopes_json: str, changed_paths_file: Path
 ) -> list[dict[str, str]]:
@@ -368,13 +392,26 @@ def trusted_targets(
     normalized_scopes: list[tuple[str, set[str] | None]] = []
     seen_environments: set[str] = set()
     for scope in scopes:
-        if not isinstance(scope, dict) or set(scope) != {
-            "environment",
-            "live_review",
-            "namespaces",
-        }:
+        if not isinstance(scope, dict):
+            raise InputError("trusted environment scope must be an object")
+        keys = set(scope)
+        unknown = sorted(keys - TRUSTED_SCOPE_KEYS - TRUSTED_SCOPE_OPTIONAL_KEYS)
+        missing = sorted(TRUSTED_SCOPE_KEYS - keys)
+        if unknown or missing:
             raise InputError(
-                "trusted environment scope must contain only environment, live_review, and namespaces"
+                "trusted environment scope shape has drifted from "
+                "`EnvironmentScope`: "
+                + "; ".join(
+                    part
+                    for part in (
+                        f"unrecognized {', '.join(unknown)}" if unknown else "",
+                        f"missing {', '.join(missing)}" if missing else "",
+                    )
+                    if part
+                )
+                + ". Add the field to TRUSTED_SCOPE_KEYS or "
+                "TRUSTED_SCOPE_OPTIONAL_KEYS once you have decided whether live "
+                "review should route on it."
             )
         environment = scope.get("environment")
         live_review = scope.get("live_review")
