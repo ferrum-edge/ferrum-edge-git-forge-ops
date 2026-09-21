@@ -124,16 +124,19 @@ APPLY_REVISION_BINDINGS = (
 # means a workflow that needs no credential values is exempt by construction,
 # and one that starts binding them is covered the moment it does.
 BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
-# Per privileged reconciling workflow: the checkout step name, the job-level
-# markers that prove the environment lock is already held, and every step that
-# must not run before the freshness guard.
+# The job-level markers that prove the environment lock is already held, and
+# every step that must not run before the freshness guard.
+#
+# `lock` is expressed as patterns rather than one literal binding: what matters
+# is that the job binds *an* Environment and serializes on the shared
+# `ferrum-apply-<env>` group, not which expression names the environment. A
+# workflow with two privileged jobs legitimately spells them differently.
+ENVIRONMENT_BINDING = re.compile(r"^    environment: \$\{\{ .+ \}\}$", re.MULTILINE)
+APPLY_CONCURRENCY_GROUP = re.compile(
+    r"^      group: ferrum-apply-\$\{\{ .+ \}\}$", re.MULTILINE
+)
 FRESH_HEAD_WORKFLOWS = {
     "apply-on-merge.yml": {
-        "checkout_step": "Check out protected main for apply",
-        "lock": (
-            "    environment: ${{ matrix.environment }}",
-            "      group: ferrum-apply-${{ matrix.environment }}",
-        ),
         "gateway": (
             "bash .github/scripts/install-ferrum-edge.sh",
             "run: cargo install --path . --locked",
@@ -142,11 +145,6 @@ FRESH_HEAD_WORKFLOWS = {
         ),
     },
     "rotate.yml": {
-        "checkout_step": "Check out protected main for rotation",
-        "lock": (
-            "    environment: ${{ inputs.environment }}",
-            "      group: ferrum-apply-${{ inputs.environment }}",
-        ),
         "gateway": (
             "run: cargo install --path . --locked",
             "- name: Load credential bundles",
@@ -352,73 +350,115 @@ def stale_deployment_guard_violations(
     re-run of an old workflow replays an old desired snapshot over newer
     configuration.
 
-    So the environment-bound job must, after the lock is held and before it
-    builds a binary or touches the gateway: re-fetch the protected branch, move
-    onto its current head, print both revisions, and fail closed unless the
-    triggering commit is still an ancestor of that head. Desired state, ledger
-    and binary then all come from the one commit.
+    So an environment-bound job must, after the lock is held and before it
+    builds a binary or touches the gateway: check out the protected branch with
+    enough history to test ancestry, re-fetch it, move onto its current head,
+    print both revisions, and fail closed unless the triggering commit is still
+    an ancestor of that head.
+
+    Evaluated **per job**. Measured across a whole file the rule only reads
+    correctly while a workflow has exactly one privileged job: `named_step`
+    would check the first guard and leave a second job's unchecked, and the
+    ordering comparisons would relate steps that never run in the same runner.
+    A staged promotion needs a second such job, and it needs its own guard.
     """
     violations: list[str] = []
-    checkout_step = contract["checkout_step"]
-    checkout = named_step(text, checkout_step)
-    if checkout is None:
-        violations.append(f"{workflow}: a {checkout_step!r} step is required")
-    else:
-        for required in FRESH_HEAD_CHECKOUT:
-            if required not in checkout:
-                violations.append(
-                    f"{workflow}: {checkout_step!r} must check out the protected "
-                    f"branch with enough history to test ancestry; missing {required!r}"
+    # A *reconciling* job is one that holds the lock: it binds a GitHub
+    # Environment and serializes on the shared `ferrum-apply-<env>` group.
+    # Defining the set that way rather than "jobs that already have a guard"
+    # is what makes a missing guard visible — a job identified by the guard it
+    # carries cannot be reported for not carrying one.
+    reconciling = [
+        (name, body)
+        for name, body in workflow_jobs(text)
+        if ENVIRONMENT_BINDING.search(body) and APPLY_CONCURRENCY_GROUP.search(body)
+    ]
+    if not reconciling:
+        return [
+            f"{workflow}: no environment-bound, ferrum-apply-serialized job exists, "
+            "so nothing reconciles under the lock the freshness guard depends on"
+        ]
+
+    for job, body in reconciling:
+        label = f"{workflow}: job {job!r}"
+        marker = f"      - name: {FRESH_HEAD_STEP}\n"
+        if marker not in body:
+            violations.append(
+                f"{label}: a {FRESH_HEAD_STEP!r} step must refresh the protected "
+                "branch and reject a stale deployment before any gateway step"
+            )
+            continue
+        guard_index = body.index(marker)
+
+        # The privileged checkout is whichever `actions/checkout` precedes the
+        # guard in this job. Naming it by step title would force every job to
+        # reuse one label; what matters is the three properties.
+        checkout = _checkout_before(body, guard_index)
+        if checkout is None:
+            violations.append(
+                f"{label}: a checkout of the protected branch must precede "
+                f"{FRESH_HEAD_STEP!r}"
+            )
+        else:
+            for required in FRESH_HEAD_CHECKOUT:
+                if required not in checkout:
+                    violations.append(
+                        f"{label}: the checkout before {FRESH_HEAD_STEP!r} must name "
+                        "the protected branch with enough history to test ancestry; "
+                        f"missing {required!r}"
+                    )
+
+        guard = named_step(body, FRESH_HEAD_STEP) or ""
+        for required in FRESH_HEAD_CONTROLS:
+            if required not in guard:
+                violations.append(f"{label}: {FRESH_HEAD_STEP!r} is missing {required!r}")
+
+        if workflow == "apply-on-merge.yml":
+            satisfied = any(
+                all(required in guard for required in family)
+                for family in APPLY_REVISION_BINDINGS
+            )
+            if not satisfied:
+                # Report the closest family so the message names something
+                # actionable rather than every alternative at once.
+                closest = max(
+                    APPLY_REVISION_BINDINGS,
+                    key=lambda family: sum(1 for item in family if item in guard),
                 )
-    guard = named_step(text, FRESH_HEAD_STEP)
-    if guard is None:
-        return violations + [
-            f"{workflow}: a {FRESH_HEAD_STEP!r} step must refresh the protected "
-            "branch and reject a stale deployment before any gateway step"
-        ]
-    for required in FRESH_HEAD_CONTROLS:
-        if required not in guard:
-            violations.append(
-                f"{workflow}: {FRESH_HEAD_STEP!r} is missing {required!r}"
-            )
-    if workflow == "apply-on-merge.yml":
-        satisfied = [
-            family
-            for family in APPLY_REVISION_BINDINGS
-            if all(required in guard for required in family)
-        ]
-        if not satisfied:
-            # Report the closest family so the message names something
-            # actionable rather than every alternative at once.
-            closest = max(
-                APPLY_REVISION_BINDINGS,
-                key=lambda family: sum(1 for item in family if item in guard),
-            )
-            missing = [item for item in closest if item not in guard]
-            violations.append(
-                f"{workflow}: {FRESH_HEAD_STEP!r} must bind PR attribution to "
-                "unchanged executable and desired inputs; no recognized "
-                f"implementation is complete (closest is missing {', '.join(repr(item) for item in missing)})"
-            )
-    guard_index = text.find(f"      - name: {FRESH_HEAD_STEP}\n")
-    for marker in contract["lock"]:
-        marker_index = text.find(marker)
-        if not 0 <= marker_index < guard_index:
-            violations.append(
-                f"{workflow}: the freshness guard must run inside the "
-                f"environment-bound, serialized job; {marker!r} does not precede it"
-            )
-    for marker in contract["gateway"]:
-        # `rfind`: the enumerator job builds the binary too, and it is the
-        # privileged job's copy that has to come from the refreshed head.
-        marker_index = text.rfind(marker)
-        if not 0 <= guard_index < marker_index:
-            violations.append(
-                f"{workflow}: {marker!r} must not run before the freshness guard; "
-                "the binary, the desired state and the ledger all come from the "
-                "refreshed protected head"
-            )
+                missing = [item for item in closest if item not in guard]
+                violations.append(
+                    f"{label}: {FRESH_HEAD_STEP!r} must bind PR attribution to "
+                    "unchanged executable and desired inputs; no recognized "
+                    "implementation is complete (closest is missing "
+                    f"{', '.join(repr(item) for item in missing)})"
+                )
+
+        for marker in contract["gateway"]:
+            # `rfind` within the job: an enumerator job builds the binary too,
+            # and it is this job's copy that has to come from the refreshed head.
+            marker_index = body.rfind(marker)
+            if marker_index >= 0 and marker_index < guard_index:
+                violations.append(
+                    f"{label}: {marker!r} must not run before the freshness guard; "
+                    "the binary, the desired state and the ledger all come from the "
+                    "refreshed protected head"
+                )
     return violations
+
+
+def _checkout_before(body: str, guard_index: int) -> str | None:
+    """The last `actions/checkout` step in this job before the guard."""
+    matches = [
+        match
+        for match in re.finditer(r"^      - (?:name:.*|uses: actions/checkout@)", body, re.MULTILINE)
+        if match.start() < guard_index
+    ]
+    for match in reversed(matches):
+        end = body.find("\n      - ", match.end())
+        step = body[match.start():] if end < 0 else body[match.start():end]
+        if "uses: actions/checkout@" in step:
+            return step
+    return None
 
 
 def trusted_classifier_violations(
@@ -986,6 +1026,17 @@ def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
 MINT_STEP = "- name: Mint narrowly scoped state-writer token"
 
 
+def workflow_jobs(text: str) -> list[tuple[str, str]]:
+    """Every conventionally indented job, with its own body."""
+    jobs: list[tuple[str, str]] = []
+    for match in re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", text, re.MULTILINE):
+        body = re.split(
+            r"^  \S|^\S", text[match.end():], maxsplit=1, flags=re.MULTILINE
+        )[0]
+        jobs.append((match.group("name"), body))
+    return jobs
+
+
 def privileged_jobs(text: str) -> list[tuple[str, str]]:
     """Every job that mints the state-writer token, with its own body.
 
@@ -998,14 +1049,7 @@ def privileged_jobs(text: str) -> list[tuple[str, str]]:
     Returning the jobs lets the rule be applied where it is true — in each of
     them — which is both the correct reading and a strictly stronger one.
     """
-    jobs: list[tuple[str, str]] = []
-    for match in re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", text, re.MULTILINE):
-        body = re.split(
-            r"^  \S|^\S", text[match.end():], maxsplit=1, flags=re.MULTILINE
-        )[0]
-        if MINT_STEP in body:
-            jobs.append((match.group("name"), body))
-    return jobs
+    return [(name, body) for name, body in workflow_jobs(text) if MINT_STEP in body]
 
 
 def state_writer_token_violations(

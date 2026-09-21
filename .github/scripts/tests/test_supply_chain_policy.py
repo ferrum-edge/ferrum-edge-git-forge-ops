@@ -1177,38 +1177,108 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
 
     def test_privileged_checkout_must_name_the_branch_with_full_history(self):
         # `actions/checkout` with no `ref:` selects the triggering commit, and
-        # a shallow clone cannot answer the ancestry question at all.
-        for workflow, step in (
-            ("apply-on-merge.yml", "Check out protected main for apply"),
-            ("rotate.yml", "Check out protected main for rotation"),
-        ):
+        # a shallow clone cannot answer the ancestry question at all. The
+        # checkout under test is whichever one precedes the guard in that job,
+        # not a step with a particular title — a workflow with two privileged
+        # jobs legitimately labels them differently.
+        for workflow in ("apply-on-merge.yml", "rotate.yml"):
             with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
                 root = self._mirror_repo(Path(directory))
                 path = root / ".github/workflows" / workflow
                 text = path.read_text(encoding="utf-8")
-                # The privileged checkout is the only one in either file that
-                # names a ref or a depth; dropping both lines reproduces the
-                # event-SHA, shallow default.
-                self.assertEqual(
-                    text.count(
-                        "          ref: ${{ github.event.repository.default_branch }}\n"
-                    ),
-                    1,
-                )
                 path.write_text(
                     text.replace(
                         "          ref: ${{ github.event.repository.default_branch }}\n",
                         "",
-                        1,
-                    ).replace("          fetch-depth: 0\n", "", 1),
+                    ).replace("          fetch-depth: 0\n", ""),
                     encoding="utf-8",
                 )
                 violations = self._violations(root)
                 self.assertTrue(
                     any(
-                        step in item and "protected branch with enough history" in item
+                        "protected branch with enough history" in item
                         for item in violations
                     ),
+                    violations,
+                )
+
+    def test_every_guarded_job_is_checked_independently(self):
+        # Measured across a whole file, `named_step` checks the FIRST guard and
+        # leaves a second privileged job's unchecked. A staged promotion needs
+        # a second such job, and it needs its own guard.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", text, contract
+            ),
+            [],
+        )
+
+        # Duplicate the privileged job, then break the copy's guard.
+        start = text.index("  apply:\n")
+        job = text[start:]
+        broken = job.replace("  apply:\n", "  promote:\n", 1).replace(
+            '          git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head" || {\n',
+            "          true || {\n",
+            1,
+        )
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", text + broken, contract
+        )
+        self.assertTrue(
+            any("job 'promote'" in item and "is missing" in item for item in violations),
+            violations,
+        )
+        self.assertFalse(
+            any("job 'apply'" in item for item in violations), violations
+        )
+
+    def test_a_reconciling_job_is_identified_by_the_lock_it_holds(self):
+        # Identifying the set by "jobs that already carry a guard" cannot
+        # report a job for *not* carrying one. The lock is the definition: a
+        # job that binds an Environment and serializes on ferrum-apply-<env>
+        # reconciles, and must be guarded.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", text, contract
+            ),
+            [],
+        )
+
+        # Remove the guard entirely: the job is still identified by its lock,
+        # so the absence is reported.
+        start = text.index(
+            "      - name: Refresh protected branch and reject stale deployments"
+        )
+        end = text.index("      - name: ", start + 20)
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", text[:start] + text[end:], contract
+        )
+        self.assertTrue(
+            any("must refresh the protected branch" in item for item in violations),
+            violations,
+        )
+
+        # And a file where nothing holds the lock reconciles nothing.
+        for removed in (
+            "    environment: ${{ matrix.environment }}\n",
+            "      group: ferrum-apply-${{ matrix.environment }}\n",
+        ):
+            with self.subTest(removed=removed):
+                mutated = text.replace(removed, "", 1)
+                self.assertNotEqual(mutated, text)
+                violations = check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", mutated, contract
+                )
+                self.assertTrue(
+                    any("reconciles under the lock" in item for item in violations),
                     violations,
                 )
 
