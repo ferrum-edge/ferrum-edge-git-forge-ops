@@ -119,6 +119,7 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let violations = violation_lines(&stderr).count();
             let mut checks = vec![if output.status.success() {
                 Check::pass(
                     "settings-audit",
@@ -129,16 +130,40 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
                         evidence_lines(&stdout).count()
                     ),
                 )
+            } else if violations == 0 {
+                // The auditor exits non-zero for two different reasons, and
+                // collapsing them is the mistake this whole scope is built to
+                // avoid. Violations are a finding about the repository; an
+                // API error, a token without Administration: read, or a
+                // missing App id means the audit *did not happen*. Reporting
+                // the second as a failed control would be inventing a result,
+                // and reporting it as a pass would be worse.
+                Check::new(
+                    "settings-audit",
+                    "Repository settings match the launch baseline",
+                    Scope::Github,
+                    Status::Unknown,
+                    format!(
+                        "{AUDITOR} could not complete: {}",
+                        stderr
+                            .lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty())
+                            .unwrap_or("it exited non-zero without saying why")
+                    ),
+                )
+                .remedy(
+                    "This is not a finding about the repository — the audit did not \
+                     run. Check that GH_TOKEN carries Administration: read for this \
+                     repository, then re-run.",
+                )
             } else {
                 Check::new(
                     "settings-audit",
                     "Repository settings match the launch baseline",
                     Scope::Github,
                     Status::Fail,
-                    format!(
-                        "{AUDITOR} reported {} violation(s)",
-                        violation_lines(&stderr).count()
-                    ),
+                    format!("{AUDITOR} reported {violations} violation(s)"),
                 )
                 .remedy(
                     "Each line below names one control. \

@@ -275,6 +275,41 @@ fn github_checks_surface_each_auditor_violation_as_its_own_finding() {
 }
 
 #[test]
+fn an_auditor_that_could_not_run_is_unknown_not_a_failed_control() {
+    // The auditor exits non-zero for two different reasons. Violations are a
+    // finding about the repository; an API error or a token without
+    // Administration: read means the audit did not happen. Reporting the
+    // second as a failed control invents a result about settings nobody
+    // looked at.
+    let dir = repo(&[(
+        ".github/scripts/audit_settings.py",
+        "import sys\n\
+         print('settings audit failed closed: GitHub API request failed for \
+         repos/acme/repo/rulesets: 403', file=sys.stderr)\n\
+         sys.exit(1)\n",
+    )]);
+    let checks = doctor::github::run(
+        dir.path(),
+        &doctor::github::GithubContext {
+            repository: Some("acme/repo".to_string()),
+            token: Some("token".to_string()),
+            state_writer_app_id: Some("99".to_string()),
+            template_repo: false,
+        },
+    );
+    let check = find(&checks, "settings-audit");
+    assert_eq!(check.status, Status::Unknown, "{check:?}");
+    assert!(check.detail.contains("could not complete"), "{check:?}");
+    assert!(check.detail.contains("403"), "{check:?}");
+    // ...and it must not manufacture per-control findings from an empty
+    // violation list.
+    assert!(
+        checks.iter().all(|check| check.id != "settings-control"),
+        "{checks:?}"
+    );
+}
+
+#[test]
 fn a_missing_auditor_is_unknown_not_a_pass() {
     let dir = repo(&[]);
     let checks = doctor::github::run(
