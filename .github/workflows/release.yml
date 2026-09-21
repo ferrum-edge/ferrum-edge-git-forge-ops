@@ -34,6 +34,9 @@ jobs:
       contents: read
       checks: read
       pull-requests: read
+      # Reading the lifecycle workflow's run history and downloading its
+      # sealed result artifact.
+      actions: read
     steps:
       - name: Verify the published commit passed every required check
         env:
@@ -108,6 +111,57 @@ jobs:
             cat "$checks_file"
             exit 1
           }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The required-checks test above proves the unit and policy suites
+      # passed. It cannot prove the product was run: the lifecycle suite is
+      # not a per-PR required check, because it needs a gateway build and
+      # turning every pull request red when that is unavailable would train
+      # people to override the gate rather than fix it.
+      #
+      # So publication verifies it directly, bound to the exact revision being
+      # published. Every way of NOT having a result — never ran, ran for
+      # another revision, ran against another gateway build, was cancelled
+      # mid-run, skipped a scenario — fails here, because a release gate that
+      # can be satisfied by an absence is not a gate.
+      - name: Require a lifecycle acceptance result for this revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          runs_file=$(mktemp)
+          trap 'rm -f "$runs_file"' EXIT
+
+          gh api "repos/${REPO}/actions/workflows/lifecycle.yml/runs?head_sha=${RELEASE_SHA}&per_page=20" \
+            > "$runs_file" || {
+            echo "::error::The lifecycle acceptance workflow's run history could not be read."
+            exit 1
+          }
+          run_id=$(jq -er '
+            [.workflow_runs[]? | select(.conclusion == "success")]
+            | if length > 0 then (sort_by(.updated_at) | last | .id)
+              else error("no successful lifecycle run for this revision")
+              end
+          ' "$runs_file") || {
+            echo "::error::No successful GitForgeOps Lifecycle Acceptance run exists for ${RELEASE_SHA}. Dispatch the workflow for this commit and re-run the release."
+            exit 1
+          }
+
+          gh run download "$run_id" --repo "$REPO" \
+            --name "lifecycle-result-${RELEASE_SHA}" --dir acceptance || {
+            echo "::error::Lifecycle run ${run_id} published no result artifact for ${RELEASE_SHA}."
+            exit 1
+          }
+
+          python3 .github/scripts/lifecycle_result.py verify \
+            --result acceptance/lifecycle-result.json \
+            --revision "$RELEASE_SHA" \
+            --summary "$GITHUB_STEP_SUMMARY"
 
   docker:
     name: Build and push Docker image
