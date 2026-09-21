@@ -230,6 +230,14 @@ class RunbookTests(unittest.TestCase):
         self.assertIn("[REDACTED]", runner)
         self.assertIn("FERRUM_ADMIN_JWT_SECRET", runner)
 
+    def test_the_sqlite_store_is_created_inside_the_throwaway_workdir(self):
+        # `?mode=rwc` is load-bearing: sqlx opens a SQLite URL read-write but
+        # will not create a missing file without it, and the failure reads
+        # like a permissions problem rather than a missing flag.
+        runner = (ROOT / "tests/lifecycle/run.sh").read_text(encoding="utf-8")
+        self.assertIn("sqlite://$WORKDIR/ferrum.db?mode=rwc", runner)
+        self.assertIn('rm -rf "$WORKDIR"', runner)
+
     def test_the_runner_removes_everything_it_created(self):
         runner = (ROOT / "tests/lifecycle/run.sh").read_text(encoding="utf-8")
         self.assertIn("trap cleanup EXIT", runner)
