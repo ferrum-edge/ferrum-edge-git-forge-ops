@@ -79,12 +79,14 @@ python3 .github/scripts/lifecycle_result.py verify \
 | `LIFECYCLE_RESULT` | where to seal the result (default `./lifecycle-result.json`) |
 | `LIFECYCLE_ONLY` | run one scenario id |
 | `LIFECYCLE_GATEWAY_PORT` | gateway port (default `18080`) |
-| `LIFECYCLE_GATEWAY_CMD` | how to start the gateway; the one integration point that depends on the companion's own CLI |
+| `LIFECYCLE_GATEWAY_CMD` | how to start the gateway. Left unset, the runner reads the build's own `--help`, picks the first of `serve`/`server`/`run`/`start`/`gateway` it offers, and falls back to the bare binary (a gateway configured entirely through `FERRUM_*`) |
+| `LIFECYCLE_GATEWAY_MODE` | `FERRUM_MODE` for the gateway (default `database`) |
 | `LIFECYCLE_GATEWAY_EXTERNAL` | do not start a gateway; one is already listening |
 | `GITFORGEOPS_BINARY` | the binary under test (default `gitforgeops` on `PATH`) |
 
 If the gateway does not answer `GET /health` within 30 seconds the run **fails
-loudly** with the command it used. It does not fall back to skipping every
+loudly** with the command it used *and the subcommands that build actually
+offers*. It does not fall back to skipping every
 scenario: a suite that silently certifies nothing is worse than one that is
 red.
 
