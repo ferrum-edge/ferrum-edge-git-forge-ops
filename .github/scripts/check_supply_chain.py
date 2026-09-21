@@ -95,21 +95,48 @@ FRESH_HEAD_CONTROLS = (
     'git cat-file -e "${TRIGGER_SHA}^{commit}"',
     'git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head"',
 )
-APPLY_REVISION_BINDING = (
-    'git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- .',
-    "':(exclude).state/**'",
-    "':(exclude)assembled/**'",
+# The guard must bind PR attribution to unchanged executable and desired
+# inputs. Two implementations satisfy that, and the policy accepts either as
+# long as ONE of them is completely present:
+#
+#   1. a literal pathspec diff, permitting only generated state to differ;
+#   2. the shared deployment-scope classifier, which decides supersession from
+#      the same path list that schedules a replacement apply run.
+#
+# Spelled as families rather than one flat tuple because a half-present
+# implementation is the dangerous case: an operator who deletes one exclusion
+# from (1), or the branch argument from (2), has silently changed what the
+# guard refuses.
+APPLY_REVISION_BINDINGS = (
+    (
+        'git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- .',
+        "':(exclude).state/**'",
+        "':(exclude)assembled/**'",
+    ),
+    (
+        "python3 .github/scripts/deployment_scope.py classify \\",
+        '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
+    ),
 )
-# Per privileged reconciling workflow: the checkout step name, the job-level
-# markers that prove the environment lock is already held, and every step that
-# must not run before the freshness guard.
+# A workflow that resolves `${gh-env-secret:...}` placeholders reads the
+# credential bundle secrets, and every such workflow must use the fail-closed
+# loader. Keying the rule on the binding rather than on a hand-maintained list
+# means a workflow that needs no credential values is exempt by construction,
+# and one that starts binding them is covered the moment it does.
+BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
+# The job-level markers that prove the environment lock is already held, and
+# every step that must not run before the freshness guard.
+#
+# `lock` is expressed as patterns rather than one literal binding: what matters
+# is that the job binds *an* Environment and serializes on the shared
+# `ferrum-apply-<env>` group, not which expression names the environment. A
+# workflow with two privileged jobs legitimately spells them differently.
+ENVIRONMENT_BINDING = re.compile(r"^    environment: \$\{\{ .+ \}\}$", re.MULTILINE)
+APPLY_CONCURRENCY_GROUP = re.compile(
+    r"^      group: ferrum-apply-\$\{\{ .+ \}\}$", re.MULTILINE
+)
 FRESH_HEAD_WORKFLOWS = {
     "apply-on-merge.yml": {
-        "checkout_step": "Check out protected main for apply",
-        "lock": (
-            "    environment: ${{ matrix.environment }}",
-            "      group: ferrum-apply-${{ matrix.environment }}",
-        ),
         "gateway": (
             "bash .github/scripts/install-ferrum-edge.sh",
             "run: cargo install --path . --locked",
@@ -118,11 +145,6 @@ FRESH_HEAD_WORKFLOWS = {
         ),
     },
     "rotate.yml": {
-        "checkout_step": "Check out protected main for rotation",
-        "lock": (
-            "    environment: ${{ inputs.environment }}",
-            "      group: ferrum-apply-${{ inputs.environment }}",
-        ),
         "gateway": (
             "run: cargo install --path . --locked",
             "- name: Load credential bundles",
@@ -328,61 +350,120 @@ def stale_deployment_guard_violations(
     re-run of an old workflow replays an old desired snapshot over newer
     configuration.
 
-    So the environment-bound job must, after the lock is held and before it
-    builds a binary or touches the gateway: re-fetch the protected branch, move
-    onto its current head, print both revisions, and fail closed unless the
-    triggering commit is still an ancestor of that head. Desired state, ledger
-    and binary then all come from the one commit.
+    So an environment-bound job must, after the lock is held and before it
+    builds a binary or touches the gateway: check out the protected branch with
+    enough history to test ancestry, re-fetch it, move onto its current head,
+    print both revisions, and fail closed unless the triggering commit is still
+    an ancestor of that head.
+
+    Evaluated **per job**. Measured across a whole file the rule only reads
+    correctly while a workflow has exactly one privileged job: `named_step`
+    would check the first guard and leave a second job's unchecked, and the
+    ordering comparisons would relate steps that never run in the same runner.
+    A staged promotion needs a second such job, and it needs its own guard.
     """
     violations: list[str] = []
-    checkout_step = contract["checkout_step"]
-    checkout = named_step(text, checkout_step)
-    if checkout is None:
-        violations.append(f"{workflow}: a {checkout_step!r} step is required")
-    else:
-        for required in FRESH_HEAD_CHECKOUT:
-            if required not in checkout:
-                violations.append(
-                    f"{workflow}: {checkout_step!r} must check out the protected "
-                    f"branch with enough history to test ancestry; missing {required!r}"
-                )
-    guard = named_step(text, FRESH_HEAD_STEP)
-    if guard is None:
-        return violations + [
-            f"{workflow}: a {FRESH_HEAD_STEP!r} step must refresh the protected "
-            "branch and reject a stale deployment before any gateway step"
+    # A *reconciling* job is one that holds the lock: it binds a GitHub
+    # Environment and serializes on the shared `ferrum-apply-<env>` group.
+    # Defining the set that way rather than "jobs that already have a guard"
+    # is what makes a missing guard visible — a job identified by the guard it
+    # carries cannot be reported for not carrying one.
+    reconciling = [
+        (name, body)
+        for name, body in workflow_jobs(text)
+        if ENVIRONMENT_BINDING.search(body) and APPLY_CONCURRENCY_GROUP.search(body)
+    ]
+    if not reconciling:
+        return [
+            f"{workflow}: no environment-bound, ferrum-apply-serialized job exists, "
+            "so nothing reconciles under the lock the freshness guard depends on"
         ]
-    for required in FRESH_HEAD_CONTROLS:
-        if required not in guard:
+
+    for job, body in reconciling:
+        label = f"{workflow}: job {job!r}"
+        marker = f"      - name: {FRESH_HEAD_STEP}\n"
+        if marker not in body:
             violations.append(
-                f"{workflow}: {FRESH_HEAD_STEP!r} is missing {required!r}"
+                f"{label}: a {FRESH_HEAD_STEP!r} step must refresh the protected "
+                "branch and reject a stale deployment before any gateway step"
             )
-    if workflow == "apply-on-merge.yml":
-        for required in APPLY_REVISION_BINDING:
+            continue
+        guard_index = body.index(marker)
+
+        # The privileged checkout is whichever `actions/checkout` precedes the
+        # guard in this job. Naming it by step title would force every job to
+        # reuse one label; what matters is the three properties.
+        checkout = _checkout_before(body, guard_index)
+        if checkout is None:
+            violations.append(
+                f"{label}: a checkout of the protected branch must precede "
+                f"{FRESH_HEAD_STEP!r}"
+            )
+        else:
+            for required in FRESH_HEAD_CHECKOUT:
+                if required not in checkout:
+                    violations.append(
+                        f"{label}: the checkout before {FRESH_HEAD_STEP!r} must name "
+                        "the protected branch with enough history to test ancestry; "
+                        f"missing {required!r}"
+                    )
+
+        guard = named_step(body, FRESH_HEAD_STEP) or ""
+        for required in FRESH_HEAD_CONTROLS:
             if required not in guard:
-                violations.append(
-                    f"{workflow}: {FRESH_HEAD_STEP!r} must bind PR attribution "
-                    f"to unchanged executable and desired inputs; missing {required!r}"
+                violations.append(f"{label}: {FRESH_HEAD_STEP!r} is missing {required!r}")
+
+        if workflow == "apply-on-merge.yml":
+            satisfied = any(
+                all(required in guard for required in family)
+                for family in APPLY_REVISION_BINDINGS
+            )
+            if not satisfied:
+                # Report the closest family so the message names something
+                # actionable rather than every alternative at once.
+                closest = max(
+                    APPLY_REVISION_BINDINGS,
+                    key=lambda family: sum(1 for item in family if item in guard),
                 )
-    guard_index = text.find(f"      - name: {FRESH_HEAD_STEP}\n")
-    for marker in contract["lock"]:
-        marker_index = text.find(marker)
-        if not 0 <= marker_index < guard_index:
-            violations.append(
-                f"{workflow}: the freshness guard must run inside the "
-                f"environment-bound, serialized job; {marker!r} does not precede it"
-            )
-    for marker in contract["gateway"]:
-        # `rfind`: the enumerator job builds the binary too, and it is the
-        # privileged job's copy that has to come from the refreshed head.
-        marker_index = text.rfind(marker)
-        if not 0 <= guard_index < marker_index:
-            violations.append(
-                f"{workflow}: {marker!r} must not run before the freshness guard; "
-                "the binary, the desired state and the ledger all come from the "
-                "refreshed protected head"
-            )
+                missing = [item for item in closest if item not in guard]
+                violations.append(
+                    f"{label}: {FRESH_HEAD_STEP!r} must bind PR attribution to "
+                    "unchanged executable and desired inputs; no recognized "
+                    "implementation is complete (closest is missing "
+                    f"{', '.join(repr(item) for item in missing)})"
+                )
+
+        for marker in contract["gateway"]:
+            # Present AND after the guard. "After" alone would let the step be
+            # deleted outright, and a reconciling job that never loads the
+            # credential bundle or never builds the binary is not a safer job
+            # — it is a differently broken one.
+            #
+            # `rfind` within the job: an enumerator job builds the binary too,
+            # and it is this job's copy that has to come from the refreshed head.
+            marker_index = body.rfind(marker)
+            if not 0 <= guard_index < marker_index:
+                violations.append(
+                    f"{label}: {marker!r} must be present and must not run before "
+                    "the freshness guard; the binary, the desired state and the "
+                    "ledger all come from the refreshed protected head"
+                )
     return violations
+
+
+def _checkout_before(body: str, guard_index: int) -> str | None:
+    """The last `actions/checkout` step in this job before the guard."""
+    matches = [
+        match
+        for match in re.finditer(r"^      - (?:name:.*|uses: actions/checkout@)", body, re.MULTILINE)
+        if match.start() < guard_index
+    ]
+    for match in reversed(matches):
+        end = body.find("\n      - ", match.end())
+        step = body[match.start():] if end < 0 else body[match.start():end]
+        if "uses: actions/checkout@" in step:
+            return step
+    return None
 
 
 def trusted_classifier_violations(
@@ -947,6 +1028,45 @@ def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
     return violations
 
 
+MINT_STEP = "- name: Mint narrowly scoped state-writer token"
+
+
+def workflow_jobs(text: str) -> list[tuple[str, str]]:
+    """Every job under `jobs:`, with its own body.
+
+    Scoped to the `jobs:` mapping rather than every two-space key in the file.
+    A bare indentation match also collects `on:`'s triggers — `push`,
+    `schedule` — as "jobs", and a per-job security rule that silently runs
+    against a trigger block is a rule nobody can reason about.
+    """
+    start = re.search(r"^jobs:\s*$", text, re.MULTILINE)
+    if start is None:
+        return []
+    section = re.split(r"^\S", text[start.end():], maxsplit=1, flags=re.MULTILINE)[0]
+    jobs: list[tuple[str, str]] = []
+    for match in re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", section, re.MULTILINE):
+        body = re.split(
+            r"^  \S|^\S", section[match.end():], maxsplit=1, flags=re.MULTILINE
+        )[0]
+        jobs.append((match.group("name"), body))
+    return jobs
+
+
+def privileged_jobs(text: str) -> list[tuple[str, str]]:
+    """Every job that mints the state-writer token, with its own body.
+
+    The install-before-mint-before-commit rule is about ONE job's step
+    sequence. Measured across a whole file it silently stops meaning anything
+    as soon as a workflow has two privileged jobs: `rfind` picks up the second
+    job's build and `find` the first job's mint, and the ordering test compares
+    steps that never run in the same runner.
+
+    Returning the jobs lets the rule be applied where it is true — in each of
+    them — which is both the correct reading and a strictly stronger one.
+    """
+    return [(name, body) for name, body in workflow_jobs(text) if MINT_STEP in body]
+
+
 def state_writer_token_violations(
     workflow: str, text: str, commit_step: str
 ) -> list[str]:
@@ -955,13 +1075,21 @@ def state_writer_token_violations(
         violations.append(
             f"{workflow}: state-writer token must not be persisted by checkout"
         )
-    install_index = text.rfind("run: cargo install --path . --locked")
-    mint_index = text.find("- name: Mint narrowly scoped state-writer token")
-    commit_index = text.find(commit_step)
-    if not (install_index >= 0 and install_index < mint_index < commit_index):
+    jobs = privileged_jobs(text)
+    if not jobs:
         violations.append(
-            f"{workflow}: state-writer token must be minted after untrusted builds and immediately before state persistence"
+            f"{workflow}: no job mints the state-writer token, so the ownership "
+            "ledger is never published"
         )
+    for name, body in jobs:
+        install_index = body.rfind("run: cargo install --path . --locked")
+        mint_index = body.find(MINT_STEP)
+        commit_index = body.find(commit_step)
+        if not (install_index >= 0 and install_index < mint_index < commit_index):
+            violations.append(
+                f"{workflow}: job {name!r}: state-writer token must be minted after "
+                "untrusted builds and immediately before state persistence"
+            )
     for required in (
         "STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}",
         "git config --local http.https://github.com/.extraheader",
@@ -1197,26 +1325,31 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"{privileged_workflow}: must fail before environment binding when repo config is absent"
             )
-        if ".github/scripts/credential_bundles.py" not in text:
-            violations.append(
-                f"{privileged_workflow}: credential bundles must use the fail-closed loader"
+        # Scoped to the workflows that actually read credential values. A
+        # privileged workflow that binds no bundle secret cannot mishandle one.
+        if BUNDLE_SECRET_BINDING in text:
+            if ".github/scripts/credential_bundles.py" not in text:
+                violations.append(
+                    f"{privileged_workflow}: credential bundles must use the fail-closed loader"
+                )
+            if "except json.JSONDecodeError" in text:
+                violations.append(
+                    f"{privileged_workflow}: malformed credential bundles must not fail open"
+                )
+            # The loader reads enumerated env bindings, so every shard the Rust
+            # allocator may create has to be bound here by name. Cross-checked
+            # against MAX_BUNDLE_SHARDS on both sides.
+            violations.extend(
+                credential_bundle_binding_violations(
+                    privileged_workflow, text, shard_limit
+                )
             )
-        if "except json.JSONDecodeError" in text:
-            violations.append(
-                f"{privileged_workflow}: malformed credential bundles must not fail open"
-            )
-        # The loader reads enumerated env bindings, so every shard the Rust
-        # allocator may create has to be bound here by name. Cross-checked
-        # against MAX_BUNDLE_SHARDS on both sides.
-        violations.extend(
-            credential_bundle_binding_violations(privileged_workflow, text, shard_limit)
-        )
-        # $RUNNER_TEMP is wiped with the workspace; a bare `mktemp` lands in a
-        # /tmp that self-hosted runners share between jobs and never clean.
-        if '"${RUNNER_TEMP:-/tmp}/ferrum-creds-' not in text:
-            violations.append(
-                f"{privileged_workflow}: the resolved credential file must live under $RUNNER_TEMP"
-            )
+            # $RUNNER_TEMP is wiped with the workspace; a bare `mktemp` lands in
+            # a /tmp that self-hosted runners share between jobs and never clean.
+            if '"${RUNNER_TEMP:-/tmp}/ferrum-creds-' not in text:
+                violations.append(
+                    f"{privileged_workflow}: the resolved credential file must live under $RUNNER_TEMP"
+                )
         if "[skip ci]" in text:
             violations.append(
                 f"{privileged_workflow}: state commits must not suppress required checks with [skip ci]"

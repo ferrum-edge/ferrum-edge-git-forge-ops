@@ -572,16 +572,27 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         self.assertTrue(any("release identity" in item for item in release_identity))
 
+    @staticmethod
+    def _privileged_job(name: str, ordered: bool = True) -> str:
+        steps = [
+            "      - name: Mint narrowly scoped state-writer token",
+            "      - name: Commit state update",
+        ]
+        build = "      - run: cargo install --path . --locked"
+        body = [build, *steps] if ordered else [*steps, build]
+        return f"  {name}:\n    steps:\n" + "\n".join(body) + "\n"
+
+    AUTH_LINES = "\n".join(
+        [
+            "        STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}",
+            "        git config --local http.https://github.com/.extraheader",
+            "        git config --local --unset-all http.https://github.com/.extraheader",
+        ]
+    )
+
     def test_state_writer_token_must_follow_build_and_stay_ephemeral(self):
-        secure = "\n".join(
-            [
-                "run: cargo install --path . --locked",
-                "- name: Mint narrowly scoped state-writer token",
-                "- name: Commit state update",
-                "STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}",
-                "git config --local http.https://github.com/.extraheader",
-                "git config --local --unset-all http.https://github.com/.extraheader",
-            ]
+        secure = (
+            "jobs:\n" + self._privileged_job("apply") + self.AUTH_LINES + "\n"
         )
         self.assertEqual(
             check_supply_chain.state_writer_token_violations(
@@ -591,13 +602,52 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
 
         insecure = secure.replace(
-            "- name: Mint narrowly scoped state-writer token\n", ""
+            "      - name: Mint narrowly scoped state-writer token\n", ""
         ) + "\ntoken: ${{ steps.state-writer.outputs.token }}"
         violations = check_supply_chain.state_writer_token_violations(
             "rotate.yml", insecure, "- name: Commit state update"
         )
         self.assertTrue(any("persisted by checkout" in item for item in violations))
-        self.assertTrue(any("minted after" in item for item in violations))
+        self.assertTrue(any("never published" in item for item in violations))
+
+    def test_every_privileged_job_is_ordered_independently(self):
+        # Measured across a whole file, the rule stops meaning anything the
+        # moment a workflow has two privileged jobs: `rfind` picks up the
+        # second job's build and `find` the first job's mint, and the ordering
+        # test compares steps that never run in the same runner. A second job
+        # that mints before it builds must be caught, and must be NAMED.
+        text = (
+            "jobs:\n"
+            + self._privileged_job("apply")
+            + self._privileged_job("promote", ordered=False)
+            + self.AUTH_LINES
+            + "\n"
+        )
+        violations = check_supply_chain.state_writer_token_violations(
+            "apply-on-merge.yml", text, "- name: Commit state update"
+        )
+        self.assertTrue(
+            any("job 'promote'" in item and "minted after" in item for item in violations),
+            violations,
+        )
+        self.assertFalse(
+            any("job 'apply'" in item for item in violations), violations
+        )
+
+    def test_two_correctly_ordered_privileged_jobs_are_accepted(self):
+        text = (
+            "jobs:\n"
+            + self._privileged_job("apply")
+            + self._privileged_job("promote")
+            + self.AUTH_LINES
+            + "\n"
+        )
+        self.assertEqual(
+            check_supply_chain.state_writer_token_violations(
+                "apply-on-merge.yml", text, "- name: Commit state update"
+            ),
+            [],
+        )
 
     def test_state_push_retry_must_use_the_default_branch(self):
         commit_step = "- name: Commit state update"
@@ -1127,38 +1177,140 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
 
     def test_privileged_checkout_must_name_the_branch_with_full_history(self):
         # `actions/checkout` with no `ref:` selects the triggering commit, and
-        # a shallow clone cannot answer the ancestry question at all.
-        for workflow, step in (
-            ("apply-on-merge.yml", "Check out protected main for apply"),
-            ("rotate.yml", "Check out protected main for rotation"),
-        ):
+        # a shallow clone cannot answer the ancestry question at all. The
+        # checkout under test is whichever one precedes the guard in that job,
+        # not a step with a particular title — a workflow with two privileged
+        # jobs legitimately labels them differently.
+        for workflow in ("apply-on-merge.yml", "rotate.yml"):
             with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
                 root = self._mirror_repo(Path(directory))
                 path = root / ".github/workflows" / workflow
                 text = path.read_text(encoding="utf-8")
-                # The privileged checkout is the only one in either file that
-                # names a ref or a depth; dropping both lines reproduces the
-                # event-SHA, shallow default.
-                self.assertEqual(
-                    text.count(
-                        "          ref: ${{ github.event.repository.default_branch }}\n"
-                    ),
-                    1,
-                )
                 path.write_text(
                     text.replace(
                         "          ref: ${{ github.event.repository.default_branch }}\n",
                         "",
-                        1,
-                    ).replace("          fetch-depth: 0\n", "", 1),
+                    ).replace("          fetch-depth: 0\n", ""),
                     encoding="utf-8",
                 )
                 violations = self._violations(root)
                 self.assertTrue(
                     any(
-                        step in item and "protected branch with enough history" in item
+                        "protected branch with enough history" in item
                         for item in violations
                     ),
+                    violations,
+                )
+
+    def test_every_guarded_job_is_checked_independently(self):
+        # Measured across a whole file, `named_step` checks the FIRST guard and
+        # leaves a second privileged job's unchecked. A staged promotion needs
+        # a second such job, and it needs its own guard.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", text, contract
+            ),
+            [],
+        )
+
+        # Duplicate the privileged job, then break the copy's guard.
+        start = text.index("  apply:\n")
+        job = text[start:]
+        broken = job.replace("  apply:\n", "  promote:\n", 1).replace(
+            '          git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head" || {\n',
+            "          true || {\n",
+            1,
+        )
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", text + broken, contract
+        )
+        self.assertTrue(
+            any("job 'promote'" in item and "is missing" in item for item in violations),
+            violations,
+        )
+        self.assertFalse(
+            any("job 'apply'" in item for item in violations), violations
+        )
+
+    def test_workflow_jobs_reads_jobs_not_trigger_keys(self):
+        # A bare two-space indentation match also collects `on:`'s triggers as
+        # "jobs". A per-job security rule silently running against a trigger
+        # block is a rule nobody can reason about.
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        names = [name for name, _ in check_supply_chain.workflow_jobs(text)]
+        self.assertIn("apply", names)
+        self.assertIn("list-envs", names)
+        for trigger in ("push", "schedule", "workflow_dispatch"):
+            self.assertNotIn(trigger, names)
+
+    def test_a_gateway_step_deleted_outright_is_still_a_violation(self):
+        # "After the guard" alone would let the step be removed entirely. A
+        # reconciling job that never loads the credential bundle is not a
+        # safer job; it is a differently broken one.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        for marker in contract["gateway"]:
+            with self.subTest(marker=marker):
+                stripped = text.replace(marker, "removed-marker")
+                self.assertNotEqual(stripped, text)
+                violations = check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", stripped, contract
+                )
+                self.assertTrue(
+                    any("must be present" in item for item in violations), violations
+                )
+
+    def test_a_reconciling_job_is_identified_by_the_lock_it_holds(self):
+        # Identifying the set by "jobs that already carry a guard" cannot
+        # report a job for *not* carrying one. The lock is the definition: a
+        # job that binds an Environment and serializes on ferrum-apply-<env>
+        # reconciles, and must be guarded.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", text, contract
+            ),
+            [],
+        )
+
+        # Remove the guard entirely: the job is still identified by its lock,
+        # so the absence is reported.
+        start = text.index(
+            "      - name: Refresh protected branch and reject stale deployments"
+        )
+        end = text.index("      - name: ", start + 20)
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", text[:start] + text[end:], contract
+        )
+        self.assertTrue(
+            any("must refresh the protected branch" in item for item in violations),
+            violations,
+        )
+
+        # And a file where nothing holds the lock reconciles nothing.
+        for removed in (
+            "    environment: ${{ matrix.environment }}\n",
+            "      group: ferrum-apply-${{ matrix.environment }}\n",
+        ):
+            with self.subTest(removed=removed):
+                mutated = text.replace(removed, "", 1)
+                self.assertNotEqual(mutated, text)
+                violations = check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", mutated, contract
+                )
+                self.assertTrue(
+                    any("reconciles under the lock" in item for item in violations),
                     violations,
                 )
 
@@ -1198,6 +1350,106 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations = self._violations(root)
         self.assertTrue(
             any("must bind PR attribution" in item for item in violations), violations
+        )
+
+    def test_either_recognized_attribution_binding_satisfies_the_policy(self):
+        # The guard may bind attribution with a literal pathspec diff or with
+        # the shared deployment-scope classifier. Both enforce the property;
+        # the policy must not require one spelling, or a legitimate rewrite of
+        # the guard could never be presented for review.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", workflow, contract
+            ),
+            [],
+        )
+        classifier = workflow.replace(
+            '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
+            "            ':(exclude).state/**' ':(exclude)assembled/**' || {\n"
+            '            echo "::error::Superseded deployment: ${DEFAULT_BRANCH} at $fresh_head contains changes beyond generated state since triggering commit $TRIGGER_SHA. Let the newer merge\'s apply run reconcile its own revision."\n'
+            "            exit 1\n"
+            "          }\n",
+            "          python3 .github/scripts/deployment_scope.py classify \\\n"
+            '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
+            1,
+        )
+        self.assertNotEqual(classifier, workflow, "the legacy binding moved")
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", classifier, contract
+            ),
+            [],
+        )
+
+    def test_a_half_present_attribution_binding_is_still_rejected(self):
+        # Deleting one exclusion, or the branch argument, silently changes what
+        # the guard refuses. Neither family may be accepted incomplete.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        half = workflow.replace("':(exclude)assembled/**'", "", 1)
+        self.assertNotEqual(half, workflow)
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", half, contract
+        )
+        self.assertTrue(
+            any("no recognized implementation is complete" in item for item in violations),
+            violations,
+        )
+
+    def test_bundle_loader_rules_follow_the_secret_binding(self):
+        # A privileged workflow that binds no credential-bundle secret cannot
+        # mishandle one, and requiring the loader there would force an
+        # unattended job to hold every consumer secret just to satisfy policy.
+        # One that DOES bind the secret is covered the moment it does.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(check_supply_chain.BUNDLE_SECRET_BINDING, text)
+            path.write_text(
+                # Every occurrence: the first is a cross-reference in a
+                # comment, and only the invocation matters.
+                text.replace("credential_bundles.py", "something_else.py"),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("fail-closed loader" in item for item in violations), violations
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            text = path.read_text(encoding="utf-8")
+            # Remove every bundle binding AND the loader step it feeds.
+            without = "\n".join(
+                line
+                for line in text.splitlines()
+                if check_supply_chain.BUNDLE_SECRET_BINDING not in line
+                and "credential_bundles.py" not in line
+                and "ferrum-creds-" not in line
+                and "FERRUM_CREDS_JSON_FILE" not in line
+            )
+            path.write_text(without + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertNotIn(
+            "fail-closed loader", result.stdout + result.stderr, "loader still required"
+        )
+        self.assertNotIn(
+            "under $RUNNER_TEMP",
+            result.stdout + result.stderr,
+            "credential file location still required",
         )
 
     def test_state_commits_must_not_suppress_required_checks(self):
