@@ -59,6 +59,10 @@ approved, and adds no new supply-chain surface.
 
 ### Commands
 
+Scenarios run in sequence and mutate shared state — one deletes the proxy —
+so each one deploys what it needs first. That is what makes `LIFECYCLE_ONLY`
+meaningful: any scenario can be run alone and still be reporting on itself.
+
 ```bash
 # Everything, sealed into ./lifecycle-result.json
 bash tests/lifecycle/run.sh
