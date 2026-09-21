@@ -983,6 +983,31 @@ def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
     return violations
 
 
+MINT_STEP = "- name: Mint narrowly scoped state-writer token"
+
+
+def privileged_jobs(text: str) -> list[tuple[str, str]]:
+    """Every job that mints the state-writer token, with its own body.
+
+    The install-before-mint-before-commit rule is about ONE job's step
+    sequence. Measured across a whole file it silently stops meaning anything
+    as soon as a workflow has two privileged jobs: `rfind` picks up the second
+    job's build and `find` the first job's mint, and the ordering test compares
+    steps that never run in the same runner.
+
+    Returning the jobs lets the rule be applied where it is true — in each of
+    them — which is both the correct reading and a strictly stronger one.
+    """
+    jobs: list[tuple[str, str]] = []
+    for match in re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", text, re.MULTILINE):
+        body = re.split(
+            r"^  \S|^\S", text[match.end():], maxsplit=1, flags=re.MULTILINE
+        )[0]
+        if MINT_STEP in body:
+            jobs.append((match.group("name"), body))
+    return jobs
+
+
 def state_writer_token_violations(
     workflow: str, text: str, commit_step: str
 ) -> list[str]:
@@ -991,13 +1016,21 @@ def state_writer_token_violations(
         violations.append(
             f"{workflow}: state-writer token must not be persisted by checkout"
         )
-    install_index = text.rfind("run: cargo install --path . --locked")
-    mint_index = text.find("- name: Mint narrowly scoped state-writer token")
-    commit_index = text.find(commit_step)
-    if not (install_index >= 0 and install_index < mint_index < commit_index):
+    jobs = privileged_jobs(text)
+    if not jobs:
         violations.append(
-            f"{workflow}: state-writer token must be minted after untrusted builds and immediately before state persistence"
+            f"{workflow}: no job mints the state-writer token, so the ownership "
+            "ledger is never published"
         )
+    for name, body in jobs:
+        install_index = body.rfind("run: cargo install --path . --locked")
+        mint_index = body.find(MINT_STEP)
+        commit_index = body.find(commit_step)
+        if not (install_index >= 0 and install_index < mint_index < commit_index):
+            violations.append(
+                f"{workflow}: job {name!r}: state-writer token must be minted after "
+                "untrusted builds and immediately before state persistence"
+            )
     for required in (
         "STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}",
         "git config --local http.https://github.com/.extraheader",

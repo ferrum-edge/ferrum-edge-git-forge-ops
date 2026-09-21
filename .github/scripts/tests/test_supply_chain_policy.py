@@ -572,16 +572,27 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         self.assertTrue(any("release identity" in item for item in release_identity))
 
+    @staticmethod
+    def _privileged_job(name: str, ordered: bool = True) -> str:
+        steps = [
+            "      - name: Mint narrowly scoped state-writer token",
+            "      - name: Commit state update",
+        ]
+        build = "      - run: cargo install --path . --locked"
+        body = [build, *steps] if ordered else [*steps, build]
+        return f"  {name}:\n    steps:\n" + "\n".join(body) + "\n"
+
+    AUTH_LINES = "\n".join(
+        [
+            "        STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}",
+            "        git config --local http.https://github.com/.extraheader",
+            "        git config --local --unset-all http.https://github.com/.extraheader",
+        ]
+    )
+
     def test_state_writer_token_must_follow_build_and_stay_ephemeral(self):
-        secure = "\n".join(
-            [
-                "run: cargo install --path . --locked",
-                "- name: Mint narrowly scoped state-writer token",
-                "- name: Commit state update",
-                "STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}",
-                "git config --local http.https://github.com/.extraheader",
-                "git config --local --unset-all http.https://github.com/.extraheader",
-            ]
+        secure = (
+            "jobs:\n" + self._privileged_job("apply") + self.AUTH_LINES + "\n"
         )
         self.assertEqual(
             check_supply_chain.state_writer_token_violations(
@@ -591,13 +602,52 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
 
         insecure = secure.replace(
-            "- name: Mint narrowly scoped state-writer token\n", ""
+            "      - name: Mint narrowly scoped state-writer token\n", ""
         ) + "\ntoken: ${{ steps.state-writer.outputs.token }}"
         violations = check_supply_chain.state_writer_token_violations(
             "rotate.yml", insecure, "- name: Commit state update"
         )
         self.assertTrue(any("persisted by checkout" in item for item in violations))
-        self.assertTrue(any("minted after" in item for item in violations))
+        self.assertTrue(any("never published" in item for item in violations))
+
+    def test_every_privileged_job_is_ordered_independently(self):
+        # Measured across a whole file, the rule stops meaning anything the
+        # moment a workflow has two privileged jobs: `rfind` picks up the
+        # second job's build and `find` the first job's mint, and the ordering
+        # test compares steps that never run in the same runner. A second job
+        # that mints before it builds must be caught, and must be NAMED.
+        text = (
+            "jobs:\n"
+            + self._privileged_job("apply")
+            + self._privileged_job("promote", ordered=False)
+            + self.AUTH_LINES
+            + "\n"
+        )
+        violations = check_supply_chain.state_writer_token_violations(
+            "apply-on-merge.yml", text, "- name: Commit state update"
+        )
+        self.assertTrue(
+            any("job 'promote'" in item and "minted after" in item for item in violations),
+            violations,
+        )
+        self.assertFalse(
+            any("job 'apply'" in item for item in violations), violations
+        )
+
+    def test_two_correctly_ordered_privileged_jobs_are_accepted(self):
+        text = (
+            "jobs:\n"
+            + self._privileged_job("apply")
+            + self._privileged_job("promote")
+            + self.AUTH_LINES
+            + "\n"
+        )
+        self.assertEqual(
+            check_supply_chain.state_writer_token_violations(
+                "apply-on-merge.yml", text, "- name: Commit state update"
+            ),
+            [],
+        )
 
     def test_state_push_retry_must_use_the_default_branch(self):
         commit_step = "- name: Commit state update"
