@@ -338,6 +338,16 @@ class RepositoryContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue((ROOT / path).exists(), path)
 
+    def test_every_shipped_example_is_upstream_managed(self):
+        # The examples are upstream's documentation of its own contract, and
+        # each one is named individually rather than by directory because
+        # `.gitforgeops/` also holds the customer's real config. A new example
+        # that nobody adds here is one no customer ever receives.
+        for example in sorted((ROOT / ".gitforgeops").glob("*.example.yaml")):
+            relative = f".gitforgeops/{example.name}"
+            with self.subTest(example=relative):
+                self.assertIn(relative, template_update.UPSTREAM_MANAGED)
+
     def test_no_path_is_both_upstream_managed_and_customer_owned(self):
         for owned in template_update.CUSTOMER_OWNED:
             self.assertNotIn(owned, template_update.UPSTREAM_MANAGED)

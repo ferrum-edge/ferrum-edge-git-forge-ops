@@ -47,6 +47,7 @@ Dockerfile  .dockerignore
 .github/ferrum-edge-checksums.txt  .github/cargo-audit-policy.json
 .github/dependabot.yml
 .gitforgeops/config.example.yaml  .gitforgeops/policies.example.yaml
+.gitforgeops/smoke.example.yaml
 docs/  README.md  CLAUDE.md  SECURITY.md  LICENSE.md
 ```
 

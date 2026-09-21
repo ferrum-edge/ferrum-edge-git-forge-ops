@@ -80,6 +80,7 @@ UPSTREAM_MANAGED = (
     ".github/dependabot.yml",
     ".gitforgeops/config.example.yaml",
     ".gitforgeops/policies.example.yaml",
+    ".gitforgeops/smoke.example.yaml",
     "docs",
     "README.md",
     "CLAUDE.md",
