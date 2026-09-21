@@ -2337,7 +2337,7 @@ having a result is a refusal:
 | a scenario reported `skipped` | blocked |
 | the record is older than the freshness window | blocked |
 
-`skipped` is a status a scenario may legitimately have — five of them need a
+`skipped` is a status a scenario may legitimately have — six of them need a
 disposable GitHub repository, which CI cannot create for itself. It is never a
 pass. Those run through
 [`github_acceptance.md`](tests/lifecycle/github_acceptance.md) and their

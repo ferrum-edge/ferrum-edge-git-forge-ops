@@ -27,6 +27,7 @@ and asserted against this file by the test suite.
 | `ledger-publication-failure` | When state publication is rejected after a gateway mutation and retries are exhausted, does a fresh runner recover ownership by the documented procedure — rather than treating a runner-local ledger as durable? |
 | `runner-interruption` | After an interruption mid-mutation, does the documented reconciliation path work, with state-override authorization only where it is genuinely required? |
 | `scheduling-and-attribution` | Queued and superseded applies, unrelated later merges, re-runs of an older workflow, PR-author credential delivery, policy-override attribution — including [#261](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/261)'s regression. |
+| `staged-promotion` | Does an opted-in production environment stay blocked until staging applied *and* served traffic for the same revision — and does breaking staging's routing block it even though the gateway accepted the write? |
 | `drift-monitoring` | Is drift distinguishable from a failed check and from a skipped one? |
 | `file-and-mesh-boundary` | For the advertised file/mesh profile: assembly, encrypted materialization, delivery boundary — and that assembly is *not* reported as live fleet deployment. |
 
@@ -150,7 +151,7 @@ ambiguous outcome stops the run rather than being retried blindly.
 
 ## The GitHub-repository half
 
-Five scenarios are about GitHub's own controls — environment approvals,
+Six scenarios are about GitHub's own controls — environment approvals,
 state-writer App permissions, protected-branch ledger writes, scheduling and
 attribution. They cannot run inside this repository's CI, which has no
 authority to create repositories, environments or Apps. They run against a

@@ -132,9 +132,10 @@ class CoverageTests(unittest.TestCase):
     """The declared scenarios are the product's promises, enumerated."""
 
     def test_every_acceptance_scenario_from_the_issue_is_declared(self):
-        # One id per acceptance bullet in #263. Adding a fail-closed gate to
-        # `apply` without adding a scenario here narrows what the suite
-        # certifies without narrowing what ships.
+        # One id per acceptance bullet in #263, plus the promotion path #268
+        # asks this suite to exercise. Adding a fail-closed gate to `apply`
+        # without adding a scenario here narrows what the suite certifies
+        # without narrowing what ships.
         self.assertEqual(
             set(lifecycle_result.REQUIRED_SCENARIO_IDS),
             {
@@ -146,6 +147,7 @@ class CoverageTests(unittest.TestCase):
                 "ledger-publication-failure",
                 "runner-interruption",
                 "scheduling-and-attribution",
+                "staged-promotion",
                 "drift-monitoring",
                 "file-and-mesh-boundary",
             },

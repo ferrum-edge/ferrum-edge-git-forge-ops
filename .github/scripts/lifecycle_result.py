@@ -95,6 +95,13 @@ REQUIRED_SCENARIOS: tuple[tuple[str, str], ...] = (
         "attribution — including the regression from #261.",
     ),
     (
+        "staged-promotion",
+        "An opted-in production environment cannot start until the required "
+        "staging apply and its traffic checks succeed for the same approved "
+        "source revision; breaking staging routing blocks production even "
+        "though the gateway accepted the write.",
+    ),
+    (
         "drift-monitoring",
         "The supported monitoring model: drift is distinguished from a failed "
         "check and from a skipped one.",

@@ -156,7 +156,36 @@ wholesale or by rolling back unrelated live configuration.
 
 ---
 
-## 6. `partial-failure-recovery` (optional here)
+## 6. `staged-promotion`
+
+Needs two environments and `promotion.requires` on the second.
+
+1. Declare `staging` and `production` in `.gitforgeops/config.yaml`, with
+   `promotion.requires: staging` on production, and declare at least one
+   traffic check for staging in `.gitforgeops/smoke.yaml`.
+2. Merge a resource change. Approve staging's apply.
+   - ✅ Production's job does not start until staging has applied **and** its
+     traffic checks have passed.
+3. **Break staging's routing without breaking the write** — point the upstream
+   at a port nothing listens on, so the gateway accepts the configuration and
+   the route answers 502. Merge and approve staging.
+   - ✅ Staging's apply succeeds, its traffic check fails, and production is
+     blocked with the reason named in the job summary.
+   - ❌ Production starting here is the bug the gate exists for.
+4. **Move `main` during verification.** While staging's checks run, merge a
+   resource change. Production must refuse the promotion rather than silently
+   deploying the newer revision, and the newer merge must run its own
+   staging→production cycle.
+5. Confirm staging's approval granted nothing in production: production's own
+   reviewer is still required.
+
+```bash
+python3 .github/scripts/lifecycle_result.py record \
+  --result lifecycle-result.json --scenario staged-promotion \
+  --status passed --detail "502 staging blocked production; mid-flight merge refused"
+```
+
+## 7. `partial-failure-recovery` (optional here)
 
 Runs locally against a fault-injecting proxy — see
 [README.md#injecting-failures](README.md#injecting-failures). Record it from
@@ -164,7 +193,7 @@ whichever environment you actually exercised.
 
 ---
 
-## 7. Seal and publish
+## 8. Seal and publish
 
 Re-seal so the record certifies the revision you actually tested:
 
@@ -183,7 +212,7 @@ and the record is inside the freshness window. That is the same computation
 
 ---
 
-## 8. Clean up
+## 9. Clean up
 
 - delete the repository
 - delete its Environments and their secrets

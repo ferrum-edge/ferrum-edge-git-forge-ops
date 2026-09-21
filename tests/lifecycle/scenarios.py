@@ -330,6 +330,13 @@ def scenario_scheduling_and_attribution(harness: Harness) -> str:
     )
 
 
+def scenario_staged_promotion(harness: Harness) -> str:
+    raise NotImplementedError(
+        "needs a disposable GitHub repository with two approval-gated "
+        "environments; run through tests/lifecycle/github_acceptance.md"
+    )
+
+
 def scenario_drift_monitoring(harness: Harness) -> str:
     # Out-of-band change: the gateway now has a row the repository declares
     # differently. `--exit-on-drift` must say 2, and must not say 1.
@@ -386,6 +393,7 @@ SCENARIOS = {
     "ledger-publication-failure": scenario_ledger_publication_failure,
     "runner-interruption": scenario_runner_interruption,
     "scheduling-and-attribution": scenario_scheduling_and_attribution,
+    "staged-promotion": scenario_staged_promotion,
     "drift-monitoring": scenario_drift_monitoring,
     "file-and-mesh-boundary": scenario_file_and_mesh_boundary,
 }
