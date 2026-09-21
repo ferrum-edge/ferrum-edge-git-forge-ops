@@ -305,13 +305,32 @@ def scenario_modify_and_delete_in_order(harness: Harness) -> str:
     # an order the gateway accepts.
     harness.remove(f"resources/{NAMESPACE}/proxies/orders.yaml")
     harness.remove(f"resources/{NAMESPACE}/plugins/orders-key-auth.yaml")
-    harness.run("apply", "--auto-approve")
+
+    # Two of four managed rows is over the 25% default, so the large-prune
+    # guard must refuse first. Asserting that it fires is the point: a safety
+    # gate nobody has watched refuse is a gate nobody knows works, and simply
+    # passing --allow-large-prune here would have tested the deletion while
+    # silently retiring the guard from the suite.
+    refused = harness.run("apply", "--auto-approve", expect=1)
+    if "large-prune" not in refused.stderr and "--allow-large-prune" not in refused.stderr:
+        raise ScenarioFailure(
+            "a deletion over the prune threshold was not refused by the "
+            f"large-prune guard\n{refused.stderr}"
+        )
+
+    # Then the documented way through it.
+    harness.run("apply", "--auto-approve", "--allow-large-prune")
+    harness.expect_status("/orders/status/200", 404, attempts=5)
 
     if not unmanaged_proxy_exists(harness):
         raise ScenarioFailure(
             "shared mode deleted a resource this repository never declared"
         )
-    return "modify and delete succeeded in dependency order; unmanaged row survived"
+    return (
+        "modify applied; the large-prune guard refused the deletion and "
+        "--allow-large-prune carried it through in dependency order; the "
+        "unmanaged row survived"
+    )
 
 
 def scenario_credentials_generate_and_rotate(harness: Harness) -> str:
