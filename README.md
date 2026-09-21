@@ -358,7 +358,8 @@ order — deep detail for each control lives in
 - **Watch the settings audit.** It runs weekly, but GitHub disables schedules on
   a quiet repository — dispatch it by hand from the Actions tab now and then, or
   re-run `bootstrap_repo_settings.py` without `--apply` to see the same drift as
-  a local diff.
+  a local diff. `gitforgeops doctor` runs the same auditor and folds its findings
+  in beside the local and gateway checks; see [Setup doctor](#setup-doctor).
 - **Rotate credentials deliberately.** Use the `rotate.yml` workflow rather than
   editing or reordering a credential array; entry position is the broker's slot
   identity. See [Rotation](#rotation) and
@@ -1680,6 +1681,9 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--allow-plaintext-plugin-config PLUGIN_NAME]  # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
 gitforgeops verify [--format text|json]                 # declared traffic checks against the data plane
+
+gitforgeops doctor [--format text|json] [--scope local|github|gateway|all] \
+  [--repo OWNER/REPO] [--state-writer-app-id N]  # read-only readiness diagnosis
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops version [--format text|json] # package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \
@@ -1745,6 +1749,81 @@ Use `diff` for a comparison that does not preview credential allocation.
 - When any live value is captured for brokering, `--credential-bundle-output PRIVATE_PATH` is mandatory. It atomically writes the exact live values under their canonical broker slots, shards them into `FERRUM_CREDS_BUNDLE*` objects under the same 40 KiB policy as allocation, forces mode 0600 on Unix, and refuses any path inside the resource tree or another Git worktree. The credential import bundle is published before the redacted tree, so a later publication failure cannot discard the only captured copy.
 - Treat both the source backup and credential import bundle as plaintext secrets. To verify locally without copying values into an environment variable, set `FERRUM_CREDS_JSON_FILE=/secure/path/credential-import.json` and run `gitforgeops plan`. To seed GitHub, set each top-level `FERRUM_CREDS_BUNDLE*` object as the JSON value of the same-named GitHub Environment Secret (for example, `jq -c '.FERRUM_CREDS_BUNDLE' credential-import.json | gh secret set FERRUM_CREDS_BUNDLE --env production`). Confirm the redacted config resolves without drift, then securely remove the local artifacts according to your storage policy.
 - `import` writes per-resource YAML for the four gateway kinds only; API specs and gateway trust bundles present in the source backup are reported as skipped rather than silently dropped, because they are managed through `/api-specs` and `/gateway-trust-bundles`, not through this repo. Unknown future top-level backup sections are also named explicitly. Present `counts` / `resource_counts` objects are validated against the decoded document before publication so a truncated-but-parseable backup cannot become an incomplete desired tree. That enforcement is scoped to `import`, which turns a document into permanent repository state: on live reads (`diff`, `plan`, `apply`, drift-check) a seal that disagrees is printed as a warning and discarded, so a gateway that omits `counts.upstreams` or a cached export that elides `api_specs` cannot take down every command over metadata no decision is made from.
+
+## Setup doctor
+
+One command for "is this repository ready to deploy to this environment, and
+what is still misconfigured?" It provisions nothing, applies nothing, rotates
+nothing, and prints no secret value.
+
+```bash
+gitforgeops doctor                       # local + GitHub metadata
+gitforgeops doctor --scope all --env production
+gitforgeops doctor --format json         # same checks, machine-readable
+```
+
+```
+=== GitForgeOps Setup Doctor ===
+
+-- local --
+PASS    Repository configuration parses: .gitforgeops/config.yaml declares 2 environment(s): production, staging
+FAIL    Configured overlays exist: missing overlay directories: staging -> overlays/staging
+        -> Create the directory (an empty one is valid) or remove `overlay:` from that environment.
+FAIL    Admin JWT signing secret is configured: FERRUM_ADMIN_JWT_SECRET is not set
+        -> api mode needs the gateway's signing secret (>= 32 characters). Presence is not
+           correctness: the gateway scope proves whether the value and its claims are accepted.
+
+-- github --
+UNKNOWN Repository settings match the launch baseline: no GH_TOKEN with Administration: read
+        -> Export GH_TOKEN=$(gh auth token) and re-run. This is reported as unknown rather
+           than passed on purpose.
+
+4 passed, 2 failed, 0 warned, 1 unknown, 3 skipped.
+UNKNOWN is not a pass: those checks could not be performed.
+Not ready to deploy: resolve every FAIL above.
+```
+
+Exit code `0` when nothing is blocking, `3` when something is. Three is
+deliberate: `1` means the diagnosis itself failed to run, and "we looked, and
+the answer is no" is a different thing.
+
+### Scopes are trust boundaries
+
+| Scope | Needs | Checks |
+| --- | --- | --- |
+| `local` (default) | nothing | repository config and overlays, template vs deployment repository, resource tree, policy config, validator binary and digest allowlist, per-mode requirements, process-environment parse |
+| `github` (default) | `GH_TOKEN` with Administration: read | delegates to `audit_settings.py`: branch ruleset, App bypass, environment protections, labels, required checks — and republishes each violation as its own finding |
+| `gateway` (opt-in) | that environment's own credentials | `GET /health` and `GET /cluster` only: connectivity, TLS/CA/mTLS, whether the minted token's claims are accepted, and whether admin writes are enabled |
+
+The GitHub scope deliberately carries **no baseline of its own**. It runs the
+same auditor that `bootstrap_repo_settings.py` writes for and
+`settings-audit.yml` schedules, so doctor, bootstrap and the scheduled audit
+cannot describe three different sets of controls.
+
+### The five statuses, and why `UNKNOWN` exists
+
+`PASS` / `FAIL` / `WARN` are the obvious three. The other two carry the weight:
+
+- **`UNKNOWN`** — the check could not be performed. No administration-read
+  token, no environment credentials, an API that does not expose the answer.
+  It never renders as a pass, and the summary says out loud that those checks
+  did not look. Guessing that a control is probably fine is how a repository
+  gets declared ready without anyone having verified it.
+- **`SKIP`** — the check does not apply. A file-mode environment has no Admin
+  API; a template repository has no deployment target. A fresh template copy
+  therefore reports *intentionally unconfigured* rather than broken, which is
+  what it is.
+
+### Secrets
+
+Credentials are described by presence and never by value, in text and in JSON
+alike. Presence is also not correctness — a `FERRUM_ADMIN_JWT_SECRET` that is
+set but wrong passes every local check and answers 401 halfway through an
+apply — so the local scope says "is set (presence only)" and the gateway scope
+is where the value is actually exercised. A rejected token's remediation prints
+the four claim settings (`issuer`, `role`, `audience`, `ttl`) to compare
+against the gateway's own configuration, because an unset one means "use the
+documented default", not "send nothing".
 
 ## Adopting an existing gateway
 

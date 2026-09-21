@@ -171,6 +171,30 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
         format: ReportFormat,
     },
+    /// Read-only readiness diagnosis: is this repository able to deploy, and
+    /// what is still misconfigured?
+    ///
+    /// Provisions nothing, applies nothing, rotates nothing, and prints no
+    /// secret value. Checks are grouped by trust boundary — `local` needs no
+    /// credential, `github` needs an administration-read token, `gateway`
+    /// needs the environment's own credentials and issues reads only.
+    Doctor {
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+        /// Which trust boundaries to check. Repeatable. Defaults to `local`
+        /// and `github`: the gateway scope is opt-in because it needs an
+        /// environment's deployment credentials.
+        #[arg(long, value_enum)]
+        scope: Vec<DoctorScope>,
+        /// `owner/repo` for the GitHub-metadata scope. Defaults to
+        /// `GITHUB_REPOSITORY`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Numeric id of the state-writer GitHub App (repository variable
+        /// `GITFORGEOPS_STATE_APP_ID`; public metadata, not a credential).
+        #[arg(long)]
+        state_writer_app_id: Option<String>,
+    },
     /// Print the Cargo package version and build-time git metadata.
     Version {
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
@@ -201,6 +225,20 @@ pub enum ValidateFormat {
     Json,
     Github,
     GithubAnnotations,
+}
+
+/// Which trust boundary a `doctor` run is allowed to cross.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DoctorScope {
+    /// Repository and process environment. No credential.
+    Local,
+    /// Repository administration metadata, through `audit_settings.py`.
+    Github,
+    /// The environment's gateway. Reads only, and opt-in because it needs
+    /// that environment's deployment credentials.
+    Gateway,
+    /// Every scope above.
+    All,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

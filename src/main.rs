@@ -144,6 +144,21 @@ async fn main() {
             include_scopes,
         } => cmd_envs(format, include_scopes),
         cli::Commands::Verify { format } => cmd_verify(format, explicit_env.as_deref()).await,
+        cli::Commands::Doctor {
+            format,
+            scope,
+            repo,
+            state_writer_app_id,
+        } => {
+            cmd_doctor(
+                format,
+                &scope,
+                repo.as_deref(),
+                state_writer_app_id.as_deref(),
+                explicit_env.as_deref(),
+            )
+            .await
+        }
         cli::Commands::Version { format } => cmd_version(format),
         cli::Commands::Rotate {
             consumer,
@@ -3399,6 +3414,142 @@ async fn cmd_verify(
         cli::ReportFormat::Json => print!("{}", gitforgeops::json_output::pretty(&report)?),
     }
     if report.exit_code() != 0 {
+        process::exit(report.exit_code());
+    }
+    Ok(())
+}
+
+/// Read-only readiness diagnosis.
+///
+/// Three properties are load-bearing and are why this is not just a wrapper
+/// around the existing commands:
+///
+/// 1. **It never mutates.** No settings writer, no gateway write, no
+///    credential allocation, no state lock. The gateway scope reaches exactly
+///    `GET /health` and `GET /cluster`.
+/// 2. **It never guesses.** A check that could not run reports `UNKNOWN`, and
+///    `UNKNOWN` is not a pass — a laptop with no administration-read token has
+///    not verified the branch ruleset, and saying so is the whole point.
+/// 3. **It owns no baseline.** Repository settings are judged by
+///    `audit_settings.py`, the same script `bootstrap_repo_settings.py` writes
+///    and the scheduled audit runs, so the three cannot drift apart.
+async fn cmd_doctor(
+    format: cli::ReportFormat,
+    scopes: &[cli::DoctorScope],
+    repository: Option<&str>,
+    state_writer_app_id: Option<&str>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gitforgeops::doctor::{self, Check, Scope, Status};
+
+    let selected: Vec<cli::DoctorScope> = if scopes.is_empty() {
+        // The gateway scope needs an environment's deployment credentials, so
+        // it is never implied. Everything that can be answered without one is.
+        vec![cli::DoctorScope::Local, cli::DoctorScope::Github]
+    } else if scopes.contains(&cli::DoctorScope::All) {
+        vec![
+            cli::DoctorScope::Local,
+            cli::DoctorScope::Github,
+            cli::DoctorScope::Gateway,
+        ]
+    } else {
+        scopes.to_vec()
+    };
+
+    let root = std::path::PathBuf::from(".");
+    let mut report = doctor::Report::default();
+
+    // The env parse is itself a finding: `load_env_config` refuses an invalid
+    // enum, boolean or integer, and an operator seeing that failure from the
+    // middle of `apply` has no idea which variable is at fault.
+    let env_config = match config::load_env_config() {
+        Ok(env) => {
+            report.push(Check::pass(
+                "process-env",
+                "Process environment parses",
+                Scope::Local,
+                format!(
+                    "mode={:?}, apply_strategy={:?}",
+                    env.gateway_mode, env.apply_strategy
+                ),
+            ));
+            Some(env)
+        }
+        Err(error) => {
+            report.push(
+                Check::new(
+                    "process-env",
+                    "Process environment parses",
+                    Scope::Local,
+                    Status::Fail,
+                    format!("{error}"),
+                )
+                .remedy(
+                    "Every present FERRUM_* value must parse. A blank value means \
+                     \"unset\" and uses the documented default; an invalid one fails \
+                     before resources or credentials are read. See .env.example.",
+                ),
+            );
+            None
+        }
+    };
+
+    if selected.contains(&cli::DoctorScope::Local) {
+        report.extend(doctor::local::run(&root, env_config.as_ref()));
+    }
+
+    if selected.contains(&cli::DoctorScope::Github) {
+        let template_repo =
+            doctor::local::repository_kind(&root) == doctor::local::RepositoryKind::Template;
+        report.extend(doctor::github::run(
+            &root,
+            &doctor::github::GithubContext {
+                repository: repository
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("GITHUB_REPOSITORY").ok()),
+                token: std::env::var("GH_TOKEN")
+                    .ok()
+                    .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+                    .filter(|value| !value.trim().is_empty()),
+                state_writer_app_id: state_writer_app_id
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("GITFORGEOPS_STATE_APP_ID").ok())
+                    .filter(|value| !value.trim().is_empty()),
+                template_repo,
+            },
+        ));
+    }
+
+    if selected.contains(&cli::DoctorScope::Gateway) {
+        match (&env_config, resolve_runtime(explicit_env)) {
+            (Some(env), Ok((_, resolved, _))) => {
+                report.extend(doctor::gateway::run(&resolved.name, env).await);
+            }
+            (_, Err(error)) => report.push(
+                Check::new(
+                    "gateway-environment",
+                    "An environment could be selected",
+                    Scope::Gateway,
+                    Status::Unknown,
+                    format!("no environment could be resolved: {error}"),
+                )
+                .remedy("Pass --env NAME, or set FERRUM_ENV."),
+            ),
+            (None, _) => report.push(Check::new(
+                "gateway-environment",
+                "An environment could be selected",
+                Scope::Gateway,
+                Status::Unknown,
+                "the process environment did not parse, so no gateway client could be built",
+            )),
+        }
+    }
+
+    match format {
+        cli::ReportFormat::Text => print!("{}", report.render_text()),
+        cli::ReportFormat::Json => print!("{}", gitforgeops::json_output::pretty(&report)?),
+    }
+    if !report.is_ready() {
         process::exit(report.exit_code());
     }
     Ok(())

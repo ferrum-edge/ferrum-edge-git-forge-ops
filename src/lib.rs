@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod diagnostics;
 pub mod diff;
+pub mod doctor;
 pub mod error;
 pub mod http_client;
 pub mod import;

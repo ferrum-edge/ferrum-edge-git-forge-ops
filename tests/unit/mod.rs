@@ -6,6 +6,7 @@ mod cli_tests;
 mod companion_schema_tests;
 mod diff_exit_tests;
 mod diff_tests;
+mod doctor_tests;
 mod env_tests;
 mod file_target_tests;
 mod github_api_tests;

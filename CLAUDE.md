@@ -72,6 +72,9 @@ gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
                                                           # Exit stays 0 on offline apply blockers unless
                                                           # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
 gitforgeops verify [--format text|json]                   # Declared traffic checks vs the data plane (exit 4 on failure)
+
+gitforgeops doctor [--format text|json] [--scope local|github|gateway|all] \
+  [--repo OWNER/REPO] [--state-writer-app-id N]           # Read-only readiness diagnosis (exit 3 on a blocker)
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops version [--format text|json]                 # Cargo package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -627,6 +630,34 @@ in `src/policy/github_override.rs` and raw input verification in
 `src/policy/override_input.rs`. Audit entries record PR, review id, authorized
 head and actual applied revision; optional fields preserve old state loading.
 
+### Setup doctor (`src/doctor/`)
+
+`gitforgeops doctor` answers "is this repository ready to deploy, and what is
+still misconfigured" without provisioning anything. Three properties are
+load-bearing:
+
+1. **It never mutates.** No settings writer, no gateway write, no credential
+   allocation, no state lock. `doctor::gateway` reaches exactly `GET /health`
+   and `GET /cluster`.
+2. **It never guesses.** `Status::Unknown` is a check that could not be
+   performed (no administration-read token, no environment credentials) and is
+   never rendered as a pass; the text report says so explicitly. `Skipped` is a
+   check that does not apply (file mode has no Admin API; a template has no
+   deployment target), which is why a fresh template reads as intentionally
+   unconfigured rather than broken.
+3. **It owns no baseline.** Repository settings are judged by running
+   `audit_settings.py` — the same script `bootstrap_repo_settings.py` writes for
+   and `settings-audit.yml` schedules — and republishing each violation as its
+   own `settings-control` check, so the three cannot drift apart.
+
+Scopes are trust boundaries, not subjects: `local` (no credential), `github`
+(administration-read token) and `gateway` (that environment's deployment
+credentials, reads only). Default is `local,github`; the gateway scope is
+opt-in. Credentials are reported by presence and never by value —
+`Check::secret_presence` states plainly that presence is not correctness, and
+the gateway scope is where a wrong-but-present signing secret is actually
+caught (a 401 remediation prints the four claim settings to compare).
+
 ### Preview verdicts (`src/verdict.rs`)
 
 Two pure computations, shared so a preview and the run it previews cannot
@@ -842,6 +873,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/main.rs` — async Tokio entry, command dispatch
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `version`, `rotate`)
 - `src/version.rs` — `--version` / `version` identity (Cargo package version plus `build.rs` git metadata)
+- `src/doctor/` — read-only readiness diagnosis grouped by trust boundary: `local.rs` (repository + process env, no credential; template vs deployment repository), `github.rs` (delegates to `.github/scripts/audit_settings.py` — doctor owns no settings baseline of its own), `gateway.rs` (`GET /health` + `GET /cluster` only). `Status::Unknown` is never a pass and `DOCTOR_FAILED_EXIT_CODE` is 3, distinct from the command failing
 - `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
