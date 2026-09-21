@@ -73,8 +73,12 @@ PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
 # A SQLite file inside the throwaway workdir: `database` mode needs a config
 # store, and this is the only one that needs no service to be running. It goes
 # with the workdir when the trap fires.
+#
+# `?mode=rwc` is load-bearing. sqlx opens a SQLite URL read-write but will not
+# CREATE a missing file without it, and the failure — "unable to open database
+# file" — reads like a permissions problem rather than a missing flag.
 export FERRUM_DB_TYPE="${LIFECYCLE_DB_TYPE:-sqlite}"
-export FERRUM_DB_URL="${LIFECYCLE_DB_URL:-sqlite://$WORKDIR/ferrum.db}"
+export FERRUM_DB_URL="${LIFECYCLE_DB_URL:-sqlite://$WORKDIR/ferrum.db?mode=rwc}"
 
 # The gateway launch is the one integration point that depends on the
 # companion's own CLI surface, so it is DISCOVERED rather than guessed. A
