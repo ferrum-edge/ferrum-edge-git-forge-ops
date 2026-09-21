@@ -306,6 +306,15 @@ class ClassificationTests(unittest.TestCase):
         self.assertFalse(report.has_pins)
         self.assertEqual(report.redundant_pins, [])
 
+    def test_a_retired_stage_with_a_moved_clean_base_requires_a_repin(self):
+        pin = check_base_image_pin.parse_dockerfile(RETIRED_DOCKERFILE)
+        findings, digest = check_base_image_pin.parse_trivy_report(
+            report_document([], "sha256:dddd")
+        )
+        report = check_base_image_pin.classify(findings, pin, digest)
+        self.assertEqual(report.state, "repin")
+        self.assertTrue(report.digest_moved)
+
     def test_a_retired_stage_still_covers_a_purged_package(self):
         pin = check_base_image_pin.parse_dockerfile(RETIRED_DOCKERFILE)
         findings, _ = check_base_image_pin.parse_trivy_report(
@@ -421,12 +430,16 @@ class RenderTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
-    def run_main(self, vulnerabilities, extra_args=(), dockerfile=DOCKERFILE):
+    def run_main(
+        self, vulnerabilities, extra_args=(), dockerfile=DOCKERFILE, digest="sha256:cccc"
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "Dockerfile").write_text(dockerfile, encoding="utf-8")
             report_path = root / "scan.json"
-            report_path.write_text(json.dumps(report_document(vulnerabilities)), encoding="utf-8")
+            report_path.write_text(
+                json.dumps(report_document(vulnerabilities, digest)), encoding="utf-8"
+            )
             body = root / "report.md"
             with contextlib.redirect_stdout(io.StringIO()):
                 code = check_base_image_pin.main(
@@ -462,6 +475,14 @@ class MainTests(unittest.TestCase):
         code, body = self.run_main([], dockerfile=RETIRED_DOCKERFILE)
         self.assertEqual(code, 0)
         self.assertIn("needs no point-release package stage", body)
+
+    def test_a_retired_dockerfile_with_a_moved_clean_base_requests_a_repin(self):
+        code, body = self.run_main(
+            [], dockerfile=RETIRED_DOCKERFILE, digest="sha256:dddd"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("pins an older digest", body)
+        self.assertIn("debian:trixie-slim@sha256:dddd", body)
 
     def test_print_base_ref_emits_the_tag_without_a_digest(self):
         with tempfile.TemporaryDirectory() as directory:
