@@ -47,6 +47,7 @@ outcomes into the same result file before publishing.
 ### Prerequisites
 
 - `python3` (standard library only — no packages to install)
+- nothing else: the config store is a SQLite file the run creates and deletes
 - the `gitforgeops` binary on `PATH` (`cargo install --path . --locked`)
 - the `ferrum-edge` binary on `PATH`, installed through
   [`install-ferrum-edge.sh`](../../.github/scripts/install-ferrum-edge.sh),
@@ -66,7 +67,7 @@ bash tests/lifecycle/run.sh
 LIFECYCLE_ONLY=create-and-route bash tests/lifecycle/run.sh
 
 # Against a gateway you started yourself
-LIFECYCLE_GATEWAY_EXTERNAL=1 LIFECYCLE_GATEWAY_PORT=9000 \
+LIFECYCLE_GATEWAY_EXTERNAL=1 LIFECYCLE_ADMIN_PORT=9000 LIFECYCLE_PROXY_PORT=9001 \
   bash tests/lifecycle/run.sh
 
 # Read the result the way the release gate does
@@ -78,7 +79,9 @@ python3 .github/scripts/lifecycle_result.py verify \
 | --- | --- |
 | `LIFECYCLE_RESULT` | where to seal the result (default `./lifecycle-result.json`) |
 | `LIFECYCLE_ONLY` | run one scenario id |
-| `LIFECYCLE_GATEWAY_PORT` | gateway port (default `18080`) |
+| `LIFECYCLE_ADMIN_PORT` | admin API port (default `18080`) |
+| `LIFECYCLE_PROXY_PORT` | data-plane port (default `18081`) — a separate listener |
+| `LIFECYCLE_DB_TYPE` / `LIFECYCLE_DB_URL` | config store (default a SQLite file in the throwaway workdir) |
 | `LIFECYCLE_GATEWAY_CMD` | how to start the gateway. Left unset, the runner reads the build's own `--help`, picks the first of `serve`/`server`/`run`/`start`/`gateway` it offers, and falls back to the bare binary (a gateway configured entirely through `FERRUM_*`) |
 | `LIFECYCLE_GATEWAY_MODE` | `FERRUM_MODE` for the gateway (default `database`) |
 | `LIFECYCLE_GATEWAY_EXTERNAL` | do not start a gateway; one is already listening |
@@ -138,10 +141,10 @@ keep that log off CI.
 `partial-failure-recovery` needs the admin API to misbehave on demand — a 500
 after a commit, a connection dropped mid-response, a `X-Data-Source: cached`
 header on `/backup`. Put a fault-injecting reverse proxy between the harness
-and the gateway and point `LIFECYCLE_GATEWAY_PORT` at it:
+and the gateway and point `LIFECYCLE_ADMIN_PORT` at it:
 
 ```bash
-LIFECYCLE_GATEWAY_EXTERNAL=1 LIFECYCLE_GATEWAY_PORT=18081 \
+LIFECYCLE_GATEWAY_EXTERNAL=1 LIFECYCLE_ADMIN_PORT=18090 \
   bash tests/lifecycle/run.sh
 ```
 
