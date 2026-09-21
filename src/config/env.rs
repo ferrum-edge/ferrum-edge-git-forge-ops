@@ -127,6 +127,13 @@ pub struct EnvConfig {
     /// stderr warning, and under `GITHUB_ACTIONS` it is refused unless the
     /// gateway host is loopback.
     pub tls_no_verify: bool,
+    /// Data-plane base URL for `gitforgeops verify`.
+    ///
+    /// Its own setting rather than a reuse of `gateway_url`: verification asks
+    /// whether a *client* can reach the route that was just deployed, which is
+    /// a different endpoint from the admin API that accepted the write, and on
+    /// most deployments a different host entirely.
+    pub verify_base_url: Option<String>,
     /// Permit a cleartext `http://` gateway URL (default `false`).
     ///
     /// The admin JWT and every resolved consumer credential travel in the
@@ -191,6 +198,7 @@ impl Default for EnvConfig {
             mesh_file_output_path: DEFAULT_MESH_FILE_OUTPUT_PATH.to_string(),
             edge_binary_path: "ferrum-edge".to_string(),
             tls_no_verify: false,
+            verify_base_url: None,
             allow_insecure_http: false,
             ca_cert: None,
             client_cert: None,
@@ -236,6 +244,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
+/// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (verification is skipped)  |
 /// | `FERRUM_ALLOW_INSECURE_HTTP` | `allow_insecure_http` | `false` (an `http://` gateway URL is refused) |
 /// | `FERRUM_GATEWAY_CA_CERT`     | `ca_cert`          | `None`                           |
 /// | `FERRUM_GATEWAY_CLIENT_CERT` | `client_cert`      | `None`                           |
@@ -282,6 +291,9 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
     // "no gateway configured" rather than as a malformed URL.
     let gateway_url = non_empty_env("FERRUM_GATEWAY_URL");
     let tls_no_verify = parse_bool_env("FERRUM_TLS_NO_VERIFY", false)?;
+    // Environment secret: unset interpolates to "" and must read as
+    // "no data plane configured", not as an empty base URL.
+    let verify_base_url = non_empty_env("FERRUM_VERIFY_BASE_URL");
     let allow_insecure_http = parse_bool_env("FERRUM_ALLOW_INSECURE_HTTP", false)?;
     let warnings = validate_gateway_transport(
         gateway_url.as_deref(),
@@ -297,6 +309,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         // Some("") would produce misleading downstream errors ("secret too
         // short") instead of the clear "not configured" ones.
         gateway_url,
+        verify_base_url,
         admin_jwt_secret: non_empty_env("FERRUM_ADMIN_JWT_SECRET"),
         admin_jwt_issuer: non_empty_env("FERRUM_ADMIN_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),

@@ -161,6 +161,16 @@ pub enum Commands {
         #[arg(long)]
         include_scopes: bool,
     },
+    /// Run this environment's declared traffic checks against its data plane.
+    ///
+    /// A successful apply proves the gateway accepted a configuration write.
+    /// This proves it is serving it. Checks are declared in
+    /// `.gitforgeops/smoke.yaml`; there is no hook and no shell, because a
+    /// promotion gate runs with deployment credentials in its environment.
+    Verify {
+        #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+        format: ReportFormat,
+    },
     /// Print the Cargo package version and build-time git metadata.
     Version {
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]

@@ -71,6 +71,7 @@ gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
                                                           # Post PR comment; optionally require live comparison.
                                                           # Exit stays 0 on offline apply blockers unless
                                                           # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
+gitforgeops verify [--format text|json]                   # Declared traffic checks vs the data plane (exit 4 on failure)
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops version [--format text|json]                 # Cargo package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -383,6 +384,47 @@ longer strands an authorized deployment. `GENERATED_PATHS` (`.state/**`,
 `assembled/**`) is in neither half: the apply writes it, so it must not reject a
 queued run and must not re-trigger the job that produced it. Operator recovery
 for an already-superseded run is `README.md#recovering-a-superseded-apply`.
+
+### Staged promotion
+
+`promotion.requires: <env>` on an environment takes it out of the parallel
+matrix and into a second phase. `EnvironmentScope.promotion_requires` is what
+`apply-on-merge.yml` splits on: `null` keeps today's independent behaviour
+(same merge, parallel jobs, own approval, own concurrency group), non-null puts
+the environment in the `promote` job. `RepoConfig::validate` refuses a
+predecessor that does not exist, a self-reference, and any cycle — each would
+produce a matrix entry waiting on a record no job will ever write.
+
+Ordering is not authorization. `needs: [list-envs, apply]` is the coarse half;
+the precise half is `.github/scripts/promotion_record.py`. Each environment's
+apply writes `{environment, source_revision, apply_result, verify_result,
+authorized, run_id, actor, pull_request}` as an artifact, and `require` refuses
+unless the named predecessor's record exists, applied `success`, verified
+`success`, **and** recorded the revision this job is about to apply. Only
+`success` authorizes: `skipped` (file mode has no data plane), `not_run`
+(no declared checks) and `cancelled` all block. Staging and production
+legitimately assemble different bytes — different overlays — so what is bound
+is the source commit, never the assembled document.
+
+The promote job runs the same freshness guard and the same
+`deployment_scope.py classify`, so a deployment-affecting merge during staging
+verification refuses the promotion instead of silently deploying the newer
+revision; that merge runs its own staging→production cycle. The ledger is still
+read from the refreshed head, so revision pinning cannot resurrect an obsolete
+`.state/<env>.json`. `check_supply_chain.py::state_writer_token_violations`
+evaluates `install < mint < commit` per privileged job, because both jobs carry
+it.
+
+Traffic checks are **data, never code** (`src/verify/`): a job holding
+deployment credentials must not execute an arbitrary command from a repository
+file, so the closed schema is the whole execution surface. TLS is always
+verified in this path — `FERRUM_TLS_NO_VERIFY` is deliberately not threaded
+into `verify::runner`, because a check that accepts any certificate has not
+verified TLS; a private CA goes in `FERRUM_GATEWAY_CA_CERT`, which it honours. Header values are an
+explicit `literal:` or `slot:` (exactly one), and an unresolvable slot fails the
+check rather than sending an empty header — an empty credential would make a
+`401`-expecting check pass for the wrong reason. Results carry name, method,
+path and status only; the response body is never read.
 
 ### Ownership modes
 
@@ -813,6 +855,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
+- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `exit_code` is `VERIFY_FAILED_EXIT_CODE` = 4), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, the response body is never read)
 - `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
 - `src/diagnostics.rs` — the shared log sanitizer (`sanitize` / `sanitize_line` / `sanitize_block`
   and their `safe*` `Display` adapters) every diagnostic routes untrusted ids, namespaces,
