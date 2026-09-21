@@ -329,14 +329,25 @@ that runs before any build or gateway call: re-fetch the branch, `git checkout
 --force -B <branch> refs/remotes/origin/<branch>` (stay on the branch — the
 ledger commit later pushes it), print the triggering SHA and the branch head,
 and fail closed unless `git merge-base --is-ancestor` puts the trigger inside
-that head. Apply additionally permits differences from the trigger only under
-`.state/**` and `assembled/**`, binding the triggering PR's authorization and
-credential recipient to unchanged executable and desired inputs. Binary,
-desired state and ledger then all come from the refreshed checkout;
-`GITHUB_SHA` for the apply is that refreshed head, matching
+that head. Binary, desired state and ledger then all come from the refreshed
+checkout; `GITHUB_SHA` for the apply is that refreshed head, matching
 `state.last_applied_commit`. PR attribution (override label, credential
 recipient) stays on the triggering merge. `check_supply_chain.py::
 stale_deployment_guard_violations` enforces the shape and the step ordering.
+
+Apply additionally calls `.github/scripts/deployment_scope.py classify`, which
+refuses the queued run when the refreshed head changed a **deployment input** —
+binding the triggering PR's authorization and credential recipient to unchanged
+executable and desired inputs. `DEPLOYMENT_INPUT_PATHS` there is one list used
+twice: it is also `apply-on-merge.yml`'s `on.push.paths` filter, and
+`check_supply_chain.py::deployment_scope_violations` fails the build when the
+two halves disagree. Equality is the invariant — a change that supersedes a
+queued apply always schedules a replacement run, and a change that schedules
+nothing (docs, `tests/**`, an unrelated workflow) can never supersede, so it no
+longer strands an authorized deployment. `GENERATED_PATHS` (`.state/**`,
+`assembled/**`) is in neither half: the apply writes it, so it must not reject a
+queued run and must not re-trigger the job that produced it. Operator recovery
+for an already-superseded run is `README.md#recovering-a-superseded-apply`.
 
 ### Ownership modes
 

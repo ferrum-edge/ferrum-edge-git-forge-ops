@@ -95,24 +95,17 @@ FRESH_HEAD_CONTROLS = (
     'git cat-file -e "${TRIGGER_SHA}^{commit}"',
     'git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head"',
 )
-# The guard must bind PR attribution to unchanged executable and desired
-# inputs. Two implementations satisfy that, and the policy accepts either as
-# long as ONE of them is completely present:
+# The guard must decide supersession through the shared classifier rather than
+# an ad-hoc diff, so the paths that refuse a queued apply stay exactly the paths
+# that schedule a replacement one.
 #
-#   1. a literal pathspec diff, permitting only generated state to differ;
-#   2. the shared deployment-scope classifier, which decides supersession from
-#      the same path list that schedules a replacement apply run.
-#
-# Spelled as families rather than one flat tuple because a half-present
-# implementation is the dangerous case: an operator who deletes one exclusion
-# from (1), or the branch argument from (2), has silently changed what the
-# guard refuses.
+# Spelled as a family of families, because a half-present implementation is the
+# dangerous case: the classifier invoked without its branch argument silently
+# changes what the guard refuses and what its message tells the operator to do.
+# The literal-pathspec family this replaces was the bug — it rejected every
+# difference, including a merge that schedules no apply of its own, so a queued
+# deployment could be cancelled with nothing left to reconcile it.
 APPLY_REVISION_BINDINGS = (
-    (
-        'git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- .',
-        "':(exclude).state/**'",
-        "':(exclude)assembled/**'",
-    ),
     (
         "python3 .github/scripts/deployment_scope.py classify \\",
         '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
@@ -124,6 +117,21 @@ APPLY_REVISION_BINDINGS = (
 # means a workflow that needs no credential values is exempt by construction,
 # and one that starts binding them is covered the moment it does.
 BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
+DEPLOYMENT_SCOPE_SCRIPT = Path(".github/scripts/deployment_scope.py")
+DEPLOYMENT_INPUT_TUPLE = re.compile(
+    r"^DEPLOYMENT_INPUT_PATHS:[^=]*=\s*\((?P<body>.*?)\)\s*$",
+    re.MULTILINE | re.DOTALL,
+)
+GENERATED_PATH_TUPLE = re.compile(
+    r"^GENERATED_PATHS:[^=]*=\s*\((?P<body>.*?)\)\s*$",
+    re.MULTILINE | re.DOTALL,
+)
+QUOTED = re.compile(r"""["']([^"']+)["']""")
+PUSH_PATHS_BLOCK = re.compile(
+    r"^  push:\s*$\n(?:^    (?!paths:).*\n)*^    paths:\s*$\n"
+    r"(?P<body>(?:^      - .*\n)*)",
+    re.MULTILINE,
+)
 # The job-level markers that prove the environment lock is already held, and
 # every step that must not run before the freshness guard.
 #
@@ -464,6 +472,86 @@ def _checkout_before(body: str, guard_index: int) -> str | None:
         if "uses: actions/checkout@" in step:
             return step
     return None
+
+
+def deployment_scope_violations(root: Path, apply_workflow: str) -> list[str]:
+    """Scheduling and supersession must be the same set of paths.
+
+    `apply-on-merge.yml` only runs for pushes that touch its `paths:` filter,
+    and its freshness guard refuses to reconcile a refreshed head that changed a
+    deployment input since the triggering merge. When those two sets differ in
+    the wrong direction a merge can cancel an authorized apply without
+    scheduling anything to replace it — a README-only push used to strand a
+    queued configuration change permanently, with the guard telling the operator
+    to wait for an apply run that would never exist.
+
+    Equality removes the failure by construction: a path that supersedes always
+    schedules a replacement, and a path that schedules nothing can never
+    supersede. `.state/**` and `assembled/**` must be in neither — as deployment
+    inputs they would reject every queued run, and as triggers the ledger commit
+    each apply pushes would re-trigger the workflow that wrote it.
+    """
+    violations: list[str] = []
+    script = root / DEPLOYMENT_SCOPE_SCRIPT
+    if not script.is_file():
+        return [
+            f"{DEPLOYMENT_SCOPE_SCRIPT}: the shared deployment-scope classifier "
+            "must exist; apply scheduling and supersession are defined by it"
+        ]
+    source = script.read_text(encoding="utf-8")
+    declared = DEPLOYMENT_INPUT_TUPLE.search(source)
+    if declared is None:
+        return [
+            f"{DEPLOYMENT_SCOPE_SCRIPT}: DEPLOYMENT_INPUT_PATHS must be declared here"
+        ]
+    scope_paths = QUOTED.findall(declared.group("body"))
+    generated = GENERATED_PATH_TUPLE.search(source)
+    generated_paths = QUOTED.findall(generated.group("body")) if generated else []
+    if not generated_paths:
+        violations.append(
+            f"{DEPLOYMENT_SCOPE_SCRIPT}: GENERATED_PATHS must name the ledger and "
+            "assembled output this workflow writes back to the protected branch"
+        )
+    for produced in generated_paths:
+        if produced in scope_paths:
+            violations.append(
+                f"{DEPLOYMENT_SCOPE_SCRIPT}: {produced!r} is written by the apply "
+                "itself and must not be a deployment input"
+            )
+
+    trigger = PUSH_PATHS_BLOCK.search(apply_workflow)
+    if trigger is None:
+        return violations + [
+            "apply-on-merge.yml: a push trigger with an explicit paths filter is "
+            "required; an unfiltered trigger re-runs on its own ledger commit"
+        ]
+    trigger_paths = [
+        line.strip().lstrip("- ").strip().strip("'\"")
+        for line in trigger.group("body").splitlines()
+        if line.strip()
+    ]
+    for produced in generated_paths:
+        if produced in trigger_paths:
+            violations.append(
+                f"apply-on-merge.yml: {produced!r} must not trigger the workflow "
+                "that writes it; the ledger commit would re-trigger the apply"
+            )
+    missing = sorted(set(scope_paths) - set(trigger_paths))
+    extra = sorted(set(trigger_paths) - set(scope_paths))
+    if missing:
+        violations.append(
+            "apply-on-merge.yml: every deployment input must schedule its own "
+            "apply or it supersedes a queued run with no replacement; the push "
+            f"trigger is missing {', '.join(repr(item) for item in missing)}"
+        )
+    if extra:
+        violations.append(
+            "apply-on-merge.yml: the push trigger schedules applies for "
+            f"{', '.join(repr(item) for item in extra)}, which "
+            f"{DEPLOYMENT_SCOPE_SCRIPT} does not treat as a deployment input; "
+            "add them to DEPLOYMENT_INPUT_PATHS or drop them from the trigger"
+        )
+    return violations
 
 
 def trusted_classifier_violations(
@@ -1383,6 +1471,12 @@ def main(argv: list[str] | None = None) -> int:
                 contract,
             )
         )
+
+    violations.extend(
+        deployment_scope_violations(
+            root, (workflows / "apply-on-merge.yml").read_text(encoding="utf-8")
+        )
+    )
 
     settings_audit = (workflows / "settings-audit.yml").read_text(encoding="utf-8")
     # The audit token reads repository administration settings. As a repository

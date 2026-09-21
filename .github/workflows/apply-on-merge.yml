@@ -1,12 +1,31 @@
 name: GitForgeOps Apply
 
+# The path filter below and the supersession test in the freshness guard are
+# ONE list, `DEPLOYMENT_INPUT_PATHS` in `.github/scripts/deployment_scope.py`,
+# and `check_supply_chain.py` fails the build when they drift apart.
+#
+# Keeping them equal is what makes a queued apply un-strandable. A path here
+# schedules its own apply run AND supersedes a queued one, so a superseding
+# change always leaves a replacement behind; a path not here can do neither, so
+# a docs-only merge can no longer cancel an authorized deployment with nothing
+# to reconcile it. `.state/**` and `assembled/**` are deliberately absent from
+# both halves: the ledger commit at the end of this job would otherwise
+# re-trigger the job that wrote it.
 on:
   push:
     branches: [main]
     paths:
-      - 'resources/**'
-      - 'overlays/**'
+      - '.github/ferrum-edge-checksums.txt'
+      - '.github/scripts/**'
+      - '.github/workflows/apply-on-merge.yml'
       - '.gitforgeops/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'overlays/**'
+      - 'resources/**'
+      - 'rust-toolchain.toml'
+      - 'src/**'
 
 # `apply` commits state updates (and, in file mode, the assembled placeholder
 # YAML) back to main, and queries the GitHub API to resolve the PR that
@@ -193,15 +212,17 @@ jobs:
           }
           # PR authorization and credential delivery below are intentionally
           # attributed to TRIGGER_SHA. A newer resource, policy, workflow, or
-          # binary revision must therefore never ride an older run's approval.
-          # State-writer commits are the sole exception: they advance the
-          # ownership ledger (and file-mode generated output) without changing
-          # the desired input or executable that the triggering PR approved.
-          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \
-            ':(exclude).state/**' ':(exclude)assembled/**' || {
-            echo "::error::Superseded deployment: ${DEFAULT_BRANCH} at $fresh_head contains changes beyond generated state since triggering commit $TRIGGER_SHA. Let the newer merge's apply run reconcile its own revision."
-            exit 1
-          }
+          # binary revision must therefore never ride an older run's approval —
+          # and the classifier refuses exactly those, using the same path list
+          # that puts each of them on its own apply run. A difference the
+          # classifier calls inert (documentation, tests, an unrelated
+          # workflow, the ledger and assembled output this job writes) cannot
+          # change the desired input, the policy configuration or the
+          # executable, so the revision applied here is still the one the
+          # triggering PR authorized and the run proceeds instead of stranding
+          # the deployment.
+          python3 .github/scripts/deployment_scope.py classify \
+            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Download ferrum-edge binary

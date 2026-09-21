@@ -1341,9 +1341,9 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path = root / ".github/workflows/apply-on-merge.yml"
             text = path.read_text(encoding="utf-8")
             text = text.replace(
-                '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
-                "            ':(exclude).state/**' ':(exclude)assembled/**' || {\n",
-                '          true || {\n',
+                "          python3 .github/scripts/deployment_scope.py classify \\\n"
+                '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
+                "          true\n",
                 1,
             )
             path.write_text(text, encoding="utf-8")
@@ -1352,11 +1352,12 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("must bind PR attribution" in item for item in violations), violations
         )
 
-    def test_either_recognized_attribution_binding_satisfies_the_policy(self):
-        # The guard may bind attribution with a literal pathspec diff or with
-        # the shared deployment-scope classifier. Both enforce the property;
-        # the policy must not require one spelling, or a legitimate rewrite of
-        # the guard could never be presented for review.
+    def test_the_classifier_is_the_only_recognized_attribution_binding(self):
+        # The literal-pathspec binding this replaces was the bug: it rejected
+        # every difference, including a merge that schedules no apply of its
+        # own, so a queued deployment could be cancelled with nothing left to
+        # reconcile it. Accepting it alongside the classifier would let a
+        # repository regress to it silently.
         contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
@@ -1367,46 +1368,50 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ),
             [],
         )
-        classifier = workflow.replace(
-            '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
-            "            ':(exclude).state/**' ':(exclude)assembled/**' || {\n"
-            '            echo "::error::Superseded deployment: ${DEFAULT_BRANCH} at $fresh_head contains changes beyond generated state since triggering commit $TRIGGER_SHA. Let the newer merge\'s apply run reconcile its own revision."\n'
-            "            exit 1\n"
-            "          }\n",
+        legacy = workflow.replace(
             "          python3 .github/scripts/deployment_scope.py classify \\\n"
             '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
+            '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
+            "            ':(exclude).state/**' ':(exclude)assembled/**'\n",
             1,
         )
-        self.assertNotEqual(classifier, workflow, "the legacy binding moved")
-        self.assertEqual(
-            check_supply_chain.stale_deployment_guard_violations(
-                "apply-on-merge.yml", classifier, contract
+        self.assertNotEqual(legacy, workflow, "the classifier binding moved")
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", legacy, contract
+        )
+        self.assertTrue(
+            any(
+                "no recognized implementation is complete" in item
+                for item in violations
             ),
-            [],
+            violations,
         )
 
     def test_a_half_present_attribution_binding_is_still_rejected(self):
-        # Deleting one exclusion, or the branch argument, silently changes what
-        # the guard refuses. Neither family may be accepted incomplete.
+        # Dropping the branch argument silently changes what the guard refuses
+        # and what its message tells the operator to do.
         contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
         )
-        half = workflow.replace("':(exclude)assembled/**'", "", 1)
+        half = workflow.replace(' --branch "$DEFAULT_BRANCH"', "", 1)
         self.assertNotEqual(half, workflow)
         violations = check_supply_chain.stale_deployment_guard_violations(
             "apply-on-merge.yml", half, contract
         )
         self.assertTrue(
-            any("no recognized implementation is complete" in item for item in violations),
+            any(
+                "no recognized implementation is complete" in item
+                for item in violations
+            ),
             violations,
         )
 
     def test_bundle_loader_rules_follow_the_secret_binding(self):
         # A privileged workflow that binds no credential-bundle secret cannot
-        # mishandle one, and requiring the loader there would force an
-        # unattended job to hold every consumer secret just to satisfy policy.
-        # One that DOES bind the secret is covered the moment it does.
+        # mishandle one, and requiring the loader there would force a job that
+        # needs no credential values to hold every consumer secret purely to
+        # satisfy policy. One that DOES bind the secret is covered at once.
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/drift-check.yml"
@@ -1450,6 +1455,93 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "under $RUNNER_TEMP",
             result.stdout + result.stderr,
             "credential file location still required",
+        )
+
+    def test_apply_trigger_and_supersession_scope_must_be_one_list(self):
+        # Dropping a path from the trigger while the classifier still treats it
+        # as a deployment input recreates the stranded-apply bug: the merge
+        # supersedes a queued run and schedules nothing to replace it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "      - 'overlays/**'\n", "", 1
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "push trigger is missing 'overlays/**'" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_apply_trigger_may_not_schedule_paths_the_classifier_ignores(self):
+        # The mirror image: a trigger path the guard calls inert starts an apply
+        # for a change that provably cannot affect one.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "      - 'resources/**'\n",
+                    "      - 'resources/**'\n      - 'README.md'\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "schedules applies for 'README.md'" in item for item in violations
+            ),
+            violations,
+        )
+
+    def test_generated_output_may_be_neither_trigger_nor_deployment_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            script = root / ".github/scripts/deployment_scope.py"
+            script.write_text(
+                script.read_text(encoding="utf-8").replace(
+                    '    "src/**",\n)', '    "src/**",\n    ".state/**",\n)', 1
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "is written by the apply itself and must not be a deployment input"
+                in item
+                for item in violations
+            ),
+            violations,
+        )
+        self.assertTrue(
+            any("push trigger is missing '.state/**'" in item for item in violations),
+            violations,
+        )
+
+    def test_apply_push_trigger_must_stay_path_filtered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index("  push:\n")
+            end = text.index("\n# `apply` commits state updates")
+            path.write_text(
+                text[:start] + "  push:\n    branches: [main]\n" + text[end:],
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "explicit paths filter is required" in item for item in violations
+            ),
+            violations,
         )
 
     def test_state_commits_must_not_suppress_required_checks(self):
@@ -1694,6 +1786,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ".github/workflows",
             ".github/scripts/check_supply_chain.py",
             ".github/scripts/credential_bundles.py",
+            ".github/scripts/deployment_scope.py",
             ".github/scripts/install-ferrum-edge.sh",
             ".github/scripts/refresh-ferrum-edge-pin.sh",
             ".github/ferrum-edge-checksums.txt",

@@ -270,6 +270,34 @@ gitforgeops then trusts that CA alone. Both switches print a loud stderr banner
 when they take effect locally, so a warning in a job log means one of them
 reached CI and should be removed from wherever it was set.
 
+### Scheduling and supersession are one list
+
+`apply-on-merge.yml` runs only for pushes that touch its `paths:` filter, and
+its freshness guard refuses to reconcile a refreshed protected head that
+changed a deployment input since the triggering merge. Those two sets are the
+same list — `DEPLOYMENT_INPUT_PATHS` in
+[`.github/scripts/deployment_scope.py`](../.github/scripts/deployment_scope.py)
+— and `check_supply_chain.py` fails the build when they drift apart.
+
+Equality is what keeps an approval-gated deployment from being cancelled by
+accident. While a merge waits for its environment's required reviewer, other
+merges land on `main`:
+
+- A merge that changes a deployment input (resources, overlays,
+  `.gitforgeops/`, the engine source, the helper scripts, the validator pin, or
+  this workflow) **supersedes** the waiting run — and schedules an apply of its
+  own, which reconciles its revision together with everything queued behind it.
+- A merge that changes nothing else — documentation, tests, an unrelated
+  workflow — leaves the waiting run alone, because it would schedule no
+  replacement and therefore may cancel nothing.
+
+`.state/**` and `assembled/**` belong to neither half: the apply writes them,
+so they must not reject a queued run, and they must not trigger the workflow
+that produced them.
+
+Operator recovery for an already-superseded run is documented in
+[Recovering a superseded apply](../README.md#recovering-a-superseded-apply).
+
 ## 4. Restrict GitHub Actions
 
 In **Settings → Actions → General**:

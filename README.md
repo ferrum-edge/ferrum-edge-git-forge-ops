@@ -1376,10 +1376,73 @@ Protected main HEAD: 9ab1…
 
 Everything after that point — the `gitforgeops` binary it builds, the desired resources it assembles, and the `.state/<env>.json` it reconciles against — comes from that one commit. Two consequences worth knowing:
 
-- **Queued runs consume current generated state safely.** Merge B queued behind A's apply reads A's published ledger rather than treating A's rows as unmanaged. Only `.state/**` and file-mode `assembled/**` may differ from B's triggering revision.
-- **A stale or superseded run is rejected, not silently replayed.** A trigger that is no longer an ancestor is stale. An ancestor whose protected head contains any newer non-generated change is superseded. Both fail before building a binary or contacting the gateway; the newer merge's own run must reconcile that revision.
+- **Queued runs consume current generated state safely.** Merge B queued behind A's apply reads A's published ledger rather than treating A's rows as unmanaged.
+- **A stale or superseded run is rejected, not silently replayed.** A trigger that is no longer an ancestor is stale. An ancestor whose protected head changed a *deployment input* is superseded. Both fail before building a binary or contacting the gateway; the newer merge's own run must reconcile that revision.
 
-Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author. The generated-state-only guard guarantees that a later PR's desired input or executable cannot be applied under that attribution.
+Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author. The supersession guard is what guarantees that a later PR's desired input or executable cannot be applied under that attribution.
+
+##### Deployment inputs: one list for scheduling and for supersession
+
+What counts as a deployment input is not "anything that changed". It is the
+single list in [`.github/scripts/deployment_scope.py`](.github/scripts/deployment_scope.py):
+
+| Path | Why it changes what an apply does |
+| --- | --- |
+| `resources/**`, `overlays/**` | the desired gateway configuration |
+| `.gitforgeops/**` | environment routing, ownership mode, enforceable policy |
+| `src/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` | the `gitforgeops` binary the job installs |
+| `.github/scripts/**` | helper programs the job executes (credential loading, the validator installer, merge attribution) |
+| `.github/ferrum-edge-checksums.txt` | which validator build is trusted |
+| `.github/workflows/apply-on-merge.yml` | the deployment procedure itself |
+
+That same list is the workflow's `on.push.paths` filter, and
+`check_supply_chain.py` fails the build if the two halves ever disagree. The
+equality is the point:
+
+- **A change that supersedes always schedules a replacement.** Anything that
+  can reject a queued apply also starts an apply of its own, which reconciles
+  that revision together with everything queued behind it.
+- **A change that schedules nothing can never supersede.** A README, a doc, a
+  unit test (not compiled into the installed binary) or an unrelated workflow
+  leaves a queued apply alone. It used to cancel it — with no replacement run
+  in existence, that silently dropped an authorized configuration change.
+
+`.state/**` and file-mode `assembled/**` are in neither half. They are written
+by the apply itself, so treating them as deployment inputs would reject every
+queued run, and triggering on them would make each apply re-trigger itself
+through its own ledger commit.
+
+##### Recovering a superseded apply
+
+The guard prints the deployment-affecting paths it found and the head that
+carries them:
+
+```
+::error::Superseded deployment: main at 9ab1… changed deployment-affecting
+inputs since triggering commit 4f2c…:
+  - resources/ferrum/proxies/orders.yaml
+Every one of those paths schedules its own GitForgeOps Apply run, which
+reconciles this revision together with everything it carries forward.
+```
+
+So the recovery is to find that run, not to re-run the superseded one:
+
+1. Open **Actions → GitForgeOps Apply** and find the run whose commit is the
+   head named in the error.
+2. If it is waiting on the environment's required reviewer, approve it. It
+   applies the superseding revision *and* the desired state your merge added,
+   because both are in that commit's tree.
+3. If it failed, re-run it. Re-running is safe for the reasons in
+   [What if apply fails after merge?](#what-if-apply-fails-after-merge).
+4. If no such run exists, the superseding merge predates this guard's path
+   list. Push any deployment-input change (adding the resource you intended,
+   or re-saving `.gitforgeops/config.yaml`) to schedule a fresh apply; the
+   ledger read and the diff make it converge on the current desired state.
+
+Credential delivery follows the run that allocates the slot. A superseding
+merge's run delivers to *its* author, so when your merge introduced a consumer
+credential and a later merge superseded it, rotate the slot afterwards with
+`rotate.yml` to re-deliver it to the right recipient.
 
 ### Post-apply convergence
 
@@ -1392,9 +1455,9 @@ The merge commit is already on `main`, but config isn't (fully) applied. Re-run 
 1. Incremental mode re-fetches actual state via `GET /backup`, so already-applied resources are skipped.
 2. Full-replace mode is idempotent — `POST /restore` converges regardless of prior partial state.
 3. `.state/<env>.json` is an ownership manifest of the *last successful* apply; it never causes re-runs to skip work.
-4. The re-run refreshes generated ownership state from the protected branch, but refuses to run if a later substantive merge has superseded its desired input. Use that newer merge's apply run instead. See [Ordering between runs](#ordering-between-runs-the-environment-lock-and-the-freshness-guard).
+4. The re-run refreshes generated ownership state from the protected branch, but refuses to run if a later merge changed a deployment input. Use that newer merge's apply run instead. See [Ordering between runs](#ordering-between-runs-the-environment-lock-and-the-freshness-guard).
 
-A `Stale deployment` error means the triggering commit is no longer an ancestor of `main`; a `Superseded deployment` error means a newer substantive revision is present. Nothing was mutated in either case; use the current revision's apply run.
+A `Stale deployment` error means the triggering commit is no longer an ancestor of `main`; a `Superseded deployment` error means a newer revision changed a deployment input, and names both the paths and the head that carries them. Nothing was mutated in either case — follow [Recovering a superseded apply](#recovering-a-superseded-apply). A docs-only or test-only merge is *not* superseding and leaves the queued run intact.
 
 Two failures are the exception — do **not** blindly re-run:
 
