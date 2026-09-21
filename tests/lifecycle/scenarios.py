@@ -53,9 +53,21 @@ class ScenarioFailure(AssertionError):
 class Harness:
     """Everything a scenario needs, and nothing it should not have."""
 
-    def __init__(self, workdir: Path, gateway_url: str, upstream_url: str, binary: str):
+    def __init__(
+        self,
+        workdir: Path,
+        gateway_url: str,
+        proxy_url: str,
+        upstream_url: str,
+        binary: str,
+    ):
         self.workdir = workdir
+        # The admin API. Writes configuration.
         self.gateway_url = gateway_url.rstrip("/")
+        # The data plane. Serves traffic. A different listener on a different
+        # port — sending a route check at the admin API would get a 404 that
+        # looks exactly like a routing failure.
+        self.proxy_url = proxy_url.rstrip("/")
         self.upstream_url = upstream_url.rstrip("/")
         self.binary = binary
         # Every secret this run has seen, for `redact`. Populated as
@@ -90,7 +102,7 @@ class Harness:
                 "FERRUM_GATEWAY_MODE": "api",
                 "FERRUM_GATEWAY_URL": self.gateway_url,
                 "FERRUM_ADMIN_JWT_SECRET": os.environ["FERRUM_ADMIN_JWT_SECRET"],
-                "FERRUM_VERIFY_BASE_URL": self.gateway_url,
+                "FERRUM_VERIFY_BASE_URL": self.proxy_url,
                 # Loopback gateway: the CI/loopback gate permits cleartext here
                 # and nowhere else.
                 "FERRUM_ALLOW_INSECURE_HTTP": "true",
@@ -121,8 +133,9 @@ class Harness:
     # -- traffic -----------------------------------------------------------
 
     def request(self, path: str, headers: dict[str, str] | None = None) -> int:
+        """A client request through the DATA plane."""
         request = urllib.request.Request(
-            f"{self.gateway_url}{path}", headers=headers or {}
+            f"{self.proxy_url}{path}", headers=headers or {}
         )
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
@@ -503,7 +516,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--result", required=True)
-    parser.add_argument("--gateway-url", required=True)
+    parser.add_argument("--gateway-url", required=True, help="admin API base URL")
+    parser.add_argument("--proxy-url", required=True, help="data-plane base URL")
     parser.add_argument("--upstream-url", required=True)
     parser.add_argument("--binary", default="gitforgeops")
     parser.add_argument(
@@ -518,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
     harness = Harness(
         workdir=Path(args.workdir),
         gateway_url=args.gateway_url,
+        proxy_url=args.proxy_url,
         upstream_url=args.upstream_url,
         binary=args.binary,
     )

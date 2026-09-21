@@ -61,8 +61,20 @@ for _ in $(seq 1 50); do [ -s "$WORKDIR/upstream.port" ] && break; sleep 0.1; do
 UPSTREAM_PORT="$(cat "$WORKDIR/upstream.port")"
 UPSTREAM_URL="http://127.0.0.1:${UPSTREAM_PORT}"
 
-GATEWAY_PORT="${LIFECYCLE_GATEWAY_PORT:-18080}"
-GATEWAY_URL="http://127.0.0.1:${GATEWAY_PORT}"
+# The admin API and the data plane are SEPARATE listeners on separate ports.
+# Conflating them would make the traffic scenarios send their requests at the
+# admin API, which answers 404 for `/orders` and would look exactly like a
+# routing failure.
+ADMIN_PORT="${LIFECYCLE_ADMIN_PORT:-18080}"
+PROXY_PORT="${LIFECYCLE_PROXY_PORT:-18081}"
+GATEWAY_URL="http://127.0.0.1:${ADMIN_PORT}"
+PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
+
+# A SQLite file inside the throwaway workdir: `database` mode needs a config
+# store, and this is the only one that needs no service to be running. It goes
+# with the workdir when the trap fires.
+export FERRUM_DB_TYPE="${LIFECYCLE_DB_TYPE:-sqlite}"
+export FERRUM_DB_URL="${LIFECYCLE_DB_URL:-sqlite://$WORKDIR/ferrum.db}"
 
 # The gateway launch is the one integration point that depends on the
 # companion's own CLI surface, so it is DISCOVERED rather than guessed. A
@@ -100,8 +112,12 @@ if [ -z "${LIFECYCLE_GATEWAY_EXTERNAL:-}" ]; then
   # shellcheck disable=SC2086  # the command is a deliberate word-split hook
   env FERRUM_ADMIN_JWT_SECRET="$FERRUM_ADMIN_JWT_SECRET" \
       FERRUM_MODE="${LIFECYCLE_GATEWAY_MODE:-database}" \
-      FERRUM_ADMIN_PORT="$GATEWAY_PORT" \
-      FERRUM_PROXY_PORT="$GATEWAY_PORT" \
+      FERRUM_DB_TYPE="$FERRUM_DB_TYPE" \
+      FERRUM_DB_URL="$FERRUM_DB_URL" \
+      FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
+      FERRUM_ADMIN_HTTP_PORT="$ADMIN_PORT" \
+      FERRUM_PROXY_BIND_ADDRESS=127.0.0.1 \
+      FERRUM_PROXY_HTTP_PORT="$PROXY_PORT" \
       $GATEWAY_CMD > "$GATEWAY_LOG" 2>&1 &
   GATEWAY_PID=$!
 fi
@@ -137,6 +153,7 @@ python3 "$ROOT/tests/lifecycle/scenarios.py" \
   --workdir "$WORKDIR/repo" \
   --result "$RESULT" \
   --gateway-url "$GATEWAY_URL" \
+  --proxy-url "$PROXY_URL" \
   --upstream-url "$UPSTREAM_URL" \
   --binary "${GITFORGEOPS_BINARY:-gitforgeops}" \
   "${ONLY[@]+"${ONLY[@]}"}"

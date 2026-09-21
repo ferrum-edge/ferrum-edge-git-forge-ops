@@ -41,7 +41,8 @@ def harness(workdir: Path) -> "scenarios.Harness":
     return scenarios.Harness(
         workdir=workdir,
         gateway_url="http://127.0.0.1:18080",
-        upstream_url="http://127.0.0.1:18081",
+        proxy_url="http://127.0.0.1:18081",
+        upstream_url="http://127.0.0.1:18082",
         binary="gitforgeops",
     )
 
@@ -163,9 +164,26 @@ class IsolationTests(unittest.TestCase):
                 os.environ.update(previous)
 
         self.assertEqual(built["FERRUM_GATEWAY_URL"], "http://127.0.0.1:18080")
+        # Traffic verification reaches the DATA plane, which is a different
+        # listener — pointing it at the admin API would get a 404 that looks
+        # exactly like a routing failure.
+        self.assertEqual(built["FERRUM_VERIFY_BASE_URL"], "http://127.0.0.1:18081")
         self.assertNotIn("FERRUM_NAMESPACE", built)
         self.assertNotIn("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH", built)
         self.assertEqual(built["FERRUM_ENV"], scenarios.ENVIRONMENT)
+
+    def test_client_traffic_goes_to_the_data_plane_not_the_admin_api(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = harness(Path(directory))
+            self.assertNotEqual(instance.gateway_url, instance.proxy_url)
+        source = (ROOT / "tests/lifecycle/scenarios.py").read_text(encoding="utf-8")
+        # `request` is the client path; `_admin` is the human-admin path.
+        client = source[source.index("def request(") : source.index("def expect_status(")]
+        self.assertIn("self.proxy_url", client)
+        self.assertNotIn("self.gateway_url", client)
+        admin = source[source.index("def _admin(") : source.index("def create_unmanaged_proxy(")]
+        self.assertIn("harness.gateway_url", admin)
+        self.assertNotIn("harness.proxy_url", admin)
 
     def test_the_upstream_never_echoes_a_request_header(self):
         # A proxied credential arriving at the upstream and being reflected
