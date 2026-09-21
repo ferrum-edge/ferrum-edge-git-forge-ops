@@ -65,13 +65,41 @@ GATEWAY_PORT="${LIFECYCLE_GATEWAY_PORT:-18080}"
 GATEWAY_URL="http://127.0.0.1:${GATEWAY_PORT}"
 
 # The gateway launch is the one integration point that depends on the
-# companion's own CLI surface. It is a single variable so a Ferrum Edge change
-# is a one-line edit here rather than a rewrite of the suite, and so an
-# operator can point the suite at a gateway they started themselves.
-GATEWAY_CMD="${LIFECYCLE_GATEWAY_CMD:-${FERRUM_EDGE_BINARY_PATH:-ferrum-edge} serve -m database}"
+# companion's own CLI surface, so it is DISCOVERED rather than guessed. A
+# hard-coded subcommand is wrong exactly once — the moment Ferrum Edge renames
+# or removes it — and the failure it produces ("unrecognized subcommand") tells
+# the reader nothing about what to use instead.
+#
+# `LIFECYCLE_GATEWAY_CMD` still overrides everything, for an operator who knows
+# better than this heuristic or is testing a build with a different surface.
+BINARY="${FERRUM_EDGE_BINARY_PATH:-ferrum-edge}"
+GATEWAY_CMD="${LIFECYCLE_GATEWAY_CMD:-}"
+AVAILABLE=""
+if [ -z "$GATEWAY_CMD" ]; then
+  # clap prints `Commands:` followed by indented `<name>  <about>` lines, and
+  # stops at the next unindented section. Anything unparseable leaves
+  # AVAILABLE empty, and the bare invocation below is then tried on its own.
+  AVAILABLE=$("$BINARY" --help 2>&1 | awk '
+    /^Commands:/ {inside = 1; next}
+    inside && /^[^ ]/ {inside = 0}
+    inside && /^[[:space:]]+[a-z][a-z0-9-]*/ {print $1}
+  ' | tr '\n' ' ')
+  for candidate in serve server run start gateway; do
+    case " $AVAILABLE " in
+      *" $candidate "*) GATEWAY_CMD="$BINARY $candidate"; break ;;
+    esac
+  done
+  # No serving subcommand: the gateway is configured entirely through FERRUM_*
+  # and started by the bare binary. That is the shape `-m file` / `-m mesh`
+  # validation implies, so it is the fallback rather than an error.
+  [ -n "$GATEWAY_CMD" ] || GATEWAY_CMD="$BINARY"
+fi
+
 if [ -z "${LIFECYCLE_GATEWAY_EXTERNAL:-}" ]; then
+  echo "Starting the gateway with: $GATEWAY_CMD"
   # shellcheck disable=SC2086  # the command is a deliberate word-split hook
   env FERRUM_ADMIN_JWT_SECRET="$FERRUM_ADMIN_JWT_SECRET" \
+      FERRUM_MODE="${LIFECYCLE_GATEWAY_MODE:-database}" \
       FERRUM_ADMIN_PORT="$GATEWAY_PORT" \
       FERRUM_PROXY_PORT="$GATEWAY_PORT" \
       $GATEWAY_CMD > "$GATEWAY_LOG" 2>&1 &
@@ -85,6 +113,8 @@ for _ in $(seq 1 60); do
 done
 [ -n "$ready" ] || {
   echo "::error::The gateway did not answer GET /health at ${GATEWAY_URL} within 30s." \
+       "Tried: ${GATEWAY_CMD}." \
+       "${AVAILABLE:+Subcommands this build offers: ${AVAILABLE}.}" \
        "Set LIFECYCLE_GATEWAY_CMD for this Ferrum Edge build, or start a gateway" \
        "yourself and re-run with LIFECYCLE_GATEWAY_EXTERNAL=1." >&2
   exit 1

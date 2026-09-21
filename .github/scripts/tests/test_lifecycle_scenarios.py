@@ -183,6 +183,21 @@ class RunbookTests(unittest.TestCase):
         self.assertIn("did not answer GET /health", runner)
         self.assertIn("exit 1", runner)
 
+    def test_the_gateway_command_is_discovered_not_guessed(self):
+        # A hard-coded subcommand is wrong exactly once — the moment Ferrum
+        # Edge renames or removes it — and "unrecognized subcommand" tells the
+        # reader nothing about what to use instead. The runner reads the
+        # build's own `--help`, and says what it found when nothing answers.
+        runner = (ROOT / "tests/lifecycle/run.sh").read_text(encoding="utf-8")
+        self.assertIn('"$BINARY" --help', runner)
+        self.assertIn("/^Commands:/", runner)
+        self.assertIn("for candidate in serve server run start gateway", runner)
+        # No serving subcommand at all falls back to the bare binary, because
+        # a gateway configured entirely through FERRUM_* is the shape the
+        # `-m file` / `-m mesh` validation surface implies.
+        self.assertIn('GATEWAY_CMD="$BINARY"', runner)
+        self.assertIn("Subcommands this build offers", runner)
+
     def test_the_runner_seals_even_on_failure(self):
         # An UNSEALED record reads as "the suite was cancelled". A suite that
         # ran and found problems is a different, louder thing.
