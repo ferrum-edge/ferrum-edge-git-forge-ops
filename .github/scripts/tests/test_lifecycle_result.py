@@ -265,6 +265,21 @@ class ReleaseGateWiringTests(unittest.TestCase):
             if later in self.release:
                 self.assertLess(gate, self.release.index(later), later)
 
+    def test_the_gate_waits_for_the_run_it_is_gating_on(self):
+        # Both workflows start on the same push, so a single sample is always
+        # too early — the release would be permanently red and the gate would
+        # become something operators re-run past rather than read.
+        self.assertIn("head_sha=${RELEASE_SHA}", self.release)
+        self.assertIn("still running for", self.release)
+        self.assertIn("sleep 30", self.release)
+
+    def test_the_gate_distinguishes_not_yet_run_from_did_not_pass(self):
+        # A finished run that did not certify is a different thing from one
+        # that has not happened, and only one of them is fixed by waiting.
+        self.assertIn("ran for ${RELEASE_SHA} and did not pass", self.release)
+        self.assertIn("has not started for ${RELEASE_SHA} yet", self.release)
+        self.assertIn("Fix the scenarios it reported, not the gate", self.release)
+
     def test_the_lifecycle_workflow_seals_and_publishes_its_result(self):
         workflow = (ROOT / ".github/workflows/lifecycle.yml").read_text(
             encoding="utf-8"

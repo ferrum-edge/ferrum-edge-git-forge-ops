@@ -137,18 +137,44 @@ jobs:
           runs_file=$(mktemp)
           trap 'rm -f "$runs_file"' EXIT
 
-          gh api "repos/${REPO}/actions/workflows/lifecycle.yml/runs?head_sha=${RELEASE_SHA}&per_page=20" \
-            > "$runs_file" || {
-            echo "::error::The lifecycle acceptance workflow's run history could not be read."
-            exit 1
-          }
-          run_id=$(jq -er '
-            [.workflow_runs[]? | select(.conclusion == "success")]
-            | if length > 0 then (sort_by(.updated_at) | last | .id)
-              else error("no successful lifecycle run for this revision")
-              end
-          ' "$runs_file") || {
-            echo "::error::No successful GitForgeOps Lifecycle Acceptance run exists for ${RELEASE_SHA}. Dispatch the workflow for this commit and re-run the release."
+          # Both workflows start on the same push, so a single sample is
+          # always too early — the release would be permanently red and the
+          # gate would be something operators re-run past rather than read.
+          # Wait for the lifecycle run for THIS revision to finish, bounded,
+          # and say which of the three outcomes happened.
+          run_id=
+          for attempt in $(seq 1 40); do
+            gh api "repos/${REPO}/actions/workflows/lifecycle.yml/runs?head_sha=${RELEASE_SHA}&per_page=20" \
+              > "$runs_file" || {
+              echo "::error::The lifecycle acceptance workflow's run history could not be read."
+              exit 1
+            }
+            run_id=$(jq -r '
+              [.workflow_runs[]? | select(.conclusion == "success")]
+              | if length > 0 then (sort_by(.updated_at) | last | .id | tostring) else "" end
+            ' "$runs_file")
+            [ -n "$run_id" ] && break
+
+            pending=$(jq -r '
+              [.workflow_runs[]? | select(.status != "completed")] | length
+            ' "$runs_file")
+            if [ "$pending" -gt 0 ]; then
+              echo "Lifecycle acceptance is still running for ${RELEASE_SHA} (attempt ${attempt}/40)."
+              sleep 30
+              continue
+            fi
+            # Completed, none successful: a finished run that did not certify
+            # is a different thing from one that has not happened, and the
+            # operator needs to be told which.
+            if [ "$(jq -r '.total_count // 0' "$runs_file")" -gt 0 ]; then
+              echo "::error::Lifecycle acceptance ran for ${RELEASE_SHA} and did not pass. Fix the scenarios it reported, not the gate."
+              exit 1
+            fi
+            echo "Lifecycle acceptance has not started for ${RELEASE_SHA} yet (attempt ${attempt}/40)."
+            sleep 30
+          done
+          [ -n "$run_id" ] || {
+            echo "::error::No successful GitForgeOps Lifecycle Acceptance run exists for ${RELEASE_SHA} after waiting. Dispatch the workflow for this commit and re-run the release."
             exit 1
           }
 
