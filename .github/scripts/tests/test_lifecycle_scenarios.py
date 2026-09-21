@@ -44,6 +44,7 @@ def harness(workdir: Path) -> "scenarios.Harness":
         proxy_url="http://127.0.0.1:18081",
         upstream_url="http://127.0.0.1:18082",
         binary="gitforgeops",
+        creds_file="/tmp/creds.json",
     )
 
 
@@ -169,6 +170,11 @@ class IsolationTests(unittest.TestCase):
         # exactly like a routing failure.
         self.assertEqual(built["FERRUM_VERIFY_BASE_URL"], "http://127.0.0.1:18081")
         self.assertNotIn("FERRUM_NAMESPACE", built)
+        # Stripping every FERRUM_* means anything the child genuinely needs
+        # has to be supplied here. The credential bundle was the one that got
+        # forgotten, and the symptom — "required credential slot has no
+        # value" — points at the repository rather than at the harness.
+        self.assertEqual(built["FERRUM_CREDS_JSON_FILE"], "/tmp/creds.json")
         self.assertNotIn("GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH", built)
         self.assertEqual(built["FERRUM_ENV"], scenarios.ENVIRONMENT)
 
@@ -215,6 +221,10 @@ class RunbookTests(unittest.TestCase):
         # `-m file` / `-m mesh` validation surface implies.
         self.assertIn('GATEWAY_CMD="$BINARY"', runner)
         self.assertIn("Subcommands this build offers", runner)
+
+    def test_the_runner_hands_the_bundle_to_the_driver(self):
+        runner = (ROOT / "tests/lifecycle/run.sh").read_text(encoding="utf-8")
+        self.assertIn('--creds-file "$CREDS"', runner)
 
     def test_the_runner_seals_even_on_failure(self):
         # An UNSEALED record reads as "the suite was cancelled". A suite that

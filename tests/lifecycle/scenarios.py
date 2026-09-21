@@ -60,6 +60,7 @@ class Harness:
         proxy_url: str,
         upstream_url: str,
         binary: str,
+        creds_file: str,
     ):
         self.workdir = workdir
         # The admin API. Writes configuration.
@@ -70,6 +71,10 @@ class Harness:
         self.proxy_url = proxy_url.rstrip("/")
         self.upstream_url = upstream_url.rstrip("/")
         self.binary = binary
+        # The broker bundle the seeded `alloc=require` slot resolves from.
+        # Passed in rather than inherited: `env()` strips every FERRUM_* it
+        # did not set, so anything the child needs has to be supplied here.
+        self.creds_file = creds_file
         # Every secret this run has seen, for `redact`. Populated as
         # credentials are allocated; never written to disk.
         self._secrets: set[str] = set()
@@ -103,6 +108,7 @@ class Harness:
                 "FERRUM_GATEWAY_URL": self.gateway_url,
                 "FERRUM_ADMIN_JWT_SECRET": os.environ["FERRUM_ADMIN_JWT_SECRET"],
                 "FERRUM_VERIFY_BASE_URL": self.proxy_url,
+                "FERRUM_CREDS_JSON_FILE": self.creds_file,
                 # Loopback gateway: the CI/loopback gate permits cleartext here
                 # and nowhere else.
                 "FERRUM_ALLOW_INSECURE_HTTP": "true",
@@ -521,6 +527,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--upstream-url", required=True)
     parser.add_argument("--binary", default="gitforgeops")
     parser.add_argument(
+        "--creds-file",
+        required=True,
+        help="credential bundle the seeded alloc=require slot resolves from",
+    )
+    parser.add_argument(
         "--only", action="append", default=[], choices=lifecycle_result.REQUIRED_SCENARIO_IDS
     )
     args = parser.parse_args(argv)
@@ -535,6 +546,7 @@ def main(argv: list[str] | None = None) -> int:
         proxy_url=args.proxy_url,
         upstream_url=args.upstream_url,
         binary=args.binary,
+        creds_file=args.creds_file,
     )
     harness.workdir.mkdir(parents=True, exist_ok=True)
     return 1 if run_scenarios(harness, Path(args.result), args.only) else 0
