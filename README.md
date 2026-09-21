@@ -2391,6 +2391,36 @@ allowlist; the label probe runs without the installer token.
 
 ## Upgrading
 
+### Adopting an upstream update in a template copy
+
+Creating a repository from the template copies **files, not history**, and
+`apply-on-merge.yml` builds the engine from *your* checkout — so publishing a
+new image upstream does not change what your repository runs. An upstream
+security or correctness fix reaches you when you deliberately adopt it.
+
+```bash
+python3 .github/scripts/template_update.py identify        # what is installed
+python3 .github/scripts/template_update.py status          # is there anything new
+python3 .github/scripts/template_update.py plan --to v0.2.0
+python3 .github/scripts/template_update.py apply --to v0.2.0
+```
+
+It compares three ways — the baseline recorded in `.gitforgeops/baseline.json`,
+the upstream target, and your tree — so an upstream change to a file you never
+touched is adopted, a file you edited that upstream did not touch is left
+alone, and a file both sides changed is reported as a **conflict** and never
+overwritten. `resources/`, `overlays/`, your environment and policy
+configuration, `.state/`, `assembled/` and `.github/CODEOWNERS` are never read
+from upstream and never written; repository settings and secrets are outside
+Git and untouched by construction.
+
+An engine or workflow update is a deployment input: merging one schedules an
+apply of its own and supersedes any apply still queued from an earlier merge,
+so a new engine never rides an older approval. The full procedure, the
+post-adoption checks, and the recovery path for an update that goes wrong —
+including why you must *not* restore an old `.state/<env>.json` — are in
+[Adopting upstream updates](docs/template-updates.md).
+
 ### `live_review` defaults to `true`
 
 `.gitforgeops/config.yaml` gained a per-environment `live_review` flag, and its
