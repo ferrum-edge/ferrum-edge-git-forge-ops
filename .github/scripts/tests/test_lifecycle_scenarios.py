@@ -12,6 +12,7 @@ gateway-less CI should still be proving them:
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -190,6 +191,35 @@ class IsolationTests(unittest.TestCase):
         admin = source[source.index("def _admin(") : source.index("def create_unmanaged_proxy(")]
         self.assertIn("harness.gateway_url", admin)
         self.assertNotIn("harness.proxy_url", admin)
+
+    def test_out_of_band_admin_calls_assert_their_own_outcome(self):
+        # A silently failed admin call is the worst kind of harness bug: the
+        # scenario carries on and draws a confident, wrong conclusion from a
+        # gateway that was never touched. One run reported "shared mode
+        # deleted a resource this repository never declared" when the resource
+        # had simply never been created.
+        source = (ROOT / "tests/lifecycle/scenarios.py").read_text(encoding="utf-8")
+        self.assertIn("This is a harness failure, not a", source)
+        checked = source[source.index("def _admin(") : source.index("def __admin(")]
+        self.assertIn("raise ScenarioFailure", checked)
+
+    def test_the_admin_token_carries_the_claims_the_product_mints(self):
+        # A token missing `sub`, `nbf` or `jti` is rejected with a plain 401
+        # that looks exactly like a wrong secret.
+        minted = (ROOT / "tests/lifecycle/admin_token.py").read_text(encoding="utf-8")
+        claims = set(
+            re.findall(r'"(iss|sub|role|iat|nbf|exp|jti)":', minted)
+        )
+        rust = (ROOT / "src/jwt.rs").read_text(encoding="utf-8")
+        body = rust[rust.index("struct Claims {") : rust.index("\n}", rust.index("struct Claims {"))]
+        required = {
+            name
+            for name in re.findall(r"^    (\w+): ", body, re.MULTILINE)
+            # `aud` and `ns` are `skip_serializing_if` — emitted only when
+            # configured, and a stray one is itself a rejection.
+            if name not in {"aud", "ns"}
+        }
+        self.assertEqual(required, claims)
 
     def test_the_upstream_never_echoes_a_request_header(self):
         # A proxied credential arriving at the upstream and being reflected

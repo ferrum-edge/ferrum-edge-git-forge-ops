@@ -447,7 +447,32 @@ def harness_key(harness: Harness) -> str:
     return key
 
 
-def _admin(harness: Harness, method: str, path: str, body: dict | None = None) -> int:
+def _admin(
+    harness: Harness,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    expect: tuple[int, ...] = (200, 201, 204),
+) -> int:
+    """An out-of-band admin call, standing in for a human administrator.
+
+    It ASSERTS its outcome. A silently failed admin call is the worst kind of
+    harness bug: the scenario carries on and draws a confident, wrong
+    conclusion from a gateway that was never touched — on one run this suite
+    reported "shared mode deleted a resource this repository never declared"
+    when in truth the resource had never been created.
+    """
+    status = __admin(harness, method, path, body)
+    if status not in expect:
+        raise ScenarioFailure(
+            f"the harness's own out-of-band {method} {path} answered {status}, "
+            f"expected one of {expect}. This is a harness failure, not a "
+            "finding about gitforgeops."
+        )
+    return status
+
+
+def __admin(harness: Harness, method: str, path: str, body: dict | None = None) -> int:
     token = os.environ["GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN"]
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(
@@ -485,7 +510,8 @@ def create_unmanaged_proxy(harness: Harness) -> None:
 
 
 def unmanaged_proxy_exists(harness: Harness) -> bool:
-    return _admin(harness, "GET", "/proxies/admin-owned-proxy") == 200
+    # A plain read: 404 is a legitimate answer here, and is the finding.
+    return __admin(harness, "GET", "/proxies/admin-owned-proxy") == 200
 
 
 def mutate_proxy_out_of_band(harness: Harness) -> None:

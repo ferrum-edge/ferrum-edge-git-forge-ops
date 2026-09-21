@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import time
+import uuid
 
 
 def segment(payload: dict) -> bytes:
@@ -32,6 +33,7 @@ def main() -> int:
     parser.add_argument("--secret", required=True)
     parser.add_argument("--issuer", default="ferrum-edge")
     parser.add_argument("--role", default="admin")
+    parser.add_argument("--subject", default="gitforgeops-lifecycle")
     parser.add_argument("--ttl", type=int, default=3600)
     args = parser.parse_args()
 
@@ -41,10 +43,16 @@ def main() -> int:
             segment({"alg": "HS256", "typ": "JWT"}),
             segment(
                 {
+                    # The same claim set `src/jwt.rs` mints. A token missing
+                    # `sub`, `nbf` or `jti` is rejected, and the rejection is
+                    # a plain 401 that looks exactly like a wrong secret.
                     "iss": args.issuer,
+                    "sub": args.subject,
                     "role": args.role,
                     "iat": now,
+                    "nbf": now,
                     "exp": now + args.ttl,
+                    "jti": uuid.uuid4().hex,
                 }
             ),
         )
