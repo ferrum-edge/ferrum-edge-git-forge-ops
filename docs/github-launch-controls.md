@@ -24,6 +24,11 @@ Secrets are the one thing the script will not touch: it neither accepts nor
 prints a secret value, and finishes by listing the `gh secret set` commands left
 to run.
 
+For the order of operations rather than the control-by-control specification,
+[`docs/quickstart.md`](quickstart.md) walks one gateway, one namespace and one
+declared environment from an empty template to a first successful apply. It
+applies a subset of this baseline and links back here for the rest.
+
 ## Template repositories
 
 The upstream repository is the template customers copy, and a template has no

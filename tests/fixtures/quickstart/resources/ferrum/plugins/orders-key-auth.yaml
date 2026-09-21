@@ -1,0 +1,11 @@
+kind: PluginConfig
+spec:
+  id: "orders-key-auth"
+  plugin_name: "key_auth"
+  # Scoped to one proxy: a global config of the same plugin_name would be
+  # replaced by this one for that proxy.
+  scope: proxy
+  proxy_id: "orders-proxy"
+  enabled: true
+  config:
+    key_location: "header:X-API-Key"

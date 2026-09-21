@@ -24,6 +24,7 @@ mod override_tests;
 mod ownership_tests;
 mod passthrough_tests;
 mod policy_tests;
+mod quickstart_tests;
 mod reconcile_tests;
 mod repo_config_tests;
 mod review_tests;

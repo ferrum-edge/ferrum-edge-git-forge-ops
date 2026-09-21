@@ -1,0 +1,6 @@
+# Overlays deep-merge onto the resource of the same kind and id. Only the keys
+# named here change; everything else comes from resources/.
+kind: Proxy
+spec:
+  id: "orders-proxy"
+  backend_host: "orders.prod.internal"
