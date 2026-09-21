@@ -971,6 +971,37 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 - `tempfile` crate for filesystem tests.
 - No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking. GitHub Environment Secret adapters (`fetch_public_key` / `put_environment_secret`) are driven against an in-process loopback stub in `tests/unit/github_api_tests.rs` by injecting a test-only API origin (`fetch_public_key_at` / `put_environment_secret_at` / `allocate_and_deliver_at` / `rotate_and_deliver_at`). Production wrappers keep the compiled-in `https://api.github.com` origin; there is no environment-variable override.
 
+## Lifecycle acceptance (`tests/lifecycle/`)
+
+The suite that runs the product rather than its unit tests: a real gateway
+(the same allowlisted `ferrum-edge` binary the validator installer fetches — no
+second artifact to pin), a stdlib test upstream, the real binary, real traffic.
+`run.sh` owns process lifecycle and disposability; `scenarios.py` owns the
+scenarios; `.github/scripts/lifecycle_result.py` owns the record.
+
+`REQUIRED_SCENARIOS` there is the contract, and
+`test_lifecycle_result.py` asserts the scenario list, the driver's `SCENARIOS`
+map and `tests/lifecycle/README.md` stay in step — adding a fail-closed gate to
+`apply` without adding a scenario narrows what the suite certifies without
+narrowing what ships.
+
+`release.yml`'s `authorize-release` downloads the sealed result for the exact
+revision being published and runs `lifecycle_result.py verify`. Only `passed`
+certifies: an unrun suite, a result for another revision, a result from another
+gateway build, an unsealed (cancelled) record, a `skipped` scenario and a stale
+record are each a refusal, because a release gate that can be satisfied by an
+absence is not a gate. Lifecycle is deliberately **not** a per-PR required
+check — it needs a gateway build, and turning every PR red when that is
+unavailable trains people to override the gate rather than fix it.
+
+Five scenarios need a disposable GitHub repository (environment approvals,
+state-writer App permissions, protected-branch ledger writes, scheduling,
+attribution). They record `skipped` with a reason and run through
+`tests/lifecycle/github_acceptance.md`. Redaction happens at capture:
+`Harness.redact` over every captured stream keyed on the run's own secrets,
+`run.sh` over the gateway log tail, and the test upstream never echoes a header
+or logs a request line.
+
 ## Development Guidelines
 
 Repository-local agent skills, Claude rules, and their dispatchers are guarded by

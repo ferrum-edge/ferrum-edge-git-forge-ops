@@ -2296,6 +2296,57 @@ tag daily. Reintroduce a temporary digest-pinned point-release package stage
 only when that canary reports a fixed CRITICAL/HIGH the rebuilt base does not
 yet carry; never pull those fixes through apt.
 
+## Lifecycle acceptance
+
+`cargo test --test unit_tests` proves the code does what the code says.
+[`tests/lifecycle/`](tests/lifecycle/) proves the *product* does what this
+README says: a real Ferrum Edge gateway, a real upstream, the real binary,
+real HTTP traffic through the routes it created.
+
+```bash
+bash tests/lifecycle/run.sh                       # the whole suite
+LIFECYCLE_ONLY=create-and-route bash tests/lifecycle/run.sh
+```
+
+It needs the `ferrum-edge` binary on `PATH` — the same one
+`install-ferrum-edge.sh` fetches and verifies against the allowlisted digests,
+reused as the gateway so the suite certifies a build this repository has
+already approved and adds no second artifact to pin. Everything else is
+standard library: the test upstream is 40 lines of `http.server`.
+
+Everything it touches is disposable and removed on exit: a temporary
+repository tree, a loopback gateway, a per-run admin secret, a per-run consumer
+key, a 0600 credential bundle. **Do not point it at a real gateway** — several
+scenarios deliberately mutate resources out of band and delete managed ones.
+
+### The result is the release gate
+
+Each run seals a record: the exact GitForgeOps revision, the gateway build's
+digest, and one entry per declared scenario. `release.yml` refuses to publish
+without one for the revision being published.
+
+The gate exists for the *quiet* failures, not the loud one. Every way of not
+having a result is a refusal:
+
+| | |
+| --- | --- |
+| the suite never ran for this revision | blocked |
+| it ran for an older revision | blocked |
+| it ran against a different gateway build | blocked |
+| it was cancelled mid-run (record left unsealed) | blocked |
+| a scenario reported `skipped` | blocked |
+| the record is older than the freshness window | blocked |
+
+`skipped` is a status a scenario may legitimately have — five of them need a
+disposable GitHub repository, which CI cannot create for itself. It is never a
+pass. Those run through
+[`github_acceptance.md`](tests/lifecycle/github_acceptance.md) and their
+outcomes are recorded into the same file before a release.
+
+Adding a fail-closed gate to `apply` without adding a scenario narrows what the
+suite certifies without narrowing what ships, so the scenario list, the driver
+and the runbook are asserted to stay in step.
+
 ## Build, test, lint
 
 ```
