@@ -257,6 +257,23 @@ def seed_repository(harness: Harness) -> None:
     )
 
 
+def ensure_deployed(harness: Harness) -> None:
+    """Put the repository's desired state on the gateway, from any starting point.
+
+    Scenarios run in sequence and mutate shared state — one of them deletes
+    the proxy — and `LIFECYCLE_ONLY` runs any single one on its own. Either
+    way, a scenario that assumes what ran before it is a scenario that reports
+    on the previous scenario's leftovers. So each one that needs the tree
+    deployed says so.
+
+    `--allow-large-prune` because re-seeding after the delete scenario is a
+    re-creation, and the guard's refusal is asserted where it belongs, in
+    `modify-and-delete-in-order`.
+    """
+    seed_repository(harness)
+    harness.run("apply", "--auto-approve", "--allow-large-prune")
+
+
 # -- scenarios ---------------------------------------------------------------
 #
 # Each returns a detail string on success and raises `ScenarioFailure` on a
@@ -277,6 +294,7 @@ def scenario_create_and_route(harness: Harness) -> str:
 
 
 def scenario_reapply_is_a_no_op(harness: Harness) -> str:
+    ensure_deployed(harness)
     before = harness.state()
     # exit 0 = in sync. Persistent false drift from credential normalization is
     # exactly what this catches.
@@ -290,6 +308,7 @@ def scenario_reapply_is_a_no_op(harness: Harness) -> str:
 
 
 def scenario_modify_and_delete_in_order(harness: Harness) -> str:
+    ensure_deployed(harness)
     # An unmanaged row the repository never declared must survive shared mode.
     create_unmanaged_proxy(harness)
 
@@ -376,6 +395,7 @@ def scenario_staged_promotion(harness: Harness) -> str:
 
 
 def scenario_drift_monitoring(harness: Harness) -> str:
+    ensure_deployed(harness)
     # Out-of-band change: the gateway now has a row the repository declares
     # differently. `--exit-on-drift` must say 2, and must not say 1.
     mutate_proxy_out_of_band(harness)
@@ -401,6 +421,9 @@ def scenario_drift_monitoring(harness: Harness) -> str:
 
 
 def scenario_file_and_mesh_boundary(harness: Harness) -> str:
+    # Only the tree is needed here, not a deployed gateway: the point is that
+    # assembling a document is NOT deploying it.
+    seed_repository(harness)
     output = harness.workdir / "assembled" / "acceptance.yaml"
     harness.run(
         "export",

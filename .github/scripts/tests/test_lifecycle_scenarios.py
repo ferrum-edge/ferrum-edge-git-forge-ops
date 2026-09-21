@@ -192,6 +192,27 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("harness.gateway_url", admin)
         self.assertNotIn("harness.proxy_url", admin)
 
+    def test_every_scenario_that_needs_a_gateway_deploys_to_it_first(self):
+        # Scenarios mutate shared state — one of them deletes the proxy — and
+        # `LIFECYCLE_ONLY` runs any single one alone. A scenario that assumes
+        # what ran before it reports on the previous scenario's leftovers.
+        source = (ROOT / "tests/lifecycle/scenarios.py").read_text(encoding="utf-8")
+        for identifier in (
+            "reapply_is_a_no_op",
+            "modify_and_delete_in_order",
+            "drift_monitoring",
+        ):
+            with self.subTest(scenario=identifier):
+                start = source.index(f"def scenario_{identifier}(")
+                body = source[start : source.index("\n\n\ndef ", start)]
+                self.assertIn("ensure_deployed(harness)", body)
+        # `create-and-route` seeds and applies as its own subject, and
+        # `file-and-mesh-boundary` deliberately needs only the tree.
+        start = source.index("def scenario_file_and_mesh_boundary(")
+        body = source[start : source.index("\n\n\nSCENARIOS", start)]
+        self.assertIn("seed_repository(harness)", body)
+        self.assertNotIn("ensure_deployed(harness)", body)
+
     def test_out_of_band_admin_calls_assert_their_own_outcome(self):
         # A silently failed admin call is the worst kind of harness bug: the
         # scenario carries on and draws a confident, wrong conclusion from a
