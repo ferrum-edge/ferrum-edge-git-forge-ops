@@ -1,0 +1,6 @@
+{
+  "upstream": "https://github.com/ferrum-edge/ferrum-edge-git-forge-ops.git",
+  "ref": "main",
+  "commit": "b3b443e465ec8a7e56534c623017602ff9b523db",
+  "_comment": "The upstream revision this repository's upstream-managed files were last synced from. Written by .github/scripts/template_update.py; see docs/template-updates.md."
+}

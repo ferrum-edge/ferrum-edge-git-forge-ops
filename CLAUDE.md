@@ -868,6 +868,24 @@ author's (or dispatcher's) SSH public key fetched from
 `GET /users/{login}/keys`, then posted as a PR comment or workflow output.
 Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
+### Downstream template updates
+
+A repository created from the template shares no history with upstream and
+builds the engine from its own checkout, so upstream publishing an image
+updates nothing. `.github/scripts/template_update.py` closes that with a
+three-way comparison against `.gitforgeops/baseline.json` (the upstream commit
+the tree was last synced from): `B == U` skip, `L == B` adopt, `L == U` already
+adopted, otherwise **conflict** — reported, never overwritten, and the baseline
+is not advanced while one remains. `UPSTREAM_MANAGED` and `CUSTOMER_OWNED` are
+the two fences; `CUSTOMER_OWNED` (`resources/`, `overlays/`,
+`.gitforgeops/config.yaml`, `.gitforgeops/policies.yaml`, `.state/`,
+`assembled/`, `.github/CODEOWNERS`) is applied to upstream's own tree too, so
+upstream shipping a `.state/` file cannot overwrite a live ledger. Secrets and
+repository settings are outside Git. `POST_ADOPTION_CHECKS` is printed by
+`apply` and asserted against `docs/template-updates.md` so the tool and the
+runbook cannot disagree. Recovery is `git revert` of the adoption commit —
+never restoring an obsolete ledger, which is a separate state-override repair.
+
 ### Source Layout
 
 - `src/main.rs` — async Tokio entry, command dispatch
