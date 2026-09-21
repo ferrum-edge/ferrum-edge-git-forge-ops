@@ -13,22 +13,43 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use base64::Engine as _;
+
 use super::{resolve_headers, CheckResult, EnvironmentChecks, Outcome, SmokeCheck, VerifyReport};
 
 /// Build a client for one check. Each gets its own because the per-check
 /// timeout is the bound that matters.
-fn client(
-    check: &SmokeCheck,
-    danger_accept_invalid_certs: bool,
-) -> crate::error::Result<reqwest::Client> {
-    reqwest::Client::builder()
+///
+/// There is deliberately **no** `danger_accept_invalid_certs` here, and it is
+/// not an oversight that `FERRUM_TLS_NO_VERIFY` does not reach it. A check
+/// that accepts any certificate has not verified TLS; it has verified that
+/// *something* answered. A promotion gate that passes against an interceptor
+/// is worse than no gate, because it is believed.
+///
+/// A data plane behind a private CA is supported the way the admin client
+/// supports it: give the CA. `FERRUM_GATEWAY_CA_CERT` is already an
+/// environment secret and already bound in the workflow, so this is a
+/// configuration the operator has rather than a check they have to weaken.
+fn client(check: &SmokeCheck, ca_cert: Option<&str>) -> crate::error::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .timeout(check.timeout())
-        .connect_timeout(Duration::from_secs(check.timeout_secs.min(10)))
-        // The data plane may be reached through the same private CA the admin
-        // API is; a verification that cannot establish TLS is a failed check,
-        // not a silent pass, so the opt-out is explicit and shared with the
-        // admin client's own dev-only switch.
-        .danger_accept_invalid_certs(danger_accept_invalid_certs)
+        .connect_timeout(Duration::from_secs(check.timeout_secs.min(10)));
+
+    if let Some(ca_b64) = ca_cert {
+        let ca_pem = base64::engine::general_purpose::STANDARD
+            .decode(ca_b64)
+            .map_err(|error| {
+                crate::error::Error::HttpClient(format!("verify CA cert decode: {error}"))
+            })?;
+        let certificate = reqwest::Certificate::from_pem(&ca_pem).map_err(|error| {
+            crate::error::Error::HttpClient(format!("verify CA cert parse: {error}"))
+        })?;
+        builder = builder
+            .add_root_certificate(certificate)
+            .tls_built_in_root_certs(false);
+    }
+
+    builder
         .build()
         .map_err(|error| crate::error::Error::HttpClient(format!("verify client: {error}")))
 }
@@ -46,7 +67,7 @@ pub async fn run_check(
     base_url: &str,
     check: &SmokeCheck,
     bundle: &BTreeMap<String, String>,
-    accept_invalid_certs: bool,
+    ca_cert: Option<&str>,
 ) -> CheckResult {
     let url = join(base_url, &check.path);
     let failed = |outcome: Outcome, attempts: u32, detail: String| CheckResult {
@@ -84,7 +105,7 @@ pub async fn run_check(
         if attempt > 0 {
             tokio::time::sleep(check.backoff(attempt)).await;
         }
-        let client = match client(check, accept_invalid_certs) {
+        let client = match client(check, ca_cert) {
             Ok(client) => client,
             Err(error) => return failed(Outcome::Unreachable, attempts, error.to_string()),
         };
@@ -156,11 +177,11 @@ pub async fn run(
     base_url: &str,
     checks: &EnvironmentChecks,
     bundle: &BTreeMap<String, String>,
-    accept_invalid_certs: bool,
+    ca_cert: Option<&str>,
 ) -> VerifyReport {
     let mut results = Vec::with_capacity(checks.checks.len());
     for check in &checks.checks {
-        results.push(run_check(base_url, check, bundle, accept_invalid_certs).await);
+        results.push(run_check(base_url, check, bundle, ca_cert).await);
     }
     VerifyReport {
         environment: environment.to_string(),

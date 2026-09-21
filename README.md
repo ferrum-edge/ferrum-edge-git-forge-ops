@@ -2043,7 +2043,12 @@ entire execution surface — a `run:` or `command:` key is a load error, not a
 silently ignored one.
 
 Requests go to `FERRUM_VERIFY_BASE_URL`, the gateway's **data plane**, which is
-a different endpoint from the admin API in `FERRUM_GATEWAY_URL`. A header value
+a different endpoint from the admin API in `FERRUM_GATEWAY_URL`. TLS is always
+verified — `FERRUM_TLS_NO_VERIFY` deliberately does not reach this path,
+because a check that accepts any certificate has not verified TLS and a
+promotion gate that passes against an interceptor is worse than no gate. A
+private CA belongs in `FERRUM_GATEWAY_CA_CERT`, which the check honours. A
+header value
 is either a `literal:` or a credential-bundle `slot:` — stated, never inferred
 from string syntax — and exactly one of the two. A slot that is not in the
 bundle **fails** the check rather than sending an empty header, because an

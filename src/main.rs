@@ -3386,7 +3386,11 @@ async fn cmd_verify(
         &base_url,
         checks,
         &bundle,
-        env_config.tls_no_verify,
+        // A private CA is configuration; `FERRUM_TLS_NO_VERIFY` is deliberately
+        // not honoured here. A check that accepts any certificate has not
+        // verified TLS, and a promotion gate that passes against an
+        // interceptor is worse than no gate.
+        env_config.ca_cert.as_deref(),
     )
     .await;
 

@@ -12,7 +12,10 @@
 #
 # Requests go to the gateway's DATA plane, whose base URL is the
 # FERRUM_VERIFY_BASE_URL environment secret — a different endpoint from the
-# admin API in FERRUM_GATEWAY_URL.
+# admin API in FERRUM_GATEWAY_URL. TLS is always verified: a private CA goes
+# in FERRUM_GATEWAY_CA_CERT, and FERRUM_TLS_NO_VERIFY deliberately does not
+# reach this path, because a check that accepts any certificate has not
+# verified TLS.
 
 version: 1
 

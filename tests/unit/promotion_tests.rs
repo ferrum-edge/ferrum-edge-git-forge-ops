@@ -239,6 +239,31 @@ fn a_missing_credential_slot_fails_the_check_rather_than_sending_nothing() {
     assert!(resolved.contains(&("X-API-Key".to_string(), "s3cret-value".to_string())));
 }
 
+// -- TLS is verified, always -------------------------------------------------
+
+#[test]
+fn the_verify_path_never_accepts_an_invalid_certificate() {
+    // A check that accepts any certificate has not verified TLS; it has
+    // verified that *something* answered. A promotion gate that passes
+    // against an interceptor is worse than no gate, because it is believed.
+    // A private CA is configuration (`FERRUM_GATEWAY_CA_CERT`), not a reason
+    // to weaken the check.
+    let runner = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/verify/runner.rs"),
+    )
+    .expect("read runner");
+    let code: String = runner
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("danger_accept_invalid_certs"),
+        "the verification client must not accept invalid certificates"
+    );
+    assert!(code.contains("add_root_certificate"), "{code}");
+}
+
 // -- reporting: never a pass we did not earn --------------------------------
 
 fn report(outcomes: &[Outcome]) -> VerifyReport {

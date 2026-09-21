@@ -417,7 +417,10 @@ it.
 
 Traffic checks are **data, never code** (`src/verify/`): a job holding
 deployment credentials must not execute an arbitrary command from a repository
-file, so the closed schema is the whole execution surface. Header values are an
+file, so the closed schema is the whole execution surface. TLS is always
+verified in this path — `FERRUM_TLS_NO_VERIFY` is deliberately not threaded
+into `verify::runner`, because a check that accepts any certificate has not
+verified TLS; a private CA goes in `FERRUM_GATEWAY_CA_CERT`, which it honours. Header values are an
 explicit `literal:` or `slot:` (exactly one), and an unresolvable slot fails the
 check rather than sending an empty header — an empty credential would make a
 `401`-expecting check pass for the wrong reason. Results carry name, method,
