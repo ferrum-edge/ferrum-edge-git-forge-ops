@@ -42,6 +42,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       envs: ${{ steps.list.outputs.envs }}
+      promotions: ${{ steps.list.outputs.promotions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -85,18 +86,35 @@ jobs:
           if [[ ! -f .gitforgeops/config.yaml ]]; then
             echo "::notice::No .gitforgeops/config.yaml on the protected branch; skipping apply. See docs/github-launch-controls.md to configure deployment environments."
             echo "envs=[]" >> "$GITHUB_OUTPUT"
+            echo "promotions=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          envs=$(gitforgeops envs --format json | jq -c .)
+          scopes=$(gitforgeops envs --format json --include-scopes | jq -c .)
           jq -e '
             type == "array" and
-            all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))
-          ' <<< "$envs" >/dev/null || {
+            all(.[];
+              (.environment | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))
+              and ((.promotion_requires // "x") | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))
+          ' <<< "$scopes" >/dev/null || {
             echo "::error::Every environment must be a single safe path component."
             exit 1
           }
+          # Two matrices, because a promotion is a different capability from a
+          # parallel deployment rather than a stricter version of it. An
+          # environment with no `promotion.requires` keeps exactly today's
+          # behaviour: it deploys in the independent matrix, in parallel, with
+          # its own approval and its own concurrency group.
+          envs=$(jq -c '[.[] | select(.promotion_requires == null) | .environment]' <<< "$scopes")
+          promotions=$(jq -c '[.[] | select(.promotion_requires != null)
+            | {environment, requires: .promotion_requires}]' <<< "$scopes")
           echo "envs=$envs" >> "$GITHUB_OUTPUT"
+          echo "promotions=$promotions" >> "$GITHUB_OUTPUT"
 
+  # Independent environments: today's behaviour, unchanged. Parallel matrix
+  # jobs, each with its own environment approval and its own concurrency group.
+  # Parallel is NOT staged — production here does not wait for staging and is
+  # not promoted from it. Opt an environment into `promotion.requires` to get
+  # the chain below instead.
   apply:
     needs: list-envs
     if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
@@ -345,7 +363,9 @@ jobs:
           echo "author=$author" >> "$GITHUB_OUTPUT"
 
       - name: Apply
+        id: apply
         if: steps.deployment-mode.outputs.mode == 'api'
+        continue-on-error: true
         env:
           FERRUM_ENV: ${{ matrix.environment }}
           FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
@@ -393,7 +413,9 @@ jobs:
       # the separate `materialize-file.yml` workflow which produces an
       # age-encrypted artifact.
       - name: Apply (file mode)
+        id: apply-file
         if: steps.deployment-mode.outputs.mode == 'file'
+        continue-on-error: true
         env:
           FERRUM_ENV: ${{ matrix.environment }}
           FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
@@ -417,6 +439,78 @@ jobs:
           GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
+
+
+      # A successful apply proves the gateway accepted a configuration write.
+      # It does not prove the route answers, the upstream is reachable, or that
+      # authentication is enforced — and a promotion decided on "the write
+      # returned 200" is exactly the gap this closes. The checks are DATA
+      # (`.gitforgeops/smoke.yaml`): no hook, no shell, because this job holds
+      # deployment credentials and an arbitrary command in a repository file
+      # would be a way to spend them.
+      #
+      # `continue-on-error` so the outcome is recorded rather than the job
+      # ending here; the record is what blocks a promotion, and a run that
+      # stops before recording is indistinguishable from one that never
+      # started.
+      - name: Verify traffic
+        id: verify
+        if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' }}
+        continue-on-error: true
+        env:
+          FERRUM_ENV: ${{ matrix.environment }}
+          FERRUM_VERIFY_BASE_URL: ${{ secrets.FERRUM_VERIFY_BASE_URL }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+        run: gitforgeops verify
+
+      - name: Record promotion result
+        if: ${{ !cancelled() }}
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          REVISION: ${{ steps.freshness.outputs.applied_sha }}
+          MODE: ${{ steps.deployment-mode.outputs.mode }}
+          APPLY_RESULT: ${{ (steps.apply.outcome == 'success' || steps.apply-file.outcome == 'success') && 'success' || 'failure' }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          ACTOR: ${{ steps.pr.outputs.author }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          # File mode has no data plane to send traffic to. It is recorded as
+          # `skipped`, which does NOT authorize a promotion — an environment
+          # nothing can verify must not be a promotion predecessor.
+          verify="$VERIFY_OUTCOME"
+          if [ "$MODE" = file ]; then
+            verify=skipped
+          elif [ -z "$verify" ] || [ "$verify" = skipped ]; then
+            verify=not_run
+          elif [ "$verify" != success ]; then
+            verify=failure
+          fi
+          python3 .github/scripts/promotion_record.py write \
+            --environment "$ENVIRONMENT" \
+            --revision "$REVISION" \
+            --apply-result "$APPLY_RESULT" \
+            --verify-result "$verify" \
+            --run-id "$GITHUB_RUN_ID" \
+            --actor "$ACTOR" \
+            --pr "$PR_NUMBER" \
+            --output "promotion-records/${ENVIRONMENT}.json"
+
+      - name: Publish promotion record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: promotion-record-${{ matrix.environment }}
+          path: promotion-records/
+          retention-days: 30
+
+      # The apply step ran with `continue-on-error` so its outcome could be
+      # recorded. Fail the job now, after the record exists.
+      - name: Fail on apply error
+        if: ${{ !cancelled() && steps.apply.outcome == 'failure' || steps.apply-file.outcome == 'failure' }}
+        run: |
+          echo "::error::The apply step failed; see its output above."
+          exit 1
 
       - name: Mint narrowly scoped state-writer token
         if: ${{ !cancelled() }}
@@ -506,3 +600,548 @@ jobs:
 
           echo "ERROR: failed to push state for ${{ matrix.environment }} after 5 attempts" >&2
           exit 1
+
+  # Staged promotion. An environment that declares `promotion.requires` is not
+  # in the parallel matrix above: it may not start until its predecessor's apply
+  # AND its traffic verification succeeded, for the SAME source revision.
+  #
+  # `needs: apply` is the coarse half of that — the whole independent phase must
+  # be green. The precise half is the promotion record: this job reads its
+  # named predecessor's record and refuses unless that predecessor applied and
+  # verified the exact revision this job is about to apply. Job ordering alone
+  # would prove only that two jobs ran in sequence.
+  promote:
+    needs: [list-envs, apply]
+    if: needs.list-envs.outputs.promotions != '[]' && needs.list-envs.outputs.promotions != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: ${{ fromJson(needs.list-envs.outputs.promotions) }}
+    environment: ${{ matrix.scope.environment }}
+    concurrency:
+      group: ferrum-apply-${{ matrix.scope.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate deployment routing
+        id: deployment-mode
+        env:
+          RAW_MODE: ${{ vars.FERRUM_GATEWAY_MODE }}
+        run: |
+          set -euo pipefail
+          mode=$(printf '%s' "${RAW_MODE:-api}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          [ -n "$mode" ] || mode=api
+          case "$mode" in
+            api|file) ;;
+            *)
+              echo "::error::Invalid FERRUM_GATEWAY_MODE '$RAW_MODE'; expected api or file."
+              exit 1
+              ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      # The App token itself is minted only after the untrusted build has run
+      # and immediately before the ledger is committed — `check_supply_chain.py`
+      # enforces that install < mint < commit ordering so a Contents: write
+      # token is never present while candidate code executes. The cost of that
+      # ordering is that an environment missing the App credentials would apply
+      # to the live gateway and only *then* discover it cannot record what it
+      # did, leaving `.state/<env>.json` behind live state. Shared mode reads
+      # the missing entries as "never managed" and quietly stops reconciling
+      # them. Prove the credentials exist before the mutation; keep the mint
+      # late.
+      - name: Require state-writer App credentials
+        env:
+          STATE_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+          STATE_APP_PRIVATE_KEY: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$STATE_APP_ID" ] || [ -z "$STATE_APP_PRIVATE_KEY" ]; then
+            echo "::error::The state-writer GitHub App is not configured: set repository variable GITFORGEOPS_STATE_APP_ID and environment secret GITFORGEOPS_STATE_APP_PRIVATE_KEY before applying. See docs/github-launch-controls.md."
+            exit 1
+          fi
+
+      # The concurrency group above serializes applies per environment, but
+      # `actions/checkout` still selects the commit that TRIGGERED the run. A
+      # merge queued behind a running apply therefore reconciled from a
+      # `.state/<env>.json` that predates the ledger the earlier run publishes
+      # — shared mode reads the rows it never saw as "never managed" and
+      # silently stops reconciling them — and re-running an old workflow
+      # replayed an old desired snapshot over newer configuration. Now that the
+      # lock is held, take the protected branch as it stands at this moment.
+      - name: Check out protected main for promotion
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # `git merge-base --is-ancestor` below needs real history. A shallow
+          # clone cannot answer whether the triggering commit is still on the
+          # branch, and "cannot tell" would have to fail closed on every run.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # `actions/checkout` resolved the branch when *it* ran, which can be many
+      # minutes before the queue ahead of this job drains. Fetch the ref again,
+      # move onto whatever it points at now, and refuse to deploy a revision
+      # the protected branch no longer carries. Everything downstream — the
+      # gitforgeops binary, the desired resources, the ownership ledger — is
+      # then read from this one commit, so a stale run cannot roll newer
+      # configuration back and cannot reconcile against a superseded ledger.
+      - name: Refresh protected branch and reject stale deployments
+        id: freshness
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TRIGGER_SHA: ${{ github.sha }}
+          FETCH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TRIGGER_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Triggering commit is not a 40-hex object name."
+            exit 1
+          }
+          # The checkout deliberately persisted no credentials, so authenticate
+          # this one fetch with the job's read-only token and drop the header
+          # again on the way out.
+          auth=$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git fetch --no-tags --force origin \
+            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          fresh_head=$(git rev-parse "refs/remotes/origin/${DEFAULT_BRANCH}")
+          # Stay ON the branch rather than detaching: the state commit at the
+          # end of this job pushes it, and a detached HEAD has nothing to push.
+          git checkout --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/${DEFAULT_BRANCH}"
+          echo "Triggering commit: $TRIGGER_SHA"
+          echo "Protected ${DEFAULT_BRANCH} HEAD: $fresh_head"
+          git cat-file -e "${TRIGGER_SHA}^{commit}" 2>/dev/null || {
+            echo "::error::Triggering commit $TRIGGER_SHA is not reachable from ${DEFAULT_BRANCH} at $fresh_head; refusing to apply a revision the protected branch no longer carries."
+            exit 1
+          }
+          git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head" || {
+            echo "::error::Stale deployment: $TRIGGER_SHA is not an ancestor of ${DEFAULT_BRANCH} at $fresh_head. Re-run the apply for the current head instead."
+            exit 1
+          }
+          # PR authorization and credential delivery below are intentionally
+          # attributed to TRIGGER_SHA. A newer resource, policy, workflow, or
+          # binary revision must therefore never ride an older run's approval —
+          # and the classifier refuses exactly those, using the same path list
+          # that puts each of them on its own apply run. A difference the
+          # classifier calls inert (documentation, tests, an unrelated
+          # workflow, the ledger and assembled output this job writes) cannot
+          # change the desired input, the policy configuration or the
+          # executable, so the revision applied here is still the one the
+          # triggering PR authorized and the run proceeds instead of stranding
+          # the deployment.
+          python3 .github/scripts/deployment_scope.py classify \
+            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"
+          echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
+
+      # The revision is fixed by the guard above. Now prove it is the one the
+      # predecessor applied and verified.
+      #
+      # A newer deployment-affecting merge does not silently ride this
+      # approval: the guard has already refused it, and the newer merge runs
+      # its own staging -> production cycle. A revision mismatch here is the
+      # belt to that brace, and it also catches a re-run of an older workflow.
+      - name: Collect promotion records
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: promotion-record-*
+          path: promotion-records
+          merge-multiple: true
+
+      - name: Require an authorized promotion
+        env:
+          REQUIRES: ${{ matrix.scope.requires }}
+          REVISION: ${{ steps.freshness.outputs.applied_sha }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/promotion_record.py require \
+            --environment "$REQUIRES" \
+            --revision "$REVISION" \
+            --records promotion-records \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Download ferrum-edge binary
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/install-ferrum-edge.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install gitforgeops
+        run: cargo install --path . --locked
+
+      - name: Load credential bundles
+        id: load-bundles
+        # Bind every credential-bundle Environment Secret by NAME. The previous
+        # `toJSON(secrets)` spill handed this step the whole environment — admin
+        # JWT signing key, state-writer App private key, registry token — just to
+        # pull out a few bundle values, and since GitHub's 2026-07-28 change a
+        # public-repository run that reads the whole secrets context is held for
+        # manual approval before it may start.
+        #
+        # The list is finite by construction: shards 0..15, matching
+        # MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in
+        # .github/scripts/credential_bundles.py (16 x ~440 ~= 7,000 slots).
+        # Adding capacity means raising both constants and extending this block
+        # in all four privileged workflows; check_supply_chain.py fails the
+        # build when they drift apart.
+        #
+        # The loader writes the filtered payload to a file and the binary reads
+        # the PATH from FERRUM_CREDS_JSON_FILE: $GITHUB_ENV materializes into
+        # the next step's process environment, where kernel env-block caps can
+        # truncate a large multi-shard payload. Kept under $RUNNER_TEMP so
+        # GitHub Actions cleans it up when the runner is recycled.
+        env:
+          FERRUM_CREDS_BUNDLE: ${{ secrets.FERRUM_CREDS_BUNDLE }}
+          FERRUM_CREDS_BUNDLE_1: ${{ secrets.FERRUM_CREDS_BUNDLE_1 }}
+          FERRUM_CREDS_BUNDLE_2: ${{ secrets.FERRUM_CREDS_BUNDLE_2 }}
+          FERRUM_CREDS_BUNDLE_3: ${{ secrets.FERRUM_CREDS_BUNDLE_3 }}
+          FERRUM_CREDS_BUNDLE_4: ${{ secrets.FERRUM_CREDS_BUNDLE_4 }}
+          FERRUM_CREDS_BUNDLE_5: ${{ secrets.FERRUM_CREDS_BUNDLE_5 }}
+          FERRUM_CREDS_BUNDLE_6: ${{ secrets.FERRUM_CREDS_BUNDLE_6 }}
+          FERRUM_CREDS_BUNDLE_7: ${{ secrets.FERRUM_CREDS_BUNDLE_7 }}
+          FERRUM_CREDS_BUNDLE_8: ${{ secrets.FERRUM_CREDS_BUNDLE_8 }}
+          FERRUM_CREDS_BUNDLE_9: ${{ secrets.FERRUM_CREDS_BUNDLE_9 }}
+          FERRUM_CREDS_BUNDLE_10: ${{ secrets.FERRUM_CREDS_BUNDLE_10 }}
+          FERRUM_CREDS_BUNDLE_11: ${{ secrets.FERRUM_CREDS_BUNDLE_11 }}
+          FERRUM_CREDS_BUNDLE_12: ${{ secrets.FERRUM_CREDS_BUNDLE_12 }}
+          FERRUM_CREDS_BUNDLE_13: ${{ secrets.FERRUM_CREDS_BUNDLE_13 }}
+          FERRUM_CREDS_BUNDLE_14: ${{ secrets.FERRUM_CREDS_BUNDLE_14 }}
+          FERRUM_CREDS_BUNDLE_15: ${{ secrets.FERRUM_CREDS_BUNDLE_15 }}
+        run: |
+          set -euo pipefail
+          creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
+          python3 .github/scripts/credential_bundles.py "$creds_file"
+          echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
+
+      - name: Validate
+        env:
+          FERRUM_ENV: ${{ matrix.scope.environment }}
+        run: gitforgeops validate
+
+      # Map the merge commit back to the PR that produced it. The binary uses
+      # this for (a) policy-override label/permission lookups and (b) routing
+      # age-encrypted credential delivery to the PR author. Using
+      # ${{ github.actor }} for delivery would target the merger (or a bot),
+      # not the contributor who actually requested the credential slot.
+      #
+      # Attribution stays keyed on the TRIGGERING merge. The freshness guard
+      # permits the refreshed head to differ only in generated state/output,
+      # so the executable and desired input remain exactly those reviewed in
+      # this PR. A later substantive merge must use its own apply run, author,
+      # and override label.
+      - name: Derive PR metadata from merge commit
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PUSH_SHA: ${{ github.sha }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          pages_file=$(mktemp)
+          trap 'rm -f "$pages_file"' EXIT
+          context=
+          for attempt in 1 2 3 4 5; do
+            context=
+            if ! gh api "repos/${REPO}/commits/${PUSH_SHA}/pulls?per_page=100" \
+              --paginate --slurp > "$pages_file"; then
+              echo "Merge-association API request failed; retrying ($attempt/5)." >&2
+              if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+              continue
+            fi
+            if context=$(python3 .github/scripts/merge_context.py \
+              "$pages_file" "$PUSH_SHA" "$BASE_BRANCH"); then
+              break
+            fi
+            echo "Merge association is not yet unambiguous; retrying ($attempt/5)." >&2
+            if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
+          done
+          [ -n "$context" ] || {
+            echo "::error::Could not attribute this apply to exactly one merged PR."
+            exit 1
+          }
+          pr=$(jq -r '.number' <<< "$context")
+          author=$(jq -r '.author' <<< "$context")
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+          echo "author=$author" >> "$GITHUB_OUTPUT"
+
+      - name: Apply
+        id: apply
+        if: steps.deployment-mode.outputs.mode == 'api'
+        continue-on-error: true
+        env:
+          FERRUM_ENV: ${{ matrix.scope.environment }}
+          FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
+          FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
+          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          # Optional JWT claim settings, documented as per-environment
+          # secrets. GitHub Environment Secrets are not process environment
+          # variables: unbound, the run always minted the default issuer, role
+          # and TTL with no audience, and a gateway configured otherwise
+          # answered 401 to every call. Blank is not "empty issuer" — the Rust
+          # env parser treats an empty or whitespace-only value as unset, so an
+          # environment that configures none of these keeps the documented
+          # defaults (`ferrum-edge`, `admin`, no `aud`, 3600s). Each must match
+          # the gateway's own configuration.
+          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
+          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
+          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}
+          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+          FERRUM_GATEWAY_CLIENT_CERT: ${{ secrets.FERRUM_GATEWAY_CLIENT_CERT }}
+          FERRUM_GATEWAY_CLIENT_KEY: ${{ secrets.FERRUM_GATEWAY_CLIENT_KEY }}
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # The revision actually applied, which is the refreshed protected
+          # head — not the commit that triggered the run. It is what the policy
+          # override audit trail records, and it matches `last_applied_commit`
+          # (a `git rev-parse HEAD` of this same checkout).
+          GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          # The merge association is resolved exactly before apply; generated
+          # credentials are never delivered to an arbitrary first match or
+          # to the pusher of an unattributed direct commit.
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
+          GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gitforgeops apply --auto-approve
+
+      # File mode: `gitforgeops apply` in file mode writes the placeholder-
+      # preserving YAML to disk AND runs the credential allocator (so
+      # alloc=generate/rotate slots get real values in the GitHub Env
+      # Secret, deliveries go out, and state is updated). Calling plain
+      # `export` here would skip allocation and state tracking, leaving
+      # slots permanently pending and breaking later materialization.
+      # To pull the fully-populated YAML (credentials inlined), admins run
+      # the separate `materialize-file.yml` workflow which produces an
+      # age-encrypted artifact.
+      - name: Apply (file mode)
+        id: apply-file
+        if: steps.deployment-mode.outputs.mode == 'file'
+        continue-on-error: true
+        env:
+          FERRUM_ENV: ${{ matrix.scope.environment }}
+          FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
+          # Must match the path staged by the commit step below. Without
+          # this override, apply writes to the default
+          # ./assembled/resources.yaml and the per-env staged path doesn't
+          # exist, so placeholder-assembly changes never get committed.
+          FERRUM_FILE_OUTPUT_PATH: assembled/${{ matrix.scope.environment }}.yaml
+          # The mesh document is a SEPARATE artifact with its own destination:
+          # a mesh node's loader rejects a document carrying proxies:/
+          # upstreams:, and gateway file mode ignores a mesh: key. Written
+          # only when the repo declares `kind: MeshConfig` fragments under
+          # resources/<ns>/mesh/. Staged by the same commit step below.
+          FERRUM_MESH_FILE_OUTPUT_PATH: assembled/${{ matrix.scope.environment }}-mesh.yaml
+          FERRUM_GH_PROVISIONER_TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # The refreshed protected head, for the same reason as api mode.
+          GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
+          GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gitforgeops apply --auto-approve
+
+
+      # A successful apply proves the gateway accepted a configuration write.
+      # It does not prove the route answers, the upstream is reachable, or that
+      # authentication is enforced — and a promotion decided on "the write
+      # returned 200" is exactly the gap this closes. The checks are DATA
+      # (`.gitforgeops/smoke.yaml`): no hook, no shell, because this job holds
+      # deployment credentials and an arbitrary command in a repository file
+      # would be a way to spend them.
+      #
+      # `continue-on-error` so the outcome is recorded rather than the job
+      # ending here; the record is what blocks a promotion, and a run that
+      # stops before recording is indistinguishable from one that never
+      # started.
+      - name: Verify traffic
+        id: verify
+        if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' }}
+        continue-on-error: true
+        env:
+          FERRUM_ENV: ${{ matrix.scope.environment }}
+          FERRUM_VERIFY_BASE_URL: ${{ secrets.FERRUM_VERIFY_BASE_URL }}
+          FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
+        run: gitforgeops verify
+
+      - name: Record promotion result
+        if: ${{ !cancelled() }}
+        env:
+          ENVIRONMENT: ${{ matrix.scope.environment }}
+          REVISION: ${{ steps.freshness.outputs.applied_sha }}
+          MODE: ${{ steps.deployment-mode.outputs.mode }}
+          APPLY_RESULT: ${{ (steps.apply.outcome == 'success' || steps.apply-file.outcome == 'success') && 'success' || 'failure' }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          ACTOR: ${{ steps.pr.outputs.author }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          # File mode has no data plane to send traffic to. It is recorded as
+          # `skipped`, which does NOT authorize a promotion — an environment
+          # nothing can verify must not be a promotion predecessor.
+          verify="$VERIFY_OUTCOME"
+          if [ "$MODE" = file ]; then
+            verify=skipped
+          elif [ -z "$verify" ] || [ "$verify" = skipped ]; then
+            verify=not_run
+          elif [ "$verify" != success ]; then
+            verify=failure
+          fi
+          python3 .github/scripts/promotion_record.py write \
+            --environment "$ENVIRONMENT" \
+            --revision "$REVISION" \
+            --apply-result "$APPLY_RESULT" \
+            --verify-result "$verify" \
+            --run-id "$GITHUB_RUN_ID" \
+            --actor "$ACTOR" \
+            --pr "$PR_NUMBER" \
+            --output "promotion-records/${ENVIRONMENT}.json"
+
+      - name: Publish promotion record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: promotion-record-${{ matrix.scope.environment }}
+          path: promotion-records/
+          retention-days: 30
+
+      # The apply step ran with `continue-on-error` so its outcome could be
+      # recorded. Fail the job now, after the record exists.
+      - name: Fail on apply error
+        if: ${{ !cancelled() && steps.apply.outcome == 'failure' || steps.apply-file.outcome == 'failure' }}
+        run: |
+          echo "::error::The apply step failed; see its output above."
+          exit 1
+
+      - name: Mint narrowly scoped state-writer token
+        if: ${{ !cancelled() }}
+        id: state-writer
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
+          private-key: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Commit state + assembled (if changed)
+        # Run on partial-failure paths too: cmd_apply persists state for the
+        # successful portion of an apply BEFORE returning the deferred
+        # error, so the .state/<env>.json on disk reflects what actually
+        # landed even when the overall command exits non-zero. Default
+        # `if: success()` would skip this step on partial failure and the
+        # next shared-mode run would lose managed tracking for resources
+        # that did change — failed-Delete keys would also stay flagged
+        # only in memory and lose their retry signal. `!cancelled()` runs
+        # on success and failure but still respects job cancellation.
+        #
+        # Persisting state is load-bearing: shared-mode diffs, credential shard
+        # counts, and rotation metadata all live in .state/<env>.json. A silent
+        # push failure would leave the next run reading stale state while
+        # reporting success, so we fail the job if we can't push.
+        #
+        # When the matrix runs multiple envs in parallel and they all try to
+        # push to main, contention is normal — retry with rebase on rejection.
+        if: ${{ !cancelled() }}
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          STATE_WRITER_TOKEN: ${{ steps.state-writer.outputs.token }}
+        run: |
+          set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "$STATE_WRITER_TOKEN" | base64 | tr -d '\n')
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git config user.name "gitforgeops[bot]"
+          git config user.email "gitforgeops[bot]@users.noreply.github.com"
+
+          # Stage only the paths this job owns so we don't accidentally pick up
+          # anything else that landed in the workdir.
+          mkdir -p .state assembled
+          # Stage only files that exist, and let a real `git add` failure
+          # (e.g. the path being gitignored) fail the job. Swallowing it with
+          # `|| true` is how state silently stopped being committed once
+          # before: the add errored, nothing was staged, and the run reported
+          # "No state changes to commit" on every apply.
+          for path in \
+            ".state/${{ matrix.scope.environment }}.json" \
+            "assembled/${{ matrix.scope.environment }}.yaml" \
+            "assembled/${{ matrix.scope.environment }}-mesh.yaml"; do
+            # The assembled docs exist only in file mode, and the mesh doc only
+            # once the repo has declared MeshConfig fragments — absence is
+            # normal. Removing the last fragment retracts the mesh doc in place
+            # (rewritten as `mesh: {}`, never deleted), so this stages the
+            # retraction as an ordinary modification.
+            [ -f "$path" ] || continue
+            git add "$path"
+          done
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(gitforgeops): state update for ${{ matrix.scope.environment }}"
+
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:$DEFAULT_BRANCH"; then
+              echo "Pushed state on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt; fetching + rebasing..."
+            git fetch origin "$DEFAULT_BRANCH"
+            # Rebase preserves the single state commit on top of whatever
+            # other envs pushed in the meantime. Each env's state file is
+            # independent so there's no real conflict to resolve — but abort
+            # cleanly if one somehow surfaces.
+            git rebase "origin/$DEFAULT_BRANCH" || {
+              git rebase --abort
+              echo "Rebase failed" >&2
+              exit 1
+            }
+            sleep $((attempt * 2))
+          done
+
+          echo "ERROR: failed to push state for ${{ matrix.scope.environment }} after 5 attempts" >&2
+          exit 1
+
+  # One GitHub-native record of what was promoted, from what revision, on whose
+  # authority. `always()` so a blocked promotion is reported rather than absent.
+  promotion-summary:
+    needs: [apply, promote]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Collect promotion records
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: promotion-record-*
+          path: promotion-records
+          merge-multiple: true
+
+      - name: Summarize
+        run: |
+          python3 .github/scripts/promotion_record.py summarize \
+            --records promotion-records \
+            --summary "$GITHUB_STEP_SUMMARY"

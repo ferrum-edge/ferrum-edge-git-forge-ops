@@ -37,6 +37,19 @@ environments:
       # false, monitoring stays approval-gated and the check honestly reports
       # `Not completed`. See docs/github-launch-controls.md §3.1.
       unattended: false
+
+    promotion:
+      # Staged promotion: production may not start until `staging` has applied
+      # AND passed its declared traffic checks, for the SAME source revision.
+      #
+      # Leave this out — the default — and production deploys independently,
+      # in parallel with staging, exactly as before. Parallel matrix jobs are
+      # not staged rollout: without `requires`, production does not wait for
+      # staging and is not promoted from it.
+      #
+      # Declare the checks that authorize the promotion in
+      # .gitforgeops/smoke.yaml; an environment with none has verified nothing.
+      requires: staging
     ownership:
       mode: exclusive           # repo is the source of truth
       namespaces: [ferrum]      # scope of exclusivity (required for exclusive)

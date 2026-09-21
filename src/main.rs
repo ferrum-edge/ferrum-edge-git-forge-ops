@@ -143,6 +143,7 @@ async fn main() {
             format,
             include_scopes,
         } => cmd_envs(format, include_scopes),
+        cli::Commands::Verify { format } => cmd_verify(format, explicit_env.as_deref()).await,
         cli::Commands::Version { format } => cmd_version(format),
         cli::Commands::Rotate {
             consumer,
@@ -3336,6 +3337,69 @@ async fn cmd_review(
     Ok(())
 }
 
+/// Run the environment's declared traffic checks.
+///
+/// Deliberately separate from `apply`: configuration acceptance and healthy
+/// traffic are different results, and collapsing them is what lets a
+/// promotion proceed on a gateway that took the write and serves a 502.
+///
+/// Fails closed on every "we did not actually verify" case — no declared
+/// checks, no data-plane URL, an unresolvable credential slot — because a
+/// promotion gate reading any of those as a pass is worse than no gate.
+async fn cmd_verify(
+    format: cli::ReportFormat,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let smoke = gitforgeops::verify::SmokeConfig::load()?.ok_or_else(|| {
+        gitforgeops::error::Error::Config(format!(
+            "{} is absent, so there is nothing to verify. Declare at least one \
+             representative route for '{}' before gating a promotion on it.",
+            gitforgeops::verify::SMOKE_CONFIG_PATH,
+            resolved.name
+        ))
+    })?;
+    let checks = smoke.for_environment(&resolved.name).ok_or_else(|| {
+        gitforgeops::error::Error::Config(format!(
+            "{} declares no checks for environment '{}'. An environment with no \
+             declared check has verified nothing, which a promotion gate must not \
+             read as a pass.",
+            gitforgeops::verify::SMOKE_CONFIG_PATH,
+            resolved.name
+        ))
+    })?;
+    let base_url = env_config.verify_base_url.clone().ok_or_else(|| {
+        gitforgeops::error::Error::Config(
+            "FERRUM_VERIFY_BASE_URL is not set. Traffic verification reaches the \
+             gateway's DATA plane, which is a different endpoint from the admin API \
+             in FERRUM_GATEWAY_URL."
+                .to_string(),
+        )
+    })?;
+    // Header values may name credential-bundle slots. The bundle is loaded the
+    // same way every other command loads it; a slot that is not in it fails
+    // the check rather than sending an empty header.
+    let (bundle, _) = load_credential_bundles(&env_config)?;
+
+    let report = gitforgeops::verify::runner::run(
+        &resolved.name,
+        &base_url,
+        checks,
+        &bundle,
+        env_config.tls_no_verify,
+    )
+    .await;
+
+    match format {
+        cli::ReportFormat::Text => print!("{}", report.render_text()),
+        cli::ReportFormat::Json => print!("{}", gitforgeops::json_output::pretty(&report)?),
+    }
+    if report.exit_code() != 0 {
+        process::exit(report.exit_code());
+    }
+    Ok(())
+}
+
 fn cmd_version(format: cli::ReportFormat) -> Result<(), Box<dyn std::error::Error>> {
     let info = gitforgeops::version::BuildInfo::current();
     match format {
@@ -3367,6 +3431,9 @@ fn cmd_envs(
                 // target, so it never gains a monitoring environment either.
                 monitoring_environment: ResolvedEnv::default_env_name(),
                 unattended_monitoring: false,
+
+                // target, so it is never a promotion participant either.
+                promotion_requires: None,
             }],
         };
         print!("{}", gitforgeops::json_output::compact(&scopes)?);

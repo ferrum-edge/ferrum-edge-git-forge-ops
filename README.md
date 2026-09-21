@@ -1679,6 +1679,7 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--accept-unknown-field NAME] \
   [--allow-plaintext-plugin-config PLUGIN_NAME]  # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
+gitforgeops verify [--format text|json]                 # declared traffic checks against the data plane
 gitforgeops envs [--format json|text] [--include-scopes] # for CI matrix discovery
 gitforgeops version [--format text|json] # package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \
@@ -1954,6 +1955,124 @@ These gateway resources carry an `api_spec_id`: they are provisioned by an OpenA
 - **GitHub settings are part of the security boundary.** CODEOWNERS alone is advisory; the active ruleset, environment reviewers/branch restrictions, Actions allowlist/SHA policy, state-App bypass, and scheduled settings audit described in [GitHub launch controls](docs/github-launch-controls.md) are launch requirements.
 - **Diagnostics cannot forge workflow commands.** Resource ids, namespaces, plugin names, YAML paths and gateway response bodies are attacker-controlled input in a fork PR, and the GitHub Actions runner reads `::…::` at the start of a job-log line as a command. Every diagnostic interpolates those values through one shared sanitizer (`src/diagnostics.rs`): control characters and Unicode line separators become `U+FFFD`, output is length-bounded, and no rendered line can begin a workflow command. So a hostile id cannot fabricate an `::error::` annotation, fold output away with `::group::`, or emit `::stop-commands::` to silence the real annotations a later step writes. The GitHub-annotation output format is the one deliberate exception — it emits real commands and percent-encodes their data.
 - **Validation is hermetic.** `ferrum-edge validate` is invoked with `-m file` (or `-m mesh`) pinned and `-s` pointed at an empty settings file, so an inherited `FERRUM_MODE` or a stray `ferrum.conf` in the checkout can't turn validation into a fail-open no-op that still exits 0. Every inherited `FERRUM_*` variable is removed from the child's environment for the same reason. Gitforgeops then supplies the values itself, rather than letting the caller do it: each gateway pass gets its document-derived `FERRUM_NAMESPACE` (an empty document still gets one pass under an explicit `ferrum` context), and the separate mesh pass gets `FERRUM_MESH_ALLOW_NO_CA=true`, ferrum-edge's documented validation-only opt-out from the mesh workload-identity gate, because a CI runner is not a mesh node — see [Mesh configuration](#validation-and-the-absence-of-a-mesh-admin-api). The temporary spec is written through `tempfile` at mode 0600 with an unpredictable name and removed on drop — callers resolve credential placeholders *before* validating, so that file can hold live consumer credentials. If literal or resolved Consumer credential material is present, child stdout/stderr is suppressed and a generic failure is reported so a malicious or overly verbose validator cannot echo secrets into CI. `ferrum-edge validate` itself has no machine-readable output mode; the text/JSON/GitHub-annotation formats of `--format` are produced gitforgeops-side.
+
+## Staged promotion
+
+By default every declared environment deploys as an independent matrix job:
+same merge, parallel, each with its own approval and its own concurrency group.
+**Parallel is not staged.** Production does not wait for staging and is not
+promoted from it; both simply reconcile the same source revision with their own
+overlays.
+
+An environment that should wait says so:
+
+```yaml
+environments:
+  staging: {}
+  production:
+    promotion:
+      requires: staging
+```
+
+`production` then leaves the parallel matrix and enters a second phase that may
+not start until `staging` has **applied** and **been shown to serve traffic**,
+for the *same source revision*.
+
+### Why a record rather than `needs:`
+
+Job ordering proves two jobs ran in sequence. It proves nothing about what is
+running on the gateway. So each environment's apply writes a promotion record —
+environment, source revision, apply result, traffic result, and the run, actor
+and PR that authorized it — and the promoting job reads its named
+predecessor's record and refuses unless:
+
+- the record exists at all (missing means never started, cancelled before
+  recording, or runner lost — none of which is "staging is fine"),
+- the apply succeeded,
+- traffic verification succeeded,
+- and **the recorded revision is the one this job is about to apply**.
+
+That last condition is what makes the promotion revision-bound. Staging and
+production legitimately assemble different *bytes*, because they select
+different overlays; what must be identical is the commit the desired resources,
+the policy, the engine and the workflows all came from.
+
+If `main` moves during staging verification or while production waits for
+approval, the freshness guard refuses the promotion rather than silently
+deploying the newer revision — and the newer merge runs its own
+staging→production cycle. The revision check in the record is the belt to that
+brace, and it also catches a re-run of an older workflow. The ownership ledger
+is still read fresh from the refreshed protected head, so pinning a revision
+never resurrects an obsolete `.state/<env>.json`.
+
+Staging's approval is its own environment's approval. It grants nothing in
+production, which still requires production's reviewer.
+
+### Traffic checks are data, not hooks
+
+A successful apply proves the gateway *accepted* a configuration write. It does
+not prove a route answers, an upstream is reachable, or that authentication is
+enforced. `gitforgeops verify` closes that with checks declared in
+`.gitforgeops/smoke.yaml`:
+
+```yaml
+version: 1
+
+environments:
+  staging:
+    checks:
+      - name: orders route serves authenticated traffic
+        method: GET
+        path: /orders/healthz
+        headers:
+          X-API-Key:
+            slot: ferrum/orders-client/keyauth/key
+        expect_status: 200
+        attempts: 5
+        timeout_secs: 10
+
+      - name: orders route rejects an unauthenticated request
+        path: /orders/healthz
+        expect_status: 401
+```
+
+There is no hook, no shell and no plugin, deliberately: this runs in a job that
+holds deployment credentials, and an arbitrary command in a repository file
+would be a way to spend them. The closed `deny_unknown_fields` schema is the
+entire execution surface — a `run:` or `command:` key is a load error, not a
+silently ignored one.
+
+Requests go to `FERRUM_VERIFY_BASE_URL`, the gateway's **data plane**, which is
+a different endpoint from the admin API in `FERRUM_GATEWAY_URL`. A header value
+is either a `literal:` or a credential-bundle `slot:` — stated, never inferred
+from string syntax — and exactly one of the two. A slot that is not in the
+bundle **fails** the check rather than sending an empty header, because an
+empty credential would make a check that expects `401` pass for entirely the
+wrong reason.
+
+Nothing sensitive is printed. A result carries the check's name, method, path,
+the status it wanted and the status it got. Never a header value; the response
+body is never even read.
+
+### What blocks a promotion
+
+| Condition | Result |
+| --- | --- |
+| Staging apply failed | blocked |
+| Staging applied, a declared route answers wrongly | **blocked** — the gateway accepted the write and is not serving it |
+| A check timed out, or the route was unreachable | blocked |
+| Staging job cancelled, or left no record | blocked |
+| No checks declared for the predecessor | blocked — an environment with no declared check has verified nothing |
+| File-mode predecessor (no data plane) | blocked — recorded as `skipped`, which authorizes nothing |
+| `main` moved a deployment input meanwhile | blocked — the newer merge promotes its own revision |
+
+A failed probe blocks the *promotion*. It does not roll anything back:
+automatic global rollback is not an assumed consequence of a failed check, and
+staging is left exactly as it was applied so you can look at it.
+
+Every outcome lands in the run's job summary — environment, source revision,
+apply result, traffic result, and who authorized it — so a blocked promotion is
+visible rather than merely absent.
 
 ## Drift detection
 

@@ -111,6 +111,24 @@ pub struct MonitoringConfig {
     pub unattended: bool,
 }
 
+/// Staged promotion: this environment may not be applied until another one
+/// has applied *and verified* the same source revision.
+///
+/// Independent environments are the default and stay the default. Declaring
+/// `requires:` opts one environment out of the parallel matrix and into a
+/// chain, which is a different capability rather than a stricter version of
+/// the same one — parallel matrix jobs are not staged rollout, and describing
+/// them as one is how "production was promoted from staging" gets believed
+/// about a deployment that never waited for staging at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromotionConfig {
+    /// The environment whose successful apply and verification authorize this
+    /// one, for the same source revision. `None` = deploy independently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentConfig {
@@ -123,6 +141,8 @@ pub struct EnvironmentConfig {
     pub apply_strategy: ApplyStrategy,
     pub ownership: OwnershipConfig,
     pub monitoring: MonitoringConfig,
+
+    pub promotion: PromotionConfig,
 }
 
 impl Default for EnvironmentConfig {
@@ -134,6 +154,8 @@ impl Default for EnvironmentConfig {
             apply_strategy: ApplyStrategy::Incremental,
             ownership: OwnershipConfig::default(),
             monitoring: MonitoringConfig::default(),
+
+            promotion: PromotionConfig::default(),
         }
     }
 }
@@ -179,6 +201,12 @@ pub struct EnvironmentScope {
     /// approval. Reported in the drift check's outcome so an approval-gated
     /// run is never mistaken for a completed one.
     pub unattended_monitoring: bool,
+
+    /// The environment whose applied-and-verified revision authorizes this
+    /// one. `None` = this environment deploys independently, in the parallel
+    /// matrix. `apply-on-merge.yml` splits its matrix on exactly this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_requires: Option<String>,
 }
 
 impl RepoConfig {
@@ -237,6 +265,8 @@ impl RepoConfig {
                         name.clone()
                     },
                     unattended_monitoring: env.monitoring.unattended,
+
+                    promotion_requires: env.promotion.requires.clone(),
                 }
             })
             .collect()
@@ -325,6 +355,44 @@ impl RepoConfig {
                     "environment '{name}': ownership.large_prune_threshold_percent={} is out of range 0..=100",
                     env.ownership.large_prune_threshold_percent
                 )));
+            }
+        }
+
+        // A promotion chain that names a missing environment would emit a
+        // matrix the workflow cannot satisfy, and a cycle would deadlock every
+        // environment in it forever. Both are load-time errors rather than a
+        // job that waits for a predecessor that will never run.
+        for (name, env) in &self.environments {
+            let Some(required) = &env.promotion.requires else {
+                continue;
+            };
+            if required == name {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': promotion.requires names itself"
+                )));
+            }
+            if !self.environments.contains_key(required) {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': promotion.requires '{required}' is not a declared environment"
+                )));
+            }
+        }
+        for name in self.environments.keys() {
+            let mut seen = vec![name.as_str()];
+            let mut cursor = name.as_str();
+            while let Some(next) = self
+                .environments
+                .get(cursor)
+                .and_then(|env| env.promotion.requires.as_deref())
+            {
+                if seen.contains(&next) {
+                    return Err(crate::error::Error::Config(format!(
+                        "environment '{name}': promotion.requires forms a cycle ({} -> {next})",
+                        seen.join(" -> ")
+                    )));
+                }
+                seen.push(next);
+                cursor = next;
             }
         }
 

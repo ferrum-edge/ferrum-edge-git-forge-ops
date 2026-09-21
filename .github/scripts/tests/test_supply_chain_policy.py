@@ -1395,13 +1395,15 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
-        # And a file where nothing holds the lock reconciles nothing.
-        for removed in (
-            "    environment: ${{ matrix.environment }}\n",
-            "      group: ferrum-apply-${{ matrix.environment }}\n",
+        # And a file where NO job holds the lock reconciles nothing. Stripping
+        # every occurrence, because the workflow has more than one privileged
+        # job and each of them holding the lock is the point.
+        for pattern in (
+            check_supply_chain.ENVIRONMENT_BINDING,
+            check_supply_chain.APPLY_CONCURRENCY_GROUP,
         ):
-            with self.subTest(removed=removed):
-                mutated = text.replace(removed, "", 1)
+            with self.subTest(pattern=pattern.pattern):
+                mutated = pattern.sub("", text)
                 self.assertNotEqual(mutated, text)
                 violations = check_supply_chain.stale_deployment_guard_violations(
                     "apply-on-merge.yml", mutated, contract

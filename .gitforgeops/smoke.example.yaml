@@ -1,0 +1,52 @@
+# gitforgeops traffic verification
+#
+# Rename to `.gitforgeops/smoke.yaml` to give `gitforgeops verify` something to
+# check. A successful apply proves the gateway ACCEPTED a configuration write;
+# these checks prove it is SERVING it. A staged promotion
+# (`promotion.requires` in config.yaml) will not authorize the next
+# environment until they pass.
+#
+# The checks are data, deliberately. There is no hook and no shell: this runs
+# in a job that holds deployment credentials, and an arbitrary command in a
+# repository file would be a way to spend them.
+#
+# Requests go to the gateway's DATA plane, whose base URL is the
+# FERRUM_VERIFY_BASE_URL environment secret — a different endpoint from the
+# admin API in FERRUM_GATEWAY_URL.
+
+version: 1
+
+environments:
+  staging:
+    checks:
+      # Prove the route exists, reaches its upstream, and answers.
+      - name: orders route serves authenticated traffic
+        method: GET
+        path: /orders/healthz
+        headers:
+          # A credential-bundle slot. Resolved at run time and never printed;
+          # a slot that is not in the bundle FAILS the check rather than
+          # sending an empty header.
+          X-API-Key:
+            slot: ferrum/orders-client/keyauth/key
+        expect_status: 200
+        # A freshly applied route can take a moment to become live, so retry —
+        # but boundedly. An unbounded wait is a promotion that hangs rather
+        # than one that is blocked.
+        attempts: 5
+        timeout_secs: 10
+        retry_backoff_ms: 500
+
+      # Prove authentication is ENFORCED, not merely configured. Expecting a
+      # 401 is the only way to catch a scoped auth plugin that silently did
+      # not attach.
+      - name: orders route rejects an unauthenticated request
+        method: GET
+        path: /orders/healthz
+        expect_status: 401
+        attempts: 3
+
+  # `production` deliberately has no entry here. An environment with no
+  # declared check has verified nothing, and `gitforgeops verify` fails rather
+  # than reporting a pass — so a promotion gated on it stays blocked until you
+  # say what "serving correctly" means for it.
