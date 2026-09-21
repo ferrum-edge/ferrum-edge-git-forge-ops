@@ -1200,6 +1200,106 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("must bind PR attribution" in item for item in violations), violations
         )
 
+    def test_either_recognized_attribution_binding_satisfies_the_policy(self):
+        # The guard may bind attribution with a literal pathspec diff or with
+        # the shared deployment-scope classifier. Both enforce the property;
+        # the policy must not require one spelling, or a legitimate rewrite of
+        # the guard could never be presented for review.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", workflow, contract
+            ),
+            [],
+        )
+        classifier = workflow.replace(
+            '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
+            "            ':(exclude).state/**' ':(exclude)assembled/**' || {\n"
+            '            echo "::error::Superseded deployment: ${DEFAULT_BRANCH} at $fresh_head contains changes beyond generated state since triggering commit $TRIGGER_SHA. Let the newer merge\'s apply run reconcile its own revision."\n'
+            "            exit 1\n"
+            "          }\n",
+            "          python3 .github/scripts/deployment_scope.py classify \\\n"
+            '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
+            1,
+        )
+        self.assertNotEqual(classifier, workflow, "the legacy binding moved")
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", classifier, contract
+            ),
+            [],
+        )
+
+    def test_a_half_present_attribution_binding_is_still_rejected(self):
+        # Deleting one exclusion, or the branch argument, silently changes what
+        # the guard refuses. Neither family may be accepted incomplete.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        half = workflow.replace("':(exclude)assembled/**'", "", 1)
+        self.assertNotEqual(half, workflow)
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", half, contract
+        )
+        self.assertTrue(
+            any("no recognized implementation is complete" in item for item in violations),
+            violations,
+        )
+
+    def test_bundle_loader_rules_follow_the_secret_binding(self):
+        # A privileged workflow that binds no credential-bundle secret cannot
+        # mishandle one, and requiring the loader there would force an
+        # unattended job to hold every consumer secret just to satisfy policy.
+        # One that DOES bind the secret is covered the moment it does.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(check_supply_chain.BUNDLE_SECRET_BINDING, text)
+            path.write_text(
+                # Every occurrence: the first is a cross-reference in a
+                # comment, and only the invocation matters.
+                text.replace("credential_bundles.py", "something_else.py"),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("fail-closed loader" in item for item in violations), violations
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            text = path.read_text(encoding="utf-8")
+            # Remove every bundle binding AND the loader step it feeds.
+            without = "\n".join(
+                line
+                for line in text.splitlines()
+                if check_supply_chain.BUNDLE_SECRET_BINDING not in line
+                and "credential_bundles.py" not in line
+                and "ferrum-creds-" not in line
+                and "FERRUM_CREDS_JSON_FILE" not in line
+            )
+            path.write_text(without + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertNotIn(
+            "fail-closed loader", result.stdout + result.stderr, "loader still required"
+        )
+        self.assertNotIn(
+            "under $RUNNER_TEMP",
+            result.stdout + result.stderr,
+            "credential file location still required",
+        )
+
     def test_state_commits_must_not_suppress_required_checks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))

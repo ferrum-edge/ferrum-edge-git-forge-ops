@@ -95,11 +95,35 @@ FRESH_HEAD_CONTROLS = (
     'git cat-file -e "${TRIGGER_SHA}^{commit}"',
     'git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head"',
 )
-APPLY_REVISION_BINDING = (
-    'git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- .',
-    "':(exclude).state/**'",
-    "':(exclude)assembled/**'",
+# The guard must bind PR attribution to unchanged executable and desired
+# inputs. Two implementations satisfy that, and the policy accepts either as
+# long as ONE of them is completely present:
+#
+#   1. a literal pathspec diff, permitting only generated state to differ;
+#   2. the shared deployment-scope classifier, which decides supersession from
+#      the same path list that schedules a replacement apply run.
+#
+# Spelled as families rather than one flat tuple because a half-present
+# implementation is the dangerous case: an operator who deletes one exclusion
+# from (1), or the branch argument from (2), has silently changed what the
+# guard refuses.
+APPLY_REVISION_BINDINGS = (
+    (
+        'git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- .',
+        "':(exclude).state/**'",
+        "':(exclude)assembled/**'",
+    ),
+    (
+        "python3 .github/scripts/deployment_scope.py classify \\",
+        '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
+    ),
 )
+# A workflow that resolves `${gh-env-secret:...}` placeholders reads the
+# credential bundle secrets, and every such workflow must use the fail-closed
+# loader. Keying the rule on the binding rather than on a hand-maintained list
+# means a workflow that needs no credential values is exempt by construction,
+# and one that starts binding them is covered the moment it does.
+BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
 # Per privileged reconciling workflow: the checkout step name, the job-level
 # markers that prove the environment lock is already held, and every step that
 # must not run before the freshness guard.
@@ -358,12 +382,24 @@ def stale_deployment_guard_violations(
                 f"{workflow}: {FRESH_HEAD_STEP!r} is missing {required!r}"
             )
     if workflow == "apply-on-merge.yml":
-        for required in APPLY_REVISION_BINDING:
-            if required not in guard:
-                violations.append(
-                    f"{workflow}: {FRESH_HEAD_STEP!r} must bind PR attribution "
-                    f"to unchanged executable and desired inputs; missing {required!r}"
-                )
+        satisfied = [
+            family
+            for family in APPLY_REVISION_BINDINGS
+            if all(required in guard for required in family)
+        ]
+        if not satisfied:
+            # Report the closest family so the message names something
+            # actionable rather than every alternative at once.
+            closest = max(
+                APPLY_REVISION_BINDINGS,
+                key=lambda family: sum(1 for item in family if item in guard),
+            )
+            missing = [item for item in closest if item not in guard]
+            violations.append(
+                f"{workflow}: {FRESH_HEAD_STEP!r} must bind PR attribution to "
+                "unchanged executable and desired inputs; no recognized "
+                f"implementation is complete (closest is missing {', '.join(repr(item) for item in missing)})"
+            )
     guard_index = text.find(f"      - name: {FRESH_HEAD_STEP}\n")
     for marker in contract["lock"]:
         marker_index = text.find(marker)
@@ -1197,26 +1233,31 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"{privileged_workflow}: must fail before environment binding when repo config is absent"
             )
-        if ".github/scripts/credential_bundles.py" not in text:
-            violations.append(
-                f"{privileged_workflow}: credential bundles must use the fail-closed loader"
+        # Scoped to the workflows that actually read credential values. A
+        # privileged workflow that binds no bundle secret cannot mishandle one.
+        if BUNDLE_SECRET_BINDING in text:
+            if ".github/scripts/credential_bundles.py" not in text:
+                violations.append(
+                    f"{privileged_workflow}: credential bundles must use the fail-closed loader"
+                )
+            if "except json.JSONDecodeError" in text:
+                violations.append(
+                    f"{privileged_workflow}: malformed credential bundles must not fail open"
+                )
+            # The loader reads enumerated env bindings, so every shard the Rust
+            # allocator may create has to be bound here by name. Cross-checked
+            # against MAX_BUNDLE_SHARDS on both sides.
+            violations.extend(
+                credential_bundle_binding_violations(
+                    privileged_workflow, text, shard_limit
+                )
             )
-        if "except json.JSONDecodeError" in text:
-            violations.append(
-                f"{privileged_workflow}: malformed credential bundles must not fail open"
-            )
-        # The loader reads enumerated env bindings, so every shard the Rust
-        # allocator may create has to be bound here by name. Cross-checked
-        # against MAX_BUNDLE_SHARDS on both sides.
-        violations.extend(
-            credential_bundle_binding_violations(privileged_workflow, text, shard_limit)
-        )
-        # $RUNNER_TEMP is wiped with the workspace; a bare `mktemp` lands in a
-        # /tmp that self-hosted runners share between jobs and never clean.
-        if '"${RUNNER_TEMP:-/tmp}/ferrum-creds-' not in text:
-            violations.append(
-                f"{privileged_workflow}: the resolved credential file must live under $RUNNER_TEMP"
-            )
+            # $RUNNER_TEMP is wiped with the workspace; a bare `mktemp` lands in
+            # a /tmp that self-hosted runners share between jobs and never clean.
+            if '"${RUNNER_TEMP:-/tmp}/ferrum-creds-' not in text:
+                violations.append(
+                    f"{privileged_workflow}: the resolved credential file must live under $RUNNER_TEMP"
+                )
         if "[skip ci]" in text:
             violations.append(
                 f"{privileged_workflow}: state commits must not suppress required checks with [skip ci]"
