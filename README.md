@@ -77,6 +77,13 @@ order — deep detail for each control lives in
 [GitHub launch controls](docs/github-launch-controls.md), which
 `bootstrap_repo_settings.py` (step 5) automates.
 
+> **Want the short version?** [**Quickstart**](docs/quickstart.md) is the
+> minimal tested profile — one gateway, one namespace, shared ownership, one
+> declared environment — taken all the way to a first successful apply, a
+> delivered credential and real authenticated traffic. Every file it tells you
+> to copy is a fixture the build validates. Come back here for the full
+> control-by-control setup, or start there and grow.
+
 1. **Create the repository from the template.** On the upstream repository page
    choose **Use this template → Create a new repository**, or:
 
@@ -181,15 +188,26 @@ order — deep detail for each control lives in
    ```
 
    Make the App the `main` ruleset's **sole always-on bypass** — passing
-   `--state-writer-app-id` in step 5 does exactly that. A solo maintainer has a
-   second problem: the ruleset requires an approving review and there is nobody
-   to give one. The workaround is a second bypass actor, the **Repository Admin**
-   role in `pull_request` mode (what step 5 configures when you omit the flag),
-   merging with `gh pr merge --admin`. The settings audit reports that as a
-   violation — it requires exactly one bypass actor, the App, in `always` mode —
-   so it is a deliberate, visible deviation, not a supported configuration. The
-   App itself is not optional either way: apply and rotate fail their preflight
-   without it.
+   `--state-writer-app-id` in step 5 does exactly that.
+
+   Omitting the flag configures the **Repository Admin** role in
+   `pull_request` mode instead. That is a pre-App fallback for a repository
+   that does not have the App yet, not a solo-maintainer feature: the settings
+   audit reports it as a violation, because the baseline requires exactly one
+   bypass actor, the App, in `always` mode. Replace it as soon as the App
+   exists. Apply and rotate fail their preflight without the App either way.
+
+   Two things it is *not* a workaround for, because neither is a problem:
+
+   - **The ruleset does not require an approving review.**
+     `required_approving_review_count` is `0` ([launch controls
+     §2](docs/github-launch-controls.md#2-protect-main-with-an-active-ruleset)).
+     A pull request is required; an approval is not. A solo maintainer merges
+     their own pull request once the required checks pass, with no bypass.
+   - **The bypass does not affect environment approvals.** Those are a separate
+     control, and the baseline sets `prevent_self_review: true`, so the account
+     that merged cannot approve the apply its merge triggered. That genuinely
+     needs a second human; see [Quickstart §0](docs/quickstart.md#decide-who-approves-what).
 
 7. **Declare your environments in `.gitforgeops/config.yaml`.** Copy the example
    and replace its entries with your real deployment targets. The file carries
@@ -1250,8 +1268,8 @@ Practical limits you should know about:
 
 ### How this scales out in real setups
 
-- **Solo maintainer, one gateway** — one environment (`default`), no `.gitforgeops/config.yaml` needed (tool falls back to env-var driven behavior). Credential broker still works if you set up one GitHub Environment.
-- **Small team, staging + prod** — two environments, matrix runs two jobs in parallel, two `.state/*.json` files, two sets of env secrets. The most common setup.
+- **Solo maintainer, one gateway** — one declared environment. Committing `.gitforgeops/config.yaml` is what makes the bundled workflows deploy at all: without it `apply-on-merge.yml` emits an empty matrix and deploys nothing, and `drift-check.yml` fails its enumeration preflight. The synthetic local `default` environment is a *local CLI* fallback for `validate` / `diff` / `plan` driven purely by `FERRUM_*` variables, and is never a trusted workflow target. The shape is in [Quickstart](docs/quickstart.md); note that a deployment environment's required reviewer cannot be the person who merged, so a genuinely single-person repository still needs a second approver.
+- **Small team, staging + prod** — two environments, matrix runs two jobs in parallel, two `.state/*.json` files, two sets of env secrets. The most common setup. Parallel is not staged: production does not wait for staging and is not promoted from it. A real promotion path is [#268](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/268).
 - **Platform team, 5-10 environments** — matrix scales linearly. Protection rules on GitHub Environments (required reviewers for production, wait timers for canary, etc.) enforce deployment gates without code changes.
 - **Multi-tenant platform, 50+ namespaces in one env** — per-namespace ownership is still via `FERRUM_NAMESPACE` filter + `ownership.namespaces` list; the single apply pass handles all of them. For bigger scale, split into multiple environments backed by the same gateway with `FERRUM_NAMESPACE` acting as a slice.
 

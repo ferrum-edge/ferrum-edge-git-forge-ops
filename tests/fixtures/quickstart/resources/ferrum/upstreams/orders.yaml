@@ -1,0 +1,9 @@
+kind: Upstream
+spec:
+  id: "orders-upstream"
+  name: "Orders service"
+  algorithm: round_robin
+  targets:
+    - host: "orders.internal"
+      port: 8080
+      weight: 1

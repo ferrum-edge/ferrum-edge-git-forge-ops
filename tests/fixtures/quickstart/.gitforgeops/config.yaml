@@ -1,0 +1,14 @@
+version: 1
+
+environments:
+  production:
+    # -> overlays/production/. The directory must exist, even if empty.
+    overlay: production
+    # Shared is the safer default: the repository manages only what it has
+    # already applied, and anything else on the gateway is reported as
+    # unmanaged and left alone.
+    apply_strategy: incremental
+    ownership:
+      mode: shared
+
+default_environment: production
