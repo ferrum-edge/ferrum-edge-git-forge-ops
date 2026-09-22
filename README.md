@@ -2207,7 +2207,7 @@ environments:
 ```
 
 `production-monitor` is created by `bootstrap_repo_settings.py` with no
-reviewer, protected branches only, and gateway **read** material only — no
+reviewer, an exact-default-branch deployment policy, and gateway **read** material only — no
 state-writer key, no provisioner token, no credential bundles (a comparison
 does not need credential values; `diff` excludes still-unresolved broker leaves
 per leaf). Three independent fences keep it that way: the settings audit

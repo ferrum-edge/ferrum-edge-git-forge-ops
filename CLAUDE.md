@@ -334,6 +334,7 @@ be named with the suffix: the settings audit waives its required-reviewer rule
 for exactly that shape.
 
 Three independent fences bound what the reviewer-free environment can reach:
+its custom deployment policy admits only the repository's exact default branch;
 `audit_settings.py` rejects a `<env>-monitor` holding
 `GITFORGEOPS_STATE_APP_PRIVATE_KEY`, `FERRUM_GH_PROVISIONER_TOKEN`,
 `SETTINGS_AUDIT_TOKEN` or `FERRUM_CREDS_BUNDLE[_N]` (secret *names* only, never

@@ -488,10 +488,13 @@ def monitoring_responses():
     responses["repos/acme/repo/environments/production-monitor"] = {
         "protection_rules": [],
         "deployment_branch_policy": {
-            "protected_branches": True,
-            "custom_branch_policies": False,
+            "protected_branches": False,
+            "custom_branch_policies": True,
         },
     }
+    responses[
+        "repos/acme/repo/environments/production-monitor/deployment-branch-policies?per_page=100"
+    ] = [{"branch_policies": [{"id": 17, "name": "main", "type": "branch"}]}]
     responses["repos/acme/repo/environments/production-monitor/secrets?per_page=100"] = [
         {
             "total_count": 2,
@@ -608,6 +611,24 @@ class MonitoringEnvironmentTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "restrict deployments" in item and "production-monitor" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_monitoring_rejects_generic_protected_branches(self):
+        responses = monitoring_responses()
+        responses["repos/acme/repo/environments/production-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        }
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "production-monitor" in item and "exact 'main'" in item
                 for item in audit.violations
             ),
             audit.violations,
