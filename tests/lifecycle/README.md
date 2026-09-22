@@ -29,7 +29,7 @@ and asserted against this file by the test suite.
 | `scheduling-and-attribution` | Queued and superseded applies, unrelated later merges, re-runs of an older workflow, PR-author credential delivery, policy-override attribution — including [#261](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/261)'s regression. |
 | `staged-promotion` | Does an opted-in production environment stay blocked until staging applied *and* served traffic for the same revision — and does breaking staging's routing block it even though the gateway accepted the write? |
 | `drift-monitoring` | Is drift distinguishable from a failed check and from a skipped one? |
-| `file-and-mesh-boundary` | For the advertised file/mesh profile: assembly, encrypted materialization, delivery boundary — and that assembly is *not* reported as live fleet deployment. |
+| `file-and-mesh-boundary` | For the advertised file/mesh profile: assembly that preserves placeholders, a separate mesh document, and 0600 materialization that never touches the committed artifact — and that assembly is *not* reported as live fleet deployment. Encrypted delivery to a GitHub key is `credentials-generate-and-rotate`'s. |
 
 ### `skipped` is not `passed`
 
@@ -37,8 +37,9 @@ Several scenarios need a disposable GitHub repository, which the suite cannot
 create for itself. Those record `skipped` with the reason, and **a skipped
 scenario never certifies anything** — the release gate refuses a result that
 contains one exactly as it refuses a failure. Run them through
-[the GitHub acceptance path](#the-github-repository-half) and record their
-outcomes into the same result file before publishing.
+[the GitHub acceptance path](#the-github-repository-half) and submit their
+outcomes as an attestation to a dispatched acceptance run for the release
+revision.
 
 ---
 
@@ -183,11 +184,20 @@ python3 .github/scripts/lifecycle_result.py record \
   --scenario scheduling-and-attribution --status passed \
   --detail "run 123456: docs-only merge did not strand the queued apply"
 
-# 3. Re-seal, so the record certifies the revision you actually tested.
+# 3. Re-seal, so the record certifies the upstream revision you tested.
 python3 .github/scripts/lifecycle_result.py seal \
   --result lifecycle-result.json \
-  --revision "$(git rev-parse HEAD)" --gateway "<gateway digest>"
+  --revision <upstream commit> --gateway "<gateway digest>"
+
+# 4. Hand it to the release gate: dispatch the acceptance workflow on the
+#    release ref with the sealed file as its input, then re-run Release.
+gh workflow run lifecycle.yml --ref <release tag or main> \
+  -f github_acceptance="$(cat lifecycle-result.json)"
 ```
+
+The dispatched run merges your outcomes into **only** the scenarios it recorded
+as `skipped`, attributed to you, and refuses an attestation sealed for another
+revision. It never overwrites a scenario it ran itself.
 
 Delete the repository, its environments and its App installation when you are
 done. Nothing in it is meant to outlive the run.

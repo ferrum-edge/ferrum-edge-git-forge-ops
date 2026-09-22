@@ -395,15 +395,20 @@ matrix and into a second phase. `EnvironmentScope.promotion_requires` is what
 `apply-on-merge.yml` splits on: `null` keeps today's independent behaviour
 (same merge, parallel jobs, own approval, own concurrency group), non-null puts
 the environment in the `promote` job. `RepoConfig::validate` refuses a
-predecessor that does not exist, a self-reference, and any cycle — each would
-produce a matrix entry waiting on a record no job will ever write.
+predecessor that does not exist, a self-reference, any cycle, and a chain
+deeper than one stage (the predecessor must itself be independent, because all
+promoted environments run in one parallel phase) — each would produce a matrix
+entry waiting on a record no job will ever write.
 
 Ordering is not authorization. `needs: [list-envs, apply]` is the coarse half;
 the precise half is `.github/scripts/promotion_record.py`. Each environment's
 apply writes `{environment, source_revision, apply_result, verify_result,
 authorized, run_id, actor, pull_request}` as an artifact, and `require` refuses
 unless the named predecessor's record exists, applied `success`, verified
-`success`, **and** recorded the revision this job is about to apply. Only
+`success`, **and** recorded the revision this job is about to apply — or an
+ancestor of it that `deployment_scope.classify` finds differs only outside
+`DEPLOYMENT_INPUT_PATHS`. That clause is load-bearing: the predecessor's own
+ledger commit always moves the branch before the promote job refreshes it. Only
 `success` authorizes: `skipped` (file mode has no data plane), `not_run`
 (no declared checks) and `cancelled` all block. Staging and production
 legitimately assemble different bytes — different overlays — so what is bound
@@ -876,7 +881,11 @@ updates nothing. `.github/scripts/template_update.py` closes that with a
 three-way comparison against `.gitforgeops/baseline.json` (the upstream commit
 the tree was last synced from): `B == U` skip, `L == B` adopt, `L == U` already
 adopted, otherwise **conflict** — reported, never overwritten, and the baseline
-is not advanced while one remains. `UPSTREAM_MANAGED` and `CUSTOMER_OWNED` are
+is not advanced while one remains. `--keep PATH` resolves a conflict in favour
+of the local file and is refused for a path not in conflict. A template copy
+inherits upstream's `baseline.json`, which names upstream's last writer rather
+than the copied commit, so `detect-baseline [--write]` finds the exact upstream
+commit whose managed files match (an inexact match needs `--accept-closest`). `UPSTREAM_MANAGED` and `CUSTOMER_OWNED` are
 the two fences; `CUSTOMER_OWNED` (`resources/`, `overlays/`,
 `.gitforgeops/config.yaml`, `.gitforgeops/policies.yaml`, `.state/`,
 `assembled/`, `.github/CODEOWNERS`) is applied to upstream's own tree too, so
@@ -891,7 +900,7 @@ never restoring an obsolete ledger, which is a separate state-override repair.
 - `src/main.rs` — async Tokio entry, command dispatch
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `version`, `rotate`)
 - `src/version.rs` — `--version` / `version` identity (Cargo package version plus `build.rs` git metadata)
-- `src/doctor/` — read-only readiness diagnosis grouped by trust boundary: `local.rs` (repository + process env, no credential; template vs deployment repository), `github.rs` (delegates to `.github/scripts/audit_settings.py` — doctor owns no settings baseline of its own), `gateway.rs` (`GET /health` + `GET /cluster` only). `Status::Unknown` is never a pass and `DOCTOR_FAILED_EXIT_CODE` is 3, distinct from the command failing
+- `src/doctor/` — read-only readiness diagnosis grouped by trust boundary: `local.rs` (repository + process env, no credential; template vs deployment repository), `github.rs` (delegates to `.github/scripts/audit_settings.py` — doctor owns no settings baseline of its own), `gateway.rs` (`GET /health` + `GET /cluster` only; `/health` is unauthenticated on Ferrum Edge, so the token is proven by `/cluster`, which passes the admin JWT gate). `Status::Unknown` is never a pass and `DOCTOR_FAILED_EXIT_CODE` is 3, distinct from the command failing
 - `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
@@ -994,10 +1003,17 @@ absence is not a gate. Lifecycle is deliberately **not** a per-PR required
 check — it needs a gateway build, and turning every PR red when that is
 unavailable trains people to override the gate rather than fix it.
 
-Five scenarios need a disposable GitHub repository (environment approvals,
-state-writer App permissions, protected-branch ledger writes, scheduling,
-attribution). They record `skipped` with a reason and run through
-`tests/lifecycle/github_acceptance.md`. Redaction happens at capture:
+Six scenarios need a disposable GitHub repository or a fault-injecting proxy
+(environment approvals, state-writer App permissions, protected-branch ledger
+writes, scheduling, attribution, staged promotion, partial failure). They
+record `skipped` with a reason and run through
+`tests/lifecycle/github_acceptance.md`. Their outcomes reach the gate only as
+an attestation: `lifecycle.yml` dispatched on the release ref with the
+operator's sealed result as its `github_acceptance` input, merged by
+`lifecycle_result.py attest` into the scenarios that run itself `skipped` —
+never over one it ran — and attributed to the dispatching actor. `release.yml`
+binds the result's gateway build to the revision's own checksum allowlist
+(`--gateway-allowlist`). Redaction happens at capture:
 `Harness.redact` over every captured stream keyed on the run's own secrets,
 `run.sh` over the gateway log tail, and the test upstream never echoes a header
 or logs a request line.
