@@ -146,19 +146,26 @@ export GH_TOKEN=$(gh auth token)
 
 python3 .github/scripts/bootstrap_repo_settings.py --repo OWNER/REPO \
   --state-writer-app-id 123456 \
+  --environment production \
   --reviewer SECOND-MAINTAINER            # plan
 
 python3 .github/scripts/bootstrap_repo_settings.py --repo OWNER/REPO \
   --state-writer-app-id 123456 \
+  --environment production \
   --reviewer SECOND-MAINTAINER --apply    # write
 ```
 
 It finishes by listing the exact `gh secret set` commands left for you. Run
-those in step 5.
+those in step 5. Before setting any secrets, confirm the applied plan contains
+`CREATE environment production` or `UPDATE environment production` (or
+`UNCHANGED environment production` on a later idempotent run). A successful
+bootstrap without that environment line is not a completed deployment setup.
 
 `--reviewer` is the environment's required reviewer from §0. Without it, the
 environment step reports `BLOCKED` rather than creating an environment nobody
-has to approve.
+has to approve. `--environment production` is explicit because the repository
+configuration used for automatic environment discovery is not committed until
+step 4.
 
 ---
 
