@@ -281,8 +281,12 @@ class WorkflowWiringTests(unittest.TestCase):
             2,
         )
         self.assertEqual(
-            self.text.count("deployment_scope.py classify"), 2
+            self.text.count(
+                'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py"'
+            ),
+            2,
         )
+        self.assertEqual(self.text.count('python3 "$trusted_classifier" classify'), 2)
 
 
 if __name__ == "__main__":

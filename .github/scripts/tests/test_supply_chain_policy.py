@@ -1440,7 +1440,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path = root / ".github/workflows/apply-on-merge.yml"
             text = path.read_text(encoding="utf-8")
             text = text.replace(
-                "          python3 .github/scripts/deployment_scope.py classify \\\n"
+                '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+                '          python3 "$trusted_classifier" classify \\\n'
                 '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
                 "          true\n",
                 1,
@@ -1468,7 +1469,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             [],
         )
         legacy = workflow.replace(
-            "          python3 .github/scripts/deployment_scope.py classify \\\n"
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+            '          python3 "$trusted_classifier" classify \\\n'
             '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
             '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
             "            ':(exclude).state/**' ':(exclude)assembled/**'\n",

@@ -133,7 +133,8 @@ FRESH_HEAD_CONTROLS = (
 # deployment could be cancelled with nothing left to reconcile it.
 APPLY_REVISION_BINDINGS = (
     (
-        "python3 .github/scripts/deployment_scope.py classify \\",
+        'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"',
+        'python3 "$trusted_classifier" classify \\',
         '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
     ),
 )
