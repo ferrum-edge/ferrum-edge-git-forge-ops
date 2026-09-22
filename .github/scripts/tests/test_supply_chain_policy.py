@@ -1322,8 +1322,10 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "          true || {\n",
             1,
         )
+        # A column-zero comment is still inside the YAML `jobs:` mapping; it
+        # must not hide the following job from the trusted textual checker.
         violations = check_supply_chain.stale_deployment_guard_violations(
-            "apply-on-merge.yml", text + broken, contract
+            "apply-on-merge.yml", text + "# staged promotion\n" + broken, contract
         )
         self.assertTrue(
             any("job 'promote'" in item and "is missing" in item for item in violations),

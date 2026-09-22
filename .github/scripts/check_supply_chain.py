@@ -1215,13 +1215,16 @@ def workflow_jobs(text: str) -> list[tuple[str, str]]:
     start = re.search(r"^jobs:\s*$", text, re.MULTILINE)
     if start is None:
         return []
-    section = re.split(r"^\S", text[start.end():], maxsplit=1, flags=re.MULTILINE)[0]
+    section = re.split(
+        r"^(?!#)\S", text[start.end():], maxsplit=1, flags=re.MULTILINE
+    )[0]
     jobs: list[tuple[str, str]] = []
-    for match in re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", section, re.MULTILINE):
-        body = re.split(
-            r"^  \S|^\S", section[match.end():], maxsplit=1, flags=re.MULTILINE
-        )[0]
-        jobs.append((match.group("name"), body))
+    matches = list(
+        re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", section, re.MULTILINE)
+    )
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(section)
+        jobs.append((match.group("name"), section[match.end():end]))
     return jobs
 
 
