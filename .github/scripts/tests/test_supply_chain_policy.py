@@ -634,6 +634,27 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("job 'apply'" in item for item in violations), violations
         )
 
+    def test_unrecognized_job_headers_cannot_hide_a_token_mint(self):
+        for header in ('  "promote":\n', "  promote: # privileged job\n"):
+            with self.subTest(header=header.rstrip()):
+                hidden_job = self._privileged_job("promote", ordered=False).replace(
+                    "  promote:\n", header, 1
+                )
+                text = (
+                    "jobs:\n"
+                    + self._privileged_job("apply")
+                    + hidden_job
+                    + self.AUTH_LINES
+                    + "\n"
+                )
+                violations = check_supply_chain.state_writer_token_violations(
+                    "apply-on-merge.yml", text, "- name: Commit state update"
+                )
+                self.assertTrue(
+                    any("every state-writer token mint" in item for item in violations),
+                    violations,
+                )
+
     def test_two_correctly_ordered_privileged_jobs_are_accepted(self):
         text = (
             "jobs:\n"

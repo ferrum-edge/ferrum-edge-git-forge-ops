@@ -1249,6 +1249,11 @@ def state_writer_token_violations(
             f"{workflow}: state-writer token must not be persisted by checkout"
         )
     jobs = privileged_jobs(text)
+    assigned_mints = sum(body.count(MINT_STEP) for _, body in jobs)
+    if assigned_mints != text.count(MINT_STEP):
+        violations.append(
+            f"{workflow}: every state-writer token mint must belong to a validated job"
+        )
     if not jobs:
         violations.append(
             f"{workflow}: no job mints the state-writer token, so the ownership "
