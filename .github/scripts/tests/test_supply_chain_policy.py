@@ -968,6 +968,31 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("fail-closed loader" in item for item in violations), violations
         )
 
+    def test_credential_workflow_cannot_remove_all_bundle_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8")
+            text = re.sub(
+                r"      - name: Load credential bundles\n.*?(?=      - name: )",
+                "      - name: Load credential bundles\n        run: ':'\n",
+                text,
+                flags=re.DOTALL,
+            )
+            self.assertNotIn(check_supply_chain.BUNDLE_SECRET_BINDING, text)
+            path.write_text(text, encoding="utf-8")
+            violations = self._violations(root)
+
+        for expected in (
+            "fail-closed loader",
+            "missing or mismatched: FERRUM_CREDS_BUNDLE",
+            "resolved credential file must live under $RUNNER_TEMP",
+        ):
+            with self.subTest(expected=expected):
+                self.assertTrue(
+                    any(expected in item for item in violations), violations
+                )
+
     def test_validate_pr_rejects_the_whole_secrets_context(self):
         # Guard the wiring, not just the regex: the real workflow text is run
         # through the same check the policy applies.

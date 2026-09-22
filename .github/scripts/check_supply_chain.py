@@ -39,13 +39,16 @@ PRIVILEGED_WORKFLOWS = (
     "materialize-file.yml",
     "rotate.yml",
 )
-# A workflow that resolves `${gh-env-secret:...}` placeholders reads the
-# credential bundle secrets, and every such workflow must use the fail-closed
-# loader. Keying the rule on the binding rather than on a hand-maintained list
-# means a workflow that needs no credential values is exempt by construction —
-# `drift-check.yml` compares without them, because unresolved broker leaves are
-# excluded from the live comparison per leaf — and one that starts binding them
-# is covered the moment it does.
+# Workflows whose operation requires credential values. This list must be
+# independent of candidate-controlled secret bindings: otherwise deleting every
+# binding would also delete the evidence that the fail-closed loader is needed.
+# `drift-check.yml` is deliberately absent because unresolved broker leaves are
+# excluded from its live comparison per leaf.
+CREDENTIAL_BUNDLE_WORKFLOWS = (
+    "apply-on-merge.yml",
+    "materialize-file.yml",
+    "rotate.yml",
+)
 BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
 # Scheduled monitoring runs unattended in an environment with no required
 # reviewer, so the fence is what that job can reach at all: read the gateway,
@@ -137,12 +140,6 @@ APPLY_REVISION_BINDINGS = (
         '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
     ),
 )
-# A workflow that resolves `${gh-env-secret:...}` placeholders reads the
-# credential bundle secrets, and every such workflow must use the fail-closed
-# loader. Keying the rule on the binding rather than on a hand-maintained list
-# means a workflow that needs no credential values is exempt by construction,
-# and one that starts binding them is covered the moment it does.
-BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
 DEPLOYMENT_SCOPE_SCRIPT = Path(".github/scripts/deployment_scope.py")
 DEPLOYMENT_INPUT_TUPLE = re.compile(
     r"^DEPLOYMENT_INPUT_PATHS:[^=]*=\s*\((?P<body>.*?)\)\s*$",
@@ -1498,9 +1495,13 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"{privileged_workflow}: must fail before environment binding when repo config is absent"
             )
-        # Scoped to the workflows that actually read credential values. A
-        # privileged workflow that binds no bundle secret cannot mishandle one.
-        if BUNDLE_SECRET_BINDING in text:
+        # Credential-consuming operations must retain this contract even when
+        # a candidate removes every secret reference. Other privileged
+        # workflows become covered if they start binding credential bundles.
+        if (
+            privileged_workflow in CREDENTIAL_BUNDLE_WORKFLOWS
+            or BUNDLE_SECRET_BINDING in text
+        ):
             if ".github/scripts/credential_bundles.py" not in text:
                 violations.append(
                     f"{privileged_workflow}: credential bundles must use the fail-closed loader"
