@@ -1,14 +1,15 @@
 //! Read-only repository administration metadata.
 //!
-//! This scope deliberately owns no baseline of its own. `audit_settings.py` is
-//! the specification of what the launch controls are, `bootstrap_repo_settings.py`
-//! writes exactly that, and doctor *runs the auditor* rather than reimplementing
+//! This scope deliberately owns no baseline of its own. The auditor bundled into
+//! the binary is the specification of what the launch controls are,
+//! `bootstrap_repo_settings.py` writes exactly that, and doctor runs that auditor
+//! rather than reimplementing
 //! its rules — otherwise three descriptions of the same controls would drift
 //! apart, which is the failure mode this whole tier exists to catch.
 //!
 //! Nothing here writes. The auditor is invoked in its normal read-only mode
 //! with a token the operator already has; when there is no token, or no
-//! auditor on disk, the result is [`Status::Unknown`] and never a pass.
+//! Python, the result is [`Status::Unknown`] and never a pass.
 
 use std::path::Path;
 use std::process::Command;
@@ -16,6 +17,8 @@ use std::process::Command;
 use super::{Check, Scope, Status};
 
 const AUDITOR: &str = ".github/scripts/audit_settings.py";
+const BUNDLED_AUDITOR: &str = include_str!("../../.github/scripts/audit_settings.py");
+const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// What doctor needs in order to ask GitHub anything.
 pub struct GithubContext {
@@ -32,21 +35,6 @@ pub struct GithubContext {
 }
 
 pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
-    let auditor = root.join(AUDITOR);
-    if !auditor.is_file() {
-        return vec![Check::new(
-            "settings-audit",
-            "Repository settings match the launch baseline",
-            Scope::Github,
-            Status::Unknown,
-            format!("{AUDITOR} is not in this checkout"),
-        )
-        .remedy(
-            "Run doctor from the repository root. The settings baseline lives in \
-             that script, and doctor deliberately does not carry a second copy.",
-        )];
-    }
-
     let Some(repository) = context.repository.as_deref() else {
         return vec![Check::new(
             "settings-audit",
@@ -93,10 +81,17 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
 
     let mut command = Command::new("python3");
     command
-        .arg(&auditor)
+        // Never execute the checkout's copy: doctor is commonly run with both
+        // repository-administration and gateway credentials in its parent.
+        .arg("-c")
+        .arg(BUNDLED_AUDITOR)
         .arg("--repo")
         .arg(repository)
-        .current_dir(root);
+        .current_dir(root)
+        // The auditor needs only the GitHub token. In particular, do not expose
+        // gateway, broker, credential-bundle, or unrelated process secrets.
+        .env_clear()
+        .env("PATH", CHILD_PATH);
     if context.template_repo {
         command.arg("--template-repo");
     }
