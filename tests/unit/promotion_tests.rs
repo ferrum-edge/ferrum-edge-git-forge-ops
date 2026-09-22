@@ -264,6 +264,22 @@ fn the_verify_path_never_accepts_an_invalid_certificate() {
     assert!(code.contains("add_root_certificate"), "{code}");
 }
 
+#[test]
+fn traffic_checks_never_follow_or_accept_redirects() {
+    let runner = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/verify/runner.rs"),
+    )
+    .expect("read runner");
+    assert!(
+        runner.contains("redirect(reqwest::redirect::Policy::none())"),
+        "credential-bearing verification requests must not follow redirects"
+    );
+    assert!(
+        runner.contains("!response.status().is_redirection()"),
+        "a redirect must not satisfy a traffic check even when its status was expected"
+    );
+}
+
 // -- reporting: never a pass we did not earn --------------------------------
 
 fn report(outcomes: &[Outcome]) -> VerifyReport {

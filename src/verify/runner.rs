@@ -33,7 +33,11 @@ use super::{resolve_headers, CheckResult, EnvironmentChecks, Outcome, SmokeCheck
 fn client(check: &SmokeCheck, ca_cert: Option<&str>) -> crate::error::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(check.timeout())
-        .connect_timeout(Duration::from_secs(check.timeout_secs.min(10)));
+        .connect_timeout(Duration::from_secs(check.timeout_secs.min(10)))
+        // Checks may carry credential-bundle values in arbitrary headers.
+        // Never let a gateway redirect forward them to another origin or let
+        // the redirect target's response authorize a promotion.
+        .redirect(reqwest::redirect::Policy::none());
 
     if let Some(ca_b64) = ca_cert {
         let ca_pem = base64::engine::general_purpose::STANDARD
@@ -134,7 +138,8 @@ pub async fn run_check(
                     path: check.path.clone(),
                     expected_status: check.expect_status,
                     actual_status: Some(status),
-                    outcome: if status == check.expect_status {
+                    outcome: if !response.status().is_redirection() && status == check.expect_status
+                    {
                         Outcome::Passed
                     } else {
                         Outcome::Unexpected
