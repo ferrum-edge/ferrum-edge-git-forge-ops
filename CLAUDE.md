@@ -653,7 +653,9 @@ load-bearing:
 3. **It owns no baseline.** Repository settings are judged by running
    `audit_settings.py` — the same script `bootstrap_repo_settings.py` writes for
    and `settings-audit.yml` schedules — and republishing each violation as its
-   own `settings-control` check, so the three cannot drift apart.
+   own `settings-control` check, so the three cannot drift apart. Doctor runs
+   the copy compiled into its binary (`python3 -I -c`), never the checkout's,
+   with only `GH_TOKEN` and the variables `python3`/`gh` need to reach GitHub.
 
 Scopes are trust boundaries, not subjects: `local` (no credential), `github`
 (administration-read token) and `gateway` (that environment's deployment
