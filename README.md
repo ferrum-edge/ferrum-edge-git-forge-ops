@@ -1399,6 +1399,9 @@ Everything after that point — the `gitforgeops` binary it builds, the desired 
 - **A stale or superseded run is rejected, not silently replayed.** A trigger that is no longer an ancestor is stale. An ancestor whose protected head changed a *deployment input* is superseded. Both fail before building a binary or contacting the gateway; the newer merge's own run must reconcile that revision.
 
 Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author. The supersession guard is what guarantees that a later PR's desired input or executable cannot be applied under that attribution.
+The guard extracts its classifier from the triggering commit before using it;
+it never lets the refreshed, not-yet-authorized head decide whether its own
+helper or executable changes are safe.
 
 ##### Deployment inputs: one list for scheduling and for supersession
 
@@ -2227,7 +2230,7 @@ environments:
 ```
 
 `production-monitor` is created by `bootstrap_repo_settings.py` with no
-reviewer, protected branches only, and gateway **read** material only — no
+reviewer, an exact-default-branch deployment policy, and gateway **read** material only — no
 state-writer key, no provisioner token, no credential bundles (a comparison
 does not need credential values; `diff` excludes still-unresolved broker leaves
 per leaf). Three independent fences keep it that way: the settings audit
@@ -2314,7 +2317,9 @@ produce the same bytes. `dpkg --purge` removes apt and unused TLS packages
 from the reviewed base. `base-image-pin-canary.yml` watches the moving Debian
 tag daily. Reintroduce a temporary digest-pinned point-release package stage
 only when that canary reports a fixed CRITICAL/HIGH the rebuilt base does not
-yet carry; never pull those fixes through apt.
+yet carry; when a clean moving tag has advanced, the canary instead requests a
+runtime digest repin so the scanned fixes reach the built image. Never pull
+those fixes through apt.
 
 ## Lifecycle acceptance
 

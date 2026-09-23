@@ -330,8 +330,13 @@ class Report:
         return bool(self.current_digest) and self.current_digest != self.pinned_digest
 
 
-def classify(findings: list[Finding], pin: BasePin) -> Report:
-    report = Report(image=pin.image, pinned_digest=pin.digest, has_pins=bool(pin.packages))
+def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") -> Report:
+    report = Report(
+        image=pin.image,
+        pinned_digest=pin.digest,
+        current_digest=current_digest,
+        has_pins=bool(pin.packages),
+    )
     pinned = pin.versions_by_name()
     purged = set(pin.purged)
     reported = {finding.package for finding in findings}
@@ -366,6 +371,8 @@ def classify(findings: list[Finding], pin: BasePin) -> Report:
         report.state = "stale"
     elif pin.packages and not findings:
         report.state = "retire"
+    elif not pin.packages and not findings and report.digest_moved:
+        report.state = "repin"
     return report
 
 
@@ -419,6 +426,7 @@ def check_pool(pin: BasePin, report: Report, *, fetch=head_status) -> None:
 HEADLINE = {
     "ok": "The pinned runtime security packages are still required and still sufficient.",
     "ok-retired": "The digest-pinned runtime base needs no point-release package stage.",
+    "repin": "The moving runtime base is clean, but the Dockerfile pins an older digest.",
     "retire": "The base image has caught up: the pinned package stage can be retired.",
     "stale": "The pinned runtime security packages no longer cover the base image.",
 }
@@ -454,6 +462,15 @@ def render(report: Report) -> str:
             "3. Keep the `dpkg --purge` step: it removes packages from the base rather",
             "   than adding any, and the runtime smoke test asserts they stay gone.",
             "4. Let the `trivy-image` gate confirm the rebuilt image before merging.",
+            "",
+        ]
+
+    if report.state == "repin":
+        lines += [
+            "The current base tag reports no fixed CRITICAL or HIGH vulnerability, but",
+            "the runtime image still uses the older digest. Repin the runtime `FROM` to",
+            f"`{report.image}@{report.current_digest}` and let the `trivy-image` gate",
+            "confirm the rebuilt image before merging.",
             "",
         ]
 
@@ -575,8 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     findings, current_digest = parse_trivy_report(document)
-    report = classify(findings, pin)
-    report.current_digest = current_digest
+    report = classify(findings, pin, current_digest)
     if not args.skip_pool_check:
         check_pool(pin, report)
 
