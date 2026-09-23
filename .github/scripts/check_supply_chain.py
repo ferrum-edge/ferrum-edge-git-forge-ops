@@ -131,9 +131,15 @@ FRESH_HEAD_CONTROLS = (
 # The literal-pathspec family this replaces was the bug — it rejected every
 # difference, including a merge that schedules no apply of its own, so a queued
 # deployment could be cancelled with nothing left to reconcile it.
+#
+# The classifier is extracted from the triggering commit rather than run from
+# the refreshed checkout, so a newer head cannot replace the program deciding
+# whether it may ride the older authorization. The checkout-executed form is
+# retired: it let the refreshed head approve its own helper changes.
 APPLY_REVISION_BINDINGS = (
     (
-        "python3 .github/scripts/deployment_scope.py classify \\",
+        'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"',
+        'python3 "$trusted_classifier" classify \\',
         '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
     ),
 )

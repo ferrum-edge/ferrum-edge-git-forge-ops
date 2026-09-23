@@ -395,6 +395,29 @@ impl RepoConfig {
                 cursor = next;
             }
         }
+        // `apply-on-merge.yml` has exactly two phases: the independent matrix,
+        // then one `promote` matrix whose jobs run in parallel. A predecessor
+        // that is itself promoted runs in that same parallel phase, so its
+        // successor would read for a record that has not been written yet and
+        // refuse on every run — a configuration that loads and can never
+        // deploy. Refuse it here, where the operator can still act on it.
+        for (name, env) in &self.environments {
+            let Some(required) = env.promotion.requires.as_deref() else {
+                continue;
+            };
+            if let Some(grand) = self
+                .environments
+                .get(required)
+                .and_then(|predecessor| predecessor.promotion.requires.as_deref())
+            {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': promotion.requires '{required}', which is itself \
+                     promoted from '{grand}'. Promotion is one stage deep: a predecessor must \
+                     deploy independently (no promotion.requires). Promote '{name}' from \
+                     '{grand}' instead, or drop the chain."
+                )));
+            }
+        }
 
         if let Some(default) = &self.default_environment {
             if !self.environments.contains_key(default) {

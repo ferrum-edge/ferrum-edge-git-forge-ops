@@ -103,10 +103,24 @@ fn a_promotion_cycle_is_refused_at_load() {
 }
 
 #[test]
-fn a_long_chain_without_a_cycle_is_accepted() {
-    let config = load_repo(
+fn a_chain_deeper_than_one_stage_is_refused_at_load() {
+    // The workflow runs every promoted environment in one parallel phase, so
+    // `production` would look for `staging`'s record while `staging` is still
+    // running — and refuse on every merge. Loading would be the lie.
+    let error = load_repo(
         "version: 1\nenvironments:\n  dev: {}\n  staging:\n    promotion:\n      requires: dev\n\
          \n  production:\n    promotion:\n      requires: staging\n",
+    )
+    .expect_err("must refuse");
+    assert!(error.contains("one stage deep"), "{error}");
+    assert!(error.contains("'production'"), "{error}");
+}
+
+#[test]
+fn several_environments_may_share_one_independent_predecessor() {
+    let config = load_repo(
+        "version: 1\nenvironments:\n  staging: {}\n  production:\n    promotion:\n      requires: staging\n\
+         \n  dr:\n    promotion:\n      requires: staging\n",
     )
     .expect("loads");
     assert_eq!(config.environment_scopes().len(), 3);
