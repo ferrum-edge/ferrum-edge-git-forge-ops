@@ -1488,28 +1488,22 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
-    def test_the_trigger_pinned_classifier_is_a_recognized_binding(self):
+    def test_the_trigger_pinned_classifier_is_the_recognized_binding(self):
         # Running the classifier extracted from the triggering commit keeps a
         # refreshed head from replacing the program that judges it.
         contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
         )
-        pinned = workflow.replace(
-            "          python3 .github/scripts/deployment_scope.py classify \\\n",
-            '          trusted_classifier="$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")"\n'
-            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
-            '          python3 "$trusted_classifier" classify \\\n',
-        )
-        self.assertNotEqual(pinned, workflow, "the classifier binding moved")
+        self.assertIn('python3 "$trusted_classifier" classify \\\n', workflow)
         self.assertEqual(
             check_supply_chain.stale_deployment_guard_violations(
-                "apply-on-merge.yml", pinned, contract
+                "apply-on-merge.yml", workflow, contract
             ),
             [],
         )
         # Extracting the trusted copy without running it is not a binding.
-        unused = pinned.replace(
+        unused = workflow.replace(
             '          python3 "$trusted_classifier" classify \\\n',
             "          true \\\n",
         )
@@ -1518,6 +1512,20 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 "no recognized implementation is complete" in item
                 for item in check_supply_chain.stale_deployment_guard_violations(
                     "apply-on-merge.yml", unused, contract
+                )
+            )
+        )
+        # The retired checkout-executed form lets the refreshed head run its
+        # own classifier, so it is no longer a recognized binding.
+        checkout_executed = workflow.replace(
+            '          python3 "$trusted_classifier" classify \\\n',
+            "          python3 .github/scripts/deployment_scope.py classify \\\n",
+        )
+        self.assertTrue(
+            any(
+                "no recognized implementation is complete" in item
+                for item in check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", checkout_executed, contract
                 )
             )
         )
