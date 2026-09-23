@@ -200,10 +200,7 @@ fn file_mode_checks_the_output_path_instead_of_gateway_credentials() {
 
 #[test]
 fn github_checks_without_a_token_are_unknown_rather_than_passed() {
-    let dir = repo(&[(
-        ".github/scripts/audit_settings.py",
-        "import sys; sys.exit(0)\n",
-    )]);
+    let dir = repo(&[]);
     let checks = doctor::github::run(
         dir.path(),
         &doctor::github::GithubContext {
@@ -227,10 +224,7 @@ fn github_checks_without_a_token_are_unknown_rather_than_passed() {
 
 #[test]
 fn github_checks_without_the_state_writer_app_id_are_unknown() {
-    let dir = repo(&[(
-        ".github/scripts/audit_settings.py",
-        "import sys; sys.exit(0)\n",
-    )]);
+    let dir = repo(&[]);
     let checks = doctor::github::run(
         dir.path(),
         &doctor::github::GithubContext {
@@ -244,18 +238,19 @@ fn github_checks_without_the_state_writer_app_id_are_unknown() {
 }
 
 #[test]
-fn github_checks_surface_each_auditor_violation_as_its_own_finding() {
-    // Doctor owns no settings baseline: it runs the same auditor the bootstrap
-    // writes for and the scheduled audit runs, and republishes its findings.
-    let dir = repo(&[(
-        ".github/scripts/audit_settings.py",
-        "import sys\n\
-         print('Repository protection evidence:')\n\
-         print('  PASS: something is fine')\n\
-         print('Repository protection violations:', file=sys.stderr)\n\
-         print('  FAIL: environment \\'production\\' must require at least one reviewer', file=sys.stderr)\n\
-         sys.exit(1)\n",
-    )]);
+fn github_doctor_does_not_execute_the_checkout_auditor() {
+    // Neither the checkout's auditor nor a checkout module shadowing a
+    // standard-library import of the bundled one may run.
+    let dir = repo(&[
+        (
+            ".github/scripts/audit_settings.py",
+            "from pathlib import Path\nPath('checkout-auditor-ran').write_text('bad')\n",
+        ),
+        (
+            "argparse.py",
+            "from pathlib import Path\nPath('checkout-module-ran').write_text('bad')\n",
+        ),
+    ]);
     let checks = doctor::github::run(
         dir.path(),
         &doctor::github::GithubContext {
@@ -264,45 +259,44 @@ fn github_checks_surface_each_auditor_violation_as_its_own_finding() {
             state_writer_app_id: Some("99".to_string()),
             template_repo: false,
         },
+    );
+    assert!(!dir.path().join("checkout-auditor-ran").exists());
+    assert!(!dir.path().join("checkout-module-ran").exists());
+    assert_eq!(find(&checks, "settings-audit").status, Status::Unknown);
+}
+
+#[test]
+fn github_checks_surface_each_auditor_violation_as_its_own_finding() {
+    // Doctor owns no settings baseline: it runs the same auditor the bootstrap
+    // writes for and the scheduled audit runs, and republishes its findings.
+    let checks = doctor::github::audit_checks(
+        false,
+        "Repository protection evidence:\n  PASS: something is fine\n",
+        "Repository protection violations:\n  \
+         FAIL: environment 'production' must require at least one reviewer\n",
     );
     assert_eq!(find(&checks, "settings-audit").status, Status::Fail);
     assert!(
         checks.iter().any(|check| check.id == "settings-control"
             && check.detail.contains("must require at least one reviewer")),
-        "{:?}",
-        checks
+        "{checks:?}"
     );
 }
 
 #[test]
 fn an_auditor_that_could_not_run_is_unknown_not_a_failed_control() {
-    // The auditor exits non-zero for two different reasons. Violations are a
-    // finding about the repository; an API error or a token without
-    // Administration: read means the audit did not happen. Reporting the
-    // second as a failed control invents a result about settings nobody
-    // looked at.
-    let dir = repo(&[(
-        ".github/scripts/audit_settings.py",
-        "import sys\n\
-         print('settings audit failed closed: GitHub API request failed for \
-         repos/acme/repo/rulesets: 403', file=sys.stderr)\n\
-         sys.exit(1)\n",
-    )]);
-    let checks = doctor::github::run(
-        dir.path(),
-        &doctor::github::GithubContext {
-            repository: Some("acme/repo".to_string()),
-            token: Some("token".to_string()),
-            state_writer_app_id: Some("99".to_string()),
-            template_repo: false,
-        },
+    // Violations are a finding about the repository; an API error or a token
+    // without Administration: read means the audit did not happen.
+    let checks = doctor::github::audit_checks(
+        false,
+        "",
+        "settings audit failed closed: GitHub API request failed for \
+         repos/acme/repo/rulesets: 403\n",
     );
     let check = find(&checks, "settings-audit");
     assert_eq!(check.status, Status::Unknown, "{check:?}");
     assert!(check.detail.contains("could not complete"), "{check:?}");
     assert!(check.detail.contains("403"), "{check:?}");
-    // ...and it must not manufacture per-control findings from an empty
-    // violation list.
     assert!(
         checks.iter().all(|check| check.id != "settings-control"),
         "{checks:?}"
@@ -310,7 +304,7 @@ fn an_auditor_that_could_not_run_is_unknown_not_a_failed_control() {
 }
 
 #[test]
-fn a_missing_auditor_is_unknown_not_a_pass() {
+fn github_doctor_uses_its_bundled_auditor_when_checkout_copy_is_missing() {
     let dir = repo(&[]);
     let checks = doctor::github::run(
         dir.path(),
@@ -321,7 +315,12 @@ fn a_missing_auditor_is_unknown_not_a_pass() {
             template_repo: false,
         },
     );
-    assert_eq!(find(&checks, "settings-audit").status, Status::Unknown);
+    let check = find(&checks, "settings-audit");
+    assert_eq!(check.status, Status::Unknown);
+    assert!(
+        !check.detail.contains("is not in this checkout"),
+        "{check:?}"
+    );
 }
 
 // -- the gateway scope reads, and only reads -------------------------------

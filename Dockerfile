@@ -20,6 +20,9 @@ RUN set -eu; \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
+# `gitforgeops doctor` compiles the settings auditor into the binary
+# (`include_str!`) so it never executes a checkout-controlled copy.
+COPY .github/scripts/audit_settings.py .github/scripts/audit_settings.py
 RUN cargo build --release --locked
 
 # Slim Debian runtime rather than distroless: the image is meant to be run
