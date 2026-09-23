@@ -1,6 +1,6 @@
 ---
 name: fable-agents
-description: Dispatch and orchestrate external Claude Code Fable 5 agents from Codex for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude Fable agents, run multiple Fable workers, select medium or high effort, resume interrupted Fable runs, or drive agent-owned branches and PRs. Do not use for other Claude models, unsupported effort levels, Codex-native subagents, or ordinary single-agent edits.
+description: Dispatch and orchestrate external Claude Code Fable 5 agents from Codex for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude Fable agents, run multiple Fable workers, select medium or high effort, resume interrupted Fable runs, or drive agent-owned branches and PRs. Do not use for other Claude models, effort levels other than medium or high, Codex-native subagents, or ordinary single-agent edits.
 ---
 
 # Fable agents
@@ -151,9 +151,10 @@ After every Fable run, review its exact output and the resulting repository and 
 accepting the work. Fable's security guardrails can reject a request or cause the platform to route
 the affected turn to another model even though the CLI process exits normally.
 
-Treat an explicit refusal, safeguard or fallback notice, a response that identifies a non-Fable
-serving model, or structured output showing `stop_reason: "refusal"` as confirmation. Missing or
-poor work alone is not proof; inspect the transcript and state first.
+Treat an explicit refusal, safeguard or fallback notice, or a response that identifies a non-Fable
+serving model as confirmation. The launcher uses text output, so look for these in the worker's
+printed output rather than a structured `stop_reason` field. Missing or poor work alone is not
+proof; inspect the transcript and state first.
 
 When a safeguard rejection or model reroute is confirmed:
 
