@@ -1,6 +1,8 @@
+use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::effective_scheme;
-use crate::policy::config::is_default_auth_plugin_name;
+use crate::policy::config::effective_auth_plugin_names;
+use crate::policy::PolicyConfig;
 
 use super::resource_diff::{DiffAction, ResourceDiff};
 
@@ -11,11 +13,30 @@ pub struct BreakingChange {
     pub reason: String,
 }
 
+/// Detect breaking changes with the built-in notion of what counts as an
+/// authentication plugin.
 pub fn detect_breaking_changes(
     diffs: &[ResourceDiff],
     desired: &GatewayConfig,
     actual: &GatewayConfig,
 ) -> Vec<BreakingChange> {
+    detect_breaking_changes_with_policy(diffs, desired, actual, None)
+}
+
+/// Detect breaking changes against a resolved policy configuration.
+///
+/// A plugin config counts as authentication when its `plugin_name` is on the
+/// same allowlist `require_auth_plugin` and the security audit use (see
+/// [`effective_auth_plugin_names`]), so a configured custom authenticator is
+/// reported exactly like a built-in one. Without a policy the built-in
+/// defaults apply.
+pub fn detect_breaking_changes_with_policy(
+    diffs: &[ResourceDiff],
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    policy: Option<&PolicyConfig>,
+) -> Vec<BreakingChange> {
+    let auth_names = effective_auth_plugin_names(policy);
     let mut breaking = Vec::new();
 
     for diff in diffs {
@@ -36,13 +57,9 @@ pub fn detect_breaking_changes(
                     });
                 }
                 if diff.kind == "PluginConfig" {
-                    let is_auth = actual
-                        .plugin_configs
-                        .iter()
-                        .find(|p| p.id == diff.id && p.namespace == diff.namespace)
-                        .map(|p| is_default_auth_plugin_name(&p.plugin_name))
-                        .unwrap_or(false);
-                    if is_auth {
+                    let deleted_auth = find_plugin_config(actual, diff)
+                        .is_some_and(|p| is_auth_plugin(&auth_names, &p.plugin_name));
+                    if deleted_auth {
                         breaking.push(BreakingChange {
                             kind: diff.kind.clone(),
                             id: diff.id.clone(),
@@ -55,12 +72,72 @@ pub fn detect_breaking_changes(
                 if diff.kind == "Proxy" {
                     check_proxy_breaking_fields(diff, desired, actual, &mut breaking);
                 }
+                if diff.kind == "PluginConfig" {
+                    check_auth_plugin_modify(diff, desired, actual, &auth_names, &mut breaking);
+                }
             }
             DiffAction::Add => {}
         }
     }
 
     breaking
+}
+
+fn find_plugin_config<'a>(
+    config: &'a GatewayConfig,
+    diff: &ResourceDiff,
+) -> Option<&'a PluginConfig> {
+    config
+        .plugin_configs
+        .iter()
+        .find(|p| p.id == diff.id && p.namespace == diff.namespace)
+}
+
+fn is_auth_plugin(auth_names: &[String], plugin_name: &str) -> bool {
+    auth_names.contains(&plugin_name.to_ascii_lowercase())
+}
+
+/// A live, enabled authenticator that stops authenticating strands every
+/// client that relies on it: disabling it leaves its proxies without that
+/// check, and renaming it to a different plugin kind orphans the credentials
+/// consumers hold for the old one. Any other edit (config values, priority,
+/// labels) is not reported.
+fn check_auth_plugin_modify(
+    diff: &ResourceDiff,
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    auth_names: &[String],
+    breaking: &mut Vec<BreakingChange>,
+) {
+    let desired_plugin = find_plugin_config(desired, diff);
+    let actual_plugin = find_plugin_config(actual, diff);
+    let (Some(d), Some(a)) = (desired_plugin, actual_plugin) else {
+        return;
+    };
+    if !a.enabled || !is_auth_plugin(auth_names, &a.plugin_name) {
+        return;
+    }
+
+    if d.plugin_name != a.plugin_name {
+        breaking.push(BreakingChange {
+            kind: "PluginConfig".to_string(),
+            id: diff.id.clone(),
+            reason: format!(
+                "Auth plugin plugin_name changed ({} -> {}) — consumer credentials for \
+                 the previous authenticator no longer apply",
+                a.plugin_name, d.plugin_name
+            ),
+        });
+    }
+    if !d.enabled {
+        breaking.push(BreakingChange {
+            kind: "PluginConfig".to_string(),
+            id: diff.id.clone(),
+            reason: "Auth plugin disabled (enabled: true -> false) — proxies it guarded \
+                     stop authenticating with it"
+                .to_string(),
+        });
+    }
 }
 
 fn check_proxy_breaking_fields(
