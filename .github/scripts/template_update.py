@@ -37,19 +37,31 @@ settings live outside Git entirely and are untouched by construction.
 Usage::
 
     template_update.py identify [--repo-root .]
-    template_update.py status   [--upstream PATH|URL] [--to REF]
-    template_update.py plan     [--upstream PATH|URL] [--to REF] [--format text|json]
-    template_update.py apply    [--upstream PATH|URL] [--to REF]
+    template_update.py detect-baseline [--upstream PATH|URL] [--to REF] [--write]
+    template_update.py status   [--upstream PATH|URL] [--to REF] [--keep PATH ...]
+    template_update.py plan     [--upstream PATH|URL] [--to REF] [--keep PATH ...]
+                                [--format text|json]
+    template_update.py apply    [--upstream PATH|URL] [--to REF] [--keep PATH ...]
 
 `apply` writes only the clean updates and refuses to advance the recorded
 baseline while any conflict remains, so a half-adopted update cannot be
-mistaken for a completed one.
+mistaken for a completed one. `--keep PATH` is how a conflict is resolved in
+favour of the local file: it is a decision named on the command line, never a
+default, and it may only name a path that is actually in conflict.
+
+`detect-baseline` answers "which upstream commit was this tree copied from?"
+by finding the upstream commit whose upstream-managed files match the local
+ones most closely. A repository created with "Use this template" inherits
+upstream's own `baseline.json`, which names whatever commit last wrote it —
+not the commit the copy was taken from — so a fresh copy should record its
+real baseline once before its first update.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -137,6 +149,34 @@ class UpdateError(RuntimeError):
     """Something the operator has to decide about."""
 
 
+FULL_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+def validate_object_id(value: object, field: str) -> str:
+    """Accept only a full SHA-1 or SHA-256 object ID from repository data."""
+    if not isinstance(value, str) or FULL_OBJECT_ID.fullmatch(value) is None:
+        raise UpdateError(
+            f"{field} must be a full 40- or 64-character lowercase hexadecimal "
+            "Git object ID"
+        )
+    return value
+
+
+def validate_ref(value: object, field: str) -> str:
+    """Reject option-like and syntactically invalid revisions before invoking Git."""
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        raise UpdateError(f"{field} must be a valid Git ref name")
+    result = subprocess.run(
+        ["git", "check-ref-format", "--allow-onelevel", value],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise UpdateError(f"{field} must be a valid Git ref name")
+    return value
+
+
 @dataclass
 class Baseline:
     upstream: str
@@ -152,6 +192,8 @@ class Baseline:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as error:
             raise UpdateError(f"{BASELINE_PATH} is not valid JSON: {error}") from error
+        if not isinstance(data, dict):
+            raise UpdateError(f"{BASELINE_PATH} must contain a JSON object")
         missing = [key for key in ("upstream", "ref", "commit") if not data.get(key)]
         if missing:
             raise UpdateError(
@@ -159,7 +201,15 @@ class Baseline:
                 "upstream revision this tree was last synced from and an update "
                 "cannot be computed without it"
             )
-        return cls(data["upstream"], data["ref"], data["commit"])
+        if not isinstance(data["upstream"], str) or data["upstream"].startswith("-"):
+            raise UpdateError(
+                f"{BASELINE_PATH} upstream must be a path or URL, not a Git option"
+            )
+        return cls(
+            data["upstream"],
+            validate_ref(data["ref"], f"{BASELINE_PATH} ref"),
+            validate_object_id(data["commit"], f"{BASELINE_PATH} commit"),
+        )
 
     def write(self, root: Path) -> None:
         path = root / BASELINE_PATH
@@ -189,6 +239,7 @@ ADOPT = "adopt"
 ALREADY = "already-adopted"
 LOCAL_ONLY = "local-only"
 CONFLICT = "conflict"
+KEPT = "kept"
 
 
 @dataclass
@@ -215,6 +266,10 @@ class Plan:
     @property
     def preserved(self) -> list[Change]:
         return [change for change in self.changes if change.action == LOCAL_ONLY]
+
+    @property
+    def kept(self) -> list[Change]:
+        return [change for change in self.changes if change.action == KEPT]
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -261,7 +316,13 @@ def upstream_paths(mirror: Path, revisions: tuple[str, ...]) -> list[str]:
     return sorted(path for path in found if not is_customer_owned(path))
 
 
-def build_plan(root: Path, mirror: Path, baseline: Baseline, target: str) -> Plan:
+def build_plan(
+    root: Path,
+    mirror: Path,
+    baseline: Baseline,
+    target: str,
+    keep: tuple[str, ...] = (),
+) -> Plan:
     plan = Plan(baseline=baseline, target=target)
     for path in upstream_paths(mirror, (baseline.commit, target)):
         before = _blob(mirror, baseline.commit, path)
@@ -299,6 +360,15 @@ def build_plan(root: Path, mirror: Path, baseline: Baseline, target: str) -> Pla
                 )
             )
             continue
+        if path in keep:
+            plan.changes.append(
+                Change(
+                    path,
+                    KEPT,
+                    "changed upstream AND locally; your version kept by --keep",
+                )
+            )
+            continue
         plan.changes.append(
             Change(
                 path,
@@ -306,7 +376,86 @@ def build_plan(root: Path, mirror: Path, baseline: Baseline, target: str) -> Pla
                 "changed upstream AND locally since the recorded baseline",
             )
         )
+
+    # A `--keep` that matches no conflict is a typo or a stale decision. Either
+    # way, silently ignoring it would let an operator believe they had resolved
+    # something they had not.
+    kept = {change.path for change in plan.kept}
+    unmatched = sorted(set(keep) - kept)
+    if unmatched:
+        raise UpdateError(
+            f"--keep names {', '.join(unmatched)}, which "
+            f"{'is' if len(unmatched) == 1 else 'are'} not in conflict for this "
+            "update; --keep only resolves a reported conflict"
+        )
     return plan
+
+
+def _blob_hash(content: bytes) -> str:
+    """The git blob id of `content`, without needing the local tree in git."""
+    import hashlib
+
+    return hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
+
+
+def _local_managed_hashes(root: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for prefix in UPSTREAM_MANAGED:
+        base = root / prefix
+        candidates = [base] if base.is_file() else (
+            sorted(item for item in base.rglob("*") if item.is_file())
+            if base.is_dir()
+            else []
+        )
+        for candidate in candidates:
+            relative = candidate.relative_to(root).as_posix()
+            if is_customer_owned(relative):
+                continue
+            hashes[relative] = _blob_hash(candidate.read_bytes())
+    return hashes
+
+
+def _tree_hashes(mirror: Path, rev: str) -> dict[str, str]:
+    listing = _git(mirror, "ls-tree", "-r", rev, "--", *UPSTREAM_MANAGED, check=False)
+    hashes: dict[str, str] = {}
+    for line in listing.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == "blob" and not is_customer_owned(path):
+            hashes[path] = parts[2]
+    return hashes
+
+
+def detect_baseline(
+    root: Path, mirror: Path, ref: str, limit: int = 2000
+) -> tuple[str, int, int]:
+    """The upstream commit on `ref` closest to this tree's upstream-managed files.
+
+    Returns (commit, differing paths, commits examined). Zero differing paths
+    is an exact match; anything else is the closest candidate, and the caller
+    reports how far off it is rather than pretending it is exact. Ties go to
+    the newest commit, which is the one a copy was most likely taken from.
+    """
+    local = _local_managed_hashes(root)
+    revisions = _git(
+        mirror, "rev-list", "--first-parent", f"--max-count={limit}", ref
+    ).split()
+    if not revisions:
+        raise UpdateError(f"upstream revision {ref!r} has no history to search")
+    best: tuple[str, int] | None = None
+    for rev in revisions:
+        upstream = _tree_hashes(mirror, rev)
+        differing = sum(
+            1
+            for path in set(local) | set(upstream)
+            if local.get(path) != upstream.get(path)
+        )
+        if best is None or differing < best[1]:
+            best = (rev, differing)
+        if differing == 0:
+            break
+    assert best is not None
+    return best[0], best[1], len(revisions)
 
 
 def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
@@ -318,16 +467,18 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
     mirror = workdir / "upstream"
     source = Path(upstream)
     if source.is_dir():
-        _git(workdir, "clone", "--quiet", "--no-local", str(source), str(mirror))
+        _git(
+            workdir, "clone", "--quiet", "--no-local", "--", str(source), str(mirror)
+        )
     else:
         mirror.mkdir(parents=True)
         _git(mirror, "init", "--quiet")
-        _git(mirror, "remote", "add", "origin", upstream)
+        _git(mirror, "remote", "add", "origin", "--", upstream)
         _git(mirror, "fetch", "--quiet", "--tags", "origin")
     for ref in refs:
         # Fail here, with the ref named, rather than deep inside a comparison.
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
-            _git(mirror, "fetch", "--quiet", "origin", ref, check=False)
+            _git(mirror, "fetch", "--quiet", "origin", "--", ref, check=False)
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
             raise UpdateError(
                 f"upstream revision {ref!r} could not be resolved in {upstream}"
@@ -394,6 +545,10 @@ def render_plan(plan: Plan) -> str:
         lines.append(f"Preserved local edits ({len(plan.preserved)}):")
         lines += [f"  {change.path} — {change.detail}" for change in plan.preserved]
         lines.append("")
+    if plan.kept:
+        lines.append(f"Kept by decision ({len(plan.kept)}):")
+        lines += [f"  {change.path} — {change.detail}" for change in plan.kept]
+        lines.append("")
     if plan.conflicts:
         lines.append(f"CONFLICTS ({len(plan.conflicts)}) — resolve these by hand:")
         lines += [f"  {change.path} — {change.detail}" for change in plan.conflicts]
@@ -402,7 +557,8 @@ def render_plan(plan: Plan) -> str:
             "Each of these changed upstream AND in this repository since the "
             "recorded baseline. Nothing is overwritten. Compare them with:",
             f"  git -C <upstream-clone> diff {plan.baseline.commit}..{plan.target} -- <path>",
-            "resolve each one deliberately, then re-run `apply`.",
+            "resolve each one deliberately — take upstream's version, merge the "
+            "two, or keep yours with `--keep <path>` — then re-run `apply`.",
             "",
         ]
     if not plan.adoptable and not plan.conflicts:
@@ -443,10 +599,33 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("identify", help="which engine, baseline and validator are installed")
+    detector = sub.add_parser(
+        "detect-baseline",
+        help="find the upstream commit this tree was copied from",
+    )
+    detector.add_argument("--upstream")
+    detector.add_argument("--to", default=None)
+    detector.add_argument(
+        "--write",
+        action="store_true",
+        help="record the match as the baseline (an inexact one needs --accept-closest)",
+    )
+    detector.add_argument(
+        "--accept-closest",
+        action="store_true",
+        help="with --write, record the closest commit even though files differ",
+    )
     for name in ("status", "plan", "apply"):
         command = sub.add_parser(name)
         command.add_argument("--upstream")
         command.add_argument("--to", default=None)
+        command.add_argument(
+            "--keep",
+            action="append",
+            default=[],
+            metavar="PATH",
+            help="resolve this conflict by keeping the local file (repeatable)",
+        )
         if name != "apply":
             command.add_argument("--format", choices=("text", "json"), default="text")
 
@@ -458,6 +637,44 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(identify(root), indent=2))
             return 0
 
+        if args.command == "detect-baseline":
+            recorded = Baseline.load(root)
+            upstream = args.upstream or (recorded.upstream if recorded else DEFAULT_UPSTREAM)
+            ref = args.to or (recorded.ref if recorded else DEFAULT_REF)
+            with tempfile.TemporaryDirectory() as temporary:
+                mirror = prepare_mirror(upstream, (ref,), Path(temporary))
+                commit, differing, examined = detect_baseline(root, mirror, ref)
+            if differing and not (args.write and args.accept_closest):
+                print(
+                    f"closest upstream commit: {commit} ({differing} upstream-managed "
+                    f"path(s) differ; searched {examined} commit(s) of {ref}). This "
+                    "tree has local edits or was copied from a revision outside that "
+                    "range, so it is not recorded without a decision: confirm it, "
+                    "then re-run with --write --accept-closest, or pass --to the ref "
+                    "the copy came from."
+                )
+                return 1
+            if differing:
+                print(
+                    f"closest upstream commit: {commit} ({differing} path(s) differ); "
+                    "recording it because --accept-closest was given. The differing "
+                    "paths will surface as local edits or conflicts on the next plan."
+                )
+            else:
+                print(f"exact match: this tree was copied from {commit}.")
+            if recorded and recorded.commit == commit:
+                print(f"{BASELINE_PATH} already records it.")
+                return 0
+            if args.write:
+                Baseline(upstream=upstream, ref=ref, commit=commit).write(root)
+                print(f"Recorded {commit} in {BASELINE_PATH}.")
+            elif recorded:
+                print(
+                    f"{BASELINE_PATH} records {recorded.commit} instead. Re-run with "
+                    "--write to record the real baseline before your first update."
+                )
+            return 0
+
         baseline = Baseline.load(root)
         if baseline is None:
             raise UpdateError(
@@ -466,13 +683,16 @@ def main(argv: list[str] | None = None) -> int:
                 "this tree was copied from — see docs/template-updates.md."
             )
         upstream = args.upstream or baseline.upstream or DEFAULT_UPSTREAM
+        if upstream.startswith("-"):
+            raise UpdateError("upstream must be a path or URL, not a Git option")
         target_ref = args.to or baseline.ref or DEFAULT_REF
+        target_ref = validate_ref(target_ref, "target ref")
 
         with tempfile.TemporaryDirectory() as temporary:
             workdir = Path(temporary)
             mirror = prepare_mirror(upstream, (baseline.commit, target_ref), workdir)
             target = resolve(mirror, target_ref)
-            plan = build_plan(root, mirror, baseline, target)
+            plan = build_plan(root, mirror, baseline, target, tuple(args.keep))
 
             if args.command in ("status", "plan"):
                 if args.format == "json":

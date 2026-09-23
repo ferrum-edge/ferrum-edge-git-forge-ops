@@ -129,6 +129,110 @@ class RevisionBindingTests(unittest.TestCase):
         self.assertNotIn("assembled", json.dumps(record()))
 
 
+class LedgerCommitTests(unittest.TestCase):
+    """The predecessor's own ledger commit moves the branch before we look.
+
+    Every apply publishes `.state/<env>.json`, so the head the promoting job
+    refreshes onto is never the revision staging recorded. An exact-SHA test
+    therefore blocked every promotion; the rule is "same deployment inputs",
+    judged by the freshness guard's own classifier.
+    """
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.repo = Path(self._temporary.name)
+        for args in (
+            ("init", "--quiet", "--initial-branch=main"),
+            ("config", "user.email", "test@example.invalid"),
+            ("config", "user.name", "Test"),
+            ("config", "commit.gpgsign", "false"),
+        ):
+            self._git(*args)
+        self.applied = self._commit({"resources/ferrum/proxies/orders.yaml": "a\n"})
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    def _git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(self.repo),
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+
+    def _commit(self, files: dict[str, str]) -> str:
+        for relative, content in files.items():
+            destination = self.repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-m", "change", "--no-gpg-sign")
+        return self._git("rev-parse", "HEAD").strip()
+
+    def _reasons(self, revision: str) -> list[str]:
+        return promotion_record.blockers(
+            record(revision=self.applied), "staging", revision, self.repo
+        )
+
+    def test_the_predecessors_ledger_commit_does_not_block_its_own_promotion(self):
+        head = self._commit({".state/staging.json": "{}\n"})
+        self.assertNotEqual(head, self.applied)
+        self.assertEqual(self._reasons(head), [])
+
+    def test_documentation_and_tests_between_them_do_not_block(self):
+        head = self._commit({"README.md": "docs\n", "tests/unit/x.rs": "// t\n"})
+        self.assertEqual(self._reasons(head), [])
+
+    def test_a_deployment_input_between_them_still_blocks(self):
+        self._commit({".state/staging.json": "{}\n"})
+        head = self._commit({"resources/ferrum/proxies/orders.yaml": "b\n"})
+        reasons = self._reasons(head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("deployment inputs changed", reasons[0])
+        self.assertIn("resources/ferrum/proxies/orders.yaml", reasons[0])
+
+    def test_a_revision_that_is_not_a_descendant_blocks(self):
+        # A re-run of an older workflow: the record is from a revision the
+        # branch has since moved past, so it is the *descendant* here.
+        older = self.applied
+        newer = self._commit({".state/staging.json": "{}\n"})
+        reasons = promotion_record.blockers(
+            record(revision=newer), "staging", older, self.repo
+        )
+        self.assertTrue(any("is not an ancestor" in reason for reason in reasons))
+
+    def test_an_unknown_recorded_revision_blocks_rather_than_passing(self):
+        reasons = promotion_record.blockers(
+            record(revision="c" * 40), "staging", self.applied, self.repo
+        )
+        self.assertTrue(any("is not an ancestor" in reason for reason in reasons))
+
+    def test_the_cli_compares_in_the_given_checkout(self):
+        head = self._commit({".state/staging.json": "{}\n"})
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "staging.json").write_text(
+                json.dumps(record(revision=self.applied)), encoding="utf-8"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "require",
+                    "--environment", "staging",
+                    "--revision", head,
+                    "--records", directory,
+                    "--repo", str(self.repo),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("only outside the deployment inputs", result.stdout)
+
+
 class ProvenanceTests(unittest.TestCase):
     def test_the_record_carries_who_authorized_what(self):
         entry = record(run_id="99", actor="octocat", pull_request="7")
@@ -246,6 +350,9 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_the_promote_job_requires_a_matching_authorized_record(self):
         self.assertIn("promotion_record.py require", self.text)
         self.assertIn('--environment "$REQUIRES"', self.text)
+        # The comparison needs the checkout: without it only an exact SHA
+        # matches, and the predecessor's ledger commit guarantees it never does.
+        self.assertIn("--repo .", self.text)
         self.assertIn(
             'REVISION: ${{ steps.freshness.outputs.applied_sha }}', self.text
         )
@@ -281,8 +388,12 @@ class WorkflowWiringTests(unittest.TestCase):
             2,
         )
         self.assertEqual(
-            self.text.count("deployment_scope.py classify"), 2
+            self.text.count(
+                'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py"'
+            ),
+            2,
         )
+        self.assertEqual(self.text.count('python3 "$trusted_classifier" classify'), 2)
 
 
 if __name__ == "__main__":

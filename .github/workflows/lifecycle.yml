@@ -18,7 +18,20 @@ on:
       - 'assembled/**'
   schedule:
     - cron: '0 3 * * *'
+  # Dispatch on the revision you are releasing (a tag or `main`) with the
+  # sealed result from tests/lifecycle/github_acceptance.md pasted into
+  # `github_acceptance`. It is the only way the scenarios CI cannot run —
+  # environment approvals, the state-writer App, protected-branch ledger writes
+  # — reach the release gate, and it can only fill the scenarios this run
+  # records as `skipped`.
   workflow_dispatch:
+    inputs:
+      github_acceptance:
+        description: >-
+          Sealed lifecycle-result.json from the GitHub acceptance path, as JSON.
+          Fills only this run's skipped scenarios, attributed to you.
+        required: false
+        default: ''
 
 # Reads only. The suite talks to a loopback gateway it starts itself, with
 # credentials generated for the process and destroyed with it. It binds no
@@ -74,6 +87,26 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
           LIFECYCLE_RESULT: ${{ github.workspace }}/lifecycle-result.json
         run: bash tests/lifecycle/run.sh
+
+      # The attestation arrives through the environment, never interpolated
+      # into the script, and is merged only into scenarios this run skipped.
+      # An unsealed attestation, or one sealed for another revision, fails the
+      # step — and the job — rather than being dropped.
+      - name: Merge the GitHub-repository attestation
+        id: attest
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.github_acceptance != '' }}
+        env:
+          ATTESTATION: ${{ inputs.github_acceptance }}
+          ATTESTED_BY: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          attestation="${RUNNER_TEMP}/github-acceptance.json"
+          printf '%s' "$ATTESTATION" > "$attestation"
+          python3 .github/scripts/lifecycle_result.py attest \
+            --result lifecycle-result.json \
+            --attestation "$attestation" \
+            --revision "$GITHUB_SHA" \
+            --attested-by "$ATTESTED_BY"
 
       - name: Summarize
         if: ${{ !cancelled() }}

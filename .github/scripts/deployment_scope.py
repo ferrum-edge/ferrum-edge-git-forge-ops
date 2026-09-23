@@ -56,7 +56,9 @@ from pathlib import Path
 #   resources/, overlays/, .gitforgeops/  desired configuration, environment
 #                                         routing and enforceable policy
 #   src/, build.rs, Cargo.*,              the gitforgeops binary this job
-#   rust-toolchain.toml                   installs with `cargo install --path .`
+#   rust-toolchain.toml, .cargo/          installs with `cargo install --path .`
+#                                         (`.cargo/config.toml` can set
+#                                         rustflags, env and source replacement)
 #   .github/scripts/                      helper programs the job executes
 #                                         (credential loading, installer,
 #                                         merge attribution, this file)
@@ -66,6 +68,7 @@ from pathlib import Path
 # Sorted, and written with the same `**` spelling the workflow trigger uses so
 # the two can be compared literally.
 DEPLOYMENT_INPUT_PATHS: tuple[str, ...] = (
+    ".cargo/**",
     ".github/ferrum-edge-checksums.txt",
     ".github/scripts/**",
     ".github/workflows/apply-on-merge.yml",
