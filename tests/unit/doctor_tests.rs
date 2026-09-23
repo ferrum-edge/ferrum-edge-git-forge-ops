@@ -239,10 +239,18 @@ fn github_checks_without_the_state_writer_app_id_are_unknown() {
 
 #[test]
 fn github_doctor_does_not_execute_the_checkout_auditor() {
-    let dir = repo(&[(
-        ".github/scripts/audit_settings.py",
-        "from pathlib import Path\nPath('checkout-auditor-ran').write_text('bad')\n",
-    )]);
+    // Neither the checkout's auditor nor a checkout module shadowing a
+    // standard-library import of the bundled one may run.
+    let dir = repo(&[
+        (
+            ".github/scripts/audit_settings.py",
+            "from pathlib import Path\nPath('checkout-auditor-ran').write_text('bad')\n",
+        ),
+        (
+            "argparse.py",
+            "from pathlib import Path\nPath('checkout-module-ran').write_text('bad')\n",
+        ),
+    ]);
     let checks = doctor::github::run(
         dir.path(),
         &doctor::github::GithubContext {
@@ -253,7 +261,46 @@ fn github_doctor_does_not_execute_the_checkout_auditor() {
         },
     );
     assert!(!dir.path().join("checkout-auditor-ran").exists());
+    assert!(!dir.path().join("checkout-module-ran").exists());
     assert_eq!(find(&checks, "settings-audit").status, Status::Unknown);
+}
+
+#[test]
+fn github_checks_surface_each_auditor_violation_as_its_own_finding() {
+    // Doctor owns no settings baseline: it runs the same auditor the bootstrap
+    // writes for and the scheduled audit runs, and republishes its findings.
+    let checks = doctor::github::audit_checks(
+        false,
+        "Repository protection evidence:\n  PASS: something is fine\n",
+        "Repository protection violations:\n  \
+         FAIL: environment 'production' must require at least one reviewer\n",
+    );
+    assert_eq!(find(&checks, "settings-audit").status, Status::Fail);
+    assert!(
+        checks.iter().any(|check| check.id == "settings-control"
+            && check.detail.contains("must require at least one reviewer")),
+        "{checks:?}"
+    );
+}
+
+#[test]
+fn an_auditor_that_could_not_run_is_unknown_not_a_failed_control() {
+    // Violations are a finding about the repository; an API error or a token
+    // without Administration: read means the audit did not happen.
+    let checks = doctor::github::audit_checks(
+        false,
+        "",
+        "settings audit failed closed: GitHub API request failed for \
+         repos/acme/repo/rulesets: 403\n",
+    );
+    let check = find(&checks, "settings-audit");
+    assert_eq!(check.status, Status::Unknown, "{check:?}");
+    assert!(check.detail.contains("could not complete"), "{check:?}");
+    assert!(check.detail.contains("403"), "{check:?}");
+    assert!(
+        checks.iter().all(|check| check.id != "settings-control"),
+        "{checks:?}"
+    );
 }
 
 #[test]

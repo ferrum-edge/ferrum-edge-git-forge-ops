@@ -18,7 +18,26 @@ use super::{Check, Scope, Status};
 
 const AUDITOR: &str = ".github/scripts/audit_settings.py";
 const BUNDLED_AUDITOR: &str = include_str!("../../.github/scripts/audit_settings.py");
-const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+/// The only parent variables the auditor inherits besides `GH_TOKEN`: what
+/// `python3` and `gh` need to be found and to reach GitHub. Gateway, broker and
+/// credential-bundle secrets, and anything else in doctor's environment, stay
+/// behind.
+const INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "GH_HOST",
+    "GH_CONFIG_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SYSTEMROOT",
+];
 
 /// What doctor needs in order to ask GitHub anything.
 pub struct GithubContext {
@@ -83,15 +102,21 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
     command
         // Never execute the checkout's copy: doctor is commonly run with both
         // repository-administration and gateway credentials in its parent.
+        // `-I` (isolated mode) also keeps the checkout directory off
+        // `sys.path` and ignores PYTHON* variables, so a checkout cannot shadow
+        // a standard-library module the bundled auditor imports.
+        .arg("-I")
         .arg("-c")
         .arg(BUNDLED_AUDITOR)
         .arg("--repo")
         .arg(repository)
         .current_dir(root)
-        // The auditor needs only the GitHub token. In particular, do not expose
-        // gateway, broker, credential-bundle, or unrelated process secrets.
-        .env_clear()
-        .env("PATH", CHILD_PATH);
+        .env_clear();
+    for name in INHERITED_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     if context.template_repo {
         command.arg("--template-repo");
     }
@@ -111,79 +136,85 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
             format!("could not run {AUDITOR}: {error}"),
         )
         .remedy("Install python3, or run the auditor yourself and read its output.")],
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let violations = violation_lines(&stderr).count();
-            let mut checks = vec![if output.status.success() {
-                Check::pass(
-                    "settings-audit",
-                    "Repository settings match the launch baseline",
-                    Scope::Github,
-                    format!(
-                        "{AUDITOR} reported {} control(s) active",
-                        evidence_lines(&stdout).count()
-                    ),
-                )
-            } else if violations == 0 {
-                // The auditor exits non-zero for two different reasons, and
-                // collapsing them is the mistake this whole scope is built to
-                // avoid. Violations are a finding about the repository; an
-                // API error, a token without Administration: read, or a
-                // missing App id means the audit *did not happen*. Reporting
-                // the second as a failed control would be inventing a result,
-                // and reporting it as a pass would be worse.
-                Check::new(
-                    "settings-audit",
-                    "Repository settings match the launch baseline",
-                    Scope::Github,
-                    Status::Unknown,
-                    format!(
-                        "{AUDITOR} could not complete: {}",
-                        stderr
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty())
-                            .unwrap_or("it exited non-zero without saying why")
-                    ),
-                )
-                .remedy(
-                    "This is not a finding about the repository — the audit did not \
-                     run. Check that GH_TOKEN carries Administration: read for this \
-                     repository, then re-run.",
-                )
-            } else {
-                Check::new(
-                    "settings-audit",
-                    "Repository settings match the launch baseline",
-                    Scope::Github,
-                    Status::Fail,
-                    format!("{AUDITOR} reported {violations} violation(s)"),
-                )
-                .remedy(
-                    "Each line below names one control. \
-                     `python3 .github/scripts/bootstrap_repo_settings.py --repo <slug>` \
-                     plans the fixes it can write; the rest are documented in \
-                     docs/github-launch-controls.md.",
-                )
-            }];
-            // The auditor's own findings, one check each, so a machine-readable
-            // doctor report carries them rather than a single opaque exit code.
-            for violation in violation_lines(&stderr) {
-                checks.push(
-                    Check::new(
-                        "settings-control",
-                        "Launch control",
-                        Scope::Github,
-                        Status::Fail,
-                        violation.to_string(),
-                    )
-                    .remedy("See docs/github-launch-controls.md for this control."),
-                );
-            }
-            checks
-        }
+        Ok(output) => audit_checks(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ),
     }
+}
+
+/// Turn one auditor run into doctor checks: a pass, an audit that did not
+/// happen (unknown), or one failed check per reported control.
+pub fn audit_checks(success: bool, stdout: &str, stderr: &str) -> Vec<Check> {
+    let violations = violation_lines(stderr).count();
+    let mut checks = vec![if success {
+        Check::pass(
+            "settings-audit",
+            "Repository settings match the launch baseline",
+            Scope::Github,
+            format!(
+                "{AUDITOR} reported {} control(s) active",
+                evidence_lines(stdout).count()
+            ),
+        )
+    } else if violations == 0 {
+        // The auditor exits non-zero for two different reasons, and
+        // collapsing them is the mistake this whole scope is built to
+        // avoid. Violations are a finding about the repository; an
+        // API error, a token without Administration: read, or a
+        // missing App id means the audit *did not happen*. Reporting
+        // the second as a failed control would be inventing a result,
+        // and reporting it as a pass would be worse.
+        Check::new(
+            "settings-audit",
+            "Repository settings match the launch baseline",
+            Scope::Github,
+            Status::Unknown,
+            format!(
+                "{AUDITOR} could not complete: {}",
+                stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("it exited non-zero without saying why")
+            ),
+        )
+        .remedy(
+            "This is not a finding about the repository — the audit did not \
+             run. Check that GH_TOKEN carries Administration: read for this \
+             repository, then re-run.",
+        )
+    } else {
+        Check::new(
+            "settings-audit",
+            "Repository settings match the launch baseline",
+            Scope::Github,
+            Status::Fail,
+            format!("{AUDITOR} reported {violations} violation(s)"),
+        )
+        .remedy(
+            "Each line below names one control. \
+             `python3 .github/scripts/bootstrap_repo_settings.py --repo <slug>` \
+             plans the fixes it can write; the rest are documented in \
+             docs/github-launch-controls.md.",
+        )
+    }];
+    // The auditor's own findings, one check each, so a machine-readable
+    // doctor report carries them rather than a single opaque exit code.
+    for violation in violation_lines(stderr) {
+        checks.push(
+            Check::new(
+                "settings-control",
+                "Launch control",
+                Scope::Github,
+                Status::Fail,
+                violation.to_string(),
+            )
+            .remedy("See docs/github-launch-controls.md for this control."),
+        );
+    }
+    checks
 }
 
 fn evidence_lines(stdout: &str) -> impl Iterator<Item = &str> {
