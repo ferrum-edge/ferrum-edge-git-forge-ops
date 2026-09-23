@@ -201,8 +201,10 @@ class Baseline:
                 "upstream revision this tree was last synced from and an update "
                 "cannot be computed without it"
             )
-        if not isinstance(data["upstream"], str):
-            raise UpdateError(f"{BASELINE_PATH} upstream must be a string")
+        if not isinstance(data["upstream"], str) or data["upstream"].startswith("-"):
+            raise UpdateError(
+                f"{BASELINE_PATH} upstream must be a path or URL, not a Git option"
+            )
         return cls(
             data["upstream"],
             validate_ref(data["ref"], f"{BASELINE_PATH} ref"),
@@ -465,11 +467,13 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
     mirror = workdir / "upstream"
     source = Path(upstream)
     if source.is_dir():
-        _git(workdir, "clone", "--quiet", "--no-local", str(source), str(mirror))
+        _git(
+            workdir, "clone", "--quiet", "--no-local", "--", str(source), str(mirror)
+        )
     else:
         mirror.mkdir(parents=True)
         _git(mirror, "init", "--quiet")
-        _git(mirror, "remote", "add", "origin", upstream)
+        _git(mirror, "remote", "add", "origin", "--", upstream)
         _git(mirror, "fetch", "--quiet", "--tags", "origin")
     for ref in refs:
         # Fail here, with the ref named, rather than deep inside a comparison.
@@ -679,6 +683,8 @@ def main(argv: list[str] | None = None) -> int:
                 "this tree was copied from — see docs/template-updates.md."
             )
         upstream = args.upstream or baseline.upstream or DEFAULT_UPSTREAM
+        if upstream.startswith("-"):
+            raise UpdateError("upstream must be a path or URL, not a Git option")
         target_ref = args.to or baseline.ref or DEFAULT_REF
         target_ref = validate_ref(target_ref, "target ref")
 

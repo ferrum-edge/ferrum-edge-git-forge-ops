@@ -414,6 +414,21 @@ class TemplateUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("v99.99.99", result.stderr)
 
+    def test_baseline_and_command_line_upstreams_reject_git_options(self):
+        marker = self.fixture.customer.parent / "upstream-injection-marker"
+        malicious_upstream = f"--upload-pack=touch {marker}"
+        payload = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        payload["upstream"] = malicious_upstream
+        write(
+            self.fixture.customer,
+            {".gitforgeops/baseline.json": json.dumps(payload)},
+        )
+
+        result = self.fixture.run("status")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not a Git option", result.stderr)
+        self.assertFalse(marker.exists())
+
     def test_baseline_commit_must_be_a_full_object_id(self):
         marker = self.fixture.customer.parent / "commit-injection-marker"
         payload = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
