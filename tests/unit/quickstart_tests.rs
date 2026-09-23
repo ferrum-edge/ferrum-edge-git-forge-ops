@@ -273,9 +273,7 @@ fn the_guide_names_shipped_doctor_commands_and_local_tool_prerequisites() {
     assert!(guide.contains("README: Setup doctor"));
     assert!(guide.contains("FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge"));
     assert!(guide.contains("Ferrum Edge v0.9.5"));
-    assert!(guide.contains(
-        "31573f0afab23694ce0cfe432f1220dd38099e3ee643e8c5d5b6d2bb3488297c"
-    ));
+    assert!(guide.contains("31573f0afab23694ce0cfe432f1220dd38099e3ee643e8c5d5b6d2bb3488297c"));
     assert!(guide.contains("Install `age`"));
     assert!(guide.contains("install `python3`"));
     assert!(guide.contains("gitforgeops-required-static-validation"));
