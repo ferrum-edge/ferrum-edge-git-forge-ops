@@ -264,3 +264,27 @@ fn the_guide_says_github_deployment_needs_the_committed_config() {
     assert!(guide.contains("fails its enumeration preflight"));
     assert!(guide.contains("Local CLI use does not need it"));
 }
+
+#[test]
+fn the_bootstrap_explicitly_protects_production_before_secrets_are_set() {
+    let guide = guide_text();
+    let bootstrap = guide
+        .split("## 3. Apply the settings baseline")
+        .nth(1)
+        .expect("quickstart has a settings-baseline step")
+        .split("## 4. Commit the repository configuration")
+        .next()
+        .expect("settings-baseline step ends before repository configuration");
+
+    assert_eq!(
+        bootstrap
+            .matches("--environment production \\ --reviewer")
+            .count(),
+        2,
+        "both the plan and apply bootstrap commands must name production before config discovery is available"
+    );
+    assert!(
+        bootstrap.contains("confirm the applied plan contains `CREATE environment production` or `UPDATE environment production`"),
+        "operators must verify the protected environment was reconciled before installing secrets"
+    );
+}
