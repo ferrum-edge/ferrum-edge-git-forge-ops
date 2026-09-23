@@ -1,9 +1,9 @@
 ---
-name: sol-agents
-description: Dispatch and orchestrate parallel gpt-6-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
+name: luna-agents
+description: Dispatch and orchestrate parallel gpt-6-luna codex CLI subagents (medium/high/xhigh effort) for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn luna/codex agents on issues, PRs, review findings, or red CI.
 ---
 
-# sol-agents: codex CLI subagent orchestration
+# luna-agents: codex CLI subagent orchestration
 
 You are the ORCHESTRATOR. Agents implement/fix; you verify their diffs, drive/merge
 decisions, and never let an unreviewed PR merge.
@@ -25,7 +25,7 @@ primary checkout. Never run a write-enabled worker in the orchestrator's or anot
 Write the prompt to a file outside the repo, then launch:
 
 ```bash
-<ABS_REPO>/.agents/skills/sol-agents/scripts/dispatch-agent.sh \
+<ABS_REPO>/.agents/skills/luna-agents/scripts/dispatch-agent.sh \
   --worktree <ABS_PATH_TO_WORKER_WORKTREE> \
   --prompt-file <ABS_PROMPT_FILE> \
   --effort <medium|high|xhigh>
@@ -49,7 +49,7 @@ Non-negotiables:
   `/usr/local/bin/codex` / `~/.local/bin/codex`, then `PATH`. Any candidate under
   `com.conductor.app` is refused — Conductor's bundle lags the standalone release.
 - The launcher clears inherited `CODEX_HOME` and OpenAI endpoint/auth overrides, then runs
-  `codex exec --model gpt-6-sol --ignore-user-config --ignore-rules --config
+  `codex exec --model gpt-6-luna --ignore-user-config --ignore-rules --config
   model_reasoning_effort="<effort>" --config service_tier="<default|priority>" --sandbox
   danger-full-access --cd <worktree> -`. Worktree isolation prevents git collisions; it is not a
   host sandbox.
@@ -76,13 +76,13 @@ Non-negotiables:
 ## Prompt construction (all modes)
 
 Every prompt starts with:
-`First read <ABS_REPO>/.agents/skills/sol-agents/references/agent-brief.md and follow it exactly`
+`First read <ABS_REPO>/.agents/skills/luna-agents/references/agent-brief.md and follow it exactly`
 (implementer mode) or
-`Read <ABS_REPO>/.agents/skills/sol-agents/references/continuation-brief.md AND
-<ABS_REPO>/.agents/skills/sol-agents/references/agent-brief.md and follow them`
+`Read <ABS_REPO>/.agents/skills/luna-agents/references/continuation-brief.md AND
+<ABS_REPO>/.agents/skills/luna-agents/references/agent-brief.md and follow them`
 (fix/shepherd modes — give BOTH absolute paths; the continuation brief defers to
 agent-brief for ground rules and must never be dispatched alone).
-Use only those shared `.agents/skills/sol-agents/references/` paths so Claude and Codex
+Use only those shared `.agents/skills/luna-agents/references/` paths so Claude and Codex
 orchestrators cannot drift onto private copies. They carry worktree isolation, mandatory local
 validation, review-loop discipline, failure-triage rules, and the final-report format. Verify the
 briefs' review-bot section matches reality before dispatching (Codex vs Claude
