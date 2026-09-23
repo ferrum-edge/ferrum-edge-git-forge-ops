@@ -199,9 +199,9 @@ already run by then:
   suppression is the fail-closed fallback in three cases: a secret shorter
   than `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced
   without mangling the report; a secret an emitter would re-encode
-  (`is_reencoding_hazard`, which now covers any control character and any
-  non-ASCII character anywhere in the value, not only the newline/quote/`#`/
-  `: `/edge-whitespace set); and a surviving `FRAGMENT_SCAN_LENGTH`-byte run.
+  (`is_reencoding_hazard`: a newline, carriage return, quote, backslash,
+  `#`, `: `, edge whitespace, or any control or non-ASCII character); and a
+  surviving `FRAGMENT_SCAN_LENGTH`-byte run.
   `FRAGMENT_SCAN_LENGTH` is pinned to `MIN_SCRUB_LENGTH`, asserted at compile
   time, so no value is covered by a needle without also being covered by the
   post-scrub scan.
