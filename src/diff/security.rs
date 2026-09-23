@@ -8,7 +8,7 @@ use crate::plugin_catalog::{
     retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive,
     waf_skips_oversized_body, RetiredRemediation, RETIRED_PLUGIN_NAMES,
 };
-use crate::policy::config::default_auth_plugin_names;
+use crate::policy::config::effective_auth_plugin_names;
 use crate::policy::PolicyConfig;
 use crate::secrets::plugin_config::{render_config_path, sensitive_string_paths, value_at};
 use crate::secrets::resolver::is_identity_credential_leaf;
@@ -109,19 +109,7 @@ pub fn audit_security_with_scope(
 ) -> Vec<SecurityFinding> {
     let mut findings = Vec::new();
 
-    let auth_names: Vec<String> = match policy {
-        Some(cfg) => cfg
-            .policies
-            .require_auth_plugin
-            .auth_plugin_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect(),
-        None => default_auth_plugin_names()
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect(),
-    };
+    let auth_names = effective_auth_plugin_names(policy);
 
     for consumer in &config.consumers {
         for (cred_type, cred_value) in &consumer.credentials {

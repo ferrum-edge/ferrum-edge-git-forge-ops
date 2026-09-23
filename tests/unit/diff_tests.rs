@@ -721,6 +721,204 @@ fn breaking_auth_plugin_deletion_scoped_by_namespace() {
     );
 }
 
+/// A policy whose `require_auth_plugin.auth_plugin_names` allowlist is `names`.
+fn auth_policy(names: &[&str]) -> gitforgeops::policy::PolicyConfig {
+    use gitforgeops::policy::config::{PolicyConfig, PolicyRules, RequireAuthPluginRuleConfig};
+
+    PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: RequireAuthPluginRuleConfig {
+                auth_plugin_names: names.iter().map(|name| name.to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Runs `desired` vs `actual` plugin configs through diff + breaking detection
+/// and returns the PluginConfig breaking reasons.
+fn plugin_breaking_reasons(
+    desired: Vec<PluginConfig>,
+    actual: Vec<PluginConfig>,
+    policy: Option<&gitforgeops::policy::PolicyConfig>,
+) -> Vec<String> {
+    let desired = GatewayConfig {
+        plugin_configs: desired,
+        ..GatewayConfig::default()
+    };
+    let actual = GatewayConfig {
+        plugin_configs: actual,
+        ..GatewayConfig::default()
+    };
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    gitforgeops::diff::detect_breaking_changes_with_policy(&diffs, &desired, &actual, policy)
+        .into_iter()
+        .filter(|bc| bc.kind == "PluginConfig")
+        .map(|bc| bc.reason)
+        .collect()
+}
+
+/// Runs a single plugin config through a Modify where only `mutate` differs.
+fn plugin_modify_reasons(
+    actual_plugin: PluginConfig,
+    mutate: impl Fn(&mut PluginConfig),
+    policy: Option<&gitforgeops::policy::PolicyConfig>,
+) -> Vec<String> {
+    let mut desired_plugin = actual_plugin.clone();
+    mutate(&mut desired_plugin);
+    plugin_breaking_reasons(vec![desired_plugin], vec![actual_plugin], policy)
+}
+
+#[test]
+fn breaking_without_policy_falls_back_to_builtin_auth_names() {
+    let actual = GatewayConfig {
+        plugin_configs: vec![
+            make_plugin_config("auth", "ferrum", "key_auth", PluginScope::Global),
+            make_plugin_config("custom", "ferrum", "acme_auth", PluginScope::Global),
+        ],
+        ..GatewayConfig::default()
+    };
+    let desired = GatewayConfig::default();
+    let diffs = compute_diff(&desired, &actual).unwrap();
+
+    let default_breaking = detect_breaking_changes(&diffs, &desired, &actual);
+    let no_policy_breaking =
+        gitforgeops::diff::detect_breaking_changes_with_policy(&diffs, &desired, &actual, None);
+
+    // Without a policy only the built-in authenticator counts; an unlisted
+    // custom name is not an authenticator.
+    for breaking in [default_breaking, no_policy_breaking] {
+        let entries: Vec<(&str, &str)> = breaking
+            .iter()
+            .map(|bc| (bc.id.as_str(), bc.reason.as_str()))
+            .collect();
+        assert_eq!(entries, vec![("auth", "Auth plugin deleted")]);
+    }
+}
+
+#[test]
+fn breaking_detects_configured_custom_auth_plugin_deletion() {
+    let policy = auth_policy(&["acme_auth"]);
+    let sso = make_plugin_config("sso", "ferrum", "acme_auth", PluginScope::Global);
+    let reasons = plugin_breaking_reasons(vec![], vec![sso], Some(&policy));
+    assert_eq!(reasons, vec!["Auth plugin deleted".to_string()]);
+}
+
+#[test]
+fn breaking_auth_classification_follows_the_policy_allowlist_case_insensitively() {
+    // The configured allowlist replaces the defaults, exactly as it does for
+    // `require_auth_plugin` and the security audit.
+    let policy = auth_policy(&["ACME_AUTH"]);
+    let reasons = plugin_breaking_reasons(
+        vec![],
+        vec![
+            make_plugin_config("sso", "ferrum", "acme_auth", PluginScope::Global),
+            make_plugin_config("keys", "ferrum", "key_auth", PluginScope::Global),
+        ],
+        Some(&policy),
+    );
+    assert_eq!(reasons, vec!["Auth plugin deleted".to_string()]);
+}
+
+#[test]
+fn breaking_detects_builtin_auth_plugin_disabled() {
+    let reasons = plugin_modify_reasons(
+        make_plugin_config("auth", "ferrum", "key_auth", PluginScope::Global),
+        |p| p.enabled = false,
+        None,
+    );
+    assert_eq!(
+        reasons.len(),
+        1,
+        "expected one breaking entry, got {reasons:?}"
+    );
+    assert!(
+        reasons[0].contains("Auth plugin disabled") && reasons[0].contains("true -> false"),
+        "expected a disabled-authenticator entry, got {reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_detects_configured_custom_auth_plugin_disabled() {
+    let policy = auth_policy(&["acme_auth"]);
+    let reasons = plugin_modify_reasons(
+        make_plugin_config("sso", "ferrum", "acme_auth", PluginScope::Global),
+        |p| p.enabled = false,
+        Some(&policy),
+    );
+    assert!(
+        reasons.iter().any(|r| r.contains("Auth plugin disabled")),
+        "expected a disabled-authenticator entry, got {reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_detects_auth_plugin_name_change() {
+    let reasons = plugin_modify_reasons(
+        make_plugin_config("auth", "ferrum", "key_auth", PluginScope::Global),
+        |p| p.plugin_name = "rate_limiting".to_string(),
+        None,
+    );
+    assert_eq!(
+        reasons.len(),
+        1,
+        "expected one breaking entry, got {reasons:?}"
+    );
+    assert!(
+        reasons[0].contains("plugin_name changed")
+            && reasons[0].contains("key_auth -> rate_limiting"),
+        "expected a plugin_name change naming the direction, got {reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_ignores_benign_plugin_config_modifications() {
+    // A non-auth plugin being disabled or renamed does not strand clients.
+    let reasons = plugin_modify_reasons(
+        make_plugin_config("limits", "ferrum", "rate_limiting", PluginScope::Global),
+        |p| {
+            p.enabled = false;
+            p.config = serde_json::json!({"requests_per_second": 10});
+        },
+        None,
+    );
+    assert!(
+        reasons.is_empty(),
+        "non-auth modify is not breaking: {reasons:?}"
+    );
+
+    // An auth plugin that stays enabled under the same name is not breaking
+    // when only its settings change.
+    let reasons = plugin_modify_reasons(
+        make_plugin_config("auth", "ferrum", "key_auth", PluginScope::Global),
+        |p| {
+            p.priority_override = Some(1100);
+            p.config = serde_json::json!({"key_location": "header:x-api-key"});
+        },
+        None,
+    );
+    assert!(
+        reasons.is_empty(),
+        "auth settings edit is not breaking: {reasons:?}"
+    );
+
+    // Re-enabling or renaming an authenticator that was already disabled
+    // live cannot strand anything that currently authenticates.
+    let mut disabled = make_plugin_config("auth", "ferrum", "key_auth", PluginScope::Global);
+    disabled.enabled = false;
+    let reasons = plugin_modify_reasons(
+        disabled,
+        |p| p.plugin_name = "rate_limiting".to_string(),
+        None,
+    );
+    assert!(
+        reasons.is_empty(),
+        "already-disabled auth is not breaking: {reasons:?}"
+    );
+}
+
 #[test]
 fn security_detects_literal_credential() {
     let mut creds = std::collections::BTreeMap::new();
