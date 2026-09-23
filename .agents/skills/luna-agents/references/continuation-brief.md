@@ -1,4 +1,4 @@
-# Ferrum Edge Git Forge Ops Qwen3.8 Max continuation brief
+# Ferrum Edge Git Forge Ops Luna continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow every rule in
 `agent-brief.md`, especially isolation, direct implementation, host discipline, the
@@ -10,11 +10,10 @@ orchestrator must provide absolute paths to both briefs; do not use this continu
 Complete the assigned continuation work and validation yourself in this session. Do not stop at
 partial work or hand unfinished implementation back to the controller. Perform commit, push, PR,
 review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke
-any agent-dispatch skill or script, including `qwen-agents`, `deepseek-pro-agents`,
-`deepseek-flash-agents`, `opencode-laguna-agents`, `grok-agents`, `sol-agents`, `luna-agents`, `opus-agents`,
-`fable-agents`, `composer-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers,
-or Claude CLI workers. Do not spawn nested workers. The orchestrator selected this model
-deliberately.
+any agent-dispatch skill or script, including `sol-agents`, `luna-agents`, `opus-agents`, `fable-agents`,
+`grok-agents`,
+`.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not spawn
+nested workers. The orchestrator selected this model and reasoning effort deliberately.
 
 ## Reconstruct state before editing
 
