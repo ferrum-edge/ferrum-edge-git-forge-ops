@@ -3177,7 +3177,7 @@ fn unknown_custom_plugin_names_keep_opt_in_severity_and_allowlist_behavior() {
                 .policies
                 .plugin_name_is_known
                 .allowed_extra_plugin_names
-                .push("COMPANY_SSO".into());
+                .push("company_sso".into());
             assert!(evaluate_policies(&cfg, &policy).is_empty());
         }
     }
@@ -3193,6 +3193,25 @@ fn plugin_name_is_known_warns_on_unknown_names_and_accepts_declared_customs() {
 
     let declared = known_name_policies(vec!["company_sso".to_string()]);
     assert!(evaluate_policies(&cfg, &declared).is_empty());
+}
+
+#[test]
+fn plugin_name_is_known_matches_custom_plugin_names_exactly() {
+    let exact = named_plugin_config("acme_auth");
+    let declared = known_name_policies(vec!["acme_auth".to_string()]);
+    assert!(
+        evaluate_policies(&exact, &declared).is_empty(),
+        "an exact custom name must be accepted"
+    );
+
+    let variant = named_plugin_config("Acme_Auth");
+    let findings = evaluate_policies(&variant, &declared);
+    assert_eq!(findings.len(), 1, "a case variant must not be accepted");
+    assert_eq!(findings[0].kind, "PluginConfig");
+    assert!(
+        findings[0].message.contains("Acme_Auth"),
+        "the unknown-name finding must name the configured spelling"
+    );
 }
 
 #[test]
