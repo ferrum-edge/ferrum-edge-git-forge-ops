@@ -1486,6 +1486,40 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_the_trigger_pinned_classifier_is_a_recognized_binding(self):
+        # Running the classifier extracted from the triggering commit keeps a
+        # refreshed head from replacing the program that judges it.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        pinned = workflow.replace(
+            "          python3 .github/scripts/deployment_scope.py classify \\\n",
+            '          trusted_classifier="$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")"\n'
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+            '          python3 "$trusted_classifier" classify \\\n',
+        )
+        self.assertNotEqual(pinned, workflow, "the classifier binding moved")
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", pinned, contract
+            ),
+            [],
+        )
+        # Extracting the trusted copy without running it is not a binding.
+        unused = pinned.replace(
+            '          python3 "$trusted_classifier" classify \\\n',
+            "          true \\\n",
+        )
+        self.assertTrue(
+            any(
+                "no recognized implementation is complete" in item
+                for item in check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", unused, contract
+                )
+            )
+        )
+
     def test_a_half_present_attribution_binding_is_still_rejected(self):
         # Dropping the branch argument silently changes what the guard refuses
         # and what its message tells the operator to do.
