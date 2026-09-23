@@ -97,6 +97,15 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.assertTrue(any("README Development status" in issue for issue in issues), issues)
         self.assertTrue(any("quickstart" in issue for issue in issues), issues)
 
+    def test_quickstart_must_require_a_supported_record(self):
+        quickstart = self.root / "docs/quickstart.md"
+        original = quickstart.read_text(encoding="utf-8")
+        changed = original.replace("`status` is\n`supported`", "`status` is\n`pending`", 1)
+        self.assertNotEqual(changed, original)
+        quickstart.write_text(changed, encoding="utf-8")
+        issues = check_release_baseline.check(self.root)
+        self.assertIn("quickstart must require a supported release record", issues)
+
     def test_release_gate_must_use_recorded_gateway_digest(self):
         workflow = self.root / ".github/workflows/release.yml"
         workflow.write_text(

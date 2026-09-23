@@ -55,7 +55,7 @@ def check(root: Path) -> list[str]:
         or "`status` becomes `supported`" not in readme
     ):
         issues.append("README Development status must explain pending and supported states")
-    if "`status` is `supported`" not in quickstart:
+    if "`status` is `supported`" not in " ".join(quickstart.split()):
         issues.append("quickstart must require a supported release record")
 
     pin = validator.get("sha256")

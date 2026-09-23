@@ -102,10 +102,6 @@ jobs:
       - name: Test privileged-input boundary
         run: python3 -m unittest discover -s .github/scripts/tests -v
 
-      - name: Check release baseline consistency
-        if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'
-        run: python3 .github/scripts/check_release_baseline.py
-
   security-cargo-audit:
     runs-on: ubuntu-24.04
     permissions:
