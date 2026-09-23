@@ -145,6 +145,7 @@ def configured_responses(
             "can_approve_pull_request_reviews": False,
         },
         f"repos/{REPO}": {
+            "default_branch": "main",
             "security_and_analysis": {
                 "secret_scanning": {"status": "enabled"},
                 "secret_scanning_push_protection": {"status": "enabled"},
@@ -341,7 +342,47 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
         )
         _, _, body = step.writes[0]
         self.assertEqual(body["reviewers"], [])
-        self.assertTrue(body["deployment_branch_policy"]["protected_branches"])
+        self.assertEqual(
+            body["deployment_branch_policy"],
+            {"protected_branches": False, "custom_branch_policies": True},
+        )
+        self.assertEqual(
+            step.writes[1],
+            (
+                "POST",
+                "repos/acme/repo/environments/staging-monitor/deployment-branch-policies",
+                {"name": "main", "type": "branch"},
+            ),
+        )
+
+    def test_an_exact_default_branch_monitor_is_unchanged(self):
+        responses = configured_responses(environments=("staging", "staging-monitor"))
+        responses["repos/acme/repo/environments/staging-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+        responses[
+            "repos/acme/repo/environments/staging-monitor/deployment-branch-policies?per_page=100"
+        ] = [{"branch_policies": [{"id": 17, "name": "main", "type": "branch"}]}]
+        api = FakeApi(responses)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+                "      unattended: true\n",
+                encoding="utf-8",
+            )
+            plan = bootstrap.build_plan(
+                api, namespace(config=str(config), reviewer=["octocat"])
+            )
+        step = next(
+            item for item in plan.steps if item.target == "environment staging-monitor"
+        )
+        self.assertEqual(step.action, bootstrap.UNCHANGED)
+        self.assertEqual(step.writes, [])
 
     def test_opting_out_creates_nothing_and_says_monitoring_is_gated(self):
         plan, _ = self._plan(
