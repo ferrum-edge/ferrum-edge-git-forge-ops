@@ -634,6 +634,50 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("job 'apply'" in item for item in violations), violations
         )
 
+    def test_unrecognized_job_headers_cannot_hide_a_token_mint(self):
+        for header in ('  "promote":\n', "  promote: # privileged job\n"):
+            with self.subTest(header=header.rstrip()):
+                hidden_job = self._privileged_job("promote", ordered=False).replace(
+                    "  promote:\n", header, 1
+                )
+                text = (
+                    "jobs:\n"
+                    + self._privileged_job("apply")
+                    + hidden_job
+                    + self.AUTH_LINES
+                    + "\n"
+                )
+                violations = check_supply_chain.state_writer_token_violations(
+                    "apply-on-merge.yml", text, "- name: Commit state update"
+                )
+                self.assertTrue(
+                    any("every state-writer token mint" in item for item in violations),
+                    violations,
+                )
+
+    def test_comments_do_not_fold_an_unrecognized_job_into_its_neighbor(self):
+        # Column-zero comments stay inside `jobs:`, but an unrecognized header
+        # still ends the preceding job, so its token mint is never attributed
+        # to a validated job.
+        hidden_job = self._privileged_job("promote", ordered=False).replace(
+            "  promote:\n", '  "promote":\n', 1
+        )
+        text = (
+            "jobs:\n"
+            + self._privileged_job("apply")
+            + "# staged promotion\n"
+            + hidden_job
+            + self.AUTH_LINES
+            + "\n"
+        )
+        violations = check_supply_chain.state_writer_token_violations(
+            "apply-on-merge.yml", text, "- name: Commit state update"
+        )
+        self.assertTrue(
+            any("every state-writer token mint" in item for item in violations),
+            violations,
+        )
+
     def test_two_correctly_ordered_privileged_jobs_are_accepted(self):
         text = (
             "jobs:\n"
@@ -967,6 +1011,31 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertTrue(
             any("fail-closed loader" in item for item in violations), violations
         )
+
+    def test_credential_workflow_cannot_remove_all_bundle_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8")
+            text = re.sub(
+                r"      - name: Load credential bundles\n.*?(?=      - name: )",
+                "      - name: Load credential bundles\n        run: ':'\n",
+                text,
+                flags=re.DOTALL,
+            )
+            self.assertNotIn(check_supply_chain.BUNDLE_SECRET_BINDING, text)
+            path.write_text(text, encoding="utf-8")
+            violations = self._violations(root)
+
+        for expected in (
+            "fail-closed loader",
+            "missing or mismatched: FERRUM_CREDS_BUNDLE",
+            "resolved credential file must live under $RUNNER_TEMP",
+        ):
+            with self.subTest(expected=expected):
+                self.assertTrue(
+                    any(expected in item for item in violations), violations
+                )
 
     def test_validate_pr_rejects_the_whole_secrets_context(self):
         # Guard the wiring, not just the regex: the real workflow text is run
@@ -1322,8 +1391,10 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "          true || {\n",
             1,
         )
+        # A column-zero comment is still inside the YAML `jobs:` mapping; it
+        # must not hide the following job from the trusted textual checker.
         violations = check_supply_chain.stale_deployment_guard_violations(
-            "apply-on-merge.yml", text + broken, contract
+            "apply-on-merge.yml", text + "# staged promotion\n" + broken, contract
         )
         self.assertTrue(
             any("job 'promote'" in item and "is missing" in item for item in violations),
@@ -1440,7 +1511,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path = root / ".github/workflows/apply-on-merge.yml"
             text = path.read_text(encoding="utf-8")
             text = text.replace(
-                "          python3 .github/scripts/deployment_scope.py classify \\\n"
+                '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+                '          python3 "$trusted_classifier" classify \\\n'
                 '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
                 "          true\n",
                 1,
@@ -1468,7 +1540,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             [],
         )
         legacy = workflow.replace(
-            "          python3 .github/scripts/deployment_scope.py classify \\\n"
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+            '          python3 "$trusted_classifier" classify \\\n'
             '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
             '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
             "            ':(exclude).state/**' ':(exclude)assembled/**'\n",
@@ -1484,6 +1557,48 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 for item in violations
             ),
             violations,
+        )
+
+    def test_the_trigger_pinned_classifier_is_the_recognized_binding(self):
+        # Running the classifier extracted from the triggering commit keeps a
+        # refreshed head from replacing the program that judges it.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('python3 "$trusted_classifier" classify \\\n', workflow)
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", workflow, contract
+            ),
+            [],
+        )
+        # Extracting the trusted copy without running it is not a binding.
+        unused = workflow.replace(
+            '          python3 "$trusted_classifier" classify \\\n',
+            "          true \\\n",
+        )
+        self.assertTrue(
+            any(
+                "no recognized implementation is complete" in item
+                for item in check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", unused, contract
+                )
+            )
+        )
+        # The retired checkout-executed form lets the refreshed head run its
+        # own classifier, so it is no longer a recognized binding.
+        checkout_executed = workflow.replace(
+            '          python3 "$trusted_classifier" classify \\\n',
+            "          python3 .github/scripts/deployment_scope.py classify \\\n",
+        )
+        self.assertTrue(
+            any(
+                "no recognized implementation is complete" in item
+                for item in check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", checkout_executed, contract
+                )
+            )
         )
 
     def test_a_half_present_attribution_binding_is_still_rejected(self):

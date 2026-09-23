@@ -111,6 +111,11 @@ ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_CA_CERT", "optional; base64 PEM for a private CA"),
     ("FERRUM_GATEWAY_CLIENT_CERT", "optional; base64 PEM, mTLS (needs the key too)"),
     ("FERRUM_GATEWAY_CLIENT_KEY", "optional; base64 PEM, mTLS (needs the cert too)"),
+    (
+        "FERRUM_VERIFY_BASE_URL",
+        "optional; https:// data-plane URL for traffic checks — required for an "
+        "environment that is a promotion predecessor",
+    ),
 )
 
 # Mirrors `MONITORING_ENVIRONMENT_SUFFIX` in `src/config/repo_config.rs` and
@@ -134,7 +139,8 @@ MONITORING_ENVIRONMENT_SECRETS = (
     ),
     (
         "FERRUM_ADMIN_JWT_ROLE",
-        "set to the least-privileged gateway role that can read GET /backup",
+        "optional; leave unset (admin) — GET /backup is admin-only today, so no "
+        "lesser role can run a drift check",
     ),
     (
         "FERRUM_ADMIN_JWT_ISSUER",
@@ -961,7 +967,7 @@ def step_audit_token_environment(api: GitHubApi, repo: str) -> list[Step]:
 
 
 def step_monitoring_environments(
-    api: GitHubApi, repo: str, environments: list[str]
+    api: GitHubApi, repo: str, environments: list[str], default_branch: str
 ) -> list[Step]:
     """Create the read-only environment a scheduled drift check binds.
 
@@ -971,8 +977,8 @@ def step_monitoring_environments(
     narrow — `audit_settings.py` grants it only to `<deployment-env>-monitor`
     where the deployment environment exists, and only while the environment
     holds no deployment, credential-broker or state-writing secret. Its branch
-    policy is still protected-branches-only, so an untrusted ref can never be
-    released the monitoring credentials.
+    policy admits only the exact default branch, so another protected ref can
+    never be released the monitoring credentials.
     """
     steps: list[Step] = []
     for base in environments:
@@ -983,13 +989,15 @@ def step_monitoring_environments(
             "wait_timer": 0,
             "reviewers": [],
             "deployment_branch_policy": {
-                "protected_branches": True,
-                "custom_branch_policies": False,
+                "protected_branches": False,
+                "custom_branch_policies": True,
             },
         }
+        policy_path = f"repos/{repo}/environments/{encoded}/deployment-branch-policies"
+        create_policy = ("POST", policy_path, {"name": default_branch, "type": "branch"})
         target = f"environment {name}"
         summary = (
-            f"read-only drift monitoring for {base}, protected branches only, "
+            f"read-only drift monitoring for {base}, exact {default_branch!r} branch only, "
             "no reviewer"
         )
         if detail is None:
@@ -999,33 +1007,51 @@ def step_monitoring_environments(
                     target,
                     summary,
                     ["environment: <absent> -> present"],
-                    [("PUT", f"repos/{repo}/environments/{encoded}", body)],
+                    [("PUT", f"repos/{repo}/environments/{encoded}", body), create_policy],
                 )
             )
             continue
         policy = detail.get("deployment_branch_policy") or {}
         current_reviewers, _ = environment_reviewers(detail)
+        current_policies = []
+        if policy.get("custom_branch_policies") is True:
+            pages = api.get(f"{policy_path}?per_page=100", paginate=True)
+            if isinstance(pages, list):
+                current_policies = [
+                    item
+                    for page in pages
+                    if isinstance(page, dict)
+                    for item in page.get("branch_policies", [])
+                    if isinstance(item, dict)
+                ]
+        policy_is_exact = (
+            policy.get("protected_branches") is False
+            and policy.get("custom_branch_policies") is True
+            and [item.get("name") for item in current_policies] == [default_branch]
+        )
         details = field_differences(
             {
                 # A reviewer added by hand parks every scheduled check; report
                 # it as drift and let the PUT remove it.
                 "reviewers": len(current_reviewers),
-                "deployment_branch_policy.protected_branches": policy.get(
-                    "protected_branches"
-                )
-                is True,
+                "deployment_branch_policy.exact_default_branch": policy_is_exact,
             },
-            {"reviewers": 0, "deployment_branch_policy.protected_branches": True},
+            {"reviewers": 0, "deployment_branch_policy.exact_default_branch": True},
         )
+        writes: list[tuple[str, str, dict | None]] = []
+        if details:
+            writes.append(("PUT", f"repos/{repo}/environments/{encoded}", body))
+            for item in current_policies:
+                if item.get("id") is not None:
+                    writes.append(("DELETE", f"{policy_path}/{item['id']}", None))
+            writes.append(create_policy)
         steps.append(
             Step(
                 UNCHANGED if not details else UPDATE,
                 target,
                 summary,
                 details,
-                []
-                if not details
-                else [("PUT", f"repos/{repo}/environments/{encoded}", body)],
+                writes,
             )
         )
     return steps
@@ -1201,7 +1227,10 @@ def build_plan(api: GitHubApi, args) -> Plan:
         plan.steps.extend(step_environments(api, repo, environments, reviewers))
         monitoring = resolve_monitoring_environments(args, environments)
         if monitoring:
-            plan.steps.extend(step_monitoring_environments(api, repo, monitoring))
+            default_branch = repository.get("default_branch") or "main"
+            plan.steps.extend(
+                step_monitoring_environments(api, repo, monitoring, default_branch)
+            )
             plan.warnings.append(
                 "Unattended drift monitoring is enabled for "
                 f"{', '.join(monitoring)}. Each gets a reviewer-free "

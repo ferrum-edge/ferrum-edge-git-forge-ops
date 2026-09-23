@@ -280,9 +280,11 @@ binds. Left out (or `false`), monitoring stays on the deployment environment
 and the check reports `Not completed` with the reason — never anything
 resembling "in sync".
 
-The bootstrap script creates each `<env>-monitor` with no reviewer, protected
-branches only, and prints the `gh secret set` commands for exactly the read
-material a comparison needs.
+The bootstrap script creates each `<env>-monitor` with no reviewer and a custom
+deployment policy matching only the repository's exact default branch. It also
+prints the `gh secret set` commands for exactly the read material a comparison
+needs. The exact policy is the non-bypassable boundary that prevents a workflow
+dispatched from another protected ref from receiving the signing secret.
 
 **What the monitoring environment may hold.** `audit_settings.py` grants the
 reviewer waiver only to `<env>-monitor` where `<env>` is itself a listed
@@ -366,6 +368,9 @@ changed a deployment input since the triggering merge. Those two sets are the
 same list — `DEPLOYMENT_INPUT_PATHS` in
 [`.github/scripts/deployment_scope.py`](../.github/scripts/deployment_scope.py)
 — and `check_supply_chain.py` fails the build when they drift apart.
+The workflow executes that classifier from the triggering commit, not from the
+refreshed checkout it is evaluating. A newer helper change therefore cannot
+approve itself under the waiting run's older environment authorization.
 
 Equality is what keeps an approval-gated deployment from being cancelled by
 accident. While a merge waits for its environment's required reviewer, other

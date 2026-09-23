@@ -195,20 +195,46 @@ whichever environment you actually exercised.
 
 ## 8. Seal and publish
 
-Re-seal so the record certifies the revision you actually tested:
+Re-seal so the record certifies the revision you actually tested — the
+upstream commit (or release tag) whose template you exercised, not the
+disposable repository's own commit:
 
 ```bash
 python3 .github/scripts/lifecycle_result.py seal \
   --result lifecycle-result.json \
-  --revision "$(git rev-parse HEAD)" --gateway "<gateway binary sha256>"
-
-python3 .github/scripts/lifecycle_result.py verify \
-  --result lifecycle-result.json --revision "$(git rev-parse HEAD)"
+  --revision <upstream commit being released> --gateway "<gateway binary sha256>"
 ```
 
-`verify` exits 0 only when every scenario is `passed`, the revision matches,
-and the record is inside the freshness window. That is the same computation
-`release.yml` runs.
+Then hand it to the release gate. The gate reads the result artifact of a
+**GitForgeOps Lifecycle Acceptance** run for the release revision, so dispatch
+that workflow on the release ref with your sealed file as its
+`github_acceptance` input:
+
+```bash
+gh workflow run lifecycle.yml --repo ferrum-edge/ferrum-edge-git-forge-ops \
+  --ref <release tag or main> \
+  -f github_acceptance="$(cat lifecycle-result.json)"
+```
+
+That run executes the local scenarios itself, then merges your outcomes into
+**only** the scenarios it recorded as `skipped`, each marked `attested by
+@<you>`. It refuses an attestation that is unsealed or sealed for a different
+revision, and it can never overwrite a scenario it ran. When it is green,
+re-run the `Release` workflow for the same revision; it picks the newest
+successful acceptance run for that commit.
+
+`verify` is the same computation the release runs, if you want to check the
+merged record yourself:
+
+```bash
+python3 .github/scripts/lifecycle_result.py verify \
+  --result lifecycle-result.json --revision <upstream commit> \
+  --gateway-allowlist .github/ferrum-edge-checksums.txt
+```
+
+It exits 0 only when every scenario is `passed`, the revision matches, the
+gateway build is one the revision's allowlist trusts, and the record is inside
+the freshness window.
 
 ---
 

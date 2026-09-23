@@ -19,14 +19,24 @@ staleness window.
 
 `skipped` is a status a scenario may legitimately have. It is never a pass.
 
+Some scenarios can only run against a disposable GitHub repository, which CI
+cannot create. Their outcomes reach the release gate as an **attestation**: the
+operator's own sealed result for the same revision, merged into the CI run's
+record by `attest`. An attestation can only fill a scenario the CI run itself
+recorded as `skipped` — it can never overwrite what the suite actually ran —
+and every attested entry names who attested it.
+
 Usage::
 
     lifecycle_result.py declare                     # the required scenario ids
     lifecycle_result.py record --result FILE --scenario ID --status STATUS \\
         [--detail TEXT]
     lifecycle_result.py seal --result FILE --revision SHA --gateway BUILD
+    lifecycle_result.py attest --result FILE --attestation FILE \\
+        --revision SHA --attested-by LOGIN
     lifecycle_result.py verify --result FILE --revision SHA \\
-        [--gateway BUILD] [--max-age-hours N] [--summary FILE]
+        [--gateway BUILD | --gateway-allowlist FILE] [--max-age-hours N] \\
+        [--summary FILE]
 """
 
 from __future__ import annotations
@@ -108,9 +118,10 @@ REQUIRED_SCENARIOS: tuple[tuple[str, str], ...] = (
     ),
     (
         "file-and-mesh-boundary",
-        "For the advertised file/mesh profile, verify assembly, encrypted "
-        "materialization and the delivery boundary — and that assembly is not "
-        "reported as live fleet deployment.",
+        "For the advertised file/mesh profile, verify assembly (placeholders "
+        "preserved, a separate mesh document), 0600 materialization that never "
+        "touches the committed artifact — and that assembly is not reported as "
+        "live fleet deployment.",
     ),
 )
 
@@ -178,14 +189,80 @@ def seal(result: dict, revision: str, gateway_build: str, now: datetime) -> dict
     return result
 
 
+def attest(
+    result: dict, attestation: dict, revision: str, attested_by: str
+) -> list[str]:
+    """Fill the CI run's `skipped` scenarios from an operator's sealed result.
+
+    Returns the scenario ids that were filled. Refuses an attestation that is
+    unsealed or sealed for a different revision: it describes a run of some
+    other code. Entries for scenarios the CI run did NOT skip are ignored —
+    what the suite ran itself is never replaced by what someone typed.
+    """
+    if not attested_by.strip():
+        raise ResultError("an attestation must name who attested it")
+    attested_revision = attestation.get("gitforgeops_revision")
+    if not attested_revision:
+        raise ResultError(
+            "the attestation was never sealed; run `lifecycle_result.py seal` on it "
+            "for the revision you tested"
+        )
+    if attested_revision != revision:
+        raise ResultError(
+            f"the attestation certifies {attested_revision}, not {revision}. An "
+            "acceptance run against other code proves nothing about this revision."
+        )
+    theirs = attestation.get("scenarios")
+    ours = result.get("scenarios")
+    if not isinstance(theirs, dict) or not isinstance(ours, dict):
+        raise ResultError("the attestation or the result carries no scenario outcomes")
+
+    filled: list[str] = []
+    for identifier in REQUIRED_SCENARIO_IDS:
+        current = ours.get(identifier)
+        entry = theirs.get(identifier)
+        if not isinstance(current, dict) or current.get("status") != SKIPPED:
+            continue
+        if not isinstance(entry, dict) or entry.get("status") not in (PASSED, FAILED):
+            continue
+        detail = str(entry.get("detail") or "").splitlines()[0:1]
+        ours[identifier] = {
+            "status": entry["status"],
+            "detail": f"attested by @{attested_by}"
+            + (f": {detail[0]}" if detail and detail[0] else ""),
+        }
+        filled.append(identifier)
+    result["attested_by"] = attested_by
+    result["attested_scenarios"] = filled
+    return filled
+
+
+def allowlisted_digests(text: str) -> list[str]:
+    """The validator builds `.github/ferrum-edge-checksums.txt` trusts."""
+    digests = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        digests.append(stripped.split()[0])
+    return digests
+
+
 def blockers(
     result: dict,
     revision: str,
     gateway_build: str | None,
     max_age_hours: int,
     now: datetime,
+    gateway_allowlist: list[str] | None = None,
 ) -> list[str]:
-    """Why this result may not authorize publishing `revision`."""
+    """Why this result may not authorize publishing `revision`.
+
+    `gateway_build` pins one exact build; `gateway_allowlist` accepts any build
+    the revision's own checksum allowlist trusts. The release gate uses the
+    allowlist, because the suite runs whichever allowlisted build the installer
+    resolves on the day.
+    """
     reasons: list[str] = []
 
     recorded = result.get("gitforgeops_revision")
@@ -207,6 +284,16 @@ def blockers(
                 f"the result was produced against gateway build "
                 f"{recorded_gateway!r}, but {gateway_build!r} is the pinned "
                 "build being certified."
+            )
+
+    if gateway_allowlist is not None:
+        recorded_gateway = result.get("gateway_build")
+        if recorded_gateway not in gateway_allowlist:
+            reasons.append(
+                f"the result was produced against gateway build "
+                f"{recorded_gateway!r}, which this revision's validator allowlist "
+                "does not trust. A result from an unapproved gateway certifies "
+                "nothing about the build this revision pins."
             )
 
     sealed_at = result.get("sealed_at")
@@ -264,6 +351,14 @@ def render(result: dict) -> str:
         f"- revision: `{result.get('gitforgeops_revision') or 'UNSEALED'}`",
         f"- gateway build: `{result.get('gateway_build') or 'unknown'}`",
         f"- sealed at: `{result.get('sealed_at') or 'never'}`",
+    ]
+    if result.get("attested_by"):
+        filled = ", ".join(f"`{item}`" for item in result.get("attested_scenarios") or [])
+        lines.append(
+            f"- GitHub-repository scenarios attested by `@{result['attested_by']}`: "
+            + (filled or "none filled")
+        )
+    lines += [
         "",
         "| Scenario | Status | Detail |",
         "| --- | --- | --- |",
@@ -304,10 +399,24 @@ def main(argv: list[str] | None = None) -> int:
     sealer.add_argument("--revision", required=True)
     sealer.add_argument("--gateway", required=True)
 
+    attester = sub.add_parser(
+        "attest",
+        help="fill this run's skipped scenarios from an operator's sealed result",
+    )
+    attester.add_argument("--result", required=True)
+    attester.add_argument("--attestation", required=True)
+    attester.add_argument("--revision", required=True)
+    attester.add_argument("--attested-by", required=True)
+
     verifier = sub.add_parser("verify")
     verifier.add_argument("--result", required=True)
     verifier.add_argument("--revision", required=True)
-    verifier.add_argument("--gateway")
+    gateway = verifier.add_mutually_exclusive_group()
+    gateway.add_argument("--gateway")
+    gateway.add_argument(
+        "--gateway-allowlist",
+        help="a checksum allowlist; the recorded gateway build must be one of its digests",
+    )
     verifier.add_argument("--max-age-hours", type=int, default=DEFAULT_MAX_AGE_HOURS)
     verifier.add_argument("--summary")
 
@@ -341,13 +450,31 @@ def main(argv: list[str] | None = None) -> int:
             print(f"sealed for {args.revision} against {args.gateway}")
             return 0
 
+        if args.command == "attest":
+            result = load(path)
+            attestation = load(Path(args.attestation))
+            filled = attest(result, attestation, args.revision, args.attested_by)
+            save(path, result)
+            print(
+                f"attested by @{args.attested_by}: "
+                + (", ".join(filled) if filled else "no skipped scenario to fill")
+            )
+            return 0
+
         result = load(path)
+        allowlist = None
+        if args.gateway_allowlist:
+            allowlist_path = Path(args.gateway_allowlist)
+            if not allowlist_path.is_file():
+                raise ResultError(f"{allowlist_path} does not exist")
+            allowlist = allowlisted_digests(allowlist_path.read_text(encoding="utf-8"))
         reasons = blockers(
             result,
             args.revision,
             args.gateway,
             args.max_age_hours,
             datetime.now(timezone.utc),
+            allowlist,
         )
         text = render(result)
         print(text, end="")

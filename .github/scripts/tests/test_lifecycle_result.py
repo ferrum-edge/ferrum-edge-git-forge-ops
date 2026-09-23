@@ -128,6 +128,135 @@ class CertificationTests(unittest.TestCase):
             lifecycle_result.record(result, "create-and-route", "probably_fine")
 
 
+GITHUB_HALF = (
+    "credentials-generate-and-rotate",
+    "partial-failure-recovery",
+    "ledger-publication-failure",
+    "runner-interruption",
+    "scheduling-and-attribution",
+    "staged-promotion",
+)
+
+
+def ci_result():
+    """What CI actually produces: the local half passed, the GitHub half skipped."""
+    result = lifecycle_result.empty_result()
+    for identifier in lifecycle_result.REQUIRED_SCENARIO_IDS:
+        status = (
+            lifecycle_result.SKIPPED
+            if identifier in GITHUB_HALF
+            else lifecycle_result.PASSED
+        )
+        lifecycle_result.record(result, identifier, status, "ci")
+    lifecycle_result.seal(result, REVISION, GATEWAY, NOW - timedelta(hours=1))
+    return result
+
+
+def operator_attestation(revision=REVISION, status=lifecycle_result.PASSED):
+    attestation = lifecycle_result.empty_result()
+    for identifier in GITHUB_HALF:
+        lifecycle_result.record(attestation, identifier, status, "run 123: ok")
+    lifecycle_result.seal(attestation, revision, "e" * 64, NOW - timedelta(hours=2))
+    return attestation
+
+
+class AttestationTests(unittest.TestCase):
+    """The GitHub half has to be able to reach the gate — and nothing else may."""
+
+    def test_ci_alone_never_certifies_a_release(self):
+        found = reasons(ci_result())
+        self.assertEqual(len(found), len(GITHUB_HALF), found)
+
+    def test_an_attestation_fills_the_skipped_scenarios_and_certifies(self):
+        result = ci_result()
+        filled = lifecycle_result.attest(
+            result, operator_attestation(), REVISION, "maintainer"
+        )
+        self.assertEqual(sorted(filled), sorted(GITHUB_HALF))
+        self.assertEqual(reasons(result), [])
+        entry = result["scenarios"]["staged-promotion"]
+        self.assertIn("attested by @maintainer", entry["detail"])
+        self.assertIn("@maintainer", lifecycle_result.render(result))
+
+    def test_an_attestation_never_overwrites_what_the_suite_ran(self):
+        result = ci_result()
+        lifecycle_result.record(
+            result, "create-and-route", lifecycle_result.FAILED, "route 502"
+        )
+        attestation = operator_attestation()
+        lifecycle_result.record(
+            attestation, "create-and-route", lifecycle_result.PASSED, "trust me"
+        )
+        lifecycle_result.attest(result, attestation, REVISION, "maintainer")
+        self.assertEqual(
+            result["scenarios"]["create-and-route"]["status"], lifecycle_result.FAILED
+        )
+
+    def test_an_attested_failure_is_recorded_as_a_failure(self):
+        result = ci_result()
+        lifecycle_result.attest(
+            result,
+            operator_attestation(status=lifecycle_result.FAILED),
+            REVISION,
+            "maintainer",
+        )
+        self.assertEqual(
+            result["scenarios"]["staged-promotion"]["status"], lifecycle_result.FAILED
+        )
+        self.assertTrue(reasons(result))
+
+    def test_an_attestation_for_other_code_is_refused(self):
+        with self.assertRaises(lifecycle_result.ResultError) as raised:
+            lifecycle_result.attest(
+                ci_result(),
+                operator_attestation(revision=OTHER_REVISION),
+                REVISION,
+                "maintainer",
+            )
+        self.assertIn("proves nothing about this revision", str(raised.exception))
+
+    def test_an_unsealed_attestation_is_refused(self):
+        attestation = operator_attestation()
+        attestation["gitforgeops_revision"] = None
+        with self.assertRaises(lifecycle_result.ResultError):
+            lifecycle_result.attest(ci_result(), attestation, REVISION, "maintainer")
+
+    def test_the_lifecycle_workflow_accepts_an_attestation_only_by_dispatch(self):
+        workflow = (ROOT / ".github/workflows/lifecycle.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("github_acceptance:", workflow)
+        self.assertIn("lifecycle_result.py attest", workflow)
+        # Through the environment, never interpolated into the script.
+        self.assertIn("ATTESTATION: ${{ inputs.github_acceptance }}", workflow)
+        self.assertNotIn('"${{ inputs.github_acceptance }}"', workflow)
+        self.assertIn("--attested-by \"$ATTESTED_BY\"", workflow)
+
+
+class GatewayAllowlistTests(unittest.TestCase):
+    ALLOWLIST = f"# comment\n{GATEWAY}  ferrum-edge-linux-x86_64  # note\n\n"
+
+    def test_an_allowlisted_gateway_build_certifies(self):
+        allowlist = lifecycle_result.allowlisted_digests(self.ALLOWLIST)
+        self.assertEqual(allowlist, [GATEWAY])
+        found = lifecycle_result.blockers(
+            passing_result(), REVISION, None, 72, NOW, allowlist
+        )
+        self.assertEqual(found, [])
+
+    def test_a_build_outside_the_allowlist_certifies_nothing(self):
+        found = lifecycle_result.blockers(
+            passing_result(), REVISION, None, 72, NOW, ["f" * 64]
+        )
+        self.assertTrue(any("allowlist" in reason for reason in found), found)
+
+    def test_the_release_gate_binds_the_result_to_the_allowlist(self):
+        release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "--gateway-allowlist .github/ferrum-edge-checksums.txt", release
+        )
+
+
 class CoverageTests(unittest.TestCase):
     """The declared scenarios are the product's promises, enumerated."""
 

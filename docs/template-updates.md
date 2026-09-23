@@ -72,8 +72,8 @@ Three of those are worth spelling out:
 - **`README.md` is upstream-managed**, because it is the engine's documentation
   and it changes with the engine. If you rewrote it for your own team, upstream
   editing it will surface as a conflict on every update — resolve it by keeping
-  yours. Consider putting your own description in a separate file so this stops
-  being a recurring decision.
+  yours with `--keep README.md`. Consider putting your own description in a
+  separate file so this stops being a recurring decision.
 
 **Outside Git entirely, and untouched by construction**: repository settings,
 rulesets, GitHub Environments, environment secrets, the credential-broker
@@ -106,6 +106,24 @@ how much attention they need from you:
 `plan` exits 1 when a conflict exists, so it is the one to wire into a job if
 you want a red signal.
 
+## Before your first update: record your real baseline
+
+"Use this template" copies upstream's own `.gitforgeops/baseline.json`, and
+that file names whichever upstream commit last wrote it — not the commit your
+copy was taken from. Left as it is, files upstream changed between the two
+show up as spurious conflicts. Record the real one once:
+
+```bash
+python3 .github/scripts/template_update.py detect-baseline          # report
+python3 .github/scripts/template_update.py detect-baseline --write  # record it
+```
+
+It searches upstream's history for the commit whose upstream-managed files
+match yours exactly, and records it only on an exact match. If you have
+already edited upstream-managed files it reports the closest commit and how
+many paths differ; confirm that is the revision you copied, then record it
+with `--write --accept-closest`. Commit the result.
+
 ## Adopting one
 
 ```bash
@@ -125,8 +143,17 @@ Omit it and the ref recorded in your baseline (`main` by default) is used.
 
 `apply` writes only the clean updates. If any conflict remains it prints them,
 **does not advance the baseline**, and exits 1 — a half-adopted update must not
-be recorded as a completed one. Resolve each conflicting file deliberately,
-commit, and re-run `apply` to record the baseline.
+be recorded as a completed one. Resolve each conflicting file deliberately:
+
+- **take upstream's version** — copy it in (the output prints the `git diff`
+  to inspect), and the next run sees it as already adopted;
+- **merge the two** — edit the file, then keep the result as below;
+- **keep yours** — re-run with `--keep <path>` (repeatable).
+
+`--keep` is a decision named on the command line, never a default, and it only
+accepts a path that is actually in conflict for this update — a typo or a
+decision left over from an older update is refused rather than read as
+"resolved". Then commit, and re-run `apply` to record the baseline.
 
 ### Review it like the code change it is
 

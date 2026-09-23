@@ -454,10 +454,11 @@ failing does not stop production, and production is not "promoted" from
 anything — it reconciles the same source revision with its own overlay.
 
 If you want a real promotion path — staging applies, representative traffic is
-verified, and only then is production authorized for the same revision — that
-is a distinct capability tracked in
-[#268](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/268).
-Do not read parallel matrix jobs as staged rollout.
+verified, and only then is production authorized for the same revision — opt
+production into it with `promotion.requires: staging` and declare staging's
+checks in `.gitforgeops/smoke.yaml`; see
+[Staged promotion](../README.md#staged-promotion). Do not read parallel matrix
+jobs as staged rollout.
 
 ---
 
