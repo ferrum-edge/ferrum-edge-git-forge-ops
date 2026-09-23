@@ -48,7 +48,7 @@ Dockerfile  .dockerignore
 .github/dependabot.yml
 .gitforgeops/config.example.yaml  .gitforgeops/policies.example.yaml
 .gitforgeops/smoke.example.yaml
-docs/  README.md  CLAUDE.md  SECURITY.md  LICENSE.md
+release/  docs/  README.md  CLAUDE.md  SECURITY.md  LICENSE.md
 ```
 
 **Yours, never read from upstream and never written**:

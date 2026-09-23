@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "status": "pending",
+  "gitforgeops": {
+    "version": "0.1.0",
+    "tag": "v0.1.0",
+    "source_sha": null,
+    "image_digest": null
+  },
+  "validator": {
+    "version": "v0.9.5",
+    "asset": "ferrum-edge-linux-x86_64",
+    "sha256": "31573f0afab23694ce0cfe432f1220dd38099e3ee643e8c5d5b6d2bb3488297c"
+  },
+  "tested_gateway": {
+    "version": "v0.9.5",
+    "binary_sha256": "31573f0afab23694ce0cfe432f1220dd38099e3ee643e8c5d5b6d2bb3488297c",
+    "image": "docker.io/ferrumedge/ferrum-edge",
+    "image_digest": "sha256:eca46c84bca92d6ef467979f8846537f7ab56c0cdc137befff465526a10fe10f"
+  },
+  "lifecycle": {
+    "run_url": null
+  }
+}
