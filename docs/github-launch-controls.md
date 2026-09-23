@@ -366,6 +366,9 @@ changed a deployment input since the triggering merge. Those two sets are the
 same list — `DEPLOYMENT_INPUT_PATHS` in
 [`.github/scripts/deployment_scope.py`](../.github/scripts/deployment_scope.py)
 — and `check_supply_chain.py` fails the build when they drift apart.
+The workflow executes that classifier from the triggering commit, not from the
+refreshed checkout it is evaluating. A newer helper change therefore cannot
+approve itself under the waiting run's older environment authorization.
 
 Equality is what keeps an approval-gated deployment from being cancelled by
 accident. While a merge waits for its environment's required reviewer, other

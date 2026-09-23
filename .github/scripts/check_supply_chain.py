@@ -132,17 +132,11 @@ FRESH_HEAD_CONTROLS = (
 # difference, including a merge that schedules no apply of its own, so a queued
 # deployment could be cancelled with nothing left to reconcile it.
 #
-# The second family runs the classifier extracted from the triggering commit
-# rather than the refreshed checkout, so a newer head cannot replace the
-# program deciding whether it may ride the older authorization. It is accepted
-# here first because this check executes the default branch's policy against a
-# candidate: the workflow can only move to it once the protected policy knows
-# it, after which the checkout-executed family can be retired.
+# The classifier is extracted from the triggering commit rather than run from
+# the refreshed checkout, so a newer head cannot replace the program deciding
+# whether it may ride the older authorization. The checkout-executed form is
+# retired: it let the refreshed head approve its own helper changes.
 APPLY_REVISION_BINDINGS = (
-    (
-        "python3 .github/scripts/deployment_scope.py classify \\",
-        '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
-    ),
     (
         'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"',
         'python3 "$trusted_classifier" classify \\',

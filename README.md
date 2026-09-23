@@ -1399,6 +1399,9 @@ Everything after that point — the `gitforgeops` binary it builds, the desired 
 - **A stale or superseded run is rejected, not silently replayed.** A trigger that is no longer an ancestor is stale. An ancestor whose protected head changed a *deployment input* is superseded. Both fail before building a binary or contacting the gateway; the newer merge's own run must reconcile that revision.
 
 Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author. The supersession guard is what guarantees that a later PR's desired input or executable cannot be applied under that attribution.
+The guard extracts its classifier from the triggering commit before using it;
+it never lets the refreshed, not-yet-authorized head decide whether its own
+helper or executable changes are safe.
 
 ##### Deployment inputs: one list for scheduling and for supersession
 
