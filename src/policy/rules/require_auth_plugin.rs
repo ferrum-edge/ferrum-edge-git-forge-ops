@@ -22,12 +22,7 @@ impl RequireAuthPluginRule {
         // attacker could commit `enabled: false` on an auth plugin and pass
         // this policy while the proxy accepts unauthenticated traffic) is
         // delegated to the shared `effective_plugins` merge.
-        let allowlist: Vec<String> = self
-            .config
-            .auth_plugin_names
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
+        let allowlist = self.config.normalized_auth_plugin_names();
 
         effective_plugins(cfg, proxy)
             .into_iter()

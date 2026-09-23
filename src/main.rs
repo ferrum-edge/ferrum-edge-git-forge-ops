@@ -865,7 +865,8 @@ fn ownership_preview(
             &pair.namespace,
         )?);
     }
-    let (mut diffs, _, _, _) = compute_namespace_diffs(pairs, None, diff::DiffOptions::default())?;
+    let (mut diffs, _, _, _) =
+        compute_namespace_diffs(pairs, None, diff::DiffOptions::default(), None)?;
     diffs.extend(pending.iter().cloned());
     let handled = adoption_handled_keys(&diffs, state);
     let ledger = ledger_keys(state);
@@ -902,10 +903,16 @@ type NamespaceDiffs = (
 /// it prints and the large-prune guard it evaluates describe the run that is
 /// about to happen. Computing the preview with the default while applying with
 /// the flag hid spec-owned deletions from both.
+///
+/// `policy_cfg` supplies the repository's auth-plugin allowlist for breaking
+/// detection, so a deleted, disabled or renamed authenticator is classified
+/// the same way `require_auth_plugin` and the security audit classify it.
+/// Callers that discard the breaking list pass `None` (built-in defaults).
 fn compute_namespace_diffs(
     namespace_pairs: &[NamespaceSnapshot],
     previously_managed: Option<&HashSet<String>>,
     options: diff::DiffOptions,
+    policy_cfg: Option<&policy::PolicyConfig>,
 ) -> gitforgeops::error::Result<NamespaceDiffs> {
     let mut diffs = Vec::new();
     let mut breaking = Vec::new();
@@ -920,8 +927,12 @@ fn compute_namespace_diffs(
     for pair in namespace_pairs {
         let result =
             diff::compute_diff_with_options(&pair.desired, &pair.actual, ownership_scope, options)?;
-        let namespace_breaking =
-            diff::detect_breaking_changes(&result.diffs, &pair.desired, &pair.actual);
+        let namespace_breaking = diff::detect_breaking_changes_with_policy(
+            &result.diffs,
+            &pair.desired,
+            &pair.actual,
+            policy_cfg,
+        );
 
         diffs.extend(result.diffs);
         unmanaged.extend(result.unmanaged);
@@ -1484,6 +1495,7 @@ async fn cmd_diff(
         &namespace_pairs,
         managed.as_ref(),
         diff::DiffOptions::default(),
+        None,
     )?;
     let diffs = apply::order_incremental_diffs(diffs, &desired);
     let plugin_attach_notice =
@@ -1791,6 +1803,7 @@ async fn cmd_plan(
                         &namespace_pairs,
                         managed.as_ref(),
                         diff::DiffOptions::default(),
+                        policy_cfg.as_ref(),
                     )?;
                     d.extend(pending);
                     (d, b, u, s, true, None)
@@ -2420,8 +2433,12 @@ async fn cmd_apply(
                 if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                     return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
                 }
-                let (mut diffs, _, unmanaged, spec_owned) =
-                    compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options)?;
+                let (mut diffs, _, unmanaged, spec_owned) = compute_namespace_diffs(
+                    &namespace_pairs,
+                    managed.as_ref(),
+                    diff_options,
+                    policy_cfg.as_ref(),
+                )?;
                 let (pending, adoptions) =
                     ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy)?;
                 diffs.extend(pending);
@@ -2580,8 +2597,12 @@ async fn cmd_apply(
                 state.save()?;
             }
             let managed = previously_managed(&resolved, &state);
-            let (diffs, _, _, _) =
-                compute_namespace_diffs(&namespace_pairs, managed.as_ref(), diff_options)?;
+            let (diffs, _, _, _) = compute_namespace_diffs(
+                &namespace_pairs,
+                managed.as_ref(),
+                diff_options,
+                policy_cfg.as_ref(),
+            )?;
             let delete_count = diffs
                 .iter()
                 .filter(|d| matches!(d.action, diff::DiffAction::Delete))
@@ -3159,6 +3180,7 @@ async fn cmd_review(
                                 &namespace_pairs,
                                 managed.as_ref(),
                                 diff::DiffOptions::default(),
+                                policy_cfg.as_ref(),
                             )?;
                             d.extend(pending);
                             (d, b, u, s, None)

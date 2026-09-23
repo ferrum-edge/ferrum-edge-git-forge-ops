@@ -69,6 +69,32 @@ impl Default for RequireAuthPluginRuleConfig {
     }
 }
 
+impl RequireAuthPluginRuleConfig {
+    /// The configured allowlist, lowercased for case-insensitive matching
+    /// against a plugin's `plugin_name`.
+    pub fn normalized_auth_plugin_names(&self) -> Vec<String> {
+        self.auth_plugin_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect()
+    }
+}
+
+/// The plugin names that count as authentication for a repository: the
+/// resolved `require_auth_plugin.auth_plugin_names` allowlist when a policy is
+/// loaded (whether or not the rule itself is enabled), otherwise the built-in
+/// defaults. Lowercased.
+///
+/// The single classification shared by the policy rule, the security audit
+/// and breaking-change detection, so they cannot disagree about which plugin
+/// configs authenticate traffic.
+pub fn effective_auth_plugin_names(policy: Option<&PolicyConfig>) -> Vec<String> {
+    policy
+        .map(|cfg| cfg.policies.require_auth_plugin.clone())
+        .unwrap_or_default()
+        .normalized_auth_plugin_names()
+}
+
 /// Spellings that are not real `plugin_name` values but appear in
 /// hand-written policy files and in this repo's own examples from before the
 /// catalog was pinned down. Tolerated so an upgrade does not suddenly report
