@@ -5,12 +5,14 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         --effort medium|high' >&2
+    '                         --effort medium|high|xhigh' \
+    '                         [--fast]' >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
+fast='false'
 
 while (($#)); do
   case "$1" in
@@ -41,6 +43,10 @@ while (($#)); do
       effort=${2-}
       shift 2
       ;;
+    --fast)
+      fast='true'
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -54,13 +60,18 @@ while (($#)); do
 done
 
 case "$effort" in
-  medium|high) ;;
+  medium|high|xhigh) ;;
   *)
     printf 'Invalid effort: %s\n' "${effort:-<empty>}" >&2
     usage
     exit 2
     ;;
 esac
+
+service_tier='default'
+if [[ "$fast" == 'true' ]]; then
+  service_tier='priority'
+fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
@@ -76,10 +87,10 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # shellcheck source=../../_lib/resolve-agent-bin.sh
 . "$script_dir/../../_lib/resolve-agent-bin.sh"
 
-claude_bin=$(resolve_agent_bin claude CLAUDE_BIN \
-  "${HOME}/.local/bin/claude" \
-  /opt/homebrew/bin/claude \
-  /usr/local/bin/claude)
+codex_bin=$(resolve_agent_bin codex CODEX_BIN \
+  /opt/homebrew/bin/codex \
+  /usr/local/bin/codex \
+  "${HOME}/.local/bin/codex")
 
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
@@ -91,17 +102,20 @@ if [[ "$physical_worktree" != "$physical_root" ]]; then
 fi
 require_linked_worktree "$physical_root"
 acquire_worktree_dispatch_lock "$physical_root"
+isolate_codex_provider
 
 cd "$physical_worktree"
-isolate_claude_provider
 
-printf '[fable-agents] dispatch model=claude-fable-5-1 effort=%s worktree=%s bin=%s\n' \
-  "$effort" "$physical_worktree" "$claude_bin" >&2
+printf '[luna-agents] dispatch model=gpt-6-luna effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
+  "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
 
-run_dispatch_child "$prompt_file" "$claude_bin" -p \
-  --model claude-fable-5-1 \
-  --effort "$effort" \
-  --setting-sources '' \
-  --permission-mode bypassPermissions \
-  --output-format text \
-  --verbose
+run_dispatch_child "$prompt_file" "$codex_bin" exec \
+  --model gpt-6-luna \
+  --ignore-user-config \
+  --ignore-rules \
+  --config 'model_provider="openai"' \
+  --config "model_reasoning_effort=\"$effort\"" \
+  --config "service_tier=\"$service_tier\"" \
+  --sandbox danger-full-access \
+  --cd "$physical_worktree" \
+  -

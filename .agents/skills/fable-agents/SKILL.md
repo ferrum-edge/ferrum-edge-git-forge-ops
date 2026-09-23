@@ -1,6 +1,6 @@
 ---
 name: fable-agents
-description: Dispatch and orchestrate external Claude Code Fable 5 agents from Codex for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude Fable agents, run multiple Fable workers, select medium or high effort, resume interrupted Fable runs, or drive agent-owned branches and PRs. Do not use for other Claude models, effort levels other than medium or high, Codex-native subagents, or ordinary single-agent edits.
+description: Dispatch and orchestrate external Claude Code Fable 5.1 agents from Codex for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude Fable agents, run multiple Fable workers, select medium or high effort, resume interrupted Fable runs, or drive agent-owned branches and PRs. Do not use for other Claude models, effort levels other than medium or high, Codex-native subagents, or ordinary single-agent edits.
 ---
 
 # Fable agents
@@ -31,9 +31,9 @@ Fable.
    - `CLAUDE_BIN` if it points at an executable absolute path,
    - `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`,
    - `claude` on `PATH`.
-3. Confirm that the installed CLI accepts `claude-fable-5` and exposes `--effort` with `medium`
+3. Confirm that the installed CLI accepts `claude-fable-5-1` and exposes `--effort` with `medium`
    and `high`.
-4. Use only the pinned model `claude-fable-5`. Do not expose a model override in the launcher.
+4. Use only the pinned model `claude-fable-5-1`. Do not expose a model override in the launcher.
 5. Stop and report the problem if authentication or Fable access is unavailable. Do not silently
    substitute another model or effort.
 
@@ -91,7 +91,7 @@ the prompt file to the bundled launcher from one long-lived execution session:
   --effort <medium|high>
 ```
 
-The launcher pins `claude-fable-5`, clears environment variables that can override the provider,
+The launcher pins `claude-fable-5-1`, clears environment variables that can override the provider,
 authentication, model, effort, or thinking, omits the ordinary Claude Code fallback-model option,
 ignores user/project/local settings, enables verbose text output, and closes stdin at the prompt
 file's EOF. Delete the temporary prompt after the worker finishes.
@@ -115,7 +115,7 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including sol-agents, opus-agents, fable-agents, grok-agents, or any
+skills or scripts (including sol-agents, luna-agents, opus-agents, fable-agents, grok-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
