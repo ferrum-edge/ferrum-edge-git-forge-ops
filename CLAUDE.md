@@ -71,6 +71,10 @@ gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
                                                           # Post PR comment; optionally require live comparison.
                                                           # Exit stays 0 on offline apply blockers unless
                                                           # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
+gitforgeops verify [--format text|json]                   # Declared traffic checks vs the data plane (exit 4 on failure)
+
+gitforgeops doctor [--format text|json] [--scope local|github|gateway|all] \
+  [--repo OWNER/REPO] [--state-writer-app-id N]           # Read-only readiness diagnosis (exit 3 on a blocker)
 gitforgeops envs [--format json|text] [--include-scopes]  # List envs / trusted CI namespace scopes
 gitforgeops version [--format text|json]                 # Cargo package version plus build-time git metadata
 gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential slot and re-deliver
@@ -195,9 +199,9 @@ already run by then:
   suppression is the fail-closed fallback in three cases: a secret shorter
   than `MIN_SCRUB_LENGTH` (8 bytes), which cannot be substring-replaced
   without mangling the report; a secret an emitter would re-encode
-  (`is_reencoding_hazard`, which now covers any control character and any
-  non-ASCII character anywhere in the value, not only the newline/quote/`#`/
-  `: `/edge-whitespace set); and a surviving `FRAGMENT_SCAN_LENGTH`-byte run.
+  (`is_reencoding_hazard`: a newline, carriage return, quote, backslash,
+  `#`, `: `, edge whitespace, or any control or non-ASCII character); and a
+  surviving `FRAGMENT_SCAN_LENGTH`-byte run.
   `FRAGMENT_SCAN_LENGTH` is pinned to `MIN_SCRUB_LENGTH`, asserted at compile
   time, so no value is covered by a needle without also being covered by the
   post-scrub scan.
@@ -305,7 +309,8 @@ Publication is a **reconciliation**, not a conditional write: `apply::reconcile_
 ### Multi-Environment (repo config)
 
 `.gitforgeops/config.yaml` declares logical environments. Each entry picks an
-overlay, apply strategy, ownership mode, and whether live PR review is enabled.
+overlay, apply strategy, ownership mode, whether live PR review is enabled, and
+whether scheduled drift monitoring runs unattended.
 Set `live_review: false` for file-mode environments. **No gateway URL, no JWT, no
 secret names** live in this file — those come from GitHub Environment Secrets
 of the same name as the entry (e.g. `production` entry → GitHub Environment
@@ -316,6 +321,41 @@ Workflows run as a matrix over `gitforgeops envs --format json`, binding
 `environment: ${{ matrix.environment }}` to pull the scoped secrets. Concurrency
 groups serialize per-env applies so two concurrent writes to the same
 environment never interleave.
+
+#### Unattended drift monitoring
+
+`monitoring.unattended: true` on an environment makes `EnvironmentScope`
+report `monitoring_environment = "<env>-monitor"` (`MONITORING_ENVIRONMENT_SUFFIX`,
+`repo_config.rs`), and `drift-check.yml` binds that instead of the deployment
+environment. Default `false` keeps the check on the deployment environment,
+where GitHub withholds the secrets until a reviewer approves — reported
+honestly as `not_completed`, never as in sync. A deployment environment may not
+be named with the suffix: the settings audit waives its required-reviewer rule
+for exactly that shape.
+
+Three independent fences bound what the reviewer-free environment can reach:
+its custom deployment policy admits only the repository's exact default branch;
+`audit_settings.py` rejects a `<env>-monitor` holding
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY`, `FERRUM_GH_PROVISIONER_TOKEN`,
+`SETTINGS_AUDIT_TOKEN` or `FERRUM_CREDS_BUNDLE[_N]` (secret *names* only, never
+values) and requires its base environment to exist;
+`check_supply_chain.py::monitoring_workflow_violations` rejects a
+`drift-check.yml` that binds any of those, holds a write permission, omits the
+outcome classifier, or runs a `gitforgeops` subcommand other than `diff`; and
+`drift-check.yml` binds no credential bundle at all, because `diff` excludes
+still-unresolved broker leaves from live comparison per leaf.
+`CREDENTIAL_BUNDLE_WORKFLOWS` is the bundle-reading subset of
+`PRIVILEGED_WORKFLOWS` for that reason.
+
+Outcomes come from `.github/scripts/drift_report.py`: `in_sync`, `drift`,
+`failed`, `skipped` (file mode), `not_completed`. Only `in_sync` is a successful
+comparison; `drift`/`failed`/`not_completed` block, `skipped` does not. A matrix
+entry with no record is reconstructed as `not_completed`. The settings audit
+separately reads the newest successful `drift-check.yml` run and fails when it
+is older than `--monitoring-max-age-hours` (48), so a `cron:` entry alone cannot
+pass for coverage. Ferrum Edge has no read-only admin role today, so the
+monitoring environment's JWT signing secret is gateway-write-equivalent; that
+dependency is documented rather than papered over.
 
 #### Freshness guard (the lock does not move the checkout)
 
@@ -329,14 +369,74 @@ that runs before any build or gateway call: re-fetch the branch, `git checkout
 --force -B <branch> refs/remotes/origin/<branch>` (stay on the branch — the
 ledger commit later pushes it), print the triggering SHA and the branch head,
 and fail closed unless `git merge-base --is-ancestor` puts the trigger inside
-that head. Apply additionally permits differences from the trigger only under
-`.state/**` and `assembled/**`, binding the triggering PR's authorization and
-credential recipient to unchanged executable and desired inputs. Binary,
-desired state and ledger then all come from the refreshed checkout;
-`GITHUB_SHA` for the apply is that refreshed head, matching
+that head. Binary, desired state and ledger then all come from the refreshed
+checkout; `GITHUB_SHA` for the apply is that refreshed head, matching
 `state.last_applied_commit`. PR attribution (override label, credential
 recipient) stays on the triggering merge. `check_supply_chain.py::
 stale_deployment_guard_violations` enforces the shape and the step ordering.
+
+Apply additionally calls `.github/scripts/deployment_scope.py classify`, which
+refuses the queued run when the refreshed head changed a **deployment input** —
+binding the triggering PR's authorization and credential recipient to unchanged
+executable and desired inputs. `DEPLOYMENT_INPUT_PATHS` there is one list used
+twice: it is also `apply-on-merge.yml`'s `on.push.paths` filter, and
+`check_supply_chain.py::deployment_scope_violations` fails the build when the
+two halves disagree. Equality is the invariant — a change that supersedes a
+queued apply always schedules a replacement run, and a change that schedules
+nothing (docs, `tests/**`, an unrelated workflow) can never supersede, so it no
+longer strands an authorized deployment. The workflow extracts the classifier
+from the triggering commit before executing it; the refreshed head cannot
+approve its own helper or executable changes under an older authorization.
+`GENERATED_PATHS` (`.state/**`,
+`assembled/**`) is in neither half: the apply writes it, so it must not reject a
+queued run and must not re-trigger the job that produced it. Operator recovery
+for an already-superseded run is `README.md#recovering-a-superseded-apply`.
+
+### Staged promotion
+
+`promotion.requires: <env>` on an environment takes it out of the parallel
+matrix and into a second phase. `EnvironmentScope.promotion_requires` is what
+`apply-on-merge.yml` splits on: `null` keeps today's independent behaviour
+(same merge, parallel jobs, own approval, own concurrency group), non-null puts
+the environment in the `promote` job. `RepoConfig::validate` refuses a
+predecessor that does not exist, a self-reference, any cycle, and a chain
+deeper than one stage (the predecessor must itself be independent, because all
+promoted environments run in one parallel phase) — each would produce a matrix
+entry waiting on a record no job will ever write.
+
+Ordering is not authorization. `needs: [list-envs, apply]` is the coarse half;
+the precise half is `.github/scripts/promotion_record.py`. Each environment's
+apply writes `{environment, source_revision, apply_result, verify_result,
+authorized, run_id, actor, pull_request}` as an artifact, and `require` refuses
+unless the named predecessor's record exists, applied `success`, verified
+`success`, **and** recorded the revision this job is about to apply — or an
+ancestor of it that `deployment_scope.classify` finds differs only outside
+`DEPLOYMENT_INPUT_PATHS`. That clause is load-bearing: the predecessor's own
+ledger commit always moves the branch before the promote job refreshes it. Only
+`success` authorizes: `skipped` (file mode has no data plane), `not_run`
+(no declared checks) and `cancelled` all block. Staging and production
+legitimately assemble different bytes — different overlays — so what is bound
+is the source commit, never the assembled document.
+
+The promote job runs the same freshness guard and the same
+`deployment_scope.py classify`, so a deployment-affecting merge during staging
+verification refuses the promotion instead of silently deploying the newer
+revision; that merge runs its own staging→production cycle. The ledger is still
+read from the refreshed head, so revision pinning cannot resurrect an obsolete
+`.state/<env>.json`. `check_supply_chain.py::state_writer_token_violations`
+evaluates `install < mint < commit` per privileged job, because both jobs carry
+it.
+
+Traffic checks are **data, never code** (`src/verify/`): a job holding
+deployment credentials must not execute an arbitrary command from a repository
+file, so the closed schema is the whole execution surface. TLS is always
+verified in this path — `FERRUM_TLS_NO_VERIFY` is deliberately not threaded
+into `verify::runner`, because a check that accepts any certificate has not
+verified TLS; a private CA goes in `FERRUM_GATEWAY_CA_CERT`, which it honours. Header values are an
+explicit `literal:` or `slot:` (exactly one), and an unresolvable slot fails the
+check rather than sending an empty header — an empty credential would make a
+`401`-expecting check pass for the wrong reason. Results carry name, method,
+path and status only; the response body is never read.
 
 ### Ownership modes
 
@@ -538,6 +638,36 @@ always inspect their own checkout. All use the shared authorization predicate
 in `src/policy/github_override.rs` and raw input verification in
 `src/policy/override_input.rs`. Audit entries record PR, review id, authorized
 head and actual applied revision; optional fields preserve old state loading.
+
+### Setup doctor (`src/doctor/`)
+
+`gitforgeops doctor` answers "is this repository ready to deploy, and what is
+still misconfigured" without provisioning anything. Three properties are
+load-bearing:
+
+1. **It never mutates.** No settings writer, no gateway write, no credential
+   allocation, no state lock. `doctor::gateway` reaches exactly `GET /health`
+   and `GET /cluster`.
+2. **It never guesses.** `Status::Unknown` is a check that could not be
+   performed (no administration-read token, no environment credentials) and is
+   never rendered as a pass; the text report says so explicitly. `Skipped` is a
+   check that does not apply (file mode has no Admin API; a template has no
+   deployment target), which is why a fresh template reads as intentionally
+   unconfigured rather than broken.
+3. **It owns no baseline.** Repository settings are judged by running
+   `audit_settings.py` — the same script `bootstrap_repo_settings.py` writes for
+   and `settings-audit.yml` schedules — and republishing each violation as its
+   own `settings-control` check, so the three cannot drift apart. Doctor runs
+   the copy compiled into its binary (`python3 -I -c`), never the checkout's,
+   with only `GH_TOKEN` and the variables `python3`/`gh` need to reach GitHub.
+
+Scopes are trust boundaries, not subjects: `local` (no credential), `github`
+(administration-read token) and `gateway` (that environment's deployment
+credentials, reads only). Default is `local,github`; the gateway scope is
+opt-in. Credentials are reported by presence and never by value —
+`Check::secret_presence` states plainly that presence is not correctness, and
+the gateway scope is where a wrong-but-present signing secret is actually
+caught (a 401 remediation prints the four claim settings to compare).
 
 ### Preview verdicts (`src/verdict.rs`)
 
@@ -749,11 +879,34 @@ author's (or dispatcher's) SSH public key fetched from
 `GET /users/{login}/keys`, then posted as a PR comment or workflow output.
 Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
+### Downstream template updates
+
+A repository created from the template shares no history with upstream and
+builds the engine from its own checkout, so upstream publishing an image
+updates nothing. `.github/scripts/template_update.py` closes that with a
+three-way comparison against `.gitforgeops/baseline.json` (the upstream commit
+the tree was last synced from): `B == U` skip, `L == B` adopt, `L == U` already
+adopted, otherwise **conflict** — reported, never overwritten, and the baseline
+is not advanced while one remains. `--keep PATH` resolves a conflict in favour
+of the local file and is refused for a path not in conflict. A template copy
+inherits upstream's `baseline.json`, which names upstream's last writer rather
+than the copied commit, so `detect-baseline [--write]` finds the exact upstream
+commit whose managed files match (an inexact match needs `--accept-closest`). `UPSTREAM_MANAGED` and `CUSTOMER_OWNED` are
+the two fences; `CUSTOMER_OWNED` (`resources/`, `overlays/`,
+`.gitforgeops/config.yaml`, `.gitforgeops/policies.yaml`, `.state/`,
+`assembled/`, `.github/CODEOWNERS`) is applied to upstream's own tree too, so
+upstream shipping a `.state/` file cannot overwrite a live ledger. Secrets and
+repository settings are outside Git. `POST_ADOPTION_CHECKS` is printed by
+`apply` and asserted against `docs/template-updates.md` so the tool and the
+runbook cannot disagree. Recovery is `git revert` of the adoption commit —
+never restoring an obsolete ledger, which is a separate state-override repair.
+
 ### Source Layout
 
 - `src/main.rs` — async Tokio entry, command dispatch
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `version`, `rotate`)
 - `src/version.rs` — `--version` / `version` identity (Cargo package version plus `build.rs` git metadata)
+- `src/doctor/` — read-only readiness diagnosis grouped by trust boundary: `local.rs` (repository + process env, no credential; template vs deployment repository), `github.rs` (delegates to `.github/scripts/audit_settings.py` — doctor owns no settings baseline of its own), `gateway.rs` (`GET /health` + `GET /cluster` only; `/health` is unauthenticated on Ferrum Edge, so the token is proven by `/cluster`, which passes the admin JWT gate). `Status::Unknown` is never a pass and `DOCTOR_FAILED_EXIT_CODE` is 3, distinct from the command failing
 - `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
 - `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
 - `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
@@ -767,6 +920,7 @@ Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
+- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `exit_code` is `VERIFY_FAILED_EXIT_CODE` = 4), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, the response body is never read)
 - `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
 - `src/diagnostics.rs` — the shared log sanitizer (`sanitize` / `sanitize_line` / `sanitize_block`
   and their `safe*` `Display` adapters) every diagnostic routes untrusted ids, namespaces,
@@ -825,11 +979,50 @@ Absent/blank env values use defaults; every present invalid enum, boolean, or in
 - `tests/unit_tests.rs` is the single integration test binary; submodules live under `tests/unit/*.rs` and register in `tests/unit/mod.rs`.
 - Fixtures under `tests/fixtures/` (`simple-config/`, `overlay-test/`, `companion-schema/`, `mesh-minimal/`, `literal-credential/`). Fixtures never carry literal consumer secrets: `simple-config/` uses `${gh-env-secret:alloc=require}`; `literal-credential/` is the negative case for the security gate.
 - `companion-schema/` holds one file per kind populating **every** field mirrored in `src/config/schema.rs`. `tests/unit/companion_schema_tests.rs` loads it strictly, assembles it, round-trips it through export, and — by reading the struct definitions out of `schema.rs` — fails when a newly mirrored field is not exercised there. Add new mirrored fields to that fixture in the same PR. Values are illustrative, not a working gateway or mesh document.
+- `quickstart/` is the copyable half of `docs/quickstart.md`: the exact files that guide tells a new operator to write, plus its `.gitforgeops/config.yaml`. `tests/unit/quickstart_tests.rs` loads it strictly, applies the production overlay, audits it with the same `security_blockers` gate `cmd_apply` runs pre-resolution, and asserts **byte equality** between each fenced block in the guide and its fixture file. A setup guide otherwise goes stale silently; this makes the break land in the PR that causes it. Edit the guide and the fixture together.
 - `mesh-minimal/` is the opposite mesh contract: a MeshConfig with a required workload `selector` and the smallest workload/service set `ferrum-edge validate -m mesh` accepts. `tests/unit/mesh_minimal_tests.rs` loads it strictly and asserts the rendered `{version, mesh}` document still carries that selector. Keep `companion-schema/` unchanged when editing this fixture.
 - New test file: create `tests/unit/<name>.rs` AND add `mod <name>;` to `tests/unit/mod.rs`.
 - `validator_namespace_tests.rs` exercises the shared command paths with a namespace-checking stub and, when `GITFORGEOPS_TEST_EDGE_BINARY` names a real Edge binary, the real validator; the real-binary tests skip when it is absent. Wire it into `rust-ci.yml` (trusted installer, candidate checksum allowlist, same pin as `validate-pr.yml`) only once the pinned validator accepts resource labels (issue #223); the current allowlisted builds predate that support. The installer candidate is GitHub's newest published version release (`GET /releases/latest`; assets are immutable per tag, a new version tag is a new candidate); the trust anchor remains the content allowlist, not the tag.
 - `tempfile` crate for filesystem tests.
 - No network in tests — `AdminClient::new` constructs the client without connecting, so credential-validation paths can be exercised without mocking. GitHub Environment Secret adapters (`fetch_public_key` / `put_environment_secret`) are driven against an in-process loopback stub in `tests/unit/github_api_tests.rs` by injecting a test-only API origin (`fetch_public_key_at` / `put_environment_secret_at` / `allocate_and_deliver_at` / `rotate_and_deliver_at`). Production wrappers keep the compiled-in `https://api.github.com` origin; there is no environment-variable override.
+
+## Lifecycle acceptance (`tests/lifecycle/`)
+
+The suite that runs the product rather than its unit tests: a real gateway
+(the same allowlisted `ferrum-edge` binary the validator installer fetches — no
+second artifact to pin), a stdlib test upstream, the real binary, real traffic.
+`run.sh` owns process lifecycle and disposability; `scenarios.py` owns the
+scenarios; `.github/scripts/lifecycle_result.py` owns the record.
+
+`REQUIRED_SCENARIOS` there is the contract, and
+`test_lifecycle_result.py` asserts the scenario list, the driver's `SCENARIOS`
+map and `tests/lifecycle/README.md` stay in step — adding a fail-closed gate to
+`apply` without adding a scenario narrows what the suite certifies without
+narrowing what ships.
+
+`release.yml`'s `authorize-release` downloads the sealed result for the exact
+revision being published and runs `lifecycle_result.py verify`. Only `passed`
+certifies: an unrun suite, a result for another revision, a result from another
+gateway build, an unsealed (cancelled) record, a `skipped` scenario and a stale
+record are each a refusal, because a release gate that can be satisfied by an
+absence is not a gate. Lifecycle is deliberately **not** a per-PR required
+check — it needs a gateway build, and turning every PR red when that is
+unavailable trains people to override the gate rather than fix it.
+
+Six scenarios need a disposable GitHub repository or a fault-injecting proxy
+(environment approvals, state-writer App permissions, protected-branch ledger
+writes, scheduling, attribution, staged promotion, partial failure). They
+record `skipped` with a reason and run through
+`tests/lifecycle/github_acceptance.md`. Their outcomes reach the gate only as
+an attestation: `lifecycle.yml` dispatched on the release ref with the
+operator's sealed result as its `github_acceptance` input, merged by
+`lifecycle_result.py attest` into the scenarios that run itself `skipped` —
+never over one it ran — and attributed to the dispatching actor. `release.yml`
+binds the result's gateway build to the revision's own checksum allowlist
+(`--gateway-allowlist`). Redaction happens at capture:
+`Harness.redact` over every captured stream keyed on the run's own secrets,
+`run.sh` over the gateway log tail, and the test upstream never echoes a header
+or logs a request line.
 
 ## Development Guidelines
 

@@ -256,16 +256,22 @@ class PrInputTests(unittest.TestCase):
                         {
                             "environment": "staging",
                             "live_review": True,
+                            "monitoring_environment": "unused",
+                            "unattended_monitoring": False,
                             "namespaces": None,
                         },
                         {
                             "environment": "production",
                             "live_review": True,
+                            "monitoring_environment": "unused",
+                            "unattended_monitoring": False,
                             "namespaces": ["team-a"],
                         },
                         {
                             "environment": "file-output",
                             "live_review": False,
+                            "monitoring_environment": "unused",
+                            "unattended_monitoring": False,
                             "namespaces": None,
                         },
                     ]
@@ -296,18 +302,48 @@ class PrInputTests(unittest.TestCase):
             with self.assertRaisesRegex(pr_input.InputError, "may not be a symlink"):
                 pr_input.trusted_targets(
                     root,
-                    '[{"environment":"production","live_review":true,"namespaces":null}]',
+                    '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
                     write_changed_paths(root, ["resources/linked/proxies/api.yaml"]),
                 )
+
+    def test_trusted_targets_accept_the_optional_promotion_key(self):
+        # `promotion_requires` is `skip_serializing_if`, so it is absent for an
+        # independent environment and present for a promoted one. Live review
+        # routes on neither, but must accept both shapes.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "resources/ferrum").mkdir(parents=True)
+            for scope in (
+                '{"environment":"production","live_review":true,"namespaces":null,'
+                '"monitoring_environment":"production","unattended_monitoring":false}',
+                '{"environment":"production","live_review":true,"namespaces":null,'
+                '"monitoring_environment":"production","unattended_monitoring":false,'
+                '"promotion_requires":"staging"}',
+            ):
+                with self.subTest(scope=scope):
+                    self.assertEqual(
+                        pr_input.trusted_targets(
+                            root,
+                            f"[{scope}]",
+                            write_changed_paths(
+                                root, ["resources/ferrum/proxies/api.yaml"]
+                            ),
+                        ),
+                        [{"environment": "production", "namespace": "ferrum"}],
+                    )
 
     def test_trusted_targets_reject_malformed_or_duplicate_scope(self):
         cases = [
             '["production"]',
-            '[{"environment":"production","live_review":true,"namespaces":["unsafe namespace"]}]',
-            '[{"environment":"production","live_review":true,"namespaces":null},'
-            '{"environment":"production","live_review":true,"namespaces":null}]',
-            '[{"environment":"production","live_review":true,"namespaces":null,"extra":true}]',
-            '[{"environment":"production","live_review":"yes","namespaces":null}]',
+            '[{"environment":"production","live_review":true,"namespaces":["unsafe namespace"],"monitoring_environment":"production","unattended_monitoring":false}]',
+            '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false},'
+            '{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
+            '[{"environment":"production","live_review":true,"namespaces":null,"extra":true,"monitoring_environment":"production","unattended_monitoring":false}]',
+            '[{"environment":"production","live_review":"yes","namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
+            # A scope missing a field `EnvironmentScope` always serializes is
+            # an older or hand-written payload, not a newer one. Accepting it
+            # would mean routing on a shape nobody produces.
+            '[{"environment":"production","live_review":true,"namespaces":null}]',
         ]
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -331,7 +367,7 @@ class PrInputTests(unittest.TestCase):
             (root / "resources/untouched").mkdir()
             targets = pr_input.trusted_targets(
                 root,
-                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
                 write_changed_paths(
                     root,
                     [
@@ -351,7 +387,7 @@ class PrInputTests(unittest.TestCase):
             (root / "resources/team").mkdir(parents=True)
             targets = pr_input.trusted_targets(
                 root,
-                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
                 write_changed_paths(root, [".gitforgeops/policies.yaml"]),
             )
             self.assertEqual(targets, [])
@@ -362,7 +398,7 @@ class PrInputTests(unittest.TestCase):
             (root / "resources/team").mkdir(parents=True)
             targets = pr_input.trusted_targets(
                 root,
-                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
                 write_changed_paths(
                     root,
                     ["overlays/README.md", "resources/README.md", "resources/team/.gitkeep"],
@@ -377,7 +413,7 @@ class PrInputTests(unittest.TestCase):
             (root / "resources/_shared").mkdir()
             targets = pr_input.trusted_targets(
                 root,
-                '[{"environment":"production","live_review":true,"namespaces":null}]',
+                '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
                 write_changed_paths(
                     root,
                     [
@@ -402,7 +438,7 @@ class PrInputTests(unittest.TestCase):
             with self.assertRaisesRegex(pr_input.InputError, "256-job matrix limit"):
                 pr_input.trusted_targets(
                     root,
-                    '[{"environment":"production","live_review":true,"namespaces":null}]',
+                    '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]',
                     write_changed_paths(root, changed),
                 )
 
@@ -410,7 +446,7 @@ class PrInputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "resources/team").mkdir(parents=True)
-            scopes = '[{"environment":"production","live_review":true,"namespaces":null}]'
+            scopes = '[{"environment":"production","live_review":true,"namespaces":null,"monitoring_environment":"production","unattended_monitoring":false}]'
             for path in ("resources/../escape.yaml", "/resources/team/api.yaml", 7):
                 with self.subTest(path=path), self.assertRaises(pr_input.InputError):
                     pr_input.trusted_targets(
@@ -432,6 +468,41 @@ class AllowlistParityTests(unittest.TestCase):
         start = source.index(f"const {name}:")
         body = source[start : source.index("];", start)]
         return re.findall(r'"([^"]*)"', body[body.index("=") :])
+
+    def test_trusted_scope_keys_match_the_rust_environment_scope(self):
+        """A field added to `EnvironmentScope` must be decided about here.
+
+        This is the check that was missing. `envs --include-scopes` serializes
+        that struct, `pr_input` validates its shape with a closed key set, and
+        nothing tied the two together — so adding `monitoring_environment` on
+        the Rust side broke trusted live review on `main` with a message about
+        a contract nobody had touched.
+
+        Failing here instead means the person adding a field is told to decide
+        whether live review should route on it, at the moment they add it.
+        """
+        source = (self.REPO_ROOT / "src/config/repo_config.rs").read_text()
+        start = source.index("pub struct EnvironmentScope {")
+        body = source[start : source.index("\n}", start)]
+        # Field declarations only: skip doc comments and serde attributes.
+        fields = set(re.findall(r"^    pub (\w+):", body, re.MULTILINE))
+        self.assertTrue(fields, body)
+
+        declared = pr_input.TRUSTED_SCOPE_KEYS | pr_input.TRUSTED_SCOPE_OPTIONAL_KEYS
+        self.assertEqual(
+            fields,
+            declared,
+            "EnvironmentScope and pr_input's trusted scope contract have drifted",
+        )
+        # A `skip_serializing_if` field may be absent from the JSON, so it
+        # belongs in the optional set and nowhere else.
+        skipped = set(
+            re.findall(
+                r'#\[serde\(skip_serializing_if[^\]]*\]\s*\n\s*pub (\w+):',
+                body,
+            )
+        )
+        self.assertEqual(skipped, set(pr_input.TRUSTED_SCOPE_OPTIONAL_KEYS))
 
     def test_non_config_allowlist_matches_the_rust_loader(self):
         strict = (self.REPO_ROOT / "src/config/strict.rs").read_text()

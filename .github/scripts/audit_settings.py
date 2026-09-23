@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 
@@ -49,6 +50,40 @@ RELEASE_TAG_PATTERN = "refs/tags/v*"
 # policy is audited like any other environment's — that restriction is the whole
 # point of moving the token here.
 SETTINGS_AUDIT_ENVIRONMENT = "settings-audit"
+
+# A deployment environment that opted into unattended drift monitoring gets a
+# second GitHub Environment named `<deployment-env>-monitor`. It exists only so
+# a nightly `gitforgeops diff` can read the gateway without parking in "waiting
+# for approval" — an approval-gated environment withholds its secrets until a
+# human releases the job, which turns scheduled monitoring into no monitoring.
+#
+# That is a narrow, named exception and not a general weakening: the reviewer
+# rule is waived ONLY for this suffix, only when the deployment environment it
+# is derived from also exists, and only while the environment holds no
+# deployment, broker or state-writing authority (below). `repo_config.rs`
+# reserves the suffix so a deployment environment can never be named into the
+# waiver, and `check_supply_chain.py` separately fences what `drift-check.yml`
+# is allowed to reach at all.
+MONITORING_ENVIRONMENT_SUFFIX = "-monitor"
+
+# Secret NAMES that must never appear in a monitoring environment. Names are
+# readable through the API; values are not, and are never requested. Presence
+# of a name is not proof a value is correct, but absence is proof the job
+# cannot reach that authority.
+MONITORING_FORBIDDEN_SECRETS = (
+    "FERRUM_GH_PROVISIONER_TOKEN",
+    "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
+    "SETTINGS_AUDIT_TOKEN",
+)
+MONITORING_FORBIDDEN_SECRET_PREFIXES = ("FERRUM_CREDS_BUNDLE",)
+
+# The drift workflow whose last successful run is the monitoring evidence.
+MONITORING_WORKFLOW_FILE = "drift-check.yml"
+# The cron is daily; two periods of slack absorbs one missed or queued run
+# without letting a silently disabled schedule pass for coverage. GitHub
+# disables scheduled workflows after 60 days without repository activity, so
+# "the cron line is still in the file" proves nothing on its own.
+MONITORING_MAX_AGE_HOURS = 48
 
 # A template repository is the copy customers clone from. It has no deployment
 # environments and no state-writer App, because nothing on it ever applies to a
@@ -270,11 +305,131 @@ def audit_tag_ruleset(audit: Audit, ruleset: dict) -> None:
     )
 
 
-def audit_environment(audit: Audit, repo: str, environment: dict, branch: str) -> None:
+def is_monitoring_environment(name: str, all_names: set[str]) -> bool:
+    """Is this the derived read-only monitoring environment of a real one?
+
+    The suffix alone is not enough: an environment named `anything-monitor`
+    with no corresponding deployment environment would otherwise mint its own
+    reviewer waiver. `repo_config.rs` refuses to name a deployment environment
+    into the suffix, so the base name can only be a genuine deployment target.
+    """
+    if not name.endswith(MONITORING_ENVIRONMENT_SUFFIX):
+        return False
+    base = name[: -len(MONITORING_ENVIRONMENT_SUFFIX)]
+    return bool(base) and base in all_names
+
+
+def audit_monitoring_secrets(audit: Audit, repo: str, name: str) -> None:
+    """A monitoring environment may hold gateway read material and nothing else.
+
+    Only secret *names* are read — never values, and never through a path that
+    could print one. A name present is not proof its value is correct, which is
+    why this check only ever proves the negative: the job cannot reach an
+    authority whose secret is not bound to it.
+    """
+    encoded_name = quote(name, safe="")
+    pages = gh_json(
+        f"repos/{repo}/environments/{encoded_name}/secrets?per_page=100",
+        paginate=True,
+    )
+    if not isinstance(pages, list) or not all(isinstance(page, dict) for page in pages):
+        raise RuntimeError("environment secret listing had an unexpected shape")
+    secret_names = {
+        item.get("name")
+        for page in pages
+        for item in page.get("secrets", [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    forbidden = sorted(
+        secret
+        for secret in secret_names
+        if secret in MONITORING_FORBIDDEN_SECRETS
+        or secret.startswith(MONITORING_FORBIDDEN_SECRET_PREFIXES)
+    )
+    audit.require(
+        not forbidden,
+        f"monitoring environment {name!r} must not hold deployment, credential-broker "
+        f"or state-writing secrets; found {', '.join(forbidden)}. It runs without a "
+        "required reviewer, so its authority must stop at reading the gateway",
+        f"environment {name}: holds no deployment/broker/state secret",
+    )
+
+
+def audit_monitoring_coverage(
+    audit: Audit, repo: str, monitoring_names: set[str], max_age_hours: int, now: datetime
+) -> None:
+    """A cron entry is not monitoring coverage; a completed run is.
+
+    The schedule can be disabled by GitHub after 60 days of repository
+    inactivity, turned off in the Actions tab, or fail every night against an
+    unreachable gateway — and in each case the workflow file still contains a
+    perfectly good `cron:` line. So the evidence is the newest *successful* run
+    of the drift workflow, not its existence.
+
+    Only enforced once at least one environment has opted into unattended
+    monitoring. A repository that has not is reported, accurately, as having
+    approval-gated monitoring and no unattended coverage claim.
+    """
+    if not monitoring_names:
+        audit.evidence.append(
+            "drift monitoring is approval-gated: no environment declares "
+            "`monitoring.unattended`, so scheduled checks wait for a reviewer "
+            "and no unattended coverage is claimed"
+        )
+        return
+    listed = ", ".join(sorted(monitoring_names))
+    try:
+        runs = gh_json(
+            f"repos/{repo}/actions/workflows/{MONITORING_WORKFLOW_FILE}/runs"
+            "?status=success&per_page=1"
+        )
+    except RuntimeError as error:
+        audit.violations.append(
+            f"unattended drift monitoring is configured ({listed}) but its run "
+            f"history could not be read: {error}"
+        )
+        return
+    entries = runs.get("workflow_runs") if isinstance(runs, dict) else None
+    newest = entries[0] if isinstance(entries, list) and entries else None
+    timestamp = newest.get("updated_at") if isinstance(newest, dict) else None
+    if not isinstance(timestamp, str):
+        audit.violations.append(
+            f"unattended drift monitoring is configured ({listed}) but "
+            f"{MONITORING_WORKFLOW_FILE} has never completed successfully; a cron "
+            "entry alone is not monitoring coverage"
+        )
+        return
+    try:
+        completed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        audit.violations.append(
+            f"{MONITORING_WORKFLOW_FILE} reported an unparseable completion time "
+            f"{timestamp!r}"
+        )
+        return
+    age_hours = (now - completed).total_seconds() / 3600
+    audit.require(
+        age_hours <= max_age_hours,
+        f"unattended drift monitoring last completed successfully {age_hours:.0f}h "
+        f"ago ({timestamp}), beyond the {max_age_hours}h window; scheduled "
+        "monitoring has stopped even though the cron entry is still present",
+        f"drift monitoring completed successfully {age_hours:.0f}h ago "
+        f"({timestamp}) for {listed}",
+    )
+
+
+def audit_environment(
+    audit: Audit,
+    repo: str,
+    environment: dict,
+    branch: str,
+    all_names: set[str] | None = None,
+) -> None:
     name = environment.get("name")
     if not isinstance(name, str) or not name:
         audit.violations.append("environment listing contained an unnamed environment")
         return
+    all_names = all_names or set()
     encoded_name = quote(name, safe="")
     detail = gh_json(f"repos/{repo}/environments/{encoded_name}")
     rules = detail.get("protection_rules", [])
@@ -290,6 +445,17 @@ def audit_environment(audit: Audit, repo: str, environment: dict, branch: str) -
             "administration-read audit token, deploys nothing)"
         )
         has_reviewers = True
+    elif is_monitoring_environment(name, all_names):
+        # Same shape of exception, same reason: a required reviewer on an
+        # environment whose only job is a scheduled read produces a check that
+        # never completes. The waiver is paid for by the secret-name fence.
+        audit.evidence.append(
+            f"environment {name}: reviewer rules waived (read-only drift "
+            "monitoring for "
+            f"{name[: -len(MONITORING_ENVIRONMENT_SUFFIX)]!r}, mutates nothing)"
+        )
+        has_reviewers = True
+        audit_monitoring_secrets(audit, repo, name)
     else:
         audit.require(
             has_reviewers,
@@ -304,7 +470,9 @@ def audit_environment(audit: Audit, repo: str, environment: dict, branch: str) -
         )
 
     policy = detail.get("deployment_branch_policy") or {}
+    monitoring_environment = is_monitoring_environment(name, all_names)
     branch_limited = policy.get("protected_branches") is True
+    policy_names: list[object] = []
     if policy.get("custom_branch_policies") is True:
         pages = gh_json(
             f"repos/{repo}/environments/{encoded_name}/deployment-branch-policies?per_page=100",
@@ -320,9 +488,16 @@ def audit_environment(audit: Audit, repo: str, environment: dict, branch: str) -
         ]
         policy_names = [item.get("name") for item in policies]
         branch_limited = policy_names == [branch]
+    if monitoring_environment:
+        branch_limited = (
+            policy.get("protected_branches") is False
+            and policy.get("custom_branch_policies") is True
+            and policy_names == [branch]
+        )
     audit.require(
         branch_limited,
-        f"environment {name!r} must restrict deployments to protected branches or exact {branch!r}",
+        f"environment {name!r} must restrict deployments to "
+        + (f"exact {branch!r}" if monitoring_environment else f"protected branches or exact {branch!r}"),
     )
     if has_reviewers and branch_limited:
         audit.evidence.append(f"environment {name}: reviewer + branch policy present")
@@ -335,6 +510,8 @@ def run(
     state_writer_app_id: int | None,
     release_tag_pattern: str,
     template_repo: bool = False,
+    monitoring_max_age_hours: int = MONITORING_MAX_AGE_HOURS,
+    now: datetime | None = None,
 ) -> Audit:
     audit = Audit()
     if template_repo:
@@ -402,16 +579,27 @@ def run(
         "released only to the protected default branch",
         f"audit-token environment {SETTINGS_AUDIT_ENVIRONMENT} present",
     )
+    monitoring_names = {
+        name for name in names if is_monitoring_environment(name, names)
+    }
     if not template_repo:
-        # The audit-token environment is not a deployment target, so it cannot
-        # be the one protected environment a deployment repository is required
-        # to have.
+        # Neither the audit-token environment nor a read-only monitoring
+        # environment is a deployment target, so neither can be the one
+        # protected environment a deployment repository is required to have.
         audit.require(
-            bool(names - {SETTINGS_AUDIT_ENVIRONMENT}),
+            bool(names - {SETTINGS_AUDIT_ENVIRONMENT} - monitoring_names),
             "repository must define at least one protected environment",
         )
     for environment in listed:
-        audit_environment(audit, repo, environment, branch)
+        audit_environment(audit, repo, environment, branch, names)
+    if not template_repo:
+        audit_monitoring_coverage(
+            audit,
+            repo,
+            monitoring_names,
+            monitoring_max_age_hours,
+            now or datetime.now(timezone.utc),
+        )
     return audit
 
 
@@ -422,6 +610,15 @@ def main() -> int:
     parser.add_argument("--required-check", action="append", default=[])
     parser.add_argument("--state-writer-app-id", type=int)
     parser.add_argument("--release-tag-pattern", default=RELEASE_TAG_PATTERN)
+    parser.add_argument(
+        "--monitoring-max-age-hours",
+        type=int,
+        default=MONITORING_MAX_AGE_HOURS,
+        help=(
+            "how recently the drift workflow must have completed successfully "
+            "before unattended monitoring counts as covered"
+        ),
+    )
     parser.add_argument(
         "--template-repo",
         action="store_true",
@@ -452,6 +649,7 @@ def main() -> int:
             args.state_writer_app_id,
             args.release_tag_pattern,
             args.template_repo,
+            args.monitoring_max_age_hours,
         )
     except (
         RuntimeError,

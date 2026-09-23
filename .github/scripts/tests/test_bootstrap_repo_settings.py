@@ -145,6 +145,7 @@ def configured_responses(
             "can_approve_pull_request_reviews": False,
         },
         f"repos/{REPO}": {
+            "default_branch": "main",
             "security_and_analysis": {
                 "secret_scanning": {"status": "enabled"},
                 "secret_scanning_push_protection": {"status": "enabled"},
@@ -247,6 +248,216 @@ class ConfigReaderTests(unittest.TestCase):
 
     def test_a_missing_config_resolves_no_environments(self):
         self.assertEqual(bootstrap.resolve_environments(namespace()), [])
+
+
+MONITORING_CONFIG_YAML = """version: 1
+
+environments:
+  staging:
+    overlay: staging
+    monitoring:
+      unattended: true
+    ownership:
+      mode: shared
+
+  production:
+    overlay: production
+    ownership:
+      mode: shared
+    monitoring:
+      unattended: false   # stays approval-gated
+
+  sandbox:
+    overlay: sandbox
+    ownership:
+      mode: shared
+"""
+
+
+class MonitoringConfigReaderTests(unittest.TestCase):
+    def test_only_an_explicit_true_opts_an_environment_in(self):
+        self.assertEqual(
+            bootstrap.unattended_environments_from_config(MONITORING_CONFIG_YAML),
+            ["staging"],
+        )
+
+    def test_an_absent_monitoring_block_is_opted_out(self):
+        self.assertEqual(
+            bootstrap.unattended_environments_from_config(CONFIG_YAML), []
+        )
+
+    def test_an_unattended_key_outside_a_monitoring_block_is_ignored(self):
+        # `unattended:` directly under an environment, or under `ownership:`,
+        # is not the opt-in. Reading it as one would waive a reviewer on the
+        # strength of a typo.
+        self.assertEqual(
+            bootstrap.unattended_environments_from_config(
+                "version: 1\nenvironments:\n  staging:\n    unattended: true\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            bootstrap.unattended_environments_from_config(
+                "version: 1\nenvironments:\n  staging:\n    ownership:\n"
+                "      unattended: true\n"
+            ),
+            [],
+        )
+
+    def test_an_explicit_environment_list_carries_no_monitoring_opinion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(MONITORING_CONFIG_YAML, encoding="utf-8")
+            args = namespace(config=str(config), environment=["staging"])
+            self.assertEqual(
+                bootstrap.resolve_monitoring_environments(args, ["staging"]),
+                ["staging"],
+            )
+            # An environment not in the deployment list never gets a monitor.
+            self.assertEqual(
+                bootstrap.resolve_monitoring_environments(args, ["production"]),
+                [],
+            )
+
+
+class MonitoringEnvironmentPlanTests(unittest.TestCase):
+    def _plan(self, config_text: str, *, existing: tuple[str, ...] = ()):
+        api = FakeApi(configured_responses(environments=("staging",) + existing))
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(config_text, encoding="utf-8")
+            return bootstrap.build_plan(
+                api, namespace(config=str(config), reviewer=["octocat"])
+            ), api
+
+    def test_an_opted_in_environment_gets_a_reviewerless_monitor(self):
+        plan, _ = self._plan(
+            "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+            "      unattended: true\n"
+        )
+        performed = actions(plan)
+        self.assertEqual(performed["environment staging-monitor"], bootstrap.CREATE)
+        step = next(
+            item for item in plan.steps if item.target == "environment staging-monitor"
+        )
+        _, _, body = step.writes[0]
+        self.assertEqual(body["reviewers"], [])
+        self.assertEqual(
+            body["deployment_branch_policy"],
+            {"protected_branches": False, "custom_branch_policies": True},
+        )
+        self.assertEqual(
+            step.writes[1],
+            (
+                "POST",
+                "repos/acme/repo/environments/staging-monitor/deployment-branch-policies",
+                {"name": "main", "type": "branch"},
+            ),
+        )
+
+    def test_an_exact_default_branch_monitor_is_unchanged(self):
+        responses = configured_responses(environments=("staging", "staging-monitor"))
+        responses["repos/acme/repo/environments/staging-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+        responses[
+            "repos/acme/repo/environments/staging-monitor/deployment-branch-policies?per_page=100"
+        ] = [{"branch_policies": [{"id": 17, "name": "main", "type": "branch"}]}]
+        api = FakeApi(responses)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+                "      unattended: true\n",
+                encoding="utf-8",
+            )
+            plan = bootstrap.build_plan(
+                api, namespace(config=str(config), reviewer=["octocat"])
+            )
+        step = next(
+            item for item in plan.steps if item.target == "environment staging-monitor"
+        )
+        self.assertEqual(step.action, bootstrap.UNCHANGED)
+        self.assertEqual(step.writes, [])
+
+    def test_opting_out_creates_nothing_and_says_monitoring_is_gated(self):
+        plan, _ = self._plan(
+            "version: 1\nenvironments:\n  staging:\n    overlay: staging\n"
+        )
+        self.assertNotIn("environment staging-monitor", actions(plan))
+        self.assertTrue(
+            any(
+                "Drift monitoring is approval-gated" in note for note in plan.notes
+            ),
+            plan.notes,
+        )
+
+    def test_a_hand_added_reviewer_on_a_monitor_is_reported_as_drift(self):
+        # A reviewer there parks every nightly run in "waiting for approval",
+        # which is the failure this environment exists to remove.
+        api = FakeApi(configured_responses(environments=("staging", "staging-monitor")))
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+                "      unattended: true\n",
+                encoding="utf-8",
+            )
+            plan = bootstrap.build_plan(
+                api, namespace(config=str(config), reviewer=["octocat"])
+            )
+        self.assertEqual(
+            actions(plan)["environment staging-monitor"], bootstrap.UPDATE
+        )
+
+    def test_the_secret_remainder_lists_read_material_and_warns_off_the_rest(self):
+        plan, _ = self._plan(
+            "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+            "      unattended: true\n"
+        )
+        notes = "\n".join(plan.notes)
+        self.assertIn("--env staging-monitor", notes)
+        self.assertIn("FERRUM_ADMIN_JWT_ROLE", notes)
+        self.assertIn("Do NOT set GITFORGEOPS_STATE_APP_PRIVATE_KEY", notes)
+        # The credential bundle is not read material for a comparison.
+        self.assertNotIn(
+            "gh secret set FERRUM_CREDS_BUNDLE --repo acme/repo --env staging-monitor",
+            notes,
+        )
+
+    def test_the_symmetric_signing_key_caveat_is_stated(self):
+        plan, _ = self._plan(
+            "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+            "      unattended: true\n"
+        )
+        warnings = "\n".join(plan.warnings)
+        self.assertIn("read-only admin role", warnings)
+        self.assertIn("write-capable at the gateway", warnings)
+
+    def test_the_suffix_matches_the_binary_and_the_auditor(self):
+        self.assertEqual(
+            bootstrap.MONITORING_ENVIRONMENT_SUFFIX,
+            audit_settings.MONITORING_ENVIRONMENT_SUFFIX,
+        )
+        rust = (
+            Path(__file__).resolve().parents[3] / "src/config/repo_config.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'pub const MONITORING_ENVIRONMENT_SUFFIX: &str = '
+            f'"{bootstrap.MONITORING_ENVIRONMENT_SUFFIX}";',
+            rust,
+        )
+
+    def test_forbidden_monitoring_secrets_agree_with_the_auditor(self):
+        offered = {name for name, _ in bootstrap.MONITORING_ENVIRONMENT_SECRETS}
+        for forbidden in audit_settings.MONITORING_FORBIDDEN_SECRETS:
+            self.assertNotIn(forbidden, offered)
+        for prefix in audit_settings.MONITORING_FORBIDDEN_SECRET_PREFIXES:
+            self.assertFalse([name for name in offered if name.startswith(prefix)])
 
 
 class IdempotencyTests(unittest.TestCase):

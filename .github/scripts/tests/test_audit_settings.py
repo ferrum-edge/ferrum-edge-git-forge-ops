@@ -2,6 +2,7 @@ import importlib.util
 import re
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -468,6 +469,312 @@ class AuditTokenEnvironmentTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(
             f"    environment: {audit_settings.SETTINGS_AUDIT_ENVIRONMENT}\n", workflow
+        )
+
+
+def monitoring_responses():
+    """`production` opted into unattended monitoring."""
+    responses = secure_responses()
+    responses["repos/acme/repo/environments?per_page=100"] = [
+        {
+            "total_count": 3,
+            "environments": [
+                {"name": "production"},
+                {"name": "production-monitor"},
+                {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+            ],
+        }
+    ]
+    responses["repos/acme/repo/environments/production-monitor"] = {
+        "protection_rules": [],
+        "deployment_branch_policy": {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        },
+    }
+    responses[
+        "repos/acme/repo/environments/production-monitor/deployment-branch-policies?per_page=100"
+    ] = [{"branch_policies": [{"id": 17, "name": "main", "type": "branch"}]}]
+    responses["repos/acme/repo/environments/production-monitor/secrets?per_page=100"] = [
+        {
+            "total_count": 2,
+            "secrets": [
+                {"name": "FERRUM_GATEWAY_URL"},
+                {"name": "FERRUM_ADMIN_JWT_SECRET"},
+            ],
+        }
+    ]
+    responses[
+        "repos/acme/repo/actions/workflows/drift-check.yml/runs?status=success&per_page=1"
+    ] = {"workflow_runs": [{"updated_at": "2026-09-21T05:00:00Z"}]}
+    return responses
+
+
+NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
+
+
+class MonitoringEnvironmentTests(unittest.TestCase):
+    """The narrow reviewer waiver for read-only drift monitoring."""
+
+    def run_audit(self, responses, now=NOW, max_age_hours=None):
+        with patch.object(
+            audit_settings,
+            "gh_json",
+            side_effect=lambda path, paginate=False: responses[path],
+        ):
+            return audit_settings.run(
+                "acme/repo",
+                "main",
+                REQUIRED_CHECKS,
+                99,
+                "refs/tags/v*",
+                False,
+                max_age_hours or audit_settings.MONITORING_MAX_AGE_HOURS,
+                now,
+            )
+
+    def test_a_reviewerless_monitoring_environment_passes(self):
+        audit = self.run_audit(monitoring_responses())
+        self.assertEqual(audit.violations, [])
+        rendered = "\n".join(audit.evidence)
+        self.assertIn("read-only drift monitoring for 'production'", rendered)
+        self.assertIn("holds no deployment/broker/state secret", rendered)
+
+    def test_the_waiver_needs_a_real_deployment_environment_behind_it(self):
+        # `anything-monitor` with no `anything` would be a way to mint an
+        # unreviewed environment by naming it.
+        responses = secure_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {
+                "total_count": 3,
+                "environments": [
+                    {"name": "production"},
+                    {"name": "ghost-monitor"},
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+                ],
+            }
+        ]
+        responses["repos/acme/repo/environments/ghost-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        }
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "'ghost-monitor' must require at least one reviewer" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_monitoring_may_not_hold_deployment_broker_or_state_secrets(self):
+        for secret in (
+            "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
+            "FERRUM_GH_PROVISIONER_TOKEN",
+            "SETTINGS_AUDIT_TOKEN",
+            "FERRUM_CREDS_BUNDLE",
+            "FERRUM_CREDS_BUNDLE_3",
+        ):
+            with self.subTest(secret=secret):
+                responses = monitoring_responses()
+                responses[
+                    "repos/acme/repo/environments/production-monitor/secrets?per_page=100"
+                ] = [
+                    {
+                        "total_count": 1,
+                        "secrets": [
+                            {"name": "FERRUM_GATEWAY_URL"},
+                            {"name": secret},
+                        ],
+                    }
+                ]
+                audit = self.run_audit(responses)
+                self.assertTrue(
+                    any(
+                        "must not hold deployment, credential-broker" in item
+                        and secret in item
+                        for item in audit.violations
+                    ),
+                    audit.violations,
+                )
+
+    def test_monitoring_still_needs_its_branch_policy(self):
+        responses = monitoring_responses()
+        responses["repos/acme/repo/environments/production-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": None,
+        }
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "restrict deployments" in item and "production-monitor" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_monitoring_rejects_generic_protected_branches(self):
+        responses = monitoring_responses()
+        responses["repos/acme/repo/environments/production-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        }
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "production-monitor" in item and "exact 'main'" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_a_monitoring_environment_is_not_a_deployment_environment(self):
+        # An orphaned `*-monitor` is neither waived nor counted: it loses the
+        # reviewer waiver (its base does not exist) and it cannot stand in for
+        # the protected deployment environment the baseline requires.
+        self.assertFalse(
+            audit_settings.is_monitoring_environment(
+                "production-monitor", {"production-monitor", "settings-audit"}
+            )
+        )
+        self.assertTrue(
+            audit_settings.is_monitoring_environment(
+                "production-monitor", {"production", "production-monitor"}
+            )
+        )
+        responses = secure_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {
+                "total_count": 2,
+                "environments": [
+                    {"name": "production-monitor"},
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+                ],
+            }
+        ]
+        responses["repos/acme/repo/environments/production-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        }
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "'production-monitor' must require at least one reviewer" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_a_deployment_environment_still_needs_its_reviewer(self):
+        responses = monitoring_responses()
+        responses["repos/acme/repo/environments/production"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": True,
+                "custom_branch_policies": False,
+            },
+        }
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "'production' must require at least one reviewer" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+
+class MonitoringCoverageTests(unittest.TestCase):
+    """A cron entry is not coverage; a completed run is."""
+
+    def run_audit(self, responses, now=NOW):
+        return MonitoringEnvironmentTests.run_audit(
+            MonitoringEnvironmentTests(), responses, now
+        )
+
+    def test_a_recent_successful_run_is_the_evidence(self):
+        audit = self.run_audit(monitoring_responses())
+        self.assertEqual(audit.violations, [])
+        self.assertTrue(
+            any(
+                "drift monitoring completed successfully 7h ago" in item
+                for item in audit.evidence
+            ),
+            audit.evidence,
+        )
+
+    def test_a_schedule_that_stopped_running_fails(self):
+        # GitHub disables scheduled workflows after 60 days of repository
+        # inactivity, and the `cron:` line stays in the file either way.
+        responses = monitoring_responses()
+        responses[
+            "repos/acme/repo/actions/workflows/drift-check.yml/runs?status=success&per_page=1"
+        ] = {"workflow_runs": [{"updated_at": "2026-09-01T05:00:00Z"}]}
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "scheduled monitoring has stopped" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_a_workflow_that_never_succeeded_fails(self):
+        responses = monitoring_responses()
+        responses[
+            "repos/acme/repo/actions/workflows/drift-check.yml/runs?status=success&per_page=1"
+        ] = {"workflow_runs": []}
+        audit = self.run_audit(responses)
+        self.assertTrue(
+            any(
+                "has never completed successfully" in item
+                for item in audit.violations
+            ),
+            audit.violations,
+        )
+
+    def test_an_unreadable_run_history_fails_closed(self):
+        responses = monitoring_responses()
+        key = (
+            "repos/acme/repo/actions/workflows/drift-check.yml/runs"
+            "?status=success&per_page=1"
+        )
+
+        def failing(path, paginate=False):
+            if path == key:
+                raise RuntimeError("403")
+            return responses[path]
+
+        with patch.object(audit_settings, "gh_json", side_effect=failing):
+            audit = audit_settings.run(
+                "acme/repo", "main", REQUIRED_CHECKS, 99, "refs/tags/v*",
+                False, audit_settings.MONITORING_MAX_AGE_HOURS, NOW,
+            )
+        self.assertTrue(
+            any("run history could not be read" in item for item in audit.violations),
+            audit.violations,
+        )
+
+    def test_approval_gated_monitoring_claims_no_coverage(self):
+        # No environment opted in, so there is nothing to have stopped — and
+        # the evidence says plainly that monitoring waits for a reviewer.
+        audit = self.run_audit(secure_responses())
+        self.assertEqual(audit.violations, [])
+        self.assertTrue(
+            any(
+                "drift monitoring is approval-gated" in item
+                for item in audit.evidence
+            ),
+            audit.evidence,
         )
 
 

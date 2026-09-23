@@ -134,6 +134,80 @@ environments:
 }
 
 #[test]
+fn monitoring_defaults_to_the_approval_gated_deployment_environment() {
+    // Opting out is the default, and opting out must leave the scheduled drift
+    // check bound to the deployment environment exactly as it is today — no
+    // reviewer-free environment appears because a config file did not mention
+    // monitoring.
+    let yaml = r#"
+environments:
+  production:
+    ownership:
+      mode: shared
+"#;
+    let file = write_repo_config(yaml);
+    let config = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+    let scopes = config.environment_scopes();
+
+    assert_eq!(scopes[0].monitoring_environment, "production");
+    assert!(!scopes[0].unattended_monitoring);
+}
+
+#[test]
+fn unattended_monitoring_derives_the_monitor_environment() {
+    let yaml = r#"
+environments:
+  production:
+    monitoring:
+      unattended: true
+    ownership:
+      mode: shared
+  sandbox:
+    monitoring:
+      unattended: false
+    ownership:
+      mode: shared
+"#;
+    let file = write_repo_config(yaml);
+    let config = RepoConfig::load_from_path(file.path()).unwrap().unwrap();
+    let scopes = config.environment_scopes();
+
+    let production = scopes
+        .iter()
+        .find(|scope| scope.environment == "production")
+        .expect("production scope");
+    assert_eq!(production.monitoring_environment, "production-monitor");
+    assert!(production.unattended_monitoring);
+
+    let sandbox = scopes
+        .iter()
+        .find(|scope| scope.environment == "sandbox")
+        .expect("sandbox scope");
+    assert_eq!(sandbox.monitoring_environment, "sandbox");
+    assert!(!sandbox.unattended_monitoring);
+}
+
+#[test]
+fn a_deployment_environment_may_not_claim_the_monitoring_suffix() {
+    // `audit_settings.py` waives the required-reviewer rule for exactly the
+    // `-monitor` suffix. A deployment environment named into that waiver would
+    // become an unreviewed gateway *write* target.
+    let yaml = r#"
+environments:
+  production-monitor:
+    ownership:
+      mode: shared
+"#;
+    let file = write_repo_config(yaml);
+    let error = RepoConfig::load_from_path(file.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("production-monitor"), "{error}");
+    assert!(error.contains("reserved"), "{error}");
+    assert!(error.contains("monitoring.unattended"), "{error}");
+}
+
+#[test]
 fn repo_config_rejects_prune_threshold_above_100() {
     // delete_pct in cmd_apply is 0..=100. A YAML value > 100 would make the
     // guard `delete_pct > threshold` never fire — mass deletions would
@@ -327,6 +401,7 @@ fn synthetic_default_honors_explicit_env_over_ferrum_env_var() {
     fn base_env() -> EnvConfig {
         EnvConfig {
             gateway_url: None,
+            verify_base_url: None,
             admin_jwt_secret: None,
             admin_jwt_issuer: "ferrum-edge".to_string(),
             admin_jwt_role: "admin".to_string(),
@@ -395,6 +470,7 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
 
     let env_config = EnvConfig {
         gateway_url: None,
+        verify_base_url: None,
         admin_jwt_secret: None,
         admin_jwt_issuer: "ferrum-edge".to_string(),
         admin_jwt_role: "admin".to_string(),

@@ -127,6 +127,15 @@ pub struct EnvConfig {
     /// stderr warning, and under `GITHUB_ACTIONS` it is refused unless the
     /// gateway host is loopback.
     pub tls_no_verify: bool,
+    /// Data-plane base URL for `gitforgeops verify`.
+    ///
+    /// Its own setting rather than a reuse of `gateway_url`: verification asks
+    /// whether a *client* can reach the route that was just deployed, which is
+    /// a different endpoint from the admin API that accepted the write, and on
+    /// most deployments a different host entirely. It is held to the same
+    /// transport rule as the gateway URL ([`validate_verify_transport`]),
+    /// because a check's headers can carry credential-bundle values.
+    pub verify_base_url: Option<String>,
     /// Permit a cleartext `http://` gateway URL (default `false`).
     ///
     /// The admin JWT and every resolved consumer credential travel in the
@@ -191,6 +200,7 @@ impl Default for EnvConfig {
             mesh_file_output_path: DEFAULT_MESH_FILE_OUTPUT_PATH.to_string(),
             edge_binary_path: "ferrum-edge".to_string(),
             tls_no_verify: false,
+            verify_base_url: None,
             allow_insecure_http: false,
             ca_cert: None,
             client_cert: None,
@@ -236,6 +246,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
+/// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run)  |
 /// | `FERRUM_ALLOW_INSECURE_HTTP` | `allow_insecure_http` | `false` (an `http://` gateway URL is refused) |
 /// | `FERRUM_GATEWAY_CA_CERT`     | `ca_cert`          | `None`                           |
 /// | `FERRUM_GATEWAY_CLIENT_CERT` | `client_cert`      | `None`                           |
@@ -282,13 +293,21 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
     // "no gateway configured" rather than as a malformed URL.
     let gateway_url = non_empty_env("FERRUM_GATEWAY_URL");
     let tls_no_verify = parse_bool_env("FERRUM_TLS_NO_VERIFY", false)?;
+    // Environment secret: unset interpolates to "" and must read as
+    // "no data plane configured", not as an empty base URL.
+    let verify_base_url = non_empty_env("FERRUM_VERIFY_BASE_URL");
     let allow_insecure_http = parse_bool_env("FERRUM_ALLOW_INSECURE_HTTP", false)?;
-    let warnings = validate_gateway_transport(
+    let mut warnings = validate_gateway_transport(
         gateway_url.as_deref(),
         allow_insecure_http,
         tls_no_verify,
         running_in_github_actions(),
     )?;
+    warnings.extend(validate_verify_transport(
+        verify_base_url.as_deref(),
+        allow_insecure_http,
+        running_in_github_actions(),
+    )?);
     warn_insecure_transport_once(&warnings);
 
     Ok(EnvConfig {
@@ -297,6 +316,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         // Some("") would produce misleading downstream errors ("secret too
         // short") instead of the clear "not configured" ones.
         gateway_url,
+        verify_base_url,
         admin_jwt_secret: non_empty_env("FERRUM_ADMIN_JWT_SECRET"),
         admin_jwt_issuer: non_empty_env("FERRUM_ADMIN_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),
@@ -470,9 +490,16 @@ pub fn validate_gateway_transport(
 /// caller's decision; this only guarantees the URL is one of the two schemes
 /// gitforgeops speaks and that it names a host.
 fn parse_gateway_url(raw: &str) -> crate::error::Result<Url> {
+    parse_transport_url("FERRUM_GATEWAY_URL", raw)
+}
+
+/// The scheme/userinfo/host rules shared by every URL gitforgeops sends a
+/// credential to: the admin API, and the data plane `verify` probes with
+/// resolved credential-slot headers.
+fn parse_transport_url(var: &str, raw: &str) -> crate::error::Result<Url> {
     let parsed = Url::parse(raw).map_err(|e| {
         invalid_env(
-            "FERRUM_GATEWAY_URL",
+            var,
             &redacted_url(raw),
             &format!("{GATEWAY_URL_ACCEPTED} ({e})"),
         )
@@ -482,32 +509,72 @@ fn parse_gateway_url(raw: &str) -> crate::error::Result<Url> {
     // never echoed by a later error.
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(crate::error::Error::Config(format!(
-            "invalid FERRUM_GATEWAY_URL: the URL embeds credentials (user:password@host), which \
+            "invalid {var}: the URL embeds credentials (user:password@host), which \
              would be sent to the gateway and recorded by anything logging the URL; expected \
-             {GATEWAY_URL_ACCEPTED}. Put the admin secret in FERRUM_ADMIN_JWT_SECRET instead \
-             (value withheld from this message)"
+             {GATEWAY_URL_ACCEPTED}. Put the admin secret in FERRUM_ADMIN_JWT_SECRET, and a \
+             check's credential in a smoke-check `slot:`, instead (value withheld from this \
+             message)"
         )));
     }
 
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(invalid_env(
-            "FERRUM_GATEWAY_URL",
-            &redacted_url(raw),
-            GATEWAY_URL_ACCEPTED,
-        ));
+        return Err(invalid_env(var, &redacted_url(raw), GATEWAY_URL_ACCEPTED));
     }
 
     // `url` guarantees a non-empty host for http/https, so this is a
     // belt-and-braces check that keeps the loopback test total.
     if parsed.host().is_none() {
-        return Err(invalid_env(
-            "FERRUM_GATEWAY_URL",
-            &redacted_url(raw),
-            GATEWAY_URL_ACCEPTED,
-        ));
+        return Err(invalid_env(var, &redacted_url(raw), GATEWAY_URL_ACCEPTED));
     }
 
     Ok(parsed)
+}
+
+/// Apply the gateway transport rule to `FERRUM_VERIFY_BASE_URL`.
+///
+/// `verify` sends declared headers to this URL, and a header may carry a
+/// resolved credential-bundle slot, so it gets the same rule as the admin API:
+/// `https://` by default, `http://` only with `FERRUM_ALLOW_INSECURE_HTTP=true`
+/// and — under `GITHUB_ACTIONS` — only to a loopback host, and never embedded
+/// `user:password@`. `FERRUM_TLS_NO_VERIFY` has no bearing here: the verify
+/// client never honours it.
+pub fn validate_verify_transport(
+    verify_base_url: Option<&str>,
+    allow_insecure_http: bool,
+    in_github_actions: bool,
+) -> crate::error::Result<Vec<String>> {
+    let Some(raw) = verify_base_url else {
+        return Ok(Vec::new());
+    };
+    let parsed = parse_transport_url("FERRUM_VERIFY_BASE_URL", raw)?;
+    if parsed.scheme() != "http" {
+        return Ok(Vec::new());
+    }
+    if !allow_insecure_http {
+        return Err(crate::error::Error::Config(format!(
+            "invalid FERRUM_VERIFY_BASE_URL value {:?}; expected {GATEWAY_URL_ACCEPTED}. \
+             Traffic checks can send credential-bundle values in their headers, so a \
+             cleartext data plane is refused unless FERRUM_ALLOW_INSECURE_HTTP=true declares \
+             it a local development gateway",
+            redacted_url(raw)
+        )));
+    }
+    if in_github_actions {
+        if let Some(host) = parsed.host().filter(|host| !host_is_loopback(host)) {
+            return Err(refused_in_github_actions(
+                "FERRUM_ALLOW_INSECURE_HTTP",
+                &format!(
+                    "the data-plane host {host} is not loopback, so an http:// \
+                     FERRUM_VERIFY_BASE_URL would put every credential a traffic check sends \
+                     on the wire in cleartext"
+                ),
+            ));
+        }
+    }
+    Ok(vec![insecure_warning(
+        "FERRUM_ALLOW_INSECURE_HTTP=true: traffic checks talk to the data plane over cleartext http://.",
+        "Any credential a check sends is unencrypted on the wire. Local development only.",
+    )])
 }
 
 /// Is the gateway host the machine running gitforgeops?

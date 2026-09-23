@@ -34,6 +34,9 @@ jobs:
       contents: read
       checks: read
       pull-requests: read
+      # Reading the lifecycle workflow's run history and downloading its
+      # sealed result artifact.
+      actions: read
     steps:
       - name: Verify the published commit passed every required check
         env:
@@ -109,6 +112,88 @@ jobs:
             exit 1
           }
 
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The required-checks test above proves the unit and policy suites
+      # passed. It cannot prove the product was run: the lifecycle suite is
+      # not a per-PR required check, because it needs a gateway build and
+      # turning every pull request red when that is unavailable would train
+      # people to override the gate rather than fix it.
+      #
+      # So publication verifies it directly, bound to the exact revision being
+      # published. Every way of NOT having a result — never ran, ran for
+      # another revision, ran against another gateway build, was cancelled
+      # mid-run, skipped a scenario — fails here, because a release gate that
+      # can be satisfied by an absence is not a gate.
+      - name: Require a lifecycle acceptance result for this revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          runs_file=$(mktemp)
+          trap 'rm -f "$runs_file"' EXIT
+
+          # Both workflows start on the same push, so a single sample is
+          # always too early — the release would be permanently red and the
+          # gate would be something operators re-run past rather than read.
+          # Wait for the lifecycle run for THIS revision to finish, bounded,
+          # and say which of the three outcomes happened.
+          run_id=
+          for attempt in $(seq 1 40); do
+            gh api "repos/${REPO}/actions/workflows/lifecycle.yml/runs?head_sha=${RELEASE_SHA}&per_page=20" \
+              > "$runs_file" || {
+              echo "::error::The lifecycle acceptance workflow's run history could not be read."
+              exit 1
+            }
+            run_id=$(jq -r '
+              [.workflow_runs[]? | select(.conclusion == "success")]
+              | if length > 0 then (sort_by(.updated_at) | last | .id | tostring) else "" end
+            ' "$runs_file")
+            [ -n "$run_id" ] && break
+
+            pending=$(jq -r '
+              [.workflow_runs[]? | select(.status != "completed")] | length
+            ' "$runs_file")
+            if [ "$pending" -gt 0 ]; then
+              echo "Lifecycle acceptance is still running for ${RELEASE_SHA} (attempt ${attempt}/40)."
+              sleep 30
+              continue
+            fi
+            # Completed, none successful: a finished run that did not certify
+            # is a different thing from one that has not happened, and the
+            # operator needs to be told which.
+            if [ "$(jq -r '.total_count // 0' "$runs_file")" -gt 0 ]; then
+              echo "::error::Lifecycle acceptance ran for ${RELEASE_SHA} and did not pass. Fix the scenarios it reported, not the gate."
+              exit 1
+            fi
+            echo "Lifecycle acceptance has not started for ${RELEASE_SHA} yet (attempt ${attempt}/40)."
+            sleep 30
+          done
+          [ -n "$run_id" ] || {
+            echo "::error::No successful GitForgeOps Lifecycle Acceptance run exists for ${RELEASE_SHA} after waiting. Dispatch the workflow for this commit and re-run the release."
+            exit 1
+          }
+
+          gh run download "$run_id" --repo "$REPO" \
+            --name "lifecycle-result-${RELEASE_SHA}" --dir acceptance || {
+            echo "::error::Lifecycle run ${run_id} published no result artifact for ${RELEASE_SHA}."
+            exit 1
+          }
+
+          # The suite runs whichever allowlisted build the installer resolves,
+          # so the result is bound to THIS revision's allowlist rather than to
+          # one digest: a result from a build the release does not trust
+          # certifies nothing about it.
+          python3 .github/scripts/lifecycle_result.py verify \
+            --result acceptance/lifecycle-result.json \
+            --revision "$RELEASE_SHA" \
+            --gateway-allowlist .github/ferrum-edge-checksums.txt \
+            --summary "$GITHUB_STEP_SUMMARY"
+
   docker:
     name: Build and push Docker image
     # Only run on the upstream repo by default. Template copies and forks
@@ -148,12 +233,12 @@ jobs:
           --write-manifest supply-chain-inputs.json
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Docker Hub
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -184,7 +269,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64

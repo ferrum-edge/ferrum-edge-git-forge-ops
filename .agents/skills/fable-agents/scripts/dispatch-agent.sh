@@ -95,11 +95,11 @@ acquire_worktree_dispatch_lock "$physical_root"
 cd "$physical_worktree"
 isolate_claude_provider
 
-printf '[fable-agents] dispatch model=claude-fable-5 effort=%s worktree=%s bin=%s\n' \
+printf '[fable-agents] dispatch model=claude-fable-5-1 effort=%s worktree=%s bin=%s\n' \
   "$effort" "$physical_worktree" "$claude_bin" >&2
 
 run_dispatch_child "$prompt_file" "$claude_bin" -p \
-  --model claude-fable-5 \
+  --model claude-fable-5-1 \
   --effort "$effort" \
   --setting-sources '' \
   --permission-mode bypassPermissions \

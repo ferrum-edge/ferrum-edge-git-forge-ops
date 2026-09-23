@@ -24,6 +24,11 @@ Secrets are the one thing the script will not touch: it neither accepts nor
 prints a secret value, and finishes by listing the `gh secret set` commands left
 to run.
 
+For the order of operations rather than the control-by-control specification,
+[`docs/quickstart.md`](quickstart.md) walks one gateway, one namespace and one
+declared environment from an empty template to a first successful apply. It
+applies a subset of this baseline and links back here for the rest.
+
 ## Template repositories
 
 The upstream repository is the template customers copy, and a template has no
@@ -197,14 +202,15 @@ The synthetic local `default` environment is never eligible for trusted live
 review in any of those paths.
 
 Delete every GitHub Environment that `.gitforgeops/config.yaml` does not
-declare — with one exception, `settings-audit` (§5), which holds the
-administration-read audit token and no gateway credential. Delete the rest,
-including the `default` environment GitHub creates on some repositories. The
-settings audit walks `GET /repos/{repo}/environments` and holds *every* listed
-environment to the reviewer and branch-policy rules below, so one forgotten
-unprotected environment keeps the audit red forever. An environment nothing
-deploys to is also a standing invitation to store credentials somewhere no
-workflow guard covers.
+declare — with two exceptions, `settings-audit` (§5) and a
+`<env>-monitor` environment created by opting an environment into unattended
+drift monitoring (§3.1). Delete the rest, including the `default` environment
+GitHub creates on some repositories. The settings audit walks
+`GET /repos/{repo}/environments` and holds *every* listed environment to the
+reviewer and branch-policy rules below, so one forgotten unprotected
+environment keeps the audit red forever. An environment nothing deploys to is
+also a standing invitation to store credentials somewhere no workflow guard
+covers.
 
 `settings-audit` is exempt from the reviewer and self-review rules alone, and
 only because it deploys nothing: a required reviewer there would park every
@@ -245,6 +251,90 @@ shard beyond that would be written but never read back, so `apply` and
 workflows; `.github/scripts/check_supply_chain.py` fails the build if they
 disagree.
 
+### 3.1 Unattended drift monitoring
+
+`drift-check.yml` runs nightly and reads the gateway with
+`gitforgeops diff --exit-on-drift`. Bound to a deployment environment, it
+inherits that environment's required reviewer — and
+[GitHub withholds an approval-gated environment's secrets](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#environment-secrets)
+until a human approves the job. The nightly run therefore parks in "waiting for
+approval" and inspects nothing.
+
+That is the approval boundary working exactly as configured, not a bypass. It
+is still a bad monitoring experience, so an environment may opt into a second,
+reviewer-free environment that holds gateway **read** material only:
+
+```yaml
+environments:
+  production:
+    overlay: production
+    ownership:
+      mode: shared
+    monitoring:
+      unattended: true      # -> binds the `production-monitor` environment
+```
+
+`gitforgeops envs --include-scopes` then reports
+`monitoring_environment: production-monitor`, and that is what the drift job
+binds. Left out (or `false`), monitoring stays on the deployment environment
+and the check reports `Not completed` with the reason — never anything
+resembling "in sync".
+
+The bootstrap script creates each `<env>-monitor` with no reviewer and a custom
+deployment policy matching only the repository's exact default branch. It also
+prints the `gh secret set` commands for exactly the read material a comparison
+needs. The exact policy is the non-bypassable boundary that prevents a workflow
+dispatched from another protected ref from receiving the signing secret.
+
+**What the monitoring environment may hold.** `audit_settings.py` grants the
+reviewer waiver only to `<env>-monitor` where `<env>` is itself a listed
+environment, and only while the environment holds none of
+`GITFORGEOPS_STATE_APP_PRIVATE_KEY`, `FERRUM_GH_PROVISIONER_TOKEN`,
+`SETTINGS_AUDIT_TOKEN` or `FERRUM_CREDS_BUNDLE[_N]` — read by **name**; no
+secret value is ever requested. `repo_config.rs` refuses to name a deployment
+environment into the suffix, and `check_supply_chain.py` separately refuses a
+`drift-check.yml` that binds any of those secrets, holds a write permission, or
+runs a `gitforgeops` subcommand other than `diff`. Three independent fences,
+because the environment has no human in front of it.
+
+The credential bundle is deliberately *not* in that list of things monitoring
+gets. A comparison does not need credential values: `diff` excludes
+still-unresolved broker leaves from the live comparison per leaf, so the rest
+of the document is compared in full and the secrets simply stay out of the
+unattended environment.
+
+**Open dependency: a genuinely read-only gateway credential.** Ferrum Edge
+signs admin tokens with a *symmetric* secret and `GET /backup` requires the
+`admin` role, so there is today no token this workflow can hold that reads
+configuration but cannot write it. Set the monitoring environment's
+`FERRUM_ADMIN_JWT_ROLE` to the least-privileged role your gateway accepts for
+`/backup`, and treat the signing secret there as gateway-write-equivalent:
+fenced to the protected default branch, holding no GitHub-side authority, but
+not read-limited at the gateway. Closing that gap needs a Ferrum Edge
+capability (a read-only admin role, or separately issued read tokens); until it
+lands, an operator who is not willing to accept that trade-off should leave
+`monitoring.unattended` off and read the approval-gated `Not completed`
+outcome for what it is.
+
+### 3.2 Monitoring outcomes
+
+The scheduled check reports five distinct outcomes, and only one of them says a
+gateway was compared and matched:
+
+| Outcome | Meaning |
+| --- | --- |
+| `In sync` | the gateway was read and matches the repository |
+| `Drift detected` | the gateway was read and differs |
+| `Check failed` | authentication, connectivity, a cached (non-authoritative) backup, or a configuration error — **nothing is known about the gateway** |
+| `Skipped (file mode)` | no live Admin API to compare against; a configured absence, not a gap |
+| `Not completed` | the comparison never ran: approval pending, cancelled, or the runner was lost |
+
+`drift_report.py` does the classification and renders the table into the run's
+job summary. `Drift detected`, `Check failed` and `Not completed` all fail the
+workflow; `Skipped` does not. A matrix entry that produced no record at all is
+reconstructed as `Not completed` rather than omitted, so an environment held at
+"waiting for approval" appears in the table instead of vanishing from it.
+
 ### The gateway URL must be `https://`
 
 Every environment-bound workflow mints an admin JWT into an `Authorization`
@@ -269,6 +359,37 @@ certificate from a private CA, put that CA in the environment's
 gitforgeops then trusts that CA alone. Both switches print a loud stderr banner
 when they take effect locally, so a warning in a job log means one of them
 reached CI and should be removed from wherever it was set.
+
+### Scheduling and supersession are one list
+
+`apply-on-merge.yml` runs only for pushes that touch its `paths:` filter, and
+its freshness guard refuses to reconcile a refreshed protected head that
+changed a deployment input since the triggering merge. Those two sets are the
+same list — `DEPLOYMENT_INPUT_PATHS` in
+[`.github/scripts/deployment_scope.py`](../.github/scripts/deployment_scope.py)
+— and `check_supply_chain.py` fails the build when they drift apart.
+The workflow executes that classifier from the triggering commit, not from the
+refreshed checkout it is evaluating. A newer helper change therefore cannot
+approve itself under the waiting run's older environment authorization.
+
+Equality is what keeps an approval-gated deployment from being cancelled by
+accident. While a merge waits for its environment's required reviewer, other
+merges land on `main`:
+
+- A merge that changes a deployment input (resources, overlays,
+  `.gitforgeops/`, the engine source, the helper scripts, the validator pin, or
+  this workflow) **supersedes** the waiting run — and schedules an apply of its
+  own, which reconciles its revision together with everything queued behind it.
+- A merge that changes nothing else — documentation, tests, an unrelated
+  workflow — leaves the waiting run alone, because it would schedule no
+  replacement and therefore may cancel nothing.
+
+`.state/**` and `assembled/**` belong to neither half: the apply writes them,
+so they must not reject a queued run, and they must not trigger the workflow
+that produced them.
+
+Operator recovery for an already-superseded run is documented in
+[Recovering a superseded apply](../README.md#recovering-a-superseded-apply).
 
 ## 4. Restrict GitHub Actions
 
@@ -356,7 +477,33 @@ creates it on every repository, template copies included.
 `settings-audit.yml` runs only from the default branch and verifies Actions
 permissions, the active `main` and release tag rulesets, required checks, the
 exact state-writer App bypass, the presence of the `settings-audit` environment,
-and every environment's reviewer/self-review/branch policy.
+every environment's reviewer/self-review/branch policy, and — for a repository
+that opted into unattended drift monitoring — the *gateway* monitoring coverage
+described next.
+
+### Gateway monitoring coverage is audited, not assumed
+
+A `cron:` line in `drift-check.yml` is not evidence that a gateway is being
+watched. The schedule can be disabled by GitHub after 60 days of repository
+inactivity, switched off in the Actions tab, or fail every night against an
+unreachable gateway, and the workflow file looks identical in each case.
+
+So the audit reads the *newest successful run* of `drift-check.yml` through the
+Actions API and fails when it is older than `--monitoring-max-age-hours`
+(default 48 — two nightly periods, enough slack for one missed or queued run).
+An unreadable run history fails closed rather than passing silently.
+
+This check only applies once at least one `<env>-monitor` environment exists.
+A repository that has not opted in is reported, accurately, as:
+
+```
+PASS: drift monitoring is approval-gated: no environment declares
+      `monitoring.unattended`, so scheduled checks wait for a reviewer and no
+      unattended coverage is claimed
+```
+
+which is a statement about what is *not* covered, not a green tick for
+monitoring that is not happening.
 
 It runs weekly on a schedule **and** on `workflow_dispatch`. The manual trigger
 is not a convenience: GitHub disables a scheduled workflow after 60 days with

@@ -111,6 +111,52 @@ ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_CA_CERT", "optional; base64 PEM for a private CA"),
     ("FERRUM_GATEWAY_CLIENT_CERT", "optional; base64 PEM, mTLS (needs the key too)"),
     ("FERRUM_GATEWAY_CLIENT_KEY", "optional; base64 PEM, mTLS (needs the cert too)"),
+    (
+        "FERRUM_VERIFY_BASE_URL",
+        "optional; https:// data-plane URL for traffic checks — required for an "
+        "environment that is a promotion predecessor",
+    ),
+)
+
+# Mirrors `MONITORING_ENVIRONMENT_SUFFIX` in `src/config/repo_config.rs` and
+# `audit_settings.py`. An environment that sets `monitoring.unattended: true`
+# gets a second GitHub Environment with this suffix, holding gateway *read*
+# material and nothing else, and no required reviewer — an approval-gated
+# environment withholds its secrets until a human releases the job, which turns
+# a nightly drift check into no drift check at all.
+MONITORING_ENVIRONMENT_SUFFIX = "-monitor"
+# Everything a `gitforgeops diff` needs, and nothing more. Notably absent:
+# GITFORGEOPS_STATE_APP_PRIVATE_KEY (ledger writes), FERRUM_GH_PROVISIONER_TOKEN
+# (credential-broker writes) and FERRUM_CREDS_BUNDLE[_N] (credential values a
+# comparison does not need). `audit_settings.py` fails the audit if any of them
+# is added later, and `check_supply_chain.py` refuses the workflow binding.
+MONITORING_ENVIRONMENT_SECRETS = (
+    ("FERRUM_GATEWAY_URL", "required; must be an https:// URL"),
+    (
+        "FERRUM_ADMIN_JWT_SECRET",
+        "required; the gateway's signing secret — see the read-only-role caveat "
+        "in docs/github-launch-controls.md",
+    ),
+    (
+        "FERRUM_ADMIN_JWT_ROLE",
+        "optional; leave unset (admin) — GET /backup is admin-only today, so no "
+        "lesser role can run a drift check",
+    ),
+    (
+        "FERRUM_ADMIN_JWT_ISSUER",
+        "optional; default ferrum-edge, must equal the gateway's issuer",
+    ),
+    (
+        "FERRUM_ADMIN_JWT_AUDIENCE",
+        "optional; set only if the gateway configures an audience",
+    ),
+    (
+        "FERRUM_ADMIN_JWT_TTL_SECS",
+        "optional; default 3600, must fit the gateway's FERRUM_ADMIN_JWT_MAX_TTL",
+    ),
+    ("FERRUM_GATEWAY_CA_CERT", "optional; base64 PEM for a private CA"),
+    ("FERRUM_GATEWAY_CLIENT_CERT", "optional; base64 PEM, mTLS (needs the key too)"),
+    ("FERRUM_GATEWAY_CLIENT_KEY", "optional; base64 PEM, mTLS (needs the cert too)"),
 )
 
 ENVIRONMENT_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
@@ -256,6 +302,57 @@ def environment_names_from_config(text: str) -> list[str]:
     return names
 
 
+def unattended_environments_from_config(text: str) -> list[str]:
+    """Which environments asked for an unattended drift check?
+
+    Same deliberately small reader as `environment_names_from_config`, one
+    level deeper: an environment counts when its `monitoring:` block sets
+    `unattended: true`. Anything else — absent, `false`, a comment, a
+    differently indented key — reads as opted out, which leaves that
+    environment's monitoring approval-gated exactly as it is today.
+    """
+    names: list[str] = []
+    inside = False
+    depth: int | None = None
+    current: str | None = None
+    monitoring_depth: int | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if indent == 0:
+            inside = stripped.rstrip() == "environments:"
+            depth = None
+            current = None
+            monitoring_depth = None
+            continue
+        if not inside:
+            continue
+        if depth is None:
+            depth = indent
+        if indent == depth:
+            name = stripped[:-1].strip().strip("'\"") if stripped.endswith(":") else ""
+            current = name if ENVIRONMENT_NAME.match(name) else None
+            monitoring_depth = None
+            continue
+        if current is None or indent <= depth:
+            continue
+        if monitoring_depth is not None and indent <= monitoring_depth:
+            monitoring_depth = None
+        if stripped.rstrip() == "monitoring:":
+            monitoring_depth = indent
+            continue
+        if monitoring_depth is None or indent <= monitoring_depth:
+            continue
+        key, separator, value = stripped.partition(":")
+        if separator and key.strip() == "unattended":
+            if value.split("#")[0].strip().lower() == "true" and current not in names:
+                names.append(current)
+    return names
+
+
 def resolve_environments(args) -> list[str]:
     if args.environment:
         return list(dict.fromkeys(args.environment))
@@ -263,6 +360,20 @@ def resolve_environments(args) -> list[str]:
     if not config.is_file():
         return []
     return environment_names_from_config(config.read_text(encoding="utf-8"))
+
+
+def resolve_monitoring_environments(args, environments: list[str]) -> list[str]:
+    """Deployment environments whose monitoring runs unattended.
+
+    `--environment` overrides the config file for the deployment list, and it
+    carries no monitoring opinion, so an explicit list opts nothing in. The
+    config file is the only place `monitoring.unattended` can be declared.
+    """
+    config = Path(args.config)
+    if not config.is_file():
+        return []
+    declared = unattended_environments_from_config(config.read_text(encoding="utf-8"))
+    return [name for name in declared if name in environments]
 
 
 # --------------------------------------------------------------------------
@@ -855,6 +966,97 @@ def step_audit_token_environment(api: GitHubApi, repo: str) -> list[Step]:
     ]
 
 
+def step_monitoring_environments(
+    api: GitHubApi, repo: str, environments: list[str], default_branch: str
+) -> list[Step]:
+    """Create the read-only environment a scheduled drift check binds.
+
+    Deliberately reviewer-free, for the same reason as the audit-token
+    environment: a required reviewer holds every nightly run in "waiting for
+    approval", which is a monitoring setup that monitors nothing. The waiver is
+    narrow — `audit_settings.py` grants it only to `<deployment-env>-monitor`
+    where the deployment environment exists, and only while the environment
+    holds no deployment, credential-broker or state-writing secret. Its branch
+    policy admits only the exact default branch, so another protected ref can
+    never be released the monitoring credentials.
+    """
+    steps: list[Step] = []
+    for base in environments:
+        name = f"{base}{MONITORING_ENVIRONMENT_SUFFIX}"
+        encoded = quote(name, safe="")
+        detail = optional_get(api, f"repos/{repo}/environments/{encoded}")
+        body = {
+            "wait_timer": 0,
+            "reviewers": [],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+        policy_path = f"repos/{repo}/environments/{encoded}/deployment-branch-policies"
+        create_policy = ("POST", policy_path, {"name": default_branch, "type": "branch"})
+        target = f"environment {name}"
+        summary = (
+            f"read-only drift monitoring for {base}, exact {default_branch!r} branch only, "
+            "no reviewer"
+        )
+        if detail is None:
+            steps.append(
+                Step(
+                    CREATE,
+                    target,
+                    summary,
+                    ["environment: <absent> -> present"],
+                    [("PUT", f"repos/{repo}/environments/{encoded}", body), create_policy],
+                )
+            )
+            continue
+        policy = detail.get("deployment_branch_policy") or {}
+        current_reviewers, _ = environment_reviewers(detail)
+        current_policies = []
+        if policy.get("custom_branch_policies") is True:
+            pages = api.get(f"{policy_path}?per_page=100", paginate=True)
+            if isinstance(pages, list):
+                current_policies = [
+                    item
+                    for page in pages
+                    if isinstance(page, dict)
+                    for item in page.get("branch_policies", [])
+                    if isinstance(item, dict)
+                ]
+        policy_is_exact = (
+            policy.get("protected_branches") is False
+            and policy.get("custom_branch_policies") is True
+            and [item.get("name") for item in current_policies] == [default_branch]
+        )
+        details = field_differences(
+            {
+                # A reviewer added by hand parks every scheduled check; report
+                # it as drift and let the PUT remove it.
+                "reviewers": len(current_reviewers),
+                "deployment_branch_policy.exact_default_branch": policy_is_exact,
+            },
+            {"reviewers": 0, "deployment_branch_policy.exact_default_branch": True},
+        )
+        writes: list[tuple[str, str, dict | None]] = []
+        if details:
+            writes.append(("PUT", f"repos/{repo}/environments/{encoded}", body))
+            for item in current_policies:
+                if item.get("id") is not None:
+                    writes.append(("DELETE", f"{policy_path}/{item['id']}", None))
+            writes.append(create_policy)
+        steps.append(
+            Step(
+                UNCHANGED if not details else UPDATE,
+                target,
+                summary,
+                details,
+                writes,
+            )
+        )
+    return steps
+
+
 def step_environments(
     api: GitHubApi, repo: str, environments: list[str], reviewers: list[dict]
 ) -> list[Step]:
@@ -1023,6 +1225,33 @@ def build_plan(api: GitHubApi, args) -> Plan:
         )
     elif environments:
         plan.steps.extend(step_environments(api, repo, environments, reviewers))
+        monitoring = resolve_monitoring_environments(args, environments)
+        if monitoring:
+            default_branch = repository.get("default_branch") or "main"
+            plan.steps.extend(
+                step_monitoring_environments(api, repo, monitoring, default_branch)
+            )
+            plan.warnings.append(
+                "Unattended drift monitoring is enabled for "
+                f"{', '.join(monitoring)}. Each gets a reviewer-free "
+                f"`<env>{MONITORING_ENVIRONMENT_SUFFIX}` environment so the "
+                "nightly check is not parked waiting for approval. Give it "
+                "gateway READ material only — Ferrum Edge signs admin tokens "
+                "with a symmetric secret, so until the gateway offers a "
+                "read-only admin role the signing key you put there is "
+                "write-capable at the gateway. The environment's branch policy "
+                "and the workflow's secret fence are what bound it; see "
+                "docs/github-launch-controls.md."
+            )
+        else:
+            plan.notes.append("")
+            plan.notes.append(
+                "Drift monitoring is approval-gated: no environment sets "
+                "`monitoring.unattended: true`, so each scheduled check waits "
+                "for that environment's reviewer and reports `not_completed` "
+                "until one approves it. That is the approval boundary working "
+                "as configured, not a failure."
+            )
     else:
         plan.notes.append("")
         plan.notes.append(
@@ -1040,11 +1269,24 @@ def build_plan(api: GitHubApi, args) -> Plan:
             "one exists."
         )
 
-    plan.notes.extend(secret_remainder(args.repo, environments, args.template_repo))
+    plan.notes.extend(
+        secret_remainder(
+            args.repo,
+            environments,
+            args.template_repo,
+            resolve_monitoring_environments(args, environments),
+        )
+    )
     return plan
 
 
-def secret_remainder(repo: str, environments: list[str], template_repo: bool) -> list[str]:
+def secret_remainder(
+    repo: str,
+    environments: list[str],
+    template_repo: bool,
+    monitoring: list[str] | None = None,
+) -> list[str]:
+    monitoring = monitoring or []
     lines = [
         "",
         "Secrets are not set by this script and never pass through it. Run these "
@@ -1078,6 +1320,19 @@ def secret_remainder(repo: str, environments: list[str], template_repo: bool) ->
                 f"  gh secret set {name} --repo {repo} --env {environment}"
                 f"   # {note}"
             )
+    for environment in monitoring:
+        monitor = f"{environment}{MONITORING_ENVIRONMENT_SUFFIX}"
+        lines.append(f"  # environment {monitor} (read-only drift monitoring)")
+        for name, note in MONITORING_ENVIRONMENT_SECRETS:
+            lines.append(
+                f"  gh secret set {name} --repo {repo} --env {monitor}   # {note}"
+            )
+        lines.append(
+            f"  # Do NOT set GITFORGEOPS_STATE_APP_PRIVATE_KEY, "
+            f"FERRUM_GH_PROVISIONER_TOKEN or FERRUM_CREDS_BUNDLE[_N] on "
+            f"{monitor}: the settings audit fails when a monitoring environment "
+            "holds deployment, broker or state-writing authority."
+        )
     lines.append(
         "  # FERRUM_CREDS_BUNDLE[_N] are written by the credential broker on the "
         "first apply that resolves an alloc=generate placeholder; seed them by "

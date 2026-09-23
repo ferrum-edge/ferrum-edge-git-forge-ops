@@ -1,0 +1,12 @@
+kind: Consumer
+spec:
+  id: "orders-client"
+  username: "orders-client"
+  credentials:
+    # The broker allocates this on the first apply and delivers it,
+    # age-encrypted, to the pull request's author. Never write a literal
+    # secret here: `apply` refuses the document before it reads a bundle.
+    #
+    # Slot: ferrum/orders-client/keyauth/key
+    keyauth:
+      - key: "${gh-env-secret:alloc=generate}"

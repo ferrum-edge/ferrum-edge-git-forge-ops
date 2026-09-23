@@ -143,6 +143,22 @@ async fn main() {
             format,
             include_scopes,
         } => cmd_envs(format, include_scopes),
+        cli::Commands::Verify { format } => cmd_verify(format, explicit_env.as_deref()).await,
+        cli::Commands::Doctor {
+            format,
+            scope,
+            repo,
+            state_writer_app_id,
+        } => {
+            cmd_doctor(
+                format,
+                &scope,
+                repo.as_deref(),
+                state_writer_app_id.as_deref(),
+                explicit_env.as_deref(),
+            )
+            .await
+        }
         cli::Commands::Version { format } => cmd_version(format),
         cli::Commands::Rotate {
             consumer,
@@ -3336,6 +3352,209 @@ async fn cmd_review(
     Ok(())
 }
 
+/// Run the environment's declared traffic checks.
+///
+/// Deliberately separate from `apply`: configuration acceptance and healthy
+/// traffic are different results, and collapsing them is what lets a
+/// promotion proceed on a gateway that took the write and serves a 502.
+///
+/// Fails closed on every "we did not actually verify" case — no declared
+/// checks, no data-plane URL, an unresolvable credential slot — because a
+/// promotion gate reading any of those as a pass is worse than no gate.
+async fn cmd_verify(
+    format: cli::ReportFormat,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    let smoke = gitforgeops::verify::SmokeConfig::load()?.ok_or_else(|| {
+        gitforgeops::error::Error::Config(format!(
+            "{} is absent, so there is nothing to verify. Declare at least one \
+             representative route for '{}' before gating a promotion on it.",
+            gitforgeops::verify::SMOKE_CONFIG_PATH,
+            resolved.name
+        ))
+    })?;
+    let checks = smoke.for_environment(&resolved.name).ok_or_else(|| {
+        gitforgeops::error::Error::Config(format!(
+            "{} declares no checks for environment '{}'. An environment with no \
+             declared check has verified nothing, which a promotion gate must not \
+             read as a pass.",
+            gitforgeops::verify::SMOKE_CONFIG_PATH,
+            resolved.name
+        ))
+    })?;
+    let base_url = env_config.verify_base_url.clone().ok_or_else(|| {
+        gitforgeops::error::Error::Config(
+            "FERRUM_VERIFY_BASE_URL is not set. Traffic verification reaches the \
+             gateway's DATA plane, which is a different endpoint from the admin API \
+             in FERRUM_GATEWAY_URL."
+                .to_string(),
+        )
+    })?;
+    // Header values may name credential-bundle slots. The bundle is loaded the
+    // same way every other command loads it; a slot that is not in it fails
+    // the check rather than sending an empty header.
+    let (bundle, _) = load_credential_bundles(&env_config)?;
+
+    let report = gitforgeops::verify::runner::run(
+        &resolved.name,
+        &base_url,
+        checks,
+        &bundle,
+        // A private CA is configuration; `FERRUM_TLS_NO_VERIFY` is deliberately
+        // not honoured here. A check that accepts any certificate has not
+        // verified TLS, and a promotion gate that passes against an
+        // interceptor is worse than no gate.
+        env_config.ca_cert.as_deref(),
+    )
+    .await;
+
+    match format {
+        cli::ReportFormat::Text => print!("{}", report.render_text()),
+        cli::ReportFormat::Json => print!("{}", gitforgeops::json_output::pretty(&report)?),
+    }
+    if report.exit_code() != 0 {
+        process::exit(report.exit_code());
+    }
+    Ok(())
+}
+
+/// Read-only readiness diagnosis.
+///
+/// Three properties are load-bearing and are why this is not just a wrapper
+/// around the existing commands:
+///
+/// 1. **It never mutates.** No settings writer, no gateway write, no
+///    credential allocation, no state lock. The gateway scope reaches exactly
+///    `GET /health` and `GET /cluster`.
+/// 2. **It never guesses.** A check that could not run reports `UNKNOWN`, and
+///    `UNKNOWN` is not a pass — a laptop with no administration-read token has
+///    not verified the branch ruleset, and saying so is the whole point.
+/// 3. **It owns no baseline.** Repository settings are judged by
+///    `audit_settings.py`, the same script `bootstrap_repo_settings.py` writes
+///    and the scheduled audit runs, so the three cannot drift apart.
+async fn cmd_doctor(
+    format: cli::ReportFormat,
+    scopes: &[cli::DoctorScope],
+    repository: Option<&str>,
+    state_writer_app_id: Option<&str>,
+    explicit_env: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gitforgeops::doctor::{self, Check, Scope, Status};
+
+    let selected: Vec<cli::DoctorScope> = if scopes.is_empty() {
+        // The gateway scope needs an environment's deployment credentials, so
+        // it is never implied. Everything that can be answered without one is.
+        vec![cli::DoctorScope::Local, cli::DoctorScope::Github]
+    } else if scopes.contains(&cli::DoctorScope::All) {
+        vec![
+            cli::DoctorScope::Local,
+            cli::DoctorScope::Github,
+            cli::DoctorScope::Gateway,
+        ]
+    } else {
+        scopes.to_vec()
+    };
+
+    let root = std::path::PathBuf::from(".");
+    let mut report = doctor::Report::default();
+
+    // The env parse is itself a finding: `load_env_config` refuses an invalid
+    // enum, boolean or integer, and an operator seeing that failure from the
+    // middle of `apply` has no idea which variable is at fault.
+    let env_config = match config::load_env_config() {
+        Ok(env) => {
+            report.push(Check::pass(
+                "process-env",
+                "Process environment parses",
+                Scope::Local,
+                format!(
+                    "mode={:?}, apply_strategy={:?}",
+                    env.gateway_mode, env.apply_strategy
+                ),
+            ));
+            Some(env)
+        }
+        Err(error) => {
+            report.push(
+                Check::new(
+                    "process-env",
+                    "Process environment parses",
+                    Scope::Local,
+                    Status::Fail,
+                    format!("{error}"),
+                )
+                .remedy(
+                    "Every present FERRUM_* value must parse. A blank value means \
+                     \"unset\" and uses the documented default; an invalid one fails \
+                     before resources or credentials are read. See .env.example.",
+                ),
+            );
+            None
+        }
+    };
+
+    if selected.contains(&cli::DoctorScope::Local) {
+        report.extend(doctor::local::run(&root, env_config.as_ref()));
+    }
+
+    if selected.contains(&cli::DoctorScope::Github) {
+        let template_repo =
+            doctor::local::repository_kind(&root) == doctor::local::RepositoryKind::Template;
+        report.extend(doctor::github::run(
+            &root,
+            &doctor::github::GithubContext {
+                repository: repository
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("GITHUB_REPOSITORY").ok()),
+                token: std::env::var("GH_TOKEN")
+                    .ok()
+                    .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+                    .filter(|value| !value.trim().is_empty()),
+                state_writer_app_id: state_writer_app_id
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("GITFORGEOPS_STATE_APP_ID").ok())
+                    .filter(|value| !value.trim().is_empty()),
+                template_repo,
+            },
+        ));
+    }
+
+    if selected.contains(&cli::DoctorScope::Gateway) {
+        match (&env_config, resolve_runtime(explicit_env)) {
+            (Some(env), Ok((_, resolved, _))) => {
+                report.extend(doctor::gateway::run(&resolved.name, env).await);
+            }
+            (_, Err(error)) => report.push(
+                Check::new(
+                    "gateway-environment",
+                    "An environment could be selected",
+                    Scope::Gateway,
+                    Status::Unknown,
+                    format!("no environment could be resolved: {error}"),
+                )
+                .remedy("Pass --env NAME, or set FERRUM_ENV."),
+            ),
+            (None, _) => report.push(Check::new(
+                "gateway-environment",
+                "An environment could be selected",
+                Scope::Gateway,
+                Status::Unknown,
+                "the process environment did not parse, so no gateway client could be built",
+            )),
+        }
+    }
+
+    match format {
+        cli::ReportFormat::Text => print!("{}", report.render_text()),
+        cli::ReportFormat::Json => print!("{}", gitforgeops::json_output::pretty(&report)?),
+    }
+    if !report.is_ready() {
+        process::exit(report.exit_code());
+    }
+    Ok(())
+}
+
 fn cmd_version(format: cli::ReportFormat) -> Result<(), Box<dyn std::error::Error>> {
     let info = gitforgeops::version::BuildInfo::current();
     match format {
@@ -3363,6 +3582,13 @@ fn cmd_envs(
                 environment: ResolvedEnv::default_env_name(),
                 live_review: false,
                 namespaces: None,
+                // The synthetic local default is never a trusted workflow
+                // target, so it never gains a monitoring environment either.
+                monitoring_environment: ResolvedEnv::default_env_name(),
+                unattended_monitoring: false,
+
+                // target, so it is never a promotion participant either.
+                promotion_requires: None,
             }],
         };
         print!("{}", gitforgeops::json_output::compact(&scopes)?);

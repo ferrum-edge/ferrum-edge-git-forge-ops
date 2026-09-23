@@ -70,6 +70,65 @@ impl Default for OwnershipConfig {
     }
 }
 
+/// Reserved suffix for the GitHub Environment a scheduled drift check binds
+/// when an environment opts into unattended monitoring.
+///
+/// The name is derived rather than configured so the same string is reachable
+/// from the binary, `drift-check.yml`, `bootstrap_repo_settings.py` and
+/// `audit_settings.py` without any of them parsing another's data. The audit
+/// keys its narrow reviewer waiver on exactly this suffix, so a deployment
+/// environment may never carry it.
+pub const MONITORING_ENVIRONMENT_SUFFIX: &str = "-monitor";
+
+/// Derive the monitoring environment name for a deployment environment.
+pub fn monitoring_environment_name(environment: &str) -> String {
+    format!("{environment}{MONITORING_ENVIRONMENT_SUFFIX}")
+}
+
+// `false` is the derived default here, so this type keeps `#[derive(Default)]`
+// rather than the hand-written impl the neighbouring config structs need for
+// their non-`false`/non-zero defaults. The container-level `#[serde(default)]`
+// rule is unchanged: `{}` still deserializes to `MonitoringConfig::default()`,
+// which `tests/unit/serde_default_tests.rs` asserts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitoringConfig {
+    /// Run the scheduled drift check in `<environment>-monitor` instead of the
+    /// deployment environment.
+    ///
+    /// A deployment environment requires a reviewer, and GitHub withholds an
+    /// approval-gated environment's secrets until a human approves the job —
+    /// so a nightly drift check bound to it parks in "waiting for approval"
+    /// and inspects nothing. That is the approval boundary working as
+    /// configured, which is why this is opt-in rather than a default: turning
+    /// it on means provisioning a second GitHub Environment holding gateway
+    /// *read* credentials and nothing else, and accepting that it runs
+    /// unattended.
+    ///
+    /// Left `false`, monitoring stays bound to the deployment environment and
+    /// the check reports `not_completed` (approval pending) rather than
+    /// anything resembling "in sync".
+    pub unattended: bool,
+}
+
+/// Staged promotion: this environment may not be applied until another one
+/// has applied *and verified* the same source revision.
+///
+/// Independent environments are the default and stay the default. Declaring
+/// `requires:` opts one environment out of the parallel matrix and into a
+/// chain, which is a different capability rather than a stricter version of
+/// the same one — parallel matrix jobs are not staged rollout, and describing
+/// them as one is how "production was promoted from staging" gets believed
+/// about a deployment that never waited for staging at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromotionConfig {
+    /// The environment whose successful apply and verification authorize this
+    /// one, for the same source revision. `None` = deploy independently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentConfig {
@@ -81,6 +140,9 @@ pub struct EnvironmentConfig {
     pub namespace_filter: Option<String>,
     pub apply_strategy: ApplyStrategy,
     pub ownership: OwnershipConfig,
+    pub monitoring: MonitoringConfig,
+
+    pub promotion: PromotionConfig,
 }
 
 impl Default for EnvironmentConfig {
@@ -91,6 +153,9 @@ impl Default for EnvironmentConfig {
             namespace_filter: None,
             apply_strategy: ApplyStrategy::Incremental,
             ownership: OwnershipConfig::default(),
+            monitoring: MonitoringConfig::default(),
+
+            promotion: PromotionConfig::default(),
         }
     }
 }
@@ -125,6 +190,23 @@ pub struct EnvironmentScope {
     /// explicit filter/ownership allowlist that the caller must intersect
     /// with those directories.
     pub namespaces: Option<Vec<String>>,
+    /// The GitHub Environment a scheduled drift check should bind for this
+    /// deployment environment. Equal to `environment` unless the environment
+    /// opted into unattended monitoring, in which case it is the derived
+    /// `<environment>-monitor`. `drift-check.yml` binds this field directly,
+    /// so an environment that has not opted in keeps every existing approval
+    /// gate.
+    pub monitoring_environment: String,
+    /// Whether that monitoring environment is expected to run without a human
+    /// approval. Reported in the drift check's outcome so an approval-gated
+    /// run is never mistaken for a completed one.
+    pub unattended_monitoring: bool,
+
+    /// The environment whose applied-and-verified revision authorizes this
+    /// one. `None` = this environment deploys independently, in the parallel
+    /// matrix. `apply-on-merge.yml` splits its matrix on exactly this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_requires: Option<String>,
 }
 
 impl RepoConfig {
@@ -177,6 +259,14 @@ impl RepoConfig {
                     environment: name.clone(),
                     live_review: env.live_review,
                     namespaces,
+                    monitoring_environment: if env.monitoring.unattended {
+                        monitoring_environment_name(name)
+                    } else {
+                        name.clone()
+                    },
+                    unattended_monitoring: env.monitoring.unattended,
+
+                    promotion_requires: env.promotion.requires.clone(),
                 }
             })
             .collect()
@@ -221,6 +311,21 @@ impl RepoConfig {
                 super::resolved::validate_overlay_name(overlay)?;
             }
 
+            // `<name>-monitor` is the derived GitHub Environment a scheduled
+            // drift check binds, and the settings audit waives the required-
+            // reviewer rule for exactly that suffix. A deployment environment
+            // named `staging-monitor` would inherit that waiver and become an
+            // unreviewed gateway *write* target.
+            if name.ends_with(MONITORING_ENVIRONMENT_SUFFIX) {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': the '{MONITORING_ENVIRONMENT_SUFFIX}' suffix is \
+                     reserved for the drift-monitoring environment derived from a deployment \
+                     environment of the same base name. Rename this environment; set \
+                     `monitoring.unattended: true` on the deployment environment to create \
+                     its monitoring target."
+                )));
+            }
+
             if matches!(env.ownership.mode, OwnershipMode::Exclusive)
                 && env
                     .ownership
@@ -249,6 +354,67 @@ impl RepoConfig {
                 return Err(crate::error::Error::Config(format!(
                     "environment '{name}': ownership.large_prune_threshold_percent={} is out of range 0..=100",
                     env.ownership.large_prune_threshold_percent
+                )));
+            }
+        }
+
+        // A promotion chain that names a missing environment would emit a
+        // matrix the workflow cannot satisfy, and a cycle would deadlock every
+        // environment in it forever. Both are load-time errors rather than a
+        // job that waits for a predecessor that will never run.
+        for (name, env) in &self.environments {
+            let Some(required) = &env.promotion.requires else {
+                continue;
+            };
+            if required == name {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': promotion.requires names itself"
+                )));
+            }
+            if !self.environments.contains_key(required) {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': promotion.requires '{required}' is not a declared environment"
+                )));
+            }
+        }
+        for name in self.environments.keys() {
+            let mut seen = vec![name.as_str()];
+            let mut cursor = name.as_str();
+            while let Some(next) = self
+                .environments
+                .get(cursor)
+                .and_then(|env| env.promotion.requires.as_deref())
+            {
+                if seen.contains(&next) {
+                    return Err(crate::error::Error::Config(format!(
+                        "environment '{name}': promotion.requires forms a cycle ({} -> {next})",
+                        seen.join(" -> ")
+                    )));
+                }
+                seen.push(next);
+                cursor = next;
+            }
+        }
+        // `apply-on-merge.yml` has exactly two phases: the independent matrix,
+        // then one `promote` matrix whose jobs run in parallel. A predecessor
+        // that is itself promoted runs in that same parallel phase, so its
+        // successor would read for a record that has not been written yet and
+        // refuse on every run — a configuration that loads and can never
+        // deploy. Refuse it here, where the operator can still act on it.
+        for (name, env) in &self.environments {
+            let Some(required) = env.promotion.requires.as_deref() else {
+                continue;
+            };
+            if let Some(grand) = self
+                .environments
+                .get(required)
+                .and_then(|predecessor| predecessor.promotion.requires.as_deref())
+            {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': promotion.requires '{required}', which is itself \
+                     promoted from '{grand}'. Promotion is one stage deep: a predecessor must \
+                     deploy independently (no promotion.requires). Promote '{name}' from \
+                     '{grand}' instead, or drop the chain."
                 )));
             }
         }

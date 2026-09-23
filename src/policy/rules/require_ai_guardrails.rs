@@ -116,26 +116,56 @@ impl PolicyCheck for RequireAiGuardrailsRule {
                 continue;
             }
 
-            for plugin in attached {
-                if let Some(reason) = Self::neutered_reason(plugin) {
-                    findings.push(PolicyFinding {
-                        rule_id: self.rule_id().to_string(),
-                        severity: self.config.severity,
-                        kind: "Proxy".to_string(),
-                        id: proxy.id.clone(),
-                        namespace: proxy.namespace.clone(),
-                        message: format!(
-                            "proxy {} in namespace {} is guarded by {} plugin {}, but that instance has {reason} — it observes instead of refusing",
-                            proxy.id, proxy.namespace, plugin.plugin_name, plugin.id
-                        ),
-                        remediation: Some(format!(
-                            "Remove the escape hatch from plugin {} so it keeps the gateway's fail-closed default",
-                            plugin.id
-                        )),
-                        overridden_by: None,
-                    });
-                }
+            // The requirement is met by the route as a whole: one effective,
+            // enforcing guardrail protects it, so an observing companion (a
+            // dry-run firewall alongside an enforcing shield) is not a finding.
+            // Only when every attached guardrail is neutered does the route lack
+            // enforcement, and then one finding names each ineffective instance.
+            let attached_count = attached.len();
+            let ineffective: Vec<(&&PluginConfig, String)> = attached
+                .into_iter()
+                .filter_map(|plugin| Self::neutered_reason(plugin).map(|reason| (plugin, reason)))
+                .collect();
+
+            if ineffective.len() < attached_count {
+                continue;
             }
+
+            let plural = ineffective.len() > 1;
+            let descriptions: Vec<String> = ineffective
+                .iter()
+                .map(|(plugin, reason)| {
+                    format!("{} plugin {} has {reason}", plugin.plugin_name, plugin.id)
+                })
+                .collect();
+            let plugin_ids: Vec<&str> = ineffective
+                .iter()
+                .map(|(plugin, _)| plugin.id.as_str())
+                .collect();
+
+            findings.push(PolicyFinding {
+                rule_id: self.rule_id().to_string(),
+                severity: self.config.severity,
+                kind: "Proxy".to_string(),
+                id: proxy.id.clone(),
+                namespace: proxy.namespace.clone(),
+                message: format!(
+                    "proxy {} in namespace {} is guarded by {} — the guardrail{} observe{} instead of refusing",
+                    proxy.id,
+                    proxy.namespace,
+                    descriptions.join("; "),
+                    if plural { "s" } else { "" },
+                    if plural { "" } else { "s" },
+                ),
+                remediation: Some(format!(
+                    "Remove the escape hatch from plugin{} {} so {} keep{} the gateway's fail-closed default",
+                    if plural { "s" } else { "" },
+                    plugin_ids.join(", "),
+                    if plural { "they" } else { "it" },
+                    if plural { "" } else { "s" },
+                )),
+                overridden_by: None,
+            });
         }
 
         findings

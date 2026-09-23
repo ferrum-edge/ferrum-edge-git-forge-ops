@@ -1,0 +1,9 @@
+kind: Proxy
+spec:
+  id: "orders-proxy"
+  name: "Orders API"
+  listen_path: "/orders"
+  backend_scheme: https
+  backend_host: "orders.internal"
+  backend_port: 8080
+  strip_listen_path: true

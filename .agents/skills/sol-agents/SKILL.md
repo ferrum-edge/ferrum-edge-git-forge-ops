@@ -1,11 +1,11 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate external GPT-5.6 Sol Codex CLI agents for Ferrum Edge Git Forge Ops issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-5.6 Sol agents, select medium/high/xhigh reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
+description: Dispatch and orchestrate external GPT-6 Sol Codex CLI agents for Ferrum Edge Git Forge Ops issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-6 Sol agents, select medium/high/xhigh reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
 ---
 
 # Sol agents
 
-Act as the Codex orchestrator. Treat external GPT-5.6 Sol Codex CLI processes as implementation
+Act as the Codex orchestrator. Treat external GPT-6 Sol Codex CLI processes as implementation
 workers. Own task decomposition, worktree isolation, effort selection, liveness, independent diff
 review, and the final merge recommendation. Require each worker to carry its assigned scope through
 the stopping point in the prompt. Never accept a worker's report without checking the repository
@@ -33,8 +33,8 @@ model and reasoning effort deliberately.
    - `codex` on `PATH`.
 3. Confirm that the installed CLI supports `--model`, `--config`, `--sandbox`, `--cd`, and reading
    a prompt from stdin with `-`. If the user explicitly requests fast mode, also confirm the
-   bundled model catalog lists the `priority` service tier for `gpt-5.6-sol`.
-4. Use the pinned model `gpt-5.6-sol`. Stop and report the exact error if authentication, model
+   bundled model catalog lists the `priority` service tier for `gpt-6-sol`.
+4. Use the pinned model `gpt-6-sol`. Stop and report the exact error if authentication, model
    access, requested effort, or requested service tier is rejected. Do not silently substitute
    another model, effort, or service tier.
 5. Use `danger-full-access` only for a trusted repository task where the user's requested workflow
@@ -95,7 +95,7 @@ for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or
 Omit it for every other run, including continuations unless they remain within the same explicit
 request. Record the selected mode beside each worker.
 
-The launcher pins `gpt-5.6-sol`, the reasoning effort, `danger-full-access`, the verified worktree
+The launcher pins `gpt-6-sol`, the reasoning effort, `danger-full-access`, the verified worktree
 root, and stdin prompt mode. It pins `service_tier="default"` normally and selects the model's Fast
 `priority` tier only with `--fast`. The prompt file reaches EOF cleanly, avoiding the non-TTY hang
 caused by a prompt argument with open stdin. Delete the temporary prompt after the worker exits.
@@ -116,7 +116,7 @@ Do not stop at analysis, partial implementation, or a handoff for someone else t
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including sol-agents, opus-agents, fable-agents, grok-agents, or any
+skills or scripts (including sol-agents, luna-agents, opus-agents, fable-agents, grok-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
@@ -184,5 +184,5 @@ into prompts. Never put credentials, tokens, cookies, or secrets in prompts or w
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model, effort, or service-tier mismatch: stop the worker, record the exact diagnostic, correct
-  the launch contract, and relaunch. Never claim `medium`, `high`, `xhigh`, `gpt-5.6-sol`, or fast
+  the launch contract, and relaunch. Never claim `medium`, `high`, `xhigh`, `gpt-6-sol`, or fast
   mode without launch evidence.
