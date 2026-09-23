@@ -116,14 +116,18 @@ impl PolicyCheck for RequireAiGuardrailsRule {
                 continue;
             }
 
+            // The requirement is met by the route as a whole: one effective,
+            // enforcing guardrail protects it, so an observing companion (a
+            // dry-run firewall alongside an enforcing shield) is not a finding.
+            // Only when every attached guardrail is neutered does the route lack
+            // enforcement, and then one finding names each ineffective instance.
+            let attached_count = attached.len();
             let ineffective: Vec<(&&PluginConfig, String)> = attached
                 .into_iter()
-                .filter_map(|plugin| {
-                    Self::neutered_reason(plugin).map(|reason| (plugin, reason))
-                })
+                .filter_map(|plugin| Self::neutered_reason(plugin).map(|reason| (plugin, reason)))
                 .collect();
 
-            if ineffective.is_empty() {
+            if ineffective.len() < attached_count {
                 continue;
             }
 
@@ -134,8 +138,10 @@ impl PolicyCheck for RequireAiGuardrailsRule {
                     format!("{} plugin {} has {reason}", plugin.plugin_name, plugin.id)
                 })
                 .collect();
-            let plugin_ids: Vec<&str> =
-                ineffective.iter().map(|(plugin, _)| plugin.id.as_str()).collect();
+            let plugin_ids: Vec<&str> = ineffective
+                .iter()
+                .map(|(plugin, _)| plugin.id.as_str())
+                .collect();
 
             findings.push(PolicyFinding {
                 rule_id: self.rule_id().to_string(),
