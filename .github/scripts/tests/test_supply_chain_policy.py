@@ -655,6 +655,29 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     violations,
                 )
 
+    def test_comments_do_not_fold_an_unrecognized_job_into_its_neighbor(self):
+        # Column-zero comments stay inside `jobs:`, but an unrecognized header
+        # still ends the preceding job, so its token mint is never attributed
+        # to a validated job.
+        hidden_job = self._privileged_job("promote", ordered=False).replace(
+            "  promote:\n", '  "promote":\n', 1
+        )
+        text = (
+            "jobs:\n"
+            + self._privileged_job("apply")
+            + "# staged promotion\n"
+            + hidden_job
+            + self.AUTH_LINES
+            + "\n"
+        )
+        violations = check_supply_chain.state_writer_token_violations(
+            "apply-on-merge.yml", text, "- name: Commit state update"
+        )
+        self.assertTrue(
+            any("every state-writer token mint" in item for item in violations),
+            violations,
+        )
+
     def test_two_correctly_ordered_privileged_jobs_are_accepted(self):
         text = (
             "jobs:\n"

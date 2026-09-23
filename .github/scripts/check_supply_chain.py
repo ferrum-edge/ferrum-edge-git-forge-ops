@@ -1225,12 +1225,18 @@ def workflow_jobs(text: str) -> list[tuple[str, str]]:
         r"^(?!#)\S", text[start.end():], maxsplit=1, flags=re.MULTILINE
     )[0]
     jobs: list[tuple[str, str]] = []
-    matches = list(
-        re.finditer(r"^  (?P<name>[A-Za-z0-9_-]+):\n", section, re.MULTILINE)
-    )
-    for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(section)
-        jobs.append((match.group("name"), section[match.end():end]))
+    for match in re.finditer(
+        r"^  (?P<name>[A-Za-z0-9_-]+):\n", section, re.MULTILINE
+    ):
+        # A job's body ends at the next line indented two spaces or less that
+        # is not a comment. Bounding it at the next *recognized* header instead
+        # would fold a job whose header this parser does not recognize (a
+        # quoted key, a trailing comment) into the preceding job, hiding it
+        # from the per-job checks that count what each job does.
+        body = re.split(
+            r"^ {0,2}(?!#)\S", section[match.end():], maxsplit=1, flags=re.MULTILINE
+        )[0]
+        jobs.append((match.group("name"), body))
     return jobs
 
 
