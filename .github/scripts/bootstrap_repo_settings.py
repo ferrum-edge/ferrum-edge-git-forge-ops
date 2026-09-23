@@ -111,6 +111,11 @@ ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_CA_CERT", "optional; base64 PEM for a private CA"),
     ("FERRUM_GATEWAY_CLIENT_CERT", "optional; base64 PEM, mTLS (needs the key too)"),
     ("FERRUM_GATEWAY_CLIENT_KEY", "optional; base64 PEM, mTLS (needs the cert too)"),
+    (
+        "FERRUM_VERIFY_BASE_URL",
+        "optional; https:// data-plane URL for traffic checks — required for an "
+        "environment that is a promotion predecessor",
+    ),
 )
 
 # Mirrors `MONITORING_ENVIRONMENT_SUFFIX` in `src/config/repo_config.rs` and
@@ -134,7 +139,8 @@ MONITORING_ENVIRONMENT_SECRETS = (
     ),
     (
         "FERRUM_ADMIN_JWT_ROLE",
-        "set to the least-privileged gateway role that can read GET /backup",
+        "optional; leave unset (admin) — GET /backup is admin-only today, so no "
+        "lesser role can run a drift check",
     ),
     (
         "FERRUM_ADMIN_JWT_ISSUER",

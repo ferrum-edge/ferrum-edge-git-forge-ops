@@ -165,11 +165,22 @@ python3 "$ROOT/tests/lifecycle/scenarios.py" \
 SCENARIO_STATUS=$?
 set -e
 
+# `sha256sum` on Linux runners, `shasum -a 256` on a macOS laptop — the same
+# fallback the installer uses. A missing tool must not leave the record
+# unsealed, which the gate would read as a cancelled run.
+digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
 # Seal even on failure: an unsealed result reads as "the suite was cancelled",
 # and a suite that ran and found problems is a different, louder thing.
 python3 "$ROOT/.github/scripts/lifecycle_result.py" seal \
   --result "$RESULT" \
   --revision "${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD)}" \
-  --gateway "$(sha256sum "$(command -v "${FERRUM_EDGE_BINARY_PATH:-ferrum-edge}")" | cut -d' ' -f1)"
+  --gateway "$(digest "$(command -v "${FERRUM_EDGE_BINARY_PATH:-ferrum-edge}")")"
 
 exit "$SCENARIO_STATUS"

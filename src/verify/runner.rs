@@ -30,10 +30,17 @@ use super::{resolve_headers, CheckResult, EnvironmentChecks, Outcome, SmokeCheck
 /// supports it: give the CA. `FERRUM_GATEWAY_CA_CERT` is already an
 /// environment secret and already bound in the workflow, so this is a
 /// configuration the operator has rather than a check they have to weaken.
+///
+/// Redirects are **not** followed. A check states the status the route must
+/// answer with, so a `301` is an answer to compare, not an instruction. And
+/// following one would re-send the declared headers — including a resolved
+/// credential slot in an ordinary header such as `X-API-Key`, which reqwest
+/// does not strip — to whatever host the `Location` names.
 fn client(check: &SmokeCheck, ca_cert: Option<&str>) -> crate::error::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(check.timeout())
-        .connect_timeout(Duration::from_secs(check.timeout_secs.min(10)));
+        .connect_timeout(Duration::from_secs(check.timeout_secs.min(10)))
+        .redirect(reqwest::redirect::Policy::none());
 
     if let Some(ca_b64) = ca_cert {
         let ca_pem = base64::engine::general_purpose::STANDARD

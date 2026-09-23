@@ -1,5 +1,7 @@
 .git
 .github
+# The doctor bundles this one script into the binary at build time.
+!.github/scripts/audit_settings.py
 .state
 assembled
 target
