@@ -1,4 +1,4 @@
 interface:
-  display_name: "Fable 5 Agents"
-  short_description: "Orchestrate Fable 5 coding agents"
-  default_prompt: "Use $fable-agents to dispatch Claude Fable 5 agents for this repository task."
+  display_name: "Fable 5.1 Agents"
+  short_description: "Orchestrate Fable 5.1 coding agents"
+  default_prompt: "Use $fable-agents to dispatch Claude Fable 5.1 agents for this repository task."

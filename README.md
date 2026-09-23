@@ -1412,7 +1412,7 @@ single list in [`.github/scripts/deployment_scope.py`](.github/scripts/deploymen
 | --- | --- |
 | `resources/**`, `overlays/**` | the desired gateway configuration |
 | `.gitforgeops/**` | environment routing, ownership mode, enforceable policy |
-| `src/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` | the `gitforgeops` binary the job installs |
+| `src/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**` | the `gitforgeops` binary the job installs (`.cargo/config.toml` can change rustflags, build env and dependency sources) |
 | `.github/scripts/**` | helper programs the job executes (credential loading, the validator installer, merge attribution) |
 | `.github/ferrum-edge-checksums.txt` | which validator build is trusted |
 | `.github/workflows/apply-on-merge.yml` | the deployment procedure itself |
@@ -1655,6 +1655,7 @@ Runtime variables supported by the binary include:
 | `FERRUM_ADMIN_JWT_TTL_SECS` | `3600` | Admin token lifetime. |
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validation binary path. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Accept any gateway TLS certificate. Dev only: warns loudly, and is refused under `GITHUB_ACTIONS` for a non-loopback host. See [Transport security](#transport-security). |
+| `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `gitforgeops verify` (a GitHub Environment secret in CI). Unset means `verify` refuses rather than passing vacuously. Same transport rule as `FERRUM_GATEWAY_URL`. |
 | `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Permit a cleartext `http://` `FERRUM_GATEWAY_URL`. Dev only: warns loudly, and is refused under `GITHUB_ACTIONS` for a non-loopback host. See [Transport security](#transport-security). |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for the Admin API. |
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end Admin API request timeout. Raise for large `/backup` or slow `/restore`. |
@@ -1796,7 +1797,7 @@ the answer is no" is a different thing.
 | --- | --- | --- |
 | `local` (default) | nothing | repository config and overlays, template vs deployment repository, resource tree, policy config, validator binary and digest allowlist, per-mode requirements, process-environment parse |
 | `github` (default) | `GH_TOKEN` with Administration: read | delegates to `audit_settings.py`: branch ruleset, App bypass, environment protections, labels, required checks — and republishes each violation as its own finding |
-| `gateway` (opt-in) | that environment's own credentials | `GET /health` and `GET /cluster` only: connectivity, TLS/CA/mTLS, whether the minted token's claims are accepted, and whether admin writes are enabled |
+| `gateway` (opt-in) | that environment's own credentials | `GET /health` and `GET /cluster` only. `/health` is unauthenticated on Ferrum Edge, so it answers connectivity, TLS/CA/mTLS and whether admin writes are enabled; `/cluster` sits behind the admin JWT gate, so it is what proves the signing secret and claims are accepted |
 
 The GitHub scope deliberately carries **no baseline of its own**. It runs the
 same auditor that `bootstrap_repo_settings.py` writes for and
@@ -2060,6 +2061,12 @@ environments:
 not start until `staging` has **applied** and **been shown to serve traffic**,
 for the *same source revision*.
 
+Promotion is **one stage deep**: the predecessor must itself deploy
+independently. Several environments may share one predecessor (`production`
+and `dr` both requiring `staging`), but `production` requiring a `staging` that
+itself requires `dev` is refused at load — every promoted environment runs in
+the same second phase, so the chain could never be satisfied.
+
 ### Why a record rather than `needs:`
 
 Job ordering proves two jobs ran in sequence. It proves nothing about what is
@@ -2072,12 +2079,21 @@ predecessor's record and refuses unless:
   recording, or runner lost — none of which is "staging is fine"),
 - the apply succeeded,
 - traffic verification succeeded,
-- and **the recorded revision is the one this job is about to apply**.
+- and **the recorded revision is the one this job is about to apply** — or an
+  ancestor of it that differs only outside the
+  [deployment inputs](#deployment-inputs-one-list-for-scheduling-and-for-supersession).
 
 That last condition is what makes the promotion revision-bound. Staging and
 production legitimately assemble different *bytes*, because they select
-different overlays; what must be identical is the commit the desired resources,
-the policy, the engine and the workflows all came from.
+different overlays; what must be identical is everything the desired
+resources, the policy, the engine and the workflows came from.
+
+The ancestor clause is what lets the gate pass at all: staging's apply commits
+`.state/staging.json` back to the protected branch, so the head production
+refreshes onto is staging's ledger commit, never the revision staging recorded.
+The difference is judged by the same classifier as the freshness guard, so a
+ledger, documentation or test commit in between is the same deployment and a
+resource, policy, engine or workflow commit is not.
 
 If `main` moves during staging verification or while production waits for
 approval, the freshness guard refuses the promotion rather than silently
@@ -2125,7 +2141,11 @@ entire execution surface — a `run:` or `command:` key is a load error, not a
 silently ignored one.
 
 Requests go to `FERRUM_VERIFY_BASE_URL`, the gateway's **data plane**, which is
-a different endpoint from the admin API in `FERRUM_GATEWAY_URL`. TLS is always
+a different endpoint from the admin API in `FERRUM_GATEWAY_URL`, and is held to
+the same [transport rule](#transport-security): `https://` only unless
+`FERRUM_ALLOW_INSECURE_HTTP=true`, and in CI only to a loopback host. Redirects
+are never followed — a `3xx` is an answer to compare with `expect_status`, and
+following one would re-send the check's headers to whatever host it named. TLS is always
 verified — `FERRUM_TLS_NO_VERIFY` deliberately does not reach this path,
 because a check that accepts any certificate has not verified TLS and a
 promotion gate that passes against an interceptor is worse than no gate. A
@@ -2454,6 +2474,7 @@ security or correctness fix reaches you when you deliberately adopt it.
 
 ```bash
 python3 .github/scripts/template_update.py identify        # what is installed
+python3 .github/scripts/template_update.py detect-baseline --write  # once, on a fresh copy
 python3 .github/scripts/template_update.py status          # is there anything new
 python3 .github/scripts/template_update.py plan --to v0.2.0
 python3 .github/scripts/template_update.py apply --to v0.2.0
@@ -2463,7 +2484,8 @@ It compares three ways — the baseline recorded in `.gitforgeops/baseline.json`
 the upstream target, and your tree — so an upstream change to a file you never
 touched is adopted, a file you edited that upstream did not touch is left
 alone, and a file both sides changed is reported as a **conflict** and never
-overwritten. `resources/`, `overlays/`, your environment and policy
+overwritten — you resolve it by taking upstream's file, merging, or keeping
+yours with `--keep <path>`. `resources/`, `overlays/`, your environment and policy
 configuration, `.state/`, `assembled/` and `.github/CODEOWNERS` are never read
 from upstream and never written; repository settings and secrets are outside
 Git and untouched by construction.

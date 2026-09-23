@@ -143,8 +143,13 @@ impl Check {
         self
     }
 
+    /// Attach what to do about a non-passing check. A passing check keeps no
+    /// remediation: the report would otherwise print instructions under a PASS
+    /// line, which reads as "there is still something to fix".
     pub fn remedy(mut self, remediation: impl Into<String>) -> Self {
-        self.remediation = Some(remediation.into());
+        if self.status != Status::Pass {
+            self.remediation = Some(remediation.into());
+        }
         self
     }
 
