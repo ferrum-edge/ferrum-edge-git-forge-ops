@@ -69,12 +69,17 @@ it.** In file mode `apply` writes `assembled/<env>.yaml` (and
 `assembled/<env>-mesh.yaml` when the repository declares mesh fragments) and
 commits it. Getting those documents onto a fleet is your own delivery step.
 
-Scheduled drift monitoring is bound to the deployment environment, so a nightly
-run waits for that environment's required reviewer before it can read the
-gateway. That is the approval boundary working as configured. Until
-[#262](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/262)
-lands, treat drift monitoring as approval-gated: approve the scheduled run, or
-dispatch `gitforgeops diff --exit-on-drift` yourself.
+The sample configuration leaves `monitoring.unattended` unset, so scheduled
+drift monitoring is approval-gated: its nightly run waits for the deployment
+environment's required reviewer before it can read the gateway. To opt into
+unattended checks, set `monitoring.unattended: true`; bootstrap creates and
+binds a separate `<env>-monitor` environment. Set its secrets as described in
+[launch controls §3.1](github-launch-controls.md#31-unattended-drift-monitoring).
+The monitoring environment's admin JWT signing secret is write-equivalent at
+the gateway, even though the workflow runs read-only commands. See the
+[documented caveat](../README.md#unattended-monitoring-and-when-it-is-approval-gated)
+before enabling it. You can also dispatch `gitforgeops diff --exit-on-drift`
+yourself.
 
 ### Prerequisites
 
@@ -335,22 +340,38 @@ the matching private key handy — you decrypt with
 
 ## 7. Check locally, then open the pull request
 
+### Set up the local tools
+
+Install Rust and build this checked-out repository with `cargo build`; run the
+CLI as `./target/debug/gitforgeops` (or install it with `cargo install
+--path .`). `validate` invokes a separate Ferrum Edge validator. Use the
+repository-approved Ferrum Edge v0.9.5 binary (SHA-256
+`31573f0afab23694ce0cfe432f1220dd38099e3ee643e8c5d5b6d2bb3488297c`),
+installed on `PATH` as `ferrum-edge` or selected with
+`FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The bundled workflows verify
+this digest against `.github/ferrum-edge-checksums.txt` before use.
+
+Install `age` for decrypting the delivered credential in step 8, and install
+`python3` for the bootstrap commands in steps 3 and 5. If you prefer not to
+set up local validation, skip the commands below and wait for
+`gitforgeops-required-static-validation` and `rust-ci-check` on your pull
+request; the latter runs formatting, clippy and unit tests for Rust changes.
+
 ```bash
-gitforgeops validate                 # assembles and shells out to ferrum-edge validate
-gitforgeops --env production plan    # validation + diff + breaking/security/policy + blockers
+./target/debug/gitforgeops validate                      # assembles and shells out to ferrum-edge validate
+./target/debug/gitforgeops --env production plan         # validation + diff + breaking/security/policy + blockers
 ```
 
 `plan` needs gateway credentials to compare against live state. Without them it
 still reports every *offline* blocker — literal credentials, required
 credential slots, schema, policy, security — and exits 1 if any exist.
 
-Once `gitforgeops doctor` is available
-([#264](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/264)),
-run it as the final readiness check before opening the pull request; it folds
-the local checks, the settings audit and a read-only gateway probe into one
-report. Until then, `validate` plus
-`python3 .github/scripts/bootstrap_repo_settings.py --repo OWNER/REPO` (without
-`--apply`, so it only prints drift) covers the same ground in two commands.
+Run `gitforgeops doctor` for local checks and GitHub metadata, then
+`gitforgeops doctor --scope all --env production` when production gateway
+credentials are available for the read-only gateway checks. See
+[README: Setup doctor](../README.md#setup-doctor). Keep `validate` for the
+gateway schema check and `plan` for the live diff and apply-blocker report;
+doctor does not replace either command.
 
 Open the pull request. You should see:
 
