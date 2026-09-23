@@ -187,7 +187,19 @@ python3 .github/scripts/lifecycle_result.py record \
 python3 .github/scripts/lifecycle_result.py seal \
   --result lifecycle-result.json \
   --revision "$(git rev-parse HEAD)" --gateway "<gateway digest>"
+
+# 4. Dispatch GitForgeOps Lifecycle Acceptance at that revision and provide
+#    the single-line output of this command as manual_result_base64:
+base64 -w0 lifecycle-result.json
 ```
+
+The dispatch is the authenticated publication boundary: GitHub permits only a
+repository writer to start it. The workflow verifies that the imported record
+is complete, sealed for the selected revision, and bound to the installed
+gateway digest before rerunning the five loopback scenarios into that record.
+The resulting artifact is therefore obtainable by `release.yml`; ordinary
+push and scheduled runs still start from an empty record and cannot certify
+the manual scenarios by omission.
 
 Delete the repository, its environments and its App installation when you are
 done. Nothing in it is meant to outlive the run.

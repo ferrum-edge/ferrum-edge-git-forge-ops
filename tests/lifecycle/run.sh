@@ -147,10 +147,22 @@ GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN="$(
 )"
 export GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN
 
-python3 "$ROOT/.github/scripts/lifecycle_result.py" init --result "$RESULT"
+if [ "${LIFECYCLE_PRESERVE_RESULT:-false}" = "true" ]; then
+  [ -f "$RESULT" ] || {
+    echo "::error::LIFECYCLE_PRESERVE_RESULT=true requires an existing result." >&2
+    exit 1
+  }
+else
+  python3 "$ROOT/.github/scripts/lifecycle_result.py" init --result "$RESULT"
+fi
 
 ONLY=()
-[ -n "${LIFECYCLE_ONLY:-}" ] && ONLY=(--only "$LIFECYCLE_ONLY")
+if [ -n "${LIFECYCLE_ONLY:-}" ]; then
+  IFS=',' read -r -a REQUESTED_SCENARIOS <<< "$LIFECYCLE_ONLY"
+  for scenario in "${REQUESTED_SCENARIOS[@]}"; do
+    ONLY+=(--only "$scenario")
+  done
+fi
 
 set +e
 python3 "$ROOT/tests/lifecycle/scenarios.py" \

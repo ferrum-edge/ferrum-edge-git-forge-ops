@@ -258,6 +258,11 @@ class RunbookTests(unittest.TestCase):
         self.assertIn("did not answer GET /health", runner)
         self.assertIn("exit 1", runner)
 
+    def test_the_runner_can_extend_imported_manual_evidence(self):
+        runner = (ROOT / "tests/lifecycle/run.sh").read_text(encoding="utf-8")
+        self.assertIn('LIFECYCLE_PRESERVE_RESULT:-false', runner)
+        self.assertIn('IFS=\',\' read -r -a REQUESTED_SCENARIOS', runner)
+
     def test_the_gateway_command_is_discovered_not_guessed(self):
         # A hard-coded subcommand is wrong exactly once — the moment Ferrum
         # Edge renames or removes it — and "unrecognized subcommand" tells the

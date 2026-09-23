@@ -285,6 +285,15 @@ class ReleaseGateWiringTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("tests/lifecycle/run.sh", workflow)
+
+    def test_manual_results_have_an_authenticated_import_path(self):
+        workflow = (ROOT / ".github/workflows/lifecycle.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("manual_result_base64:", workflow)
+        self.assertIn("base64 --decode > lifecycle-result.json", workflow)
+        self.assertIn("--gateway", workflow)
+        self.assertIn("LIFECYCLE_PRESERVE_RESULT:", workflow)
         self.assertIn("actions/upload-artifact@", workflow)
         # `!cancelled()` rather than `always()`: a cancelled run must leave an
         # unsealed record, which the gate reads as "did not finish".

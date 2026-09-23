@@ -19,6 +19,13 @@ on:
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      manual_result_base64:
+        description: >-
+          Base64-encoded lifecycle-result.json containing the completed manual
+          scenarios for this exact revision and pinned gateway build
+        required: false
+        type: string
 
 # Reads only. The suite talks to a loopback gateway it starts itself, with
 # credentials generated for the process and destroyed with it. It binds no
@@ -64,6 +71,21 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash .github/scripts/install-ferrum-edge.sh
 
+      # workflow_dispatch is restricted to users with write access. Importing
+      # the manually collected half here gives it an authenticated route into
+      # the same artifact that release.yml consumes. Verify its bindings before
+      # allowing the automated half to add evidence to it.
+      - name: Import manual lifecycle evidence
+        if: ${{ inputs.manual_result_base64 != '' }}
+        env:
+          MANUAL_RESULT_BASE64: ${{ inputs.manual_result_base64 }}
+        run: |
+          printf '%s' "$MANUAL_RESULT_BASE64" | base64 --decode > lifecycle-result.json
+          python3 .github/scripts/lifecycle_result.py verify \
+            --result lifecycle-result.json \
+            --revision "$GITHUB_SHA" \
+            --gateway "$(sha256sum "$(command -v ferrum-edge)" | cut -d' ' -f1)"
+
       # `!cancelled()` on the steps below, never `always()`: a cancelled run
       # must leave an UNSEALED record, which the release gate reads as "the
       # suite did not finish" rather than as a clean result.
@@ -73,6 +95,8 @@ jobs:
         env:
           GITHUB_SHA: ${{ github.sha }}
           LIFECYCLE_RESULT: ${{ github.workspace }}/lifecycle-result.json
+          LIFECYCLE_PRESERVE_RESULT: ${{ inputs.manual_result_base64 != '' }}
+          LIFECYCLE_ONLY: ${{ inputs.manual_result_base64 != '' && 'create-and-route,reapply-is-a-no-op,modify-and-delete-in-order,drift-monitoring,file-and-mesh-boundary' || '' }}
         run: bash tests/lifecycle/run.sh
 
       - name: Summarize
