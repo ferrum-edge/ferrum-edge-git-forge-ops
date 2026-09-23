@@ -2333,7 +2333,9 @@ produce the same bytes. `dpkg --purge` removes apt and unused TLS packages
 from the reviewed base. `base-image-pin-canary.yml` watches the moving Debian
 tag daily. Reintroduce a temporary digest-pinned point-release package stage
 only when that canary reports a fixed CRITICAL/HIGH the rebuilt base does not
-yet carry; never pull those fixes through apt.
+yet carry; when a clean moving tag has advanced, the canary instead requests a
+runtime digest repin so the scanned fixes reach the built image. Never pull
+those fixes through apt.
 
 ## Lifecycle acceptance
 

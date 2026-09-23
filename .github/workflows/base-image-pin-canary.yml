@@ -3,10 +3,11 @@ name: GitForgeOps Base Image Pin Canary
 # The runtime stage pins a digest of the Debian base. A temporary
 # `runtime-security-updates` builder stage may install reviewed point-release
 # packages by exact version and SHA-256 when that digest predates the fixes.
-# Four things the canary has to notice: the base catches up (retire the stage),
+# Five things the canary has to notice: the base catches up (retire the stage),
 # Debian publishes a newer point release (refresh the pins), the archive drops
 # a superseded .deb (the image build fails on a 404), or a later tag reports a
-# fix after the stage has already been retired (reintroduce the pins). A
+# fix after the stage has already been retired (reintroduce the pins), or a
+# clean moving tag no longer matches the pinned runtime digest (repin it). A
 # comment cannot notice any of them. The `trivy-image` gate notices a gap, but
 # only by turning every pull request red — which is how the perl-base and
 # libsqlite3 gap was found. This canary checks the moving tag daily and hands
