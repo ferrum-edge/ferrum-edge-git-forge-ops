@@ -24,8 +24,9 @@ paths:
   unknown outcome.
 - Incremental apply orders dependency writes before dependent writes and deletes in reverse.
   Continue collecting per-resource failures so partial application stays visible.
-- A cached `/backup` is unsafe for prune computation. Block deletes unless the existing explicit
-  acknowledgement is present; pure writes may continue.
+- A cached `/backup` (`X-Data-Source: cached`) blocks every mutation, including adds and modifies,
+  because the cached view drops API-spec ownership metadata. No flag bypasses this gate, including
+  `--allow-large-prune`.
 - Keep preview and execution semantics aligned. `diff`, `plan`, PR review, confirmation prompts,
   large-prune accounting, and apply must classify the same operation set.
 - Resource IDs interpolated into URL paths must pass the shared path-segment validation; do not

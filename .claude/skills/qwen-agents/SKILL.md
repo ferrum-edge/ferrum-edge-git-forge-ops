@@ -88,7 +88,7 @@ findings verbatim, CI-red diagnosis, per-finding guidance (fix vs acceptable-reb
 **Shepherd (drive to clean+green):** like fix round, plus loop until review-clean AND CI green.
 Only when the user wants agents babysitting CI.
 
-**Cadence override (recommended default — CI takes 20-30 min):** append:
+**Cadence override (recommended default — full CI outlasts a worker round):** append:
 "CADENCE OVERRIDE: do NOT wait for in-progress CI. Loop: reconstruct state -> fix findings + RED
 checks -> fmt -> push -> ONE review trigger -> EXIT with report."
 

@@ -44,6 +44,10 @@ import lifecycle_result  # noqa: E402  (path set above)
 
 NAMESPACE = "ferrum"
 ENVIRONMENT = "acceptance"
+ROOT = Path(__file__).resolve().parents[2]
+# The smallest MeshConfig `ferrum-edge validate -m mesh` accepts, shared with
+# the unit suite so the two cannot disagree about what a legal fragment is.
+MESH_FIXTURE = ROOT / "tests/fixtures/mesh-minimal/ferrum/mesh/minimal.yaml"
 
 
 class ScenarioFailure(AssertionError):
@@ -319,6 +323,9 @@ def scenario_modify_and_delete_in_order(harness: Harness) -> str:
         .replace('name: "Orders API"', 'name: "Orders API v2"'),
     )
     harness.run("apply", "--auto-approve")
+    # The modification must actually have landed: a converged diff is the
+    # evidence, not the apply's exit code.
+    harness.run("diff", "--exit-on-drift")
 
     # Deleting the proxy must not orphan its scoped plugin, and must happen in
     # an order the gateway accepts.
@@ -396,6 +403,14 @@ def scenario_staged_promotion(harness: Harness) -> str:
 
 def scenario_drift_monitoring(harness: Harness) -> str:
     ensure_deployed(harness)
+    # In sync first. Without this the scenario would claim three outcomes and
+    # have observed two.
+    in_sync = harness.run("diff", "--exit-on-drift", expect=None)
+    if in_sync.returncode != 0:
+        raise ScenarioFailure(
+            "a freshly applied gateway reported exit "
+            f"{in_sync.returncode}, expected in sync (0)\n{in_sync.stdout}"
+        )
     # Out-of-band change: the gateway now has a row the repository declares
     # differently. `--exit-on-drift` must say 2, and must not say 1.
     mutate_proxy_out_of_band(harness)
@@ -424,13 +439,26 @@ def scenario_file_and_mesh_boundary(harness: Harness) -> str:
     # Only the tree is needed here, not a deployed gateway: the point is that
     # assembling a document is NOT deploying it.
     seed_repository(harness)
-    output = harness.workdir / "assembled" / "acceptance.yaml"
-    harness.run(
-        "export",
-        "--output",
-        str(output),
-        FERRUM_GATEWAY_MODE="file",
-    )
+    fragment = f"resources/{NAMESPACE}/mesh/minimal.yaml"
+    harness.write(fragment, MESH_FIXTURE.read_text(encoding="utf-8"))
+    try:
+        return _file_and_mesh_boundary(harness)
+    finally:
+        # Mesh is file-only; leave the api-mode tree the other scenarios use.
+        harness.remove(fragment)
+
+
+def _file_and_mesh_boundary(harness: Harness) -> str:
+    assembled = harness.workdir / "assembled"
+    output = assembled / "acceptance.yaml"
+    mesh_output = assembled / "acceptance-mesh.yaml"
+    file_mode = {
+        "FERRUM_GATEWAY_MODE": "file",
+        "FERRUM_MESH_FILE_OUTPUT_PATH": str(mesh_output),
+    }
+
+    # 1. Assembly: a commit-safe gateway document, and a SEPARATE mesh document.
+    harness.run("export", "--output", str(output), **file_mode)
     if not output.is_file():
         raise ScenarioFailure("file-mode export wrote no document")
     text = output.read_text(encoding="utf-8")
@@ -439,10 +467,41 @@ def scenario_file_and_mesh_boundary(harness: Harness) -> str:
             "the exported document has no placeholder left, so it is not the "
             "commit-safe artifact export promises"
         )
-    for secret in harness._secrets:  # noqa: SLF001 - the harness is the owner
-        if secret in text:
-            raise ScenarioFailure("a credential value reached the exported document")
-    return "file-mode assembly preserves placeholders; assembly is not deployment"
+    key = harness_key(harness)
+    if key in text:
+        raise ScenarioFailure("a credential value reached the exported document")
+    if not mesh_output.is_file():
+        raise ScenarioFailure("a declared MeshConfig produced no mesh document")
+    mesh = mesh_output.read_text(encoding="utf-8")
+    if "mesh:" not in mesh or "spiffe://cluster.local/ns/ferrum/sa/api" not in mesh:
+        raise ScenarioFailure("the mesh document does not carry the declared workload")
+    if "proxies:" in mesh or "workloads:" in text:
+        raise ScenarioFailure(
+            "the gateway and mesh documents were mixed; a mesh node rejects a "
+            "document carrying gateway resources"
+        )
+
+    # 2. Materialization: the credential appears ONLY in a private file.
+    materialized = assembled / "acceptance.materialized.yaml"
+    harness.run("export", "--materialize", "--output", str(materialized), **file_mode)
+    if key not in materialized.read_text(encoding="utf-8"):
+        raise ScenarioFailure("materialization did not resolve the seeded credential")
+    mode = materialized.stat().st_mode & 0o777
+    if mode != 0o600:
+        raise ScenarioFailure(
+            f"the materialized document is mode {oct(mode)}; plaintext credentials "
+            "must be written 0600"
+        )
+    if key in output.read_text(encoding="utf-8"):
+        raise ScenarioFailure("materializing rewrote the commit-safe document")
+    materialized.unlink()
+
+    return (
+        "file-mode assembly preserves placeholders and writes a separate mesh "
+        "document; materialization is 0600 and never touches the committed "
+        "artifact. Encrypted delivery needs a GitHub key and is covered by "
+        "credentials-generate-and-rotate"
+    )
 
 
 SCENARIOS = {

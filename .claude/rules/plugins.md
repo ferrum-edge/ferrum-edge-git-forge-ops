@@ -17,13 +17,14 @@ paths:
   priority ordering and all instances where the policy intentionally reasons about multiplicity.
 - New policy rules implement `PolicyCheck`, add typed config in `src/policy/config.rs`, register in
   `src/policy/registry.rs`, default to disabled, and include unit coverage.
-- Policy severity `error` blocks apply unless the configured label exists and the effective label
-  actor currently has at least the required repository permission. Pagination and unknown
-  permissions fail closed.
-- The credential broker currently resolves consumer credentials only. `PluginConfig.config` values
-  are neither brokered nor masked on this branch, so repository plugin configs must not contain
-  secrets. Any future plugin-secret support must add explicit import, diff, review, and log-redaction
-  behavior with tests before this rule can claim that protection.
+- Policy severity `error` blocks apply unless overridden. An override needs the configured PR
+  label, a latest labeler who currently has at least the required repository permission, and that
+  account's latest review on the current head with body `gitforgeops-override <label>`
+  (`src/policy/github_override.rs`). Pagination and unknown permissions fail closed.
+- `PluginConfig.config` secrets are brokered under `<ns>/<plugin-id>/@plugin-config/config/<path>`.
+  `src/secrets/plugin_config.rs` classifies which leaves are sensitive; the same paths drive
+  import capture, diff/review masking, and validator-output scrubbing. A new secret-bearing plugin
+  field needs a classification entry plus import, diff, review, and redaction tests.
 - Never print resolved consumer credentials, credential bundles, or validator diagnostics that may
   echo them.
 - Spec-owned plugin configs follow the same ownership rules as spec-owned proxies/upstreams and are

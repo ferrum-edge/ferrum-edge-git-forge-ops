@@ -15,6 +15,7 @@ on:
   push:
     branches: [main]
     paths:
+      - '.cargo/**'
       - '.github/ferrum-edge-checksums.txt'
       - '.github/scripts/**'
       - '.github/workflows/apply-on-merge.yml'
@@ -239,8 +240,16 @@ jobs:
           # executable, so the revision applied here is still the one the
           # triggering PR authorized and the run proceeds instead of stranding
           # the deployment.
-          python3 .github/scripts/deployment_scope.py classify \
+          # Load the classifier from the triggering revision, not the refreshed
+          # checkout it is deciding whether to trust. Otherwise a newer commit
+          # could replace this program and approve its own executable changes
+          # under the older run's environment authorization.
+          trusted_classifier=$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")
+          trap 'rm -f "${trusted_classifier:-}"; git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"
+          python3 "$trusted_classifier" classify \
             "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"
+          rm -f "$trusted_classifier"
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Download ferrum-edge binary
@@ -452,10 +461,13 @@ jobs:
       # `continue-on-error` so the outcome is recorded rather than the job
       # ending here; the record is what blocks a promotion, and a run that
       # stops before recording is indistinguishable from one that never
-      # started.
+      # started. A repository that declares no `.gitforgeops/smoke.yaml` has
+      # opted out of traffic checks: the step is skipped rather than failed on
+      # every apply, and the record says `not_run`, which still authorizes no
+      # promotion.
       - name: Verify traffic
         id: verify
-        if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' }}
+        if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' && hashFiles('.gitforgeops/smoke.yaml') != '' }}
         continue-on-error: true
         env:
           FERRUM_ENV: ${{ matrix.environment }}
@@ -507,7 +519,7 @@ jobs:
       # The apply step ran with `continue-on-error` so its outcome could be
       # recorded. Fail the job now, after the record exists.
       - name: Fail on apply error
-        if: ${{ !cancelled() && steps.apply.outcome == 'failure' || steps.apply-file.outcome == 'failure' }}
+        if: ${{ !cancelled() && (steps.apply.outcome == 'failure' || steps.apply-file.outcome == 'failure') }}
         run: |
           echo "::error::The apply step failed; see its output above."
           exit 1
@@ -734,12 +746,23 @@ jobs:
           # executable, so the revision applied here is still the one the
           # triggering PR authorized and the run proceeds instead of stranding
           # the deployment.
-          python3 .github/scripts/deployment_scope.py classify \
+          # Load the classifier from the triggering revision, not the refreshed
+          # checkout it is deciding whether to trust. Otherwise a newer commit
+          # could replace this program and approve its own executable changes
+          # under the older run's environment authorization.
+          trusted_classifier=$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")
+          trap 'rm -f "${trusted_classifier:-}"; git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
+          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"
+          python3 "$trusted_classifier" classify \
             "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"
+          rm -f "$trusted_classifier"
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       # The revision is fixed by the guard above. Now prove it is the one the
-      # predecessor applied and verified.
+      # predecessor applied and verified — or a descendant of it that differs
+      # only outside the deployment inputs. That second case is the normal one:
+      # the predecessor's own ledger commit has moved the branch by the time
+      # this job refreshes it, so an exact-SHA test could never pass.
       #
       # A newer deployment-affecting merge does not silently ride this
       # approval: the guard has already refused it, and the newer merge runs
@@ -762,6 +785,7 @@ jobs:
             --environment "$REQUIRES" \
             --revision "$REVISION" \
             --records promotion-records \
+            --repo . \
             --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Download ferrum-edge binary
@@ -973,10 +997,13 @@ jobs:
       # `continue-on-error` so the outcome is recorded rather than the job
       # ending here; the record is what blocks a promotion, and a run that
       # stops before recording is indistinguishable from one that never
-      # started.
+      # started. A repository that declares no `.gitforgeops/smoke.yaml` has
+      # opted out of traffic checks: the step is skipped rather than failed on
+      # every apply, and the record says `not_run`, which still authorizes no
+      # promotion.
       - name: Verify traffic
         id: verify
-        if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' }}
+        if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' && hashFiles('.gitforgeops/smoke.yaml') != '' }}
         continue-on-error: true
         env:
           FERRUM_ENV: ${{ matrix.scope.environment }}
@@ -1028,7 +1055,7 @@ jobs:
       # The apply step ran with `continue-on-error` so its outcome could be
       # recorded. Fail the job now, after the record exists.
       - name: Fail on apply error
-        if: ${{ !cancelled() && steps.apply.outcome == 'failure' || steps.apply-file.outcome == 'failure' }}
+        if: ${{ !cancelled() && (steps.apply.outcome == 'failure' || steps.apply-file.outcome == 'failure') }}
         run: |
           echo "::error::The apply step failed; see its output above."
           exit 1

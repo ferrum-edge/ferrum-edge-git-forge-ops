@@ -634,6 +634,27 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("job 'apply'" in item for item in violations), violations
         )
 
+    def test_unrecognized_job_headers_cannot_hide_a_token_mint(self):
+        for header in ('  "promote":\n', "  promote: # privileged job\n"):
+            with self.subTest(header=header.rstrip()):
+                hidden_job = self._privileged_job("promote", ordered=False).replace(
+                    "  promote:\n", header, 1
+                )
+                text = (
+                    "jobs:\n"
+                    + self._privileged_job("apply")
+                    + hidden_job
+                    + self.AUTH_LINES
+                    + "\n"
+                )
+                violations = check_supply_chain.state_writer_token_violations(
+                    "apply-on-merge.yml", text, "- name: Commit state update"
+                )
+                self.assertTrue(
+                    any("every state-writer token mint" in item for item in violations),
+                    violations,
+                )
+
     def test_two_correctly_ordered_privileged_jobs_are_accepted(self):
         text = (
             "jobs:\n"
@@ -1442,7 +1463,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path = root / ".github/workflows/apply-on-merge.yml"
             text = path.read_text(encoding="utf-8")
             text = text.replace(
-                "          python3 .github/scripts/deployment_scope.py classify \\\n"
+                '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+                '          python3 "$trusted_classifier" classify \\\n'
                 '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
                 "          true\n",
                 1,
@@ -1470,7 +1492,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             [],
         )
         legacy = workflow.replace(
-            "          python3 .github/scripts/deployment_scope.py classify \\\n"
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+            '          python3 "$trusted_classifier" classify \\\n'
             '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
             '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
             "            ':(exclude).state/**' ':(exclude)assembled/**'\n",
@@ -1486,6 +1509,48 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 for item in violations
             ),
             violations,
+        )
+
+    def test_the_trigger_pinned_classifier_is_the_recognized_binding(self):
+        # Running the classifier extracted from the triggering commit keeps a
+        # refreshed head from replacing the program that judges it.
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('python3 "$trusted_classifier" classify \\\n', workflow)
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "apply-on-merge.yml", workflow, contract
+            ),
+            [],
+        )
+        # Extracting the trusted copy without running it is not a binding.
+        unused = workflow.replace(
+            '          python3 "$trusted_classifier" classify \\\n',
+            "          true \\\n",
+        )
+        self.assertTrue(
+            any(
+                "no recognized implementation is complete" in item
+                for item in check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", unused, contract
+                )
+            )
+        )
+        # The retired checkout-executed form lets the refreshed head run its
+        # own classifier, so it is no longer a recognized binding.
+        checkout_executed = workflow.replace(
+            '          python3 "$trusted_classifier" classify \\\n',
+            "          python3 .github/scripts/deployment_scope.py classify \\\n",
+        )
+        self.assertTrue(
+            any(
+                "no recognized implementation is complete" in item
+                for item in check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", checkout_executed, contract
+                )
+            )
         )
 
     def test_a_half_present_attribution_binding_is_still_rejected(self):

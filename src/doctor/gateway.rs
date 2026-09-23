@@ -2,10 +2,17 @@
 //!
 //! Everything below is a **read**. `AdminClient` construction validates the
 //! transport configuration (scheme, CA, mTLS pairing) before a socket opens;
-//! `GET /health` then proves connectivity, TLS trust and — crucially — whether
-//! the minted token's claims are the ones the gateway accepts. No mutating
-//! endpoint is reachable from here, which is why the module exposes only these
-//! two calls.
+//! then two calls answer two different questions:
+//!
+//! * `GET /health` — is the gateway reachable over this transport, and does it
+//!   accept admin writes? Ferrum Edge serves `/health` **without
+//!   authentication**, so an answer here says nothing about the token.
+//! * `GET /cluster` — does the gateway accept the token we mint? It sits behind
+//!   the admin JWT gate with no role requirement, so a 401/403 there is the
+//!   signing secret or a claim being wrong, and a 200 is proof they are right.
+//!
+//! No mutating endpoint is reachable from here, which is why the module exposes
+//! only these two calls.
 //!
 //! The point of running it at all is that presence is not correctness. A
 //! `FERRUM_ADMIN_JWT_SECRET` that is set but wrong passes every local check and
@@ -22,7 +29,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
     if matches!(env.gateway_mode, GatewayMode::File) {
         return vec![Check::new(
             "gateway-reachable",
-            "Gateway is reachable and accepts our token",
+            "Gateway is reachable",
             Scope::Gateway,
             Status::Skipped,
             "file mode has no Admin API to contact",
@@ -33,7 +40,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
     if env.gateway_url.is_none() || env.admin_jwt_secret.is_none() {
         return vec![Check::new(
             "gateway-reachable",
-            "Gateway is reachable and accepts our token",
+            "Gateway is reachable",
             Scope::Gateway,
             Status::Unknown,
             "no gateway URL or signing secret in this process environment",
@@ -79,10 +86,11 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
             checks.push(
                 Check::pass(
                     "gateway-reachable",
-                    "Gateway is reachable and accepts our token",
+                    "Gateway is reachable",
                     Scope::Gateway,
                     format!(
-                        "GET /health answered: mode={}, ready={}, admin_writes_enabled={}",
+                        "GET /health (unauthenticated) answered: mode={}, ready={}, \
+                         admin_writes_enabled={}",
                         health.mode.as_deref().unwrap_or("unknown"),
                         health
                             .ready
@@ -118,44 +126,27 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
             }
         }
         Err(error) => {
-            let message = error.to_string();
-            let unauthorized = message.contains("401") || message.contains("403");
             checks.push(
                 Check::new(
                     "gateway-reachable",
-                    "Gateway is reachable and accepts our token",
+                    "Gateway is reachable",
                     Scope::Gateway,
                     Status::Fail,
-                    format!("GET /health failed: {message}"),
+                    format!("GET /health failed: {error}"),
                 )
                 .for_environment(environment)
-                .remedy(if unauthorized {
-                    // The four claim settings are the usual cause, and an
-                    // unset one means "use the default", not "send nothing".
-                    format!(
-                        "The gateway was reached but rejected the token. Every claim \
-                         must equal the gateway's own configuration: issuer={}, \
-                         role={}, audience={}, ttl={}s. `/backup` and `/restore` are \
-                         admin-only, and a gateway with no audience rejects a token \
-                         that carries one.",
-                        env.admin_jwt_issuer,
-                        env.admin_jwt_role,
-                        env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
-                        env.admin_jwt_ttl_secs,
-                    )
-                } else {
+                .remedy(
                     "The gateway was not reached. Check the URL, network path, and — \
                      for a private CA — that FERRUM_GATEWAY_CA_CERT holds the \
-                     base64-encoded PEM that signs the gateway's certificate."
-                        .to_string()
-                }),
+                     base64-encoded PEM that signs the gateway's certificate.",
+                ),
             );
             // Nothing below can be answered once /health failed; say so rather
-            // than leaving the pairing question silently absent.
+            // than leaving the token question silently absent.
             checks.push(
                 Check::new(
-                    "gateway-pairing",
-                    "Gateway and client are a supported pairing",
+                    "gateway-token",
+                    "Gateway accepts our admin token",
                     Scope::Gateway,
                     Status::Unknown,
                     "not attempted: the gateway did not answer /health",
@@ -166,32 +157,59 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
         }
     }
 
-    // Advisory: a gateway that cannot answer `/cluster` (older build, DP node,
-    // file/database mode) is not broken, so this never fails.
+    // The authenticated half. `/cluster` passes the admin JWT gate and has no
+    // role requirement, so its answer is about the token and nothing else.
     match client.get_cluster().await {
         Ok(cluster) => checks.push(
             Check::pass(
-                "gateway-pairing",
-                "Gateway and client are a supported pairing",
+                "gateway-token",
+                "Gateway accepts our admin token",
                 Scope::Gateway,
-                crate::http_client::convergence_summary(&cluster),
+                format!(
+                    "GET /cluster accepted the minted token; {}",
+                    crate::http_client::convergence_summary(&cluster)
+                ),
             )
             .for_environment(environment),
         ),
-        Err(error) => checks.push(
-            Check::new(
-                "gateway-pairing",
-                "Gateway and client are a supported pairing",
-                Scope::Gateway,
-                Status::Unknown,
-                format!("GET /cluster did not answer: {error}"),
-            )
-            .for_environment(environment)
-            .remedy(
-                "Advisory only — an older gateway build or a non-clustered mode has \
-                 no cluster to report. It does not block an apply.",
-            ),
-        ),
+        Err(error) => {
+            let message = error.to_string();
+            let rejected = message.contains("401") || message.contains("403");
+            checks.push(
+                Check::new(
+                    "gateway-token",
+                    "Gateway accepts our admin token",
+                    Scope::Gateway,
+                    if rejected {
+                        Status::Fail
+                    } else {
+                        Status::Unknown
+                    },
+                    format!("GET /cluster failed: {message}"),
+                )
+                .for_environment(environment)
+                .remedy(if rejected {
+                    // The four claim settings are the usual cause, and an
+                    // unset one means "use the default", not "send nothing".
+                    format!(
+                        "The gateway was reached but rejected the token. The signing \
+                         secret and every claim must equal the gateway's own \
+                         configuration: issuer={}, role={}, audience={}, ttl={}s. \
+                         `/backup` and `/restore` are admin-only, and a gateway with no \
+                         audience rejects a token that carries one.",
+                        env.admin_jwt_issuer,
+                        env.admin_jwt_role,
+                        env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
+                        env.admin_jwt_ttl_secs,
+                    )
+                } else {
+                    "The authenticated read did not complete, so whether the gateway \
+                     accepts this token is not known. Re-run once the gateway answers \
+                     GET /cluster."
+                        .to_string()
+                }),
+            );
+        }
     }
 
     checks
