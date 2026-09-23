@@ -334,6 +334,7 @@ be named with the suffix: the settings audit waives its required-reviewer rule
 for exactly that shape.
 
 Three independent fences bound what the reviewer-free environment can reach:
+its custom deployment policy admits only the repository's exact default branch;
 `audit_settings.py` rejects a `<env>-monitor` holding
 `GITFORGEOPS_STATE_APP_PRIVATE_KEY`, `FERRUM_GH_PROVISIONER_TOKEN`,
 `SETTINGS_AUDIT_TOKEN` or `FERRUM_CREDS_BUNDLE[_N]` (secret *names* only, never
@@ -383,7 +384,10 @@ twice: it is also `apply-on-merge.yml`'s `on.push.paths` filter, and
 two halves disagree. Equality is the invariant — a change that supersedes a
 queued apply always schedules a replacement run, and a change that schedules
 nothing (docs, `tests/**`, an unrelated workflow) can never supersede, so it no
-longer strands an authorized deployment. `GENERATED_PATHS` (`.state/**`,
+longer strands an authorized deployment. The workflow extracts the classifier
+from the triggering commit before executing it; the refreshed head cannot
+approve its own helper or executable changes under an older authorization.
+`GENERATED_PATHS` (`.state/**`,
 `assembled/**`) is in neither half: the apply writes it, so it must not reject a
 queued run and must not re-trigger the job that produced it. Operator recovery
 for an already-superseded run is `README.md#recovering-a-superseded-apply`.
@@ -653,7 +657,9 @@ load-bearing:
 3. **It owns no baseline.** Repository settings are judged by running
    `audit_settings.py` — the same script `bootstrap_repo_settings.py` writes for
    and `settings-audit.yml` schedules — and republishing each violation as its
-   own `settings-control` check, so the three cannot drift apart.
+   own `settings-control` check, so the three cannot drift apart. Doctor runs
+   the copy compiled into its binary (`python3 -I -c`), never the checkout's,
+   with only `GH_TOKEN` and the variables `python3`/`gh` need to reach GitHub.
 
 Scopes are trust boundaries, not subjects: `local` (no credential), `github`
 (administration-read token) and `gateway` (that environment's deployment

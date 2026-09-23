@@ -24,12 +24,12 @@ impl PolicyCheck for PluginNameIsKnownRule {
             return findings;
         }
 
-        let extra: Vec<String> = self
-            .config
-            .allowed_extra_plugin_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
+        // Custom plugin names are compared exactly, matching Ferrum Edge's
+        // generated `create_custom_plugin` match arms: the gateway loads a
+        // custom plugin only when the serialized `plugin_name` equals the
+        // compiled stem, so a case variant is not loadable even when the
+        // correctly cased name is allowed here.
+        let extra: &[String] = &self.config.allowed_extra_plugin_names;
 
         for plugin in &cfg.plugin_configs {
             let name = plugin.plugin_name.as_str();
@@ -41,7 +41,7 @@ impl PolicyCheck for PluginNameIsKnownRule {
                 continue;
             }
 
-            if is_builtin(name) || extra.contains(&name.to_ascii_lowercase()) {
+            if is_builtin(name) || extra.iter().any(|allowed| allowed == name) {
                 continue;
             }
 

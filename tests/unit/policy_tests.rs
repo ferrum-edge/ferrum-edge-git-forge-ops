@@ -2979,6 +2979,75 @@ fn require_ai_guardrails_rejects_a_dry_run_guardrail() {
 }
 
 #[test]
+fn require_ai_guardrails_accepts_an_enforcing_companion_to_a_dry_run_guardrail() {
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("llm", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![
+            catalog_plugin(
+                "mcp-1",
+                "mcp_gateway",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            catalog_plugin(
+                "shield-1",
+                "ai_prompt_shield",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            catalog_plugin(
+                "fw-1",
+                "ai_semantic_firewall",
+                PluginScope::Global,
+                None,
+                serde_json::json!({"mode": "dry_run"}),
+            ),
+        ],
+        ..Default::default()
+    };
+    assert!(evaluate_policies(&cfg, &ai_policies()).is_empty());
+}
+
+#[test]
+fn require_ai_guardrails_groups_observing_guardrails_into_one_finding() {
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("llm", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![
+            catalog_plugin(
+                "mcp-1",
+                "mcp_gateway",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            catalog_plugin(
+                "shield-1",
+                "ai_prompt_shield",
+                PluginScope::Global,
+                None,
+                serde_json::json!({"mode": "dry_run"}),
+            ),
+            catalog_plugin(
+                "fw-2",
+                "ai_semantic_firewall",
+                PluginScope::Global,
+                None,
+                serde_json::json!({"on_error": "warn"}),
+            ),
+        ],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &ai_policies());
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("mode: dry_run"));
+    assert!(findings[0].message.contains("on_error: warn"));
+    assert!(findings[0].message.contains("ai_prompt_shield"));
+    assert!(findings[0].message.contains("ai_semantic_firewall"));
+}
+
+#[test]
 fn require_ai_guardrails_ignores_non_ai_routes() {
     let cfg = GatewayConfig {
         proxies: vec![proxy("plain", BackendScheme::Https, 30_000, true)],
@@ -3177,7 +3246,7 @@ fn unknown_custom_plugin_names_keep_opt_in_severity_and_allowlist_behavior() {
                 .policies
                 .plugin_name_is_known
                 .allowed_extra_plugin_names
-                .push("COMPANY_SSO".into());
+                .push("company_sso".into());
             assert!(evaluate_policies(&cfg, &policy).is_empty());
         }
     }
@@ -3193,6 +3262,25 @@ fn plugin_name_is_known_warns_on_unknown_names_and_accepts_declared_customs() {
 
     let declared = known_name_policies(vec!["company_sso".to_string()]);
     assert!(evaluate_policies(&cfg, &declared).is_empty());
+}
+
+#[test]
+fn plugin_name_is_known_matches_custom_plugin_names_exactly() {
+    let exact = named_plugin_config("acme_auth");
+    let declared = known_name_policies(vec!["acme_auth".to_string()]);
+    assert!(
+        evaluate_policies(&exact, &declared).is_empty(),
+        "an exact custom name must be accepted"
+    );
+
+    let variant = named_plugin_config("Acme_Auth");
+    let findings = evaluate_policies(&variant, &declared);
+    assert_eq!(findings.len(), 1, "a case variant must not be accepted");
+    assert_eq!(findings[0].kind, "PluginConfig");
+    assert!(
+        findings[0].message.contains("Acme_Auth"),
+        "the unknown-name finding must name the configured spelling"
+    );
 }
 
 #[test]
