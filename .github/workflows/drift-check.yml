@@ -173,8 +173,9 @@ jobs:
           FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
           # Optional JWT claim settings; see apply-on-merge.yml for why they
           # are bound explicitly and why blank means "unset", not "empty".
-          # A monitoring environment should set FERRUM_ADMIN_JWT_ROLE to the
-          # gateway's least-privileged role that can still read `GET /backup`.
+          # `GET /backup` is admin-only today, so a monitoring environment's
+          # token is admin-role and its signing secret is write-equivalent at
+          # the gateway; see docs/github-launch-controls.md §3.1.
           FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
           FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
           FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}

@@ -184,9 +184,14 @@ jobs:
             exit 1
           }
 
+          # The suite runs whichever allowlisted build the installer resolves,
+          # so the result is bound to THIS revision's allowlist rather than to
+          # one digest: a result from a build the release does not trust
+          # certifies nothing about it.
           python3 .github/scripts/lifecycle_result.py verify \
             --result acceptance/lifecycle-result.json \
             --revision "$RELEASE_SHA" \
+            --gateway-allowlist .github/ferrum-edge-checksums.txt \
             --summary "$GITHUB_STEP_SUMMARY"
 
   docker:

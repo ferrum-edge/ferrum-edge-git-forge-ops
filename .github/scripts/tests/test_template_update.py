@@ -299,6 +299,91 @@ class TemplateUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CONFLICTS", result.stdout)
 
+    # -- resolving a conflict by keeping the local file ----------------------
+
+    def _readme_conflict(self) -> None:
+        self.fixture.customer_change({"README.md": "# our team's readme\n"})
+        self.fixture.upstream_change({"README.md": "# upstream readme v2\n"}, "v2")
+
+    def test_keeping_the_local_file_resolves_the_conflict_and_advances(self):
+        # The runbook tells operators to keep their own README. Without an
+        # explicit way to say so, that conflict could never clear and the
+        # baseline could never advance again.
+        self._readme_conflict()
+        result = self.fixture.run("apply", "--keep", "README.md")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Kept by decision (1)", result.stdout)
+        self.assertEqual(self.fixture.read("README.md"), "# our team's readme\n")
+        self.assertNotEqual(
+            json.loads(self.fixture.read(".gitforgeops/baseline.json"))["commit"],
+            self.fixture.baseline,
+        )
+
+    def test_keep_resolves_only_the_path_it_names(self):
+        self._readme_conflict()
+        self.fixture.customer_change(
+            {".github/workflows/apply-on-merge.yml": "name: GitForgeOps Apply\n# ours\n"}
+        )
+        self.fixture.upstream_change(
+            {".github/workflows/apply-on-merge.yml": "name: GitForgeOps Apply\n# v3\n"},
+            "v3",
+        )
+        result = self.fixture.run("apply", "--keep", "README.md")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("CONFLICTS (1)", result.stdout)
+        self.assertIn("Baseline NOT advanced", result.stderr)
+
+    def test_keep_refuses_a_path_that_is_not_in_conflict(self):
+        # A typo, or a decision left over from an older update, must not read
+        # as "resolved".
+        self._readme_conflict()
+        result = self.fixture.run("apply", "--keep", "README.MD")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not in conflict", result.stderr)
+        self.assertEqual(self.fixture.read("README.md"), "# our team's readme\n")
+
+    # -- finding the real baseline of a fresh copy ---------------------------
+
+    def test_detect_baseline_finds_the_commit_a_copy_was_taken_from(self):
+        # "Use this template" copies upstream's own baseline.json, which names
+        # an older commit than the one actually copied.
+        copied = self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+        self.fixture.upstream_change({"src/main.rs": "// v3\n"}, "v3")
+        self.fixture.customer_change({"src/main.rs": "// v2\n"})
+
+        report = self.fixture.run("detect-baseline")
+        self.assertEqual(report.returncode, 0, report.stdout + report.stderr)
+        self.assertIn(f"exact match: this tree was copied from {copied}", report.stdout)
+        self.assertIn("--write", report.stdout)
+        # Reporting does not write.
+        self.assertEqual(
+            json.loads(self.fixture.read(".gitforgeops/baseline.json"))["commit"],
+            self.fixture.baseline,
+        )
+
+        written = self.fixture.run("detect-baseline", "--write")
+        self.assertEqual(written.returncode, 0, written.stderr)
+        self.assertEqual(
+            json.loads(self.fixture.read(".gitforgeops/baseline.json"))["commit"],
+            copied,
+        )
+        # And with the real baseline, v3 adopts cleanly instead of conflicting.
+        adopted = self.fixture.run("apply")
+        self.assertEqual(adopted.returncode, 0, adopted.stdout + adopted.stderr)
+        self.assertEqual(self.fixture.read("src/main.rs"), "// v3\n")
+
+    def test_an_inexact_match_is_reported_but_not_recorded_without_a_decision(self):
+        self.fixture.customer_change({"src/main.rs": "// our own edit\n"})
+        report = self.fixture.run("detect-baseline", "--write")
+        self.assertEqual(report.returncode, 1, report.stdout)
+        self.assertIn("closest upstream commit", report.stdout)
+        accepted = self.fixture.run("detect-baseline", "--write", "--accept-closest")
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        self.assertEqual(
+            json.loads(self.fixture.read(".gitforgeops/baseline.json"))["commit"],
+            self.fixture.baseline,
+        )
+
     # -- idempotence and identification -------------------------------------
 
     def test_adopting_twice_is_a_no_op(self):

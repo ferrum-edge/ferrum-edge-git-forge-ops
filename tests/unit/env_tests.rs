@@ -1,7 +1,8 @@
 use std::sync::{Mutex, MutexGuard};
 
 use gitforgeops::config::env::{
-    load_env_config, validate_gateway_transport, ApplyStrategy, GatewayMode,
+    load_env_config, validate_gateway_transport, validate_verify_transport, ApplyStrategy,
+    GatewayMode,
 };
 
 // Env tests mutate process-global state and must run serially. Cargo's test
@@ -456,6 +457,49 @@ fn gateway_transport_refuses_embedded_credentials_without_echoing_them() {
         assert!(error.contains("credentials"), "{url}: {error}");
         assert!(!error.contains("hunter2"), "secret echoed back: {error}");
         assert!(!error.contains("admin@"), "userinfo echoed back: {error}");
+    }
+}
+
+/// `verify` sends credential-slot headers to the data plane, so its base URL
+/// gets the admin API's transport rule rather than none at all.
+#[test]
+fn verify_base_url_follows_the_gateway_transport_rule() {
+    assert!(validate_verify_transport(None, false, true)
+        .expect("unset is not a transport")
+        .is_empty());
+    assert!(
+        validate_verify_transport(Some("https://edge.example.com"), false, true)
+            .expect("https is accepted")
+            .is_empty()
+    );
+
+    let error = validate_verify_transport(Some("http://edge.example.com"), false, false)
+        .expect_err("cleartext is refused by default")
+        .to_string();
+    assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{error}");
+    assert!(error.contains("FERRUM_ALLOW_INSECURE_HTTP"), "{error}");
+
+    let error = validate_verify_transport(Some("http://edge.example.com"), true, true)
+        .expect_err("the opt-in does not reach a remote host in CI")
+        .to_string();
+    assert!(error.contains("GITHUB_ACTIONS"), "{error}");
+    assert!(error.contains("edge.example.com"), "{error}");
+
+    // The lifecycle suite's shape: a loopback data plane in CI, opted in.
+    let warnings = validate_verify_transport(Some("http://127.0.0.1:18081"), true, true)
+        .expect("loopback stays allowed in CI with the opt-in");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+    for url in [
+        "https://user:hunter2@edge.example.com",
+        "ftp://edge.example.com",
+        "not a url",
+    ] {
+        let error = validate_verify_transport(Some(url), true, false)
+            .expect_err("never a credential-bearing or foreign URL")
+            .to_string();
+        assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{url}: {error}");
+        assert!(!error.contains("hunter2"), "secret echoed back: {error}");
     }
 }
 

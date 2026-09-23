@@ -326,8 +326,13 @@ fn a_missing_auditor_is_unknown_not_a_pass() {
 
 // -- the gateway scope reads, and only reads -------------------------------
 
-/// Answer `GET /health` and `GET /cluster` with a fixed status, recording every
-/// request line so a test can prove nothing was mutated.
+/// Answer `GET /health` and `GET /cluster` the way Ferrum Edge does, recording
+/// every request line so a test can prove nothing was mutated.
+///
+/// `/health` is unauthenticated on the real gateway — it answers 200 whatever
+/// token is presented — so only `/cluster`, which sits behind the admin JWT
+/// gate, takes `status`. A stub that rejected `/health` would test a gateway
+/// that does not exist, and let a token check pass on the one that does.
 fn spawn_gateway_stub(status: u16, requests: Arc<Mutex<Vec<String>>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let addr = listener.local_addr().expect("addr");
@@ -359,6 +364,11 @@ fn spawn_gateway_stub(status: u16, requests: Arc<Mutex<Vec<String>>>) -> String 
                 } else {
                     r#"{"status":"ok","ready":true,"mode":"cp","admin_writes_enabled":true}"#
                         .to_string()
+                };
+                let status = if first.contains("/cluster") {
+                    status
+                } else {
+                    200
                 };
                 let body = if status == 200 {
                     body
@@ -399,6 +409,7 @@ async fn the_gateway_scope_issues_reads_only() {
 
     assert_eq!(find(&checks, "gateway-transport").status, Status::Pass);
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Pass);
+    assert_eq!(find(&checks, "gateway-token").status, Status::Pass);
     assert_eq!(
         find(&checks, "gateway-reachable").environment.as_deref(),
         Some("production")
@@ -429,14 +440,24 @@ async fn a_rejected_token_is_reported_with_the_claim_settings_to_compare() {
     env.admin_jwt_issuer = "wrong-issuer".to_string();
     let checks = doctor::gateway::run("production", &env).await;
 
-    let reachable = find(&checks, "gateway-reachable");
-    assert_eq!(reachable.status, Status::Fail);
-    let remediation = reachable.remediation.as_ref().expect("remediation");
+    // `/health` is unauthenticated, so reaching it proves nothing about the
+    // token: the gateway is reachable AND rejects the token, and the report
+    // must say both rather than letting the first stand in for the second.
+    assert_eq!(find(&checks, "gateway-reachable").status, Status::Pass);
+    let token = find(&checks, "gateway-token");
+    assert_eq!(token.status, Status::Fail);
+    let remediation = token.remediation.as_ref().expect("remediation");
     assert!(remediation.contains("issuer=wrong-issuer"), "{remediation}");
     assert!(remediation.contains("audience=<unset>"), "{remediation}");
-    // The pairing question could not be answered, so it is unknown rather than
-    // silently missing from the report.
-    assert_eq!(find(&checks, "gateway-pairing").status, Status::Unknown);
+}
+
+#[tokio::test]
+async fn an_unreachable_gateway_leaves_the_token_question_unknown() {
+    let env = stub_env("http://127.0.0.1:1".to_string());
+    let checks = doctor::gateway::run("production", &env).await;
+    assert_eq!(find(&checks, "gateway-reachable").status, Status::Fail);
+    // Not attempted, and said so rather than silently missing from the report.
+    assert_eq!(find(&checks, "gateway-token").status, Status::Unknown);
 }
 
 #[tokio::test]
