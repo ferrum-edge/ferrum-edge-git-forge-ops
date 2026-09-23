@@ -850,7 +850,7 @@ overrides:
 - `waf_enforcement` catches a `waf` plugin that is attached but not blocking: `mode` other than `enforce`, a rule pack left entirely at `monitor`, or `on_body_too_large: skip`. Optional `min_paranoia_level` (gateway accepts 1–4, defaults to 1).
 - `require_ai_guardrails` requires a proxy carrying AI traffic (any `ai_*` plugin, `mcp_gateway`, or `a2a_gateway`) to also carry an *enforcing* content guardrail — not a dry-run or warn-only one.
 - `rate_limit_completeness` catches rate limiters with no usable budget: `rate_limiting` with missing/empty `limits`, no `scope: default` entry, or an entry with neither a window+`max_requests` nor `requests_per_*`; `ai_rate_limiter` with no `token_limit`; `redis_failure_policy: local_fallback` on either. It also flags the removed top-level budget fields, which the current gateway rejects outright.
-- `plugin_name_is_known` is an opt-in check of `plugin_name` against the gateway's 82 built-ins plus `allowed_extra_plugin_names`, using the configured severity for unknown custom names. The always-on security audit rejects catalog-retired names (`oauth2_auth`, `semantic_ai_firewall`) and catalog-reserved names (`__mesh_bpf_metrics`) at `error`, even when the policy rule or plugin instance is disabled. Extra-name allowlists cannot admit these names; the rule leaves them to the audit so they are reported once. Reserved plugins belong to mesh auto-injection, not repository configuration. The existing authorized security override still applies. Note that `jwt`, `oauth2`, and `oidc` are *not* plugin names; `jwt_auth`, `oauth2_introspection`, and `oidc_relying_party` are.
+- `plugin_name_is_known` is an opt-in check of `plugin_name` against the gateway's 82 built-ins plus `allowed_extra_plugin_names`, using the configured severity for unknown custom names. Built-in names are matched by exact `is_builtin()` lookup, and custom extra names are compared exactly (case-sensitive), matching the gateway's generated `create_custom_plugin` match arms — a case variant such as `Acme_Auth` is not loadable and is therefore reported as unknown even when `acme_auth` is allowed. The always-on security audit rejects catalog-retired names (`oauth2_auth`, `semantic_ai_firewall`) and catalog-reserved names (`__mesh_bpf_metrics`) at `error`, even when the policy rule or plugin instance is disabled. Extra-name allowlists cannot admit these names; the rule leaves them to the audit so they are reported once. Reserved plugins belong to mesh auto-injection, not repository configuration. The existing authorized security override still applies. Note that `jwt`, `oauth2`, and `oidc` are *not* plugin names; `jwt_auth`, `oauth2_introspection`, and `oidc_relying_party` are.
 - `priority_override_range` checks `priority_override` against the gateway's accepted `0..=10000`.
 
 ### Override flow (B2: label + permission)
@@ -1270,7 +1270,7 @@ Practical limits you should know about:
 ### How this scales out in real setups
 
 - **Solo maintainer, one gateway** — one declared environment. Committing `.gitforgeops/config.yaml` is what makes the bundled workflows deploy at all: without it `apply-on-merge.yml` emits an empty matrix and deploys nothing, and `drift-check.yml` fails its enumeration preflight. The synthetic local `default` environment is a *local CLI* fallback for `validate` / `diff` / `plan` driven purely by `FERRUM_*` variables, and is never a trusted workflow target. The shape is in [Quickstart](docs/quickstart.md); note that a deployment environment's required reviewer cannot be the person who merged, so a genuinely single-person repository still needs a second approver.
-- **Small team, staging + prod** — two environments, matrix runs two jobs in parallel, two `.state/*.json` files, two sets of env secrets. The most common setup. Parallel is not staged: production does not wait for staging and is not promoted from it. A real promotion path is [#268](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/268).
+- **Small team, staging + prod** — two environments, matrix runs two jobs in parallel, two `.state/*.json` files, two sets of env secrets. The most common setup. Two plain environment entries run independently: production does not wait for staging. Opt into revision-bound staged promotion with `promotion.requires: staging`; see [Staged promotion](#staged-promotion).
 - **Platform team, 5-10 environments** — matrix scales linearly. Protection rules on GitHub Environments (required reviewers for production, wait timers for canary, etc.) enforce deployment gates without code changes.
 - **Multi-tenant platform, 50+ namespaces in one env** — per-namespace ownership is still via `FERRUM_NAMESPACE` filter + `ownership.namespaces` list; the single apply pass handles all of them. For bigger scale, split into multiple environments backed by the same gateway with `FERRUM_NAMESPACE` acting as a slice.
 
@@ -1399,6 +1399,9 @@ Everything after that point — the `gitforgeops` binary it builds, the desired 
 - **A stale or superseded run is rejected, not silently replayed.** A trigger that is no longer an ancestor is stale. An ancestor whose protected head changed a *deployment input* is superseded. Both fail before building a binary or contacting the gateway; the newer merge's own run must reconcile that revision.
 
 Attribution stays keyed to the merge that triggered the run: the policy-override label lookup and the age-encrypted credential delivery both target that PR and its author. The supersession guard is what guarantees that a later PR's desired input or executable cannot be applied under that attribution.
+The guard extracts its classifier from the triggering commit before using it;
+it never lets the refreshed, not-yet-authorized head decide whether its own
+helper or executable changes are safe.
 
 ##### Deployment inputs: one list for scheduling and for supersession
 
@@ -2245,7 +2248,7 @@ environments:
 ```
 
 `production-monitor` is created by `bootstrap_repo_settings.py` with no
-reviewer, protected branches only, and gateway **read** material only — no
+reviewer, an exact-default-branch deployment policy, and gateway **read** material only — no
 state-writer key, no provisioner token, no credential bundles (a comparison
 does not need credential values; `diff` excludes still-unresolved broker leaves
 per leaf). Three independent fences keep it that way: the settings audit
@@ -2332,7 +2335,9 @@ produce the same bytes. `dpkg --purge` removes apt and unused TLS packages
 from the reviewed base. `base-image-pin-canary.yml` watches the moving Debian
 tag daily. Reintroduce a temporary digest-pinned point-release package stage
 only when that canary reports a fixed CRITICAL/HIGH the rebuilt base does not
-yet carry; never pull those fixes through apt.
+yet carry; when a clean moving tag has advanced, the canary instead requests a
+runtime digest repin so the scanned fixes reach the built image. Never pull
+those fixes through apt.
 
 ## Lifecycle acceptance
 

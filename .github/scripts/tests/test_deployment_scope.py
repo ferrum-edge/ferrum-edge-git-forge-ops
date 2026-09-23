@@ -200,8 +200,9 @@ class DeploymentScopeTests(unittest.TestCase):
         )
         # And the guard runs the shared classifier rather than an ad-hoc diff.
         self.assertIn(
-            "python3 .github/scripts/deployment_scope.py classify", workflow
+            'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py"', workflow
         )
+        self.assertIn('python3 "$trusted_classifier" classify', workflow)
 
     # -- CLI ----------------------------------------------------------------
 

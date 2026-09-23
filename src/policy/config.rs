@@ -267,7 +267,10 @@ pub struct PluginNameIsKnownRuleConfig {
     #[serde(default)]
     pub severity: Severity,
     /// Custom plugin names compiled into this deployment's gateway build.
-    /// Listing them here stops the rule reporting them as unknown.
+    /// Compared exactly (case-sensitive), matching the gateway's generated
+    /// `create_custom_plugin` match arms: a case variant is not loadable, so
+    /// it is not accepted here. Listing a name stops the rule reporting it
+    /// as unknown.
     #[serde(default)]
     pub allowed_extra_plugin_names: Vec<String>,
 }

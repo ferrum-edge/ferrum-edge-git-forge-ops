@@ -414,6 +414,61 @@ class TemplateUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("v99.99.99", result.stderr)
 
+    def test_baseline_and_command_line_upstreams_reject_git_options(self):
+        marker = self.fixture.customer.parent / "upstream-injection-marker"
+        malicious_upstream = f"--upload-pack=touch {marker}"
+        payload = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        payload["upstream"] = malicious_upstream
+        write(
+            self.fixture.customer,
+            {".gitforgeops/baseline.json": json.dumps(payload)},
+        )
+
+        result = self.fixture.run("status")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not a Git option", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_baseline_commit_must_be_a_full_object_id(self):
+        marker = self.fixture.customer.parent / "commit-injection-marker"
+        payload = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        payload["commit"] = f"--upload-pack=touch {marker}"
+        write(
+            self.fixture.customer,
+            {".gitforgeops/baseline.json": json.dumps(payload)},
+        )
+
+        result = self.fixture.run("status")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("full 40- or 64-character", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_baseline_and_command_line_refs_reject_git_options(self):
+        marker = self.fixture.customer.parent / "ref-injection-marker"
+        malicious_ref = f"--upload-pack=touch {marker}"
+        payload = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        payload["ref"] = malicious_ref
+        write(
+            self.fixture.customer,
+            {".gitforgeops/baseline.json": json.dumps(payload)},
+        )
+
+        baseline_result = self.fixture.run("status")
+        self.assertEqual(baseline_result.returncode, 1)
+        self.assertIn("valid Git ref name", baseline_result.stderr)
+        self.assertFalse(marker.exists())
+
+        payload["ref"] = "main"
+        write(
+            self.fixture.customer,
+            {".gitforgeops/baseline.json": json.dumps(payload)},
+        )
+        command_line_result = self.fixture.run("status", "--to", malicious_ref)
+        self.assertEqual(command_line_result.returncode, 1)
+        self.assertIn("valid Git ref name", command_line_result.stderr)
+        self.assertFalse(marker.exists())
+
 
 class RepositoryContractTests(unittest.TestCase):
     """This repository is the upstream, so its own tree must match the lists."""

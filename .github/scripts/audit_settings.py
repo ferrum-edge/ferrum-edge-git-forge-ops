@@ -470,7 +470,9 @@ def audit_environment(
         )
 
     policy = detail.get("deployment_branch_policy") or {}
+    monitoring_environment = is_monitoring_environment(name, all_names)
     branch_limited = policy.get("protected_branches") is True
+    policy_names: list[object] = []
     if policy.get("custom_branch_policies") is True:
         pages = gh_json(
             f"repos/{repo}/environments/{encoded_name}/deployment-branch-policies?per_page=100",
@@ -486,9 +488,16 @@ def audit_environment(
         ]
         policy_names = [item.get("name") for item in policies]
         branch_limited = policy_names == [branch]
+    if monitoring_environment:
+        branch_limited = (
+            policy.get("protected_branches") is False
+            and policy.get("custom_branch_policies") is True
+            and policy_names == [branch]
+        )
     audit.require(
         branch_limited,
-        f"environment {name!r} must restrict deployments to protected branches or exact {branch!r}",
+        f"environment {name!r} must restrict deployments to "
+        + (f"exact {branch!r}" if monitoring_environment else f"protected branches or exact {branch!r}"),
     )
     if has_reviewers and branch_limited:
         audit.evidence.append(f"environment {name}: reviewer + branch policy present")

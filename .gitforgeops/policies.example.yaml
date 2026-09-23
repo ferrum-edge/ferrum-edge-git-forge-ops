@@ -158,7 +158,8 @@ policies:
   plugin_name_is_known:
     enabled: false
     severity: warning
-    # Custom plugins compiled into your gateway build.
+    # Custom plugins compiled into your gateway build. Compared exactly
+    # (case-sensitive), matching the gateway's generated match arms.
     allowed_extra_plugin_names: []
 
   # `priority_override` must be within the gateway's accepted 0..=10000.

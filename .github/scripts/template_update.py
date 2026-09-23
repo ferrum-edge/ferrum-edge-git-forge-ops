@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -148,6 +149,34 @@ class UpdateError(RuntimeError):
     """Something the operator has to decide about."""
 
 
+FULL_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+def validate_object_id(value: object, field: str) -> str:
+    """Accept only a full SHA-1 or SHA-256 object ID from repository data."""
+    if not isinstance(value, str) or FULL_OBJECT_ID.fullmatch(value) is None:
+        raise UpdateError(
+            f"{field} must be a full 40- or 64-character lowercase hexadecimal "
+            "Git object ID"
+        )
+    return value
+
+
+def validate_ref(value: object, field: str) -> str:
+    """Reject option-like and syntactically invalid revisions before invoking Git."""
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        raise UpdateError(f"{field} must be a valid Git ref name")
+    result = subprocess.run(
+        ["git", "check-ref-format", "--allow-onelevel", value],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise UpdateError(f"{field} must be a valid Git ref name")
+    return value
+
+
 @dataclass
 class Baseline:
     upstream: str
@@ -163,6 +192,8 @@ class Baseline:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as error:
             raise UpdateError(f"{BASELINE_PATH} is not valid JSON: {error}") from error
+        if not isinstance(data, dict):
+            raise UpdateError(f"{BASELINE_PATH} must contain a JSON object")
         missing = [key for key in ("upstream", "ref", "commit") if not data.get(key)]
         if missing:
             raise UpdateError(
@@ -170,7 +201,15 @@ class Baseline:
                 "upstream revision this tree was last synced from and an update "
                 "cannot be computed without it"
             )
-        return cls(data["upstream"], data["ref"], data["commit"])
+        if not isinstance(data["upstream"], str) or data["upstream"].startswith("-"):
+            raise UpdateError(
+                f"{BASELINE_PATH} upstream must be a path or URL, not a Git option"
+            )
+        return cls(
+            data["upstream"],
+            validate_ref(data["ref"], f"{BASELINE_PATH} ref"),
+            validate_object_id(data["commit"], f"{BASELINE_PATH} commit"),
+        )
 
     def write(self, root: Path) -> None:
         path = root / BASELINE_PATH
@@ -428,16 +467,18 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
     mirror = workdir / "upstream"
     source = Path(upstream)
     if source.is_dir():
-        _git(workdir, "clone", "--quiet", "--no-local", str(source), str(mirror))
+        _git(
+            workdir, "clone", "--quiet", "--no-local", "--", str(source), str(mirror)
+        )
     else:
         mirror.mkdir(parents=True)
         _git(mirror, "init", "--quiet")
-        _git(mirror, "remote", "add", "origin", upstream)
+        _git(mirror, "remote", "add", "origin", "--", upstream)
         _git(mirror, "fetch", "--quiet", "--tags", "origin")
     for ref in refs:
         # Fail here, with the ref named, rather than deep inside a comparison.
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
-            _git(mirror, "fetch", "--quiet", "origin", ref, check=False)
+            _git(mirror, "fetch", "--quiet", "origin", "--", ref, check=False)
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
             raise UpdateError(
                 f"upstream revision {ref!r} could not be resolved in {upstream}"
@@ -642,7 +683,10 @@ def main(argv: list[str] | None = None) -> int:
                 "this tree was copied from — see docs/template-updates.md."
             )
         upstream = args.upstream or baseline.upstream or DEFAULT_UPSTREAM
+        if upstream.startswith("-"):
+            raise UpdateError("upstream must be a path or URL, not a Git option")
         target_ref = args.to or baseline.ref or DEFAULT_REF
+        target_ref = validate_ref(target_ref, "target ref")
 
         with tempfile.TemporaryDirectory() as temporary:
             workdir = Path(temporary)
