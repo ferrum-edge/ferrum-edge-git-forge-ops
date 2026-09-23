@@ -93,6 +93,7 @@ UPSTREAM_MANAGED = (
     ".gitforgeops/config.example.yaml",
     ".gitforgeops/policies.example.yaml",
     ".gitforgeops/smoke.example.yaml",
+    "release",
     "docs",
     "README.md",
     "CLAUDE.md",

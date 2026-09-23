@@ -1,5 +1,15 @@
 # Quickstart: one gateway, one namespace, one environment
 
+Release baseline: [v0.1.0](../release/README.md). Follow this setup as a
+supported pairing only when the [upstream record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json) `status` is
+`supported`; it then supplies the exact source revision and validator/gateway
+pairing. Use the [immutable adoption commands](../release/README.md#adopt-the-immutable-sourcetemplate-revision)
+to start a repository at that revision before continuing below. GitHub's
+**Use this template** button selects the current default branch, which may
+have moved beyond the supported baseline. The source archive itself carries
+the release-prep snapshot of the record; the upstream record is finalized
+after the image digest exists.
+
 The smallest setup that actually deploys: a single API-mode gateway, a single
 namespace, shared ownership, one declared deployment environment, and the
 security controls the bundled workflows require. Follow it end to end and you
@@ -69,12 +79,14 @@ it.** In file mode `apply` writes `assembled/<env>.yaml` (and
 `assembled/<env>-mesh.yaml` when the repository declares mesh fragments) and
 commits it. Getting those documents onto a fleet is your own delivery step.
 
-Scheduled drift monitoring is bound to the deployment environment, so a nightly
-run waits for that environment's required reviewer before it can read the
-gateway. That is the approval boundary working as configured. Until
-[#262](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/262)
-lands, treat drift monitoring as approval-gated: approve the scheduled run, or
-dispatch `gitforgeops diff --exit-on-drift` yourself.
+Scheduled drift monitoring uses the approval-gated deployment environment by
+default. A nightly run without approval inspects nothing and reports `Not
+completed`. To opt into unattended checks, set `monitoring.unattended: true`
+and provision the separate `<env>-monitor` environment described in
+[launch controls §3.1](github-launch-controls.md#31-unattended-drift-monitoring).
+It holds no state-writer key, provisioner token, or credential bundle, but its
+JWT signing secret remains gateway-write-equivalent because Ferrum Edge has no
+read-only admin role. Leave the default if that trade-off is unacceptable.
 
 ### Prerequisites
 
@@ -87,8 +99,10 @@ dispatch `gitforgeops diff --exit-on-drift` yourself.
 
 ## 1. Create the repository from the template
 
-Use the **Use this template** button, not a fork: a fork inherits neither
-repository settings nor the ability to hold your own secrets cleanly.
+Before publication, a disposable setup may use **Use this template**. For the
+supported pairing, create the copy from the exact source SHA using the
+[release instructions](../release/README.md#adopt-the-immutable-sourcetemplate-revision).
+A fork inherits neither repository settings nor your own secrets cleanly.
 
 Then, in **Actions → General**, enable workflows. A brand-new copy starts
 enabled; GitHub disables *schedules* after 60 days of repository inactivity, so

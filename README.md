@@ -4,10 +4,17 @@ GitOps workflow for managing [Ferrum Edge](https://github.com/ferrum-edge/ferrum
 
 ## Development status
 
-GitForgeOps is in **active buildout, before launch, with no users**. Breaking
-changes to the CLI, configuration, and state formats are expected; there is no
-backward-compatibility or upgrade-path commitment during buildout. Update the
-current definitions, examples, tests, and documentation together.
+First supported baseline: [v0.1.0](release/README.md). Its committed
+[upstream release record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
+is the status and exact pairing source:
+while `status` is `pending`, GitForgeOps remains in active buildout before
+launch, with no supported release or users. Breaking changes to the CLI,
+configuration, and state formats are expected during that period. Once
+`status` becomes `supported`, use only the source SHA, image digest, validator
+pin, and gateway pairing in that record as the first supported baseline. Earlier
+buildout revisions have no backward-compatibility or upgrade-path commitment.
+The [release policy and adoption steps](release/README.md#publishing-and-later-changes)
+apply from that baseline onward.
 
 This application has **no database or database migrations**. Gateway resource
 types live in [`src/config/schema.rs`](src/config/schema.rs), environment and
@@ -91,6 +98,11 @@ order — deep detail for each control lives in
    gh repo create acme/gateway-config \
      --template ferrum-edge/ferrum-edge-git-forge-ops --private
    ```
+
+   This copies the current default branch. To adopt the first **supported**
+   pairing at its exact source revision, use the
+   [immutable release instructions](release/README.md#adopt-the-immutable-sourcetemplate-revision)
+   instead, then continue with step 2 here.
 
    Choose the visibility deliberately: `--private` as shown needs GitHub Pro or
    Team for the environments in step 8 and GitHub Enterprise for their required
@@ -2279,7 +2291,11 @@ Missing history or mismatching reviewed inputs still leaves overrides inactive.
 
 ### Published images
 
-The `release` workflow publishes to two registries on every push to `main` and every protected `v*` tag. Images include BuildKit max-mode provenance and SBOM attestations; GHCR also receives a GitHub-signed build-provenance attestation tied to the pushed digest:
+The `release` workflow publishes to two registries on eligible pushes to `main`
+and protected `v*` tags. Ledger, assembled output, and release-record-only
+commits are excluded. Images include BuildKit max-mode provenance and SBOM
+attestations; GHCR also receives a GitHub-signed build-provenance attestation
+tied to the pushed digest:
 
 - `docker.io/ferrumedge/ferrum-edge-git-forge-ops`
 - `ghcr.io/ferrum-edge/ferrum-edge-git-forge-ops`

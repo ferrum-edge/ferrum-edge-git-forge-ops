@@ -13,6 +13,9 @@ on:
     paths-ignore:
       - '.state/**'
       - 'assembled/**'
+      # The signed image is built from Dockerfile/src, not the post-publication
+      # record. Filling its digest and evidence must not republish :latest.
+      - 'release/**'
     tags: ['v*']
 
 concurrency:
@@ -116,6 +119,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check release baseline consistency
+        if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'
+        run: python3 .github/scripts/check_release_baseline.py
+
       # The required-checks test above proves the unit and policy suites
       # passed. It cannot prove the product was run: the lifecycle suite is
       # not a per-PR required check, because it needs a gateway build and
@@ -184,14 +191,19 @@ jobs:
             exit 1
           }
 
-          # The suite runs whichever allowlisted build the installer resolves,
-          # so the result is bound to THIS revision's allowlist rather than to
-          # one digest: a result from a build the release does not trust
-          # certifies nothing about it.
+          # The suite runs whichever allowlisted build the installer resolves.
+          # Publication requires the exact tested build named by the committed
+          # upstream release record. Opted-in customer publishers keep their
+          # existing allowlist gate because their pairing can differ.
+          if [ "$REPO" = 'ferrum-edge/ferrum-edge-git-forge-ops' ]; then
+            gateway_args=(--gateway "$(jq -er '.tested_gateway.binary_sha256' release/baseline.json)")
+          else
+            gateway_args=(--gateway-allowlist .github/ferrum-edge-checksums.txt)
+          fi
           python3 .github/scripts/lifecycle_result.py verify \
             --result acceptance/lifecycle-result.json \
             --revision "$RELEASE_SHA" \
-            --gateway-allowlist .github/ferrum-edge-checksums.txt \
+            "${gateway_args[@]}" \
             --summary "$GITHUB_STEP_SUMMARY"
 
   docker:
@@ -215,6 +227,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Check release baseline consistency
+        if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'
+        run: python3 .github/scripts/check_release_baseline.py
 
       - name: Ensure release tag points to the default branch
         if: startsWith(github.ref, 'refs/tags/v')
