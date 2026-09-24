@@ -2047,6 +2047,15 @@ entry names the live resource that would break existing traffic:
   that is enabled live and is then disabled (`Auth plugin disabled`).
 - An enabled authentication plugin config whose `plugin_name` changes. Consumer
   credentials issued for the old authenticator stop working.
+- A Proxy that keeps existing but stops running an enabled authenticator it
+  runs live (`proxy <ns>/<id> loses authenticator <plugin_name>`), compared by
+  its effective plugin list before and after the apply. This catches a removed
+  `proxy_group` association, a proxy-scoped authenticator retargeted to another
+  proxy, and a global authenticator narrowed to a different proxy. Swapping one
+  instance for another with the same `plugin_name` is not a loss. Unmanaged
+  (shared mode) and spec-owned plugin configs count as surviving the apply, and
+  a loss already explained by a deleted, disabled or renamed auth plugin config
+  is not repeated per proxy.
 
 "Authentication plugin" uses the same definition as `require_auth_plugin` and
 the security audit. When a policy file is present, the definition is its
