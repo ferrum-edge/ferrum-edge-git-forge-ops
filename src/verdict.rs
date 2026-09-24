@@ -59,6 +59,9 @@ pub enum BlockerKind {
     ProvisionerToken,
     /// Pending allocation requires the target GitHub repository.
     ProvisioningRepository,
+    /// A file-mode apply narrowed by an ad-hoc `FERRUM_NAMESPACE` would
+    /// replace the document-wide gateway (and mesh) file with a subset.
+    NarrowedFilePublication,
 }
 
 impl BlockerKind {
@@ -72,6 +75,7 @@ impl BlockerKind {
             BlockerKind::SlotRemap => "credential-slot-remap",
             BlockerKind::ProvisionerToken => "provisioner-token",
             BlockerKind::ProvisioningRepository => "provisioning-repository",
+            BlockerKind::NarrowedFilePublication => "narrowed-file-publication",
         }
     }
 
@@ -104,6 +108,11 @@ impl BlockerKind {
             BlockerKind::SlotRemap => {
                 "credential-slot reassignment(s); rotate the affected slot before removing the \
                  entry, or re-run with --allow-credential-slot-remap"
+            }
+            BlockerKind::NarrowedFilePublication => {
+                "FERRUM_NAMESPACE narrows a file-mode environment, whose published document \
+                 replaces the whole gateway file; unset FERRUM_NAMESPACE, or declare \
+                 namespace_filter on the environment in .gitforgeops/config.yaml"
             }
         }
     }
@@ -159,6 +168,17 @@ pub struct ApplyGateInputs<'a> {
     pub allow_credential_slot_remap: bool,
     pub provisioner_token_present: bool,
     pub github_repository_present: bool,
+    /// File mode, and an ad-hoc namespace filter narrows the run below the
+    /// environment's publication scope
+    /// ([`crate::config::ResolvedEnv::covers_environment`]).
+    pub file_publication_narrowed: bool,
+}
+
+/// A file-mode publication is document-wide: whatever the run selected
+/// replaces the destination. An ad-hoc filter would drop every other
+/// namespace, and a mistyped one would publish an empty document.
+pub fn narrowed_file_publication_blocker(narrowed: bool) -> Option<ApplyBlocker> {
+    narrowed.then(|| ApplyBlocker::new(BlockerKind::NarrowedFilePublication, 1))
 }
 
 /// Validation is a single gate: it either passed or `apply` refuses.
@@ -231,6 +251,7 @@ pub fn slot_remap_blocker(report: &ResolveReport, allowed: bool) -> Option<Apply
 /// fail.
 pub fn apply_blockers(inputs: ApplyGateInputs<'_>) -> Vec<ApplyBlocker> {
     [
+        narrowed_file_publication_blocker(inputs.file_publication_narrowed),
         security_blocker(inputs.security_findings, inputs.security_overridden),
         slot_remap_blocker(inputs.secret_report, inputs.allow_credential_slot_remap),
         required_credentials_blocker(inputs.secret_report),

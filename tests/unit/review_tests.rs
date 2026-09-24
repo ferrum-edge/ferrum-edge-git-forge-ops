@@ -1581,6 +1581,6 @@ fn the_mesh_retraction_banner_names_the_destination_and_the_outcome() {
     );
 
     let narrowed = render_mesh_retraction(MeshPublication::NarrowedScope, path);
-    let narrowed = narrowed.expect("a skipped retraction is reported");
-    assert!(narrowed.contains("RETRACT mesh: skipped"), "{narrowed}");
+    let narrowed = narrowed.expect("a skipped publication is reported");
+    assert!(narrowed.contains("Mesh publication skipped"), "{narrowed}");
 }

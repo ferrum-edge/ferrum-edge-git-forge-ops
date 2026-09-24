@@ -978,6 +978,27 @@ fn a_namespace_filtered_run_never_retracts() {
 }
 
 #[test]
+fn a_namespace_filtered_run_never_publishes_a_subset_over_the_document() {
+    // The mesh document is mesh-wide: a run that selected only one
+    // namespace's fragments must not replace every other namespace's policy.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    let path = target.to_str().unwrap();
+    apply_mesh_file(&one_workload(), path).unwrap();
+    let before = read(&target);
+
+    let narrowed = MeshRetractionScope {
+        ledger_attributed: true,
+        covers_repository: false,
+    };
+    let subset = MeshConfigSpec::default();
+    let publication = reconcile_mesh_file(Some(&subset), path, narrowed);
+
+    assert_eq!(publication.unwrap(), MeshPublication::NarrowedScope);
+    assert_eq!(read(&target), before);
+}
+
+#[test]
 fn planning_a_publication_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("mesh.yaml");
@@ -1228,11 +1249,17 @@ fn cli_namespace_filtered_runs_never_retract() {
     let published = repo.published_mesh();
 
     // `edge` declares nothing at all, so the filtered run selects no fragment
-    // — which is not evidence that the repository declares none.
+    // — which is not evidence that the repository declares none. The run is
+    // refused before it can touch either document-wide file (it would also
+    // have published an empty gateway document).
     let only_edge = [("FERRUM_NAMESPACE", "edge")];
-    let filtered = repo.run(&["apply", "--auto-approve"], &only_edge);
+    let (success, filtered) = repo.try_run(&["apply", "--auto-approve"], &only_edge);
 
-    assert!(filtered.contains("namespace-filtered run"), "{filtered}");
+    assert!(!success, "{filtered}");
+    assert!(
+        filtered.contains("selected 0 desired resources"),
+        "{filtered}"
+    );
     assert_eq!(repo.published_mesh(), published);
 }
 

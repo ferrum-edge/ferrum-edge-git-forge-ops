@@ -409,17 +409,20 @@ fn plan_opt_out_is_a_warning() {
         &["plan", "--allow-empty-namespace"],
         &[("FERRUM_NAMESPACE", "does-not-exist")],
     );
-    assert!(
-        output.status.success(),
-        "{} {}",
-        stdout(&output),
-        stderr(&output)
-    );
     let combined = format!("{}{}", stdout(&output), stderr(&output));
     assert!(
         combined.contains("warning") || combined.contains("Warning"),
         "{combined}"
     );
+    // The finding is demoted, so it is no longer an apply blocker. This
+    // harness is file mode, where an ad-hoc filter that drops the on-disk
+    // resources would still publish an empty gateway document, so that
+    // separate gate remains the only blocker.
+    assert!(
+        !combined.contains("empty-namespace-filter (1)"),
+        "{combined}"
+    );
+    assert!(combined.contains("narrowed-file-publication"), "{combined}");
 }
 
 #[cfg(unix)]

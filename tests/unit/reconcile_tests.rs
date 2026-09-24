@@ -82,6 +82,7 @@ fn env(mode: OwnershipMode, namespaces: Option<Vec<String>>) -> ResolvedEnv {
         name: "production".to_string(),
         overlay: None,
         namespace_filter: None,
+        namespace_filter_is_environment_scope: false,
         apply_strategy: ApplyStrategy::Incremental,
         ownership: OwnershipConfig {
             mode,

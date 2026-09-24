@@ -103,6 +103,7 @@ async fn main() {
                 allow_nontransactional_plugin_attach,
                 explicit_env.as_deref(),
                 resolve_options,
+                cli.allow_empty_namespace,
             )
             .await
         }
@@ -1110,8 +1111,23 @@ fn mesh_retraction_scope(
 ) -> apply::MeshRetractionScope {
     apply::MeshRetractionScope {
         ledger_attributed: state.publishes_mesh_document(output_path),
-        covers_repository: resolved.namespace_filter.is_none(),
+        covers_repository: resolved.covers_environment(),
     }
+}
+
+/// File mode, narrowed by an ad-hoc `FERRUM_NAMESPACE` below the environment's
+/// publication scope, and the filter actually dropped a loaded resource. The
+/// gateway file is document-wide, so such an apply would replace every other
+/// namespace with nothing. A filter that selects everything on disk narrows
+/// nothing.
+fn file_publication_narrowed(
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    scope: &config::NamespaceScope,
+) -> bool {
+    env_config.gateway_mode == GatewayMode::File
+        && !resolved.covers_environment()
+        && scope.desired_count < scope.on_disk_count
 }
 
 /// Operator-facing line for a mesh reconciliation that publishes no declared
@@ -1143,7 +1159,7 @@ fn mesh_retraction_line(
             "Warning: the repository declares no MeshConfig fragments, but {output_path} exists and is not a document gitforgeops published; leaving it untouched. Remove it by hand once no mesh node reads it."
         )),
         apply::MeshPublication::NarrowedScope => Some(format!(
-            "Notice: no MeshConfig fragment is in scope for this namespace-filtered run, so {output_path} is left as published. Re-run without FERRUM_NAMESPACE to retract a mesh document the repository no longer declares."
+            "Notice: this namespace-filtered run does not see every MeshConfig fragment the environment publishes, and the mesh document is mesh-wide, so {output_path} is left as published. Re-run without FERRUM_NAMESPACE to publish or retract it."
         )),
     }
 }
@@ -1336,13 +1352,13 @@ async fn cmd_export(
         &env_config.mesh_file_output_path,
         mesh_retraction_scope(&resolved, &mesh_state, &env_config.mesh_file_output_path),
     )?;
-    match &assembled.mesh {
-        Some(mesh) => eprintln!(
+    match (&assembled.mesh, mesh_publication) {
+        (Some(mesh), apply::MeshPublication::Published) => eprintln!(
             "Exported mesh document to {} ({})",
             env_config.mesh_file_output_path,
             safe_line(mesh_summary_line(mesh))
         ),
-        None => {
+        _ => {
             if let Some(line) =
                 mesh_retraction_line(mesh_publication, &env_config.mesh_file_output_path, false)
             {
@@ -2075,6 +2091,11 @@ async fn cmd_plan(
         allow_credential_slot_remap,
         provisioner_token_present: env_config.github_provisioner_token.is_some(),
         github_repository_present: env_config.github_repository.is_some(),
+        file_publication_narrowed: file_publication_narrowed(
+            &env_config,
+            &resolved,
+            &namespace_scope,
+        ),
     });
     let offline_summary = verdict::blocker_summary(&blockers);
     let conflict_namespaces: std::collections::BTreeSet<&str> = spec_owned
@@ -2135,11 +2156,34 @@ async fn cmd_apply(
     allow_nontransactional_plugin_attach: bool,
     explicit_env: Option<&str>,
     resolve_options: secrets::ResolveOptions,
+    allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let allow_nontransactional_plugin_attach =
         allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+
+    // The same empty-filter refusal `validate`, `plan` and `diff` apply. In file
+    // mode a mistyped filter would otherwise publish an empty gateway document.
+    if let Some(finding) = assembled
+        .namespace_scope
+        .desired_finding(allow_empty_namespace)
+    {
+        print_namespace_finding(&finding);
+        if finding.is_error() {
+            return Err(format!("Refusing to apply: {}", finding.message).into());
+        }
+    }
+    // A file-mode document is document-wide: an ad-hoc filter would publish a
+    // subset over the whole gateway file. Checked before the state lock, the
+    // bundle read and validation, like every other offline refusal.
+    if let Some(blocker) = verdict::narrowed_file_publication_blocker(file_publication_narrowed(
+        &env_config,
+        &resolved,
+        &assembled.namespace_scope,
+    )) {
+        return Err(format!("Refusing to apply: {}", blocker.summary()).into());
+    }
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
 
@@ -3093,6 +3137,8 @@ async fn cmd_review(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let fail_on_blockers = fail_on_blockers || env_config.review_fail_on_blockers;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    let file_publication_narrowed =
+        file_publication_narrowed(&env_config, &resolved, &assembled.namespace_scope);
     let mut desired = assembled.gateway;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
@@ -3296,6 +3342,7 @@ async fn cmd_review(
         allow_credential_slot_remap,
         provisioner_token_present: env_config.github_provisioner_token.is_some(),
         github_repository_present: env_config.github_repository.is_some(),
+        file_publication_narrowed,
     });
 
     let comment = review::pr_comment::build_review_comment_with_preview(

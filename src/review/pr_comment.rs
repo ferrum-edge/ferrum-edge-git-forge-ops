@@ -765,7 +765,7 @@ pub fn render_mesh_retraction(publication: MeshPublication, output_path: &str) -
             bounded_inline_code(output_path)
         ),
         MeshPublication::NarrowedScope => format!(
-            "**RETRACT mesh: skipped** — no `MeshConfig` fragment is in scope for this namespace-filtered review, which is not evidence that the repository declares none. {} is left as published.",
+            "**Mesh publication skipped** — this namespace-filtered review does not see every `MeshConfig` fragment the environment publishes, and the mesh document is mesh-wide. {} is left as published.",
             bounded_inline_code(output_path)
         ),
     };

@@ -140,9 +140,11 @@ pub enum MeshPublication {
     /// operator repointed `FERRUM_MESH_FILE_OUTPUT_PATH` at somebody else's
     /// file, or hand-edited this one.
     Unattributed,
-    /// No fragment was *selected*, but the run is namespace-filtered, so
-    /// absence is not evidence of deletion — the fragments may simply live in
-    /// a namespace this run cannot see. Left untouched, and reported.
+    /// An ad-hoc namespace filter narrowed this run below the environment's
+    /// publication scope. The document is mesh-wide, so neither the selected
+    /// subset (it would drop every other namespace's fragments) nor its
+    /// absence (the fragments may live in a namespace this run cannot see) may
+    /// replace it. Left untouched, and reported.
     NarrowedScope,
 }
 
@@ -151,10 +153,11 @@ pub enum MeshPublication {
 pub struct MeshRetractionScope {
     /// The state ledger records this destination as gitforgeops-published.
     pub ledger_attributed: bool,
-    /// This run saw every `MeshConfig` fragment the repository declares — no
-    /// `FERRUM_NAMESPACE` filter narrowed the selection. Retraction rewrites
-    /// one mesh-wide document, so a filtered run that happens to select no
-    /// fragment must never conclude the repository declares none.
+    /// This run saw every `MeshConfig` fragment the environment publishes —
+    /// it is unfiltered, or filtered only by the environment's own declared
+    /// `namespace_filter` ([`crate::config::ResolvedEnv::covers_environment`]).
+    /// Publication and retraction both rewrite one mesh-wide document, so a
+    /// run narrowed below that scope must do neither.
     pub covers_repository: bool,
 }
 
@@ -181,16 +184,18 @@ pub fn plan_mesh_publication(
     output_path: &str,
     scope: MeshRetractionScope,
 ) -> crate::error::Result<MeshPublication> {
-    if mesh.is_some() {
-        return Ok(MeshPublication::Published);
-    }
-
     let path = Path::new(output_path);
-    if !path.exists() {
+    if mesh.is_none() && !path.exists() {
         return Ok(MeshPublication::NeverPublished);
     }
+    // Checked before `Published`: a narrowed selection is a subset of the
+    // mesh-wide document, and publishing it would drop every other
+    // namespace's fragments.
     if !scope.covers_repository {
         return Ok(MeshPublication::NarrowedScope);
+    }
+    if mesh.is_some() {
+        return Ok(MeshPublication::Published);
     }
     if !scope.ledger_attributed {
         return Ok(MeshPublication::Unattributed);

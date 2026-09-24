@@ -45,7 +45,7 @@ first, remove the entry second.
 `--allow-empty-namespace` is the same kind of CLI-only acknowledgement. A
 mistyped `FERRUM_NAMESPACE` that selects zero desired resources while the
 on-disk tree is non-empty is an error-severity finding on `validate`,
-`plan`, and `diff` (exit 1, not the drift code 2). The flag demotes that
+`plan`, `diff`, and `apply` (exit 1, not the drift code 2). The flag demotes that
 finding to a warning. There is no environment variable for it.
 
 `gitforgeops --version` / `-V` print the Cargo package version. `gitforgeops
@@ -291,12 +291,12 @@ After apply, a best-effort `GET /cluster` prints a convergence line.
 
 `kind: MeshConfig` fragments live under `resources/<ns>/mesh/`. They are not gateway resources: every fragment folds into one standalone `{version: "1", mesh: {...}}` document (`apply::render_mesh_yaml`, `MESH_DOCUMENT_VERSION`) published to `FERRUM_MESH_FILE_OUTPUT_PATH` by `export` and file-mode `apply`. `validate` / `plan` / `apply` run a second pass, `ferrum-edge validate -m mesh`, over the rendered bytes. Mesh resources never appear in `diff` — there is no live API to compare against.
 
-Publication is a **reconciliation**, not a conditional write: `apply::reconcile_mesh_file` is total over `Option<&MeshConfigSpec>`, and removing the last fragment retracts the destination by rewriting it as `{version: '1', mesh: {}}`. Never by deleting it — ferrum-edge's mesh file source bails with `mesh configuration file not found`, so a deletion would turn a policy retraction into a node outage, while `MeshFileDocument` (`deny_unknown_fields`, required `mesh`, all inner fields defaulted) accepts the empty mapping. Two gates decide whether a retraction may touch the path, both in `MeshRetractionScope`: the state ledger must attribute the destination to this repository through `StateFile::mesh_document_path`, and the run must not be `FERRUM_NAMESPACE`-filtered (a filter narrows which fragments load at all, and the document is mesh-wide, so an empty selection is not evidence of deletion). Canonical formatting alone is not provenance; anything without ledger attribution is reported and left alone. `apply::plan_mesh_publication` is the same decision without the write, so `plan` and `review` preview exactly what `apply` will do; all of them print a `RETRACT mesh` line. api-mode apply neither publishes nor retracts.
+Publication is a **reconciliation**, not a conditional write: `apply::reconcile_mesh_file` is total over `Option<&MeshConfigSpec>`, and removing the last fragment retracts the destination by rewriting it as `{version: '1', mesh: {}}`. Never by deleting it — ferrum-edge's mesh file source bails with `mesh configuration file not found`, so a deletion would turn a policy retraction into a node outage, while `MeshFileDocument` (`deny_unknown_fields`, required `mesh`, all inner fields defaulted) accepts the empty mapping. Two gates decide whether a retraction may touch the path, both in `MeshRetractionScope`: the state ledger must attribute the destination to this repository through `StateFile::mesh_document_path`, and the run must cover the environment's publication scope (`ResolvedEnv::covers_environment`: unfiltered, or filtered only by the environment's own declared `namespace_filter`). An ad-hoc `FERRUM_NAMESPACE` narrows which fragments load at all, and the document is mesh-wide, so such a run neither retracts (an empty selection is not evidence of deletion) nor publishes (the selected subset would drop every other namespace's fragments); it reports `NarrowedScope`. Canonical formatting alone is not provenance; anything without ledger attribution is reported and left alone. `apply::plan_mesh_publication` is the same decision without the write, so `plan` and `review` preview exactly what `apply` will do; all of them print a `RETRACT mesh` line. api-mode apply neither publishes nor retracts.
 
 ### Namespace Handling
 
 - Directory-inferred: `resources/<ns>/…` → resource `namespace: <ns>` unless the spec overrides with a non-default value.
-- `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset. `validate`, `plan`, and `diff` fail closed when the filter selects zero desired resources while the on-disk tree contains at least one resource; `--allow-empty-namespace` (CLI-only) demotes that to a warning. When filtered live inventory is empty solely because the filter matched no live namespace, `plan` and `diff` say so in text and JSON.
+- `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset. `validate`, `plan`, `diff`, and `apply` fail closed when the filter selects zero desired resources while the on-disk tree contains at least one resource; `--allow-empty-namespace` (CLI-only) demotes that to a warning. File-mode documents are document-wide, so an ad-hoc `FERRUM_NAMESPACE` that drops any loaded resource from a file-mode environment is the `NarrowedFilePublication` apply blocker; an environment's own `namespace_filter` is its publication scope and is not narrowing. When filtered live inventory is empty solely because the filter matched no live namespace, `plan` and `diff` say so in text and JSON.
 - Gateway validator children derive their explicit `FERRUM_NAMESPACE` from the assembled resources after selection and overlays. The parent's filter is never forwarded; every selected effective namespace is validated.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
 - `BackupSnapshot::from_scoped_body` validates every resource's explicit wire namespace
@@ -675,8 +675,8 @@ Two pure computations, shared so a preview and the run it previews cannot
 disagree.
 
 **`apply_blockers`** — every fail-closed gate `apply` refuses on that is
-decidable *without* a gateway, as `Vec<ApplyBlocker>` over seven
-`BlockerKind`s: `Validation`, `Security`, `Policy`, `RequiredCredentials`,
+decidable *without* a gateway, as `Vec<ApplyBlocker>` over eight
+`BlockerKind`s: `NarrowedFilePublication`, `Validation`, `Security`, `Policy`, `RequiredCredentials`,
 `SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
 non-empty. `review --fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`)
@@ -955,7 +955,7 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_ADMIN_JWT_ROLE` (default `admin`) — `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only
 - `FERRUM_ADMIN_JWT_AUDIENCE` (default unset) — `aud` is emitted only when set; a gateway with no audience rejects tokens carrying it
 - `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`) — must be within the gateway's `FERRUM_ADMIN_JWT_MAX_TTL`
-- `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace). `validate`, `plan`, and `diff` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` (CLI-only, no env var) demotes that refusal to a warning.
+- `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace). `validate`, `plan`, `diff`, and `apply` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). In file mode an ad-hoc filter that drops any loaded resource is refused by `plan`/`apply` (`NarrowedFilePublication`). `--allow-empty-namespace` (CLI-only, no env var) demotes that refusal to a warning.
 - `FERRUM_ALLOW_UNKNOWN_FIELDS` (default `false`) — keep unknown top-level `spec` fields verbatim instead of rejecting them; nested unknowns stay fatal. For a gateway newer than this release.
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)

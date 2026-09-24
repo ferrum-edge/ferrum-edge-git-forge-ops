@@ -74,6 +74,7 @@ fn clean_inputs<'a>(report: &'a ResolveReport) -> ApplyGateInputs<'a> {
         allow_credential_slot_remap: false,
         provisioner_token_present: true,
         github_repository_present: true,
+        file_publication_narrowed: false,
     }
 }
 
@@ -222,6 +223,7 @@ fn every_blocker_class_is_reported_together_and_named_in_the_summary() {
         allow_credential_slot_remap: false,
         provisioner_token_present: true,
         github_repository_present: true,
+        file_publication_narrowed: false,
     });
 
     let kinds: Vec<BlockerKind> = blockers.iter().map(|b| b.kind).collect();

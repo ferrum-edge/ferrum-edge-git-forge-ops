@@ -18,6 +18,11 @@ pub struct ResolvedEnv {
     pub name: String,
     pub overlay: Option<String>,
     pub namespace_filter: Option<String>,
+    /// `namespace_filter` came from the environment's own `namespace_filter`
+    /// in `.gitforgeops/config.yaml` rather than an ad-hoc `FERRUM_NAMESPACE`.
+    /// An environment-declared filter *is* that environment's publication
+    /// scope; an ad-hoc one narrows it.
+    pub namespace_filter_is_environment_scope: bool,
     pub apply_strategy: ApplyStrategy,
     pub ownership: OwnershipConfig,
 }
@@ -25,6 +30,17 @@ pub struct ResolvedEnv {
 impl ResolvedEnv {
     pub fn default_env_name() -> String {
         "default".to_string()
+    }
+
+    /// Does this run see everything the environment publishes?
+    ///
+    /// File-mode documents (gateway and mesh) are document-wide: whatever is
+    /// selected *replaces* the destination. Only an unfiltered run, or one
+    /// filtered by the environment's own declared scope, may write or retract
+    /// them; an ad-hoc `FERRUM_NAMESPACE` would publish a subset over the
+    /// whole.
+    pub fn covers_environment(&self) -> bool {
+        self.namespace_filter.is_none() || self.namespace_filter_is_environment_scope
     }
 
     /// Enforce the invariants that `RepoConfig::validate` enforces on the
@@ -229,6 +245,7 @@ fn merge(name: String, env: &EnvironmentConfig, env_config: &EnvConfig) -> Resol
     // Repo config is authoritative; env vars are fallback when repo config leaves
     // a value unset. This lets operators override per-run without editing the repo.
     let overlay = env.overlay.clone().or_else(|| env_config.overlay.clone());
+    let namespace_filter_is_environment_scope = env.namespace_filter.is_some();
     let namespace_filter = env
         .namespace_filter
         .clone()
@@ -238,6 +255,7 @@ fn merge(name: String, env: &EnvironmentConfig, env_config: &EnvConfig) -> Resol
         name,
         overlay,
         namespace_filter,
+        namespace_filter_is_environment_scope,
         apply_strategy: env.apply_strategy.clone(),
         ownership: env.ownership.clone(),
     }
@@ -256,6 +274,7 @@ fn synthetic_default(env_config: &EnvConfig, explicit_env: Option<&str>) -> Reso
         name,
         overlay: env_config.overlay.clone(),
         namespace_filter: env_config.namespace_filter.clone(),
+        namespace_filter_is_environment_scope: false,
         apply_strategy: env_config.apply_strategy.clone(),
         ownership: OwnershipConfig {
             mode: OwnershipMode::Shared,
