@@ -1680,8 +1680,14 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
             if repository_present {
                 env.push(("GITHUB_REPOSITORY", "example/repository"));
             }
-            for command in ["plan", "review"] {
-                let output = repo.run(&[command], &env);
+            for (command, args) in [
+                ("plan", &["plan"][..]),
+                (
+                    "review --fail-on-blockers",
+                    &["review", "--fail-on-blockers"][..],
+                ),
+            ] {
+                let output = repo.run(args, &env);
                 let out = stdout(&output);
                 assert_eq!(
                     output.status.success(),
@@ -1724,6 +1730,19 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
             );
         }
     }
+    // The secretless PR check: no bundle, no provisioner token, but Actions
+    // always sets GITHUB_REPOSITORY. Default review renders the blocker and
+    // stays 0 — the same contract as every other offline blocker.
+    let repo = Repo::with_consumer(&consumer);
+    let review = repo.run(&["review"], &[("GITHUB_REPOSITORY", "example/repository")]);
+    assert!(
+        review.status.success(),
+        "default review must stay 0: {} {}",
+        stdout(&review),
+        stderr(&review)
+    );
+    assert!(stdout(&review).contains("provisioner-token"));
+
     let repo = Repo::with_consumer(&consumer);
     let seeded = repo.run(&["plan"], &[("FERRUM_CREDS_JSON", BUNDLE)]);
     assert!(seeded.status.success(), "{}", stdout(&seeded));

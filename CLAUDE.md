@@ -699,8 +699,10 @@ stale-view, per-resource write failures) are deliberately excluded: a preview
 cannot decide them.
 
 Pending allocations require both provisioning environment variables. `plan` and
-`review` use `credential_provisioning_blockers`, render the missing capability,
-and exit 1. Apply calls the same predicate at its existing allocation gate,
+`review` use `credential_provisioning_blockers` and render the missing capability;
+`plan` exits 1, and `review` exits 1 only under `--fail-on-blockers` like every
+other offline blocker (the secretless PR check has no bundle, so every
+`alloc=generate` slot reads as pending there). Apply calls the same predicate at its existing allocation gate,
 after safety checks and before external writes, retaining the exact refusal text.
 File apply also checks before publishing either output document, while keeping
 credential allocation after placeholder publication.

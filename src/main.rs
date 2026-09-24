@@ -3363,11 +3363,12 @@ async fn cmd_review(
     // what the reviewer has to act on.
     review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
+    // Provisioning blockers are part of `blockers`, so they fail the run only
+    // under `--fail-on-blockers` like every other offline gate. The secretless
+    // PR check has no bundle, so every `alloc=generate` slot reads as awaiting
+    // allocation there; an unconditional exit would fail every PR in a repo
+    // with one generated credential.
     review::enforce_offline_blockers(fail_on_blockers, &blockers)?;
-
-    if let Some(summary) = verdict::blocker_summary(&provisioning_blockers) {
-        return Err(summary.into());
-    }
     if let Some(error) = validation_execution_error {
         return Err(format!("validator execution failed during review: {error}").into());
     }
