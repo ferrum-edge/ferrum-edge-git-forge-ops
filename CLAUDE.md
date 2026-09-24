@@ -818,6 +818,13 @@ the two consequences by whether evidence exists:
   `SlotRemapPolicy::Allow` so they can render it (plan then exits 1 itself).
   `--allow-credential-slot-remap` downgrades the refusal for the documented
   shrink-then-rotate sequence. Messages name slots only, never values.
+- A declared Consumer that omits a known credential type while the bundle
+  still holds a slot under `ns/id/<type>` is the same remap as `<type>: []`
+  (`check_omitted_credential_types`): re-adding the type would resurrect the
+  retired value. A Consumer absent from the walked document is deliberately
+  not checked, because namespace filters, the rotate preflight's
+  single-Consumer walk and id renames all omit Consumers whose slots remain
+  legitimate.
 - Plugin-config arrays get the same split through
   `check_plugin_array_slot_identity`, called from both plugin walks. Their
   slots carry an explicit `[N]` for every entry (no index-0 elision), so only a

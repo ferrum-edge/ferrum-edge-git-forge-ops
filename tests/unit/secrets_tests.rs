@@ -2062,6 +2062,142 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
     assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
 }
 
+// --- Omitted credential types (#332) ----------------------------------------
+
+fn partner_cfg(credentials: serde_json::Value) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [{
+            "id": "partner",
+            "username": "partner",
+            "namespace": "ferrum",
+            "credentials": credentials,
+        }]
+    }))
+    .unwrap()
+}
+
+fn retired_partner_key_bundle() -> BTreeMap<String, String> {
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/partner/keyauth/key".to_string(),
+        "OLD-RETIRED-KEY-VALUE".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauth/[1]/key".to_string(),
+        "OLD-RETIRED-SECOND-KEY".to_string(),
+    );
+    bundle
+}
+
+/// Omitting `keyauth` entirely must reach the same verdict as `keyauth: []`:
+/// the stored slots would otherwise be resurrected by a later re-add, even
+/// with `alloc=generate`.
+#[test]
+fn omitted_credential_type_is_refused_like_an_empty_array() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    let bundle = retired_partner_key_bundle();
+    for credentials in [
+        serde_json::json!({"keyauth": []}),
+        serde_json::json!({}),
+        serde_json::json!({"jwt": [{"secret": REQUIRE}]}),
+    ] {
+        let cfg = partner_cfg(credentials.clone());
+        let err = report_secrets_with_mode_and_options(
+            &cfg,
+            &bundle,
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .expect_err("a stored slot the consumer no longer declares must not resolve silently");
+        assert!(
+            matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+            "{credentials}: {err}"
+        );
+        let err = err.to_string();
+        assert!(
+            err.contains("ferrum/partner/keyauth/key")
+                && err.contains("ferrum/partner/keyauth/[1]/key")
+                && err.contains("orphaned"),
+            "{credentials}: {err}"
+        );
+        assert!(err.contains("--allow-credential-slot-remap"), "{err}");
+        assert!(
+            !err.contains("OLD-RETIRED"),
+            "a refusal must never echo bundle values: {err}"
+        );
+
+        let mut resolved = cfg.clone();
+        assert!(
+            resolve_secrets_with_mode_and_options(
+                &mut resolved,
+                &bundle,
+                GatewayMode::Api,
+                ResolveOptions::default(),
+            )
+            .is_err(),
+            "{credentials}: resolve must refuse what report refuses"
+        );
+    }
+}
+
+/// `--allow-credential-slot-remap` downgrades the omitted-type refusal to the
+/// same report it downgrades for an empty array.
+#[test]
+fn allowed_slot_remap_downgrades_the_omitted_type_refusal() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let bundle = retired_partner_key_bundle();
+    let report = report_secrets_with_mode_and_options(
+        &partner_cfg(serde_json::json!({})),
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::allowing_slot_remap(true),
+    )
+    .expect("the acknowledgement accepts the retired slots");
+    assert_eq!(report.slot_remaps.len(), 2, "{:?}", report.slot_remaps);
+}
+
+/// Declared types keep their ordinary verdicts, slots of other consumers that
+/// share a prefix are not attributed to this one, and a consumer absent from
+/// the walked document is never treated as deleted — namespace filters and
+/// the rotate preflight walk partial documents.
+#[test]
+fn omitted_type_scan_stays_within_the_declared_consumer() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = retired_partner_key_bundle();
+    bundle.insert(
+        "ferrum/partner-two/jwt/secret".to_string(),
+        "another-consumer-secret".to_string(),
+    );
+    bundle.insert(
+        "ferrum/absent/hmac_auth/secret".to_string(),
+        "consumer-not-in-this-document".to_string(),
+    );
+    let cfg = partner_cfg(serde_json::json!({
+        "keyauth": [{"key": REQUIRE}, {"key": REQUIRE}]
+    }));
+    let report = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("every stored slot of the declared consumer is still owned");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(report
+        .results
+        .iter()
+        .all(|r| r.status == SlotStatus::Resolved));
+}
+
 // --- Plugin-config array slot identity (#328) -------------------------------
 
 const OIDC_SECRET_A_SLOT: &str =

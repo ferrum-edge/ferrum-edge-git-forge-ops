@@ -1,4 +1,6 @@
-use crate::config::schema::{is_known_credential_type, unknown_credential_type_message};
+use crate::config::schema::{
+    is_known_credential_type, unknown_credential_type_message, KNOWN_CREDENTIAL_TYPES,
+};
 use crate::config::{GatewayConfig, GatewayMode};
 use crate::diagnostics::safe_line;
 
@@ -1046,6 +1048,7 @@ fn report_secrets_with_mode_inner(
             ];
             walk_and_report(value, &components, bundle, &mode, constraints, &mut report)?;
         }
+        check_omitted_credential_types(consumer, bundle, &mut report);
     }
     for plugin in &cfg.plugin_configs {
         let walk = PluginWalk::new(
@@ -1114,7 +1117,8 @@ fn report_secrets_with_mode_inner(
 /// gitforgeops will report it as unmanaged drift forever. Removing a
 /// credential you actually want gone therefore needs an explicit empty array
 /// (`keyauth: []`) for the delete-on-omit types, and a gateway-side removal
-/// for `basicauth`. Unknown credential map keys are refused before this walk,
+/// for `basicauth`. Either spelling is a slot remap while the bundle still
+/// holds a slot for the dropped type (see `check_omitted_credential_types`). Unknown credential map keys are refused before this walk,
 /// so gitforgeops cannot create a custom type the gateway would store without
 /// authenticating.
 pub fn resolve_secrets(
@@ -1177,6 +1181,7 @@ fn resolve_secrets_in_place(
             ];
             walk_report_and_replace(value, &mut components, bundle, &mode, &mut report)?;
         }
+        check_omitted_credential_types(consumer, bundle, &mut report);
     }
 
     for plugin in cfg.plugin_configs.iter_mut() {
@@ -1488,6 +1493,57 @@ fn check_array_slot_identity(
                      reassignment.",
                     items.len(),
                     if items.len() == 1 { "y" } else { "ies" }
+                ),
+            );
+        }
+    }
+}
+
+/// Stored slots for a credential type a declared Consumer no longer lists.
+///
+/// Omitting a type entirely leaves its bundle slots behind exactly like
+/// shrinking its array to `[]` does: re-adding the type later, even with
+/// `alloc=generate`, resolves to the retired value because the slot name is
+/// unchanged. `keyauth: []` is already a remap through
+/// [`check_array_slot_identity`], so the omitted spelling must reach the same
+/// verdict rather than resurrecting the credential silently.
+///
+/// Only Consumers present in the walked document are checked. A Consumer
+/// absent from it is not evidence of deletion: namespace filters, the rotate
+/// preflight's single-Consumer walk and deliberate id renames all omit
+/// Consumers whose slots are still legitimate.
+fn check_omitted_credential_types(
+    consumer: &crate::config::schema::Consumer,
+    bundle: &CredentialBundle,
+    report: &mut ResolveReport,
+) {
+    for credential_type in KNOWN_CREDENTIAL_TYPES {
+        if consumer.credentials.contains_key(credential_type) {
+            continue;
+        }
+        let prefix = join_slot_components(&[
+            SlotComponent::Literal(&consumer.namespace),
+            SlotComponent::Literal(&consumer.id),
+            SlotComponent::Literal(credential_type),
+        ]);
+        let orphans = bundle
+            .range(prefix.clone()..)
+            .map(|(slot, _)| slot)
+            .take_while(|slot| slot.starts_with(&prefix))
+            .filter(|slot| {
+                slot.strip_prefix(&prefix)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            });
+        for slot in orphans {
+            push_slot_remap(
+                report,
+                format!(
+                    "credential slot '{slot}' is orphaned: the credential bundle still holds a \
+                     value for it, but consumer '{}/{}' no longer declares '{credential_type}'. \
+                     Re-adding '{credential_type}' would resurrect this retired value through the \
+                     same slot, even with alloc=generate. Retire the slot from the credential \
+                     bundle — or pass --allow-credential-slot-remap to accept it.",
+                    consumer.namespace, consumer.id
                 ),
             );
         }

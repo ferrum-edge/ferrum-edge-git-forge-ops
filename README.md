@@ -933,7 +933,7 @@ Write the array form. `GET /backup` always returns arrays, so a bare object (`ke
 
 Any other `credentials` map key is refused before apply, and `import` refuses it before writing a tree or credential import bundle. Ferrum Edge will store opaque custom types, but auth plugins never index them — so `api_key` or `basic_auth` can validate, broker, and apply "successfully" while live traffic still 401s. `validate`, `plan`, and the credential broker fail closed with an error-severity finding that names the unknown key, the consumer, and the recognized set. Known misspellings suggest the valid key: `api_key` → `keyauth`, `basic_auth` → `basicauth`.
 
-Removal is asymmetric on the gateway side: omitting `keyauth`, `jwt`, `hmac_auth`, or `mtls_auth` **deletes** the stored entries on the next apply, while omitting `basicauth` **preserves** whatever the gateway already has. To actually clear one of the first four, write an explicit empty array (`keyauth: []`).
+Removal is asymmetric on the gateway side: omitting `keyauth`, `jwt`, `hmac_auth`, or `mtls_auth` **deletes** the stored entries on the next apply, while omitting `basicauth` **preserves** whatever the gateway already has. To actually clear one of the first four, write an explicit empty array (`keyauth: []`). Either way, retire the type's slots from the credential bundle as well: while the bundle still holds one, the omission or the empty array is refused as a [slot remap](#hazard-entry-position-is-the-slot-identity).
 
 ### What the broker will and won't generate
 
@@ -1015,6 +1015,8 @@ The two shapes get very different treatment, because only one of them leaves evi
 - **A stored slot the array no longer owns** — a **refusal**. If the bundle holds a value for entry index *N* and the array now has *N* entries or fewer, the array shrank: the entry that shifted into the vacated index has inherited a credential you meant to retire, and re-growing the list would resurrect the orphan for a new entry. `apply`, `export --materialize` and `rotate` refuse; `plan` prints a `Credential Slot Remaps` section and exits non-zero; the PR comment renders it as blocking. Messages name slots only, never values.
 
 The refusal covers deleting the *last* entry too. Nothing shifted in that case, but the orphaned value is still sitting in the bundle waiting to be handed to the next entry added at that index.
+
+It also covers dropping a credential type from a Consumer altogether. Omitting `keyauth` leaves `ferrum/app/keyauth/key` in the bundle exactly like `keyauth: []` does, and re-adding the type later — even with `alloc=generate` — would resolve to the retired value through the unchanged slot name. Both spellings are refused while the bundle still holds a slot for the type. Retire the slot from the credential bundle, or pass `--allow-credential-slot-remap`. A Consumer that is missing from the document entirely is not checked: namespace filters, the rotate preflight and a deliberate id rename all walk documents without Consumers whose slots are still legitimate, so absence is not evidence of deletion. Retire a deleted Consumer's slots from the bundle yourself before reusing its id.
 
 To land the shrink, rotate first and delete second:
 
