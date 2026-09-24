@@ -58,11 +58,34 @@ RUN printf '%s\n' '#!/bin/sh' \
     'exec /opt/override-git/loader --library-path /opt/override-git/lib /opt/override-git/git "$@"' \
     > /usr/local/bin/git && chmod 0755 /usr/local/bin/git
 
-COPY --from=ferrum-edge /app/ferrum-edge /app/ferrum-edge
-COPY --from=builder /build/target/release/gitforgeops /app/gitforgeops
+# Run unprivileged by default (issue #347). The fixed UID/GID 65532 matches the
+# upstream ferrum-edge image's non-root identity. The passwd/group entries are
+# appended directly so no account tooling runs; they only give the default
+# identity a name. `--user "$(id -u):$(id -g)"` overrides still work without a
+# passwd entry: HOME is the world-writable, sticky /tmp (a `--tmpfs /tmp` under
+# `--read-only`), and nothing the CLI runs needs a named account.
+#
+# A bind-mounted checkout is owned by the host user, so Git's ownership check
+# would otherwise refuse `/repo` for the default identity and silently leave
+# revision-bound overrides inactive. The system-level `safe.directory` entry
+# names exactly the documented mount point, never a wildcard; any other path
+# (for example a split `GITFORGEOPS_OVERRIDE_SOURCE`) still requires the
+# checkout owner's UID. `/repo` itself is owned by the default identity so a
+# named volume mounted there starts out writable.
+RUN printf '%s\n' 'gitforgeops:x:65532:65532:gitforgeops:/tmp:/usr/sbin/nologin' \
+        >> /etc/passwd \
+    && printf '%s\n' 'gitforgeops:x:65532:' >> /etc/group \
+    && printf '%s\n' '[safe]' '    directory = /repo' > /etc/gitconfig \
+    && chmod 0644 /etc/gitconfig \
+    && install -d -o 65532 -g 65532 -m 0755 /repo
 
-ENV PATH="/app:${PATH}"
+COPY --from=ferrum-edge --chmod=0755 /app/ferrum-edge /app/ferrum-edge
+COPY --from=builder --chmod=0755 /build/target/release/gitforgeops /app/gitforgeops
+
+ENV PATH="/app:${PATH}" \
+    HOME=/tmp
 WORKDIR /repo
+USER 65532:65532
 
 LABEL org.opencontainers.image.title="gitforgeops" \
       org.opencontainers.image.description="GitOps CLI for Ferrum Edge gateway configuration" \

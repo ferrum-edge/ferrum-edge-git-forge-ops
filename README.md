@@ -2313,14 +2313,28 @@ gitforgeops --env production diff --exit-on-drift
 
 A Dockerfile is included that bundles both `gitforgeops` and `ferrum-edge` into a single image. The `ferrum-edge` binary is copied from the official `ferrumedge/ferrum-edge` Docker Hub image; `gitforgeops` is compiled from source in a builder stage.
 
+The image runs as the unprivileged user `gitforgeops` (UID/GID `65532`, the
+same non-root identity as the upstream `ferrumedge/ferrum-edge` image), never
+as root. `HOME` is `/tmp`, so the CLI and Git also work under an arbitrary
+`--user` UID that has no passwd entry, and under `--read-only` with
+`--tmpfs /tmp`. Mount the checkout at `/repo` and run with its owner's UID/GID,
+`--user "$(id -u):$(id -g)"`, as every example below does: commands that write
+into the checkout (`export --output`, `import`, file-mode `apply`, the state
+ledger) then leave files owned by you rather than by `65532` or root, and the
+default user usually cannot write into a host checkout at all.
+
 Revision-bound overrides require a complete source checkout, including `.git`
 and the triggering merge's history. The runtime includes Git's local inspection
 commands and their loader/libraries copied from the existing digest-pinned Rust
 builder; no mutable package installation or extra image dependency is used.
 Those libraries are private to Git, so they do not replace the gateway's runtime
-libraries. Mount the checkout at `/repo` and run with its owner's UID/GID (for
-example, `--user "$(id -u):$(id -g)"`); no global `safe.directory` bypass is set.
-Missing history or mismatching reviewed inputs still leaves overrides inactive.
+libraries. Git's ownership check still applies: the image's system Git
+configuration trusts exactly `/repo` (`safe.directory = /repo`, never a
+wildcard) so a checkout mounted there is inspected even when its owner differs
+from the container user, while a checkout anywhere else, including a split
+`GITFORGEOPS_OVERRIDE_SOURCE`, must be owned by the container user. Missing
+history, a refused checkout or mismatching reviewed inputs still leaves
+overrides inactive.
 
 ### Published images
 
@@ -2354,7 +2368,7 @@ Platforms: `linux/amd64` + `linux/arm64`.
 ```bash
 docker build -t gitforgeops .
 
-docker run --rm -v $(pwd):/repo gitforgeops --env staging validate
+docker run --rm --user "$(id -u):$(id -g)" -v "$(pwd)":/repo gitforgeops --env staging validate
 ```
 
 The Ferrum Edge, Rust, and Debian stages are pinned by multi-architecture
