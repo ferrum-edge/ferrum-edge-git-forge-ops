@@ -226,10 +226,11 @@ jobs:
             || fail "Image default user is '$configured', expected 65532:65532."
           default_uid=$(docker run --rm --network none --entrypoint id "$image" -u)
           [ "$default_uid" = 65532 ] || fail "Default container UID is $default_uid."
-          # The system Git configuration trusts exactly the documented mount.
-          safe=$(docker run --rm --network none --entrypoint git "$image" \
-            config --system --get-all safe.directory)
-          [ "$safe" = /repo ] || fail "Unexpected system safe.directory: $safe"
+          # No safe.directory bypass: Git keeps its ownership check everywhere.
+          if safe=$(docker run --rm --network none --entrypoint git "$image" \
+              config --system --get-all safe.directory 2>/dev/null); then
+            fail "Unexpected system safe.directory: $safe"
+          fi
 
           # An arbitrary --user UID has no passwd entry; HOME must still be a
           # writable location, including under --read-only with a /tmp tmpfs.
@@ -269,22 +270,20 @@ jobs:
           [ "$(owner_run --entrypoint git "$image" rev-parse HEAD)" = "$head" ] \
             || fail "Git could not inspect the owner's checkout."
 
-          # Default identity against a checkout owned by someone else. Git
-          # inspects it only at /repo; the same checkout elsewhere is refused.
+          # Default identity against a checkout owned by someone else: Git
+          # refuses it, so revision-bound overrides stay inactive (fail closed).
           default_run() {
             docker run --rm --network none --read-only --cap-drop ALL \
               --security-opt no-new-privileges \
               --tmpfs /tmp:rw,nosuid,nodev,mode=1777 "$@"
           }
-          [ "$(default_run -v "$fixture":/repo --entrypoint git "$image" rev-parse HEAD)" = "$head" ] \
-            || fail "Git refused the /repo mount for the default user."
-          if refused=$(default_run -v "$fixture":/elsewhere -w /elsewhere \
-              --entrypoint git "$image" rev-parse HEAD 2>&1); then
-            fail "Git trusted a foreign-owned checkout outside /repo."
+          if refused=$(default_run -v "$fixture":/repo --entrypoint git "$image" \
+              rev-parse HEAD 2>&1); then
+            fail "Git trusted a checkout owned by another user."
           fi
           case "$refused" in
             *"dubious ownership"*) ;;
-            *) fail "Git failed outside /repo for another reason: $refused" ;;
+            *) fail "Git failed on the foreign-owned checkout for another reason: $refused" ;;
           esac
           # Writing needs a directory the default user may write to; what it
           # writes belongs to 65532, never to root.

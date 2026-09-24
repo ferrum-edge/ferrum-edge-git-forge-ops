@@ -2328,13 +2328,10 @@ and the triggering merge's history. The runtime includes Git's local inspection
 commands and their loader/libraries copied from the existing digest-pinned Rust
 builder; no mutable package installation or extra image dependency is used.
 Those libraries are private to Git, so they do not replace the gateway's runtime
-libraries. Git's ownership check still applies: the image's system Git
-configuration trusts exactly `/repo` (`safe.directory = /repo`, never a
-wildcard) so a checkout mounted there is inspected even when its owner differs
-from the container user, while a checkout anywhere else, including a split
-`GITFORGEOPS_OVERRIDE_SOURCE`, must be owned by the container user. Missing
-history, a refused checkout or mismatching reviewed inputs still leaves
-overrides inactive.
+libraries. Git's ownership check still applies and no `safe.directory` bypass
+is set: Git inspects the checkout only when the container runs as its owner's
+UID/GID. Missing history, a checkout owned by another user, or mismatching
+reviewed inputs leaves overrides inactive.
 
 ### Published images
 
