@@ -52,8 +52,8 @@ pub enum BlockerKind {
     Policy,
     /// `alloc=require` slots with no value in the bundle.
     RequiredCredentials,
-    /// A credential-array shape change that re-owns a stored broker slot,
-    /// without `--allow-credential-slot-remap`.
+    /// A credential shape change or a retired Consumer that re-owns or
+    /// revives a stored broker slot, without `--allow-credential-slot-remap`.
     SlotRemap,
     /// Pending allocation requires the GitHub provisioner token.
     ProvisionerToken,
@@ -106,9 +106,9 @@ impl BlockerKind {
                  switch the placeholder to alloc=generate"
             }
             BlockerKind::SlotRemap => {
-                "credential-slot reassignment(s); rotate (Consumer) or reseed (plugin config) \
-                 the affected slot and retire the orphaned slot from the bundle, or re-run with \
-                 --allow-credential-slot-remap"
+                "credential-slot reassignment(s) or revival(s); rotate (Consumer) or reseed \
+                 (plugin config) the affected slot and retire the orphaned or retired slot from \
+                 the bundle, or re-run with --allow-credential-slot-remap"
             }
             BlockerKind::NarrowedFilePublication => {
                 "FERRUM_NAMESPACE narrows a file-mode environment, whose published document \

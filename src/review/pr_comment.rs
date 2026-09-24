@@ -1098,9 +1098,10 @@ pub fn build_review_comment_with_preview(
         md.push_str("### Credential Slot Remaps\n\n");
         md.push_str(
             "A Consumer credential or plugin-config array changed shape in a way that reassigns \
-             a stored broker slot. Slot identity is the entry's array index, so the entry that \
-             shifted into a vacated index has inherited a credential that was meant to be \
-             retired.\n\n",
+             a stored broker slot, or a retired Consumer's slot is still in the credential \
+             bundle. Slot identity is the entry's array index under the Consumer id, so the \
+             entry that shifted into a vacated index, or a Consumer that reuses a retired id, \
+             inherits a credential that was meant to be retired.\n\n",
         );
         for remap in secrets.slot_remaps.iter().take(MAX_SECTION_ITEMS) {
             md.push_str(&format!("- {}\n", bounded_markdown_text(remap)));
