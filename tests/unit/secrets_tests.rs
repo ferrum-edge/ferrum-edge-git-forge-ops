@@ -2201,6 +2201,440 @@ fn omitted_type_scan_stays_within_the_declared_consumer() {
         .all(|r| r.status == SlotStatus::Resolved));
 }
 
+// --- Retired Consumers and the state ledger (#332) --------------------------
+
+fn consumers_cfg(consumers: serde_json::Value) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": consumers,
+    }))
+    .unwrap()
+}
+
+/// The document after `partner` was deleted: only an unrelated Consumer is
+/// left, and its own stored slot is still owned.
+fn partner_deleted_cfg() -> GatewayConfig {
+    consumers_cfg(serde_json::json!([{
+        "id": "other",
+        "username": "other",
+        "namespace": "ferrum",
+        "credentials": {"keyauth": [{"key": REQUIRE}]},
+    }]))
+}
+
+fn retired_partner_and_other_bundle() -> BTreeMap<String, String> {
+    let mut bundle = retired_partner_key_bundle();
+    bundle.insert(
+        "ferrum/other/keyauth/key".to_string(),
+        "OTHER-LIVE-VALUE".to_string(),
+    );
+    bundle
+}
+
+fn ledger_of(
+    managed: &[(&str, &str)],
+    coverage: gitforgeops::secrets::ConsumerCoverage,
+) -> gitforgeops::secrets::ConsumerLedger {
+    gitforgeops::secrets::ConsumerLedger::new(
+        managed
+            .iter()
+            .map(|(namespace, id)| (namespace.to_string(), id.to_string())),
+        Vec::new(),
+        coverage,
+    )
+}
+
+fn report_with_ledger(
+    cfg: &GatewayConfig,
+    bundle: &BTreeMap<String, String>,
+    ledger: &gitforgeops::secrets::ConsumerLedger,
+    allow: bool,
+) -> gitforgeops::error::Result<gitforgeops::secrets::ResolveReport> {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let options = ResolveOptions::allowing_slot_remap(allow).with_consumer_ledger(ledger);
+    report_secrets_with_mode_and_options(cfg, bundle, GatewayMode::Api, options)
+}
+
+fn resolve_with_ledger(
+    cfg: &mut GatewayConfig,
+    bundle: &BTreeMap<String, String>,
+    ledger: &gitforgeops::secrets::ConsumerLedger,
+    allow: bool,
+) -> gitforgeops::error::Result<gitforgeops::secrets::ResolveReport> {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    let options = ResolveOptions::allowing_slot_remap(allow).with_consumer_ledger(ledger);
+    resolve_secrets_with_mode_and_options(cfg, bundle, GatewayMode::Api, options)
+}
+
+fn is_slot_remap(err: &gitforgeops::error::Error) -> bool {
+    matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_))
+}
+
+/// `keyauth: []` and an omitted `keyauth` are one deletion spelled two ways,
+/// so they must name exactly the same retired slots.
+#[test]
+fn empty_array_and_omitted_type_report_the_same_retired_slots() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let bundle = retired_partner_key_bundle();
+    let ledger = ledger_of(&[("ferrum", "partner")], ConsumerCoverage::Complete);
+    let mut named = Vec::new();
+    for declared in [serde_json::json!({"keyauth": []}), serde_json::json!({})] {
+        let report = report_with_ledger(&partner_cfg(declared), &bundle, &ledger, true)
+            .expect("the acknowledgement accepts the retired slots");
+        let mut slots = Vec::new();
+        for slot in bundle.keys() {
+            let quoted = format!("'{slot}'");
+            if report.slot_remaps.iter().any(|m| m.contains(&quoted)) {
+                slots.push(slot.clone());
+            }
+        }
+        named.push((slots, report.slot_remaps.len()));
+    }
+    assert_eq!(named[0].0.len(), 2, "{named:?}");
+    assert_eq!(named[0].1, 2, "{named:?}");
+    assert_eq!(named[0], named[1]);
+}
+
+/// An unfiltered run over a ledger that records `partner` sees the whole
+/// namespace, so a missing `partner` is a deletion. Its stored slots would be
+/// resurrected by a later Consumer reusing the id, so both walks refuse.
+#[test]
+fn deleted_consumer_recorded_by_the_ledger_is_refused_in_an_unfiltered_run() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let bundle = retired_partner_and_other_bundle();
+    let ledger = ledger_of(
+        &[("ferrum", "partner"), ("ferrum", "other")],
+        ConsumerCoverage::Complete,
+    );
+
+    let err = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
+        .expect_err("a deleted Consumer's stored slots must not stay live silently");
+    assert!(is_slot_remap(&err), "{err}");
+    let err = err.to_string();
+    assert!(
+        err.contains("'ferrum/partner/keyauth/key'")
+            && err.contains("'ferrum/partner/keyauth/[1]/key'")
+            && err.contains("no longer declared"),
+        "{err}"
+    );
+    assert!(!err.contains("ferrum/other/keyauth/key"), "{err}");
+    assert!(err.contains("--allow-credential-slot-remap"), "{err}");
+    assert!(
+        !err.contains("OLD-RETIRED") && !err.contains("OTHER-LIVE"),
+        "a refusal must never echo bundle values: {err}"
+    );
+
+    let mut resolved = partner_deleted_cfg();
+    let refused = resolve_with_ledger(&mut resolved, &bundle, &ledger, false);
+    assert!(refused.is_err(), "resolve refuses what report refuses");
+    assert_eq!(
+        resolved.consumers[0].credentials["keyauth"][0]["key"],
+        REQUIRE
+    );
+}
+
+/// `--allow-credential-slot-remap` downgrades the deleted-Consumer refusal to
+/// the same report it downgrades for a shrink, and every declared slot still
+/// resolves.
+#[test]
+fn allowed_slot_remap_downgrades_the_deleted_consumer_refusal() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let bundle = retired_partner_and_other_bundle();
+    let ledger = ledger_of(
+        &[("ferrum", "partner"), ("ferrum", "other")],
+        ConsumerCoverage::Complete,
+    );
+    let mut cfg = partner_deleted_cfg();
+    let report = resolve_with_ledger(&mut cfg, &bundle, &ledger, true)
+        .expect("the acknowledgement accepts the retired slots");
+
+    assert_eq!(report.slot_remaps.len(), 2, "{:?}", report.slot_remaps);
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(
+        cfg.consumers[0].credentials["keyauth"][0]["key"],
+        "OTHER-LIVE-VALUE"
+    );
+}
+
+/// A namespace filter or a partial walk must never read absence as deletion.
+/// An ad-hoc `FERRUM_NAMESPACE` is `Partial`, the environment's own filter
+/// covers its namespace only, and no ledger at all decides nothing.
+#[test]
+fn filtered_or_partial_runs_never_read_a_missing_consumer_as_deleted() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, ConsumerCoverage, ResolveOptions,
+    };
+
+    let mut bundle = retired_partner_and_other_bundle();
+    bundle.insert(
+        "staging/partner/jwt/secret".to_string(),
+        "STAGING-PARTNER-SECRET".to_string(),
+    );
+    let managed = [
+        ("ferrum", "partner"),
+        ("ferrum", "other"),
+        ("staging", "partner"),
+    ];
+
+    let partial = ledger_of(&managed, ConsumerCoverage::Partial);
+    let report = report_with_ledger(&partner_deleted_cfg(), &bundle, &partial, false)
+        .expect("a filtered run cannot conclude that a Consumer was deleted");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+
+    let staging = ConsumerCoverage::Namespace("staging".to_string());
+    let env_scope = ledger_of(&managed, staging);
+    let report = report_with_ledger(&partner_deleted_cfg(), &bundle, &env_scope, true)
+        .expect("the acknowledgement accepts the retired slot");
+    assert_eq!(
+        report.slot_remaps.len(),
+        1,
+        "only the covered namespace can be read as deleted: {:?}",
+        report.slot_remaps
+    );
+    let remap = &report.slot_remaps[0];
+    assert!(remap.contains("'staging/partner/jwt/secret'"), "{remap}");
+
+    let report = report_secrets_with_mode_and_options(
+        &partner_deleted_cfg(),
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("without ledger evidence absence decides nothing");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+}
+
+/// A slot for a Consumer the ledger never recorded is a value seeded ahead of
+/// the PR that declares it, not a retired one.
+#[test]
+fn a_slot_the_ledger_never_attributed_is_not_a_deletion() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let bundle = retired_partner_and_other_bundle();
+    let ledger = ledger_of(&[("ferrum", "other")], ConsumerCoverage::Complete);
+    let report = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
+        .expect("a pre-seeded slot is not evidence of deletion");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+}
+
+/// The failure scenario from #332: `partner` is deleted, and a new Consumer
+/// reuses the id with `alloc=generate`. Without ledger evidence the slot reads
+/// `Resolved` with nothing to allocate or deliver, handing the new partner the
+/// old partner's key. With it, the revival is refused, in any coverage, until
+/// the slot is retired (which then allocates a fresh value) or accepted.
+#[test]
+fn regrown_consumer_does_not_silently_revive_a_retired_slot() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let regrown = partner_cfg(serde_json::json!({"keyauth": [{"key": GENERATE}]}));
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/partner/keyauth/key".to_string(),
+        "OLD-RETIRED-KEY-VALUE".to_string(),
+    );
+    // The deletion was applied, so the ledger no longer records `partner`.
+    for coverage in [
+        ConsumerCoverage::Complete,
+        ConsumerCoverage::Namespace("ferrum".to_string()),
+        ConsumerCoverage::Partial,
+    ] {
+        let ledger = ledger_of(&[], coverage.clone());
+        let err = report_with_ledger(&regrown, &bundle, &ledger, false)
+            .expect_err("a retired value must not resolve for a newly declared Consumer");
+        assert!(is_slot_remap(&err), "{coverage:?}: {err}");
+        let err = err.to_string();
+        assert!(
+            err.contains("'ferrum/partner/keyauth/key'") && err.contains("revive"),
+            "{coverage:?}: {err}"
+        );
+        assert!(!err.contains("OLD-RETIRED"), "{err}");
+
+        let mut resolved = regrown.clone();
+        let refused = resolve_with_ledger(&mut resolved, &bundle, &ledger, false);
+        assert!(refused.is_err(), "{coverage:?}");
+        assert_eq!(
+            resolved.consumers[0].credentials["keyauth"][0]["key"],
+            GENERATE
+        );
+
+        let accepted = report_with_ledger(&regrown, &bundle, &ledger, true)
+            .expect("the acknowledgement accepts the stored value");
+        assert_eq!(accepted.slot_remaps.len(), 1);
+        assert_eq!(accepted.results[0].status, SlotStatus::Resolved);
+
+        let fresh = report_with_ledger(&regrown, &BTreeMap::new(), &ledger, false)
+            .expect("a retired slot leaves nothing to revive");
+        assert!(fresh.slot_remaps.is_empty(), "{:?}", fresh.slot_remaps);
+        assert_eq!(fresh.results[0].status, SlotStatus::NeedsAllocation);
+    }
+}
+
+/// Dropping a type is refused while its slot is stored, so re-adding it can
+/// only follow an explicit decision: retire the slot first (the regrow then
+/// allocates a fresh value) or accept the stored one with the flag. A regrow
+/// under a reused id the ledger no longer records is refused on its own.
+#[test]
+fn regrow_after_omission_does_not_silently_revive_the_retired_type() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let applied = ledger_of(&[("ferrum", "partner")], ConsumerCoverage::Complete);
+    let mut seeded = retired_partner_key_bundle();
+    seeded.insert(
+        "ferrum/partner/jwt/secret".to_string(),
+        "JWT-SECRET-VALUE-0123456789abcdef".to_string(),
+    );
+
+    let omitted = partner_cfg(serde_json::json!({"jwt": [{"secret": REQUIRE}]}));
+    let err = report_with_ledger(&omitted, &seeded, &applied, false)
+        .expect_err("the omission must not retire the type silently");
+    assert!(is_slot_remap(&err), "{err}");
+
+    let regrown = partner_cfg(serde_json::json!({
+        "jwt": [{"secret": REQUIRE}],
+        "keyauth": [{"key": GENERATE}],
+    }));
+    let mut retired = seeded.clone();
+    retired.retain(|slot, _| !slot.starts_with("ferrum/partner/keyauth/"));
+    let report = report_with_ledger(&regrown, &retired, &applied, false)
+        .expect("with the slot retired the regrow is ordinary first allocation");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    let keyauth = report
+        .results
+        .iter()
+        .find(|r| r.slot == "ferrum/partner/keyauth/key")
+        .unwrap();
+    assert_eq!(keyauth.status, SlotStatus::NeedsAllocation);
+
+    let reused_id = ledger_of(&[], ConsumerCoverage::Complete);
+    let err = report_with_ledger(&regrown, &seeded, &reused_id, false)
+        .expect_err("a reused id must not inherit the retired key")
+        .to_string();
+    assert!(err.contains("'ferrum/partner/keyauth/key'"), "{err}");
+    assert!(
+        !err.contains("ferrum/partner/jwt/secret"),
+        "alloc=require is the operator's seed, not a revival: {err}"
+    );
+}
+
+/// `alloc=require` on a Consumer the ledger does not record yet is the import
+/// and pre-seeding path: the stored value is the intended one.
+#[test]
+fn required_slot_on_a_new_consumer_is_a_seed_not_a_revival() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let cfg = partner_cfg(serde_json::json!({
+        "keyauth": [{"key": REQUIRE}, {"key": REQUIRE}]
+    }));
+    let ledger = ledger_of(&[], ConsumerCoverage::Complete);
+    let report = report_with_ledger(&cfg, &retired_partner_key_bundle(), &ledger, false)
+        .expect("seeded require slots resolve");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(report
+        .results
+        .iter()
+        .all(|r| r.status == SlotStatus::Resolved));
+}
+
+/// Plugin-config slots are not Consumer slots, so a stored `alloc=generate`
+/// value there is never read as a revived Consumer credential.
+#[test]
+fn revival_check_is_limited_to_consumer_slots() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "opaque",
+            "namespace": "ferrum",
+            "plugin_name": "custom_fixture",
+            "scope": "global",
+            "config": {"display_mode": GENERATE}
+        }]
+    }))
+    .unwrap();
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/opaque/@plugin-config/config/display_mode".to_string(),
+        "stored".to_string(),
+    );
+    let ledger = ledger_of(&[], ConsumerCoverage::Complete);
+    let report = report_with_ledger(&cfg, &bundle, &ledger, false).expect("not a Consumer slot");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+}
+
+const EARLIER: &str = "2026-09-01T00:00:00+00:00";
+const LATER: &str = "2026-09-02T00:00:00+00:00";
+
+/// `ConsumerLedger::from_state` reads the committed ledger: applied Consumers
+/// and pending creates are managed, and an allocation recorded after the last
+/// clean apply is the retry of a failed apply rather than a revival.
+#[test]
+fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
+    use gitforgeops::diff::resource_diff::state_key;
+    use gitforgeops::secrets::{ConsumerCoverage, ConsumerLedger};
+    use gitforgeops::state::{CredentialMetadata, StateFile};
+
+    let bundle = retired_partner_and_other_bundle();
+    let partner_key = state_key("ferrum", "Consumer", "partner");
+    let other_key = state_key("ferrum", "Consumer", "other");
+    for pending in [false, true] {
+        let mut state = StateFile::default();
+        state
+            .resources
+            .insert(other_key.clone(), "managed".to_string());
+        if pending {
+            state.pending_creates.insert(partner_key.clone());
+        } else {
+            state
+                .resources
+                .insert(partner_key.clone(), "managed".to_string());
+        }
+        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete);
+        let err = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
+            .expect_err("the ledger attributes the deleted Consumer")
+            .to_string();
+        assert!(err.contains("'ferrum/partner/keyauth/key'"), "{err}");
+    }
+
+    let regrown = partner_cfg(serde_json::json!({"keyauth": [{"key": GENERATE}]}));
+    let slot = "ferrum/partner/keyauth/key";
+    let mut regrown_bundle = BTreeMap::new();
+    regrown_bundle.insert(slot.to_string(), "OLD-RETIRED-KEY-VALUE".to_string());
+    for (last_applied, allocated, retry) in [
+        (Some(LATER), EARLIER, false),
+        (Some(EARLIER), LATER, true),
+        (Some(EARLIER), "not a timestamp", false),
+        (None, EARLIER, true),
+    ] {
+        let mut state = StateFile::default();
+        state.last_applied_at = last_applied.map(str::to_string);
+        let metadata = CredentialMetadata {
+            slot: slot.to_string(),
+            last_rotated: allocated.to_string(),
+            ..Default::default()
+        };
+        state.credentials.insert(slot.to_string(), metadata);
+        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete);
+        let outcome = report_with_ledger(&regrown, &regrown_bundle, &ledger, false);
+        assert_eq!(
+            outcome.is_ok(),
+            retry,
+            "last_applied={last_applied:?} allocated={allocated}: {:?}",
+            outcome.err().map(|e| e.to_string())
+        );
+    }
+}
+
 // --- Plugin-config array slot identity (#328) -------------------------------
 
 const OIDC_SECRET_A_SLOT: &str =

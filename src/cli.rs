@@ -29,6 +29,12 @@ pub struct Cli {
     /// (`gitforgeops rotate --credential <type>/[N]/<key>`) and remove the
     /// entry afterwards.
     ///
+    /// The same refusal covers a retired Consumer's slots: a credential type
+    /// the Consumer no longer declares, and, in `plan`, `review` and `apply`,
+    /// a deleted Consumer the state ledger still records (only in runs that
+    /// load its whole namespace) or a stored `alloc=generate` or
+    /// `alloc=rotate` value for a Consumer the ledger does not record.
+    ///
     /// Global rather than per-subcommand because the refusal comes from
     /// credential resolution itself, which `plan`, `apply`, `review`,
     /// `export --materialize` and `rotate` all go through.

@@ -442,16 +442,42 @@ fn load_credential_bundles(
 /// `diff` keeps reporting drift. The refusal itself belongs to the mutating
 /// paths (`apply`, `export --materialize`, `rotate`), which resolve with the
 /// operator's own [`secrets::ResolveOptions`].
+///
+/// `ledger` adds the retired-Consumer checks (see [`consumer_ledger`]). `plan`
+/// and `review` pass it so they render what `apply` will refuse; `validate` and
+/// `diff` do not gate on remaps and pass `None`.
 fn resolve_credentials(
     cfg: &mut GatewayConfig,
     env_config: &EnvConfig,
+    ledger: Option<&secrets::ConsumerLedger>,
 ) -> Result<secrets::ResolveReport, Box<dyn std::error::Error>> {
     let (bundle, _) = load_credential_bundles(env_config)?;
-    Ok(secrets::resolve_secrets_with_options(
-        cfg,
-        &bundle,
-        secrets::ResolveOptions::allowing_slot_remap(true),
-    )?)
+    let options = secrets::ResolveOptions::allowing_slot_remap(true);
+    let options = match ledger {
+        Some(ledger) => options.with_consumer_ledger(ledger),
+        None => options,
+    };
+    Ok(secrets::resolve_secrets_with_options(cfg, &bundle, options)?)
+}
+
+/// The state-ledger evidence the resolver needs to catch a retired Consumer's
+/// slot (#332).
+///
+/// Coverage mirrors [`mesh_retraction_scope`]: a Consumer missing from the
+/// document counts as deleted only when this run loaded every Consumer of its
+/// namespace. That is an unfiltered run, or one filtered by the environment's
+/// own declared `namespace_filter`, which then covers that namespace only. An
+/// ad-hoc `FERRUM_NAMESPACE` covers nothing, because a Consumer it does not
+/// load may still be declared.
+fn consumer_ledger(resolved: &ResolvedEnv, state: &StateFile) -> secrets::ConsumerLedger {
+    let coverage = match resolved.namespace_filter.as_deref() {
+        None => secrets::ConsumerCoverage::Complete,
+        Some(namespace) if resolved.namespace_filter_is_environment_scope => {
+            secrets::ConsumerCoverage::Namespace(namespace.to_string())
+        }
+        Some(_) => secrets::ConsumerCoverage::Partial,
+    };
+    secrets::ConsumerLedger::from_state(state, coverage)
 }
 
 /// Is a credential bundle available to this invocation?
@@ -1223,7 +1249,7 @@ fn cmd_validate(
     if let Some(finding) = &desired_finding {
         print_namespace_finding(finding);
     }
-    let secret_report = resolve_credentials(&mut gateway_config, &env_config)?;
+    let secret_report = resolve_credentials(&mut gateway_config, &env_config, None)?;
 
     let mut result = validate::run_validation_with_report(
         &gateway_config,
@@ -1441,7 +1467,7 @@ async fn cmd_diff(
     if let Some(finding) = &desired_finding {
         print_namespace_finding(finding);
     }
-    let secret_report = resolve_credentials(&mut desired, &env_config)?;
+    let secret_report = resolve_credentials(&mut desired, &env_config, None)?;
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
@@ -1702,7 +1728,11 @@ async fn cmd_plan(
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
     );
-    let secret_report = resolve_credentials(&mut desired, &env_config)?;
+    // Loaded before resolution: the ledger is the evidence for the
+    // retired-Consumer slot checks apply will refuse on.
+    let state = StateFile::load(&resolved.name)?;
+    let ledger = consumer_ledger(&resolved, &state);
+    let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
     reportln!(json_mode, "=== Environment ===");
     reportln!(
         json_mode,
@@ -1798,7 +1828,6 @@ async fn cmd_plan(
     }
 
     let mut adoptions = Vec::new();
-    let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces);
@@ -2313,12 +2342,17 @@ async fn cmd_apply(
     let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
     let mut shard_count = state.credential_shard_count.max(1);
     let initial_bundle = secrets::merge_bundles(&per_shard);
+    // Only this first resolve consults the ledger. The re-resolve after
+    // allocation sees this run's own new values for Consumers the ledger does
+    // not record yet, which are not revived slots.
+    let ledger = consumer_ledger(&resolved, &state);
+    let initial_options = resolve_options.with_consumer_ledger(&ledger);
     let secret_report = match env_config.gateway_mode {
         GatewayMode::File => {
-            secrets::report_secrets_with_options(&desired, &initial_bundle, resolve_options)?
+            secrets::report_secrets_with_options(&desired, &initial_bundle, initial_options)?
         }
         GatewayMode::Api => {
-            secrets::resolve_secrets_with_options(&mut desired, &initial_bundle, resolve_options)?
+            secrets::resolve_secrets_with_options(&mut desired, &initial_bundle, initial_options)?
         }
     };
 
@@ -3186,7 +3220,9 @@ async fn cmd_review(
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
     );
-    let secret_report = resolve_credentials(&mut desired, &env_config)?;
+    let state = StateFile::load(&resolved.name)?;
+    let ledger = consumer_ledger(&resolved, &state);
+    let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
     let bundle_loaded = credential_bundle_loaded(&env_config);
 
     let review::ReviewValidation {
@@ -3201,7 +3237,6 @@ async fn cmd_review(
     );
 
     let mut adoptions = Vec::new();
-    let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
     let client = AdminClient::new_scoped(&env_config, &namespaces);

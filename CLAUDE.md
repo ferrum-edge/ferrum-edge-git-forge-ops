@@ -36,7 +36,8 @@ is also unset and the repo config has one entry or a `default_environment`,
 that is used.
 
 They also accept `--allow-credential-slot-remap`, which downgrades the
-credential-array slot-remap refusal to a report (see Credential broker). It is
+credential slot-remap refusal (array shrinks, dropped credential types, deleted
+Consumers and revived slots) to a report (see Credential broker). It is
 CLI-only on purpose — no env var — because accepting a credential reassignment
 is a per-run decision, not a repository setting. The safe alternative is
 slot-addressed rotation: `gitforgeops rotate --credential <type>/[N]/<key>`
@@ -821,10 +822,26 @@ the two consequences by whether evidence exists:
 - A declared Consumer that omits a known credential type while the bundle
   still holds a slot under `ns/id/<type>` is the same remap as `<type>: []`
   (`check_omitted_credential_types`): re-adding the type would resurrect the
-  retired value. A Consumer absent from the walked document is deliberately
-  not checked, because namespace filters, the rotate preflight's
-  single-Consumer walk and id renames all omit Consumers whose slots remain
-  legitimate.
+  retired value.
+- Retired Consumers need the state ledger, so `check_consumer_ledger` runs
+  only when `ResolveOptions::consumer_ledger` carries a `ConsumerLedger`
+  (built by `main.rs::consumer_ledger` from `.state/<env>.json`). `plan`,
+  `review` and the first resolve of `apply` pass one; `validate`, `diff`,
+  `export --materialize`, `rotate` and the post-allocation re-resolve do not.
+  Two findings, both slot remaps under the same policy:
+  - *Deleted Consumer*: the ledger records `ns/id` (resources or pending
+    creates), the document does not declare it, and the bundle still holds
+    `ns/id/<known-type>/…`. `ConsumerCoverage` mirrors the mesh retraction
+    scope: `Complete` for an unfiltered run, `Namespace(ns)` for the
+    environment's own `namespace_filter`, `Partial` (never deletion) for an
+    ad-hoc `FERRUM_NAMESPACE`. A slot the ledger never attributed is a
+    pre-seeded value, not a retirement.
+  - *Revived slot*: a declared Consumer the ledger does not record resolves an
+    `alloc=generate`/`alloc=rotate` slot from the bundle, so a reused id would
+    silently inherit a retired credential that is never delivered.
+    `alloc=require` is exempt (the operator's seed), and so is an allocation
+    `state.credentials` recorded after `last_applied_at` (the retry of an
+    apply that allocated and failed before recording the Consumer).
 - Plugin-config arrays get the same split through
   `check_plugin_array_slot_identity`, called from both plugin walks. Their
   slots carry an explicit `[N]` for every entry (no index-0 elision), so only a

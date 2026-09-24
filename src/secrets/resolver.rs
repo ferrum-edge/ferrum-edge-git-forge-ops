@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::config::schema::{
     is_known_credential_type, unknown_credential_type_message, KNOWN_CREDENTIAL_TYPES,
 };
@@ -63,11 +65,16 @@ pub enum SlotRemapPolicy {
 
 /// Knobs that change resolution's *verdict* without changing what it walks.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ResolveOptions {
+pub struct ResolveOptions<'a> {
     pub slot_remap: SlotRemapPolicy,
+    /// State-ledger evidence for the two retired-Consumer checks
+    /// ([`check_consumer_ledger`]). `None` skips both: the walk then only
+    /// sees the document and the bundle, from which neither a deleted
+    /// Consumer nor a revived slot can be told apart from steady state.
+    pub consumer_ledger: Option<&'a ConsumerLedger>,
 }
 
-impl ResolveOptions {
+impl ResolveOptions<'_> {
     /// Report slot remaps instead of failing on them.
     pub fn allowing_slot_remap(allow: bool) -> Self {
         Self {
@@ -76,8 +83,129 @@ impl ResolveOptions {
             } else {
                 SlotRemapPolicy::Refuse
             },
+            consumer_ledger: None,
         }
     }
+
+    /// The same verdict, checked against `ledger` as well.
+    pub fn with_consumer_ledger(self, ledger: &ConsumerLedger) -> ResolveOptions<'_> {
+        ResolveOptions {
+            slot_remap: self.slot_remap,
+            consumer_ledger: Some(ledger),
+        }
+    }
+}
+
+/// How much of the environment's Consumer set a run's document holds.
+///
+/// A Consumer missing from the document is evidence of deletion only when the
+/// run loaded every Consumer that could live in its namespace. This mirrors
+/// the mesh retraction scope: `FERRUM_NAMESPACE` narrows what is loaded, so a
+/// filtered run that does not see a Consumer says nothing about whether the
+/// repository still declares it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ConsumerCoverage {
+    /// The document may omit Consumers whose slots are still legitimate: an
+    /// ad-hoc namespace filter, or any caller that walks a partial document.
+    /// Absence is never treated as deletion.
+    #[default]
+    Partial,
+    /// An unfiltered run: every namespace on disk was loaded.
+    Complete,
+    /// A run filtered by the environment's own declared `namespace_filter`,
+    /// which is that environment's whole publication scope. Only this
+    /// namespace is fully loaded.
+    Namespace(String),
+}
+
+impl ConsumerCoverage {
+    fn covers(&self, namespace: &str) -> bool {
+        match self {
+            Self::Partial => false,
+            Self::Complete => true,
+            Self::Namespace(covered) => covered == namespace,
+        }
+    }
+}
+
+/// What the environment's state ledger says about its Consumers, for the
+/// retired-slot checks the document and bundle cannot decide alone.
+///
+/// A slot name is `<namespace>/<consumer-id>/<type>/…`, so a retired
+/// Consumer's slots still match a later Consumer that reuses the id. Only
+/// the ledger remembers which Consumers this environment has applied.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerLedger {
+    /// State keys (`resources` and `pending_creates`) the ledger records.
+    managed: BTreeSet<String>,
+    /// Canonical slots whose allocation the ledger recorded after its last
+    /// clean apply. An apply that allocated a slot and then failed before
+    /// recording the Consumer leaves exactly this trace, and its retry must
+    /// keep resolving the value it already delivered.
+    pending_allocations: BTreeSet<String>,
+    coverage: ConsumerCoverage,
+}
+
+impl ConsumerLedger {
+    /// Build from explicit `(namespace, consumer id)` pairs.
+    pub fn new(
+        managed_consumers: impl IntoIterator<Item = (String, String)>,
+        pending_allocations: impl IntoIterator<Item = String>,
+        coverage: ConsumerCoverage,
+    ) -> Self {
+        Self {
+            managed: managed_consumers
+                .into_iter()
+                .map(|(namespace, id)| consumer_state_key(&namespace, &id))
+                .collect(),
+            pending_allocations: pending_allocations.into_iter().collect(),
+            coverage,
+        }
+    }
+
+    /// Build from a loaded state ledger.
+    ///
+    /// A pending create counts as managed: it was journaled before its POST,
+    /// so its slots belong to the Consumer this repository declared. A
+    /// recorded allocation counts as pending when it is newer than
+    /// `last_applied_at`, or when the ledger has no clean apply at all. An
+    /// unparseable timestamp is not pending, so the check fails closed.
+    pub fn from_state(state: &crate::state::StateFile, coverage: ConsumerCoverage) -> Self {
+        let parse = |at: &str| chrono::DateTime::parse_from_rfc3339(at).ok();
+        let last_clean_apply = state.last_applied_at.as_deref().and_then(parse);
+        let pending_allocations = state
+            .credentials
+            .iter()
+            .filter(|(_, metadata)| {
+                let allocated = parse(metadata.last_rotated.as_str());
+                match (last_clean_apply, allocated) {
+                    (None, _) => true,
+                    (Some(clean), Some(allocated)) => allocated > clean,
+                    (Some(_), None) => false,
+                }
+            })
+            .map(|(slot, _)| slot.clone())
+            .collect();
+        Self {
+            managed: state
+                .resources
+                .keys()
+                .chain(state.pending_creates.iter())
+                .cloned()
+                .collect(),
+            pending_allocations,
+            coverage,
+        }
+    }
+
+    fn manages(&self, namespace: &str, consumer_id: &str) -> bool {
+        let key = consumer_state_key(namespace, consumer_id);
+        self.managed.contains(&key)
+    }
+}
+
+fn consumer_state_key(namespace: &str, consumer_id: &str) -> String {
+    crate::diff::resource_diff::state_key(namespace, "Consumer", consumer_id)
 }
 
 /// Whether generation constraints ([`check_generation_constraints`]) abort the
@@ -1050,6 +1178,9 @@ fn report_secrets_with_mode_inner(
         }
         check_omitted_credential_types(consumer, bundle, &mut report);
     }
+    if let Some(ledger) = options.consumer_ledger {
+        check_consumer_ledger(&cfg.consumers, bundle, ledger, &mut report);
+    }
     for plugin in &cfg.plugin_configs {
         let walk = PluginWalk::new(
             &plugin.namespace,
@@ -1182,6 +1313,9 @@ fn resolve_secrets_in_place(
             walk_report_and_replace(value, &mut components, bundle, &mode, &mut report)?;
         }
         check_omitted_credential_types(consumer, bundle, &mut report);
+    }
+    if let Some(ledger) = options.consumer_ledger {
+        check_consumer_ledger(&cfg.consumers, bundle, ledger, &mut report);
     }
 
     for plugin in cfg.plugin_configs.iter_mut() {
@@ -1550,6 +1684,104 @@ fn check_omitted_credential_types(
     }
 }
 
+/// The two retired-Consumer checks only the state ledger can decide.
+///
+/// Must run after the Consumer walks and before any plugin or
+/// service-discovery walk, while `report.results` holds Consumer slots only.
+///
+/// * **Deleted Consumer** — the bundle still holds a slot under
+///   `ns/id/<known-type>/` for a Consumer the ledger records as applied, the
+///   run covers `ns` ([`ConsumerCoverage`]), and the document no longer
+///   declares it. Re-adding the id would resurrect the value. Absence is never
+///   read as deletion outside the covered scope, and a slot for a Consumer the
+///   ledger never recorded is a pre-seeded value, not a retired one.
+/// * **Revived slot** — a declared Consumer the ledger does not record resolves
+///   an `alloc=generate` or `alloc=rotate` slot from the bundle. The placeholder
+///   asks for a new value to be generated and delivered, but the stored one
+///   predates this Consumer: it can be a retired Consumer's credential behind
+///   a reused id, and nothing would deliver it to the new holder. Recorded
+///   allocations newer than the last clean apply are the exception: that is
+///   the retry of an apply which allocated the slot and failed before it
+///   recorded the Consumer. `alloc=require` is also exempt, because it states
+///   that the operator seeds the value.
+///
+/// Both are proven remaps under the same [`SlotRemapPolicy`] as a shrink.
+fn check_consumer_ledger(
+    consumers: &[crate::config::schema::Consumer],
+    bundle: &CredentialBundle,
+    ledger: &ConsumerLedger,
+    report: &mut ResolveReport,
+) {
+    let revived: Vec<String> = report
+        .results
+        .iter()
+        .filter(|result| {
+            result.status == SlotStatus::Resolved
+                && !matches!(result.placeholder.alloc, PlaceholderAlloc::Require)
+                && !ledger.manages(&result.namespace, &result.consumer_id)
+                && !ledger.pending_allocations.contains(&result.slot)
+        })
+        .map(|result| {
+            let alloc = alloc_label(result.placeholder.alloc);
+            format!(
+                "credential slot '{}' would revive a stored value: consumer '{}/{}' is not in \
+                 this environment's state ledger, yet the credential bundle already holds a value \
+                 for its alloc={alloc} slot. It may be a retired consumer's credential behind a \
+                 reused id, and it would not be delivered to the new holder. Retire the slot from \
+                 the credential bundle so a fresh value is generated, write alloc=require if the \
+                 stored value is the intended seed, or pass --allow-credential-slot-remap to \
+                 accept it.",
+                result.slot, result.namespace, result.consumer_id
+            )
+        })
+        .collect();
+    for message in revived {
+        push_slot_remap(report, message);
+    }
+
+    let declared: BTreeSet<(&str, &str)> = consumers
+        .iter()
+        .map(|consumer| (consumer.namespace.as_str(), consumer.id.as_str()))
+        .collect();
+    for slot in bundle.keys() {
+        let components: Vec<&str> = slot.splitn(4, '/').collect();
+        let [namespace, consumer_id, credential_type, ..] = components.as_slice() else {
+            continue;
+        };
+        let credential_type = unescape_slot_component(credential_type);
+        if !is_known_credential_type(&credential_type) {
+            continue;
+        }
+        let namespace = unescape_slot_component(namespace);
+        let consumer_id = unescape_slot_component(consumer_id);
+        if !ledger.coverage.covers(&namespace)
+            || declared.contains(&(namespace.as_str(), consumer_id.as_str()))
+            || !ledger.manages(&namespace, &consumer_id)
+        {
+            continue;
+        }
+        push_slot_remap(
+            report,
+            format!(
+                "credential slot '{slot}' is orphaned: the credential bundle still holds a value \
+                 for it, but consumer '{namespace}/{consumer_id}' is recorded in this \
+                 environment's state ledger and is no longer declared. Re-adding a consumer with \
+                 this id would resurrect the retired value through the same slot, even with \
+                 alloc=generate. Retire the slot from the credential bundle — or pass \
+                 --allow-credential-slot-remap to accept it."
+            ),
+        );
+    }
+}
+
+fn alloc_label(alloc: PlaceholderAlloc) -> &'static str {
+    match alloc {
+        PlaceholderAlloc::Generate => "generate",
+        PlaceholderAlloc::Require => "require",
+        PlaceholderAlloc::Rotate => "rotate",
+    }
+}
+
 /// [`check_array_slot_identity`] for one array node inside `PluginConfig.config`.
 ///
 /// Plugin-config slots are positional too
@@ -1631,8 +1863,8 @@ fn enforce_slot_remap_policy(
         return Ok(());
     }
     Err(crate::error::Error::CredentialSlotRemap(format!(
-        "Refusing to resolve credentials: {} credential slot(s) would be reassigned by a \
-         credential-array shape change:\n  {}",
+        "Refusing to resolve credentials: {} credential slot(s) would be reassigned or \
+         revived by a credential shape change or a retired Consumer:\n  {}",
         report.slot_remaps.len(),
         report.slot_remaps.join("\n  ")
     )))
