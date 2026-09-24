@@ -1748,6 +1748,28 @@ fn best_practice_flags_single_target_upstream() {
     assert!(checks.iter().any(|c| c.message.contains("target")));
 }
 
+/// Service discovery supplies targets at runtime, so an upstream that uses it
+/// is not told to "attach service discovery" for having few static targets.
+#[test]
+fn best_practice_skips_target_count_for_service_discovery_upstream() {
+    let config = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "u1",
+            "https://consul.internal:8500",
+            None,
+        )],
+        ..GatewayConfig::default()
+    };
+    let checks = check_best_practices(&config);
+    assert!(
+        !checks
+            .iter()
+            .any(|c| c.message.contains("nothing to fail over to")),
+        "{:?}",
+        checks.iter().map(|c| &c.message).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn best_practice_flags_no_health_checks() {
     let config = GatewayConfig {

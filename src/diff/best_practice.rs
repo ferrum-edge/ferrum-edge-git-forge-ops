@@ -255,7 +255,9 @@ fn check_upstream(upstream: &Upstream, findings: &mut Vec<BestPractice>) {
     let id = upstream.id.as_str();
     let ns = upstream.namespace.as_str();
 
-    if upstream.targets.len() <= 1 {
+    // Service discovery publishes targets at runtime, so an empty or single
+    // static target list is not evidence of a missing failover path.
+    if upstream.targets.len() <= 1 && upstream.service_discovery.is_none() {
         findings.push(BestPractice::warning(
             "Upstream",
             id,
