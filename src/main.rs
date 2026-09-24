@@ -1346,9 +1346,15 @@ async fn cmd_export(
         // than trusting the pre-resolve report's NeedsAllocation
         // classification, since that classification is computed against the
         // PRE-resolve bundle snapshot.
+        //
+        // Materializing writes resolved values out, so it refuses a retired
+        // Consumer's slot (#332) exactly like `apply` does: the state ledger
+        // is the evidence, under the operator's own remap policy.
         let (bundle, _) = load_credential_bundles(&env_config)?;
-        let _ =
-            secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, resolve_options)?;
+        let state = StateFile::load(&resolved.name)?;
+        let ledger = consumer_ledger(&resolved, &state);
+        let options = resolve_options.with_consumer_ledger(&ledger);
+        let _ = secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, options)?;
         let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
         if !remaining.results.is_empty() {
             return Err(format!(

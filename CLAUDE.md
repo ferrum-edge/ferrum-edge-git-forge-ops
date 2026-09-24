@@ -826,8 +826,9 @@ the two consequences by whether evidence exists:
 - Retired Consumers need the state ledger, so `check_consumer_ledger` runs
   only when `ResolveOptions::consumer_ledger` carries a `ConsumerLedger`
   (built by `main.rs::consumer_ledger` from `.state/<env>.json`). `plan`,
-  `review` and the first resolve of `apply` pass one; `validate`, `diff`,
-  `export --materialize`, `rotate` and the post-allocation re-resolve do not.
+  `review`, the first resolve of `apply`, and `export --materialize` (which
+  writes resolved values out) pass one; `validate`, `diff`, `rotate` and the
+  post-allocation re-resolve do not.
   Two findings, both slot remaps under the same policy:
   - *Deleted Consumer*: the ledger records `ns/id` (resources or pending
     creates), the document does not declare it, and the bundle still holds
