@@ -1769,7 +1769,11 @@ pub fn split_batch(batch: BatchCreate, max_bytes: usize) -> crate::error::Result
 }
 
 /// Connected proxy/plugin create components must never cross a chunk boundary.
-fn batch_dependency_groups(mut batch: BatchCreate) -> Vec<BatchCreate> {
+///
+/// Also used by incremental apply to withhold only the create groups whose
+/// proxy references a PluginConfig that failed to write, so one blocked
+/// group cannot prevent unrelated groups from reaching `POST /batch`.
+pub(crate) fn batch_dependency_groups(mut batch: BatchCreate) -> Vec<BatchCreate> {
     fn root(parents: &mut [usize], mut index: usize) -> usize {
         while parents[index] != index {
             parents[index] = parents[parents[index]];

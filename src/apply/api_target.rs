@@ -1333,22 +1333,25 @@ async fn apply_incremental(
                 || cyclic_keys.contains(&state_key(namespace, &diff.kind, &diff.id)))
         {
             cyclic_pending = false;
-            let failed_dependency = cyclic_creates.iter().any(|d| {
-                d.kind == "Proxy"
-                    && index
-                        .proxies
-                        .get(&(d.namespace.as_str(), d.id.as_str()))
-                        .is_some_and(|proxy| proxy_has_failed_plugin(proxy, &failed_plugins))
-            });
-            let batched = if failed_dependency {
-                Err(failed_plugin_dependency())
+            // Withhold only the dependency groups whose proxy references a
+            // plugin write that already failed; every other group still gets
+            // its transactional create.
+            let (blocked, attempt) =
+                partition_cyclic_creates(&cyclic_creates, &index, &failed_plugins);
+            for group in blocked {
+                writes_failed = true;
+                failed_plugins.extend(group.withheld_plugins);
+                result.errors.push(group.message);
+            }
+            let batched = if attempt.is_empty() {
+                Ok(Some(ApplyResult::default()))
             } else {
-                try_batch_create(&cyclic_creates, &index, client, namespace, options).await
+                try_batch_create(&attempt, &index, client, namespace, options).await
             };
             match batched {
                 Ok(Some(batched)) => {
                     writes_failed |= !batched.errors.is_empty();
-                    for pending in &cyclic_creates {
+                    for pending in &attempt {
                         if pending.kind == "PluginConfig"
                             && !batched
                                 .applied_incremental
@@ -1444,7 +1447,7 @@ async fn apply_incremental(
         let outcome = match (&diff.action, diff.kind.as_str()) {
             (DiffAction::Add, "Proxy") => match index.proxies.get(&key) {
                 Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
-                    Err(failed_plugin_dependency())
+                    Err(failed_plugin_dependency(p, &failed_plugins))
                 }
                 Some(p) => create_with_reconciliation(client, namespace, CreateResource::Proxy(p))
                     .await
@@ -1453,7 +1456,7 @@ async fn apply_incremental(
             },
             (DiffAction::Modify, "Proxy") => match index.proxies.get(&key) {
                 Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
-                    Err(failed_plugin_dependency())
+                    Err(failed_plugin_dependency(p, &failed_plugins))
                 }
                 Some(p) if changed_proxy_associations.contains(&diff.id) => {
                     match &post_plugin_snapshot {
@@ -1653,10 +1656,100 @@ fn proxy_has_failed_plugin(proxy: &Proxy, failed_plugins: &BTreeSet<String>) -> 
         .any(|association| failed_plugins.contains(&association.plugin_config_id))
 }
 
-fn failed_plugin_dependency() -> crate::error::Error {
-    crate::error::Error::Config(
-        "proxy write not attempted because a referenced PluginConfig write failed".to_string(),
-    )
+/// The referenced PluginConfig ids whose write failed, sorted and deduplicated.
+fn failed_plugin_references<'a>(
+    proxy: &'a Proxy,
+    failed_plugins: &BTreeSet<String>,
+) -> BTreeSet<&'a str> {
+    proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .filter(|id| failed_plugins.contains(*id))
+        .collect()
+}
+
+fn failed_plugin_dependency(
+    proxy: &Proxy,
+    failed_plugins: &BTreeSet<String>,
+) -> crate::error::Error {
+    let failed = failed_plugin_references(proxy, failed_plugins)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::error::Error::Config(format!(
+        "proxy write not attempted because referenced PluginConfig {failed} failed to write"
+    ))
+}
+
+/// A proxy/scoped-plugin create group withheld from `POST /batch` because a
+/// proxy in it references a PluginConfig whose write already failed.
+struct BlockedCreateGroup {
+    message: String,
+    /// The group's new PluginConfig ids. They were never created, so any later
+    /// write that depends on them must be gated too.
+    withheld_plugins: Vec<String>,
+}
+
+/// Split the cyclic creates into their proxy/plugin dependency groups (the
+/// same components `split_batch` keeps inside one chunk). A group whose proxy
+/// references a failed plugin write is reported by name and withheld; every
+/// other group is returned for the transactional create, in diff order.
+fn partition_cyclic_creates(
+    cyclic_creates: &[ResourceDiff],
+    index: &DesiredIndex<'_>,
+    failed_plugins: &BTreeSet<String>,
+) -> (Vec<BlockedCreateGroup>, Vec<ResourceDiff>) {
+    if failed_plugins.is_empty() {
+        return (Vec::new(), cyclic_creates.to_vec());
+    }
+    let mut blocked = Vec::new();
+    let mut withheld = BTreeSet::new();
+    for group in http_client::batch_dependency_groups(collect_batch(cyclic_creates, index)) {
+        let failed: BTreeSet<&str> = group
+            .proxies
+            .iter()
+            .flat_map(|proxy| failed_plugin_references(proxy, failed_plugins))
+            .collect();
+        if failed.is_empty() {
+            continue;
+        }
+        let proxies = group
+            .proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let failed = failed.into_iter().collect::<Vec<_>>().join(", ");
+        let scoped = group
+            .plugin_configs
+            .iter()
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        blocked.push(BlockedCreateGroup {
+            message: format!(
+                "Proxy {proxies} create: not attempted because referenced PluginConfig {failed} failed to write; its new scoped PluginConfig {scoped} was withheld from the same POST /batch transaction and not created"
+            ),
+            withheld_plugins: group
+                .plugin_configs
+                .iter()
+                .map(|plugin| plugin.id.clone())
+                .collect(),
+        });
+        for proxy in &group.proxies {
+            withheld.insert(state_key(&proxy.namespace, "Proxy", &proxy.id));
+        }
+        for plugin in &group.plugin_configs {
+            withheld.insert(state_key(&plugin.namespace, "PluginConfig", &plugin.id));
+        }
+    }
+    let attempt = cyclic_creates
+        .iter()
+        .filter(|diff| !withheld.contains(&state_key(&diff.namespace, &diff.kind, &diff.id)))
+        .cloned()
+        .collect();
+    (blocked, attempt)
 }
 
 /// Use the namespace snapshot read after Edge's attachment/detachment writes.
@@ -2988,7 +3081,7 @@ async fn create_individually(
                 });
             }
             let outcome = if proxy_has_failed_plugin(p, &failed_plugins) {
-                Err(failed_plugin_dependency())
+                Err(failed_plugin_dependency(p, &failed_plugins))
             } else {
                 create_with_reconciliation(client, namespace, CreateResource::Proxy(&initial_proxy))
                     .await

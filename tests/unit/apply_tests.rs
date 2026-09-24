@@ -2465,8 +2465,138 @@ async fn failed_plugin_write_blocks_its_proxy_and_defers_pruning() {
         vec!["POST /plugins/config HTTP/1.1"]
     );
     assert_eq!(result.errors.len(), 2);
+    assert!(
+        result.errors[1].contains("Proxy p1 update")
+            && result.errors[1].contains("referenced PluginConfig pc1 failed to write"),
+        "{:?}",
+        result.errors
+    );
     assert_eq!(result.deletes_deferred, 1);
     assert!(result.applied_incremental.is_empty());
+    assert!(result.into_result().is_err());
+}
+
+/// Issue #337: in a mixed namespace a failed plugin write referenced by one
+/// new proxy withholds only that proxy's create group. An unrelated new
+/// proxy/scoped-plugin cycle still gets its transactional `POST /batch`.
+#[tokio::test]
+async fn failed_plugin_withholds_only_its_own_cyclic_create_group() {
+    let mut group = plugin_config("g1", "team-alpha", "unused", None);
+    group.scope = gitforgeops::config::schema::PluginScope::ProxyGroup;
+    group.proxy_id = None;
+    let mut proxy_a = proxy("pA", "team-alpha", None);
+    let mut proxy_b = proxy("pB", "team-alpha", None);
+    for (proxy, ids) in [
+        (&mut proxy_a, &["g1", "sA"][..]),
+        (&mut proxy_b, &["sB"][..]),
+    ] {
+        proxy.plugins = ids
+            .iter()
+            .map(|id| gitforgeops::config::schema::PluginAssociation {
+                plugin_config_id: (*id).into(),
+            })
+            .collect();
+    }
+    let existing = proxy("p0", "team-alpha", None);
+    let mut modified = existing.clone();
+    modified.backend_port = 9090; // Modify => the namespace is not pure-add.
+    let desired = GatewayConfig {
+        proxies: vec![modified, proxy_a, proxy_b],
+        plugin_configs: vec![
+            group,
+            plugin_config("sA", "team-alpha", "pA", None),
+            plugin_config("sB", "team-alpha", "pB", None),
+        ],
+        ..Default::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![existing],
+        upstreams: vec![upstream("stale", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /batch".into(),
+            201,
+            r#"{"created":{"proxies":1,"consumers":0,"plugin_configs":1,"upstreams":0}}"#.into(),
+            vec![],
+        ),
+        (
+            r#""id":"g1""#.into(),
+            400,
+            r#"{"error":"invalid g1"}"#.into(),
+            vec![],
+        ),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /plugins/config HTTP/1.1",
+            "POST /batch HTTP/1.1",
+            "PUT /proxies/p0 HTTP/1.1",
+        ]
+    );
+    let batch_body: serde_json::Value = {
+        let requests = requests.lock().unwrap();
+        let batch = requests
+            .iter()
+            .find(|r| r.starts_with("POST /batch"))
+            .unwrap();
+        serde_json::from_str(batch.split_once("\r\n\r\n").unwrap().1).unwrap()
+    };
+    let ids = |section: &str| -> Vec<String> {
+        batch_body[section]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids("proxies"), vec!["pB"]);
+    assert_eq!(ids("plugin_configs"), vec!["sB"]);
+
+    let applied: Vec<_> = result
+        .applied_incremental
+        .iter()
+        .map(|op| format!("{} {}", op.kind, op.id))
+        .collect();
+    assert_eq!(
+        applied,
+        vec!["Proxy pB", "PluginConfig sB", "Proxy p0"],
+        "{:?}",
+        result.errors
+    );
+    assert_eq!(result.created, 2);
+    assert_eq!(result.updated, 1);
+    assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
+    assert!(
+        result.errors[0].starts_with("[team-alpha] PluginConfig g1 create"),
+        "{:?}",
+        result.errors
+    );
+    let blocked = &result.errors[1];
+    assert!(blocked.contains("Proxy pA create"), "{blocked}");
+    assert!(
+        blocked.contains("referenced PluginConfig g1 failed to write"),
+        "{blocked}"
+    );
+    assert!(blocked.contains("sA"), "{blocked}");
+    assert!(!blocked.contains("pB"), "{blocked}");
+    // The failed write still defers this namespace's prune.
+    assert_eq!(result.deletes_deferred, 1);
     assert!(result.into_result().is_err());
 }
 
