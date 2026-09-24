@@ -322,9 +322,9 @@ fn load_bundles_refuses_non_canonical_shard_names() {
             .to_string();
         assert!(
             err.contains(alias) && err.contains("canonical"),
-            "{alias}: {err}"
+            "{alias}: the refusal must name the non-canonical shard"
         );
-        assert!(!err.contains("value-b"), "no bundle value may leak: {err}");
+        assert!(!err.contains("value-b"), "no bundle value may leak");
         assert!(load_bundles_from_env(&raw).is_err(), "{alias}");
     }
 }
