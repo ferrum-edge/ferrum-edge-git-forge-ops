@@ -1451,3 +1451,57 @@ fn assemble_rejects_duplicate_mesh_fragment_ids() {
         "{err}"
     );
 }
+
+/// The identity index behind workload/service merging must keep first-seen
+/// order, deduplicate deep-equal repeats across many fragments, append
+/// identity-less entries unchecked, and still name the defining fragment on a
+/// conflict found deep into a large merge.
+#[test]
+fn identified_mesh_merge_preserves_order_and_conflicts_across_many_fragments() {
+    use gitforgeops::config::merge_mesh_fragments;
+
+    let workload = |f: usize, i: usize| serde_json::json!({"spiffe_id": format!("spiffe://td/ns/f{f}/sa/w{i}")});
+    let fragments: Vec<(String, MeshConfigSpec)> = (0..4)
+        .map(|f| {
+            let mut workloads: Vec<serde_json::Value> = (0..250).map(|i| workload(f, i)).collect();
+            // Every fragment repeats fragment 0's first entry verbatim and
+            // carries one entry with no identity.
+            workloads.push(workload(0, 0));
+            workloads.push(serde_json::json!({"service_name": format!("anon-{f}")}));
+            (
+                format!("ferrum/mesh/frag{f}"),
+                MeshConfigSpec {
+                    workloads,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+
+    let merged = merge_mesh_fragments(fragments.clone())
+        .unwrap()
+        .expect("mesh document");
+    let mut expected = Vec::new();
+    for f in 0..4 {
+        expected.extend((0..250).map(|i| workload(f, i)));
+        expected.push(serde_json::json!({"service_name": format!("anon-{f}")}));
+    }
+    assert_eq!(merged.workloads, expected);
+
+    let mut conflicting = fragments;
+    conflicting.push((
+        "ferrum/mesh/late".to_string(),
+        MeshConfigSpec {
+            workloads: vec![serde_json::json!({
+                "spiffe_id": "spiffe://td/ns/f2/sa/w199",
+                "service_name": "different",
+            })],
+            ..Default::default()
+        },
+    ));
+    let err = merge_mesh_fragments(conflicting).unwrap_err().to_string();
+    assert!(
+        err.contains("fragment ferrum/mesh/frag2 and fragment ferrum/mesh/late"),
+        "{err}"
+    );
+}
