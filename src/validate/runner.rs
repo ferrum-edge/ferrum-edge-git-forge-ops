@@ -146,6 +146,31 @@ pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+/// Run `command`, retrying a spawn that failed with `ETXTBSY`.
+///
+/// Linux refuses to execute a file while any process holds it open for
+/// writing. A validator binary that was written moments ago — an installer
+/// replacing it, or a stub in the test suite — can still have its write
+/// descriptor inherited by a process another thread forked and has not yet
+/// `exec`ed, which clears within milliseconds. Every other spawn error is
+/// returned immediately.
+fn output_retrying_busy_executable(command: &mut Command) -> std::io::Result<std::process::Output> {
+    const ATTEMPTS: u32 = 6;
+    let mut attempt = 0;
+    loop {
+        match command.output() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt + 1 < ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// True when `path` names an existing regular file that is actually
 /// executable. `which` failing does not by itself mean the binary is missing
 /// (Windows, stripped-down containers), but a plain `Path::exists()` check
@@ -393,7 +418,7 @@ fn run_validate_command(
         command.env("FERRUM_NAMESPACE", namespace);
     }
 
-    let output = command.output();
+    let output = output_retrying_busy_executable(&mut command);
 
     // Both temp files are removed when the handles drop, on every path
     // including the error return below.
