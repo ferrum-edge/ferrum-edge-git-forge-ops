@@ -197,7 +197,10 @@ whichever environment you actually exercised.
 
 Re-seal so the record certifies the revision you actually tested — the
 upstream commit (or release tag) whose template you exercised, not the
-disposable repository's own commit:
+disposable repository's own commit — and the gateway build you tested against.
+That must be the SHA-256 of the build `install-ferrum-edge.sh` installs for the
+release revision, because the acceptance run you hand this to records that
+build and refuses an attestation for any other:
 
 ```bash
 python3 .github/scripts/lifecycle_result.py seal \
@@ -218,8 +221,10 @@ gh workflow run lifecycle.yml --repo ferrum-edge/ferrum-edge-git-forge-ops \
 
 That run executes the local scenarios itself, then merges your outcomes into
 **only** the scenarios it recorded as `skipped`, each marked `attested by
-@<you>`. It refuses an attestation that is unsealed or sealed for a different
-revision, and it can never overwrite a scenario it ran. When it is green,
+@<you>`. It refuses an attestation that is unsealed, sealed for a different
+revision or a different gateway build than the one it installed, or sealed more
+than 72 hours (the `verify` freshness window) before it runs, and it can never
+overwrite a scenario it ran. When it is green,
 re-run the `Release` workflow for the same revision; it picks the newest
 successful acceptance run for that commit.
 

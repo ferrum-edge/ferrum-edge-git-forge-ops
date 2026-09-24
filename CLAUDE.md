@@ -1023,7 +1023,9 @@ record `skipped` with a reason and run through
 an attestation: `lifecycle.yml` dispatched on the release ref with the
 operator's sealed result as its `github_acceptance` input, merged by
 `lifecycle_result.py attest` into the scenarios that run itself `skipped` —
-never over one it ran — and attributed to the dispatching actor. `release.yml`
+never over one it ran — and attributed to the dispatching actor. `attest`
+refuses an attestation sealed for another revision or another gateway build
+than the run, or older than the `verify` freshness window. `release.yml`
 binds the result's gateway build to the revision's own checksum allowlist
 (`--gateway-allowlist`). Redaction happens at capture:
 `Harness.redact` over every captured stream keyed on the run's own secrets,
