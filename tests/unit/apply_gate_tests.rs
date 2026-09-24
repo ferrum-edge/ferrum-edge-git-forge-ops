@@ -1762,10 +1762,21 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
     );
     assert!(stdout(&review).contains("provisioner-token"));
 
+    // A seeded bundle clears the allocation blocker. With no state ledger the
+    // stored alloc=generate value cannot be told apart from a retired
+    // Consumer's credential behind a reused id (#332), so the only remaining
+    // blocker is the fail-closed slot-revival refusal.
     let repo = Repo::with_consumer(&consumer);
     let seeded = repo.run(&["plan"], &[("FERRUM_CREDS_JSON", BUNDLE)]);
-    assert!(seeded.status.success(), "{}", stdout(&seeded));
-    assert!(!stdout(&seeded).contains("Apply Blockers"));
+    let out = stdout(&seeded);
+    assert!(!seeded.status.success(), "{out}");
+    assert!(!out.contains("provisioner-token"), "{out}");
+    assert!(!out.contains("provisioning-repository"), "{out}");
+    assert!(out.contains("would revive a stored value"), "{out}");
+    assert!(
+        out.contains("apply is blocked by 1 class(es): credential-slot-remap"),
+        "{out}"
+    );
 }
 
 #[test]
