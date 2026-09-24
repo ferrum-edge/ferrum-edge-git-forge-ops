@@ -117,9 +117,32 @@ pub fn authorized_review<'a>(
     .then_some(review)
 }
 
+/// `GET /repos/{repo}/collaborators/{login}/permission`.
+///
+/// `permission` is GitHub's legacy field and only ever reports
+/// `admin|write|read|none`: Maintain collapses to `write` and Triage to
+/// `read`. The full role lives in `role_name`, which for a custom role is the
+/// role's own name rather than one of the built-in ranks.
 #[derive(Debug, Deserialize)]
-struct PermissionResponse {
-    permission: String,
+pub struct PermissionResponse {
+    pub permission: String,
+    #[serde(default)]
+    pub role_name: Option<String>,
+}
+
+impl PermissionResponse {
+    /// The permission to rank against `overrides.required_permission`.
+    ///
+    /// Prefers `role_name` when it is one of the built-in ranks so a Maintain
+    /// labeler satisfies `required_permission: maintain`. A custom role (or an
+    /// absent `role_name`) falls back to the legacy base permission, which is
+    /// the strongest rank GitHub vouches for.
+    pub fn effective_permission(&self) -> &str {
+        match self.role_name.as_deref() {
+            Some(role) if OverrideConfig::permission_rank(role).is_some() => role,
+            _ => &self.permission,
+        }
+    }
 }
 
 /// Consult the GitHub API to decide whether a policy override is active on the
@@ -499,7 +522,7 @@ async fn fetch_permission(
     let url = format!("https://api.github.com/repos/{repo}/collaborators/{login}/permission");
     let value = fetch_json(client, &url, token).await?;
     let parsed: PermissionResponse = serde_json::from_value(value)?;
-    Ok(parsed.permission)
+    Ok(parsed.effective_permission().to_string())
 }
 
 /// Apply an override decision to a set of findings: sets `overridden_by` on any
