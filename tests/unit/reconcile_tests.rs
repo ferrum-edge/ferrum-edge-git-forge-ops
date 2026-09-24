@@ -82,6 +82,7 @@ fn env(mode: OwnershipMode, namespaces: Option<Vec<String>>) -> ResolvedEnv {
         name: "production".to_string(),
         overlay: None,
         namespace_filter: None,
+        namespace_filter_is_environment_scope: false,
         apply_strategy: ApplyStrategy::Incremental,
         ownership: OwnershipConfig {
             mode,
@@ -133,7 +134,7 @@ fn an_adopted_row_keeps_its_namespace_in_scope_after_the_last_declaration_goes()
                 id: "p0".to_string(),
                 action: DiffAction::Modify,
             },
-            &declared,
+            &gitforgeops::state::ResourceKeys::from_config(&declared),
         )
         .expect("recording an adopted row");
 

@@ -9,7 +9,9 @@
 //!   authentication**, so an answer here says nothing about the token.
 //! * `GET /cluster` — does the gateway accept the token we mint? It sits behind
 //!   the admin JWT gate with no role requirement, so a 401/403 there is the
-//!   signing secret or a claim being wrong, and a 200 is proof they are right.
+//!   signing secret or a claim being wrong, and a 200 proves the gateway
+//!   accepts the token. It does not prove the role: `/backup` and every write
+//!   need `admin`, which the local `admin-jwt-claims` check enforces.
 //!
 //! No mutating endpoint is reachable from here, which is why the module exposes
 //! only these two calls.
@@ -159,22 +161,36 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
 
     // The authenticated half. `/cluster` passes the admin JWT gate and has no
     // role requirement, so its answer is about the token and nothing else.
-    match client.get_cluster().await {
-        Ok(cluster) => checks.push(
-            Check::pass(
-                "gateway-token",
-                "Gateway accepts our admin token",
-                Scope::Gateway,
-                format!(
-                    "GET /cluster accepted the minted token; {}",
-                    crate::http_client::convergence_summary(&cluster)
-                ),
+    // Classification keys on the typed status, never on the error text: that
+    // text carries the gateway's body and, for transport errors, the URL, so a
+    // `401`/`403` substring there proves nothing.
+    match client.get_cluster_body().await {
+        Ok(body) => {
+            // A 2xx already proves the token was accepted. A body this build
+            // cannot parse only loses the convergence detail.
+            let convergence = match crate::http_client::parse_cluster_status(&body) {
+                Ok(cluster) => crate::http_client::convergence_summary(&cluster),
+                Err(error) => format!("cluster status unavailable ({error})"),
+            };
+            checks.push(
+                Check::pass(
+                    "gateway-token",
+                    "Gateway accepts our admin token",
+                    Scope::Gateway,
+                    format!("GET /cluster accepted the minted token; {convergence}"),
+                )
+                .for_environment(environment),
             )
-            .for_environment(environment),
-        ),
+        }
         Err(error) => {
+            let rejected = matches!(
+                error,
+                crate::error::Error::ApiError {
+                    status: 401 | 403,
+                    ..
+                }
+            );
             let message = error.to_string();
-            let rejected = message.contains("401") || message.contains("403");
             checks.push(
                 Check::new(
                     "gateway-token",

@@ -25,6 +25,7 @@ on:
       - 'build.rs'
       - 'overlays/**'
       - 'resources/**'
+      - 'rust-toolchain'
       - 'rust-toolchain.toml'
       - 'src/**'
 

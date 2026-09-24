@@ -294,6 +294,66 @@ fn load_bundles_rejects_duplicate_slots_across_shards() {
     );
 }
 
+/// Regression for #331: `u32::parse` accepted `_0`, `_00`, `_01` and `_+1`,
+/// so a second key aliased an existing shard, one shard's map overwrote the
+/// other's in `per_shard`, and the next PUT of that shard dropped slots.
+/// Only the exact names `shard_secret_name` writes may load.
+#[test]
+fn load_bundles_refuses_non_canonical_shard_names() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    for alias in [
+        "FERRUM_CREDS_BUNDLE_0",
+        "FERRUM_CREDS_BUNDLE_00",
+        "FERRUM_CREDS_BUNDLE_01",
+        "FERRUM_CREDS_BUNDLE_+1",
+        "FERRUM_CREDS_BUNDLE_",
+        "FERRUM_CREDS_BUNDLE_X",
+        "FERRUM_CREDS_BUNDLEX",
+    ] {
+        let raw = serde_json::json!({
+            "FERRUM_CREDS_BUNDLE": {"ferrum/a/keyauth/key": "value-a-aaaaaaaa"},
+            "FERRUM_CREDS_BUNDLE_1": {"ferrum/c/keyauth/key": "value-c-cccccccc"},
+            alias: {"ferrum/b/keyauth/key": "value-b-bbbbbbbb"}
+        })
+        .to_string();
+        let err = parse_bundles_from_json(&raw)
+            .expect_err("a non-canonical shard name must fail closed")
+            .to_string();
+        assert!(
+            err.contains(alias) && err.contains("canonical"),
+            "{alias}: the refusal must name the non-canonical shard"
+        );
+        assert!(!err.contains("value-b"), "no bundle value may leak");
+        assert!(load_bundles_from_env(&raw).is_err(), "{alias}");
+    }
+}
+
+/// Canonical names keep loading, every slot lands in exactly one shard, and
+/// the write-back layout holds every slot the merged view resolves.
+#[test]
+fn load_bundles_keeps_every_slot_under_canonical_shard_names() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    let names: Vec<String> = (0..4).map(shard_secret_name).collect();
+    let mut raw = serde_json::Map::new();
+    for (index, name) in names.iter().enumerate() {
+        raw.insert(
+            name.clone(),
+            serde_json::json!({ format!("ferrum/c{index}/keyauth/key"): format!("value-{index}") }),
+        );
+    }
+    let loaded = parse_bundles_from_json(&serde_json::Value::Object(raw).to_string()).unwrap();
+    assert_eq!(loaded.merged.len(), 4);
+    assert_eq!(
+        loaded.per_shard.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    let per_shard_slots: usize = loaded.per_shard.values().map(|b| b.len()).sum();
+    assert_eq!(per_shard_slots, loaded.merged.len());
+    assert!(loaded.unrecognized_keys.is_empty());
+}
+
 #[test]
 fn shard_secret_name_strips_suffix_for_shard_zero() {
     assert_eq!(shard_secret_name(0), "FERRUM_CREDS_BUNDLE");
@@ -2000,6 +2060,450 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
         report.results.iter().map(|r| &r.slot).collect::<Vec<_>>()
     );
     assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+}
+
+// --- Omitted credential types (#332) ----------------------------------------
+
+fn partner_cfg(credentials: serde_json::Value) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [{
+            "id": "partner",
+            "username": "partner",
+            "namespace": "ferrum",
+            "credentials": credentials,
+        }]
+    }))
+    .unwrap()
+}
+
+fn retired_partner_key_bundle() -> BTreeMap<String, String> {
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/partner/keyauth/key".to_string(),
+        "OLD-RETIRED-KEY-VALUE".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauth/[1]/key".to_string(),
+        "OLD-RETIRED-SECOND-KEY".to_string(),
+    );
+    bundle
+}
+
+/// Omitting `keyauth` entirely must reach the same verdict as `keyauth: []`:
+/// the stored slots would otherwise be resurrected by a later re-add, even
+/// with `alloc=generate`.
+#[test]
+fn omitted_credential_type_is_refused_like_an_empty_array() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    let bundle = retired_partner_key_bundle();
+    for (case, declared) in [
+        ("empty keyauth array", serde_json::json!({"keyauth": []})),
+        ("no credential types", serde_json::json!({})),
+        (
+            "only jwt",
+            serde_json::json!({"jwt": [{"secret": REQUIRE}]}),
+        ),
+    ] {
+        let cfg = partner_cfg(declared);
+        let err = report_secrets_with_mode_and_options(
+            &cfg,
+            &bundle,
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .expect_err("a stored slot the consumer no longer declares must not resolve silently");
+        assert!(
+            matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+            "{case}"
+        );
+        let err = err.to_string();
+        assert!(
+            err.contains("ferrum/partner/keyauth/key")
+                && err.contains("ferrum/partner/keyauth/[1]/key")
+                && err.contains("orphaned"),
+            "{case}"
+        );
+        assert!(err.contains("--allow-credential-slot-remap"));
+        assert!(
+            !err.contains("OLD-RETIRED"),
+            "a refusal must never echo bundle values"
+        );
+
+        let mut resolved = cfg.clone();
+        assert!(
+            resolve_secrets_with_mode_and_options(
+                &mut resolved,
+                &bundle,
+                GatewayMode::Api,
+                ResolveOptions::default(),
+            )
+            .is_err(),
+            "{case}: resolve must refuse what report refuses"
+        );
+    }
+}
+
+/// `--allow-credential-slot-remap` downgrades the omitted-type refusal to the
+/// same report it downgrades for an empty array.
+#[test]
+fn allowed_slot_remap_downgrades_the_omitted_type_refusal() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let bundle = retired_partner_key_bundle();
+    let report = report_secrets_with_mode_and_options(
+        &partner_cfg(serde_json::json!({})),
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::allowing_slot_remap(true),
+    )
+    .expect("the acknowledgement accepts the retired slots");
+    assert_eq!(report.slot_remaps.len(), 2);
+}
+
+/// Declared types keep their ordinary verdicts, slots of other consumers that
+/// share a prefix are not attributed to this one, and a consumer absent from
+/// the walked document is never treated as deleted — namespace filters and
+/// the rotate preflight walk partial documents.
+#[test]
+fn omitted_type_scan_stays_within_the_declared_consumer() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = retired_partner_key_bundle();
+    bundle.insert(
+        "ferrum/partner-two/jwt/secret".to_string(),
+        "another-consumer-secret".to_string(),
+    );
+    bundle.insert(
+        "ferrum/absent/hmac_auth/secret".to_string(),
+        "consumer-not-in-this-document".to_string(),
+    );
+    let cfg = partner_cfg(serde_json::json!({
+        "keyauth": [{"key": REQUIRE}, {"key": REQUIRE}]
+    }));
+    let report = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("every stored slot of the declared consumer is still owned");
+    assert!(report.slot_remaps.is_empty());
+    assert!(report
+        .results
+        .iter()
+        .all(|r| r.status == SlotStatus::Resolved));
+}
+
+// --- Plugin-config array slot identity (#328) -------------------------------
+
+const OIDC_SECRET_A_SLOT: &str =
+    "ferrum/oidc/@plugin-config/config/providers/[0]/client_auth/client_secret";
+const OIDC_SECRET_B_SLOT: &str =
+    "ferrum/oidc/@plugin-config/config/providers/[1]/client_auth/client_secret";
+
+fn oidc_providers_cfg(issuers: &[&str]) -> GatewayConfig {
+    let providers: Vec<_> = issuers
+        .iter()
+        .map(|issuer| {
+            serde_json::json!({
+                "issuer": issuer,
+                "client_auth": {"client_secret": REQUIRE}
+            })
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "oidc",
+            "namespace": "ferrum",
+            "plugin_name": "oidc_relying_party",
+            "scope": "global",
+            "config": {"providers": providers}
+        }]
+    }))
+    .unwrap()
+}
+
+fn oidc_two_provider_bundle() -> BTreeMap<String, String> {
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        OIDC_SECRET_A_SLOT.to_string(),
+        "SECRET-FOR-IDP-A-aaaaaaaa".to_string(),
+    );
+    bundle.insert(
+        OIDC_SECRET_B_SLOT.to_string(),
+        "SECRET-FOR-IDP-B-bbbbbbbb".to_string(),
+    );
+    bundle
+}
+
+/// Deleting provider A of `[A, B]` shifts B into `[0]`, where it would
+/// resolve to A's client secret. Both walks must refuse, name the orphaned
+/// slot, and leave the configuration untouched.
+#[test]
+fn shrunk_plugin_config_array_refuses_the_orphaned_slot_remap() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    let bundle = oidc_two_provider_bundle();
+    let cfg = oidc_providers_cfg(&["https://idp-b.example.com"]);
+
+    let err = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("a plugin-config shrink that reassigns a stored slot must not resolve")
+    .to_string();
+    assert!(
+        err.contains(OIDC_SECRET_B_SLOT) && err.contains("orphaned"),
+        "the refusal must name the orphaned slot"
+    );
+    assert!(err.contains("--allow-credential-slot-remap"));
+    assert!(
+        !err.contains("SECRET-FOR-IDP"),
+        "a refusal must never echo bundle values"
+    );
+
+    let mut resolved = cfg.clone();
+    let err = resolve_secrets_with_mode_and_options(
+        &mut resolved,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("resolve must refuse what report refuses");
+    assert!(
+        matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+        "the refusal did not match the expected text"
+    );
+    assert_eq!(
+        resolved.plugin_configs[0].config["providers"][0]["client_auth"]["client_secret"], REQUIRE,
+        "a refused resolution must not hand provider B the retired secret"
+    );
+}
+
+/// Steady state: every stored slot still has its provider. Resolution
+/// succeeds with each provider keeping its own secret; only the positional
+/// advisory fires.
+#[test]
+fn steady_plugin_config_array_resolves_without_a_remap() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    let bundle = oidc_two_provider_bundle();
+    let mut cfg = oidc_providers_cfg(&["https://idp-a.example.com", "https://idp-b.example.com"]);
+
+    let report = resolve_secrets_with_mode_and_options(
+        &mut cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("a stable plugin-config array must never block apply");
+
+    assert!(report.slot_remaps.is_empty());
+    assert!(
+        report.warnings.iter().any(
+            |w| w.contains("ferrum/oidc/@plugin-config/config/providers")
+                && w.contains("slot identity")
+        ),
+        "expected the positional advisory"
+    );
+    let providers = &cfg.plugin_configs[0].config["providers"];
+    assert_eq!(
+        providers[0]["client_auth"]["client_secret"],
+        "SECRET-FOR-IDP-A-aaaaaaaa"
+    );
+    assert_eq!(
+        providers[1]["client_auth"]["client_secret"],
+        "SECRET-FOR-IDP-B-bbbbbbbb"
+    );
+}
+
+/// `--allow-credential-slot-remap` downgrades the plugin-config refusal to the
+/// same report it downgrades for Consumer credentials.
+#[test]
+fn allowed_slot_remap_downgrades_the_plugin_config_shrink_refusal() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    let bundle = oidc_two_provider_bundle();
+    let mut cfg = oidc_providers_cfg(&["https://idp-b.example.com"]);
+
+    let report = resolve_secrets_with_mode_and_options(
+        &mut cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::allowing_slot_remap(true),
+    )
+    .expect("--allow-credential-slot-remap accepts the reassignment");
+
+    assert_eq!(report.slot_remaps.len(), 1);
+    assert!(report.slot_remaps[0].contains(OIDC_SECRET_B_SLOT));
+    assert_eq!(report.results.len(), 1);
+}
+
+/// A plugin-config array that never had a stored value at the vacated index
+/// cannot have remapped anything; a non-index key under the array prefix is
+/// not an entry position either.
+#[test]
+fn plugin_config_array_without_orphaned_index_slots_is_not_a_remap() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        OIDC_SECRET_A_SLOT.to_string(),
+        "SECRET-FOR-IDP-A-aaaaaaaa".to_string(),
+    );
+    bundle.insert(
+        "ferrum/oidc/@plugin-config/config/providers/client_secret".to_string(),
+        "object-shaped-slot".to_string(),
+    );
+    let cfg = oidc_providers_cfg(&["https://idp-a.example.com"]);
+
+    let report = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("nothing positional was orphaned");
+    assert!(report.slot_remaps.is_empty());
+    assert!(report.warnings.is_empty());
+}
+
+// --- Plugin-config endpoint generation (#329) -------------------------------
+
+const LDAP_URL_SLOT: &str = "ferrum/ldap/@plugin-config/config/ldap_url";
+
+fn ldap_cfg(ldap_url: &str) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "ldap",
+            "namespace": "ferrum",
+            "plugin_name": "ldap_auth",
+            "scope": "global",
+            "config": {
+                "ldap_url": ldap_url,
+                "service_account_password": GENERATE
+            }
+        }]
+    }))
+    .unwrap()
+}
+
+/// `ldap_auth.ldap_url` is a rule-declared endpoint. Random base64url has no
+/// scheme or host, so generation is refused at plan time in both walks.
+#[test]
+fn generate_on_a_plugin_endpoint_field_is_refused_at_resolve_time() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    for placeholder in [GENERATE, "${gh-env-secret:alloc=rotate}"] {
+        let cfg = ldap_cfg(placeholder);
+        let err = report_secrets_with_mode_and_options(
+            &cfg,
+            &BTreeMap::new(),
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .expect_err("an endpoint URL cannot be generated")
+        .to_string();
+        assert!(
+            err.contains(LDAP_URL_SLOT) && err.contains("endpoint"),
+            "the refusal did not match the expected text"
+        );
+        assert!(err.contains("alloc=require"));
+
+        let mut resolved = cfg.clone();
+        assert!(resolve_secrets_with_mode_and_options(
+            &mut resolved,
+            &BTreeMap::new(),
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .is_err());
+    }
+}
+
+/// The lenient walk (rotate preflight) reports instead of refusing, but the
+/// report still carries the endpoint classification so the shared
+/// per-entry policy — what the allocator runs — refuses the same slot.
+#[test]
+fn lenient_report_carries_the_endpoint_refusal_to_the_allocator_policy() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::report_secrets_lenient;
+
+    let cfg = ldap_cfg(GENERATE);
+    let report = report_secrets_lenient(&cfg, &BTreeMap::new()).expect("lenient");
+    assert!(report.endpoint_slots.contains(LDAP_URL_SLOT));
+
+    let endpoint = report
+        .results
+        .iter()
+        .find(|r| r.slot == LDAP_URL_SLOT)
+        .expect("endpoint slot reported");
+    assert_eq!(endpoint.status, SlotStatus::NeedsAllocation);
+    let err = report
+        .check_generation_allowed_for(endpoint, &GatewayMode::Api)
+        .expect_err("the allocator policy refuses the endpoint too")
+        .to_string();
+    assert!(err.contains("endpoint"));
+
+    // An opaque secret on the same plugin is still generatable.
+    let password = report
+        .results
+        .iter()
+        .find(|r| r.slot.ends_with("/service_account_password"))
+        .expect("password slot reported");
+    report
+        .check_generation_allowed_for(password, &GatewayMode::Api)
+        .expect("opaque plugin secrets stay generatable");
+}
+
+/// An already-seeded endpoint slot resolves whatever its allocation mode says.
+#[test]
+fn seeded_plugin_endpoint_resolves_regardless_of_allocation_mode() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        LDAP_URL_SLOT.to_string(),
+        "ldaps://svc:pw@ldap.internal.example:636".to_string(),
+    );
+    bundle.insert(
+        "ferrum/ldap/@plugin-config/config/service_account_password".to_string(),
+        "seeded-service-account-password".to_string(),
+    );
+    let mut cfg = ldap_cfg(GENERATE);
+    let report = resolve_secrets_with_mode_and_options(
+        &mut cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("a seeded endpoint slot never reaches the generation check");
+    assert!(report.needs_allocation().is_empty());
+    assert_eq!(
+        cfg.plugin_configs[0].config["ldap_url"],
+        "ldaps://svc:pw@ldap.internal.example:636"
+    );
 }
 
 // --- Structured credential type plumbing (G7) -------------------------------

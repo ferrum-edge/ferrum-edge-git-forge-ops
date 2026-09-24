@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -135,6 +136,58 @@ class ChangedFilesTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 result = changed_files.analyze([[{"filename": path}]], 1, "rust")
+                self.assertTrue(result["matches"])
+
+    def test_rust_scope_includes_non_rust_files_the_unit_suite_reads(self):
+        # `tests/unit` reads the quickstart guide and the example repository
+        # configuration, and `src/doctor/github.rs` embeds the settings
+        # auditor with `include_str!`. A PR that changes only one of them can
+        # still break `cargo test`.
+        for path in (
+            "docs/quickstart.md",
+            ".gitforgeops/config.example.yaml",
+            ".gitforgeops/policies.example.yaml",
+            ".gitforgeops/smoke.example.yaml",
+            ".github/scripts/audit_settings.py",
+        ):
+            with self.subTest(path=path):
+                result = changed_files.analyze([[{"filename": path}]], 1, "rust")
+                self.assertTrue(result["matches"])
+        for path in (
+            "docs/other.md",
+            ".gitforgeops/config.yaml",
+            ".gitforgeops/policies.yaml",
+            ".gitforgeops/nested/config.example.yaml",
+            ".github/scripts/bootstrap_repo_settings.py",
+            "resources/ferrum/proxies/_example.yaml",
+        ):
+            with self.subTest(path=path):
+                result = changed_files.analyze([[{"filename": path}]], 1, "rust")
+                self.assertFalse(result["matches"])
+
+    def test_rust_ci_push_paths_stay_within_the_pr_rust_scope(self):
+        text = (SCRIPT.parents[1] / "workflows" / "rust-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        block = re.search(
+            r"^  push:\n(?:^    .*\n)*?^    paths:\n((?:^      .*\n)*)",
+            text,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(block)
+        entries = re.findall(r"^      - '([^']+)'$", block.group(1), re.MULTILINE)
+        self.assertIn("docs/quickstart.md", entries)
+        self.assertIn(".gitforgeops/*.example.yaml", entries)
+        self.assertIn(".github/scripts/audit_settings.py", entries)
+        for entry in entries:
+            # Instantiate the glob with a representative concrete path.
+            sample = (
+                entry.replace("**/", "nested/")
+                .replace("**", "file.rs")
+                .replace("*", "sample")
+            )
+            with self.subTest(entry=entry, sample=sample):
+                result = changed_files.analyze([[{"filename": sample}]], 1, "rust")
                 self.assertTrue(result["matches"])
 
     def test_malformed_page_and_previous_filename_fail_closed(self):

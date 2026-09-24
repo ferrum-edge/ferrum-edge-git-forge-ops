@@ -82,6 +82,7 @@ pub fn assemble_with_namespace_filter(
     let mut config = GatewayConfig::default();
     let mut mesh_fragments: Vec<(String, MeshConfigSpec)> = Vec::new();
     let mut mesh_sources = Vec::new();
+    let mut mesh_fragment_ids: HashSet<(String, String)> = HashSet::new();
 
     for (namespace, resource) in resources {
         match resource {
@@ -128,7 +129,17 @@ pub fn assemble_with_namespace_filter(
                     }
                 }
                 let label = match id {
-                    Some(id) if !id.trim().is_empty() => format!("{namespace}/mesh/{id}"),
+                    Some(id) if !id.trim().is_empty() => {
+                        // The loader names both files; this covers callers
+                        // that assemble resources they built themselves.
+                        if !mesh_fragment_ids.insert((namespace.clone(), id.clone())) {
+                            return Err(crate::error::Error::Config(format!(
+                                "duplicate MeshConfig fragment {namespace}/mesh/{id}; a fragment \
+                                 id must be unique within its namespace"
+                            )));
+                        }
+                        format!("{namespace}/mesh/{id}")
+                    }
                     _ => format!("{namespace}/mesh"),
                 };
                 mesh_sources.push((namespace, label.clone()));
@@ -229,9 +240,10 @@ pub fn merge_mesh_fragments(
     // Remembers which fragment last set each singleton, so a conflict error
     // can name both sides instead of just the loser.
     let mut singleton_origin: HashMap<&'static str, String> = HashMap::new();
-    // Same, for the identified collections (`workloads`, `services`), keyed by
-    // `<field>/<identity>`.
-    let mut entry_origin: HashMap<String, String> = HashMap::new();
+    // Per identified collection (`workloads`, `services`): identity -> merged
+    // position and defining fragment.
+    let mut workload_index = IdentityIndex::new();
+    let mut service_index = IdentityIndex::new();
 
     for (origin, fragment) in fragments {
         let MeshConfigSpec {
@@ -264,7 +276,7 @@ pub fn merge_mesh_fragments(
             workloads,
             ArrayIdentity::MeshWorkloadSpiffeId,
             &origin,
-            &mut entry_origin,
+            &mut workload_index,
         )?;
         merge_mesh_identified_collection(
             "services",
@@ -272,7 +284,7 @@ pub fn merge_mesh_fragments(
             services,
             ArrayIdentity::MeshServiceNameNamespace,
             &origin,
-            &mut entry_origin,
+            &mut service_index,
         )?;
         merged.mesh_policies.extend(mesh_policies);
         merged.ext_authz_providers.extend(ext_authz_providers);
@@ -324,6 +336,11 @@ pub fn merge_mesh_fragments(
     Ok(Some(merged))
 }
 
+/// Identity of an entry in one identified mesh collection -> its position in
+/// the merged list and the fragment that defined it. One per collection,
+/// carried across every fragment of a merge.
+type IdentityIndex = HashMap<String, (usize, String)>;
+
 /// Concatenate one mesh collection whose entries carry a mesh-wide identity,
 /// rejecting two fragments that define the *same* identity differently.
 ///
@@ -337,8 +354,9 @@ pub fn merge_mesh_fragments(
 ///
 /// Three cases:
 ///
-/// * **New identity** — appended, and the fragment is remembered so a later
-///   conflict can name both sides.
+/// * **New identity** — appended and recorded in `index` with its merged
+///   position and fragment, so a later duplicate is a hash lookup rather than
+///   a rescan of the merged list, and a conflict can name both sides.
 /// * **Same identity, deep-equal entry** — the fragments agree. Deduplicated
 ///   silently: shared boilerplate copied into two fragments is harmless, and
 ///   emitting the entry twice would be a document the gateway then has to
@@ -361,7 +379,7 @@ fn merge_mesh_identified_collection(
     incoming: Vec<serde_json::Value>,
     identity: ArrayIdentity,
     origin: &str,
-    origins: &mut HashMap<String, String>,
+    index: &mut IdentityIndex,
 ) -> crate::error::Result<()> {
     for item in incoming {
         let Some(item_identity) = array_item_identity(&item, identity) else {
@@ -369,17 +387,9 @@ fn merge_mesh_identified_collection(
             continue;
         };
 
-        let existing = merged.iter().find(|candidate| {
-            array_item_identity(candidate, identity).as_ref() == Some(&item_identity)
-        });
-
-        match existing {
-            Some(existing) if *existing == item => continue,
-            Some(_) => {
-                let previous = origins
-                    .get(&format!("{field}/{item_identity}"))
-                    .cloned()
-                    .unwrap_or_else(|| "<unknown>".to_string());
+        match index.get(&item_identity) {
+            Some((position, _)) if merged.get(*position) == Some(&item) => continue,
+            Some((_, previous)) => {
                 return Err(crate::error::Error::Config(format!(
                     "conflicting mesh `{field}` entry {item_identity}: fragment {previous} and \
                      fragment {origin} both define it, with different contents. Mesh {field} are \
@@ -389,7 +399,7 @@ fn merge_mesh_identified_collection(
                 )));
             }
             None => {
-                origins.insert(format!("{field}/{item_identity}"), origin.to_string());
+                index.insert(item_identity, (merged.len(), origin.to_string()));
                 merged.push(item);
             }
         }

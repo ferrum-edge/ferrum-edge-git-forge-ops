@@ -357,6 +357,16 @@ impl AdminClient {
     /// an apply failure. Database/file-mode gateways answer with an
     /// informational `{mode, message}` rather than an error.
     pub async fn get_cluster(&self) -> crate::error::Result<ClusterStatus> {
+        let body = self.get_cluster_body().await?;
+        parse_cluster_status(&body)
+    }
+
+    /// `GET /cluster` up to, but not including, parsing the body.
+    ///
+    /// Separates "the gateway accepted the token" (a 2xx) from "the body is a
+    /// shape this build does not model", which `get_cluster` folds into one
+    /// error. `doctor` needs the first answer even when the second fails.
+    pub async fn get_cluster_body(&self) -> crate::error::Result<String> {
         let token = self.token()?;
         let resp = self
             .send_with_retry(RequestKind::Read, || {
@@ -364,8 +374,7 @@ impl AdminClient {
             })
             .await?;
         self.check(&resp, RequestKind::Read)?;
-        serde_json::from_str::<ClusterStatus>(&resp.body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /cluster: {e}")))
+        Ok(resp.body)
     }
 
     /// Fetch the namespace's live configuration plus the backup-only sections
@@ -968,7 +977,11 @@ pub fn map_api_error_with_location(
         return crate::error::Error::ApiError {
             status,
             message: format!(
-                "the gateway answered a redirect (HTTP {status}) instead of a response.                  {destination}gitforgeops never follows redirects on admin calls — a 301/302                  would rewrite a POST into a GET and a 307/308 would replay a destructive body                  against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme,                  host, port and any path prefix) and re-run."
+                "the gateway answered a redirect (HTTP {status}) instead of a response. \
+                 {destination}gitforgeops never follows redirects on admin calls — a 301/302 \
+                 would rewrite a POST into a GET and a 307/308 would replay a destructive body \
+                 against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme, \
+                 host, port and any path prefix) and re-run."
             ),
         };
     }
@@ -1032,13 +1045,29 @@ pub fn map_api_error_with_location(
     }
 
     if status == 413 {
-        return crate::error::Error::ApiError {
-            status,
-            message: format!(
-                "{message} — payload exceeds the gateway's restore body limit \
+        // The advice depends on which body was too large: only `/restore` has
+        // its own (much larger) limit and a strategy-level workaround.
+        let advice = match kind {
+            RequestKind::Restore => "payload exceeds the gateway's restore body limit \
                  (FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB, default 100 MiB). Split the namespace or \
                  switch to the incremental apply strategy."
+                .to_string(),
+            RequestKind::NonIdempotentMutation => format!(
+                "the create or POST /batch body exceeds the gateway's admin request body limit. \
+                 Incremental apply chunks POST /batch bodies under {BATCH_MAX_BODY_BYTES} bytes \
+                 (1 MiB) and never splits a proxy/scoped-plugin dependency group, so a single \
+                 resource or dependency group above that size cannot be sent. Reduce that \
+                 resource or group."
             ),
+            RequestKind::Mutation | RequestKind::Read => {
+                "the request body exceeds the gateway's admin request body limit. Reduce the size \
+                 of this resource."
+                    .to_string()
+            }
+        };
+        return crate::error::Error::ApiError {
+            status,
+            message: format!("{message} — {advice}"),
         };
     }
 
@@ -1760,7 +1789,11 @@ pub fn split_batch(batch: BatchCreate, max_bytes: usize) -> crate::error::Result
 }
 
 /// Connected proxy/plugin create components must never cross a chunk boundary.
-fn batch_dependency_groups(mut batch: BatchCreate) -> Vec<BatchCreate> {
+///
+/// Also used by incremental apply to withhold only the create groups whose
+/// proxy references a PluginConfig that failed to write, so one blocked
+/// group cannot prevent unrelated groups from reaching `POST /batch`.
+pub(crate) fn batch_dependency_groups(mut batch: BatchCreate) -> Vec<BatchCreate> {
     fn root(parents: &mut [usize], mut index: usize) -> usize {
         while parents[index] != index {
             parents[index] = parents[parents[index]];
@@ -2010,6 +2043,12 @@ impl ClusterStatus {
                 .and_then(|cp| cp.config_diverged)
                 == Some(true)
     }
+}
+
+/// Parse a `GET /cluster` body.
+pub fn parse_cluster_status(body: &str) -> crate::error::Result<ClusterStatus> {
+    serde_json::from_str::<ClusterStatus>(body)
+        .map_err(|e| crate::error::Error::HttpClient(format!("GET /cluster: {e}")))
 }
 
 /// One-line post-apply convergence report.

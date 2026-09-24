@@ -130,6 +130,8 @@ class DeploymentScopeTests(unittest.TestCase):
             ("Cargo.toml", "[package]\n"),
             ("build.rs", "fn main() {}\n"),
             ("rust-toolchain.toml", "[toolchain]\n"),
+            # rustup prefers the legacy file when both exist.
+            ("rust-toolchain", "1.98.0\n"),
             (".github/scripts/credential_bundles.py", "# loader\n"),
             (".github/ferrum-edge-checksums.txt", "# pins\n"),
             (".github/workflows/apply-on-merge.yml", "name: GitForgeOps Apply\n"),

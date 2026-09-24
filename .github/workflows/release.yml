@@ -149,18 +149,22 @@ jobs:
           # gate would be something operators re-run past rather than read.
           # Wait for the lifecycle run for THIS revision to finish, bounded,
           # and say which of the three outcomes happened.
-          run_id=
+          run_ids=
           for attempt in $(seq 1 40); do
             gh api "repos/${REPO}/actions/workflows/lifecycle.yml/runs?head_sha=${RELEASE_SHA}&per_page=20" \
               > "$runs_file" || {
               echo "::error::The lifecycle acceptance workflow's run history could not be read."
               exit 1
             }
-            run_id=$(jq -r '
+            # Every successful run, newest first. A newer run is not
+            # necessarily a certifying one: a push-triggered run records the
+            # GitHub-repository scenarios as `skipped`, and it must not hide an
+            # older dispatched run that carries the operator's attestation.
+            run_ids=$(jq -r '
               [.workflow_runs[]? | select(.conclusion == "success")]
-              | if length > 0 then (sort_by(.updated_at) | last | .id | tostring) else "" end
+              | sort_by(.updated_at) | reverse | .[].id | tostring
             ' "$runs_file")
-            [ -n "$run_id" ] && break
+            [ -n "$run_ids" ] && break
 
             pending=$(jq -r '
               [.workflow_runs[]? | select(.status != "completed")] | length
@@ -180,14 +184,8 @@ jobs:
             echo "Lifecycle acceptance has not started for ${RELEASE_SHA} yet (attempt ${attempt}/40)."
             sleep 30
           done
-          [ -n "$run_id" ] || {
+          [ -n "$run_ids" ] || {
             echo "::error::No successful GitForgeOps Lifecycle Acceptance run exists for ${RELEASE_SHA} after waiting. Dispatch the workflow for this commit and re-run the release."
-            exit 1
-          }
-
-          gh run download "$run_id" --repo "$REPO" \
-            --name "lifecycle-result-${RELEASE_SHA}" --dir acceptance || {
-            echo "::error::Lifecycle run ${run_id} published no result artifact for ${RELEASE_SHA}."
             exit 1
           }
 
@@ -200,11 +198,36 @@ jobs:
           else
             gateway_args=(--gateway-allowlist .github/ferrum-edge-checksums.txt)
           fi
-          python3 .github/scripts/lifecycle_result.py verify \
-            --result acceptance/lifecycle-result.json \
-            --revision "$RELEASE_SHA" \
-            "${gateway_args[@]}" \
-            --summary "$GITHUB_STEP_SUMMARY"
+
+          # Accept the newest successful run whose own result certifies this
+          # revision. Every candidate is verified with the same arguments; a
+          # run without an artifact, or whose result does not certify, only
+          # moves the search to the next older run. None certifying refuses.
+          certified=
+          for run_id in $run_ids; do
+            dir="acceptance/${run_id}"
+            echo "### Lifecycle run ${run_id}" >> "$GITHUB_STEP_SUMMARY"
+            if ! gh run download "$run_id" --repo "$REPO" \
+              --name "lifecycle-result-${RELEASE_SHA}" --dir "$dir"; then
+              echo "Lifecycle run ${run_id} published no result artifact for ${RELEASE_SHA}; trying the next older successful run."
+              echo "No result artifact." >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            if python3 .github/scripts/lifecycle_result.py verify \
+              --result "${dir}/lifecycle-result.json" \
+              --revision "$RELEASE_SHA" \
+              "${gateway_args[@]}" \
+              --summary "$GITHUB_STEP_SUMMARY"; then
+              certified=$run_id
+              break
+            fi
+            echo "Lifecycle run ${run_id} does not certify ${RELEASE_SHA}; trying the next older successful run."
+          done
+          [ -n "$certified" ] || {
+            echo "::error::No successful GitForgeOps Lifecycle Acceptance run for ${RELEASE_SHA} published a result that certifies it; every candidate is listed in the step summary. Dispatch the workflow for this commit with the GitHub-repository attestation and re-run the release."
+            exit 1
+          }
+          echo "Lifecycle run ${certified} certifies ${RELEASE_SHA}."
 
   docker:
     name: Build and push Docker image

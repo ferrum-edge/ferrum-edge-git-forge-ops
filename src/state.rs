@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,7 @@ pub struct StateFile {
     pub environment: String,
     pub last_applied_at: Option<String>,
     pub last_applied_commit: Option<String>,
-    pub resources: HashMap<String, String>,
+    pub resources: BTreeMap<String, String>,
     /// Creates durably announced before their non-idempotent POST, but not yet
     /// proven to have landed. These keys are deliberately *not* part of the
     /// shared-mode delete fence: a crashed request must not grant deletion
@@ -54,7 +54,7 @@ pub struct StateFile {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pending_creates: BTreeSet<String>,
     #[serde(default)]
-    pub credentials: HashMap<String, CredentialMetadata>,
+    pub credentials: BTreeMap<String, CredentialMetadata>,
     #[serde(default = "default_shard_count")]
     pub credential_shard_count: u32,
     #[serde(default)]
@@ -140,9 +140,9 @@ impl Default for StateFile {
             environment: "default".to_string(),
             last_applied_at: None,
             last_applied_commit: None,
-            resources: HashMap::new(),
+            resources: BTreeMap::new(),
             pending_creates: BTreeSet::new(),
-            credentials: HashMap::new(),
+            credentials: BTreeMap::new(),
             credential_shard_count: default_shard_count(),
             overrides: Vec::new(),
             mesh_document_path: None,
@@ -364,10 +364,14 @@ impl StateFile {
     /// deletion. Add/Modify prove the resource still exists in `desired` and
     /// store a non-secret ownership marker; Delete removes the key.
     /// Out-of-scope entries are never touched here.
+    ///
+    /// `desired` is the desired document's [`ResourceKeys`], built once by the
+    /// caller for the whole run: looking each op up by scanning the document
+    /// made recording a large apply O(n²).
     pub fn record_op(
         &mut self,
         op: &crate::apply::AppliedOp,
-        desired: &GatewayConfig,
+        desired: &ResourceKeys,
     ) -> crate::error::Result<()> {
         use crate::diff::resource_diff::DiffAction;
         let key = state_key(&op.namespace, &op.kind, &op.id);
@@ -378,30 +382,7 @@ impl StateFile {
                 self.pending_creates.remove(&key);
             }
             DiffAction::Add | DiffAction::Modify => {
-                let exists = match op.kind.as_str() {
-                    "Proxy" => desired
-                        .proxies
-                        .iter()
-                        .find(|p| p.namespace == op.namespace && p.id == op.id)
-                        .is_some(),
-                    "Consumer" => desired
-                        .consumers
-                        .iter()
-                        .find(|c| c.namespace == op.namespace && c.id == op.id)
-                        .is_some(),
-                    "Upstream" => desired
-                        .upstreams
-                        .iter()
-                        .find(|u| u.namespace == op.namespace && u.id == op.id)
-                        .is_some(),
-                    "PluginConfig" => desired
-                        .plugin_configs
-                        .iter()
-                        .find(|p| p.namespace == op.namespace && p.id == op.id)
-                        .is_some(),
-                    _ => false,
-                };
-                if exists {
+                if desired.contains(&key) {
                     self.resources
                         .insert(key.clone(), managed_resource_marker());
                     self.pending_creates.remove(&key);
@@ -427,13 +408,14 @@ impl StateFile {
     ) -> crate::error::Result<usize> {
         use crate::diff::resource_diff::DiffAction;
 
+        let desired = ResourceKeys::from_config(desired);
         let mut reserved = 0;
         for diff in diffs
             .iter()
             .filter(|diff| matches!(diff.action, DiffAction::Add))
         {
             let key = state_key(&diff.namespace, &diff.kind, &diff.id);
-            if !resource_exists(desired, &key) {
+            if !desired.contains(&key) {
                 return Err(crate::error::Error::Config(format!(
                     "cannot journal create for {} `{}` in namespace `{}` because it is absent from the desired configuration",
                     diff.kind, diff.id, diff.namespace
@@ -484,6 +466,8 @@ impl StateFile {
     ) -> PendingCreateReconciliation {
         let pending = self.pending_creates.iter().cloned().collect::<Vec<_>>();
         let mut report = PendingCreateReconciliation::default();
+        let desired = ResourceKeys::from_config(desired);
+        let mut live_keys: HashMap<String, ResourceKeys> = HashMap::new();
 
         for key in pending {
             if self.resources.contains_key(&key) {
@@ -518,8 +502,11 @@ impl StateFile {
                 continue;
             }
 
-            let desired_exists = resource_exists(desired, &key);
-            let live_exists = resource_exists(actual, &key);
+            let desired_exists = desired.contains(&key);
+            let live_exists = live_keys
+                .entry(namespace.clone())
+                .or_insert_with(|| ResourceKeys::from_config(actual))
+                .contains(&key);
             match (desired_exists, live_exists) {
                 (true, _) => {
                     // Still desired: keep the journal entry. An absent or
@@ -565,6 +552,8 @@ impl StateFile {
         actual_by_namespace: &BTreeMap<String, GatewayConfig>,
     ) -> usize {
         let before = self.resources.len();
+        let desired = ResourceKeys::from_config(desired);
+        let mut live_keys: HashMap<String, ResourceKeys> = HashMap::new();
         self.resources.retain(|key, _| {
             let Some(namespace) = state_key_namespace(key) else {
                 // Loading/saving rejects malformed keys. Retain defensively so
@@ -574,7 +563,11 @@ impl StateFile {
             let Some(actual) = actual_by_namespace.get(&namespace) else {
                 return true;
             };
-            resource_exists(desired, key) || resource_exists(actual, key)
+            desired.contains(key)
+                || live_keys
+                    .entry(namespace)
+                    .or_insert_with(|| ResourceKeys::from_config(actual))
+                    .contains(key)
         });
         before.saturating_sub(self.resources.len())
     }
@@ -763,23 +756,44 @@ impl PendingCreateReconciliation {
     }
 }
 
-fn resource_exists(config: &GatewayConfig, key: &str) -> bool {
-    config
-        .proxies
-        .iter()
-        .any(|resource| state_key(&resource.namespace, "Proxy", &resource.id) == key)
-        || config
+/// Every `namespace:Kind:id` state key a gateway document declares.
+///
+/// Built once per document so each existence check is a set lookup rather
+/// than a scan of the document; the ledger operations check one key per
+/// applied op, pending create or managed entry.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceKeys(HashSet<String>);
+
+impl ResourceKeys {
+    pub fn from_config(config: &GatewayConfig) -> Self {
+        let proxies = config
+            .proxies
+            .iter()
+            .map(|r| state_key(&r.namespace, "Proxy", &r.id));
+        let consumers = config
             .consumers
             .iter()
-            .any(|resource| state_key(&resource.namespace, "Consumer", &resource.id) == key)
-        || config
+            .map(|r| state_key(&r.namespace, "Consumer", &r.id));
+        let upstreams = config
             .upstreams
             .iter()
-            .any(|resource| state_key(&resource.namespace, "Upstream", &resource.id) == key)
-        || config
+            .map(|r| state_key(&r.namespace, "Upstream", &r.id));
+        let plugin_configs = config
             .plugin_configs
             .iter()
-            .any(|resource| state_key(&resource.namespace, "PluginConfig", &resource.id) == key)
+            .map(|r| state_key(&r.namespace, "PluginConfig", &r.id));
+        Self(
+            proxies
+                .chain(consumers)
+                .chain(upstreams)
+                .chain(plugin_configs)
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.0.contains(key)
+    }
 }
 
 fn managed_resource_marker() -> String {

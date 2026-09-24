@@ -90,8 +90,9 @@ jobs:
 
       # The attestation arrives through the environment, never interpolated
       # into the script, and is merged only into scenarios this run skipped.
-      # An unsealed attestation, or one sealed for another revision, fails the
-      # step — and the job — rather than being dropped.
+      # An unsealed attestation, or one sealed for another revision, another
+      # gateway build, or outside the freshness window, fails the step — and
+      # the job — rather than being dropped.
       - name: Merge the GitHub-repository attestation
         id: attest
         if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.github_acceptance != '' }}

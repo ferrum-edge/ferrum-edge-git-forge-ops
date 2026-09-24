@@ -121,6 +121,28 @@ fn an_incomplete_deployment_repository_names_each_blocker() {
 }
 
 #[test]
+fn a_non_admin_jwt_role_is_a_blocker_because_backup_is_admin_only() {
+    // `/cluster` has no role requirement, so the gateway scope cannot catch
+    // this; the first real command would 403 on `GET /backup`.
+    let dir = repo(&[]);
+    for role in ["viewer", "operator"] {
+        let env = EnvConfig {
+            admin_jwt_role: role.to_string(),
+            ..api_env()
+        };
+        let checks = doctor::local::run(dir.path(), Some(&env));
+        let claims = find(&checks, "admin-jwt-claims");
+        assert_eq!(claims.status, Status::Fail, "{role}");
+        assert!(claims
+            .remediation
+            .as_deref()
+            .is_some_and(|text| text.contains("admin-only")));
+    }
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    assert_eq!(find(&checks, "admin-jwt-claims").status, Status::Pass);
+}
+
+#[test]
 fn a_repository_config_that_does_not_load_is_a_named_failure() {
     let dir = repo(&[(
         ".gitforgeops/config.yaml",
@@ -333,6 +355,15 @@ fn github_doctor_uses_its_bundled_auditor_when_checkout_copy_is_missing() {
 /// gate, takes `status`. A stub that rejected `/health` would test a gateway
 /// that does not exist, and let a token check pass on the one that does.
 fn spawn_gateway_stub(status: u16, requests: Arc<Mutex<Vec<String>>>) -> String {
+    spawn_gateway_stub_with(status, None, requests)
+}
+
+/// [`spawn_gateway_stub`] with an explicit `/cluster` body.
+fn spawn_gateway_stub_with(
+    status: u16,
+    cluster_body: Option<&'static str>,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let addr = listener.local_addr().expect("addr");
     std::thread::spawn(move || {
@@ -369,10 +400,10 @@ fn spawn_gateway_stub(status: u16, requests: Arc<Mutex<Vec<String>>>) -> String 
                 } else {
                     200
                 };
-                let body = if status == 200 {
-                    body
-                } else {
-                    r#"{"error":"InvalidIssuer"}"#.to_string()
+                let body = match (first.contains("/cluster"), cluster_body) {
+                    (true, Some(custom)) => custom.to_string(),
+                    _ if status == 200 => body,
+                    _ => r#"{"error":"InvalidIssuer"}"#.to_string(),
                 };
                 if write!(
                     stream,
@@ -448,6 +479,40 @@ async fn a_rejected_token_is_reported_with_the_claim_settings_to_compare() {
     let remediation = token.remediation.as_ref().expect("remediation");
     assert!(remediation.contains("issuer=wrong-issuer"), "{remediation}");
     assert!(remediation.contains("audience=<unset>"), "{remediation}");
+}
+
+#[tokio::test]
+async fn a_server_error_mentioning_401_is_not_a_rejected_token() {
+    // The body (and, for transport errors, the URL) is part of the error text;
+    // a `401`/`403` substring there says nothing about the token.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_gateway_stub_with(
+        500,
+        Some(r#"{"error":"upstream pool 4013 exhausted"}"#),
+        Arc::clone(&requests),
+    );
+    let mut env = stub_env(url);
+    env.gateway_max_retries = 0;
+    let checks = doctor::gateway::run("production", &env).await;
+    assert_eq!(find(&checks, "gateway-token").status, Status::Unknown);
+}
+
+#[tokio::test]
+async fn an_accepted_token_with_an_unparseable_cluster_body_still_passes() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_gateway_stub_with(
+        200,
+        Some(r#"{"mode":"cp","data_planes":"three"}"#),
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &stub_env(url)).await;
+    let token = find(&checks, "gateway-token");
+    assert_eq!(token.status, Status::Pass);
+    assert!(
+        token.detail.contains("cluster status unavailable"),
+        "{}",
+        token.detail
+    );
 }
 
 #[tokio::test]

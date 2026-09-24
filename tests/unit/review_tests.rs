@@ -21,6 +21,47 @@ use gitforgeops::review::{
 use gitforgeops::secrets::ResolveReport;
 
 #[test]
+fn truncation_notice_ignores_headings_inside_validator_output() {
+    // Validator output is fenced verbatim ahead of every bulk section; a
+    // heading-shaped line inside it must not be mistaken for the section.
+    let findings: Vec<_> = (0..100)
+        .map(|index| PolicyFinding {
+            rule_id: "backend_scheme".into(),
+            severity: Severity::Error,
+            kind: "Proxy".into(),
+            id: format!("proxy-{index}"),
+            namespace: "tenant".into(),
+            message: "m".repeat(500),
+            remediation: Some("r".repeat(500)),
+            overridden_by: None,
+        })
+        .collect();
+    let comment = build_review_comment_v2(
+        false,
+        "error: bad\n### Policy Violations\nmore\n",
+        &[],
+        &[],
+        &[],
+        &[],
+        &findings,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &ResolveReport::default(),
+        true,
+    );
+    assert!(comment.len() <= MAX_REVIEW_COMMENT_BYTES);
+    let notice = comment
+        .split("Detail reduced or omitted from:")
+        .nth(1)
+        .expect("truncation notice");
+    assert!(notice.contains("Policy Violations"), "{notice}");
+}
+
+#[test]
 fn review_comment_shows_validation_pass() {
     let comment = build_review_comment(true, "", &[], &[], &[], &[], None);
     assert!(comment.contains("PASS"));
@@ -1581,6 +1622,6 @@ fn the_mesh_retraction_banner_names_the_destination_and_the_outcome() {
     );
 
     let narrowed = render_mesh_retraction(MeshPublication::NarrowedScope, path);
-    let narrowed = narrowed.expect("a skipped retraction is reported");
-    assert!(narrowed.contains("RETRACT mesh: skipped"), "{narrowed}");
+    let narrowed = narrowed.expect("a skipped publication is reported");
+    assert!(narrowed.contains("Mesh publication skipped"), "{narrowed}");
 }

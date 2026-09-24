@@ -8,6 +8,8 @@ scenario and reported no failures.
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -152,12 +154,21 @@ def ci_result():
     return result
 
 
-def operator_attestation(revision=REVISION, status=lifecycle_result.PASSED):
+def operator_attestation(
+    revision=REVISION,
+    status=lifecycle_result.PASSED,
+    gateway=GATEWAY,
+    sealed_at=NOW - timedelta(hours=2),
+):
     attestation = lifecycle_result.empty_result()
     for identifier in GITHUB_HALF:
         lifecycle_result.record(attestation, identifier, status, "run 123: ok")
-    lifecycle_result.seal(attestation, revision, "e" * 64, NOW - timedelta(hours=2))
+    lifecycle_result.seal(attestation, revision, gateway, sealed_at)
     return attestation
+
+
+def attest(result, attestation, revision=REVISION, attested_by="maintainer"):
+    return lifecycle_result.attest(result, attestation, revision, attested_by, now=NOW)
 
 
 class AttestationTests(unittest.TestCase):
@@ -169,9 +180,7 @@ class AttestationTests(unittest.TestCase):
 
     def test_an_attestation_fills_the_skipped_scenarios_and_certifies(self):
         result = ci_result()
-        filled = lifecycle_result.attest(
-            result, operator_attestation(), REVISION, "maintainer"
-        )
+        filled = attest(result, operator_attestation())
         self.assertEqual(sorted(filled), sorted(GITHUB_HALF))
         self.assertEqual(reasons(result), [])
         entry = result["scenarios"]["staged-promotion"]
@@ -187,19 +196,14 @@ class AttestationTests(unittest.TestCase):
         lifecycle_result.record(
             attestation, "create-and-route", lifecycle_result.PASSED, "trust me"
         )
-        lifecycle_result.attest(result, attestation, REVISION, "maintainer")
+        attest(result, attestation)
         self.assertEqual(
             result["scenarios"]["create-and-route"]["status"], lifecycle_result.FAILED
         )
 
     def test_an_attested_failure_is_recorded_as_a_failure(self):
         result = ci_result()
-        lifecycle_result.attest(
-            result,
-            operator_attestation(status=lifecycle_result.FAILED),
-            REVISION,
-            "maintainer",
-        )
+        attest(result, operator_attestation(status=lifecycle_result.FAILED))
         self.assertEqual(
             result["scenarios"]["staged-promotion"]["status"], lifecycle_result.FAILED
         )
@@ -207,19 +211,64 @@ class AttestationTests(unittest.TestCase):
 
     def test_an_attestation_for_other_code_is_refused(self):
         with self.assertRaises(lifecycle_result.ResultError) as raised:
-            lifecycle_result.attest(
-                ci_result(),
-                operator_attestation(revision=OTHER_REVISION),
-                REVISION,
-                "maintainer",
-            )
+            attest(ci_result(), operator_attestation(revision=OTHER_REVISION))
         self.assertIn("proves nothing about this revision", str(raised.exception))
 
     def test_an_unsealed_attestation_is_refused(self):
         attestation = operator_attestation()
         attestation["gitforgeops_revision"] = None
         with self.assertRaises(lifecycle_result.ResultError):
-            lifecycle_result.attest(ci_result(), attestation, REVISION, "maintainer")
+            attest(ci_result(), attestation)
+
+    def test_an_attestation_from_another_gateway_build_is_refused(self):
+        result = ci_result()
+        before = json.loads(json.dumps(result))
+        with self.assertRaises(lifecycle_result.ResultError) as raised:
+            attest(result, operator_attestation(gateway="e" * 64))
+        self.assertIn("gateway build", str(raised.exception))
+        self.assertEqual(result, before)
+
+    def test_an_attestation_without_a_gateway_build_is_refused(self):
+        attestation = operator_attestation()
+        attestation["gateway_build"] = None
+        with self.assertRaises(lifecycle_result.ResultError):
+            attest(ci_result(), attestation)
+
+    def test_an_attestation_into_an_unsealed_run_is_refused(self):
+        # Two absent gateway builds are not a match.
+        result = ci_result()
+        result["gateway_build"] = None
+        attestation = operator_attestation()
+        attestation["gateway_build"] = None
+        with self.assertRaises(lifecycle_result.ResultError):
+            attest(result, attestation)
+
+    def test_a_stale_attestation_is_refused(self):
+        result = ci_result()
+        before = json.loads(json.dumps(result))
+        stale = operator_attestation(
+            sealed_at=NOW
+            - timedelta(hours=lifecycle_result.DEFAULT_MAX_AGE_HOURS + 1)
+        )
+        with self.assertRaises(lifecycle_result.ResultError) as raised:
+            attest(result, stale)
+        self.assertIn("window", str(raised.exception))
+        self.assertEqual(result, before)
+
+    def test_an_attestation_inside_the_window_is_accepted(self):
+        recent = operator_attestation(
+            sealed_at=NOW
+            - timedelta(hours=lifecycle_result.DEFAULT_MAX_AGE_HOURS - 1)
+        )
+        self.assertEqual(sorted(attest(ci_result(), recent)), sorted(GITHUB_HALF))
+
+    def test_an_attestation_without_sealed_at_is_refused(self):
+        for sealed_at in (None, "not a timestamp"):
+            with self.subTest(sealed_at=sealed_at):
+                attestation = operator_attestation()
+                attestation["sealed_at"] = sealed_at
+                with self.assertRaises(lifecycle_result.ResultError):
+                    attest(ci_result(), attestation)
 
     def test_the_lifecycle_workflow_accepts_an_attestation_only_by_dispatch(self):
         workflow = (ROOT / ".github/workflows/lifecycle.yml").read_text(
@@ -365,6 +414,42 @@ class CliTests(unittest.TestCase):
             written = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(written["gitforgeops_revision"], REVISION)
 
+    def test_attest_refuses_an_attestation_from_another_gateway_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            attestation_path = Path(directory) / "attestation.json"
+            for path, gateway in ((result_path, GATEWAY), (attestation_path, "e" * 64)):
+                self.assertEqual(self._run("init", "--result", str(path)).returncode, 0)
+                for identifier in GITHUB_HALF:
+                    self.assertEqual(
+                        self._run(
+                            "record",
+                            "--result", str(path),
+                            "--scenario", identifier,
+                            "--status", "skipped" if path == result_path else "passed",
+                        ).returncode,
+                        0,
+                    )
+                sealed = self._run(
+                    "seal",
+                    "--result", str(path),
+                    "--revision", REVISION,
+                    "--gateway", gateway,
+                )
+                self.assertEqual(sealed.returncode, 0)
+            before = result_path.read_text(encoding="utf-8")
+            refused = self._run(
+                "attest",
+                "--result", str(result_path),
+                "--attestation", str(attestation_path),
+                "--revision", REVISION,
+                "--attested-by", "maintainer",
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout)
+            self.assertIn("::error::", refused.stdout)
+            self.assertIn("gateway build", refused.stdout)
+            self.assertEqual(result_path.read_text(encoding="utf-8"), before)
+
     def test_verify_refuses_a_missing_file_rather_than_passing(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self._run(
@@ -409,6 +494,15 @@ class ReleaseGateWiringTests(unittest.TestCase):
         self.assertIn("has not started for ${RELEASE_SHA} yet", self.release)
         self.assertIn("Fix the scenarios it reported, not the gate", self.release)
 
+    def test_the_gate_does_not_stop_at_the_newest_successful_run(self):
+        # A newer push-triggered run skips the GitHub-repository scenarios; it
+        # must not hide an older dispatched run that carries the attestation.
+        self.assertNotIn("sort_by(.updated_at) | last", self.release)
+        self.assertIn("sort_by(.updated_at) | reverse", self.release)
+        loop = self.release.index("for run_id in $run_ids; do")
+        self.assertLess(loop, self.release.index("lifecycle_result.py verify"))
+        self.assertIn("published a result that certifies it", self.release)
+
     def test_the_lifecycle_workflow_seals_and_publishes_its_result(self):
         workflow = (ROOT / ".github/workflows/lifecycle.yml").read_text(
             encoding="utf-8"
@@ -418,6 +512,168 @@ class ReleaseGateWiringTests(unittest.TestCase):
         # `!cancelled()` rather than `always()`: a cancelled run must leave an
         # unsealed record, which the gate reads as "did not finish".
         self.assertIn("!cancelled()", workflow)
+
+
+STUB_GH = """#!/usr/bin/env bash
+set -eu
+case "$1" in
+  api) cat "$STUB_RUNS" ;;
+  run)
+    id=$3
+    dir=
+    while [ $# -gt 0 ]; do
+      if [ "$1" = --dir ]; then dir=$2; fi
+      shift
+    done
+    [ -f "$STUB_RESULTS/$id.json" ] || exit 1
+    mkdir -p "$dir"
+    cp "$STUB_RESULTS/$id.json" "$dir/lifecycle-result.json"
+    ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+def release_gate_script() -> str:
+    """The shell the release runs to pick and verify a lifecycle result."""
+    lines = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8").splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if "name: Require a lifecycle acceptance result for this revision" in line
+    )
+    run = next(index for index in range(start, len(lines)) if lines[index].strip() == "run: |")
+    indent = len(lines[run + 1]) - len(lines[run + 1].lstrip())
+    body = []
+    for line in lines[run + 1 :]:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        body.append(line[indent:])
+    return "\n".join(body) + "\n"
+
+
+@unittest.skipUnless(
+    shutil.which("jq") and shutil.which("bash"),
+    "jq and bash are required to exercise the release gate's run selection",
+)
+class ReleaseGateRunSelectionTests(unittest.TestCase):
+    """The gate picks the newest successful run whose result certifies."""
+
+    def _gate(self, runs, results):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / ".github/scripts"
+            scripts.mkdir(parents=True)
+            shutil.copyfile(SCRIPT, scripts / "lifecycle_result.py")
+            (root / ".github/ferrum-edge-checksums.txt").write_text(
+                f"{GATEWAY}  ferrum-edge\n", encoding="utf-8"
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "gh").write_text(STUB_GH, encoding="utf-8")
+            (bin_dir / "gh").chmod(0o755)
+            stub_results = root / "stub-results"
+            stub_results.mkdir()
+            for run_id, result in results.items():
+                lifecycle_result.save(stub_results / f"{run_id}.json", result)
+            runs_path = root / "runs.json"
+            runs_path.write_text(
+                json.dumps({"total_count": len(runs), "workflow_runs": runs}),
+                encoding="utf-8",
+            )
+            summary = root / "summary.md"
+            completed = subprocess.run(
+                ["bash", "-c", release_gate_script()],
+                cwd=root,
+                env={
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "REPO": "acme/template-copy",
+                    "RELEASE_SHA": REVISION,
+                    "GH_TOKEN": "unused",
+                    "GITHUB_STEP_SUMMARY": str(summary),
+                    "STUB_RUNS": str(runs_path),
+                    "STUB_RESULTS": str(stub_results),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return completed
+
+    @staticmethod
+    def _run(run_id, updated_at, conclusion="success"):
+        return {
+            "id": run_id,
+            "status": "completed",
+            "conclusion": conclusion,
+            "updated_at": updated_at,
+        }
+
+    @staticmethod
+    def _fresh(result):
+        lifecycle_result.seal(result, REVISION, GATEWAY, datetime.now(timezone.utc))
+        return result
+
+    def _attested(self):
+        result = ci_result()
+        attest(result, operator_attestation())
+        return self._fresh(result)
+
+    def test_an_older_attested_run_is_not_hidden_by_a_newer_skipped_one(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+            ],
+            {101: self._attested(), 202: self._fresh(ci_result())},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Lifecycle run 202 does not certify", completed.stdout)
+        self.assertIn("Lifecycle run 101 certifies", completed.stdout)
+
+    def test_the_newest_certifying_run_is_used_first(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+            ],
+            {101: self._fresh(ci_result()), 202: self._attested()},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Lifecycle run 202 certifies", completed.stdout)
+        self.assertNotIn("Lifecycle run 101", completed.stdout)
+
+    def test_a_run_without_an_artifact_moves_to_the_next_older_run(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+            ],
+            {101: self._attested()},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Lifecycle run 202 published no result artifact", completed.stdout)
+        self.assertIn("Lifecycle run 101 certifies", completed.stdout)
+
+    def test_no_certifying_run_fails_closed(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+                self._run(303, "2026-09-21T12:00:00Z", conclusion="failure"),
+            ],
+            {
+                101: self._fresh(ci_result()),
+                202: self._fresh(ci_result()),
+                # A failed run is never a candidate, whatever it uploaded.
+                303: self._attested(),
+            },
+        )
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertIn("published a result that certifies it", completed.stdout)
+        self.assertNotIn("certifies " + REVISION + ".", completed.stdout)
+        self.assertNotIn("Lifecycle run 303", completed.stdout)
 
 
 if __name__ == "__main__":

@@ -43,8 +43,10 @@ pub type CredentialBundle = BTreeMap<String, String>;
 
 /// Parsed `FERRUM_CREDS_JSON` / `FERRUM_CREDS_JSON_FILE` document.
 ///
-/// `unrecognized_keys` are top-level keys that are not
-/// `FERRUM_CREDS_BUNDLE` / `FERRUM_CREDS_BUNDLE_N`. An empty object leaves
+/// `unrecognized_keys` are top-level keys outside the reserved
+/// `FERRUM_CREDS_BUNDLE` prefix. A key inside the prefix that is not the
+/// canonical `FERRUM_CREDS_BUNDLE` / `FERRUM_CREDS_BUNDLE_N` spelling is an
+/// error rather than an unrecognized key. An empty object leaves
 /// this empty; a non-empty object that contributes no shards is refused
 /// before a [`LoadedBundles`] is returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,13 +95,19 @@ pub fn parse_bundles_from_json(raw: &str) -> crate::error::Result<LoadedBundles>
     let mut unrecognized_keys: Vec<String> = Vec::new();
 
     for (secret_name, secret_value) in obj {
-        let shard_idx = match parse_shard_index(secret_name) {
+        let shard_idx = match parse_shard_index(secret_name)? {
             Some(n) => n,
             None => {
                 unrecognized_keys.push(secret_name.clone());
                 continue;
             }
         };
+        if per_shard.contains_key(&shard_idx) {
+            return Err(crate::error::Error::Config(format!(
+                "credential bundle key '{secret_name}' maps to shard {shard_idx}, which another \
+                 key already supplies; repair FERRUM_CREDS_BUNDLE secrets before continuing"
+            )));
+        }
         let inner: CredentialBundle = match secret_value {
             serde_json::Value::String(s) if s.is_empty() => BTreeMap::new(),
             serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
@@ -157,12 +165,36 @@ pub fn unrecognized_bundle_keys_warning(keys: &[String]) -> String {
     )
 }
 
-fn parse_shard_index(secret_name: &str) -> Option<u32> {
-    if secret_name == BUNDLE_SECRET_PREFIX {
-        return Some(0);
+/// Shard index of a top-level `FERRUM_CREDS_JSON` key.
+///
+/// `Ok(None)` for a key outside the reserved `FERRUM_CREDS_BUNDLE` prefix
+/// (reported as unrecognized). A key inside the prefix must be exactly the
+/// name [`shard_secret_name`] writes for its index. `u32::parse` alone would
+/// also accept `_0`, `_00`, `_01` and `_+1`, aliasing a second key onto an
+/// existing shard: the per-shard map keeps only one of them, and the next
+/// read-modify-write PUT of that shard silently drops the other's slots. The
+/// prefix is reserved exactly as `.github/scripts/credential_bundles.py`
+/// reserves it, so every other spelling fails closed instead.
+fn parse_shard_index(secret_name: &str) -> crate::error::Result<Option<u32>> {
+    if !secret_name.starts_with(BUNDLE_SECRET_PREFIX) {
+        return Ok(None);
     }
-    let suffix = secret_name.strip_prefix(&format!("{BUNDLE_SECRET_PREFIX}_"))?;
-    suffix.parse().ok()
+    let index = if secret_name == BUNDLE_SECRET_PREFIX {
+        Some(0)
+    } else {
+        secret_name
+            .strip_prefix(&format!("{BUNDLE_SECRET_PREFIX}_"))
+            .and_then(|suffix| suffix.parse::<u32>().ok())
+    };
+    match index {
+        Some(shard) if shard_secret_name(shard) == secret_name => Ok(Some(shard)),
+        _ => Err(crate::error::Error::Config(format!(
+            "credential bundle key '{secret_name}' is not a canonical shard name; expected \
+             {BUNDLE_SECRET_PREFIX} or {BUNDLE_SECRET_PREFIX}_<N> with N a positive decimal \
+             integer without sign or leading zeros. Rename the secret so no two keys alias one \
+             shard."
+        ))),
+    }
 }
 
 pub fn shard_secret_name(shard: u32) -> String {

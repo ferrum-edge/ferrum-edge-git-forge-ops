@@ -377,6 +377,7 @@ fn resolved_env_rejects_unsafe_environment_names() {
         name: "../oops".to_string(),
         overlay: None,
         namespace_filter: None,
+        namespace_filter_is_environment_scope: false,
         apply_strategy: ApplyStrategy::Incremental,
         ownership: OwnershipConfig {
             mode: OwnershipMode::Shared,

@@ -150,12 +150,7 @@ pub async fn allocate_and_deliver_at(
     // invalid candidate must not allow earlier candidates to reach delivery.
     let mode = current_gateway_mode()?;
     for candidate in &candidates {
-        check_generation_allowed(
-            &candidate.slot,
-            report.credential_type_for(&candidate.slot),
-            candidate.placeholder.length_bytes,
-            &mode,
-        )?;
+        report.check_generation_allowed_for(candidate, &mode)?;
     }
 
     // Phase 1: plan shard assignments, generate values, and encrypt delivery

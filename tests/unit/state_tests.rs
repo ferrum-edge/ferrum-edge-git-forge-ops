@@ -96,7 +96,7 @@ fn state_operations_refuse_symlinked_state_directory() {
         std::fs::create_dir("outside").unwrap();
         let state = StateFile {
             environment: "production".to_string(),
-            resources: std::collections::HashMap::from([(
+            resources: std::collections::BTreeMap::from([(
                 state_key("ferrum", "Proxy", "p1"),
                 "managed:v1".to_string(),
             )]),
@@ -345,7 +345,7 @@ fn write_ahead_add_reservation_survives_before_gateway_success_is_recorded() {
                 id: "new-upstream".to_string(),
                 action: DiffAction::Add,
             },
-            &desired,
+            &gitforgeops::state::ResourceKeys::from_config(&desired),
         )
         .unwrap();
     assert!(!state.pending_creates.contains(&key));
@@ -997,8 +997,9 @@ fn record_op_preserves_state_for_failed_delete() {
         action: DiffAction::Add,
     }];
 
+    let desired_keys = gitforgeops::state::ResourceKeys::from_config(&desired);
     for op in &successful_ops {
-        state.record_op(op, &desired).unwrap();
+        state.record_op(op, &desired_keys).unwrap();
     }
 
     // Successful create is in state.
@@ -1032,7 +1033,7 @@ fn record_op_preserves_state_for_failed_delete() {
                 id: "to-delete".to_string(),
                 action: DiffAction::Delete,
             },
-            &desired,
+            &gitforgeops::state::ResourceKeys::from_config(&desired),
         )
         .unwrap();
     assert!(
@@ -1075,7 +1076,7 @@ fn record_op_preserves_state_for_failed_delete() {
                 id: "app".to_string(),
                 action: DiffAction::Modify,
             },
-            &cfg,
+            &gitforgeops::state::ResourceKeys::from_config(&cfg),
         )
         .unwrap();
     assert_eq!(
@@ -1087,6 +1088,54 @@ fn record_op_preserves_state_for_failed_delete() {
         state3.resources.get(&other_key),
         Some(&"sha256:OTHER".to_string()),
         "out-of-namespace entry must remain untouched"
+    );
+}
+
+/// Issue #340: `record_op` checks existence against a prebuilt key set. The
+/// set is keyed on `(namespace, kind, id)`, never on `id` alone.
+#[test]
+fn resource_keys_are_namespace_and_kind_scoped() {
+    let desired: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "proxies": [{"id": "shared", "namespace": "ferrum", "backend_host": "h", "backend_port": 80}],
+        "consumers": [{"id": "c1", "username": "c1", "namespace": "ferrum"}],
+        "upstreams": [{"id": "u1", "namespace": "platform", "targets": []}],
+        "plugin_configs": [{"id": "pc1", "namespace": "ferrum", "plugin_name": "cors", "config": {}, "scope": "global"}],
+    }))
+    .unwrap();
+    let keys = gitforgeops::state::ResourceKeys::from_config(&desired);
+    for key in [
+        state_key("ferrum", "Proxy", "shared"),
+        state_key("ferrum", "Consumer", "c1"),
+        state_key("platform", "Upstream", "u1"),
+        state_key("ferrum", "PluginConfig", "pc1"),
+    ] {
+        assert!(keys.contains(&key), "{key}");
+    }
+    for key in [
+        state_key("platform", "Proxy", "shared"),
+        state_key("ferrum", "Upstream", "shared"),
+        state_key("ferrum", "Upstream", "u1"),
+    ] {
+        assert!(!keys.contains(&key), "{key}");
+    }
+
+    let mut state = StateFile::default();
+    let op = |namespace: &str, id: &str| gitforgeops::apply::AppliedOp {
+        kind: "Proxy".to_string(),
+        namespace: namespace.to_string(),
+        id: id.to_string(),
+        action: DiffAction::Add,
+    };
+    state.record_op(&op("ferrum", "shared"), &keys).unwrap();
+    state.record_op(&op("platform", "shared"), &keys).unwrap();
+    assert!(state
+        .resources
+        .contains_key(&state_key("ferrum", "Proxy", "shared")));
+    assert!(
+        !state
+            .resources
+            .contains_key(&state_key("platform", "Proxy", "shared")),
+        "an op for a row absent from desired must not be recorded"
     );
 }
 
@@ -1114,4 +1163,26 @@ fn the_mesh_document_attribution_round_trips_and_gates_only_its_own_path() {
         // path does not hand gitforgeops authority over the new one.
         assert!(!reloaded.publishes_mesh_document("assembled/other-mesh.yaml"));
     });
+}
+
+#[test]
+fn ledger_serialization_is_deterministic_across_reloads() {
+    // `.state/<env>.json` is committed on every apply; a per-process map order
+    // would reshuffle the whole resource map and bury the real change.
+    let mut state = StateFile::default();
+    for i in 0..20 {
+        state.resources.insert(
+            state_key("ferrum", "Proxy", &format!("p{i:02}")),
+            "managed:v1".to_string(),
+        );
+    }
+    let first = serde_json::to_string_pretty(&state).unwrap();
+    for _ in 0..5 {
+        let reloaded: StateFile = serde_json::from_str(&first).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&reloaded).unwrap(), first);
+    }
+    let keys: Vec<&String> = state.resources.keys().collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
 }

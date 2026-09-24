@@ -2,8 +2,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use gitforgeops::policy::github_override::{authorized_review, OverrideReview};
+use gitforgeops::policy::github_override::{authorized_review, OverrideReview, PermissionResponse};
 use gitforgeops::policy::override_input::verify_input;
+use gitforgeops::policy::OverrideConfig;
 use gitforgeops::policy::OverrideDecision;
 use gitforgeops::state::{OverrideRecord, StateFile};
 use serde_json::{json, Value};
@@ -258,4 +259,37 @@ fn override_audit_distinguishes_reviewed_and_applied_revisions_and_loads_legacy(
         decision.authorized_head
     );
     assert_eq!(reloaded.overrides[0].commit, "b".repeat(40));
+}
+
+fn permission_response(body: Value) -> PermissionResponse {
+    serde_json::from_value(body).unwrap()
+}
+
+#[test]
+fn maintain_role_satisfies_maintain_requirement_despite_legacy_write_field() {
+    // GitHub reports Maintain as legacy `permission: write`; the real rank is
+    // only in `role_name`.
+    let maintainer = permission_response(json!({"permission": "write", "role_name": "maintain"}));
+    assert_eq!(maintainer.effective_permission(), "maintain");
+    let cfg = OverrideConfig {
+        require_label: LABEL.into(),
+        required_permission: "maintain".into(),
+    };
+    assert!(cfg.is_sufficient(maintainer.effective_permission()));
+
+    let writer = permission_response(json!({"permission": "write", "role_name": "write"}));
+    assert!(!cfg.is_sufficient(writer.effective_permission()));
+
+    // Triage collapses to legacy `read`; the full role must still rank as triage.
+    let triage = permission_response(json!({"permission": "read", "role_name": "triage"}));
+    assert_eq!(triage.effective_permission(), "triage");
+}
+
+#[test]
+fn custom_or_absent_role_name_falls_back_to_legacy_permission() {
+    let custom =
+        permission_response(json!({"permission": "write", "role_name": "release-manager"}));
+    assert_eq!(custom.effective_permission(), "write");
+    let absent = permission_response(json!({"permission": "admin"}));
+    assert_eq!(absent.effective_permission(), "admin");
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream};
@@ -308,8 +309,12 @@ pub fn incremental_prune_notice(
 /// before propagating the failure. `into_result()` still turns it into an
 /// `Err`, so the run exits non-zero either way.
 #[derive(Debug, Default)]
-struct PreparedApply {
-    actuals: BTreeMap<String, GatewayConfig>,
+struct PreparedApply<'a> {
+    /// One authoritative live view per namespace. Views the caller supplied
+    /// are borrowed, not copied: a caller that already holds every
+    /// namespace's backup (as `cmd_apply` does) would otherwise clone the
+    /// whole live gateway once for the preflight and again for the apply.
+    actuals: BTreeMap<String, Cow<'a, GatewayConfig>>,
     full_replaces: BTreeMap<String, PreparedFullReplace>,
     /// Namespaces that cannot be reconciled this run, keyed to the reason.
     ///
@@ -397,7 +402,7 @@ async fn apply_prepared(
     client: &AdminClient,
     namespaces: &[String],
     ownership_scope: OwnershipScope<'_>,
-    prepared: &PreparedApply,
+    prepared: &PreparedApply<'_>,
     options: &ApplyOptions,
 ) -> ApplyResult {
     let mut aggregate = ApplyResult::default();
@@ -445,7 +450,14 @@ async fn apply_prepared(
                 }
             }
             ApplyStrategy::Incremental => {
-                let actual = prepared.actuals.get(namespace);
+                // `prepare_apply` refuses to return without a view for every
+                // namespace, so this is an internal invariant, not a fallback.
+                let Some(actual) = prepared.actuals.get(namespace) else {
+                    aggregate.fatal_error = Some(format!(
+                        "internal error: authoritative backup for namespace `{namespace}` was not prepared"
+                    ));
+                    break;
+                };
                 match apply_incremental(
                     &desired_namespace,
                     client,
@@ -517,17 +529,17 @@ async fn apply_prepared(
 /// Materialize the complete live view and every full-replace body before a
 /// write is possible. This prevents a deterministic error in a later
 /// namespace from appearing only after an earlier namespace was restored.
-async fn prepare_apply(
+async fn prepare_apply<'a>(
     desired: &GatewayConfig,
     client: &AdminClient,
     namespaces: &[String],
-    actual_by_namespace: Option<&BTreeMap<String, GatewayConfig>>,
-    extras_by_namespace: Option<&BTreeMap<String, BackupExtras>>,
+    actual_by_namespace: Option<&'a BTreeMap<String, GatewayConfig>>,
+    extras_by_namespace: Option<&'a BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
-) -> crate::error::Result<PreparedApply> {
+) -> crate::error::Result<PreparedApply<'a>> {
     validate_no_desired_spec_tags(desired)?;
     let mut prepared = PreparedApply::default();
-    let mut extras = BTreeMap::new();
+    let mut extras: BTreeMap<String, Cow<'a, BackupExtras>> = BTreeMap::new();
 
     for namespace in namespaces {
         let supplied_actual = actual_by_namespace.and_then(|items| items.get(namespace));
@@ -540,12 +552,16 @@ async fn prepare_apply(
             if snapshot.cached {
                 return Err(crate::error::Error::StaleGatewayView(stale_view_message()));
             }
-            prepared.actuals.insert(namespace.clone(), snapshot.config);
-            extras.insert(namespace.clone(), snapshot.extras);
+            prepared
+                .actuals
+                .insert(namespace.clone(), Cow::Owned(snapshot.config));
+            extras.insert(namespace.clone(), Cow::Owned(snapshot.extras));
         } else if let Some(actual) = supplied_actual {
-            prepared.actuals.insert(namespace.clone(), actual.clone());
+            prepared
+                .actuals
+                .insert(namespace.clone(), Cow::Borrowed(actual));
             if let Some(value) = supplied_extras {
-                extras.insert(namespace.clone(), value.clone());
+                extras.insert(namespace.clone(), Cow::Borrowed(value));
             }
         }
     }
@@ -1207,17 +1223,9 @@ async fn apply_incremental(
     client: &AdminClient,
     namespace: &str,
     ownership_scope: OwnershipScope<'_>,
-    actual: Option<&GatewayConfig>,
+    actual: &GatewayConfig,
     options: &ApplyOptions,
 ) -> crate::error::Result<ApplyResult> {
-    let fetched_actual;
-    let actual = match actual {
-        Some(actual) => actual,
-        None => {
-            fetched_actual = client.get_backup_snapshot_for_mutation(namespace).await?;
-            &fetched_actual.config
-        }
-    };
     ensure_authoritative_view(client)?;
     let DiffResult {
         mut diffs,
@@ -1231,12 +1239,15 @@ async fn apply_incremental(
             prune_spec_owned: options.confirm_api_spec_deletion,
         },
     )?;
-    let assertions = pending_create_assertion_diffs(
-        desired,
-        actual,
-        &options.pending_create_assertions,
-        namespace,
-    )?;
+    let assertions = dedupe_pending_assertions(
+        &diffs,
+        pending_create_assertion_diffs(
+            desired,
+            actual,
+            &options.pending_create_assertions,
+            namespace,
+        )?,
+    );
     for assertion in &assertions {
         eprintln!(
             "[{}] asserting repository ownership of pending {} `{}` with an idempotent update",
@@ -1333,22 +1344,25 @@ async fn apply_incremental(
                 || cyclic_keys.contains(&state_key(namespace, &diff.kind, &diff.id)))
         {
             cyclic_pending = false;
-            let failed_dependency = cyclic_creates.iter().any(|d| {
-                d.kind == "Proxy"
-                    && index
-                        .proxies
-                        .get(&(d.namespace.as_str(), d.id.as_str()))
-                        .is_some_and(|proxy| proxy_has_failed_plugin(proxy, &failed_plugins))
-            });
-            let batched = if failed_dependency {
-                Err(failed_plugin_dependency())
+            // Withhold only the dependency groups whose proxy references a
+            // plugin write that already failed; every other group still gets
+            // its transactional create.
+            let (blocked, attempt) =
+                partition_cyclic_creates(&cyclic_creates, &index, &failed_plugins);
+            for group in blocked {
+                writes_failed = true;
+                failed_plugins.extend(group.withheld_plugins);
+                result.errors.push(group.message);
+            }
+            let batched = if attempt.is_empty() {
+                Ok(Some(ApplyResult::default()))
             } else {
-                try_batch_create(&cyclic_creates, &index, client, namespace, options).await
+                try_batch_create(&attempt, &index, client, namespace, options).await
             };
             match batched {
                 Ok(Some(batched)) => {
                     writes_failed |= !batched.errors.is_empty();
-                    for pending in &cyclic_creates {
+                    for pending in &attempt {
                         if pending.kind == "PluginConfig"
                             && !batched
                                 .applied_incremental
@@ -1444,7 +1458,7 @@ async fn apply_incremental(
         let outcome = match (&diff.action, diff.kind.as_str()) {
             (DiffAction::Add, "Proxy") => match index.proxies.get(&key) {
                 Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
-                    Err(failed_plugin_dependency())
+                    Err(failed_plugin_dependency(p, &failed_plugins))
                 }
                 Some(p) => create_with_reconciliation(client, namespace, CreateResource::Proxy(p))
                     .await
@@ -1453,7 +1467,7 @@ async fn apply_incremental(
             },
             (DiffAction::Modify, "Proxy") => match index.proxies.get(&key) {
                 Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
-                    Err(failed_plugin_dependency())
+                    Err(failed_plugin_dependency(p, &failed_plugins))
                 }
                 Some(p) if changed_proxy_associations.contains(&diff.id) => {
                     match &post_plugin_snapshot {
@@ -1653,10 +1667,100 @@ fn proxy_has_failed_plugin(proxy: &Proxy, failed_plugins: &BTreeSet<String>) -> 
         .any(|association| failed_plugins.contains(&association.plugin_config_id))
 }
 
-fn failed_plugin_dependency() -> crate::error::Error {
-    crate::error::Error::Config(
-        "proxy write not attempted because a referenced PluginConfig write failed".to_string(),
-    )
+/// The referenced PluginConfig ids whose write failed, sorted and deduplicated.
+fn failed_plugin_references<'a>(
+    proxy: &'a Proxy,
+    failed_plugins: &BTreeSet<String>,
+) -> BTreeSet<&'a str> {
+    proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .filter(|id| failed_plugins.contains(*id))
+        .collect()
+}
+
+fn failed_plugin_dependency(
+    proxy: &Proxy,
+    failed_plugins: &BTreeSet<String>,
+) -> crate::error::Error {
+    let failed = failed_plugin_references(proxy, failed_plugins)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::error::Error::Config(format!(
+        "proxy write not attempted because referenced PluginConfig {failed} failed to write"
+    ))
+}
+
+/// A proxy/scoped-plugin create group withheld from `POST /batch` because a
+/// proxy in it references a PluginConfig whose write already failed.
+struct BlockedCreateGroup {
+    message: String,
+    /// The group's new PluginConfig ids. They were never created, so any later
+    /// write that depends on them must be gated too.
+    withheld_plugins: Vec<String>,
+}
+
+/// Split the cyclic creates into their proxy/plugin dependency groups (the
+/// same components `split_batch` keeps inside one chunk). A group whose proxy
+/// references a failed plugin write is reported by name and withheld; every
+/// other group is returned for the transactional create, in diff order.
+fn partition_cyclic_creates(
+    cyclic_creates: &[ResourceDiff],
+    index: &DesiredIndex<'_>,
+    failed_plugins: &BTreeSet<String>,
+) -> (Vec<BlockedCreateGroup>, Vec<ResourceDiff>) {
+    if failed_plugins.is_empty() {
+        return (Vec::new(), cyclic_creates.to_vec());
+    }
+    let mut blocked = Vec::new();
+    let mut withheld = BTreeSet::new();
+    for group in http_client::batch_dependency_groups(collect_batch(cyclic_creates, index)) {
+        let failed: BTreeSet<&str> = group
+            .proxies
+            .iter()
+            .flat_map(|proxy| failed_plugin_references(proxy, failed_plugins))
+            .collect();
+        if failed.is_empty() {
+            continue;
+        }
+        let proxies = group
+            .proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let failed = failed.into_iter().collect::<Vec<_>>().join(", ");
+        let scoped = group
+            .plugin_configs
+            .iter()
+            .map(|plugin| plugin.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        blocked.push(BlockedCreateGroup {
+            message: format!(
+                "Proxy {proxies} create: not attempted because referenced PluginConfig {failed} failed to write; its new scoped PluginConfig {scoped} was withheld from the same POST /batch transaction and not created"
+            ),
+            withheld_plugins: group
+                .plugin_configs
+                .iter()
+                .map(|plugin| plugin.id.clone())
+                .collect(),
+        });
+        for proxy in &group.proxies {
+            withheld.insert(state_key(&proxy.namespace, "Proxy", &proxy.id));
+        }
+        for plugin in &group.plugin_configs {
+            withheld.insert(state_key(&plugin.namespace, "PluginConfig", &plugin.id));
+        }
+    }
+    let attempt = cyclic_creates
+        .iter()
+        .filter(|diff| !withheld.contains(&state_key(&diff.namespace, &diff.kind, &diff.id)))
+        .cloned()
+        .collect();
+    (blocked, attempt)
 }
 
 /// Use the namespace snapshot read after Edge's attachment/detachment writes.
@@ -1772,6 +1876,7 @@ pub fn adoption_candidates(
     handled: &BTreeSet<String>,
 ) -> crate::error::Result<Vec<AdoptionCandidate>> {
     crate::config::validate_unique_live_resource_keys(actual)?;
+    let live = LiveIndex::build(actual);
     let mut candidates = Vec::new();
     let mut consider = |resource: CreateResource<'_>, namespace: &str| {
         let kind = resource.kind();
@@ -1780,10 +1885,10 @@ pub fn adoption_candidates(
         if managed_ledger.contains(&key) || handled.contains(&key) {
             return;
         }
-        if live_row_is_spec_owned(actual, kind, namespace, id) {
+        if live.is_spec_owned(kind, namespace, id) {
             return;
         }
-        if !resource.safe_to_overwrite(actual) {
+        if !resource.safe_to_overwrite(&live) {
             return;
         }
         candidates.push(AdoptionCandidate {
@@ -1807,29 +1912,6 @@ pub fn adoption_candidates(
     }
 
     Ok(candidates)
-}
-
-/// Does the live `(namespace, kind, id)` carry an `api_spec_id`? Consumers are
-/// never spec-provisioned, so they can never answer yes.
-fn live_row_is_spec_owned(actual: &GatewayConfig, kind: &str, namespace: &str, id: &str) -> bool {
-    let tagged = |candidate_ns: &str, candidate_id: &str, tag: Option<&String>| {
-        candidate_ns == namespace && candidate_id == id && tag.is_some()
-    };
-    match kind {
-        "Proxy" => actual
-            .proxies
-            .iter()
-            .any(|r| tagged(&r.namespace, &r.id, r.api_spec_id.as_ref())),
-        "Upstream" => actual
-            .upstreams
-            .iter()
-            .any(|r| tagged(&r.namespace, &r.id, r.api_spec_id.as_ref())),
-        "PluginConfig" => actual
-            .plugin_configs
-            .iter()
-            .any(|r| tagged(&r.namespace, &r.id, r.api_spec_id.as_ref())),
-        _ => false,
-    }
 }
 
 /// The one-line apply summary for an adoption pass, or `None` when nothing was
@@ -1936,6 +2018,7 @@ async fn adopt_matching_rows(
             }
         }
     };
+    let confirmation = confirmation.as_ref().map(LiveIndex::build);
 
     for candidate in &candidates {
         let key = (candidate.namespace.as_str(), candidate.id.as_str());
@@ -1961,12 +2044,8 @@ async fn adopt_matching_rows(
         let Some(resource) = resource else { continue };
 
         if let Some(confirmation) = &confirmation {
-            if live_row_is_spec_owned(
-                confirmation,
-                &candidate.kind,
-                &candidate.namespace,
-                &candidate.id,
-            ) || !resource.safe_to_overwrite(confirmation)
+            if confirmation.is_spec_owned(&candidate.kind, &candidate.namespace, &candidate.id)
+                || !resource.safe_to_overwrite(confirmation)
             {
                 let message = format!(
                     "not adopting {} `{}`: the live row changed between this run's diff and the ownership assertion, so the repository is not overwriting it. The next apply reconciles it as an ordinary change.",
@@ -2040,42 +2119,70 @@ fn applied(_: ()) -> OpOutcome {
     OpOutcome::Applied
 }
 
-/// `(namespace, id)`-keyed view over the desired config.
+/// `(namespace, id)`-keyed view over one gateway document, per kind.
 ///
-/// The diff and the desired document are both O(n); pairing them by scanning
-/// the relevant `Vec` per diff entry made the apply loop O(n²), which shows up
-/// as real time on namespaces with a few thousand resources. Built once per
-/// namespace and shared by the per-resource path and the batch collector.
-struct DesiredIndex<'a> {
+/// The diff and the documents are all O(n); pairing them by scanning the
+/// relevant `Vec` per entry made the apply loop, adoption and pending-create
+/// recovery O(n²), which shows up as real time on namespaces with a few
+/// thousand resources. Built once per document and shared by the per-resource
+/// path, the batch collector and every live-row lookup.
+///
+/// The first row wins for a repeated key, matching the linear `find` it
+/// replaces. Live documents are checked for duplicate keys before any decision
+/// relies on them, and desired documents cannot contain any.
+struct ResourceIndex<'a> {
     proxies: HashMap<(&'a str, &'a str), &'a Proxy>,
     consumers: HashMap<(&'a str, &'a str), &'a Consumer>,
     upstreams: HashMap<(&'a str, &'a str), &'a Upstream>,
     plugin_configs: HashMap<(&'a str, &'a str), &'a PluginConfig>,
 }
 
-impl<'a> DesiredIndex<'a> {
-    fn build(desired: &'a GatewayConfig) -> Self {
+/// The repository's desired document.
+type DesiredIndex<'a> = ResourceIndex<'a>;
+/// A live (`GET /backup`) document.
+type LiveIndex<'a> = ResourceIndex<'a>;
+
+impl<'a> ResourceIndex<'a> {
+    fn build(config: &'a GatewayConfig) -> Self {
+        fn index<'a, T>(
+            rows: &'a [T],
+            key: impl Fn(&'a T) -> (&'a str, &'a str),
+        ) -> HashMap<(&'a str, &'a str), &'a T> {
+            let mut map = HashMap::with_capacity(rows.len());
+            for row in rows {
+                map.entry(key(row)).or_insert(row);
+            }
+            map
+        }
+
         Self {
-            proxies: desired
+            proxies: index(&config.proxies, |p| (p.namespace.as_str(), p.id.as_str())),
+            consumers: index(&config.consumers, |c| (c.namespace.as_str(), c.id.as_str())),
+            upstreams: index(&config.upstreams, |u| (u.namespace.as_str(), u.id.as_str())),
+            plugin_configs: index(&config.plugin_configs, |p| {
+                (p.namespace.as_str(), p.id.as_str())
+            }),
+        }
+    }
+
+    /// Does the `(namespace, kind, id)` row carry an `api_spec_id`? Consumers
+    /// are never spec-provisioned, so they can never answer yes.
+    fn is_spec_owned(&self, kind: &str, namespace: &str, id: &str) -> bool {
+        let key = (namespace, id);
+        match kind {
+            "Proxy" => self
                 .proxies
-                .iter()
-                .map(|p| ((p.namespace.as_str(), p.id.as_str()), p))
-                .collect(),
-            consumers: desired
-                .consumers
-                .iter()
-                .map(|c| ((c.namespace.as_str(), c.id.as_str()), c))
-                .collect(),
-            upstreams: desired
+                .get(&key)
+                .is_some_and(|r| r.api_spec_id.is_some()),
+            "Upstream" => self
                 .upstreams
-                .iter()
-                .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
-                .collect(),
-            plugin_configs: desired
+                .get(&key)
+                .is_some_and(|r| r.api_spec_id.is_some()),
+            "PluginConfig" => self
                 .plugin_configs
-                .iter()
-                .map(|p| ((p.namespace.as_str(), p.id.as_str()), p))
-                .collect(),
+                .get(&key)
+                .is_some_and(|r| r.api_spec_id.is_some()),
+            _ => false,
         }
     }
 }
@@ -2132,44 +2239,40 @@ impl<'a> CreateResource<'a> {
         }
     }
 
-    fn exact_desired_is_live(self, actual: &GatewayConfig) -> bool {
-        matches!(self.live_match(actual), LiveMatch::Exact)
+    fn exact_desired_is_live(self, live: &LiveIndex<'_>) -> bool {
+        matches!(self.live_match(live), LiveMatch::Exact)
     }
 
     /// Whether an adoption PUT can serialize this desired row without dropping
     /// anything currently present on the gateway.
-    fn safe_to_overwrite(self, actual: &GatewayConfig) -> bool {
-        fn matches<T: serde::Serialize>(kind: &str, live: Option<&T>, desired: &T) -> bool {
-            live.is_some_and(|live| resource_values_equal(kind, desired, live))
+    fn safe_to_overwrite(self, live: &LiveIndex<'_>) -> bool {
+        fn matches<T: serde::Serialize>(kind: &str, live: Option<&&T>, desired: &T) -> bool {
+            live.is_some_and(|live| resource_values_equal(kind, desired, *live))
         }
 
         match self {
             Self::Proxy(desired) => matches(
                 self.kind(),
-                actual.proxies.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.proxies
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
             Self::Consumer(desired) => matches(
                 self.kind(),
-                actual.consumers.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.consumers
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
             Self::Upstream(desired) => matches(
                 self.kind(),
-                actual.upstreams.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.upstreams
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
             Self::PluginConfig(desired) => matches(
                 self.kind(),
-                actual.plugin_configs.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.plugin_configs
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
         }
@@ -2181,11 +2284,11 @@ impl<'a> CreateResource<'a> {
     /// `Absent` proves the write did not commit, `Different` proves *something*
     /// holds the identity but not what we sent, and `Exact` is the only one
     /// that permits recording the create as landed.
-    fn live_match(self, actual: &GatewayConfig) -> LiveMatch {
-        fn classify<T: serde::Serialize>(kind: &str, live: Option<&T>, desired: &T) -> LiveMatch {
+    fn live_match(self, live: &LiveIndex<'_>) -> LiveMatch {
+        fn classify<T: serde::Serialize>(kind: &str, live: Option<&&T>, desired: &T) -> LiveMatch {
             match live {
                 None => LiveMatch::Absent,
-                Some(live) if resource_values_match(kind, desired, live) => LiveMatch::Exact,
+                Some(live) if resource_values_match(kind, desired, *live) => LiveMatch::Exact,
                 Some(_) => LiveMatch::Different,
             }
         }
@@ -2193,30 +2296,26 @@ impl<'a> CreateResource<'a> {
         match self {
             Self::Proxy(desired) => classify(
                 self.kind(),
-                actual.proxies.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.proxies
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
             Self::Consumer(desired) => classify(
                 self.kind(),
-                actual.consumers.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.consumers
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
             Self::Upstream(desired) => classify(
                 self.kind(),
-                actual.upstreams.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.upstreams
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
             Self::PluginConfig(desired) => classify(
                 self.kind(),
-                actual.plugin_configs.iter().find(|candidate| {
-                    candidate.namespace == desired.namespace && candidate.id == desired.id
-                }),
+                live.plugin_configs
+                    .get(&(desired.namespace.as_str(), desired.id.as_str())),
                 desired,
             ),
         }
@@ -2286,7 +2385,7 @@ async fn create_with_reconciliation(
                     resource.id(),
                 )));
             }
-            match resource.live_match(&snapshot.config) {
+            match resource.live_match(&LiveIndex::build(&snapshot.config)) {
                 LiveMatch::Exact => {
                     resource
                         .assert_ownership(client, namespace)
@@ -2412,6 +2511,7 @@ pub fn pending_create_assertion_diffs(
     namespace: &str,
 ) -> crate::error::Result<Vec<ResourceDiff>> {
     crate::config::validate_unique_live_resource_keys(actual)?;
+    let live = LiveIndex::build(actual);
     let mut assertions = Vec::new();
     let mut add = |kind: &str, id: &str| {
         assertions.push(ResourceDiff {
@@ -2425,36 +2525,57 @@ pub fn pending_create_assertion_diffs(
 
     for resource in &desired.upstreams {
         let key = state_key(&resource.namespace, "Upstream", &resource.id);
-        if pending.contains(&key)
-            && CreateResource::Upstream(resource).exact_desired_is_live(actual)
+        if pending.contains(&key) && CreateResource::Upstream(resource).exact_desired_is_live(&live)
         {
             add("Upstream", &resource.id);
         }
     }
     for resource in &desired.consumers {
         let key = state_key(&resource.namespace, "Consumer", &resource.id);
-        if pending.contains(&key)
-            && CreateResource::Consumer(resource).exact_desired_is_live(actual)
+        if pending.contains(&key) && CreateResource::Consumer(resource).exact_desired_is_live(&live)
         {
             add("Consumer", &resource.id);
         }
     }
     for resource in &desired.proxies {
         let key = state_key(&resource.namespace, "Proxy", &resource.id);
-        if pending.contains(&key) && CreateResource::Proxy(resource).exact_desired_is_live(actual) {
+        if pending.contains(&key) && CreateResource::Proxy(resource).exact_desired_is_live(&live) {
             add("Proxy", &resource.id);
         }
     }
     for resource in &desired.plugin_configs {
         let key = state_key(&resource.namespace, "PluginConfig", &resource.id);
         if pending.contains(&key)
-            && CreateResource::PluginConfig(resource).exact_desired_is_live(actual)
+            && CreateResource::PluginConfig(resource).exact_desired_is_live(&live)
         {
             add("PluginConfig", &resource.id);
         }
     }
 
     Ok(assertions)
+}
+
+/// Drop pending-create assertions whose `(namespace, kind, id)` already has a
+/// diff entry.
+///
+/// The assertion is a subset match, so a live row carrying a gateway-populated
+/// optional field is both an exact pending row *and* an ordinary Modify. The
+/// ordinary Modify's PUT already asserts repository ownership, and its success
+/// clears the journal entry through `StateFile::record_op`; keeping both would
+/// issue the same PUT twice and list the row twice in every preview. Apply and
+/// every preview (interactive, `plan`, `review`) share this filter.
+pub fn dedupe_pending_assertions(
+    diffs: &[ResourceDiff],
+    assertions: Vec<ResourceDiff>,
+) -> Vec<ResourceDiff> {
+    let existing: BTreeSet<String> = diffs
+        .iter()
+        .map(|d| state_key(&d.namespace, &d.kind, &d.id))
+        .collect();
+    assertions
+        .into_iter()
+        .filter(|d| !existing.contains(&state_key(&d.namespace, &d.kind, &d.id)))
+        .collect()
 }
 
 /// One operator-facing line per spec-owned live resource the run touched.
@@ -2764,6 +2885,7 @@ fn batch_rejection_allows_replay(error: &crate::error::Error) -> bool {
 /// (`Absent`, which proves the transaction did not commit), or the live view
 /// is some third thing (`Different`) that no read can reconcile automatically.
 fn batch_live_match(batch: &BatchCreate, actual: &GatewayConfig) -> LiveMatch {
+    let live = LiveIndex::build(actual);
     let mut any_exact = false;
     let mut any_absent = false;
     let mut any_different = false;
@@ -2775,16 +2897,16 @@ fn batch_live_match(batch: &BatchCreate, actual: &GatewayConfig) -> LiveMatch {
     };
 
     for resource in &batch.proxies {
-        record(CreateResource::Proxy(resource).live_match(actual));
+        record(CreateResource::Proxy(resource).live_match(&live));
     }
     for resource in &batch.consumers {
-        record(CreateResource::Consumer(resource).live_match(actual));
+        record(CreateResource::Consumer(resource).live_match(&live));
     }
     for resource in &batch.upstreams {
-        record(CreateResource::Upstream(resource).live_match(actual));
+        record(CreateResource::Upstream(resource).live_match(&live));
     }
     for resource in &batch.plugin_configs {
-        record(CreateResource::PluginConfig(resource).live_match(actual));
+        record(CreateResource::PluginConfig(resource).live_match(&live));
     }
 
     match (any_exact, any_absent, any_different) {
@@ -2988,7 +3110,7 @@ async fn create_individually(
                 });
             }
             let outcome = if proxy_has_failed_plugin(p, &failed_plugins) {
-                Err(failed_plugin_dependency())
+                Err(failed_plugin_dependency(p, &failed_plugins))
             } else {
                 create_with_reconciliation(client, namespace, CreateResource::Proxy(&initial_proxy))
                     .await

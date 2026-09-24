@@ -103,6 +103,7 @@ async fn main() {
                 allow_nontransactional_plugin_attach,
                 explicit_env.as_deref(),
                 resolve_options,
+                cli.allow_empty_namespace,
             )
             .await
         }
@@ -914,6 +915,24 @@ fn compute_namespace_diffs(
     options: diff::DiffOptions,
     policy_cfg: Option<&policy::PolicyConfig>,
 ) -> gitforgeops::error::Result<NamespaceDiffs> {
+    compute_diffs_for_pairs(
+        namespace_pairs
+            .iter()
+            .map(|pair| (&pair.desired, &pair.actual)),
+        previously_managed,
+        options,
+        policy_cfg,
+    )
+}
+
+/// [`compute_namespace_diffs`] over borrowed `(desired, actual)` pairs, for a
+/// caller that has already moved its snapshots into per-namespace maps.
+fn compute_diffs_for_pairs<'a>(
+    pairs: impl IntoIterator<Item = (&'a GatewayConfig, &'a GatewayConfig)>,
+    previously_managed: Option<&HashSet<String>>,
+    options: diff::DiffOptions,
+    policy_cfg: Option<&policy::PolicyConfig>,
+) -> gitforgeops::error::Result<NamespaceDiffs> {
     let mut diffs = Vec::new();
     let mut breaking = Vec::new();
     let mut unmanaged = Vec::new();
@@ -924,15 +943,10 @@ fn compute_namespace_diffs(
         None => diff::OwnershipScope::Exclusive,
     };
 
-    for pair in namespace_pairs {
-        let result =
-            diff::compute_diff_with_options(&pair.desired, &pair.actual, ownership_scope, options)?;
-        let namespace_breaking = diff::detect_breaking_changes_with_policy(
-            &result.diffs,
-            &pair.desired,
-            &pair.actual,
-            policy_cfg,
-        );
+    for (desired, actual) in pairs {
+        let result = diff::compute_diff_with_options(desired, actual, ownership_scope, options)?;
+        let namespace_breaking =
+            diff::detect_breaking_changes_with_policy(&result.diffs, desired, actual, policy_cfg);
 
         diffs.extend(result.diffs);
         unmanaged.extend(result.unmanaged);
@@ -1110,8 +1124,23 @@ fn mesh_retraction_scope(
 ) -> apply::MeshRetractionScope {
     apply::MeshRetractionScope {
         ledger_attributed: state.publishes_mesh_document(output_path),
-        covers_repository: resolved.namespace_filter.is_none(),
+        covers_repository: resolved.covers_environment(),
     }
+}
+
+/// File mode, narrowed by an ad-hoc `FERRUM_NAMESPACE` below the environment's
+/// publication scope, and the filter actually dropped a loaded resource. The
+/// gateway file is document-wide, so such an apply would replace every other
+/// namespace with nothing. A filter that selects everything on disk narrows
+/// nothing.
+fn file_publication_narrowed(
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    scope: &config::NamespaceScope,
+) -> bool {
+    env_config.gateway_mode == GatewayMode::File
+        && !resolved.covers_environment()
+        && scope.desired_count < scope.on_disk_count
 }
 
 /// Operator-facing line for a mesh reconciliation that publishes no declared
@@ -1143,7 +1172,7 @@ fn mesh_retraction_line(
             "Warning: the repository declares no MeshConfig fragments, but {output_path} exists and is not a document gitforgeops published; leaving it untouched. Remove it by hand once no mesh node reads it."
         )),
         apply::MeshPublication::NarrowedScope => Some(format!(
-            "Notice: no MeshConfig fragment is in scope for this namespace-filtered run, so {output_path} is left as published. Re-run without FERRUM_NAMESPACE to retract a mesh document the repository no longer declares."
+            "Notice: this namespace-filtered run does not see every MeshConfig fragment the environment publishes, and the mesh document is mesh-wide, so {output_path} is left as published. Re-run without FERRUM_NAMESPACE to publish or retract it."
         )),
     }
 }
@@ -1336,13 +1365,13 @@ async fn cmd_export(
         &env_config.mesh_file_output_path,
         mesh_retraction_scope(&resolved, &mesh_state, &env_config.mesh_file_output_path),
     )?;
-    match &assembled.mesh {
-        Some(mesh) => eprintln!(
+    match (&assembled.mesh, mesh_publication) {
+        (Some(mesh), apply::MeshPublication::Published) => eprintln!(
             "Exported mesh document to {} ({})",
             env_config.mesh_file_output_path,
             safe_line(mesh_summary_line(mesh))
         ),
-        None => {
+        _ => {
             if let Some(line) =
                 mesh_retraction_line(mesh_publication, &env_config.mesh_file_output_path, false)
             {
@@ -1757,10 +1786,10 @@ async fn cmd_plan(
         if remap_blocked {
             reportln!(
                 json_mode,
-                "\n{} slot reassignment(s) block apply. Rotate the affected slot in place before \
-                 removing the entry, or re-run with --allow-credential-slot-remap to accept the \
-                 reassignment.",
-                secret_report.slot_remaps.len()
+                "\nThe slot reassignment(s) above block apply. Rotate the affected Consumer slot \
+                 in place before removing the entry, reseed plugin-config slots and retire the \
+                 orphaned slot from the credential bundle, or re-run with \
+                 --allow-credential-slot-remap to accept the reassignment."
             );
         } else {
             reportln!(json_mode, "\nAccepted via --allow-credential-slot-remap.");
@@ -1805,6 +1834,7 @@ async fn cmd_plan(
                         diff::DiffOptions::default(),
                         policy_cfg.as_ref(),
                     )?;
+                    let pending = apply::dedupe_pending_assertions(&d, pending);
                     d.extend(pending);
                     (d, b, u, s, true, None)
                 } else {
@@ -2075,6 +2105,11 @@ async fn cmd_plan(
         allow_credential_slot_remap,
         provisioner_token_present: env_config.github_provisioner_token.is_some(),
         github_repository_present: env_config.github_repository.is_some(),
+        file_publication_narrowed: file_publication_narrowed(
+            &env_config,
+            &resolved,
+            &namespace_scope,
+        ),
     });
     let offline_summary = verdict::blocker_summary(&blockers);
     let conflict_namespaces: std::collections::BTreeSet<&str> = spec_owned
@@ -2135,11 +2170,34 @@ async fn cmd_apply(
     allow_nontransactional_plugin_attach: bool,
     explicit_env: Option<&str>,
     resolve_options: secrets::ResolveOptions,
+    allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let allow_nontransactional_plugin_attach =
         allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+
+    // The same empty-filter refusal `validate`, `plan` and `diff` apply. In file
+    // mode a mistyped filter would otherwise publish an empty gateway document.
+    if let Some(finding) = assembled
+        .namespace_scope
+        .desired_finding(allow_empty_namespace)
+    {
+        print_namespace_finding(&finding);
+        if finding.is_error() {
+            return Err(format!("Refusing to apply: {}", finding.message).into());
+        }
+    }
+    // A file-mode document is document-wide: an ad-hoc filter would publish a
+    // subset over the whole gateway file. Checked before the state lock, the
+    // bundle read and validation, like every other offline refusal.
+    if let Some(blocker) = verdict::narrowed_file_publication_blocker(file_publication_narrowed(
+        &env_config,
+        &resolved,
+        &assembled.namespace_scope,
+    )) {
+        return Err(format!("Refusing to apply: {}", blocker.summary()).into());
+    }
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
 
@@ -2441,6 +2499,7 @@ async fn cmd_apply(
                 )?;
                 let (pending, adoptions) =
                     ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy)?;
+                let pending = apply::dedupe_pending_assertions(&diffs, pending);
                 diffs.extend(pending);
                 let diffs = apply::order_incremental_diffs(diffs, &desired);
 
@@ -2527,18 +2586,31 @@ async fn cmd_apply(
                 // allocated for a run that cannot proceed.
                 return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
             }
-            let actual_by_namespace: BTreeMap<String, GatewayConfig> = namespace_pairs
-                .iter()
-                .map(|pair| (pair.namespace.clone(), pair.actual.clone()))
-                .collect();
             // `/backup` was just read for every namespace in scope. Preserve
             // each config/extras pair from the same response so full-replace
-            // preflight never combines two different gateway snapshots.
-            let extras_by_namespace: BTreeMap<String, gitforgeops::http_client::BackupExtras> =
-                namespace_pairs
+            // preflight never combines two different gateway snapshots. The
+            // snapshots are moved, not cloned: every later step (preflight,
+            // journal reconciliation, the prune guard and the apply itself)
+            // borrows these maps.
+            let mut actual_by_namespace: BTreeMap<String, GatewayConfig> = BTreeMap::new();
+            let mut extras_by_namespace: BTreeMap<String, gitforgeops::http_client::BackupExtras> =
+                BTreeMap::new();
+            let mut desired_by_namespace: Vec<(String, GatewayConfig)> =
+                Vec::with_capacity(namespace_pairs.len());
+            for pair in namespace_pairs {
+                actual_by_namespace.insert(pair.namespace.clone(), pair.actual);
+                extras_by_namespace.insert(pair.namespace.clone(), pair.extras);
+                desired_by_namespace.push((pair.namespace, pair.desired));
+            }
+            let paired_snapshots = || {
+                desired_by_namespace
                     .iter()
-                    .map(|pair| (pair.namespace.clone(), pair.extras.clone()))
-                    .collect();
+                    .filter_map(|(namespace, desired)| {
+                        actual_by_namespace
+                            .get(namespace)
+                            .map(|actual| (desired, actual))
+                    })
+            };
 
             // This boundary precedes every external credential write and
             // state journal mutation. It rejects read-only planes,
@@ -2597,8 +2669,8 @@ async fn cmd_apply(
                 state.save()?;
             }
             let managed = previously_managed(&resolved, &state);
-            let (diffs, _, _, _) = compute_namespace_diffs(
-                &namespace_pairs,
+            let (diffs, _, _, _) = compute_diffs_for_pairs(
+                paired_snapshots(),
                 managed.as_ref(),
                 diff_options,
                 policy_cfg.as_ref(),
@@ -2641,10 +2713,9 @@ async fn cmd_apply(
                         })
                         .count()
                 }
-                None => namespace_pairs
-                    .iter()
-                    .map(|pair| {
-                        apply::exclusive_prune_denominator(&pair.actual, confirm_api_spec_deletion)
+                None => paired_snapshots()
+                    .map(|(_, actual)| {
+                        apply::exclusive_prune_denominator(actual, confirm_api_spec_deletion)
                     })
                     .sum(),
             };
@@ -2947,15 +3018,16 @@ async fn cmd_apply(
             for ns in &fully_replaced {
                 state.record_full_replace(ns, &desired);
             }
+            let desired_keys = gitforgeops::state::ResourceKeys::from_config(&desired);
             for op in &successful_ops {
-                state.record_op(op, &desired)?;
+                state.record_op(op, &desired_keys)?;
             }
             // Adoption records ownership of rows nothing had to change. Without
             // this, a resource that was already identical on the first apply
             // never entered the ledger, so shared mode's delete fence never
             // covered it and a later removal from the repository pruned nothing.
             for op in &adopted_ops {
-                state.record_op(op, &desired)?;
+                state.record_op(op, &desired_keys)?;
             }
             state.stamp_last_applied_if_clean(deferred_apply_error.is_none());
         }
@@ -3093,6 +3165,8 @@ async fn cmd_review(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let fail_on_blockers = fail_on_blockers || env_config.review_fail_on_blockers;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    let file_publication_narrowed =
+        file_publication_narrowed(&env_config, &resolved, &assembled.namespace_scope);
     let mut desired = assembled.gateway;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
@@ -3182,6 +3256,7 @@ async fn cmd_review(
                                 diff::DiffOptions::default(),
                                 policy_cfg.as_ref(),
                             )?;
+                            let pending = apply::dedupe_pending_assertions(&d, pending);
                             d.extend(pending);
                             (d, b, u, s, None)
                         }
@@ -3296,6 +3371,7 @@ async fn cmd_review(
         allow_credential_slot_remap,
         provisioner_token_present: env_config.github_provisioner_token.is_some(),
         github_repository_present: env_config.github_repository.is_some(),
+        file_publication_narrowed,
     });
 
     let comment = review::pr_comment::build_review_comment_with_preview(
@@ -3363,11 +3439,12 @@ async fn cmd_review(
     // what the reviewer has to act on.
     review::enforce_live_comparison(require_live, comparison_error.as_deref())?;
     review::enforce_comment_delivery(require_live, comment_delivery_error.as_deref())?;
+    // Provisioning blockers are part of `blockers`, so they fail the run only
+    // under `--fail-on-blockers` like every other offline gate. The secretless
+    // PR check has no bundle, so every `alloc=generate` slot reads as awaiting
+    // allocation there; an unconditional exit would fail every PR in a repo
+    // with one generated credential.
     review::enforce_offline_blockers(fail_on_blockers, &blockers)?;
-
-    if let Some(summary) = verdict::blocker_summary(&provisioning_blockers) {
-        return Err(summary.into());
-    }
     if let Some(error) = validation_execution_error {
         return Err(format!("validator execution failed during review: {error}").into());
     }

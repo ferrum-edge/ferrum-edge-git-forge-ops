@@ -1017,6 +1017,69 @@ fn payload_too_large_names_the_limit_knob() {
         .contains("FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB"));
 }
 
+/// Issue #339: the redirect explanation is one sentence stream, not a string
+/// literal with the source indentation embedded in it.
+#[test]
+fn redirect_message_reads_with_single_spaces() {
+    for location in [Some("https://gateway.example/admin"), Some("   "), None] {
+        let message = gitforgeops::http_client::map_api_error_with_location(
+            307,
+            "",
+            RequestKind::NonIdempotentMutation,
+            location,
+        )
+        .to_string();
+        assert!(!message.contains("  "), "{location:?}: {message:?}");
+        assert!(
+            message.contains("instead of a response. It "),
+            "{location:?}: {message}"
+        );
+        assert!(
+            message.contains("(scheme, host, port and any path prefix)"),
+            "{message}"
+        );
+    }
+}
+
+/// Issue #339: only `/restore` gets restore-limit advice. A create or batch
+/// 413 names the batch body cap incremental apply chunks under.
+#[test]
+fn payload_too_large_advice_depends_on_the_request_kind() {
+    let body = r#"{"error":"body too large"}"#;
+    for kind in [
+        RequestKind::Restore,
+        RequestKind::NonIdempotentMutation,
+        RequestKind::Mutation,
+        RequestKind::Read,
+    ] {
+        let error = map_api_error(413, body, kind);
+        // Batch replay classification keys on the status, so it must survive.
+        assert!(
+            matches!(
+                error,
+                gitforgeops::error::Error::ApiError { status: 413, .. }
+            ),
+            "{kind:?}: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("body too large"), "{message}");
+        let restore_advice = message.contains("FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB")
+            || message.contains("incremental apply strategy");
+        assert_eq!(
+            restore_advice,
+            kind == RequestKind::Restore,
+            "{kind:?}: {message}"
+        );
+        let batch_advice =
+            message.contains("POST /batch") && message.contains(&BATCH_MAX_BODY_BYTES.to_string());
+        assert_eq!(
+            batch_advice,
+            kind == RequestKind::NonIdempotentMutation,
+            "{kind:?}: {message}"
+        );
+    }
+}
+
 // --- Restore body ------------------------------------------------------------
 
 fn backup_extras() -> BackupExtras {

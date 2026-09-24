@@ -197,7 +197,8 @@ gh workflow run lifecycle.yml --ref <release tag or main> \
 
 The dispatched run merges your outcomes into **only** the scenarios it recorded
 as `skipped`, attributed to you, and refuses an attestation sealed for another
-revision. It never overwrites a scenario it ran itself.
+revision, against another gateway build than the one it installs, or more than
+72 hours before it runs. It never overwrites a scenario it ran itself.
 
 Delete the repository, its environments and its App installation when you are
 done. Nothing in it is meant to outlive the run.

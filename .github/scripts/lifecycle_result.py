@@ -22,9 +22,11 @@ staleness window.
 Some scenarios can only run against a disposable GitHub repository, which CI
 cannot create. Their outcomes reach the release gate as an **attestation**: the
 operator's own sealed result for the same revision, merged into the CI run's
-record by `attest`. An attestation can only fill a scenario the CI run itself
-recorded as `skipped` — it can never overwrite what the suite actually ran —
-and every attested entry names who attested it.
+record by `attest`. The attestation must be sealed for the same revision and
+the same gateway build as the CI run, inside the same freshness window `verify`
+applies. It can only fill a scenario the CI run itself recorded as `skipped` —
+it can never overwrite what the suite actually ran — and every attested entry
+names who attested it.
 
 Usage::
 
@@ -189,15 +191,43 @@ def seal(result: dict, revision: str, gateway_build: str, now: datetime) -> dict
     return result
 
 
+def staleness(sealed_at: object, max_age_hours: int, now: datetime) -> str | None:
+    """Why a record sealed at `sealed_at` is too old to certify anything.
+
+    Returns None for a record inside the window. The caller decides what an
+    absent `sealed_at` means.
+    """
+    try:
+        completed = datetime.fromisoformat(str(sealed_at).replace("Z", "+00:00"))
+    except ValueError:
+        return f"has an unparseable sealed_at {sealed_at!r}"
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=timezone.utc)
+    age = (now - completed).total_seconds() / 3600
+    if age > max_age_hours:
+        return (
+            f"is {age:.0f}h old, beyond the {max_age_hours}h window. A stale "
+            "result is a result for a gateway and a toolchain that have both moved."
+        )
+    return None
+
+
 def attest(
-    result: dict, attestation: dict, revision: str, attested_by: str
+    result: dict,
+    attestation: dict,
+    revision: str,
+    attested_by: str,
+    now: datetime | None = None,
+    max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
 ) -> list[str]:
     """Fill the CI run's `skipped` scenarios from an operator's sealed result.
 
     Returns the scenario ids that were filled. Refuses an attestation that is
-    unsealed or sealed for a different revision: it describes a run of some
-    other code. Entries for scenarios the CI run did NOT skip are ignored —
-    what the suite ran itself is never replaced by what someone typed.
+    unsealed, sealed for a different revision or a different gateway build
+    than the CI run it is merged into, or sealed outside the freshness window:
+    each describes a run of something other than what is being certified.
+    Entries for scenarios the CI run did NOT skip are ignored — what the suite
+    ran itself is never replaced by what someone typed.
     """
     if not attested_by.strip():
         raise ResultError("an attestation must name who attested it")
@@ -212,6 +242,26 @@ def attest(
             f"the attestation certifies {attested_revision}, not {revision}. An "
             "acceptance run against other code proves nothing about this revision."
         )
+    attested_gateway = attestation.get("gateway_build")
+    recorded_gateway = result.get("gateway_build")
+    if not attested_gateway or attested_gateway != recorded_gateway:
+        raise ResultError(
+            f"the attestation was produced against gateway build "
+            f"{attested_gateway!r}, but this run tested {recorded_gateway!r}. The "
+            "merged record names one gateway build, so every scenario in it must "
+            "have run against that build."
+        )
+    attested_at = attestation.get("sealed_at")
+    if not attested_at:
+        raise ResultError(
+            "the attestation carries no sealed_at; run `lifecycle_result.py seal` "
+            "on it for the revision you tested"
+        )
+    stale = staleness(
+        attested_at, max_age_hours, now if now is not None else datetime.now(timezone.utc)
+    )
+    if stale:
+        raise ResultError(f"the attestation {stale}")
     theirs = attestation.get("scenarios")
     ours = result.get("scenarios")
     if not isinstance(theirs, dict) or not isinstance(ours, dict):
@@ -297,24 +347,11 @@ def blockers(
             )
 
     sealed_at = result.get("sealed_at")
-    if not sealed_at:
-        # Already reported above as an unsealed result; do not repeat it.
-        pass
-    else:
-        try:
-            completed = datetime.fromisoformat(str(sealed_at).replace("Z", "+00:00"))
-        except ValueError:
-            reasons.append(f"the result has an unparseable sealed_at {sealed_at!r}")
-        else:
-            if completed.tzinfo is None:
-                completed = completed.replace(tzinfo=timezone.utc)
-            age = (now - completed).total_seconds() / 3600
-            if age > max_age_hours:
-                reasons.append(
-                    f"the result is {age:.0f}h old, beyond the {max_age_hours}h "
-                    "window. A stale result is a result for a gateway and a "
-                    "toolchain that have both moved."
-                )
+    # An absent sealed_at is already reported above as an unsealed result.
+    if sealed_at:
+        stale = staleness(sealed_at, max_age_hours, now)
+        if stale:
+            reasons.append(f"the result {stale}")
 
     scenarios = result.get("scenarios")
     if not isinstance(scenarios, dict):

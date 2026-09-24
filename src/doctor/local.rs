@@ -415,19 +415,37 @@ fn mode_requirements(
                      value and its claims are accepted.",
                 ),
             );
-            checks.push(Check::pass(
-                "admin-jwt-claims",
-                "Admin JWT claims are declared",
-                Scope::Local,
-                format!(
-                    "issuer={}, role={}, audience={}, ttl={}s — each must match the \
-                     gateway's own configuration",
-                    env.admin_jwt_issuer,
-                    env.admin_jwt_role,
-                    env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
-                    env.admin_jwt_ttl_secs
-                ),
-            ));
+            // Every api-mode command starts with `GET /backup`, which Ferrum
+            // Edge serves to `admin` only. `/cluster` — the gateway scope's
+            // token proof — has no role requirement, so a `viewer`/`operator`
+            // token passes there and then 403s on the first real command.
+            let admin_role = env.admin_jwt_role == "admin";
+            checks.push(
+                Check::new(
+                    "admin-jwt-claims",
+                    "Admin JWT claims are declared",
+                    Scope::Local,
+                    if admin_role {
+                        Status::Pass
+                    } else {
+                        Status::Fail
+                    },
+                    format!(
+                        "issuer={}, role={}, audience={}, ttl={}s — each must match the \
+                         gateway's own configuration",
+                        env.admin_jwt_issuer,
+                        env.admin_jwt_role,
+                        env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
+                        env.admin_jwt_ttl_secs
+                    ),
+                )
+                .remedy(format!(
+                    "FERRUM_ADMIN_JWT_ROLE={} cannot run any gitforgeops command: \
+                     `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only. \
+                     Unset it or set it to `admin`.",
+                    env.admin_jwt_role
+                )),
+            );
         }
         GatewayMode::File => {
             let output = PathBuf::from(&env.file_output_path);

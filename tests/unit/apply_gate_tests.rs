@@ -1365,6 +1365,17 @@ fn mesh_scope_preserves_shared_owned_and_filtered_publication() {
                 env.push(("FERRUM_NAMESPACE", filter));
             }
             let output = repo.run(&args, &env);
+            // An ad-hoc FERRUM_NAMESPACE narrows a file-mode environment below
+            // its publication scope: plan/apply refuse rather than publish a
+            // subset over the document-wide gateway and mesh files. An
+            // environment-declared filter is that environment's scope.
+            if env_filter.is_some() && matches!(args[0], "plan" | "apply") {
+                assert!(!output.status.success(), "{mode} {args:?}");
+                let combined = format!("{}{}", stdout(&output), stderr(&output));
+                assert!(combined.contains("narrowed-file-publication"), "{combined}");
+                assert!(!repo.dir.path().join("mesh.yaml").exists());
+                continue;
+            }
             assert!(
                 output.status.success(),
                 "{mode} {owned} {repo_filter:?} {env_filter:?} {args:?}: {} {}",
@@ -1372,6 +1383,14 @@ fn mesh_scope_preserves_shared_owned_and_filtered_publication() {
                 stderr(&output)
             );
             if matches!(args[0], "export" | "apply") {
+                if env_filter.is_some() {
+                    // Export still writes its requested output, but never a
+                    // subset over the mesh-wide destination.
+                    assert!(!repo.dir.path().join("mesh.yaml").exists());
+                    let combined = format!("{}{}", stdout(&output), stderr(&output));
+                    assert!(combined.contains("namespace-filtered run"), "{combined}");
+                    continue;
+                }
                 let mesh = std::fs::read_to_string(repo.dir.path().join("mesh.yaml")).unwrap();
                 assert!(mesh.contains("mesh-root"), "{mesh}");
                 assert_eq!(mesh.contains("ALLOW_ANY"), includes_platform, "{mesh}");
@@ -1680,8 +1699,14 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
             if repository_present {
                 env.push(("GITHUB_REPOSITORY", "example/repository"));
             }
-            for command in ["plan", "review"] {
-                let output = repo.run(&[command], &env);
+            for (command, args) in [
+                ("plan", &["plan"][..]),
+                (
+                    "review --fail-on-blockers",
+                    &["review", "--fail-on-blockers"][..],
+                ),
+            ] {
+                let output = repo.run(args, &env);
                 let out = stdout(&output);
                 assert_eq!(
                     output.status.success(),
@@ -1724,6 +1749,19 @@ fn pending_allocation_requires_provisioning_environment_in_plan_and_review() {
             );
         }
     }
+    // The secretless PR check: no bundle, no provisioner token, but Actions
+    // always sets GITHUB_REPOSITORY. Default review renders the blocker and
+    // stays 0 — the same contract as every other offline blocker.
+    let repo = Repo::with_consumer(&consumer);
+    let review = repo.run(&["review"], &[("GITHUB_REPOSITORY", "example/repository")]);
+    assert!(
+        review.status.success(),
+        "default review must stay 0: {} {}",
+        stdout(&review),
+        stderr(&review)
+    );
+    assert!(stdout(&review).contains("provisioner-token"));
+
     let repo = Repo::with_consumer(&consumer);
     let seeded = repo.run(&["plan"], &[("FERRUM_CREDS_JSON", BUNDLE)]);
     assert!(seeded.status.success(), "{}", stdout(&seeded));
@@ -1871,4 +1909,80 @@ fn reserved_plugin_names_block_public_preview_and_apply_with_default_disabled_po
             assert!(stdout(&review).contains("Apply is blocked"));
         }
     }
+}
+
+/// Two namespaces, one proxy each: enough to tell a whole gateway document
+/// from a filtered subset of it.
+fn two_namespace_repo(extra: &[(&str, &str)]) -> Repo {
+    let billing = HTTPS_PROXY
+        .replace("\"app\"", "\"bill\"")
+        .replace("/app", "/bill");
+    let mut files = vec![
+        ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
+        ("resources/billing/proxies/bill.yaml", billing.as_str()),
+    ];
+    files.extend_from_slice(extra);
+    Repo::with_files(&files)
+}
+
+#[test]
+fn file_mode_apply_refuses_an_ad_hoc_namespace_filter_that_would_truncate_the_document() {
+    let repo = two_namespace_repo(&[]);
+    let full = repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(full.status.success(), "{}", stderr(&full));
+    let published = std::fs::read_to_string(repo.published()).expect("published");
+    assert!(published.contains("namespace: ferrum"), "{published}");
+    assert!(published.contains("namespace: billing"), "{published}");
+
+    // An ad-hoc filter would replace the whole gateway file with one namespace.
+    let narrowed = repo.run(
+        &["apply", "--auto-approve"],
+        &[("FERRUM_NAMESPACE", "billing")],
+    );
+    assert!(!narrowed.status.success());
+    assert!(
+        stderr(&narrowed).contains("narrowed-file-publication"),
+        "{}",
+        stderr(&narrowed)
+    );
+    // A mistyped one would have published an empty document.
+    let typo = repo.run(
+        &["apply", "--auto-approve"],
+        &[("FERRUM_NAMESPACE", "biling")],
+    );
+    assert!(!typo.status.success());
+    assert!(
+        stderr(&typo).contains("selected 0 desired resources"),
+        "{}",
+        stderr(&typo)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.published()).expect("published"),
+        published,
+        "a refused apply must leave the published document untouched"
+    );
+
+    // plan previews the same refusal.
+    let plan = repo.run(&["plan"], &[("FERRUM_NAMESPACE", "billing")]);
+    assert!(!plan.status.success());
+    assert!(
+        stdout(&plan).contains("narrowed-file-publication"),
+        "{}",
+        stdout(&plan)
+    );
+}
+
+#[test]
+fn file_mode_apply_honours_an_environment_declared_namespace_filter() {
+    // An environment's own `namespace_filter` is its publication scope, not a
+    // narrowing of it.
+    let repo = two_namespace_repo(&[(
+        ".gitforgeops/config.yaml",
+        "version: 1\nenvironments:\n  sandbox:\n    namespace_filter: billing\n    live_review: false\n",
+    )]);
+    let apply = repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(apply.status.success(), "{}", stderr(&apply));
+    let published = std::fs::read_to_string(repo.published()).expect("published");
+    assert!(published.contains("namespace: billing"), "{published}");
+    assert!(!published.contains("namespace: ferrum"), "{published}");
 }

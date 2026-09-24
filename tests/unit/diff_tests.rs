@@ -919,6 +919,172 @@ fn breaking_ignores_benign_plugin_config_modifications() {
     );
 }
 
+/// Two proxies in `ferrum`; `orders` carries `orders_plugins` verbatim.
+fn auth_coverage_config(orders_plugins: &str, plugin_configs: &str) -> GatewayConfig {
+    let yaml = format!(
+        "proxies:
+  - id: orders
+    listen_path: /orders
+    backend_scheme: https
+    backend_host: orders.internal
+    backend_port: 443
+    {orders_plugins}
+  - id: payments
+    listen_path: /payments
+    backend_scheme: https
+    backend_host: payments.internal
+    backend_port: 443
+plugin_configs:
+{plugin_configs}"
+    );
+    let mut config: GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
+    gitforgeops::config::assembler::normalize_proxy_plugin_associations(&mut config);
+    config
+}
+
+fn auth_coverage_reasons(desired: &GatewayConfig, actual: &GatewayConfig) -> Vec<String> {
+    let diffs = compute_diff(desired, actual).unwrap();
+    detect_breaking_changes(&diffs, desired, actual)
+        .into_iter()
+        .map(|bc| bc.reason)
+        .collect()
+}
+
+const PROXY_GROUP_KEY_AUTH: &str = "  - id: sso
+    plugin_name: key_auth
+    scope: proxy_group
+";
+
+const GLOBAL_KEY_AUTH: &str = "  - id: sso
+    plugin_name: key_auth
+    scope: global
+";
+
+const KEY_AUTH_ON_PAYMENTS: &str = "  - id: sso
+    plugin_name: key_auth
+    scope: proxy
+    proxy_id: payments
+";
+
+#[test]
+fn breaking_detects_proxy_group_auth_association_removed() {
+    let actual = auth_coverage_config("plugins: [{plugin_config_id: sso}]", PROXY_GROUP_KEY_AUTH);
+    let desired = auth_coverage_config("", PROXY_GROUP_KEY_AUTH);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].starts_with("proxy ferrum/orders loses authenticator key_auth")
+            && reasons[0].contains("no enabled authenticator"),
+        "{reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_detects_proxy_scoped_auth_retargeted_to_another_proxy() {
+    let actual = auth_coverage_config(
+        "",
+        "  - id: sso
+    plugin_name: key_auth
+    scope: proxy
+    proxy_id: orders
+",
+    );
+    let desired = auth_coverage_config("", KEY_AUTH_ON_PAYMENTS);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(
+        reasons,
+        vec![
+            "proxy ferrum/orders loses authenticator key_auth — consumer credentials for it \
+             no longer apply on this proxy, which is left with no enabled authenticator"
+                .to_string()
+        ]
+    );
+}
+
+#[test]
+fn breaking_detects_global_auth_narrowed_to_another_proxy() {
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let desired = auth_coverage_config("", KEY_AUTH_ON_PAYMENTS);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    // `payments` keeps key_auth (now scoped); only `orders` loses it.
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].starts_with("proxy ferrum/orders loses authenticator key_auth"),
+        "{reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_names_only_the_lost_authenticator_when_others_remain() {
+    let plugins = "  - id: sso
+    plugin_name: key_auth
+    scope: proxy_group
+  - id: jwt
+    plugin_name: jwt_auth
+    scope: global
+";
+    let actual = auth_coverage_config("plugins: [{plugin_config_id: sso}]", plugins);
+    let desired = auth_coverage_config("", plugins);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("loses authenticator key_auth")
+            && !reasons[0].contains("no enabled authenticator"),
+        "{reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_ignores_swapping_an_authenticator_for_another_of_the_same_name() {
+    let plugins = "  - id: sso
+    plugin_name: key_auth
+    scope: proxy_group
+  - id: sso-v2
+    plugin_name: key_auth
+    scope: proxy_group
+";
+    let actual = auth_coverage_config("plugins: [{plugin_config_id: sso}]", plugins);
+    let desired = auth_coverage_config("plugins: [{plugin_config_id: sso-v2}]", plugins);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert!(reasons.is_empty(), "same authenticator kept: {reasons:?}");
+
+    // Unchanged auth coverage is never reported.
+    let reasons = auth_coverage_reasons(&actual, &actual);
+    assert!(reasons.is_empty(), "{reasons:?}");
+}
+
+#[test]
+fn breaking_does_not_repeat_a_plugin_level_auth_finding_per_proxy() {
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let desired = auth_coverage_config("", &format!("{GLOBAL_KEY_AUTH}    enabled: false\n"));
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    let breaking = detect_breaking_changes(&diffs, &desired, &actual);
+    let entries: Vec<(&str, &str)> = breaking
+        .iter()
+        .map(|bc| (bc.kind.as_str(), bc.id.as_str()))
+        .collect();
+    assert_eq!(entries, vec![("PluginConfig", "sso")], "{breaking:?}");
+}
+
+/// In shared mode a live global authenticator the repo never declared is
+/// unmanaged and survives the apply, so no declared proxy loses it.
+#[test]
+fn breaking_ignores_undeclared_unmanaged_authenticator_in_shared_mode() {
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let desired = auth_coverage_config("", "  []\n");
+    let managed = std::collections::HashSet::new();
+    let result = compute_diff_with_scope(
+        &desired,
+        &actual,
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+    )
+    .unwrap();
+    let breaking = detect_breaking_changes(&result.diffs, &desired, &actual);
+    assert!(breaking.is_empty(), "{breaking:?}");
+}
+
 #[test]
 fn security_detects_literal_credential() {
     let mut creds = std::collections::BTreeMap::new();
@@ -1580,6 +1746,28 @@ fn best_practice_flags_single_target_upstream() {
     };
     let checks = check_best_practices(&config);
     assert!(checks.iter().any(|c| c.message.contains("target")));
+}
+
+/// Service discovery supplies targets at runtime, so an upstream that uses it
+/// is not told to "attach service discovery" for having few static targets.
+#[test]
+fn best_practice_skips_target_count_for_service_discovery_upstream() {
+    let config = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "u1",
+            "https://consul.internal:8500",
+            None,
+        )],
+        ..GatewayConfig::default()
+    };
+    let checks = check_best_practices(&config);
+    assert!(
+        !checks
+            .iter()
+            .any(|c| c.message.contains("nothing to fail over to")),
+        "{:?}",
+        checks.iter().map(|c| &c.message).collect::<Vec<_>>()
+    );
 }
 
 #[test]

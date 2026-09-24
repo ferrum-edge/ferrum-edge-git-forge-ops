@@ -45,7 +45,7 @@ first, remove the entry second.
 `--allow-empty-namespace` is the same kind of CLI-only acknowledgement. A
 mistyped `FERRUM_NAMESPACE` that selects zero desired resources while the
 on-disk tree is non-empty is an error-severity finding on `validate`,
-`plan`, and `diff` (exit 1, not the drift code 2). The flag demotes that
+`plan`, `diff`, and `apply` (exit 1, not the drift code 2). The flag demotes that
 finding to a warning. There is no environment variable for it.
 
 `gitforgeops --version` / `-V` print the Cargo package version. `gitforgeops
@@ -100,7 +100,11 @@ cargo fmt --all && cargo fmt --all -- --check
 `.github/workflows/rust-ci.yml` reports its required status on every PR and
 runs those same three commands when the PR touches current **or previous**
 Rust/build/workspace input paths (`src`, `tests`, benches/examples, `build.rs`,
-`.cargo`, Cargo manifests/lockfiles, toolchain/lint config, or Dockerfile).
+`.cargo`, Cargo manifests/lockfiles, toolchain/lint config, or Dockerfile), or
+a non-Rust file the unit suite reads or the binary embeds (`docs/quickstart.md`,
+`.gitforgeops/*.example.yaml`, `.github/scripts/audit_settings.py`). Unit tests
+never read the customer-owned `resources/` tree; shipped-example checks use the
+copy under `tests/fixtures/shipped-examples/`.
 Resource-only PRs skip the Rust steps
 and run secretless `validate-pr.yml` instead. `trusted-pr-review.yml` is a
 default-branch `workflow_run` that accepts only manifest-verified resource and
@@ -249,7 +253,7 @@ Set via `FERRUM_GATEWAY_MODE`. Mesh config is file-only in both modes — there 
 
 ### Apply Strategies
 
-- **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → plugin config → proxy, then deletes in reverse). Association comparison sorts IDs without deduplicating live data; payloads and printed changes retain original order. One fresh backup per namespace after scoped plugin writes suppresses proxy updates that already converged, while preserving required ownership assertions (including ledger adoption of unchanged exclusive rows). Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to independent per-resource creates on 501. New proxies and their new scoped plugins require one create transaction by default, even in mixed namespaces. Dependency groups never split across chunks and are deterministic across input ordering. `order_incremental_diffs` shares cycle ordering with plan/review/apply previews, which explain the batch requirement and opt-in below. Failed proxy deletions defer deletion of their referenced plugins: Edge detaches references when deleting a plugin rather than rejecting the delete, so this order preserves a surviving proxy's protection.
+- **incremental** (default) — compute diff against `/backup`, then CRUD per changed resource in dependency order (`operation_rank`: add/modify upstream+consumer → plugin config → proxy, then deletes in reverse). Association comparison sorts IDs without deduplicating live data; payloads and printed changes retain original order. One fresh backup per namespace after scoped plugin writes suppresses proxy updates that already converged, while preserving required ownership assertions (including ledger adoption of unchanged exclusive rows). Deletes tolerate 404. A namespace whose diff is **pure adds** takes the transactional `POST /batch` fast path (create-only, all-or-nothing, chunked under the 1 MiB body cap), falling back to independent per-resource creates on 501. New proxies and their new scoped plugins require one create transaction by default, even in mixed namespaces. In a mixed namespace a create group whose proxy references a PluginConfig whose write already failed is withheld and reported by name (proxy, failed plugin, withheld scoped plugins); every other group still goes through `POST /batch`. Dependency groups never split across chunks and are deterministic across input ordering. `order_incremental_diffs` shares cycle ordering with plan/review/apply previews, which explain the batch requirement and opt-in below. Failed proxy deletions defer deletion of their referenced plugins: Edge detaches references when deleting a plugin rather than rejecting the delete, so this order preserves a surviving proxy's protection.
 - **full_replace** — POST to `/restore?confirm=true` atomically **per namespace** (not environment-wide; a runtime failure after an earlier namespace succeeds can still partial-fail). Every namespace payload is prebuilt before the first mutation. The body carries the repo's desired rows **plus the complete live spec-owned graph**: `/restore` validates `api_specs.items` against the tagged proxies/upstreams/plugin configs in the same payload and rejects either half on its own, and it re-creates the documents verbatim rather than re-extracting resources from them, so carrying both cannot duplicate rows. An **empty** spec section and all `gateway_trust_bundles` are omitted instead — the gateway reads `items: []` as an intentional wipe but an absent section as "count the live specs and answer 409", and an absent trust section as "leave trust exactly as it is", so omission is what preserves a concurrent update. `--confirm-api-spec-deletion` is the only path that drops the graph (trust bundles still survive). A graph that cannot be proven complete, a repo/spec ID conflict, cached data, or an unfamiliar top-level backup section fails before mutation. Because a non-empty `api_specs` section is a wipe-and-reinsert rather than a merge — and the admin API exposes no `ETag`/`If-Match`/revision a client could use as a precondition — the section is re-read (`GET /backup`) immediately before the POST and the restore is abandoned for that namespace if any spec document changed since the payload was built. That narrows the lost-update window from the whole prepare phase to one round-trip; it cannot close it, because nothing holds the gateway's namespace admission lock across two client calls.
 
 Set via `FERRUM_APPLY_STRATEGY`. Incremental is safer (partial-failure visibility, no destructive no-op replace); full_replace is stronger (per-namespace atomic, removes drift). For strict environment-wide atomicity, scope `full_replace` to a single namespace.
@@ -283,7 +287,7 @@ A `GET /health` preflight runs before the first mutation so a read-only plane fa
 
 Create and batch POST error responses are never retried blindly. An ambiguous outcome is reconciled through an authoritative (non-cached) backup, and the readback has three severities (`LiveMatch`): the **exact** row live → an idempotent PUT declares repository ownership and the create is recorded; the row **absent** → the write provably did not commit, so it is an ordinary per-resource error and the rest of the run continues; the row **present but different**, or no usable verification at all → a run-stopping `AmbiguousMutation`. `resource_values_match` is a subset test (desired ⊆ live, minus server timestamps) so a gateway-populated optional does not read as a foreign row.
 
-A separate write-ahead `pending_creates` journal closes the process-crash window without granting deletion authority: exact evidence triggers that PUT, an absent row stays retryable. A live row whose declaration disappeared is **forgotten with a warning** and handed to the ordinary rules for the mode — shared reports it as unmanaged and never deletes it, exclusive prunes it under the large-prune guard, full_replace does not journal at all. Nothing here may fail closed: CI is the only writer of `.state/<env>.json` and `state-guard.yml` blocks the hand edit a wedged journal would demand. The journal survives a process crash, because `apply-on-merge.yml` commits state with `if: !cancelled()`; it does **not** survive workflow cancellation or runner loss, which leaves the row live and unjournaled for the next run's ordinary diff to pick up.
+A separate write-ahead `pending_creates` journal closes the process-crash window without granting deletion authority: exact evidence triggers that PUT, an absent row stays retryable. Because that evidence is a subset match, a row carrying a gateway-populated optional field can also be an ordinary Modify; `dedupe_pending_assertions` drops the assertion whenever the ordinary diff already names the row, in apply and in every preview (interactive, `plan`, `review`), so it is planned and PUT exactly once. A live row whose declaration disappeared is **forgotten with a warning** and handed to the ordinary rules for the mode — shared reports it as unmanaged and never deletes it, exclusive prunes it under the large-prune guard, full_replace does not journal at all. Nothing here may fail closed: CI is the only writer of `.state/<env>.json` and `state-guard.yml` blocks the hand edit a wedged journal would demand. The journal survives a process crash, because `apply-on-merge.yml` commits state with `if: !cancelled()`; it does **not** survive workflow cancellation or runner loss, which leaves the row live and unjournaled for the next run's ordinary diff to pick up.
 
 After apply, a best-effort `GET /cluster` prints a convergence line.
 
@@ -291,12 +295,12 @@ After apply, a best-effort `GET /cluster` prints a convergence line.
 
 `kind: MeshConfig` fragments live under `resources/<ns>/mesh/`. They are not gateway resources: every fragment folds into one standalone `{version: "1", mesh: {...}}` document (`apply::render_mesh_yaml`, `MESH_DOCUMENT_VERSION`) published to `FERRUM_MESH_FILE_OUTPUT_PATH` by `export` and file-mode `apply`. `validate` / `plan` / `apply` run a second pass, `ferrum-edge validate -m mesh`, over the rendered bytes. Mesh resources never appear in `diff` — there is no live API to compare against.
 
-Publication is a **reconciliation**, not a conditional write: `apply::reconcile_mesh_file` is total over `Option<&MeshConfigSpec>`, and removing the last fragment retracts the destination by rewriting it as `{version: '1', mesh: {}}`. Never by deleting it — ferrum-edge's mesh file source bails with `mesh configuration file not found`, so a deletion would turn a policy retraction into a node outage, while `MeshFileDocument` (`deny_unknown_fields`, required `mesh`, all inner fields defaulted) accepts the empty mapping. Two gates decide whether a retraction may touch the path, both in `MeshRetractionScope`: the state ledger must attribute the destination to this repository through `StateFile::mesh_document_path`, and the run must not be `FERRUM_NAMESPACE`-filtered (a filter narrows which fragments load at all, and the document is mesh-wide, so an empty selection is not evidence of deletion). Canonical formatting alone is not provenance; anything without ledger attribution is reported and left alone. `apply::plan_mesh_publication` is the same decision without the write, so `plan` and `review` preview exactly what `apply` will do; all of them print a `RETRACT mesh` line. api-mode apply neither publishes nor retracts.
+Publication is a **reconciliation**, not a conditional write: `apply::reconcile_mesh_file` is total over `Option<&MeshConfigSpec>`, and removing the last fragment retracts the destination by rewriting it as `{version: '1', mesh: {}}`. Never by deleting it — ferrum-edge's mesh file source bails with `mesh configuration file not found`, so a deletion would turn a policy retraction into a node outage, while `MeshFileDocument` (`deny_unknown_fields`, required `mesh`, all inner fields defaulted) accepts the empty mapping. Two gates decide whether a retraction may touch the path, both in `MeshRetractionScope`: the state ledger must attribute the destination to this repository through `StateFile::mesh_document_path`, and the run must cover the environment's publication scope (`ResolvedEnv::covers_environment`: unfiltered, or filtered only by the environment's own declared `namespace_filter`). An ad-hoc `FERRUM_NAMESPACE` narrows which fragments load at all, and the document is mesh-wide, so such a run neither retracts (an empty selection is not evidence of deletion) nor publishes (the selected subset would drop every other namespace's fragments); it reports `NarrowedScope`. Canonical formatting alone is not provenance; anything without ledger attribution is reported and left alone. `apply::plan_mesh_publication` is the same decision without the write, so `plan` and `review` preview exactly what `apply` will do; all of them print a `RETRACT mesh` line. api-mode apply neither publishes nor retracts.
 
 ### Namespace Handling
 
 - Directory-inferred: `resources/<ns>/…` → resource `namespace: <ns>` unless the spec overrides with a non-default value.
-- `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset. `validate`, `plan`, and `diff` fail closed when the filter selects zero desired resources while the on-disk tree contains at least one resource; `--allow-empty-namespace` (CLI-only) demotes that to a warning. When filtered live inventory is empty solely because the filter matched no live namespace, `plan` and `diff` say so in text and JSON.
+- `FERRUM_NAMESPACE` filters load, diff, apply, and import. API import requires this (or an environment namespace filter) and processes one namespace at a time; other commands process all namespaces when it is unset. `validate`, `plan`, `diff`, and `apply` fail closed when the filter selects zero desired resources while the on-disk tree contains at least one resource; `--allow-empty-namespace` (CLI-only) demotes that to a warning. File-mode documents are document-wide, so an ad-hoc `FERRUM_NAMESPACE` that drops any loaded resource from a file-mode environment is the `NarrowedFilePublication` apply blocker; an environment's own `namespace_filter` is its publication scope and is not narrowing. When filtered live inventory is empty solely because the filter matched no live namespace, `plan` and `diff` say so in text and JSON.
 - Gateway validator children derive their explicit `FERRUM_NAMESPACE` from the assembled resources after selection and overlays. The parent's filter is never forwarded; every selected effective namespace is validated.
 - API calls send `X-Ferrum-Namespace: <ns>` per namespace; `split_config_by_namespace()` groups operations.
 - `BackupSnapshot::from_scoped_body` validates every resource's explicit wire namespace
@@ -675,8 +679,8 @@ Two pure computations, shared so a preview and the run it previews cannot
 disagree.
 
 **`apply_blockers`** — every fail-closed gate `apply` refuses on that is
-decidable *without* a gateway, as `Vec<ApplyBlocker>` over seven
-`BlockerKind`s: `Validation`, `Security`, `Policy`, `RequiredCredentials`,
+decidable *without* a gateway, as `Vec<ApplyBlocker>` over eight
+`BlockerKind`s: `NarrowedFilePublication`, `Validation`, `Security`, `Policy`, `RequiredCredentials`,
 `SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
 non-empty. `review --fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`)
@@ -699,8 +703,10 @@ stale-view, per-resource write failures) are deliberately excluded: a preview
 cannot decide them.
 
 Pending allocations require both provisioning environment variables. `plan` and
-`review` use `credential_provisioning_blockers`, render the missing capability,
-and exit 1. Apply calls the same predicate at its existing allocation gate,
+`review` use `credential_provisioning_blockers` and render the missing capability;
+`plan` exits 1, and `review` exits 1 only under `--fail-on-blockers` like every
+other offline blocker (the secretless PR check has no bundle, so every
+`alloc=generate` slot reads as pending there). Apply calls the same predicate at its existing allocation gate,
 after safety checks and before external writes, retaining the exact refusal text.
 File apply also checks before publishing either output document, while keeping
 credential allocation after placeholder publication.
@@ -773,7 +779,12 @@ Generation constraints, shared by `resolver::check_generation_allowed` and the
 allocator so `plan` and generation cannot disagree: `jwt`/`hmac_auth` secrets
 need ≥32 chars (`len=` ≥ 24 entropy bytes); `basicauth` generation is refused in file mode and
 `basicauth/…/password_hash` in either mode (the hash is HMAC-SHA256 under the
-gateway's own secret); a bundle value of `[REDACTED]` is refused.
+gateway's own secret); a plugin-config endpoint leaf
+(`secrets::plugin_config::endpoint_paths`, e.g. `ldap_auth.ldap_url`) is
+refused because random bytes have no scheme or host; a bundle value of
+`[REDACTED]` is refused. The endpoint rule needs the plugin name, so the plugin
+walks record endpoint slots in `ResolveReport::endpoint_slots` and the
+allocator validates its batch with `ResolveReport::check_generation_allowed_for`.
 
 The allocator validates the entire candidate batch before GitHub key discovery,
 including direct callers and lenient reports. Structural types must agree with
@@ -807,6 +818,19 @@ the two consequences by whether evidence exists:
   `SlotRemapPolicy::Allow` so they can render it (plan then exits 1 itself).
   `--allow-credential-slot-remap` downgrades the refusal for the documented
   shrink-then-rotate sequence. Messages name slots only, never values.
+- A declared Consumer that omits a known credential type while the bundle
+  still holds a slot under `ns/id/<type>` is the same remap as `<type>: []`
+  (`check_omitted_credential_types`): re-adding the type would resurrect the
+  retired value. A Consumer absent from the walked document is deliberately
+  not checked, because namespace filters, the rotate preflight's
+  single-Consumer walk and id renames all omit Consumers whose slots remain
+  legitimate.
+- Plugin-config arrays get the same split through
+  `check_plugin_array_slot_identity`, called from both plugin walks. Their
+  slots carry an explicit `[N]` for every entry (no index-0 elision), so only a
+  stored slot whose first segment under the array is an index at or beyond the
+  array length is a remap. The remedy is reseeding the bundle, since `rotate`
+  publishes Consumers only.
 
 Literal (non-placeholder) consumer credentials are an apply blocker too:
 `cmd_apply` runs `diff::audit_security_with_policy` on the **unresolved**
@@ -866,7 +890,10 @@ values, rejects a bundle name outside the bound range instead of dropping it,
 writes a new 0600 file without following/overwriting a destination, and the
 step exports the path as `FERRUM_CREDS_JSON_FILE`. Malformed input fails closed
 rather than becoming an empty bundle. Inline `FERRUM_CREDS_JSON` is still
-supported for small local tests.
+supported for small local tests. `bundle::parse_bundles_from_json` reserves the
+same prefix: a `FERRUM_CREDS_BUNDLE*` key must round-trip through
+`shard_secret_name`, so aliases such as `_0`, `_01` or `_+1` fail closed instead
+of overwriting a shard in `per_shard` and losing slots on the next PUT.
 
 Allocation (first apply, or rotation): generate random value → libsodium
 `crypto_box_seal` to the env's public key → PUT to
@@ -907,17 +934,17 @@ never restoring an obsolete ledger, which is a separate state-override repair.
 - `src/cli.rs` — clap parser (global `--env` flag, subcommands incl. `envs`, `version`, `rotate`)
 - `src/version.rs` — `--version` / `version` identity (Cargo package version plus `build.rs` git metadata)
 - `src/doctor/` — read-only readiness diagnosis grouped by trust boundary: `local.rs` (repository + process env, no credential; template vs deployment repository), `github.rs` (delegates to `.github/scripts/audit_settings.py` — doctor owns no settings baseline of its own), `gateway.rs` (`GET /health` + `GET /cluster` only; `/health` is unauthenticated on Ferrum Edge, so the token is proven by `/cluster`, which passes the admin JWT gate). `Status::Unknown` is never a pass and `DOCTOR_FAILED_EXIT_CODE` is 3, distinct from the command failing
-- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
-- `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs`, `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
-- `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
+- `src/config/` — `schema.rs` (typed companion mirror of Ferrum Edge types, incl. `BackendScheme` with legacy-value folding and opaque per-item `MeshConfigSpec` values), `strict.rs` (`LoadOptions` unknown-field policy, unknown-field detection with full YAML paths, non-string mapping-key rejection, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list — kept in step with `.github/scripts/pr_input.py` by a Python test — and deliberate free-form/disabled-value handling), `loader.rs` (sorted, error-propagating, symlink-rejecting walk of `proxies/consumers/upstreams/plugins/mesh`; rejects duplicate mesh fragment ids per directory namespace naming both files, and `assemble` repeats the check for resources built without the loader), `assembler.rs` (deterministic overlay deep-merge, duplicate-target rejection, `merge_mesh_fragments`, credential normalization, `normalize_proxy_plugin_associations` deriving namespace-scoped plugin attachments), `env.rs` (strict process-env parsing, incl. `validate_gateway_transport` — the https-only gateway URL rule and the CI/loopback gate on the insecure opt-ins), `repo_config.rs` (closed version-1 `.gitforgeops/config.yaml` contract), `resolved.rs` (merges repo + env-var into a single `ResolvedEnv` per invocation)
+- `src/diff/` — `resource_diff.rs` (add/modify/delete + field-level changes preserving wire order, order-insensitive association comparison that detects live duplicates + unmanaged and spec-owned tracking), `breaking.rs` (also reports a surviving proxy that loses an effective authenticator by `plugin_name`, projecting post-apply plugin configs from the diff so unmanaged/spec-owned rows survive, without repeating a plugin-level auth finding), `security.rs` (declared association/scope conflicts are errors; undeclared config references warn in shared mode and error in exclusive mode), `best_practice.rs`
+- `src/apply/` — `api_target.rs` (incremental + full_replace, all-namespace restore preflight, spec-conflict and concurrent-spec restore gates, dependency ordering, non-idempotent create reconciliation, `/batch` fast path, authoritative-backup mutation gate, exact large-prune ratio, ownership-aware delete filter, `adoption_candidates` / `adopt_matching_rows` claiming already-matching declared rows into the ledger; one `(namespace, id)` `ResourceIndex` per kind serves both the desired and the live side, so pairing, adoption, pending-create recovery and batch readback never scan a document per row, and `PreparedApply` borrows caller-supplied live views instead of cloning them), `file_target.rs` (atomic publish, `resource_counts` seal, `render_mesh_yaml` / `apply_mesh_file`, `reconcile_mesh_file` / `plan_mesh_publication` / `MeshPublication` retracting a mesh document the repository no longer declares)
 - `src/plugin_catalog.rs` — 82 builtin plugin names, retired/reserved names, auth/rate-limit/observability/AI-guardrail groupings, `effective_plugins` merge, small `cfg_*` JSON accessors
 - `src/policy/` — `config.rs` (closed version-1 YAML + override config), `registry.rs`, `rules/*` (one file per rule), `github_override.rs` (label + permission check via GitHub API)
 - `src/secrets/` — `scrubber.rs` (`SecretScrubber`: the secret byte sequences to redact from child-process output, plus the fail-closed policy — `is_reencoding_hazard` values — newline/quote/backslash/`#`/`: `/edge-whitespace plus any control or non-ASCII character — withhold the stream outright, single-line re-encodings (base64/percent/JSON-escape/single-quoted YAML) are matched as needles, and a surviving `FRAGMENT_SCAN_LENGTH`-byte run that is not also in the scrubbed document withholds; `FRAGMENT_SCAN_LENGTH == MIN_SCRUB_LENGTH` is a compile-time assertion so every scrubbable length keeps fragment coverage; `scrub_streams` is the one decision point), `placeholder.rs` (`${gh-env-secret:...}` parser), `bundle.rs` (shard layout + hash placement, `MAX_BUNDLE_SHARDS` ceiling + `reserve_shard`), `service_discovery.rs` (modeled `Upstream.service_discovery` secret table + slot derivation), `resolver.rs` (walks consumers, plugin config and service discovery, replaces in-memory), `github_api.rs` (libsodium seal + PUT), `delivery.rs` (age encryption to SSH pubkey), `allocator.rs` (generate + write + deliver)
-- `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
+- `src/http_client.rs` — `AdminClient` wrapping reqwest; namespace-scoped JWT construction; base64-encoded PEM for CA / mTLS from env; typed `ApiErrorBody` + endpoint-semantic retry classification (create/batch responses never replayed, restore only on explicit pre-commit connectivity failure; 413 advice follows the request kind — restore body limit for `/restore`, the 1 MiB `BATCH_MAX_BODY_BYTES` batch cap for create/batch POSTs), `Retry-After` honoring, paginated list helpers, `BackupExtras` (api_specs / trust bundles), `ClusterStatus` + `convergence_summary`
 - `src/validate/` — `standin.rs` (validator-only stand-ins for unresolved broker placeholders; URL shapes for endpoint-typed plugin fields via `secrets::plugin_config::{endpoint_paths, endpoint_scheme}`), `runner.rs` shells to `ferrum-edge validate` with `-m file` / `-m mesh` pinned, an empty `-s` settings file, `FERRUM_*` scrubbed from the child env, and a 0600 temp spec. Gateway passes explicitly set each document namespace through `FERRUM_NAMESPACE` and aggregate diagnostics in lexical namespace order before reporting. `validation_context_env` sets `FERRUM_MESH_ALLOW_NO_CA=true` (`MESH_ALLOW_NO_CA_ENV`) for the separate mesh pass only, because `-m mesh` refuses on a missing workload identity before it reads the document and a CI runner is not a mesh node. Every child's output and namespace labels pass through `SecretScrubber`; `reporter.rs` formats text/JSON/GitHub annotations for the gateway aggregate and optional mesh result.
 - `src/review/` — `pr_comment.rs` builds markdown (v2 includes unmanaged, spec-owned, policy, credential sections), `github.rs` posts via GitHub API
 - `src/import/` — `from_api.rs` (fetches all namespaces before publishing and refuses cached/cross-namespace backups), `from_file.rs` (parses the full backup envelope), `mod.rs::split_config` (captures every credential string under the resolver's canonical slot, requires an outside-tree mode-0600 credential import bundle for source imports, emits deterministic `alloc=require` YAML plus a non-secret `.gitforgeops-import.json` inventory, percent-encodes a leading `_`/`%` in an id so a live resource can never dead-end the import (identity comes from `spec.id`, not the filename), and atomically publishes an empty output tree; reports skipped/unsupported sections; `ImportPassthroughPolicy` + `reject_import_passthrough_fields` fail closed on unmodelled top-level fields unless each is acknowledged with `--accept-unknown-field` *and* `FERRUM_ALLOW_UNKNOWN_FIELDS=true`; `reject_import_unknown_credential_types` refuses unrecognized Consumer credential map keys before publication, with no acknowledgement flag)
-- `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal
+- `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal; `ResourceKeys` is the prebuilt `namespace:Kind:id` set `record_op` and the journal/ledger reconciliations check existence against
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `exit_code` is `VERIFY_FAILED_EXIT_CODE` = 4), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, the response body is never read)
@@ -953,7 +980,7 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_ADMIN_JWT_ROLE` (default `admin`) — `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only
 - `FERRUM_ADMIN_JWT_AUDIENCE` (default unset) — `aud` is emitted only when set; a gateway with no audience rejects tokens carrying it
 - `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`) — must be within the gateway's `FERRUM_ADMIN_JWT_MAX_TTL`
-- `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace). `validate`, `plan`, and `diff` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` (CLI-only, no env var) demotes that refusal to a warning.
+- `FERRUM_NAMESPACE` (filter; default = all namespaces except API import, which requires one explicit namespace). `validate`, `plan`, `diff`, and `apply` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). In file mode an ad-hoc filter that drops any loaded resource is refused by `plan`/`apply` (`NarrowedFilePublication`). `--allow-empty-namespace` (CLI-only, no env var) demotes that refusal to a warning.
 - `FERRUM_ALLOW_UNKNOWN_FIELDS` (default `false`) — keep unknown top-level `spec` fields verbatim instead of rejecting them; nested unknowns stay fatal. For a gateway newer than this release.
 - `FERRUM_GATEWAY_MODE` = `api` | `file` (default `api`)
 - `FERRUM_APPLY_STRATEGY` = `incremental` | `full_replace` (default `incremental`)
@@ -1000,8 +1027,10 @@ map and `tests/lifecycle/README.md` stay in step — adding a fail-closed gate t
 `apply` without adding a scenario narrows what the suite certifies without
 narrowing what ships.
 
-`release.yml`'s `authorize-release` downloads the sealed result for the exact
-revision being published and runs `lifecycle_result.py verify`. Only `passed`
+`release.yml`'s `authorize-release` walks the successful lifecycle runs for
+the exact revision being published, newest first, and accepts the first whose
+sealed result passes `lifecycle_result.py verify` (none passing is a refusal),
+so a newer unattested run cannot hide an attested one. Only `passed`
 certifies: an unrun suite, a result for another revision, a result from another
 gateway build, an unsealed (cancelled) record, a `skipped` scenario and a stale
 record are each a refusal, because a release gate that can be satisfied by an
@@ -1017,7 +1046,9 @@ record `skipped` with a reason and run through
 an attestation: `lifecycle.yml` dispatched on the release ref with the
 operator's sealed result as its `github_acceptance` input, merged by
 `lifecycle_result.py attest` into the scenarios that run itself `skipped` —
-never over one it ran — and attributed to the dispatching actor. `release.yml`
+never over one it ran — and attributed to the dispatching actor. `attest`
+refuses an attestation sealed for another revision or another gateway build
+than the run, or older than the `verify` freshness window. `release.yml`
 binds the result's gateway build to the revision's own checksum allowlist
 (`--gateway-allowlist`). Redaction happens at capture:
 `Harness.redact` over every captured stream keyed on the run's own secrets,

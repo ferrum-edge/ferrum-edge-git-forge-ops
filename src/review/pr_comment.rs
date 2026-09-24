@@ -663,6 +663,29 @@ fn append_omitted_two_column_row(md: &mut String, total: usize, label: &str) {
     }
 }
 
+/// Byte offset and text of every `### ` heading outside a fenced code block.
+fn section_headings(md: &str) -> Vec<(usize, &str)> {
+    let mut headings = Vec::new();
+    let mut open_fence: Option<usize> = None;
+    let mut offset = 0;
+    for line in md.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let ticks = trimmed.bytes().take_while(|byte| *byte == b'`').count();
+        match open_fence {
+            Some(width) if ticks >= width && trimmed.len() == ticks => open_fence = None,
+            Some(_) => {}
+            None if ticks >= 3 => open_fence = Some(ticks),
+            None => {
+                if let Some(text) = trimmed.strip_prefix("### ") {
+                    headings.push((offset, text));
+                }
+            }
+        }
+        offset += line.len();
+    }
+    headings
+}
+
 fn finalize_comment(md: String) -> String {
     if md.len() <= MAX_REVIEW_COMMENT_BYTES {
         return md;
@@ -687,22 +710,23 @@ fn finalize_comment(md: String) -> String {
         "Breaking Changes",
         "Security Findings",
         "Best Practice Recommendations",
+        "Ownership Adoption",
         "Unmanaged Resources",
         "Spec-owned Resources",
         "Policy Violations",
         "Credential Slot Remaps",
         "Secret Broker Slots",
     ];
+    // Real headings only: validator output is placed verbatim inside a fence
+    // ahead of every bulk section, so a `### Policy Violations` line inside it
+    // must not stand in for the section itself.
+    let headings = section_headings(&md);
     let omitted_sections: Vec<_> = sections
         .into_iter()
         .filter(|section| {
-            let heading = format!("\n### {section}");
-            md.find(&heading).is_some_and(|start| {
-                let next = md[start + heading.len()..]
-                    .find("\n### ")
-                    .map(|offset| start + heading.len() + offset)
-                    .unwrap_or(md.len());
-                next > end
+            headings.iter().enumerate().any(|(index, (_, text))| {
+                text.starts_with(section)
+                    && headings.get(index + 1).map_or(md.len(), |(next, _)| *next) > end
             })
         })
         .collect();
@@ -765,7 +789,7 @@ pub fn render_mesh_retraction(publication: MeshPublication, output_path: &str) -
             bounded_inline_code(output_path)
         ),
         MeshPublication::NarrowedScope => format!(
-            "**RETRACT mesh: skipped** — no `MeshConfig` fragment is in scope for this namespace-filtered review, which is not evidence that the repository declares none. {} is left as published.",
+            "**Mesh publication skipped** — this namespace-filtered review does not see every `MeshConfig` fragment the environment publishes, and the mesh document is mesh-wide. {} is left as published.",
             bounded_inline_code(output_path)
         ),
     };
@@ -1073,9 +1097,10 @@ pub fn build_review_comment_with_preview(
     if !secrets.slot_remaps.is_empty() {
         md.push_str("### Credential Slot Remaps\n\n");
         md.push_str(
-            "A credential array changed shape in a way that reassigns a stored broker slot. \
-             Slot identity is the entry's array index, so the entry that shifted into a vacated \
-             index has inherited a credential that was meant to be retired.\n\n",
+            "A Consumer credential or plugin-config array changed shape in a way that reassigns \
+             a stored broker slot. Slot identity is the entry's array index, so the entry that \
+             shifted into a vacated index has inherited a credential that was meant to be \
+             retired.\n\n",
         );
         for remap in secrets.slot_remaps.iter().take(MAX_SECTION_ITEMS) {
             md.push_str(&format!("- {}\n", bounded_markdown_text(remap)));
@@ -1083,9 +1108,10 @@ pub fn build_review_comment_with_preview(
         append_omitted_list_item(&mut md, secrets.slot_remaps.len(), "slot remap");
         md.push('\n');
         md.push_str(
-            "> **Apply is blocked.** Rotate the affected slot in place \
-             (`gitforgeops rotate --credential <type>/[N]/<key>`) before removing the entry, or \
-             re-run with `--allow-credential-slot-remap` to accept the reassignment.\n\n",
+            "> **Apply is blocked.** Rotate the affected Consumer slot in place \
+             (`gitforgeops rotate --credential <type>/[N]/<key>`) before removing the entry, \
+             reseed plugin-config slots and retire the orphaned slot from the credential bundle, \
+             or re-run with `--allow-credential-slot-remap` to accept the reassignment.\n\n",
         );
     }
 

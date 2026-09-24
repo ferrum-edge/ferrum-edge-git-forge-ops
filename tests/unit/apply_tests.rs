@@ -1178,6 +1178,58 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
     );
 }
 
+/// Issue #338: a pending row whose live copy carries a gateway-populated
+/// optional field is both an exact (subset) pending row and an ordinary
+/// Modify. It must be planned and written exactly once.
+#[tokio::test]
+async fn pending_assertion_is_not_duplicated_by_an_ordinary_modify() {
+    let desired = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", None)],
+        ..Default::default()
+    };
+    let mut live = desired.clone();
+    live.proxies[0].name = Some("gateway-populated".into());
+    let pending = std::collections::BTreeSet::from([state_key("team-alpha", "Proxy", "p1")]);
+
+    // The preview inputs: both halves name the same row ...
+    let assertions =
+        pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha").unwrap();
+    let ordinary = gitforgeops::diff::compute_diff(&desired, &live).unwrap();
+    assert_eq!(assertions.len(), 1);
+    assert_eq!(ordinary.len(), 1);
+    // ... and the shared filter keeps only the ordinary entry.
+    assert!(
+        gitforgeops::apply::dedupe_pending_assertions(&ordinary, assertions.clone()).is_empty()
+    );
+    assert_eq!(
+        gitforgeops::apply::dedupe_pending_assertions(&[], assertions).len(),
+        1,
+        "an assertion without an ordinary diff entry is kept"
+    );
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), live)])),
+        None,
+        &ApplyOptions {
+            pending_create_assertions: pending,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(mutation_lines(&requests), vec!["PUT /proxies/p1 HTTP/1.1"]);
+    assert_eq!(result.updated, 1);
+    assert_eq!(result.applied_incremental.len(), 1);
+    assert!(result.adopted.is_empty());
+}
+
 #[tokio::test]
 async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
     // A hand-authored resource carries no `created_at` / `updated_at`. Those
@@ -2465,8 +2517,138 @@ async fn failed_plugin_write_blocks_its_proxy_and_defers_pruning() {
         vec!["POST /plugins/config HTTP/1.1"]
     );
     assert_eq!(result.errors.len(), 2);
+    assert!(
+        result.errors[1].contains("Proxy p1 update")
+            && result.errors[1].contains("referenced PluginConfig pc1 failed to write"),
+        "{:?}",
+        result.errors
+    );
     assert_eq!(result.deletes_deferred, 1);
     assert!(result.applied_incremental.is_empty());
+    assert!(result.into_result().is_err());
+}
+
+/// Issue #337: in a mixed namespace a failed plugin write referenced by one
+/// new proxy withholds only that proxy's create group. An unrelated new
+/// proxy/scoped-plugin cycle still gets its transactional `POST /batch`.
+#[tokio::test]
+async fn failed_plugin_withholds_only_its_own_cyclic_create_group() {
+    let mut group = plugin_config("g1", "team-alpha", "unused", None);
+    group.scope = gitforgeops::config::schema::PluginScope::ProxyGroup;
+    group.proxy_id = None;
+    let mut proxy_a = proxy("pA", "team-alpha", None);
+    let mut proxy_b = proxy("pB", "team-alpha", None);
+    for (proxy, ids) in [
+        (&mut proxy_a, &["g1", "sA"][..]),
+        (&mut proxy_b, &["sB"][..]),
+    ] {
+        proxy.plugins = ids
+            .iter()
+            .map(|id| gitforgeops::config::schema::PluginAssociation {
+                plugin_config_id: (*id).into(),
+            })
+            .collect();
+    }
+    let existing = proxy("p0", "team-alpha", None);
+    let mut modified = existing.clone();
+    modified.backend_port = 9090; // Modify => the namespace is not pure-add.
+    let desired = GatewayConfig {
+        proxies: vec![modified, proxy_a, proxy_b],
+        plugin_configs: vec![
+            group,
+            plugin_config("sA", "team-alpha", "pA", None),
+            plugin_config("sB", "team-alpha", "pB", None),
+        ],
+        ..Default::default()
+    };
+    let actual = GatewayConfig {
+        proxies: vec![existing],
+        upstreams: vec![upstream("stale", "team-alpha")],
+        ..Default::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /batch".into(),
+            201,
+            r#"{"created":{"proxies":1,"consumers":0,"plugin_configs":1,"upstreams":0}}"#.into(),
+            vec![],
+        ),
+        (
+            r#""id":"g1""#.into(),
+            400,
+            r#"{"error":"invalid g1"}"#.into(),
+            vec![],
+        ),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        mutation_lines(&requests),
+        vec![
+            "POST /plugins/config HTTP/1.1",
+            "POST /batch HTTP/1.1",
+            "PUT /proxies/p0 HTTP/1.1",
+        ]
+    );
+    let batch_body: serde_json::Value = {
+        let requests = requests.lock().unwrap();
+        let batch = requests
+            .iter()
+            .find(|r| r.starts_with("POST /batch"))
+            .unwrap();
+        serde_json::from_str(batch.split_once("\r\n\r\n").unwrap().1).unwrap()
+    };
+    let ids = |section: &str| -> Vec<String> {
+        batch_body[section]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids("proxies"), vec!["pB"]);
+    assert_eq!(ids("plugin_configs"), vec!["sB"]);
+
+    let applied: Vec<_> = result
+        .applied_incremental
+        .iter()
+        .map(|op| format!("{} {}", op.kind, op.id))
+        .collect();
+    assert_eq!(
+        applied,
+        vec!["Proxy pB", "PluginConfig sB", "Proxy p0"],
+        "{:?}",
+        result.errors
+    );
+    assert_eq!(result.created, 2);
+    assert_eq!(result.updated, 1);
+    assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
+    assert!(
+        result.errors[0].starts_with("[team-alpha] PluginConfig g1 create"),
+        "{:?}",
+        result.errors
+    );
+    let blocked = &result.errors[1];
+    assert!(blocked.contains("Proxy pA create"), "{blocked}");
+    assert!(
+        blocked.contains("referenced PluginConfig g1 failed to write"),
+        "{blocked}"
+    );
+    assert!(blocked.contains("sA"), "{blocked}");
+    assert!(!blocked.contains("pB"), "{blocked}");
+    // The failed write still defers this namespace's prune.
+    assert_eq!(result.deletes_deferred, 1);
     assert!(result.into_result().is_err());
 }
 
@@ -3050,8 +3232,9 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
 
 fn ledger_of(ops: &[gitforgeops::apply::AppliedOp], desired: &GatewayConfig) -> StateFile {
     let mut state = StateFile::default();
+    let desired = gitforgeops::state::ResourceKeys::from_config(desired);
     for op in ops {
-        state.record_op(op, desired).expect("record adopted op");
+        state.record_op(op, &desired).expect("record adopted op");
     }
     state
 }
@@ -3194,8 +3377,9 @@ fn proxy_ledger(live: &GatewayConfig) -> StateFile {
 }
 
 fn record_prune_result(state: &mut StateFile, result: &ApplyResult, desired: &GatewayConfig) {
+    let desired = gitforgeops::state::ResourceKeys::from_config(desired);
     for op in result.applied_incremental.iter().chain(&result.adopted) {
-        state.record_op(op, desired).unwrap();
+        state.record_op(op, &desired).unwrap();
     }
 }
 
@@ -3954,6 +4138,35 @@ fn spec_owned_rows_are_never_adopted() {
         candidate_ids(&candidates),
         vec!["Upstream u1", "Proxy p1", "PluginConfig pc1"]
     );
+}
+
+/// Issue #340: live rows are looked up through a `(namespace, id)` index, so
+/// pairing is independent of live order and never crosses namespaces.
+#[test]
+fn adoption_pairs_live_rows_by_namespace_and_id_in_any_order() {
+    let desired = GatewayConfig {
+        upstreams: (0..200)
+            .map(|i| upstream(&format!("u{i:03}"), "team-alpha"))
+            .collect(),
+        ..Default::default()
+    };
+    let mut live = desired.clone();
+    live.upstreams.reverse();
+    // Same id in another namespace, and a differing row: neither may pair.
+    live.upstreams.push(upstream("u-other", "team-b"));
+    live.upstreams[0].targets.clear(); // u199 now differs.
+    let mut other_namespace_desired = upstream("u-other", "team-alpha");
+    other_namespace_desired.targets.clear();
+    let mut desired = desired;
+    desired.upstreams.push(other_namespace_desired);
+
+    let candidates =
+        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+    let ids = candidate_ids(&candidates);
+    assert_eq!(ids.len(), 199, "{ids:?}");
+    assert_eq!(ids.first().map(String::as_str), Some("Upstream u000"));
+    assert!(!ids.contains(&"Upstream u199".to_string()));
+    assert!(!ids.contains(&"Upstream u-other".to_string()));
 }
 
 #[test]

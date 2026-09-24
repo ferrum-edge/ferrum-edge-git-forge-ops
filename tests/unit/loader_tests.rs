@@ -134,11 +134,25 @@ fn loader_rejects_a_symlinked_resource_root() {
 
 #[test]
 fn load_skips_underscore_prefixed_files() {
-    let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    // A copy of the `_example.yaml` files the template ships under
+    // `resources/`. The live `resources/` tree is customer-owned, so a
+    // downstream copy that declares real resources must not break this test.
+    let example_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shipped-examples");
     let resources = load_resources(&example_dir).unwrap();
     assert!(
         resources.is_empty(),
         "files starting with _ should be skipped"
+    );
+
+    // The shipped examples are commented out, so also prove the skip holds
+    // for an underscore-prefixed file that declares a valid resource.
+    let tmp = tempfile::tempdir().unwrap();
+    write_resource(tmp.path(), "proxies", "_disabled.yaml", &minimal_proxy(""));
+    let resources = load_resources(tmp.path()).unwrap();
+    assert!(
+        resources.is_empty(),
+        "files starting with _ should be skipped even when they declare a resource"
     );
 }
 

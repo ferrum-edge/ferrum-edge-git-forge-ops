@@ -79,8 +79,11 @@ jobs:
             echo 'CANARY_EOF'
           } >>"$GITHUB_OUTPUT"
 
+      # `!cancelled()`: without a status function the condition is implicitly
+      # `success() && ...`, so a failed refresh after a failed install would
+      # skip this step exactly when the pairing is broken.
       - name: Open or update the tracking issue
-        if: steps.install.outputs.status != '0' || steps.verify.outputs.status != '0'
+        if: ${{ !cancelled() && (steps.install.outputs.status != '0' || steps.verify.outputs.status != '0') }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -109,8 +112,9 @@ jobs:
           $ALLOWLIST_LINE
           \`\`\`
 
-          If no line is shown, installation succeeded but label validation
-          failed. Do not re-approve the same incompatible build; select an
+          If no line is shown, either installation succeeded but label
+          validation failed, or computing the candidate line failed too (see
+          the canary log). Do not re-approve the same incompatible build; select an
           upstream build with resource-label support. Regenerate a candidate:
 
           \`\`\`bash
@@ -153,7 +157,7 @@ jobs:
           fi
 
       - name: Fail when the validator pairing is invalid
-        if: steps.install.outputs.status != '0' || steps.verify.outputs.status != '0'
+        if: ${{ !cancelled() && (steps.install.outputs.status != '0' || steps.verify.outputs.status != '0') }}
         run: |
           echo "::error::The reviewed validator digest or resource-label compatibility check failed; see the tracking issue."
           exit 1

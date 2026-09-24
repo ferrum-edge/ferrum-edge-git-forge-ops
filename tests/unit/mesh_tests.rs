@@ -115,14 +115,13 @@ fn loader_keeps_explicit_fragment_id_over_file_stem() {
 
 #[test]
 fn repo_example_mesh_fragment_is_fully_commented_out() {
-    // `resources/ferrum/mesh/_example.yaml` ships in the repo. It is skipped
-    // by the `_` convention, but it must also parse as nothing if someone
-    // renames it without editing — an example that silently declares a mesh
-    // would be worse than one that errors.
-    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ferrum/mesh");
-    assert!(example.join("_example.yaml").is_file());
-    let resources =
-        load_resources(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")).unwrap();
+    // `resources/ferrum/mesh/_example.yaml` ships in the template and is
+    // skipped by the `_` convention. The fixture is a copy of it: the live
+    // `resources/` tree is customer-owned, so a downstream copy that declares
+    // real mesh fragments must not break this test.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shipped-examples");
+    assert!(root.join("ferrum/mesh/_example.yaml").is_file());
+    let resources = load_resources(&root).unwrap();
     assert!(
         !resources
             .iter()
@@ -978,6 +977,27 @@ fn a_namespace_filtered_run_never_retracts() {
 }
 
 #[test]
+fn a_namespace_filtered_run_never_publishes_a_subset_over_the_document() {
+    // The mesh document is mesh-wide: a run that selected only one
+    // namespace's fragments must not replace every other namespace's policy.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("mesh.yaml");
+    let path = target.to_str().unwrap();
+    apply_mesh_file(&one_workload(), path).unwrap();
+    let before = read(&target);
+
+    let narrowed = MeshRetractionScope {
+        ledger_attributed: true,
+        covers_repository: false,
+    };
+    let subset = MeshConfigSpec::default();
+    let publication = reconcile_mesh_file(Some(&subset), path, narrowed);
+
+    assert_eq!(publication.unwrap(), MeshPublication::NarrowedScope);
+    assert_eq!(read(&target), before);
+}
+
+#[test]
 fn planning_a_publication_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("mesh.yaml");
@@ -1228,11 +1248,17 @@ fn cli_namespace_filtered_runs_never_retract() {
     let published = repo.published_mesh();
 
     // `edge` declares nothing at all, so the filtered run selects no fragment
-    // — which is not evidence that the repository declares none.
+    // — which is not evidence that the repository declares none. The run is
+    // refused before it can touch either document-wide file (it would also
+    // have published an empty gateway document).
     let only_edge = [("FERRUM_NAMESPACE", "edge")];
-    let filtered = repo.run(&["apply", "--auto-approve"], &only_edge);
+    let (success, filtered) = repo.try_run(&["apply", "--auto-approve"], &only_edge);
 
-    assert!(filtered.contains("namespace-filtered run"), "{filtered}");
+    assert!(!success, "{filtered}");
+    assert!(
+        filtered.contains("selected 0 desired resources"),
+        "{filtered}"
+    );
     assert_eq!(repo.published_mesh(), published);
 }
 
@@ -1324,5 +1350,157 @@ fn an_invalid_mesh_document_is_still_rejected_under_the_validation_context() {
     assert!(
         !repo.mesh_document().exists(),
         "a refused apply must publish nothing"
+    );
+}
+
+/// Two fragments in one directory namespace sharing a fragment id used to
+/// merge silently (with an ambiguous diagnostic label) and fail only once an
+/// overlay was configured. The loader now rejects them up front, naming both
+/// files, with or without an overlay.
+#[test]
+fn duplicate_mesh_fragment_ids_in_one_namespace_are_rejected_without_an_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            (
+                "ferrum/mesh/a.yaml",
+                "kind: MeshConfig\nid: core\nspec:\n  istio_root_namespace: istio-system\n",
+            ),
+            (
+                "ferrum/mesh/b.yaml",
+                "kind: MeshConfig\nid: core\nspec:\n  mesh_policies: [{name: p}]\n",
+            ),
+        ],
+    );
+
+    let err = load_resources(tmp.path())
+        .expect_err("duplicate fragment id must be rejected")
+        .to_string();
+    assert!(
+        err.contains("duplicate MeshConfig fragment ferrum/mesh/core"),
+        "{err}"
+    );
+    assert!(err.contains("a.yaml") && err.contains("b.yaml"), "{err}");
+}
+
+/// An `id` that collides with another fragment's file stem is the same
+/// overlay target, so it is a duplicate too.
+#[test]
+fn explicit_mesh_fragment_id_colliding_with_a_file_stem_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            ("ferrum/mesh/core.yaml", CORE_FRAGMENT),
+            (
+                "ferrum/mesh/extra.yaml",
+                "kind: MeshConfig\nid: core\nspec:\n  mesh_policies: [{name: p}]\n",
+            ),
+        ],
+    );
+    let err = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("core.yaml") && err.contains("extra.yaml"),
+        "{err}"
+    );
+}
+
+/// The same fragment id in two different directory namespaces is two
+/// distinct overlay targets and stays allowed.
+#[test]
+fn same_mesh_fragment_id_in_different_namespaces_is_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            (
+                "alpha/mesh/core.yaml",
+                "kind: MeshConfig\nspec:\n  mesh_policies: [{name: a}]\n",
+            ),
+            (
+                "beta/mesh/core.yaml",
+                "kind: MeshConfig\nspec:\n  mesh_policies: [{name: b}]\n",
+            ),
+        ],
+    );
+    let resources = load_resources(tmp.path()).unwrap();
+    assert_eq!(resources.len(), 2);
+    assert!(assemble(resources).is_ok());
+}
+
+/// Callers that build resources without the loader get the same refusal at
+/// assembly time.
+#[test]
+fn assemble_rejects_duplicate_mesh_fragment_ids() {
+    let fragment = |policy: &str| {
+        serde_yaml::from_str::<Resource>(&format!(
+            "kind: MeshConfig\nid: core\nspec:\n  mesh_policies: [{{name: {policy}}}]\n"
+        ))
+        .unwrap()
+    };
+    let err = assemble(vec![
+        ("ferrum".to_string(), fragment("a")),
+        ("ferrum".to_string(), fragment("b")),
+    ])
+    .expect_err("duplicate fragment id must be rejected")
+    .to_string();
+    assert!(
+        err.contains("duplicate MeshConfig fragment ferrum/mesh/core"),
+        "{err}"
+    );
+}
+
+/// The identity index behind workload/service merging must keep first-seen
+/// order, deduplicate deep-equal repeats across many fragments, append
+/// identity-less entries unchecked, and still name the defining fragment on a
+/// conflict found deep into a large merge.
+#[test]
+fn identified_mesh_merge_preserves_order_and_conflicts_across_many_fragments() {
+    use gitforgeops::config::merge_mesh_fragments;
+
+    let workload = |f: usize, i: usize| serde_json::json!({"spiffe_id": format!("spiffe://td/ns/f{f}/sa/w{i}")});
+    let fragments: Vec<(String, MeshConfigSpec)> = (0..4)
+        .map(|f| {
+            let mut workloads: Vec<serde_json::Value> = (0..250).map(|i| workload(f, i)).collect();
+            // Every fragment repeats fragment 0's first entry verbatim and
+            // carries one entry with no identity.
+            workloads.push(workload(0, 0));
+            workloads.push(serde_json::json!({"service_name": format!("anon-{f}")}));
+            (
+                format!("ferrum/mesh/frag{f}"),
+                MeshConfigSpec {
+                    workloads,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+
+    let merged = merge_mesh_fragments(fragments.clone())
+        .unwrap()
+        .expect("mesh document");
+    let mut expected = Vec::new();
+    for f in 0..4 {
+        expected.extend((0..250).map(|i| workload(f, i)));
+        expected.push(serde_json::json!({"service_name": format!("anon-{f}")}));
+    }
+    assert_eq!(merged.workloads, expected);
+
+    let mut conflicting = fragments;
+    conflicting.push((
+        "ferrum/mesh/late".to_string(),
+        MeshConfigSpec {
+            workloads: vec![serde_json::json!({
+                "spiffe_id": "spiffe://td/ns/f2/sa/w199",
+                "service_name": "different",
+            })],
+            ..Default::default()
+        },
+    ));
+    let err = merge_mesh_fragments(conflicting).unwrap_err().to_string();
+    assert!(
+        err.contains("fragment ferrum/mesh/frag2 and fragment ferrum/mesh/late"),
+        "{err}"
     );
 }
