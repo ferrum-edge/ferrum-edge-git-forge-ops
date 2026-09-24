@@ -357,6 +357,16 @@ impl AdminClient {
     /// an apply failure. Database/file-mode gateways answer with an
     /// informational `{mode, message}` rather than an error.
     pub async fn get_cluster(&self) -> crate::error::Result<ClusterStatus> {
+        let body = self.get_cluster_body().await?;
+        parse_cluster_status(&body)
+    }
+
+    /// `GET /cluster` up to, but not including, parsing the body.
+    ///
+    /// Separates "the gateway accepted the token" (a 2xx) from "the body is a
+    /// shape this build does not model", which `get_cluster` folds into one
+    /// error. `doctor` needs the first answer even when the second fails.
+    pub async fn get_cluster_body(&self) -> crate::error::Result<String> {
         let token = self.token()?;
         let resp = self
             .send_with_retry(RequestKind::Read, || {
@@ -364,8 +374,7 @@ impl AdminClient {
             })
             .await?;
         self.check(&resp, RequestKind::Read)?;
-        serde_json::from_str::<ClusterStatus>(&resp.body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /cluster: {e}")))
+        Ok(resp.body)
     }
 
     /// Fetch the namespace's live configuration plus the backup-only sections
@@ -2010,6 +2019,12 @@ impl ClusterStatus {
                 .and_then(|cp| cp.config_diverged)
                 == Some(true)
     }
+}
+
+/// Parse a `GET /cluster` body.
+pub fn parse_cluster_status(body: &str) -> crate::error::Result<ClusterStatus> {
+    serde_json::from_str::<ClusterStatus>(body)
+        .map_err(|e| crate::error::Error::HttpClient(format!("GET /cluster: {e}")))
 }
 
 /// One-line post-apply convergence report.
