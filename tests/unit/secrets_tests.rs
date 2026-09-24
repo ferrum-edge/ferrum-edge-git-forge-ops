@@ -2101,12 +2101,15 @@ fn omitted_credential_type_is_refused_like_an_empty_array() {
     };
 
     let bundle = retired_partner_key_bundle();
-    for credentials in [
-        serde_json::json!({"keyauth": []}),
-        serde_json::json!({}),
-        serde_json::json!({"jwt": [{"secret": REQUIRE}]}),
+    for (case, declared) in [
+        ("empty keyauth array", serde_json::json!({"keyauth": []})),
+        ("no credential types", serde_json::json!({})),
+        (
+            "only jwt",
+            serde_json::json!({"jwt": [{"secret": REQUIRE}]}),
+        ),
     ] {
-        let cfg = partner_cfg(credentials.clone());
+        let cfg = partner_cfg(declared);
         let err = report_secrets_with_mode_and_options(
             &cfg,
             &bundle,
@@ -2116,14 +2119,14 @@ fn omitted_credential_type_is_refused_like_an_empty_array() {
         .expect_err("a stored slot the consumer no longer declares must not resolve silently");
         assert!(
             matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
-            "{credentials}"
+            "{case}"
         );
         let err = err.to_string();
         assert!(
             err.contains("ferrum/partner/keyauth/key")
                 && err.contains("ferrum/partner/keyauth/[1]/key")
                 && err.contains("orphaned"),
-            "{credentials}"
+            "{case}"
         );
         assert!(err.contains("--allow-credential-slot-remap"));
         assert!(
@@ -2140,7 +2143,7 @@ fn omitted_credential_type_is_refused_like_an_empty_array() {
                 ResolveOptions::default(),
             )
             .is_err(),
-            "{credentials}: resolve must refuse what report refuses"
+            "{case}: resolve must refuse what report refuses"
         );
     }
 }
