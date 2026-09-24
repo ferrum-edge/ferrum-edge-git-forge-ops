@@ -510,6 +510,55 @@ async fn allocate_and_deliver_puts_the_sealed_bundle_for_a_new_slot() {
         .expect("allocator encrypted_value is standard base64");
 }
 
+/// A lenient report can carry an `alloc=generate` endpoint slot straight to
+/// the allocator. The batch validation must refuse it before any GitHub
+/// request, with the same verdict the strict resolver gives at plan time.
+#[tokio::test]
+async fn allocate_and_deliver_refuses_to_generate_a_plugin_endpoint_before_github() {
+    let (api_base, requests) = spawn_github_stub(success_routes(204));
+    let cfg: gitforgeops::config::schema::GatewayConfig =
+        serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "plugin_configs": [{
+                "id": "ldap",
+                "namespace": "ferrum",
+                "plugin_name": "ldap_auth",
+                "scope": "global",
+                "config": {"ldap_url": "${gh-env-secret:alloc=generate}"}
+            }]
+        }))
+        .unwrap();
+    let report = gitforgeops::secrets::report_secrets_lenient(&cfg, &BTreeMap::new())
+        .expect("the lenient walk reports instead of refusing");
+    assert_eq!(report.needs_allocation().len(), 1);
+    let mut shards = BTreeMap::new();
+    let mut shard_count = 1;
+    let failure = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        None,
+        &report,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect_err("an endpoint URL cannot be generated");
+    assert!(
+        failure.source.to_string().contains("endpoint"),
+        "{}",
+        failure.source
+    );
+    assert!(failure.partial.allocated.is_empty());
+    assert!(shards.is_empty());
+    assert!(
+        requests.lock().expect("recorded").is_empty(),
+        "a refused batch must not reach GitHub"
+    );
+}
+
 #[tokio::test]
 async fn allocate_and_deliver_maps_a_forbidden_public_key_fetch() {
     let (api_base, _) = spawn_github_stub(error_routes(

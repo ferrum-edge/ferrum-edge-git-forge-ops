@@ -779,7 +779,12 @@ Generation constraints, shared by `resolver::check_generation_allowed` and the
 allocator so `plan` and generation cannot disagree: `jwt`/`hmac_auth` secrets
 need ≥32 chars (`len=` ≥ 24 entropy bytes); `basicauth` generation is refused in file mode and
 `basicauth/…/password_hash` in either mode (the hash is HMAC-SHA256 under the
-gateway's own secret); a bundle value of `[REDACTED]` is refused.
+gateway's own secret); a plugin-config endpoint leaf
+(`secrets::plugin_config::endpoint_paths`, e.g. `ldap_auth.ldap_url`) is
+refused because random bytes have no scheme or host; a bundle value of
+`[REDACTED]` is refused. The endpoint rule needs the plugin name, so the plugin
+walks record endpoint slots in `ResolveReport::endpoint_slots` and the
+allocator validates its batch with `ResolveReport::check_generation_allowed_for`.
 
 The allocator validates the entire candidate batch before GitHub key discovery,
 including direct callers and lenient reports. Structural types must agree with

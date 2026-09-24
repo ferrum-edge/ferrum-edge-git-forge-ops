@@ -942,6 +942,7 @@ Generation constraints are shared by the resolver and allocator: `plan` checks p
 - `jwt` / `hmac_auth` need ≥32-character secrets, so `len=` must be at least 24 entropy bytes. The default `len=32` yields 43 base64url characters.
 - `basicauth` in **file mode** is refused: a file-mode gateway requires `password_hash`, and that hash is an HMAC-SHA256 under the gateway's own `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not have. Set the hash by hand, or use api mode where the admin API hashes a plaintext password on write.
 - `basicauth/…/password_hash` is refused in either mode, for the same reason.
+- A plugin-config **endpoint** (a leaf the plugin's schema rules declare as a URL, URI or DSN — `ldap_auth.ldap_url`, a `redis_url`, an OIDC `discovery_url`) is refused: a generated value is a random token with no scheme or host. Write `alloc=require` and seed the real endpoint.
 - A bundle value of `[REDACTED]` is refused — that is what a plain `GET /consumers/…` returns for `keyauth`/`jwt`/`hmac_auth` secrets, so a bundle holding it was seeded from the wrong endpoint. Re-seed from `GET /backup` or rotate the slot.
 - `mtls_auth.identity` and `basicauth.username` are public identities: supply them literally. Broker placeholders are refused even with `alloc=require` and a seeded bundle, in both gateway modes and inspect-only previews. They cannot be generated or rotated.
 

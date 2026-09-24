@@ -4,7 +4,9 @@ use crate::diagnostics::safe_line;
 
 use super::bundle::CredentialBundle;
 use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
-use super::plugin_config::{classify_plugin_config, render_config_path, ConfigPathComponent};
+use super::plugin_config::{
+    classify_plugin_config, endpoint_paths, render_config_path, ConfigPathComponent,
+};
 use super::service_discovery::{
     self, SdSecretField, SD_SECRET_FIELDS, SERVICE_DISCOVERY_SLOT_KIND,
 };
@@ -155,9 +157,37 @@ pub struct ResolveReport {
     /// string-splitting the slot back apart; see
     /// [`crate::secrets::allocator::generate_credential_value_typed`].
     pub slot_credential_types: std::collections::BTreeMap<String, String>,
+    /// Plugin-config slots whose leaf the plugin's schema rules classify as an
+    /// **endpoint** (a URL, URI or DSN the gateway parses, see
+    /// [`crate::secrets::plugin_config::endpoint_paths`]).
+    ///
+    /// Captured while walking, where the plugin name is known; the allocator
+    /// only sees slot strings, so this is how it applies the same
+    /// endpoint-generation refusal the resolver applies at plan time
+    /// ([`Self::check_generation_allowed_for`]).
+    pub endpoint_slots: std::collections::BTreeSet<String>,
 }
 
 impl ResolveReport {
+    /// The complete generation policy for one entry of this report: the
+    /// shared slot-string policy ([`check_generation_allowed`]) plus the
+    /// structural facts only the walk could capture (credential type and
+    /// endpoint classification). The allocator validates its whole batch with
+    /// this, so `plan` and allocation reach the same verdict.
+    pub fn check_generation_allowed_for(
+        &self,
+        result: &ResolveResult,
+        mode: &GatewayMode,
+    ) -> crate::error::Result<()> {
+        check_generation_allowed(
+            &result.slot,
+            self.credential_type_for(&result.slot),
+            result.placeholder.length_bytes,
+            mode,
+        )?;
+        check_endpoint_generation(&result.slot, self.endpoint_slots.contains(&result.slot))
+    }
+
     /// Explain comparison uncertainty without claiming the entire bundle is absent.
     pub fn unresolved_comparison_note(&self) -> Option<String> {
         let count = self
@@ -1018,15 +1048,17 @@ fn report_secrets_with_mode_inner(
         }
     }
     for plugin in &cfg.plugin_configs {
-        let mut path = Vec::new();
-        walk_plugin_and_report(
-            &plugin.config,
+        let walk = PluginWalk::new(
             &plugin.namespace,
             &plugin.id,
-            &mut path,
+            &plugin.plugin_name,
+            &plugin.config,
             bundle,
-            &mut report,
-        )?;
+            &mode,
+            constraints,
+        );
+        let mut path = Vec::new();
+        walk_plugin_and_report(&plugin.config, &walk, &mut path, &mut report)?;
     }
     for upstream in &cfg.upstreams {
         let Some(discovery) = upstream.service_discovery.as_ref() else {
@@ -1148,17 +1180,17 @@ fn resolve_secrets_in_place(
     }
 
     for plugin in cfg.plugin_configs.iter_mut() {
-        let namespace = plugin.namespace.clone();
-        let plugin_id = plugin.id.clone();
-        let mut path = Vec::new();
-        walk_plugin_report_and_replace(
-            &mut plugin.config,
-            &namespace,
-            &plugin_id,
-            &mut path,
+        let walk = PluginWalk::new(
+            &plugin.namespace,
+            &plugin.id,
+            &plugin.plugin_name,
+            &plugin.config,
             bundle,
-            &mut report,
-        )?;
+            &mode,
+            ConstraintMode::Enforce,
+        );
+        let mut path = Vec::new();
+        walk_plugin_report_and_replace(&mut plugin.config, &walk, &mut path, &mut report)?;
     }
 
     for upstream in cfg.upstreams.iter_mut() {
@@ -1324,6 +1356,25 @@ pub fn check_generation_allowed(
     }
 
     Ok(())
+}
+
+/// Refuse `alloc=generate` / `alloc=rotate` for a plugin-config endpoint leaf.
+///
+/// An endpoint (`ldap_auth.ldap_url`, a Redis URL, a discovery document) is
+/// brokered because it can carry userinfo or an internal host, but the
+/// broker's output is a schemeless base64url token: the gateway would reject
+/// it as a malformed URL or, worse, parse it as a relative reference. Only the
+/// operator knows the real endpoint, so it must be seeded (`alloc=require`).
+/// An already-seeded slot never reaches this check.
+pub(crate) fn check_endpoint_generation(slot: &str, endpoint: bool) -> crate::error::Result<()> {
+    if !endpoint {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "plugin config slot '{slot}': the broker cannot generate an endpoint URL — generated \
+         values are random tokens with no scheme or host. Use \
+         '${{gh-env-secret:alloc=require}}' and seed the slot with the real endpoint."
+    )))
 }
 
 /// The one implementation of ferrum-edge's ≥32-character secret floor for
@@ -1727,46 +1778,117 @@ fn resolve_service_discovery_leaf(
     Ok(existing.cloned())
 }
 
+/// Per-plugin context shared by the read-only and mutating plugin walks.
+struct PluginWalk<'a> {
+    namespace: &'a str,
+    plugin_id: &'a str,
+    /// Rule-declared endpoint leaves of this plugin
+    /// ([`crate::secrets::plugin_config::endpoint_paths`]), classified before
+    /// any leaf is replaced; replacing a string never moves a path.
+    endpoints: std::collections::BTreeSet<Vec<ConfigPathComponent>>,
+    bundle: &'a CredentialBundle,
+    mode: &'a GatewayMode,
+    constraints: ConstraintMode,
+}
+
+impl<'a> PluginWalk<'a> {
+    fn new(
+        namespace: &'a str,
+        plugin_id: &'a str,
+        plugin_name: &str,
+        config: &serde_json::Value,
+        bundle: &'a CredentialBundle,
+        mode: &'a GatewayMode,
+        constraints: ConstraintMode,
+    ) -> Self {
+        Self {
+            namespace,
+            plugin_id,
+            endpoints: endpoint_paths(plugin_name, config),
+            bundle,
+            mode,
+            constraints,
+        }
+    }
+
+    /// Report one plugin-config string leaf. Returns the bundle value when
+    /// the leaf is a placeholder with a stored value, so the mutating walk can
+    /// write it back.
+    ///
+    /// Shared by both walks so the slot, the status and the generation
+    /// verdict cannot differ between `plan` and `apply`.
+    fn report_leaf(
+        &self,
+        text: &str,
+        path: &[ConfigPathComponent],
+        report: &mut ResolveReport,
+    ) -> crate::error::Result<Option<String>> {
+        let Some(parsed) = parse_placeholder(text) else {
+            return Ok(None);
+        };
+        let placeholder = parsed?;
+        let slot = plugin_config_slot(self.namespace, self.plugin_id, path);
+        let existing = lookup_exact_slot_value(&slot, self.bundle)?;
+        let status = classify_status(&placeholder, existing);
+        let endpoint = self.endpoints.contains(path);
+        if matches!(self.constraints, ConstraintMode::Enforce)
+            && matches!(status, SlotStatus::NeedsAllocation)
+        {
+            check_generation_allowed(
+                &slot,
+                Some(PLUGIN_CONFIG_SLOT_KIND),
+                placeholder.length_bytes,
+                self.mode,
+            )?;
+            check_endpoint_generation(&slot, endpoint)?;
+        }
+        if endpoint {
+            report.endpoint_slots.insert(slot.clone());
+        }
+        report
+            .slot_credential_types
+            .insert(slot.clone(), PLUGIN_CONFIG_SLOT_KIND.to_string());
+        report.results.push(ResolveResult {
+            consumer_id: self.plugin_id.to_string(),
+            namespace: self.namespace.to_string(),
+            cred_key: plugin_config_cred_key(path),
+            slot,
+            placeholder,
+            status,
+        });
+        Ok(existing.cloned())
+    }
+}
+
 fn walk_plugin_and_report(
     value: &serde_json::Value,
-    namespace: &str,
-    plugin_id: &str,
+    walk: &PluginWalk<'_>,
     path: &mut Vec<ConfigPathComponent>,
-    bundle: &CredentialBundle,
     report: &mut ResolveReport,
 ) -> crate::error::Result<()> {
     match value {
         serde_json::Value::String(text) => {
-            if let Some(parsed) = parse_placeholder(text) {
-                let placeholder = parsed?;
-                let slot = plugin_config_slot(namespace, plugin_id, path);
-                let existing = lookup_exact_slot_value(&slot, bundle)?;
-                let status = classify_status(&placeholder, existing);
-                report
-                    .slot_credential_types
-                    .insert(slot.clone(), PLUGIN_CONFIG_SLOT_KIND.to_string());
-                report.results.push(ResolveResult {
-                    consumer_id: plugin_id.to_string(),
-                    namespace: namespace.to_string(),
-                    cred_key: plugin_config_cred_key(path),
-                    slot,
-                    placeholder,
-                    status,
-                });
-            }
+            walk.report_leaf(text, path, report)?;
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map {
                 path.push(ConfigPathComponent::Key(key.clone()));
-                walk_plugin_and_report(child, namespace, plugin_id, path, bundle, report)?;
+                walk_plugin_and_report(child, walk, path, report)?;
                 path.pop();
             }
         }
         serde_json::Value::Array(items) => {
-            check_plugin_array_slot_identity(namespace, plugin_id, path, items, bundle, report);
+            check_plugin_array_slot_identity(
+                walk.namespace,
+                walk.plugin_id,
+                path,
+                items,
+                walk.bundle,
+                report,
+            );
             for (index, child) in items.iter().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
-                walk_plugin_and_report(child, namespace, plugin_id, path, bundle, report)?;
+                walk_plugin_and_report(child, walk, path, report)?;
                 path.pop();
             }
         }
@@ -1850,47 +1972,35 @@ fn walk_report_and_replace<'a>(
 
 fn walk_plugin_report_and_replace(
     value: &mut serde_json::Value,
-    namespace: &str,
-    plugin_id: &str,
+    walk: &PluginWalk<'_>,
     path: &mut Vec<ConfigPathComponent>,
-    bundle: &CredentialBundle,
     report: &mut ResolveReport,
 ) -> crate::error::Result<()> {
     match value {
         serde_json::Value::String(text) => {
-            if let Some(parsed) = parse_placeholder(text) {
-                let placeholder = parsed?;
-                let slot = plugin_config_slot(namespace, plugin_id, path);
-                let existing = lookup_exact_slot_value(&slot, bundle)?;
-                let status = classify_status(&placeholder, existing);
-                report
-                    .slot_credential_types
-                    .insert(slot.clone(), PLUGIN_CONFIG_SLOT_KIND.to_string());
-                report.results.push(ResolveResult {
-                    consumer_id: plugin_id.to_string(),
-                    namespace: namespace.to_string(),
-                    cred_key: plugin_config_cred_key(path),
-                    slot,
-                    placeholder,
-                    status,
-                });
-                if let Some(replacement) = existing {
-                    *text = replacement.clone();
-                }
+            if let Some(replacement) = walk.report_leaf(text, path, report)? {
+                *text = replacement;
             }
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 path.push(ConfigPathComponent::Key(key.clone()));
-                walk_plugin_report_and_replace(child, namespace, plugin_id, path, bundle, report)?;
+                walk_plugin_report_and_replace(child, walk, path, report)?;
                 path.pop();
             }
         }
         serde_json::Value::Array(items) => {
-            check_plugin_array_slot_identity(namespace, plugin_id, path, items, bundle, report);
+            check_plugin_array_slot_identity(
+                walk.namespace,
+                walk.plugin_id,
+                path,
+                items,
+                walk.bundle,
+                report,
+            );
             for (index, child) in items.iter_mut().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
-                walk_plugin_report_and_replace(child, namespace, plugin_id, path, bundle, report)?;
+                walk_plugin_report_and_replace(child, walk, path, report)?;
                 path.pop();
             }
         }

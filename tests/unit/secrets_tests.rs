@@ -2186,6 +2186,128 @@ fn plugin_config_array_without_orphaned_index_slots_is_not_a_remap() {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
 
+// --- Plugin-config endpoint generation (#329) -------------------------------
+
+const LDAP_URL_SLOT: &str = "ferrum/ldap/@plugin-config/config/ldap_url";
+
+fn ldap_cfg(ldap_url: &str) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "ldap",
+            "namespace": "ferrum",
+            "plugin_name": "ldap_auth",
+            "scope": "global",
+            "config": {
+                "ldap_url": ldap_url,
+                "service_account_password": GENERATE
+            }
+        }]
+    }))
+    .unwrap()
+}
+
+/// `ldap_auth.ldap_url` is a rule-declared endpoint. Random base64url has no
+/// scheme or host, so generation is refused at plan time in both walks.
+#[test]
+fn generate_on_a_plugin_endpoint_field_is_refused_at_resolve_time() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    for placeholder in [GENERATE, "${gh-env-secret:alloc=rotate}"] {
+        let cfg = ldap_cfg(placeholder);
+        let err = report_secrets_with_mode_and_options(
+            &cfg,
+            &BTreeMap::new(),
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .expect_err("an endpoint URL cannot be generated")
+        .to_string();
+        assert!(
+            err.contains(LDAP_URL_SLOT) && err.contains("endpoint"),
+            "{err}"
+        );
+        assert!(err.contains("alloc=require"), "{err}");
+
+        let mut resolved = cfg.clone();
+        assert!(resolve_secrets_with_mode_and_options(
+            &mut resolved,
+            &BTreeMap::new(),
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .is_err());
+    }
+}
+
+/// The lenient walk (rotate preflight) reports instead of refusing, but the
+/// report still carries the endpoint classification so the shared
+/// per-entry policy — what the allocator runs — refuses the same slot.
+#[test]
+fn lenient_report_carries_the_endpoint_refusal_to_the_allocator_policy() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::report_secrets_lenient;
+
+    let cfg = ldap_cfg(GENERATE);
+    let report = report_secrets_lenient(&cfg, &BTreeMap::new()).expect("lenient");
+    assert!(report.endpoint_slots.contains(LDAP_URL_SLOT));
+
+    let endpoint = report
+        .results
+        .iter()
+        .find(|r| r.slot == LDAP_URL_SLOT)
+        .expect("endpoint slot reported");
+    assert_eq!(endpoint.status, SlotStatus::NeedsAllocation);
+    let err = report
+        .check_generation_allowed_for(endpoint, &GatewayMode::Api)
+        .expect_err("the allocator policy refuses the endpoint too")
+        .to_string();
+    assert!(err.contains("endpoint"), "{err}");
+
+    // An opaque secret on the same plugin is still generatable.
+    let password = report
+        .results
+        .iter()
+        .find(|r| r.slot.ends_with("/service_account_password"))
+        .expect("password slot reported");
+    report
+        .check_generation_allowed_for(password, &GatewayMode::Api)
+        .expect("opaque plugin secrets stay generatable");
+}
+
+/// An already-seeded endpoint slot resolves whatever its allocation mode says.
+#[test]
+fn seeded_plugin_endpoint_resolves_regardless_of_allocation_mode() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        LDAP_URL_SLOT.to_string(),
+        "ldaps://svc:pw@ldap.internal.example:636".to_string(),
+    );
+    bundle.insert(
+        "ferrum/ldap/@plugin-config/config/service_account_password".to_string(),
+        "seeded-service-account-password".to_string(),
+    );
+    let mut cfg = ldap_cfg(GENERATE);
+    let report = resolve_secrets_with_mode_and_options(
+        &mut cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("a seeded endpoint slot never reaches the generation check");
+    assert!(report.needs_allocation().is_empty());
+    assert_eq!(
+        cfg.plugin_configs[0].config["ldap_url"],
+        "ldaps://svc:pw@ldap.internal.example:636"
+    );
+}
+
 // --- Structured credential type plumbing (G7) -------------------------------
 
 /// The report captures the credential type as a slot *component*, so the
