@@ -457,7 +457,9 @@ fn resolve_credentials(
         Some(ledger) => options.with_consumer_ledger(ledger),
         None => options,
     };
-    Ok(secrets::resolve_secrets_with_options(cfg, &bundle, options)?)
+    Ok(secrets::resolve_secrets_with_options(
+        cfg, &bundle, options,
+    )?)
 }
 
 /// The state-ledger evidence the resolver needs to catch a retired Consumer's
@@ -737,7 +739,7 @@ async fn allocate_if_needed(
     report: &secrets::ResolveReport,
     per_shard: &mut BTreeMap<u32, secrets::CredentialBundle>,
     shard_count: &mut u32,
-    resolve_options: secrets::ResolveOptions,
+    resolve_options: secrets::ResolveOptions<'_>,
 ) -> Result<Option<secrets::AllocateOutcome>, Box<dyn std::error::Error>> {
     if report.needs_allocation().is_empty() {
         return Ok(None);
@@ -1309,7 +1311,7 @@ async fn cmd_export(
     materialize: bool,
     encrypt_to: Option<&str>,
     explicit_env: Option<&str>,
-    resolve_options: secrets::ResolveOptions,
+    resolve_options: secrets::ResolveOptions<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if encrypt_to.is_some() && !materialize {
         return Err(
@@ -2198,7 +2200,7 @@ async fn cmd_apply(
     confirm_api_spec_deletion: bool,
     allow_nontransactional_plugin_attach: bool,
     explicit_env: Option<&str>,
-    resolve_options: secrets::ResolveOptions,
+    resolve_options: secrets::ResolveOptions<'_>,
     allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
@@ -3751,7 +3753,7 @@ async fn cmd_rotate(
     namespace: Option<&str>,
     recipient: Option<&str>,
     explicit_env: Option<&str>,
-    resolve_options: secrets::ResolveOptions,
+    resolve_options: secrets::ResolveOptions<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     // Validate the whole desired input before reading a bundle or creating a
@@ -4003,7 +4005,7 @@ async fn push_rotated_consumer_to_gateway(
     per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
     namespace: &str,
     consumer_id: &str,
-    resolve_options: secrets::ResolveOptions,
+    resolve_options: secrets::ResolveOptions<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut desired = GatewayConfig {
         consumers: desired_snapshot
