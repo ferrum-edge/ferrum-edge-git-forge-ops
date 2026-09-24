@@ -56,8 +56,10 @@ from pathlib import Path
 #   resources/, overlays/, .gitforgeops/  desired configuration, environment
 #                                         routing and enforceable policy
 #   src/, build.rs, Cargo.*,              the gitforgeops binary this job
-#   rust-toolchain.toml, .cargo/          installs with `cargo install --path .`
-#                                         (`.cargo/config.toml` can set
+#   rust-toolchain[.toml], .cargo/        installs with `cargo install --path .`
+#                                         (rustup prefers the legacy
+#                                         `rust-toolchain` file when both
+#                                         exist; `.cargo/config.toml` can set
 #                                         rustflags, env and source replacement)
 #   .github/scripts/                      helper programs the job executes
 #                                         (credential loading, installer,
@@ -78,6 +80,7 @@ DEPLOYMENT_INPUT_PATHS: tuple[str, ...] = (
     "build.rs",
     "overlays/**",
     "resources/**",
+    "rust-toolchain",
     "rust-toolchain.toml",
     "src/**",
 )

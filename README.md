@@ -1424,7 +1424,7 @@ single list in [`.github/scripts/deployment_scope.py`](.github/scripts/deploymen
 | --- | --- |
 | `resources/**`, `overlays/**` | the desired gateway configuration |
 | `.gitforgeops/**` | environment routing, ownership mode, enforceable policy |
-| `src/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**` | the `gitforgeops` binary the job installs (`.cargo/config.toml` can change rustflags, build env and dependency sources) |
+| `src/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain`, `rust-toolchain.toml`, `.cargo/**` | the `gitforgeops` binary the job installs (`.cargo/config.toml` can change rustflags, build env and dependency sources) |
 | `.github/scripts/**` | helper programs the job executes (credential loading, the validator installer, merge attribution) |
 | `.github/ferrum-edge-checksums.txt` | which validator build is trusted |
 | `.github/workflows/apply-on-merge.yml` | the deployment procedure itself |
