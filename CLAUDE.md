@@ -883,7 +883,10 @@ values, rejects a bundle name outside the bound range instead of dropping it,
 writes a new 0600 file without following/overwriting a destination, and the
 step exports the path as `FERRUM_CREDS_JSON_FILE`. Malformed input fails closed
 rather than becoming an empty bundle. Inline `FERRUM_CREDS_JSON` is still
-supported for small local tests.
+supported for small local tests. `bundle::parse_bundles_from_json` reserves the
+same prefix: a `FERRUM_CREDS_BUNDLE*` key must round-trip through
+`shard_secret_name`, so aliases such as `_0`, `_01` or `_+1` fail closed instead
+of overwriting a shard in `per_shard` and losing slots on the next PUT.
 
 Allocation (first apply, or rotation): generate random value → libsodium
 `crypto_box_seal` to the env's public key → PUT to

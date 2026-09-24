@@ -1035,6 +1035,7 @@ Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `
 - Single bundle holds ~440 credentials at 48 KB GitHub secret cap.
 - Auto-sharded by deterministic hash when any bundle approaches 40 KB.
 - **Shard ceiling: 16** (`FERRUM_CREDS_BUNDLE` … `FERRUM_CREDS_BUNDLE_15`) × ~440 slots/bundle = **~7,000 credentials per environment**. `import`, `apply`, and `rotate` refuse to create shard 16 rather than writing a secret nothing reads back.
+- The `FERRUM_CREDS_BUNDLE` prefix is reserved. When `FERRUM_CREDS_JSON` / `FERRUM_CREDS_JSON_FILE` is loaded, only the exact names above are accepted. A spelling such as `FERRUM_CREDS_BUNDLE_0`, `_01` or `_+1` would alias an existing shard, and the next write-back of that shard would drop slots, so it fails closed.
 
 #### "Load credential bundles"
 

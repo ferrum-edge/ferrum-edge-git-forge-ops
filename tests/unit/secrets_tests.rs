@@ -294,6 +294,66 @@ fn load_bundles_rejects_duplicate_slots_across_shards() {
     );
 }
 
+/// Regression for #331: `u32::parse` accepted `_0`, `_00`, `_01` and `_+1`,
+/// so a second key aliased an existing shard, one shard's map overwrote the
+/// other's in `per_shard`, and the next PUT of that shard dropped slots.
+/// Only the exact names `shard_secret_name` writes may load.
+#[test]
+fn load_bundles_refuses_non_canonical_shard_names() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    for alias in [
+        "FERRUM_CREDS_BUNDLE_0",
+        "FERRUM_CREDS_BUNDLE_00",
+        "FERRUM_CREDS_BUNDLE_01",
+        "FERRUM_CREDS_BUNDLE_+1",
+        "FERRUM_CREDS_BUNDLE_",
+        "FERRUM_CREDS_BUNDLE_X",
+        "FERRUM_CREDS_BUNDLEX",
+    ] {
+        let raw = serde_json::json!({
+            "FERRUM_CREDS_BUNDLE": {"ferrum/a/keyauth/key": "value-a-aaaaaaaa"},
+            "FERRUM_CREDS_BUNDLE_1": {"ferrum/c/keyauth/key": "value-c-cccccccc"},
+            alias: {"ferrum/b/keyauth/key": "value-b-bbbbbbbb"}
+        })
+        .to_string();
+        let err = parse_bundles_from_json(&raw)
+            .expect_err("a non-canonical shard name must fail closed")
+            .to_string();
+        assert!(
+            err.contains(alias) && err.contains("canonical"),
+            "{alias}: {err}"
+        );
+        assert!(!err.contains("value-b"), "no bundle value may leak: {err}");
+        assert!(load_bundles_from_env(&raw).is_err(), "{alias}");
+    }
+}
+
+/// Canonical names keep loading, every slot lands in exactly one shard, and
+/// the write-back layout holds every slot the merged view resolves.
+#[test]
+fn load_bundles_keeps_every_slot_under_canonical_shard_names() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    let names: Vec<String> = (0..4).map(shard_secret_name).collect();
+    let mut raw = serde_json::Map::new();
+    for (index, name) in names.iter().enumerate() {
+        raw.insert(
+            name.clone(),
+            serde_json::json!({ format!("ferrum/c{index}/keyauth/key"): format!("value-{index}") }),
+        );
+    }
+    let loaded = parse_bundles_from_json(&serde_json::Value::Object(raw).to_string()).unwrap();
+    assert_eq!(loaded.merged.len(), 4);
+    assert_eq!(
+        loaded.per_shard.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    let per_shard_slots: usize = loaded.per_shard.values().map(|b| b.len()).sum();
+    assert_eq!(per_shard_slots, loaded.merged.len());
+    assert!(loaded.unrecognized_keys.is_empty());
+}
+
 #[test]
 fn shard_secret_name_strips_suffix_for_shard_zero() {
     assert_eq!(shard_secret_name(0), "FERRUM_CREDS_BUNDLE");
