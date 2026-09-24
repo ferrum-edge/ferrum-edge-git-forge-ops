@@ -1178,6 +1178,58 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
     );
 }
 
+/// Issue #338: a pending row whose live copy carries a gateway-populated
+/// optional field is both an exact (subset) pending row and an ordinary
+/// Modify. It must be planned and written exactly once.
+#[tokio::test]
+async fn pending_assertion_is_not_duplicated_by_an_ordinary_modify() {
+    let desired = GatewayConfig {
+        proxies: vec![proxy("p1", "team-alpha", None)],
+        ..Default::default()
+    };
+    let mut live = desired.clone();
+    live.proxies[0].name = Some("gateway-populated".into());
+    let pending = std::collections::BTreeSet::from([state_key("team-alpha", "Proxy", "p1")]);
+
+    // The preview inputs: both halves name the same row ...
+    let assertions =
+        pending_create_assertion_diffs(&desired, &live, &pending, "team-alpha").unwrap();
+    let ordinary = gitforgeops::diff::compute_diff(&desired, &live).unwrap();
+    assert_eq!(assertions.len(), 1);
+    assert_eq!(ordinary.len(), 1);
+    // ... and the shared filter keeps only the ordinary entry.
+    assert!(
+        gitforgeops::apply::dedupe_pending_assertions(&ordinary, assertions.clone()).is_empty()
+    );
+    assert_eq!(
+        gitforgeops::apply::dedupe_pending_assertions(&[], assertions).len(),
+        1,
+        "an assertion without an ordinary diff entry is kept"
+    );
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".into(), live)])),
+        None,
+        &ApplyOptions {
+            pending_create_assertions: pending,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(mutation_lines(&requests), vec!["PUT /proxies/p1 HTTP/1.1"]);
+    assert_eq!(result.updated, 1);
+    assert_eq!(result.applied_incremental.len(), 1);
+    assert!(result.adopted.is_empty());
+}
+
 #[tokio::test]
 async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
     // A hand-authored resource carries no `created_at` / `updated_at`. Those

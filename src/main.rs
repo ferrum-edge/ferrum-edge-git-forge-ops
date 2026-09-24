@@ -1821,6 +1821,7 @@ async fn cmd_plan(
                         diff::DiffOptions::default(),
                         policy_cfg.as_ref(),
                     )?;
+                    let pending = apply::dedupe_pending_assertions(&d, pending);
                     d.extend(pending);
                     (d, b, u, s, true, None)
                 } else {
@@ -2485,6 +2486,7 @@ async fn cmd_apply(
                 )?;
                 let (pending, adoptions) =
                     ownership_preview(&namespace_pairs, &state, &resolved.apply_strategy)?;
+                let pending = apply::dedupe_pending_assertions(&diffs, pending);
                 diffs.extend(pending);
                 let diffs = apply::order_incremental_diffs(diffs, &desired);
 
@@ -3228,6 +3230,7 @@ async fn cmd_review(
                                 diff::DiffOptions::default(),
                                 policy_cfg.as_ref(),
                             )?;
+                            let pending = apply::dedupe_pending_assertions(&d, pending);
                             d.extend(pending);
                             (d, b, u, s, None)
                         }

@@ -1231,12 +1231,15 @@ async fn apply_incremental(
             prune_spec_owned: options.confirm_api_spec_deletion,
         },
     )?;
-    let assertions = pending_create_assertion_diffs(
-        desired,
-        actual,
-        &options.pending_create_assertions,
-        namespace,
-    )?;
+    let assertions = dedupe_pending_assertions(
+        &diffs,
+        pending_create_assertion_diffs(
+            desired,
+            actual,
+            &options.pending_create_assertions,
+            namespace,
+        )?,
+    );
     for assertion in &assertions {
         eprintln!(
             "[{}] asserting repository ownership of pending {} `{}` with an idempotent update",
@@ -2548,6 +2551,29 @@ pub fn pending_create_assertion_diffs(
     }
 
     Ok(assertions)
+}
+
+/// Drop pending-create assertions whose `(namespace, kind, id)` already has a
+/// diff entry.
+///
+/// The assertion is a subset match, so a live row carrying a gateway-populated
+/// optional field is both an exact pending row *and* an ordinary Modify. The
+/// ordinary Modify's PUT already asserts repository ownership, and its success
+/// clears the journal entry through `StateFile::record_op`; keeping both would
+/// issue the same PUT twice and list the row twice in every preview. Apply and
+/// every preview (interactive, `plan`, `review`) share this filter.
+pub fn dedupe_pending_assertions(
+    diffs: &[ResourceDiff],
+    assertions: Vec<ResourceDiff>,
+) -> Vec<ResourceDiff> {
+    let existing: BTreeSet<String> = diffs
+        .iter()
+        .map(|d| state_key(&d.namespace, &d.kind, &d.id))
+        .collect();
+    assertions
+        .into_iter()
+        .filter(|d| !existing.contains(&state_key(&d.namespace, &d.kind, &d.id)))
+        .collect()
 }
 
 /// One operator-facing line per spec-owned live resource the run touched.
