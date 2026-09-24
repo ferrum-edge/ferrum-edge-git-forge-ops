@@ -3232,8 +3232,9 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
 
 fn ledger_of(ops: &[gitforgeops::apply::AppliedOp], desired: &GatewayConfig) -> StateFile {
     let mut state = StateFile::default();
+    let desired = gitforgeops::state::ResourceKeys::from_config(desired);
     for op in ops {
-        state.record_op(op, desired).expect("record adopted op");
+        state.record_op(op, &desired).expect("record adopted op");
     }
     state
 }
@@ -3376,8 +3377,9 @@ fn proxy_ledger(live: &GatewayConfig) -> StateFile {
 }
 
 fn record_prune_result(state: &mut StateFile, result: &ApplyResult, desired: &GatewayConfig) {
+    let desired = gitforgeops::state::ResourceKeys::from_config(desired);
     for op in result.applied_incremental.iter().chain(&result.adopted) {
-        state.record_op(op, desired).unwrap();
+        state.record_op(op, &desired).unwrap();
     }
 }
 
@@ -4136,6 +4138,35 @@ fn spec_owned_rows_are_never_adopted() {
         candidate_ids(&candidates),
         vec!["Upstream u1", "Proxy p1", "PluginConfig pc1"]
     );
+}
+
+/// Issue #340: live rows are looked up through a `(namespace, id)` index, so
+/// pairing is independent of live order and never crosses namespaces.
+#[test]
+fn adoption_pairs_live_rows_by_namespace_and_id_in_any_order() {
+    let desired = GatewayConfig {
+        upstreams: (0..200)
+            .map(|i| upstream(&format!("u{i:03}"), "team-alpha"))
+            .collect(),
+        ..Default::default()
+    };
+    let mut live = desired.clone();
+    live.upstreams.reverse();
+    // Same id in another namespace, and a differing row: neither may pair.
+    live.upstreams.push(upstream("u-other", "team-b"));
+    live.upstreams[0].targets.clear(); // u199 now differs.
+    let mut other_namespace_desired = upstream("u-other", "team-alpha");
+    other_namespace_desired.targets.clear();
+    let mut desired = desired;
+    desired.upstreams.push(other_namespace_desired);
+
+    let candidates =
+        adoption_candidates(&desired, &live, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+    let ids = candidate_ids(&candidates);
+    assert_eq!(ids.len(), 199, "{ids:?}");
+    assert_eq!(ids.first().map(String::as_str), Some("Upstream u000"));
+    assert!(!ids.contains(&"Upstream u199".to_string()));
+    assert!(!ids.contains(&"Upstream u-other".to_string()));
 }
 
 #[test]
