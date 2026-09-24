@@ -2116,19 +2116,19 @@ fn omitted_credential_type_is_refused_like_an_empty_array() {
         .expect_err("a stored slot the consumer no longer declares must not resolve silently");
         assert!(
             matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
-            "{credentials}: {err}"
+            "{credentials}"
         );
         let err = err.to_string();
         assert!(
             err.contains("ferrum/partner/keyauth/key")
                 && err.contains("ferrum/partner/keyauth/[1]/key")
                 && err.contains("orphaned"),
-            "{credentials}: {err}"
+            "{credentials}"
         );
-        assert!(err.contains("--allow-credential-slot-remap"), "{err}");
+        assert!(err.contains("--allow-credential-slot-remap"));
         assert!(
             !err.contains("OLD-RETIRED"),
-            "a refusal must never echo bundle values: {err}"
+            "a refusal must never echo bundle values"
         );
 
         let mut resolved = cfg.clone();
@@ -2160,7 +2160,7 @@ fn allowed_slot_remap_downgrades_the_omitted_type_refusal() {
         ResolveOptions::allowing_slot_remap(true),
     )
     .expect("the acknowledgement accepts the retired slots");
-    assert_eq!(report.slot_remaps.len(), 2, "{:?}", report.slot_remaps);
+    assert_eq!(report.slot_remaps.len(), 2);
 }
 
 /// Declared types keep their ordinary verdicts, slots of other consumers that
@@ -2191,7 +2191,7 @@ fn omitted_type_scan_stays_within_the_declared_consumer() {
         ResolveOptions::default(),
     )
     .expect("every stored slot of the declared consumer is still owned");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(report.slot_remaps.is_empty());
     assert!(report
         .results
         .iter()
@@ -2264,12 +2264,12 @@ fn shrunk_plugin_config_array_refuses_the_orphaned_slot_remap() {
     .to_string();
     assert!(
         err.contains(OIDC_SECRET_B_SLOT) && err.contains("orphaned"),
-        "the refusal must name the orphaned slot: {err}"
+        "the refusal must name the orphaned slot"
     );
-    assert!(err.contains("--allow-credential-slot-remap"), "{err}");
+    assert!(err.contains("--allow-credential-slot-remap"));
     assert!(
         !err.contains("SECRET-FOR-IDP"),
-        "a refusal must never echo bundle values: {err}"
+        "a refusal must never echo bundle values"
     );
 
     let mut resolved = cfg.clone();
@@ -2282,7 +2282,7 @@ fn shrunk_plugin_config_array_refuses_the_orphaned_slot_remap() {
     .expect_err("resolve must refuse what report refuses");
     assert!(
         matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
-        "{err}"
+        "the refusal did not match the expected text"
     );
     assert_eq!(
         resolved.plugin_configs[0].config["providers"][0]["client_auth"]["client_secret"], REQUIRE,
@@ -2309,14 +2309,13 @@ fn steady_plugin_config_array_resolves_without_a_remap() {
     )
     .expect("a stable plugin-config array must never block apply");
 
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(report.slot_remaps.is_empty());
     assert!(
         report.warnings.iter().any(
             |w| w.contains("ferrum/oidc/@plugin-config/config/providers")
                 && w.contains("slot identity")
         ),
-        "expected the positional advisory: {:?}",
-        report.warnings
+        "expected the positional advisory"
     );
     let providers = &cfg.plugin_configs[0].config["providers"];
     assert_eq!(
@@ -2347,7 +2346,7 @@ fn allowed_slot_remap_downgrades_the_plugin_config_shrink_refusal() {
     )
     .expect("--allow-credential-slot-remap accepts the reassignment");
 
-    assert_eq!(report.slot_remaps.len(), 1, "{:?}", report.slot_remaps);
+    assert_eq!(report.slot_remaps.len(), 1);
     assert!(report.slot_remaps[0].contains(OIDC_SECRET_B_SLOT));
     assert_eq!(report.results.len(), 1);
 }
@@ -2378,8 +2377,8 @@ fn plugin_config_array_without_orphaned_index_slots_is_not_a_remap() {
         ResolveOptions::default(),
     )
     .expect("nothing positional was orphaned");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.slot_remaps.is_empty());
+    assert!(report.warnings.is_empty());
 }
 
 // --- Plugin-config endpoint generation (#329) -------------------------------
@@ -2424,9 +2423,9 @@ fn generate_on_a_plugin_endpoint_field_is_refused_at_resolve_time() {
         .to_string();
         assert!(
             err.contains(LDAP_URL_SLOT) && err.contains("endpoint"),
-            "{err}"
+            "the refusal did not match the expected text"
         );
-        assert!(err.contains("alloc=require"), "{err}");
+        assert!(err.contains("alloc=require"));
 
         let mut resolved = cfg.clone();
         assert!(resolve_secrets_with_mode_and_options(
@@ -2461,7 +2460,7 @@ fn lenient_report_carries_the_endpoint_refusal_to_the_allocator_policy() {
         .check_generation_allowed_for(endpoint, &GatewayMode::Api)
         .expect_err("the allocator policy refuses the endpoint too")
         .to_string();
-    assert!(err.contains("endpoint"), "{err}");
+    assert!(err.contains("endpoint"));
 
     // An opaque secret on the same plugin is still generatable.
     let password = report
