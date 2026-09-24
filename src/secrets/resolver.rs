@@ -134,7 +134,8 @@ pub struct ResolveReport {
     /// per process so it shows up in CI logs even when the caller ignores this
     /// field.
     pub warnings: Vec<String>,
-    /// Credential-array shape changes that provably re-own a stored slot.
+    /// Credential-array shape changes that provably re-own a stored slot, in
+    /// Consumer credentials or in `PluginConfig.config` arrays.
     ///
     /// Populated when the bundle still holds a value for an entry index the
     /// declared array no longer has: the value has either already been handed
@@ -1442,6 +1443,74 @@ fn check_array_slot_identity(
     }
 }
 
+/// [`check_array_slot_identity`] for one array node inside `PluginConfig.config`.
+///
+/// Plugin-config slots are positional too
+/// (`<ns>/<plugin>/@plugin-config/config/providers/[1]/client_auth/client_secret`),
+/// so deleting provider A of `[A, B]` shifts B into `[0]` where it resolves to
+/// A's stored secret. The two findings keep the Consumer split: a multi-entry
+/// brokered array is an advisory, and a stored slot at an index the array no
+/// longer has is a proven remap under the same [`SlotRemapPolicy`].
+///
+/// Unlike Consumer credentials, plugin-config slots never elide index 0, so
+/// every positional slot under the array starts with an explicit `[N]`
+/// segment. A stored slot whose first segment is not an index names an object
+/// key, not an entry position, and no entry can inherit it by shifting.
+///
+/// `gitforgeops rotate` publishes Consumers only, so the remedy names the
+/// bundle instead: reseed the shifted entries and retire the orphaned slot.
+fn check_plugin_array_slot_identity(
+    namespace: &str,
+    plugin_id: &str,
+    path: &[ConfigPathComponent],
+    items: &[serde_json::Value],
+    bundle: &CredentialBundle,
+    report: &mut ResolveReport,
+) {
+    let prefix = plugin_config_slot(namespace, plugin_id, path);
+    let brokered = items.iter().any(contains_placeholder);
+
+    if brokered && items.len() > 1 {
+        push_warning(
+            report,
+            format!(
+                "plugin config array '{prefix}' has {} entries and entry ORDER is the slot \
+                 identity (entry N uses '[N]'). Removing or reordering an entry reassigns the \
+                 retired slot's value to whichever entry shifts into its index. Reseed the \
+                 affected slots in the credential bundle instead of deleting or reordering \
+                 entries.",
+                items.len()
+            ),
+        );
+    }
+
+    let scan_prefix = format!("{prefix}/");
+    for slot in bundle.keys() {
+        let Some(rest) = slot.strip_prefix(&scan_prefix) else {
+            continue;
+        };
+        let Some(index) = rest.split('/').next().and_then(parse_index_segment) else {
+            continue;
+        };
+        if index >= items.len() {
+            push_slot_remap(
+                report,
+                format!(
+                    "plugin config slot '{slot}' is orphaned: the credential bundle still holds a \
+                     value for it, but array '{prefix}' now has {} entr{} (entry index {index} no \
+                     longer exists). Slot identity is positional, so the entry that shifted into \
+                     a vacated index has inherited a retired secret, and re-growing the array \
+                     would resurrect this value for a new entry. Reseed the shifted entries' \
+                     slots with their intended values and retire this slot from the credential \
+                     bundle — or pass --allow-credential-slot-remap to accept the reassignment.",
+                    items.len(),
+                    if items.len() == 1 { "y" } else { "ies" }
+                ),
+            );
+        }
+    }
+}
+
 /// Turn detected remaps into the resolution verdict.
 ///
 /// Called at the end of every walk so `plan`, `apply`, `review`,
@@ -1694,6 +1763,7 @@ fn walk_plugin_and_report(
             }
         }
         serde_json::Value::Array(items) => {
+            check_plugin_array_slot_identity(namespace, plugin_id, path, items, bundle, report);
             for (index, child) in items.iter().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
                 walk_plugin_and_report(child, namespace, plugin_id, path, bundle, report)?;
@@ -1817,6 +1887,7 @@ fn walk_plugin_report_and_replace(
             }
         }
         serde_json::Value::Array(items) => {
+            check_plugin_array_slot_identity(namespace, plugin_id, path, items, bundle, report);
             for (index, child) in items.iter_mut().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
                 walk_plugin_report_and_replace(child, namespace, plugin_id, path, bundle, report)?;

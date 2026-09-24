@@ -813,6 +813,12 @@ the two consequences by whether evidence exists:
   `SlotRemapPolicy::Allow` so they can render it (plan then exits 1 itself).
   `--allow-credential-slot-remap` downgrades the refusal for the documented
   shrink-then-rotate sequence. Messages name slots only, never values.
+- Plugin-config arrays get the same split through
+  `check_plugin_array_slot_identity`, called from both plugin walks. Their
+  slots carry an explicit `[N]` for every entry (no index-0 elision), so only a
+  stored slot whose first segment under the array is an index at or beyond the
+  array length is a remap. The remedy is reseeding the bundle, since `rotate`
+  publishes Consumers only.
 
 Literal (non-placeholder) consumer credentials are an apply blocker too:
 `cmd_apply` runs `diff::audit_security_with_policy` on the **unresolved**

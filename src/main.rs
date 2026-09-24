@@ -1786,9 +1786,10 @@ async fn cmd_plan(
         if remap_blocked {
             reportln!(
                 json_mode,
-                "\n{} slot reassignment(s) block apply. Rotate the affected slot in place before \
-                 removing the entry, or re-run with --allow-credential-slot-remap to accept the \
-                 reassignment.",
+                "\n{} slot reassignment(s) block apply. Rotate the affected Consumer slot in \
+                 place before removing the entry, reseed plugin-config slots and retire the \
+                 orphaned slot from the credential bundle, or re-run with \
+                 --allow-credential-slot-remap to accept the reassignment.",
                 secret_report.slot_remaps.len()
             );
         } else {

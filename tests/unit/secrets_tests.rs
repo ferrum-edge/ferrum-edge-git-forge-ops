@@ -2002,6 +2002,190 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
     assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
 }
 
+// --- Plugin-config array slot identity (#328) -------------------------------
+
+const OIDC_SECRET_A_SLOT: &str =
+    "ferrum/oidc/@plugin-config/config/providers/[0]/client_auth/client_secret";
+const OIDC_SECRET_B_SLOT: &str =
+    "ferrum/oidc/@plugin-config/config/providers/[1]/client_auth/client_secret";
+
+fn oidc_providers_cfg(issuers: &[&str]) -> GatewayConfig {
+    let providers: Vec<_> = issuers
+        .iter()
+        .map(|issuer| {
+            serde_json::json!({
+                "issuer": issuer,
+                "client_auth": {"client_secret": REQUIRE}
+            })
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "oidc",
+            "namespace": "ferrum",
+            "plugin_name": "oidc_relying_party",
+            "scope": "global",
+            "config": {"providers": providers}
+        }]
+    }))
+    .unwrap()
+}
+
+fn oidc_two_provider_bundle() -> BTreeMap<String, String> {
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        OIDC_SECRET_A_SLOT.to_string(),
+        "SECRET-FOR-IDP-A-aaaaaaaa".to_string(),
+    );
+    bundle.insert(
+        OIDC_SECRET_B_SLOT.to_string(),
+        "SECRET-FOR-IDP-B-bbbbbbbb".to_string(),
+    );
+    bundle
+}
+
+/// Deleting provider A of `[A, B]` shifts B into `[0]`, where it would
+/// resolve to A's client secret. Both walks must refuse, name the orphaned
+/// slot, and leave the configuration untouched.
+#[test]
+fn shrunk_plugin_config_array_refuses_the_orphaned_slot_remap() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    let bundle = oidc_two_provider_bundle();
+    let cfg = oidc_providers_cfg(&["https://idp-b.example.com"]);
+
+    let err = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("a plugin-config shrink that reassigns a stored slot must not resolve")
+    .to_string();
+    assert!(
+        err.contains(OIDC_SECRET_B_SLOT) && err.contains("orphaned"),
+        "the refusal must name the orphaned slot: {err}"
+    );
+    assert!(err.contains("--allow-credential-slot-remap"), "{err}");
+    assert!(
+        !err.contains("SECRET-FOR-IDP"),
+        "a refusal must never echo bundle values: {err}"
+    );
+
+    let mut resolved = cfg.clone();
+    let err = resolve_secrets_with_mode_and_options(
+        &mut resolved,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("resolve must refuse what report refuses");
+    assert!(
+        matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+        "{err}"
+    );
+    assert_eq!(
+        resolved.plugin_configs[0].config["providers"][0]["client_auth"]["client_secret"], REQUIRE,
+        "a refused resolution must not hand provider B the retired secret"
+    );
+}
+
+/// Steady state: every stored slot still has its provider. Resolution
+/// succeeds with each provider keeping its own secret; only the positional
+/// advisory fires.
+#[test]
+fn steady_plugin_config_array_resolves_without_a_remap() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    let bundle = oidc_two_provider_bundle();
+    let mut cfg = oidc_providers_cfg(&["https://idp-a.example.com", "https://idp-b.example.com"]);
+
+    let report = resolve_secrets_with_mode_and_options(
+        &mut cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("a stable plugin-config array must never block apply");
+
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.warnings.iter().any(
+            |w| w.contains("ferrum/oidc/@plugin-config/config/providers")
+                && w.contains("slot identity")
+        ),
+        "expected the positional advisory: {:?}",
+        report.warnings
+    );
+    let providers = &cfg.plugin_configs[0].config["providers"];
+    assert_eq!(
+        providers[0]["client_auth"]["client_secret"],
+        "SECRET-FOR-IDP-A-aaaaaaaa"
+    );
+    assert_eq!(
+        providers[1]["client_auth"]["client_secret"],
+        "SECRET-FOR-IDP-B-bbbbbbbb"
+    );
+}
+
+/// `--allow-credential-slot-remap` downgrades the plugin-config refusal to the
+/// same report it downgrades for Consumer credentials.
+#[test]
+fn allowed_slot_remap_downgrades_the_plugin_config_shrink_refusal() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    let bundle = oidc_two_provider_bundle();
+    let mut cfg = oidc_providers_cfg(&["https://idp-b.example.com"]);
+
+    let report = resolve_secrets_with_mode_and_options(
+        &mut cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::allowing_slot_remap(true),
+    )
+    .expect("--allow-credential-slot-remap accepts the reassignment");
+
+    assert_eq!(report.slot_remaps.len(), 1, "{:?}", report.slot_remaps);
+    assert!(report.slot_remaps[0].contains(OIDC_SECRET_B_SLOT));
+    assert_eq!(report.results.len(), 1);
+}
+
+/// A plugin-config array that never had a stored value at the vacated index
+/// cannot have remapped anything; a non-index key under the array prefix is
+/// not an entry position either.
+#[test]
+fn plugin_config_array_without_orphaned_index_slots_is_not_a_remap() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        OIDC_SECRET_A_SLOT.to_string(),
+        "SECRET-FOR-IDP-A-aaaaaaaa".to_string(),
+    );
+    bundle.insert(
+        "ferrum/oidc/@plugin-config/config/providers/client_secret".to_string(),
+        "object-shaped-slot".to_string(),
+    );
+    let cfg = oidc_providers_cfg(&["https://idp-a.example.com"]);
+
+    let report = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("nothing positional was orphaned");
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
 // --- Structured credential type plumbing (G7) -------------------------------
 
 /// The report captures the credential type as a slot *component*, so the

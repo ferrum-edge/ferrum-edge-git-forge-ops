@@ -106,8 +106,9 @@ impl BlockerKind {
                  switch the placeholder to alloc=generate"
             }
             BlockerKind::SlotRemap => {
-                "credential-slot reassignment(s); rotate the affected slot before removing the \
-                 entry, or re-run with --allow-credential-slot-remap"
+                "credential-slot reassignment(s); rotate (Consumer) or reseed (plugin config) \
+                 the affected slot and retire the orphaned slot from the bundle, or re-run with \
+                 --allow-credential-slot-remap"
             }
             BlockerKind::NarrowedFilePublication => {
                 "FERRUM_NAMESPACE narrows a file-mode environment, whose published document \

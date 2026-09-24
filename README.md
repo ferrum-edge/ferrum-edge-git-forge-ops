@@ -1024,6 +1024,8 @@ gitforgeops rotate --consumer app --credential keyauth/[1]/key   # retire the li
 
 If you would rather accept the reassignment as-is, pass `--allow-credential-slot-remap` (global; works on `plan`, `apply`, `export --materialize` and `rotate`). It downgrades the refusal to the report it replaced — the hazard is still printed and still rendered in the PR comment, it just no longer stops the run.
 
+Plugin-config arrays get the same two findings. Their slots are positional too, with an explicit `[N]` on every entry (index 0 is not elided): `ferrum/oidc/@plugin-config/config/providers/[1]/client_auth/client_secret`. Deleting provider A of `[A, B]` would hand B A's stored client secret, so a stored slot at an index the array no longer has is refused exactly like a Consumer shrink, and a multi-entry brokered array prints the order-is-identity warning. `gitforgeops rotate` publishes Consumers only, so the remedy there is to reseed the shifted entries' slots and retire the orphaned slot from the credential bundle, or to accept the reassignment with `--allow-credential-slot-remap`.
+
 ### Storage: bundled environment secrets
 
 Secrets are stored as JSON bundles inside **GitHub Environment Secrets** named `FERRUM_CREDS_BUNDLE`, `FERRUM_CREDS_BUNDLE_1`, `FERRUM_CREDS_BUNDLE_2`, …

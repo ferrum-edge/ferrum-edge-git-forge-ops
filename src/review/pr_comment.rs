@@ -1097,9 +1097,10 @@ pub fn build_review_comment_with_preview(
     if !secrets.slot_remaps.is_empty() {
         md.push_str("### Credential Slot Remaps\n\n");
         md.push_str(
-            "A credential array changed shape in a way that reassigns a stored broker slot. \
-             Slot identity is the entry's array index, so the entry that shifted into a vacated \
-             index has inherited a credential that was meant to be retired.\n\n",
+            "A Consumer credential or plugin-config array changed shape in a way that reassigns \
+             a stored broker slot. Slot identity is the entry's array index, so the entry that \
+             shifted into a vacated index has inherited a credential that was meant to be \
+             retired.\n\n",
         );
         for remap in secrets.slot_remaps.iter().take(MAX_SECTION_ITEMS) {
             md.push_str(&format!("- {}\n", bounded_markdown_text(remap)));
@@ -1107,9 +1108,10 @@ pub fn build_review_comment_with_preview(
         append_omitted_list_item(&mut md, secrets.slot_remaps.len(), "slot remap");
         md.push('\n');
         md.push_str(
-            "> **Apply is blocked.** Rotate the affected slot in place \
-             (`gitforgeops rotate --credential <type>/[N]/<key>`) before removing the entry, or \
-             re-run with `--allow-credential-slot-remap` to accept the reassignment.\n\n",
+            "> **Apply is blocked.** Rotate the affected Consumer slot in place \
+             (`gitforgeops rotate --credential <type>/[N]/<key>`) before removing the entry, \
+             reseed plugin-config slots and retire the orphaned slot from the credential bundle, \
+             or re-run with `--allow-credential-slot-remap` to accept the reassignment.\n\n",
         );
     }
 
