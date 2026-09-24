@@ -29,3 +29,8 @@ for later fixes.
 - Scheduled monitoring needs approval unless `monitoring.unattended` binds its
   restricted monitor environment; its admin signing secret is still
   gateway-write-equivalent.
+- The container image runs as the non-root user `gitforgeops` (UID/GID
+  `65532`) instead of root. Anyone who ran an earlier pre-release `:latest` or
+  `:main-<sha>` image against a bind-mounted checkout should pass
+  `--user "$(id -u):$(id -g)"` so written files stay owned by the checkout
+  owner, and may need to `chown` files earlier root runs left behind.

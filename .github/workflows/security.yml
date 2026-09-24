@@ -211,6 +211,90 @@ jobs:
             esac
           done
 
+      - name: Exercise the published entrypoint as non-root
+        run: |
+          set -euo pipefail
+          image=gitforgeops:scan
+          owner_uid=$(id -u)
+          owner_gid=$(id -g)
+          fail() { echo "$*" >&2; exit 1; }
+          [ "$owner_uid" != 0 ] || fail "This check needs a non-root runner user."
+
+          # The image's own default identity: fixed, numeric and not root.
+          configured=$(docker image inspect --format '{{.Config.User}}' "$image")
+          [ "$configured" = 65532:65532 ] \
+            || fail "Image default user is '$configured', expected 65532:65532."
+          default_uid=$(docker run --rm --network none --entrypoint id "$image" -u)
+          [ "$default_uid" = 65532 ] || fail "Default container UID is $default_uid."
+          # No safe.directory bypass: Git keeps its ownership check everywhere.
+          if safe=$(docker run --rm --network none --entrypoint git "$image" \
+              config --system --get-all safe.directory 2>/dev/null); then
+            fail "Unexpected system safe.directory: $safe"
+          fi
+
+          # An arbitrary --user UID has no passwd entry; HOME must still be a
+          # writable location, including under --read-only with a /tmp tmpfs.
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 54321:54321 \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            --entrypoint sh "$image" -ec \
+            'test "$(id -u)" = 54321; test "$HOME" = /tmp; touch "$HOME/.probe"'
+
+          # A throwaway checkout owned by the runner user, never the workspace.
+          fixture="$RUNNER_TEMP/nonroot-fixture"
+          mkdir -p "$fixture"
+          git archive HEAD resources overlays | tar -x -C "$fixture"
+          git -C "$fixture" -c init.defaultBranch=main init -q
+          git -C "$fixture" add -A
+          git -C "$fixture" -c user.name=ci -c user.email=ci@example.invalid \
+            commit -q -m fixture
+          head=$(git -C "$fixture" rev-parse HEAD)
+
+          # Explicit owner UID, hardened like the documented invocation: the
+          # published entrypoint validates (exec ferrum-edge, 0600 temp spec)
+          # and writes into the bind mount; the results belong to the caller.
+          owner_run() {
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --user "$owner_uid:$owner_gid" \
+              --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+              -v "$fixture":/repo "$@"
+          }
+          [ "$(owner_run --entrypoint id "$image" -u)" = "$owner_uid" ] \
+            || fail "--user override did not take effect."
+          owner_run "$image" validate
+          owner_run "$image" export --output owner-export/gateway.yaml
+          for path in owner-export owner-export/gateway.yaml; do
+            [ "$(stat -c %u:%g "$fixture/$path")" = "$owner_uid:$owner_gid" ] \
+              || fail "$path is owned by $(stat -c %u:%g "$fixture/$path")."
+          done
+          [ "$(owner_run --entrypoint git "$image" rev-parse HEAD)" = "$head" ] \
+            || fail "Git could not inspect the owner's checkout."
+
+          # Default identity against a checkout owned by someone else: Git
+          # refuses it, so revision-bound overrides stay inactive (fail closed).
+          default_run() {
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --tmpfs /tmp:rw,nosuid,nodev,mode=1777 "$@"
+          }
+          if refused=$(default_run -v "$fixture":/repo --entrypoint git "$image" \
+              rev-parse HEAD 2>&1); then
+            fail "Git trusted a checkout owned by another user."
+          fi
+          case "$refused" in
+            *"dubious ownership"*) ;;
+            *) fail "Git failed on the foreign-owned checkout for another reason: $refused" ;;
+          esac
+          # Writing needs a directory the default user may write to; what it
+          # writes belongs to 65532, never to root.
+          chmod 0777 "$fixture"
+          default_run -v "$fixture":/repo "$image" \
+            export --output default-export/gateway.yaml
+          for path in default-export default-export/gateway.yaml; do
+            [ "$(stat -c %u:%g "$fixture/$path")" = 65532:65532 ] \
+              || fail "$path is owned by $(stat -c %u:%g "$fixture/$path")."
+          done
+
       - name: Build override regressions with the pinned builder
         run: |
           docker build --target builder -t gitforgeops:test-builder .
