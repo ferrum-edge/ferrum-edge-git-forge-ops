@@ -115,14 +115,13 @@ fn loader_keeps_explicit_fragment_id_over_file_stem() {
 
 #[test]
 fn repo_example_mesh_fragment_is_fully_commented_out() {
-    // `resources/ferrum/mesh/_example.yaml` ships in the repo. It is skipped
-    // by the `_` convention, but it must also parse as nothing if someone
-    // renames it without editing — an example that silently declares a mesh
-    // would be worse than one that errors.
-    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ferrum/mesh");
-    assert!(example.join("_example.yaml").is_file());
-    let resources =
-        load_resources(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")).unwrap();
+    // `resources/ferrum/mesh/_example.yaml` ships in the template and is
+    // skipped by the `_` convention. The fixture is a copy of it: the live
+    // `resources/` tree is customer-owned, so a downstream copy that declares
+    // real mesh fragments must not break this test.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shipped-examples");
+    assert!(root.join("ferrum/mesh/_example.yaml").is_file());
+    let resources = load_resources(&root).unwrap();
     assert!(
         !resources
             .iter()

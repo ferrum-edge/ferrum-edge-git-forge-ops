@@ -100,7 +100,11 @@ cargo fmt --all && cargo fmt --all -- --check
 `.github/workflows/rust-ci.yml` reports its required status on every PR and
 runs those same three commands when the PR touches current **or previous**
 Rust/build/workspace input paths (`src`, `tests`, benches/examples, `build.rs`,
-`.cargo`, Cargo manifests/lockfiles, toolchain/lint config, or Dockerfile).
+`.cargo`, Cargo manifests/lockfiles, toolchain/lint config, or Dockerfile), or
+a non-Rust file the unit suite reads or the binary embeds (`docs/quickstart.md`,
+`.gitforgeops/*.example.yaml`, `.github/scripts/audit_settings.py`). Unit tests
+never read the customer-owned `resources/` tree; shipped-example checks use the
+copy under `tests/fixtures/shipped-examples/`.
 Resource-only PRs skip the Rust steps
 and run secretless `validate-pr.yml` instead. `trusted-pr-review.yml` is a
 default-branch `workflow_run` that accepts only manifest-verified resource and

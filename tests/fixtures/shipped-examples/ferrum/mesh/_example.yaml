@@ -1,0 +1,62 @@
+# Example mesh configuration fragment — rename this file (remove the leading
+# underscore) to use it. Files starting with `_` are skipped by the loader.
+#
+# Mesh fragments are NOT gateway resources. Every file under
+# resources/<ns>/mesh/ contributes to ONE standalone document:
+#
+#   version: "1"
+#   mesh: { ...merged fragments... }
+#
+# published to FERRUM_MESH_FILE_OUTPUT_PATH (default ./assembled/mesh.yaml) by
+# `gitforgeops export` and by file-mode `gitforgeops apply`. That document is
+# what a mesh node reads via FERRUM_MESH_FILE_CONFIG_PATH with
+# FERRUM_MESH_CONFIG_PROTOCOL=file. Every node loads the same document and
+# derives its own slice from FERRUM_MESH_WORKLOAD_SPIFFE_ID.
+#
+# It is never merged into the gateway file: the mesh loader is
+# deny_unknown_fields and rejects `proxies:`/`upstreams:`, and the gateway's
+# own `mesh:` key is inert. There is likewise no mesh admin API, so mesh
+# resources never appear in `gitforgeops diff` — `gitforgeops validate` runs
+# `ferrum-edge validate -m mesh` on the document instead.
+#
+# Merge rules across fragments:
+#   * list fields (workloads, services, peer_authentications, ...) concatenate
+#   * singleton fields (istio_root_namespace, trust_bundles, multi_cluster,
+#     outbound_traffic_policy) must be set by at most one fragment, or by
+#     several fragments agreeing on the same value
+#
+# Overlays (overlays/<env>/<ns>/mesh/<same-file-name>.yaml) deep-merge onto the
+# matching fragment. `spec.workloads` merges additively by `spiffe_id` and
+# `spec.services` by `(name, namespace)`; every other mesh list is REPLACED by
+# the overlay's version, so an overlay's peer_authentications are exactly the
+# peer authentications for that environment.
+#
+# kind: MeshConfig
+# # Optional. Defaults to this file's stem ("_example" here); it is the handle
+# # overlays match on and never appears in the published mesh document.
+# id: core
+# spec:
+#   workloads:
+#     - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+#       selector:
+#         labels:
+#           app: api
+#       service_name: api
+#       addresses: ["10.0.0.5"]
+#       ports:
+#         - port: 8080
+#           protocol: http
+#       trust_domain: cluster.local
+#       namespace: ferrum
+#   services:
+#     - name: api
+#       namespace: ferrum
+#       ports:
+#         - port: 80
+#           protocol: http
+#       workloads:
+#         - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
+#   peer_authentications:
+#     - name: mesh-strict
+#       namespace: ferrum
+#       mtls_mode: strict

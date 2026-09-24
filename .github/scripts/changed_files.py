@@ -16,7 +16,10 @@ PATTERNS = {
         r"^(?:src/|tests/|benches/|examples/|\.cargo/|build\.rs$|"
         r"(?:.*/)?Cargo\.(?:toml|lock)$|Dockerfile$|"
         r"rust-toolchain(?:\.toml)?$|(?:\.?(?:rustfmt|clippy)\.toml)$|"
-        r"\.github/workflows/rust-ci\.yml$)"
+        r"\.github/workflows/rust-ci\.yml$|"
+        # Non-Rust files the unit suite reads or the binary embeds.
+        r"docs/quickstart\.md$|\.gitforgeops/[^/]+\.example\.yaml$|"
+        r"\.github/scripts/audit_settings\.py$)"
     ),
     "declarative": re.compile(r"^(?:resources/|overlays/|\.gitforgeops/|\.state(?:/|$))"),
     "state": re.compile(r"^\.state(?:/|$)"),

@@ -28,6 +28,10 @@ on:
       - '.clippy.toml'
       - 'Dockerfile'
       - '.github/workflows/rust-ci.yml'
+      # Non-Rust files the unit suite reads or the binary embeds.
+      - 'docs/quickstart.md'
+      - '.gitforgeops/*.example.yaml'
+      - '.github/scripts/audit_settings.py'
 
 permissions:
   contents: read
