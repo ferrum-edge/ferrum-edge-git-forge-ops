@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,7 @@ pub struct StateFile {
     pub environment: String,
     pub last_applied_at: Option<String>,
     pub last_applied_commit: Option<String>,
-    pub resources: HashMap<String, String>,
+    pub resources: BTreeMap<String, String>,
     /// Creates durably announced before their non-idempotent POST, but not yet
     /// proven to have landed. These keys are deliberately *not* part of the
     /// shared-mode delete fence: a crashed request must not grant deletion
@@ -54,7 +54,7 @@ pub struct StateFile {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pending_creates: BTreeSet<String>,
     #[serde(default)]
-    pub credentials: HashMap<String, CredentialMetadata>,
+    pub credentials: BTreeMap<String, CredentialMetadata>,
     #[serde(default = "default_shard_count")]
     pub credential_shard_count: u32,
     #[serde(default)]
@@ -140,9 +140,9 @@ impl Default for StateFile {
             environment: "default".to_string(),
             last_applied_at: None,
             last_applied_commit: None,
-            resources: HashMap::new(),
+            resources: BTreeMap::new(),
             pending_creates: BTreeSet::new(),
-            credentials: HashMap::new(),
+            credentials: BTreeMap::new(),
             credential_shard_count: default_shard_count(),
             overrides: Vec::new(),
             mesh_document_path: None,

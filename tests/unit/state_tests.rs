@@ -96,7 +96,7 @@ fn state_operations_refuse_symlinked_state_directory() {
         std::fs::create_dir("outside").unwrap();
         let state = StateFile {
             environment: "production".to_string(),
-            resources: std::collections::HashMap::from([(
+            resources: std::collections::BTreeMap::from([(
                 state_key("ferrum", "Proxy", "p1"),
                 "managed:v1".to_string(),
             )]),
@@ -1114,4 +1114,26 @@ fn the_mesh_document_attribution_round_trips_and_gates_only_its_own_path() {
         // path does not hand gitforgeops authority over the new one.
         assert!(!reloaded.publishes_mesh_document("assembled/other-mesh.yaml"));
     });
+}
+
+#[test]
+fn ledger_serialization_is_deterministic_across_reloads() {
+    // `.state/<env>.json` is committed on every apply; a per-process map order
+    // would reshuffle the whole resource map and bury the real change.
+    let mut state = StateFile::default();
+    for i in 0..20 {
+        state.resources.insert(
+            state_key("ferrum", "Proxy", &format!("p{i:02}")),
+            "managed:v1".to_string(),
+        );
+    }
+    let first = serde_json::to_string_pretty(&state).unwrap();
+    for _ in 0..5 {
+        let reloaded: StateFile = serde_json::from_str(&first).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&reloaded).unwrap(), first);
+    }
+    let keys: Vec<&String> = state.resources.keys().collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
 }
