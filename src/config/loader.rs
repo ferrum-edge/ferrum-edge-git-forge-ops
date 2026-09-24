@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
@@ -28,7 +29,8 @@ use super::strict::{self, LoadOptions};
 /// `FERRUM_NAMESPACE` filtering and overlay matching only; the namespaces
 /// that matter to the mesh live inside each workload / service / policy
 /// entry. A mesh fragment with no explicit `id` is named after its file stem
-/// so overlays have something stable to target.
+/// so overlays have something stable to target, and two fragments with the
+/// same name in one namespace are rejected, naming both files.
 pub fn load_resources(resources_dir: &Path) -> crate::error::Result<Vec<(String, Resource)>> {
     load_resources_with_options(resources_dir, LoadOptions::STRICT)
 }
@@ -126,6 +128,9 @@ pub fn load_resources_with_options(
 
         strict::validate_namespace_tree(&ns_path, "resource tree")?;
 
+        // Fragment id -> source file, for this directory namespace.
+        let mut mesh_fragment_files: HashMap<String, PathBuf> = HashMap::new();
+
         // Walk subdirectories: proxies/, consumers/, upstreams/, plugins/, mesh/
         for (subdir, expected_kind) in strict::RESOURCE_SUBDIRECTORIES {
             let subdir_path = ns_path.join(subdir);
@@ -204,6 +209,23 @@ pub fn load_resources_with_options(
                             .file_stem()
                             .and_then(|stem| stem.to_str())
                             .map(|stem| stem.to_string());
+                    }
+                    // Two fragments sharing a name would merge into one
+                    // ambiguous document and leave overlays unable to say
+                    // which one they target, so reject them here, the same
+                    // way duplicate gateway keys are rejected.
+                    if let Some(fragment_id) = id.clone() {
+                        if let Some(previous) =
+                            mesh_fragment_files.insert(fragment_id.clone(), path.clone())
+                        {
+                            return Err(crate::error::Error::Config(format!(
+                                "duplicate MeshConfig fragment {namespace}/mesh/{fragment_id} in {} \
+                                 and {}; a fragment id (top-level `id`, or the file stem) must be \
+                                 unique within its namespace — rename one fragment or merge them",
+                                previous.display(),
+                                path.display()
+                            )));
+                        }
                     }
                 }
 

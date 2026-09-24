@@ -1353,3 +1353,101 @@ fn an_invalid_mesh_document_is_still_rejected_under_the_validation_context() {
         "a refused apply must publish nothing"
     );
 }
+
+/// Two fragments in one directory namespace sharing a fragment id used to
+/// merge silently (with an ambiguous diagnostic label) and fail only once an
+/// overlay was configured. The loader now rejects them up front, naming both
+/// files, with or without an overlay.
+#[test]
+fn duplicate_mesh_fragment_ids_in_one_namespace_are_rejected_without_an_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            (
+                "ferrum/mesh/a.yaml",
+                "kind: MeshConfig\nid: core\nspec:\n  istio_root_namespace: istio-system\n",
+            ),
+            (
+                "ferrum/mesh/b.yaml",
+                "kind: MeshConfig\nid: core\nspec:\n  mesh_policies: [{name: p}]\n",
+            ),
+        ],
+    );
+
+    let err = load_resources(tmp.path())
+        .expect_err("duplicate fragment id must be rejected")
+        .to_string();
+    assert!(
+        err.contains("duplicate MeshConfig fragment ferrum/mesh/core"),
+        "{err}"
+    );
+    assert!(err.contains("a.yaml") && err.contains("b.yaml"), "{err}");
+}
+
+/// An `id` that collides with another fragment's file stem is the same
+/// overlay target, so it is a duplicate too.
+#[test]
+fn explicit_mesh_fragment_id_colliding_with_a_file_stem_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            ("ferrum/mesh/core.yaml", CORE_FRAGMENT),
+            (
+                "ferrum/mesh/extra.yaml",
+                "kind: MeshConfig\nid: core\nspec:\n  mesh_policies: [{name: p}]\n",
+            ),
+        ],
+    );
+    let err = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("core.yaml") && err.contains("extra.yaml"),
+        "{err}"
+    );
+}
+
+/// The same fragment id in two different directory namespaces is two
+/// distinct overlay targets and stays allowed.
+#[test]
+fn same_mesh_fragment_id_in_different_namespaces_is_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            (
+                "alpha/mesh/core.yaml",
+                "kind: MeshConfig\nspec:\n  mesh_policies: [{name: a}]\n",
+            ),
+            (
+                "beta/mesh/core.yaml",
+                "kind: MeshConfig\nspec:\n  mesh_policies: [{name: b}]\n",
+            ),
+        ],
+    );
+    let resources = load_resources(tmp.path()).unwrap();
+    assert_eq!(resources.len(), 2);
+    assert!(assemble(resources).is_ok());
+}
+
+/// Callers that build resources without the loader get the same refusal at
+/// assembly time.
+#[test]
+fn assemble_rejects_duplicate_mesh_fragment_ids() {
+    let fragment = |policy: &str| {
+        serde_yaml::from_str::<Resource>(&format!(
+            "kind: MeshConfig\nid: core\nspec:\n  mesh_policies: [{{name: {policy}}}]\n"
+        ))
+        .unwrap()
+    };
+    let err = assemble(vec![
+        ("ferrum".to_string(), fragment("a")),
+        ("ferrum".to_string(), fragment("b")),
+    ])
+    .expect_err("duplicate fragment id must be rejected")
+    .to_string();
+    assert!(
+        err.contains("duplicate MeshConfig fragment ferrum/mesh/core"),
+        "{err}"
+    );
+}

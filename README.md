@@ -1195,7 +1195,7 @@ Every fragment in the repo contributes to **one** merged document:
 - List fields (`workloads`, `services`, `peer_authentications`, …) concatenate across fragments.
 - Singleton fields (`istio_root_namespace`, `trust_bundles`, `multi_cluster`, `outbound_traffic_policy`) may be set by at most one fragment, or by several fragments agreeing on the same value. A conflict is an error, not a last-writer-wins merge.
 
-A mesh fragment has no top-level namespace of its own — the identity that matters lives inside each workload / service / policy entry. The directory namespace is only a handle for `FERRUM_NAMESPACE` filtering and overlay matching. See `resources/ferrum/mesh/_example.yaml`.
+A mesh fragment has no top-level namespace of its own — the identity that matters lives inside each workload / service / policy entry. The directory namespace is only a handle for `FERRUM_NAMESPACE` filtering and overlay matching. Within one directory namespace each fragment id (explicit `id`, or the file stem) must be unique; two fragments sharing one are rejected at load time with both file paths named, whether or not an overlay is configured. See `resources/ferrum/mesh/_example.yaml`.
 
 ### Overlays
 

@@ -82,6 +82,7 @@ pub fn assemble_with_namespace_filter(
     let mut config = GatewayConfig::default();
     let mut mesh_fragments: Vec<(String, MeshConfigSpec)> = Vec::new();
     let mut mesh_sources = Vec::new();
+    let mut mesh_fragment_ids: HashSet<(String, String)> = HashSet::new();
 
     for (namespace, resource) in resources {
         match resource {
@@ -128,7 +129,17 @@ pub fn assemble_with_namespace_filter(
                     }
                 }
                 let label = match id {
-                    Some(id) if !id.trim().is_empty() => format!("{namespace}/mesh/{id}"),
+                    Some(id) if !id.trim().is_empty() => {
+                        // The loader names both files; this covers callers
+                        // that assemble resources they built themselves.
+                        if !mesh_fragment_ids.insert((namespace.clone(), id.clone())) {
+                            return Err(crate::error::Error::Config(format!(
+                                "duplicate MeshConfig fragment {namespace}/mesh/{id}; a fragment \
+                                 id must be unique within its namespace"
+                            )));
+                        }
+                        format!("{namespace}/mesh/{id}")
+                    }
                     _ => format!("{namespace}/mesh"),
                 };
                 mesh_sources.push((namespace, label.clone()));
