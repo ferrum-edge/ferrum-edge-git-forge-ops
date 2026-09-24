@@ -1006,8 +1006,10 @@ map and `tests/lifecycle/README.md` stay in step — adding a fail-closed gate t
 `apply` without adding a scenario narrows what the suite certifies without
 narrowing what ships.
 
-`release.yml`'s `authorize-release` downloads the sealed result for the exact
-revision being published and runs `lifecycle_result.py verify`. Only `passed`
+`release.yml`'s `authorize-release` walks the successful lifecycle runs for
+the exact revision being published, newest first, and accepts the first whose
+sealed result passes `lifecycle_result.py verify` (none passing is a refusal),
+so a newer unattested run cannot hide an attested one. Only `passed`
 certifies: an unrun suite, a result for another revision, a result from another
 gateway build, an unsealed (cancelled) record, a `skipped` scenario and a stale
 record are each a refusal, because a release gate that can be satisfied by an

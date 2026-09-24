@@ -8,6 +8,8 @@ scenario and reported no failures.
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -492,6 +494,15 @@ class ReleaseGateWiringTests(unittest.TestCase):
         self.assertIn("has not started for ${RELEASE_SHA} yet", self.release)
         self.assertIn("Fix the scenarios it reported, not the gate", self.release)
 
+    def test_the_gate_does_not_stop_at_the_newest_successful_run(self):
+        # A newer push-triggered run skips the GitHub-repository scenarios; it
+        # must not hide an older dispatched run that carries the attestation.
+        self.assertNotIn("sort_by(.updated_at) | last", self.release)
+        self.assertIn("sort_by(.updated_at) | reverse", self.release)
+        loop = self.release.index("for run_id in $run_ids; do")
+        self.assertLess(loop, self.release.index("lifecycle_result.py verify"))
+        self.assertIn("published a result that certifies it", self.release)
+
     def test_the_lifecycle_workflow_seals_and_publishes_its_result(self):
         workflow = (ROOT / ".github/workflows/lifecycle.yml").read_text(
             encoding="utf-8"
@@ -501,6 +512,168 @@ class ReleaseGateWiringTests(unittest.TestCase):
         # `!cancelled()` rather than `always()`: a cancelled run must leave an
         # unsealed record, which the gate reads as "did not finish".
         self.assertIn("!cancelled()", workflow)
+
+
+STUB_GH = """#!/usr/bin/env bash
+set -eu
+case "$1" in
+  api) cat "$STUB_RUNS" ;;
+  run)
+    id=$3
+    dir=
+    while [ $# -gt 0 ]; do
+      if [ "$1" = --dir ]; then dir=$2; fi
+      shift
+    done
+    [ -f "$STUB_RESULTS/$id.json" ] || exit 1
+    mkdir -p "$dir"
+    cp "$STUB_RESULTS/$id.json" "$dir/lifecycle-result.json"
+    ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+def release_gate_script() -> str:
+    """The shell the release runs to pick and verify a lifecycle result."""
+    lines = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8").splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if "name: Require a lifecycle acceptance result for this revision" in line
+    )
+    run = next(index for index in range(start, len(lines)) if lines[index].strip() == "run: |")
+    indent = len(lines[run + 1]) - len(lines[run + 1].lstrip())
+    body = []
+    for line in lines[run + 1 :]:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        body.append(line[indent:])
+    return "\n".join(body) + "\n"
+
+
+@unittest.skipUnless(
+    shutil.which("jq") and shutil.which("bash"),
+    "jq and bash are required to exercise the release gate's run selection",
+)
+class ReleaseGateRunSelectionTests(unittest.TestCase):
+    """The gate picks the newest successful run whose result certifies."""
+
+    def _gate(self, runs, results):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / ".github/scripts"
+            scripts.mkdir(parents=True)
+            shutil.copyfile(SCRIPT, scripts / "lifecycle_result.py")
+            (root / ".github/ferrum-edge-checksums.txt").write_text(
+                f"{GATEWAY}  ferrum-edge\n", encoding="utf-8"
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "gh").write_text(STUB_GH, encoding="utf-8")
+            (bin_dir / "gh").chmod(0o755)
+            stub_results = root / "stub-results"
+            stub_results.mkdir()
+            for run_id, result in results.items():
+                lifecycle_result.save(stub_results / f"{run_id}.json", result)
+            runs_path = root / "runs.json"
+            runs_path.write_text(
+                json.dumps({"total_count": len(runs), "workflow_runs": runs}),
+                encoding="utf-8",
+            )
+            summary = root / "summary.md"
+            completed = subprocess.run(
+                ["bash", "-c", release_gate_script()],
+                cwd=root,
+                env={
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "REPO": "acme/template-copy",
+                    "RELEASE_SHA": REVISION,
+                    "GH_TOKEN": "unused",
+                    "GITHUB_STEP_SUMMARY": str(summary),
+                    "STUB_RUNS": str(runs_path),
+                    "STUB_RESULTS": str(stub_results),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return completed
+
+    @staticmethod
+    def _run(run_id, updated_at, conclusion="success"):
+        return {
+            "id": run_id,
+            "status": "completed",
+            "conclusion": conclusion,
+            "updated_at": updated_at,
+        }
+
+    @staticmethod
+    def _fresh(result):
+        lifecycle_result.seal(result, REVISION, GATEWAY, datetime.now(timezone.utc))
+        return result
+
+    def _attested(self):
+        result = ci_result()
+        attest(result, operator_attestation())
+        return self._fresh(result)
+
+    def test_an_older_attested_run_is_not_hidden_by_a_newer_skipped_one(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+            ],
+            {101: self._attested(), 202: self._fresh(ci_result())},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Lifecycle run 202 does not certify", completed.stdout)
+        self.assertIn("Lifecycle run 101 certifies", completed.stdout)
+
+    def test_the_newest_certifying_run_is_used_first(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+            ],
+            {101: self._fresh(ci_result()), 202: self._attested()},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Lifecycle run 202 certifies", completed.stdout)
+        self.assertNotIn("Lifecycle run 101", completed.stdout)
+
+    def test_a_run_without_an_artifact_moves_to_the_next_older_run(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+            ],
+            {101: self._attested()},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Lifecycle run 202 published no result artifact", completed.stdout)
+        self.assertIn("Lifecycle run 101 certifies", completed.stdout)
+
+    def test_no_certifying_run_fails_closed(self):
+        completed = self._gate(
+            [
+                self._run(101, "2026-09-21T10:00:00Z"),
+                self._run(202, "2026-09-21T11:00:00Z"),
+                self._run(303, "2026-09-21T12:00:00Z", conclusion="failure"),
+            ],
+            {
+                101: self._fresh(ci_result()),
+                202: self._fresh(ci_result()),
+                # A failed run is never a candidate, whatever it uploaded.
+                303: self._attested(),
+            },
+        )
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertIn("published a result that certifies it", completed.stdout)
+        self.assertNotIn("certifies " + REVISION + ".", completed.stdout)
+        self.assertNotIn("Lifecycle run 303", completed.stdout)
 
 
 if __name__ == "__main__":

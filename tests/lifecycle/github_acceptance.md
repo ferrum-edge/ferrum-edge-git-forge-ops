@@ -225,8 +225,10 @@ That run executes the local scenarios itself, then merges your outcomes into
 revision or a different gateway build than the one it installed, or sealed more
 than 72 hours (the `verify` freshness window) before it runs, and it can never
 overwrite a scenario it ran. When it is green,
-re-run the `Release` workflow for the same revision; it picks the newest
-successful acceptance run for that commit.
+re-run the `Release` workflow for the same revision. It walks the successful
+acceptance runs for that commit newest first and accepts the first whose result
+`verify` certifies, so a later push-triggered run that skipped these scenarios
+does not hide your attested one.
 
 `verify` is the same computation the release runs, if you want to check the
 merged record yourself:
