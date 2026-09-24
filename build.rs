@@ -17,8 +17,30 @@ fn main() {
         git_stdout(&["describe", "--always", "--dirty", "--tags"]),
     );
 
-    if let Some(head) = git_stdout(&["rev-parse", "--git-path", "HEAD"]) {
-        println!("cargo:rerun-if-changed={head}");
+    // Once any `rerun-if-changed` is printed, Cargo watches only those paths,
+    // so every input to the two values above has to be listed. `HEAD` alone
+    // is not enough: on a branch it holds `ref: refs/heads/<branch>` and does
+    // not change when a commit lands. The branch ref (loose or packed) moves
+    // the SHA, tags move `describe`, and the index plus the package sources
+    // move `--dirty`.
+    let mut watched = vec![
+        "HEAD".to_string(),
+        "packed-refs".to_string(),
+        "refs/tags".to_string(),
+        "index".to_string(),
+    ];
+    if let Some(branch) = git_stdout(&["symbolic-ref", "-q", "HEAD"]) {
+        watched.push(branch);
+    }
+    for name in watched {
+        if let Some(path) = git_stdout(&["rev-parse", "--git-path", &name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if in_package_git_checkout() {
+        for source in ["src", "Cargo.toml", "Cargo.lock"] {
+            println!("cargo:rerun-if-changed={source}");
+        }
     }
 }
 
