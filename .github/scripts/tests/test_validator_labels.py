@@ -165,5 +165,25 @@ class ValidatorLabelsTests(unittest.TestCase):
         )
 
 
+    def test_canary_reports_a_broken_pairing_even_when_the_refresh_fails(self):
+        # Without a status function a step's `if:` is implicitly
+        # `success() && ...`, so a failed install followed by a failed refresh
+        # would skip both the tracking issue and the final failure.
+        workflow = (ROOT / ".github/workflows/validator-pin-canary.yml").read_text()
+        condition = (
+            "if: ${{ !cancelled() && (steps.install.outputs.status != '0' || "
+            "steps.verify.outputs.status != '0') }}"
+        )
+        for name in (
+            "Open or update the tracking issue",
+            "Fail when the validator pairing is invalid",
+        ):
+            with self.subTest(step=name):
+                step = workflow.split(f"      - name: {name}\n", 1)[1].split(
+                    "\n      - name:", 1
+                )[0]
+                self.assertIn(condition, step)
+
+
 if __name__ == "__main__":
     unittest.main()
