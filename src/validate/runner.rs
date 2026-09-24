@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -92,15 +92,24 @@ pub fn build_validate_args_for_mode(
 /// inputs all live in the `FERRUM_*` namespace, so removing exactly those
 /// keeps the child functional while making the run hermetic with respect to
 /// gitforgeops' own configuration.
-pub fn scrubbed_env_names<I, S>(names: I) -> Vec<String>
+///
+/// Names are OS strings and the prefix is matched on their raw encoded bytes:
+/// the process environment may hold entries that are not valid UTF-8, and
+/// neither an unrelated such entry nor a non-UTF-8 `FERRUM_*` name may abort
+/// validation (`std::env::vars` panics on them) or escape the scrub.
+pub fn scrubbed_env_names<I, S>(names: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: AsRef<OsStr>,
 {
     names
         .into_iter()
-        .filter(|name| name.as_ref().starts_with(FERRUM_ENV_PREFIX))
-        .map(|name| name.as_ref().to_string())
+        .filter(|name| {
+            name.as_ref()
+                .as_encoded_bytes()
+                .starts_with(FERRUM_ENV_PREFIX.as_bytes())
+        })
+        .map(|name| name.as_ref().to_os_string())
         .collect()
 }
 
@@ -405,7 +414,7 @@ fn run_validate_command(
         settings_file.path(),
         spec_file.path(),
     ));
-    for name in scrubbed_env_names(std::env::vars().map(|(name, _)| name)) {
+    for name in scrubbed_env_names(std::env::vars_os().map(|(name, _)| name)) {
         command.env_remove(name);
     }
     // Order is load-bearing: every inherited `FERRUM_*` name is removed

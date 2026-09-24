@@ -611,11 +611,90 @@ fn env_scrub_targets_only_ferrum_variables() {
     assert_eq!(
         scrubbed,
         vec![
-            "FERRUM_MODE".to_string(),
-            "FERRUM_GATEWAY_URL".to_string(),
-            "FERRUM_ADMIN_JWT_SECRET".to_string(),
-            "FERRUM_MESH_ALLOW_NO_CA".to_string(),
+            "FERRUM_MODE",
+            "FERRUM_GATEWAY_URL",
+            "FERRUM_ADMIN_JWT_SECRET",
+            "FERRUM_MESH_ALLOW_NO_CA",
         ]
+    );
+}
+
+/// A non-UTF-8 `FERRUM_*` name is still removed, and a non-UTF-8 unrelated
+/// name is left for the child — neither may be dropped or panic.
+#[cfg(unix)]
+#[test]
+fn env_scrub_matches_the_prefix_on_raw_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let ferrum = OsStr::from_bytes(b"FERRUM_\xffMODE");
+    let unrelated = OsStr::from_bytes(b"LEGACY_\xe9");
+    let scrubbed = scrubbed_env_names([ferrum, unrelated, OsStr::new("PATH")]);
+    assert_eq!(scrubbed, vec![ferrum.to_os_string()]);
+}
+
+/// Regression for #330: an unrelated non-UTF-8 environment entry used to
+/// panic `std::env::vars()` inside the validator runner. Validation must run
+/// the child normally, and a non-UTF-8 `FERRUM_*` name must not reach it.
+#[cfg(unix)]
+#[test]
+fn validate_tolerates_non_utf8_environment_entries() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("resources/ferrum/proxies")).unwrap();
+    std::fs::write(
+        root.join("resources/ferrum/proxies/app.yaml"),
+        "kind: Proxy\nspec:\n  id: app\n  listen_path: /app\n  backend_scheme: http\n  \
+         backend_host: 127.0.0.1\n  backend_port: 9101\n",
+    )
+    .unwrap();
+    let env_dump = root.join("child-env");
+    let stub = root.join("validator");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nenv > '{}'\necho ok\nexit 0\n",
+            env_dump.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
+    command.arg("validate").current_dir(root).env_clear();
+    for name in ["PATH", "HOME", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("FERRUM_GATEWAY_MODE", "file")
+        .env("FERRUM_EDGE_BINARY_PATH", &stub)
+        .env(
+            "UNRELATED_LEGACY_VAR",
+            std::ffi::OsStr::from_bytes(b"caf\xe9"),
+        )
+        .env(
+            std::ffi::OsStr::from_bytes(b"FERRUM_\xffSTRAY"),
+            "must-not-reach-the-child",
+        );
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+
+    let child_env = std::fs::read(&env_dump).expect("the stub validator ran");
+    let child_env = String::from_utf8_lossy(&child_env);
+    assert!(
+        child_env.contains("UNRELATED_LEGACY_VAR="),
+        "unrelated variables pass through: {child_env}"
+    );
+    assert!(
+        !child_env.contains("must-not-reach-the-child"),
+        "a non-UTF-8 FERRUM_* name must be scrubbed: {child_env}"
     );
 }
 
