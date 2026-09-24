@@ -2355,7 +2355,12 @@ fn allowed_slot_remap_downgrades_the_deleted_consumer_refusal() {
     let report = resolve_with_ledger(&mut cfg, &bundle, &ledger, true)
         .expect("the acknowledgement accepts the retired slots");
 
-    assert_eq!(report.slot_remaps.len(), 2, "{:?}", report.slot_remaps);
+    assert_eq!(
+        report.slot_remaps.len(),
+        2,
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].status, SlotStatus::Resolved);
     assert_eq!(
@@ -2388,7 +2393,11 @@ fn filtered_or_partial_runs_never_read_a_missing_consumer_as_deleted() {
     let partial = ledger_of(&managed, ConsumerCoverage::Partial);
     let report = report_with_ledger(&partner_deleted_cfg(), &bundle, &partial, false)
         .expect("a filtered run cannot conclude that a Consumer was deleted");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.slot_remaps.is_empty(),
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
 
     let staging = ConsumerCoverage::Namespace("staging".to_string());
     let env_scope = ledger_of(&managed, staging);
@@ -2397,11 +2406,14 @@ fn filtered_or_partial_runs_never_read_a_missing_consumer_as_deleted() {
     assert_eq!(
         report.slot_remaps.len(),
         1,
-        "only the covered namespace can be read as deleted: {:?}",
-        report.slot_remaps
+        "only the covered namespace can be read as deleted: {} remap(s)",
+        report.slot_remaps.len()
     );
     let remap = &report.slot_remaps[0];
-    assert!(remap.contains("'staging/partner/jwt/secret'"), "{remap}");
+    assert!(
+        remap.contains("'staging/partner/jwt/secret'"),
+        "the remap must name the covered namespace's slot"
+    );
 
     let report = report_secrets_with_mode_and_options(
         &partner_deleted_cfg(),
@@ -2410,7 +2422,11 @@ fn filtered_or_partial_runs_never_read_a_missing_consumer_as_deleted() {
         ResolveOptions::default(),
     )
     .expect("without ledger evidence absence decides nothing");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.slot_remaps.is_empty(),
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
 }
 
 /// A slot for a Consumer the ledger never recorded is a value seeded ahead of
@@ -2423,7 +2439,11 @@ fn a_slot_the_ledger_never_attributed_is_not_a_deletion() {
     let ledger = ledger_of(&[("ferrum", "other")], ConsumerCoverage::Complete);
     let report = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
         .expect("a pre-seeded slot is not evidence of deletion");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.slot_remaps.is_empty(),
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
 }
 
 /// The failure scenario from #332: `partner` is deleted, and a new Consumer
@@ -2473,7 +2493,11 @@ fn regrown_consumer_does_not_silently_revive_a_retired_slot() {
 
         let fresh = report_with_ledger(&regrown, &BTreeMap::new(), &ledger, false)
             .expect("a retired slot leaves nothing to revive");
-        assert!(fresh.slot_remaps.is_empty(), "{:?}", fresh.slot_remaps);
+        assert!(
+            fresh.slot_remaps.is_empty(),
+            "{} unexpected slot remap(s)",
+            fresh.slot_remaps.len()
+        );
         assert_eq!(fresh.results[0].status, SlotStatus::NeedsAllocation);
     }
 }
@@ -2506,7 +2530,11 @@ fn regrow_after_omission_does_not_silently_revive_the_retired_type() {
     retired.retain(|slot, _| !slot.starts_with("ferrum/partner/keyauth/"));
     let report = report_with_ledger(&regrown, &retired, &applied, false)
         .expect("with the slot retired the regrow is ordinary first allocation");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.slot_remaps.is_empty(),
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
     let keyauth = report
         .results
         .iter()
@@ -2537,7 +2565,11 @@ fn required_slot_on_a_new_consumer_is_a_seed_not_a_revival() {
     let ledger = ledger_of(&[], ConsumerCoverage::Complete);
     let report = report_with_ledger(&cfg, &retired_partner_key_bundle(), &ledger, false)
         .expect("seeded require slots resolve");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.slot_remaps.is_empty(),
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
     assert!(report
         .results
         .iter()
@@ -2568,7 +2600,11 @@ fn revival_check_is_limited_to_consumer_slots() {
     );
     let ledger = ledger_of(&[], ConsumerCoverage::Complete);
     let report = report_with_ledger(&cfg, &bundle, &ledger, false).expect("not a Consumer slot");
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.slot_remaps.is_empty(),
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
     assert_eq!(report.results[0].status, SlotStatus::Resolved);
 }
 
@@ -2616,8 +2652,10 @@ fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
         (Some(EARLIER), "not a timestamp", false),
         (None, EARLIER, true),
     ] {
-        let mut state = StateFile::default();
-        state.last_applied_at = last_applied.map(str::to_string);
+        let mut state = StateFile {
+            last_applied_at: last_applied.map(str::to_string),
+            ..Default::default()
+        };
         let metadata = CredentialMetadata {
             slot: slot.to_string(),
             last_rotated: allocated.to_string(),
