@@ -977,7 +977,11 @@ pub fn map_api_error_with_location(
         return crate::error::Error::ApiError {
             status,
             message: format!(
-                "the gateway answered a redirect (HTTP {status}) instead of a response.                  {destination}gitforgeops never follows redirects on admin calls — a 301/302                  would rewrite a POST into a GET and a 307/308 would replay a destructive body                  against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme,                  host, port and any path prefix) and re-run."
+                "the gateway answered a redirect (HTTP {status}) instead of a response. \
+                 {destination}gitforgeops never follows redirects on admin calls — a 301/302 \
+                 would rewrite a POST into a GET and a 307/308 would replay a destructive body \
+                 against another origin. Point FERRUM_GATEWAY_URL at the final origin (scheme, \
+                 host, port and any path prefix) and re-run."
             ),
         };
     }
@@ -1041,13 +1045,29 @@ pub fn map_api_error_with_location(
     }
 
     if status == 413 {
-        return crate::error::Error::ApiError {
-            status,
-            message: format!(
-                "{message} — payload exceeds the gateway's restore body limit \
+        // The advice depends on which body was too large: only `/restore` has
+        // its own (much larger) limit and a strategy-level workaround.
+        let advice = match kind {
+            RequestKind::Restore => "payload exceeds the gateway's restore body limit \
                  (FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB, default 100 MiB). Split the namespace or \
                  switch to the incremental apply strategy."
+                .to_string(),
+            RequestKind::NonIdempotentMutation => format!(
+                "the create or POST /batch body exceeds the gateway's admin request body limit. \
+                 Incremental apply chunks POST /batch bodies under {BATCH_MAX_BODY_BYTES} bytes \
+                 (1 MiB) and never splits a proxy/scoped-plugin dependency group, so a single \
+                 resource or dependency group above that size cannot be sent. Reduce that \
+                 resource or group."
             ),
+            RequestKind::Mutation | RequestKind::Read => {
+                "the request body exceeds the gateway's admin request body limit. Reduce the size \
+                 of this resource."
+                    .to_string()
+            }
+        };
+        return crate::error::Error::ApiError {
+            status,
+            message: format!("{message} — {advice}"),
         };
     }
 
