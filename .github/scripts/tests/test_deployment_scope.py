@@ -200,11 +200,13 @@ class DeploymentScopeTests(unittest.TestCase):
         self.assertIn(
             "GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}", workflow
         )
-        # And the guard runs the shared classifier rather than an ad-hoc diff.
+        # And the guard runs the shared classifier rather than an ad-hoc diff,
+        # piped from the triggering commit into an isolated interpreter.
         self.assertIn(
-            'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py"', workflow
+            'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\\n'
+            "            python3 -I - classify \\\n",
+            workflow,
         )
-        self.assertIn('python3 "$trusted_classifier" classify', workflow)
 
     # -- CLI ----------------------------------------------------------------
 
@@ -225,6 +227,30 @@ class DeploymentScopeTests(unittest.TestCase):
         # The message has to tell the operator where the replacement is.
         self.assertIn("schedules its own", refused.stdout)
         self.assertIn(deployment_scope.RECOVERY_DOC, refused.stdout)
+
+    def test_piped_classifier_ignores_modules_the_refreshed_head_supplies(self):
+        # The guard pipes the trusted classifier into `python3 -I -` inside the
+        # refreshed checkout. A plain `python3 -` searches that checkout first,
+        # so a newer head could plant `argparse.py` and approve itself.
+        with self._repo() as repo:
+            trigger = self._commit(repo, {"resources/ferrum/proxies/a.yaml": "id: a\n"})
+            head = self._commit(
+                repo,
+                {
+                    "resources/ferrum/proxies/b.yaml": "id: b\n",
+                    "argparse.py": "print('shadowed')\nraise SystemExit(0)\n",
+                },
+            )
+            source = SCRIPT.read_text(encoding="utf-8")
+            shadowed = self._piped(repo, source, [], trigger, head)
+            isolated = self._piped(repo, source, ["-I"], trigger, head)
+        # The planted module really is reachable without isolation...
+        self.assertEqual(shadowed.returncode, 0, shadowed.stderr)
+        self.assertIn("shadowed", shadowed.stdout)
+        # ...and `-I` runs the trusted classifier, which refuses the head.
+        self.assertEqual(isolated.returncode, 1, isolated.stdout + isolated.stderr)
+        self.assertNotIn("shadowed", isolated.stdout)
+        self.assertIn("::error::Superseded deployment", isolated.stdout)
 
     def test_unchanged_head_is_reported_as_such(self):
         with self._repo() as repo:
@@ -303,6 +329,19 @@ class DeploymentScopeTests(unittest.TestCase):
                 "--repo",
                 str(repo),
             ],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+
+    @staticmethod
+    def _piped(
+        repo: Path, source: str, flags: list[str], trigger: str, head: str
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, *flags, "-", "classify", trigger, head],
+            input=source,
+            cwd=str(repo),
             check=False,
             text=True,
             capture_output=True,
