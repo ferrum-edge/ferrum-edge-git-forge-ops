@@ -139,13 +139,40 @@ FRESH_HEAD_CONTROLS = (
 # the refreshed checkout, so a newer head cannot replace the program deciding
 # whether it may ride the older authorization. The checkout-executed form is
 # retired: it let the refreshed head approve its own helper changes.
-APPLY_REVISION_BINDINGS = (
-    (
-        'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"',
-        'python3 "$trusted_classifier" classify \\',
-        '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
-    ),
+#
+# Each family is matched as one uninterrupted run of script lines, not as
+# lines found anywhere in the step. The temp-file family goes through a mutable
+# destination, and a line such as `trusted_classifier=/dev/null` slipped
+# between the `mktemp` and the extraction discards the trusted copy and runs an
+# empty program that approves every revision (#357).
+#
+# The stdin family has no destination to redirect, and is accepted here first
+# because this check executes the default branch's policy against a candidate:
+# the workflow can only move to it once the protected policy knows it, after
+# which the temp-file family can be retired. `-I` keeps the working directory —
+# the refreshed checkout being judged — off the classifier's import path; a
+# plain `python3 -` would import a head-supplied `argparse.py` first.
+TRIGGER_CLASSIFIER_TEMPFILE = (
+    'trusted_classifier=$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")',
+    "trap 'rm -f \"${trusted_classifier:-}\"; git config --local --unset-all "
+    "http.https://github.com/.extraheader || true' EXIT",
+    'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"',
+    'python3 "$trusted_classifier" classify \\',
+    '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
 )
+TRIGGER_CLASSIFIER_STDIN = (
+    'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\',
+    "python3 -I - classify \\",
+    '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
+)
+APPLY_REVISION_BINDINGS = (TRIGGER_CLASSIFIER_TEMPFILE, TRIGGER_CLASSIFIER_STDIN)
+# A piped classifier is only a binding under `pipefail`: without it a failed
+# extraction feeds `python3 -` an empty program, which exits 0 and approves the
+# revision. So the guard must turn it on first and never touch shell options
+# again.
+PIPED_REVISION_BINDINGS = (TRIGGER_CLASSIFIER_STDIN,)
+PIPED_BINDING_PRELUDE = "        run: |\n          set -euo pipefail\n"
+SHELL_OPTION_COMMAND = re.compile(r"\b(?:set|shopt|eval)\b")
 DEPLOYMENT_SCOPE_SCRIPT = Path(".github/scripts/deployment_scope.py")
 DEPLOYMENT_INPUT_TUPLE = re.compile(
     r"^DEPLOYMENT_INPUT_PATHS:[^=]*=\s*\((?P<body>.*?)\)\s*$",
@@ -451,24 +478,7 @@ def stale_deployment_guard_violations(
                 violations.append(f"{label}: {FRESH_HEAD_STEP!r} is missing {required!r}")
 
         if workflow == "apply-on-merge.yml":
-            satisfied = any(
-                all(required in guard for required in family)
-                for family in APPLY_REVISION_BINDINGS
-            )
-            if not satisfied:
-                # Report the closest family so the message names something
-                # actionable rather than every alternative at once.
-                closest = max(
-                    APPLY_REVISION_BINDINGS,
-                    key=lambda family: sum(1 for item in family if item in guard),
-                )
-                missing = [item for item in closest if item not in guard]
-                violations.append(
-                    f"{label}: {FRESH_HEAD_STEP!r} must bind PR attribution to "
-                    "unchanged executable and desired inputs; no recognized "
-                    "implementation is complete (closest is missing "
-                    f"{', '.join(repr(item) for item in missing)})"
-                )
+            violations.extend(_revision_binding_violations(label, guard))
 
         for marker in contract["gateway"]:
             # Present AND after the guard. "After" alone would let the step be
@@ -486,6 +496,63 @@ def stale_deployment_guard_violations(
                     "ledger all come from the refreshed protected head"
                 )
     return violations
+
+
+def _revision_binding_violations(label: str, guard: str) -> list[str]:
+    """The guard must run one recognized classifier binding, uninterrupted."""
+    lines = [line.strip() for line in guard.splitlines()]
+    satisfied = [
+        family for family in APPLY_REVISION_BINDINGS if _contains_run(lines, family)
+    ]
+    if not satisfied:
+        # Report the closest family so the message names something
+        # actionable rather than every alternative at once.
+        closest = max(
+            APPLY_REVISION_BINDINGS,
+            key=lambda family: sum(1 for item in family if item in lines),
+        )
+        missing = [item for item in closest if item not in lines]
+        detail = (
+            f"closest is missing {', '.join(repr(item) for item in missing)}"
+            if missing
+            else "closest has every line, but not as one uninterrupted sequence"
+        )
+        return [
+            f"{label}: {FRESH_HEAD_STEP!r} must bind PR attribution to "
+            "unchanged executable and desired inputs; no recognized "
+            f"implementation is complete ({detail})"
+        ]
+    if any(family not in PIPED_REVISION_BINDINGS for family in satisfied):
+        return []
+
+    prelude = guard.find(PIPED_BINDING_PRELUDE)
+    if prelude < 0:
+        return [
+            f"{label}: {FRESH_HEAD_STEP!r} pipes the trusted classifier, so its "
+            "script must open with 'set -euo pipefail'; otherwise a failed "
+            "extraction runs an empty program that approves the revision"
+        ]
+    changed = [
+        line.strip()
+        for line in guard[prelude + len(PIPED_BINDING_PRELUDE):].splitlines()
+        if not line.strip().startswith("#") and SHELL_OPTION_COMMAND.search(line)
+    ]
+    if changed:
+        return [
+            f"{label}: {FRESH_HEAD_STEP!r} pipes the trusted classifier, so it "
+            "must not change shell options after 'set -euo pipefail'; found "
+            f"{changed[0]!r}"
+        ]
+    return []
+
+
+def _contains_run(lines: list[str], family: tuple[str, ...]) -> bool:
+    """Whether `family` appears as consecutive lines of `lines`."""
+    width = len(family)
+    return any(
+        tuple(lines[index:index + width]) == family
+        for index in range(len(lines) - width + 1)
+    )
 
 
 def _checkout_before(body: str, guard_index: int) -> str | None:
