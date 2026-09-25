@@ -58,6 +58,9 @@ class ReleaseBaselineTests(unittest.TestCase):
     def test_supported_baseline_requires_all_release_evidence(self):
         record = self.record()
         record["status"] = "supported"
+        record["gitforgeops"]["source_sha"] = None
+        record["gitforgeops"]["image_digest"] = None
+        record["lifecycle"]["run_url"] = None
         self.write_record(record)
         self.assertEqual(len(check_release_baseline.check(self.root)), 3)
 
@@ -71,6 +74,7 @@ class ReleaseBaselineTests(unittest.TestCase):
 
     def test_pending_record_rejects_partial_publication(self):
         record = self.record()
+        record["status"] = "pending"
         record["gitforgeops"]["source_sha"] = "a" * 40
         self.write_record(record)
         self.assertTrue(any("pending" in issue for issue in check_release_baseline.check(self.root)))
