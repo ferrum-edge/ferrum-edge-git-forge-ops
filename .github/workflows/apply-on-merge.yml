@@ -245,12 +245,13 @@ jobs:
           # checkout it is deciding whether to trust. Otherwise a newer commit
           # could replace this program and approve its own executable changes
           # under the older run's environment authorization.
-          trusted_classifier=$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")
-          trap 'rm -f "${trusted_classifier:-}"; git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
-          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"
-          python3 "$trusted_classifier" classify \
+          # Pipe it straight into the interpreter: there is no file a later
+          # line could point elsewhere, `pipefail` (set above) fails the step
+          # if the extraction does, and `-I` keeps the refreshed checkout off
+          # the import path so it cannot shadow a module the classifier loads.
+          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \
+            python3 -I - classify \
             "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"
-          rm -f "$trusted_classifier"
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Download ferrum-edge binary
@@ -820,12 +821,13 @@ jobs:
           # checkout it is deciding whether to trust. Otherwise a newer commit
           # could replace this program and approve its own executable changes
           # under the older run's environment authorization.
-          trusted_classifier=$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")
-          trap 'rm -f "${trusted_classifier:-}"; git config --local --unset-all http.https://github.com/.extraheader || true' EXIT
-          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"
-          python3 "$trusted_classifier" classify \
+          # Pipe it straight into the interpreter: there is no file a later
+          # line could point elsewhere, `pipefail` (set above) fails the step
+          # if the extraction does, and `-I` keeps the refreshed checkout off
+          # the import path so it cannot shadow a module the classifier loads.
+          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \
+            python3 -I - classify \
             "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"
-          rm -f "$trusted_classifier"
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       # The revision is fixed by the guard above. Now prove it is the one the

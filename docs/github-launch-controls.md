@@ -370,7 +370,13 @@ same list — `DEPLOYMENT_INPUT_PATHS` in
 — and `check_supply_chain.py` fails the build when they drift apart.
 The workflow executes that classifier from the triggering commit, not from the
 refreshed checkout it is evaluating. A newer helper change therefore cannot
-approve itself under the waiting run's older environment authorization.
+approve itself under the waiting run's older environment authorization. The
+trusted copy is piped from `git show` into `python3 -I -` under
+`set -euo pipefail` rather than written to a temporary file: no destination
+exists for a later line to redirect (to `/dev/null`, say, which Python would
+run as an empty program that approves everything), a failed extraction fails the
+step, and `-I` keeps a head-supplied module such as `argparse.py` off the import
+path. `check_supply_chain.py` recognizes only that uninterrupted form.
 
 Equality is what keeps an approval-gated deployment from being cancelled by
 accident. While a merge waits for its environment's required reviewer, other
