@@ -389,8 +389,9 @@ twice: it is also `apply-on-merge.yml`'s `on.push.paths` filter, and
 two halves disagree. Equality is the invariant — a change that supersedes a
 queued apply always schedules a replacement run, and a change that schedules
 nothing (docs, `tests/**`, an unrelated workflow) can never supersede, so it no
-longer strands an authorized deployment. The workflow extracts the classifier
-from the triggering commit before executing it; the refreshed head cannot
+longer strands an authorized deployment. The workflow pipes the classifier
+from the triggering commit into `python3 -I -` under `set -euo pipefail` (never
+via a temp file, which a later line could redirect); the refreshed head cannot
 approve its own helper or executable changes under an older authorization.
 `GENERATED_PATHS` (`.state/**`,
 `assembled/**`) is in neither half: the apply writes it, so it must not reject a

@@ -15,8 +15,8 @@ check_supply_chain = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = check_supply_chain
 SPEC.loader.exec_module(check_supply_chain)
 
-# The two spellings of the trigger-pinned classifier, as they appear in each
-# freshness guard of apply-on-merge.yml.
+# The trigger-pinned classifier as each freshness guard of apply-on-merge.yml
+# runs it, and the retired temp-file spelling it replaced (#357).
 TEMPFILE_CLASSIFIER = (
     '          trusted_classifier=$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")\n'
     "          trap 'rm -f \"${trusted_classifier:-}\"; git config --local --unset-all "
@@ -1527,13 +1527,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/apply-on-merge.yml"
             text = path.read_text(encoding="utf-8")
-            text = text.replace(
-                '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
-                '          python3 "$trusted_classifier" classify \\\n'
-                '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
-                "          true\n",
-                1,
-            )
+            self.assertIn(STDIN_CLASSIFIER, text)
+            text = text.replace(STDIN_CLASSIFIER, "          true\n", 1)
             path.write_text(text, encoding="utf-8")
             violations = self._violations(root)
         self.assertTrue(
@@ -1557,9 +1552,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             [],
         )
         legacy = workflow.replace(
-            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
-            '          python3 "$trusted_classifier" classify \\\n'
-            '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
+            STDIN_CLASSIFIER,
             '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
             "            ':(exclude).state/**' ':(exclude)assembled/**'\n",
             1,
@@ -1583,7 +1576,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('python3 "$trusted_classifier" classify \\\n', workflow)
+        self.assertIn("            python3 -I - classify \\\n", workflow)
         self.assertEqual(
             check_supply_chain.stale_deployment_guard_violations(
                 "apply-on-merge.yml", workflow, contract
@@ -1592,8 +1585,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         # Extracting the trusted copy without running it is not a binding.
         unused = workflow.replace(
-            '          python3 "$trusted_classifier" classify \\\n',
-            "          true \\\n",
+            "            python3 -I - classify \\\n",
+            "            true \\\n",
         )
         self.assertTrue(
             any(
@@ -1604,10 +1597,11 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
         )
         # The retired checkout-executed form lets the refreshed head run its
-        # own classifier, so it is no longer a recognized binding.
+        # own classifier, so it is no longer a recognized binding — even with
+        # the trusted copy still piped in and ignored.
         checkout_executed = workflow.replace(
-            '          python3 "$trusted_classifier" classify \\\n',
-            "          python3 .github/scripts/deployment_scope.py classify \\\n",
+            "            python3 -I - classify \\\n",
+            "            python3 -I .github/scripts/deployment_scope.py classify \\\n",
         )
         self.assertTrue(
             any(
@@ -1618,56 +1612,67 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
         )
 
-    def test_the_tempfile_classifier_destination_cannot_be_redirected(self):
-        # Pointing the extraction at /dev/null discards the trusted copy, and
+    def test_the_retired_tempfile_classifier_is_no_longer_a_binding(self):
+        # The temp-file form ran whatever the destination variable named. With
+        # `trusted_classifier=/dev/null` slipped in before the extraction,
         # `python3 /dev/null` is an empty program that approves every revision.
-        # Every recognized line is still present, just no longer in sequence.
+        # The stdin form leaves nothing to redirect, so the temp-file form is
+        # retired outright rather than policed line by line (#357).
         contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
         )
+        self.assertEqual(workflow.count(STDIN_CLASSIFIER), 2)
+        self.assertNotIn("trusted_classifier", workflow)
+        retired = workflow.replace(STDIN_CLASSIFIER, TEMPFILE_CLASSIFIER)
         extraction = (
-            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py"'
+            ' > "$trusted_classifier"\n'
         )
-        redirected = workflow.replace(
-            extraction, "          trusted_classifier=/dev/null\n" + extraction, 1
+        self.assertEqual(retired.count(extraction), 2)
+        redirected = retired.replace(
+            extraction, "          trusted_classifier=/dev/null\n" + extraction
         )
-        self.assertNotEqual(redirected, workflow, "the classifier binding moved")
-        violations = check_supply_chain.stale_deployment_guard_violations(
-            "apply-on-merge.yml", redirected, contract
-        )
-        self.assertTrue(
-            any(
-                "no recognized implementation is complete" in item
-                and "not as one uninterrupted sequence" in item
-                for item in violations
-            ),
-            violations,
-        )
+        for name, candidate in (("retired", retired), ("redirected", redirected)):
+            with self.subTest(form=name):
+                violations = check_supply_chain.stale_deployment_guard_violations(
+                    "apply-on-merge.yml", candidate, contract
+                )
+                self.assertEqual(
+                    sum(
+                        "no recognized implementation is complete" in item
+                        for item in violations
+                    ),
+                    2,
+                    violations,
+                )
 
-    def test_the_stdin_pinned_classifier_is_a_recognized_binding(self):
+    def test_the_stdin_pinned_classifier_is_the_only_recognized_binding(self):
         # Piping the triggering commit's classifier into the interpreter leaves
         # no destination a candidate could redirect.
         contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count(TEMPFILE_CLASSIFIER), 2)
-        piped = workflow.replace(TEMPFILE_CLASSIFIER, STDIN_CLASSIFIER)
+        self.assertEqual(workflow.count(STDIN_CLASSIFIER), 2)
+        self.assertEqual(
+            check_supply_chain.APPLY_REVISION_BINDINGS,
+            (check_supply_chain.TRIGGER_CLASSIFIER_STDIN,),
+        )
         self.assertEqual(
             check_supply_chain.stale_deployment_guard_violations(
-                "apply-on-merge.yml", piped, contract
+                "apply-on-merge.yml", workflow, contract
             ),
             [],
         )
         # Without `-I` the interpreter searches the working directory — the
         # refreshed checkout under judgement — before the standard library.
-        importable = piped.replace(
+        importable = workflow.replace(
             "            python3 -I - classify \\\n",
             "            python3 - classify \\\n",
             1,
         )
-        self.assertNotEqual(importable, piped)
+        self.assertNotEqual(importable, workflow)
         self.assertTrue(
             any(
                 "no recognized implementation is complete" in item
@@ -1677,13 +1682,13 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
         )
         # A filter spliced into the pipe hands the interpreter an empty program.
-        truncated = piped.replace(
+        truncated = workflow.replace(
             '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\\n',
             '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\\n'
             "            head -c 0 | \\\n",
             1,
         )
-        self.assertNotEqual(truncated, piped)
+        self.assertNotEqual(truncated, workflow)
         self.assertTrue(
             any(
                 "no recognized implementation is complete" in item
@@ -1700,14 +1705,13 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
         )
-        piped = workflow.replace(TEMPFILE_CLASSIFIER, STDIN_CLASSIFIER)
         guard_opening = (
             "        run: |\n"
             "          set -euo pipefail\n"
             '          [[ "$TRIGGER_SHA" =~ ^[0-9a-f]{40}$ ]] || {\n'
         )
-        self.assertEqual(piped.count(guard_opening), 2)
-        unset = piped.replace(
+        self.assertEqual(workflow.count(guard_opening), 2)
+        unset = workflow.replace(
             guard_opening,
             guard_opening.replace("set -euo pipefail", "set -eu"),
             1,
@@ -1721,8 +1725,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ),
         )
         fetch = "          git fetch --no-tags --force origin \\\n"
-        self.assertIn(fetch, piped)
-        reverted = piped.replace(fetch, "          set +o pipefail\n" + fetch, 1)
+        self.assertIn(fetch, workflow)
+        reverted = workflow.replace(fetch, "          set +o pipefail\n" + fetch, 1)
         self.assertTrue(
             any(
                 "must not change shell options" in item
@@ -1730,18 +1734,6 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     "apply-on-merge.yml", reverted, contract
                 )
             ),
-        )
-        # The temp-file binding is not piped, so it carries no such rule.
-        self.assertEqual(
-            check_supply_chain.stale_deployment_guard_violations(
-                "apply-on-merge.yml",
-                workflow.replace(
-                    guard_opening,
-                    guard_opening.replace("set -euo pipefail", "set -eu"),
-                ),
-                contract,
-            ),
-            [],
         )
 
     def test_a_half_present_attribution_binding_is_still_rejected(self):

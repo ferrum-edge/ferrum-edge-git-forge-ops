@@ -141,36 +141,26 @@ FRESH_HEAD_CONTROLS = (
 # retired: it let the refreshed head approve its own helper changes.
 #
 # Each family is matched as one uninterrupted run of script lines, not as
-# lines found anywhere in the step. The temp-file family goes through a mutable
-# destination, and a line such as `trusted_classifier=/dev/null` slipped
-# between the `mktemp` and the extraction discards the trusted copy and runs an
-# empty program that approves every revision (#357).
+# lines found anywhere in the step, so nothing can be spliced between the
+# extraction and the interpreter.
 #
-# The stdin family has no destination to redirect, and is accepted here first
-# because this check executes the default branch's policy against a candidate:
-# the workflow can only move to it once the protected policy knows it, after
-# which the temp-file family can be retired. `-I` keeps the working directory —
-# the refreshed checkout being judged — off the classifier's import path; a
-# plain `python3 -` would import a head-supplied `argparse.py` first.
-TRIGGER_CLASSIFIER_TEMPFILE = (
-    'trusted_classifier=$(mktemp "${RUNNER_TEMP}/deployment_scope.XXXXXX")',
-    "trap 'rm -f \"${trusted_classifier:-}\"; git config --local --unset-all "
-    "http.https://github.com/.extraheader || true' EXIT",
-    'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"',
-    'python3 "$trusted_classifier" classify \\',
-    '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
-)
+# The classifier is piped into the interpreter, leaving no destination to
+# redirect. The retired temp-file family went through a mutable path, and a
+# line such as `trusted_classifier=/dev/null` slipped between the `mktemp` and
+# the extraction discarded the trusted copy and ran an empty program that
+# approved every revision (#357). `-I` keeps the working directory — the
+# refreshed checkout being judged — off the classifier's import path; a plain
+# `python3 -` would import a head-supplied `argparse.py` first.
 TRIGGER_CLASSIFIER_STDIN = (
     'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\',
     "python3 -I - classify \\",
     '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
 )
-APPLY_REVISION_BINDINGS = (TRIGGER_CLASSIFIER_TEMPFILE, TRIGGER_CLASSIFIER_STDIN)
+APPLY_REVISION_BINDINGS = (TRIGGER_CLASSIFIER_STDIN,)
 # A piped classifier is only a binding under `pipefail`: without it a failed
 # extraction feeds `python3 -` an empty program, which exits 0 and approves the
 # revision. So the guard must turn it on first and never touch shell options
 # again.
-PIPED_REVISION_BINDINGS = (TRIGGER_CLASSIFIER_STDIN,)
 PIPED_BINDING_PRELUDE = "        run: |\n          set -euo pipefail\n"
 SHELL_OPTION_COMMAND = re.compile(r"\b(?:set|shopt|eval)\b")
 DEPLOYMENT_SCOPE_SCRIPT = Path(".github/scripts/deployment_scope.py")
@@ -522,8 +512,6 @@ def _revision_binding_violations(label: str, guard: str) -> list[str]:
             "unchanged executable and desired inputs; no recognized "
             f"implementation is complete ({detail})"
         ]
-    if any(family not in PIPED_REVISION_BINDINGS for family in satisfied):
-        return []
 
     prelude = guard.find(PIPED_BINDING_PRELUDE)
     if prelude < 0:
