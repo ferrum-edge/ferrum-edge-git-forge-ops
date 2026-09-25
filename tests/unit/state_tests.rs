@@ -837,7 +837,10 @@ fn record_allocation_journals_committed_slots_without_their_values() {
             "bravo-secret-value",
             "synthetic-delivery-ciphertext",
         ] {
-            assert!(!saved.contains(secret), "a synthetic secret reached the ledger");
+            assert!(
+                !saved.contains(secret),
+                "a synthetic secret reached the ledger"
+            );
         }
     });
 }
