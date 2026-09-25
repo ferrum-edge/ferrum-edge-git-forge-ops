@@ -45,7 +45,7 @@ spec:
       healthy_status_codes: [200, 204]
       use_tls: true
       probe_type: grpc
-      udp_probe_payload: 70696e67
+      udp_probe_payload: "70696e67"
       grpc_service_name: grpc.health.v1.Health
     passive:
       unhealthy_status_codes: [500, 503]
