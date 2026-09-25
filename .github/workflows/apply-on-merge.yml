@@ -477,7 +477,10 @@ jobs:
       # started. A repository that declares no `.gitforgeops/smoke.yaml` has
       # opted out of traffic checks: the step is skipped rather than failed on
       # every apply, and the record says `not_run`, which still authorizes no
-      # promotion.
+      # promotion. A `smoke.yaml` that declares no check for THIS environment
+      # is the same opt-out, per environment: `verify` exits 5, the step
+      # succeeds with `result=skipped`, and the record says `skipped` — not a
+      # pass, not a failure, and no promotion authorized.
       #
       # Credentials come from the apply's finalized bundle, not the pre-apply
       # file: a slot this run generated exists only there and in the GitHub
@@ -498,7 +501,23 @@ jobs:
             echo "::error::The apply step left no finalized credential bundle, so traffic cannot be verified against what it deployed."
             exit 1
           fi
-          FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify
+          # 0: every check passed. 5: no check is declared for this
+          # environment, so nothing was verified and nothing failed. Anything
+          # else (4 a check failed, 1 verify could not run) fails the step.
+          status=0
+          FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify || status=$?
+          case "$status" in
+            0)
+              echo "result=passed" >> "$GITHUB_OUTPUT"
+              ;;
+            5)
+              echo "result=skipped" >> "$GITHUB_OUTPUT"
+              echo "::notice::Traffic verification skipped: .gitforgeops/smoke.yaml declares no checks for $FERRUM_ENV. Nothing was verified; this environment authorizes no promotion."
+              ;;
+            *)
+              exit "$status"
+              ;;
+          esac
 
       - name: Record promotion result
         if: ${{ !cancelled() }}
@@ -508,19 +527,27 @@ jobs:
           MODE: ${{ steps.deployment-mode.outputs.mode }}
           APPLY_RESULT: ${{ (steps.apply.outcome == 'success' || steps.apply-file.outcome == 'success') && 'success' || 'failure' }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
           ACTOR: ${{ steps.pr.outputs.author }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          # File mode has no data plane to send traffic to. It is recorded as
-          # `skipped`, which does NOT authorize a promotion — an environment
-          # nothing can verify must not be a promotion predecessor.
+          # File mode has no data plane to send traffic to, and an environment
+          # smoke.yaml declares no check for has nothing to send. Both are
+          # recorded as `skipped`, which does NOT authorize a promotion — an
+          # environment nothing verified must not be a promotion predecessor.
+          # A successful step counts as `success` only when it says every
+          # declared check passed.
           verify="$VERIFY_OUTCOME"
           if [ "$MODE" = file ]; then
             verify=skipped
           elif [ -z "$verify" ] || [ "$verify" = skipped ]; then
             verify=not_run
           elif [ "$verify" != success ]; then
+            verify=failure
+          elif [ "$VERIFY_RESULT" = skipped ]; then
+            verify=skipped
+          elif [ "$VERIFY_RESULT" != passed ]; then
             verify=failure
           fi
           python3 .github/scripts/promotion_record.py write \
@@ -645,8 +672,11 @@ jobs:
       # refuse the record, but a standalone environment — and the final
       # promotion stage — has no successor, so the job itself must fail. Last,
       # so everything that has to survive the failure has already run. No
-      # rollback. A skipped verification (no smoke.yaml, or file mode) leaves
-      # the outcome empty or `skipped` and keeps its documented behaviour.
+      # rollback. Only a real failure reaches here: a check that ran and did
+      # not pass, a missing finalized bundle, or a `verify` that could not run.
+      # A skipped verification (no smoke.yaml, file mode, or no check declared
+      # for this environment) leaves the outcome empty, `skipped` or
+      # `success`, and the job green.
       - name: Fail on traffic verification failure
         if: ${{ !cancelled() && steps.verify.outcome == 'failure' }}
         run: |
@@ -1052,7 +1082,10 @@ jobs:
       # started. A repository that declares no `.gitforgeops/smoke.yaml` has
       # opted out of traffic checks: the step is skipped rather than failed on
       # every apply, and the record says `not_run`, which still authorizes no
-      # promotion.
+      # promotion. A `smoke.yaml` that declares no check for THIS environment
+      # is the same opt-out, per environment: `verify` exits 5, the step
+      # succeeds with `result=skipped`, and the record says `skipped` — not a
+      # pass, not a failure, and no promotion authorized.
       #
       # Credentials come from the apply's finalized bundle, not the pre-apply
       # file: a slot this run generated exists only there and in the GitHub
@@ -1073,7 +1106,23 @@ jobs:
             echo "::error::The apply step left no finalized credential bundle, so traffic cannot be verified against what it deployed."
             exit 1
           fi
-          FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify
+          # 0: every check passed. 5: no check is declared for this
+          # environment, so nothing was verified and nothing failed. Anything
+          # else (4 a check failed, 1 verify could not run) fails the step.
+          status=0
+          FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify || status=$?
+          case "$status" in
+            0)
+              echo "result=passed" >> "$GITHUB_OUTPUT"
+              ;;
+            5)
+              echo "result=skipped" >> "$GITHUB_OUTPUT"
+              echo "::notice::Traffic verification skipped: .gitforgeops/smoke.yaml declares no checks for $FERRUM_ENV. Nothing was verified; this environment authorizes no promotion."
+              ;;
+            *)
+              exit "$status"
+              ;;
+          esac
 
       - name: Record promotion result
         if: ${{ !cancelled() }}
@@ -1083,19 +1132,27 @@ jobs:
           MODE: ${{ steps.deployment-mode.outputs.mode }}
           APPLY_RESULT: ${{ (steps.apply.outcome == 'success' || steps.apply-file.outcome == 'success') && 'success' || 'failure' }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
           ACTOR: ${{ steps.pr.outputs.author }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          # File mode has no data plane to send traffic to. It is recorded as
-          # `skipped`, which does NOT authorize a promotion — an environment
-          # nothing can verify must not be a promotion predecessor.
+          # File mode has no data plane to send traffic to, and an environment
+          # smoke.yaml declares no check for has nothing to send. Both are
+          # recorded as `skipped`, which does NOT authorize a promotion — an
+          # environment nothing verified must not be a promotion predecessor.
+          # A successful step counts as `success` only when it says every
+          # declared check passed.
           verify="$VERIFY_OUTCOME"
           if [ "$MODE" = file ]; then
             verify=skipped
           elif [ -z "$verify" ] || [ "$verify" = skipped ]; then
             verify=not_run
           elif [ "$verify" != success ]; then
+            verify=failure
+          elif [ "$VERIFY_RESULT" = skipped ]; then
+            verify=skipped
+          elif [ "$VERIFY_RESULT" != passed ]; then
             verify=failure
           fi
           python3 .github/scripts/promotion_record.py write \
@@ -1220,8 +1277,11 @@ jobs:
       # refuse the record, but a standalone environment — and the final
       # promotion stage — has no successor, so the job itself must fail. Last,
       # so everything that has to survive the failure has already run. No
-      # rollback. A skipped verification (no smoke.yaml, or file mode) leaves
-      # the outcome empty or `skipped` and keeps its documented behaviour.
+      # rollback. Only a real failure reaches here: a check that ran and did
+      # not pass, a missing finalized bundle, or a `verify` that could not run.
+      # A skipped verification (no smoke.yaml, file mode, or no check declared
+      # for this environment) leaves the outcome empty, `skipped` or
+      # `success`, and the job green.
       - name: Fail on traffic verification failure
         if: ${{ !cancelled() && steps.verify.outcome == 'failure' }}
         run: |

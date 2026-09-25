@@ -166,6 +166,8 @@ Needs two environments and `promotion.requires` on the second.
 2. Merge a resource change. Approve staging's apply.
    - ✅ Production's job does not start until staging has applied **and** its
      traffic checks have passed.
+   - ✅ If production declares no traffic check, its job stays green and the
+     summary records its traffic result as `skipped`, not `success`.
 3. **Break staging's routing without breaking the write** — point the upstream
    at a port nothing listens on, so the gateway accepts the configuration and
    the route answers 502. Merge and approve staging.

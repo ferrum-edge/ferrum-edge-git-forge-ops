@@ -19,7 +19,8 @@ use gitforgeops::config::repo_config::RepoConfig;
 use gitforgeops::verify::runner::run_check;
 use gitforgeops::verify::{
     is_idempotent_method, resolve_headers, HeaderValue, Outcome, SmokeCheck, SmokeConfig,
-    VerifyReport, SMOKE_CONFIG_VERSION, VERIFY_FAILED_EXIT_CODE,
+    VerifyReport, VerifyStatus, SMOKE_CONFIG_VERSION, VERIFY_FAILED_EXIT_CODE,
+    VERIFY_SKIPPED_EXIT_CODE,
 };
 use tempfile::NamedTempFile;
 
@@ -457,16 +458,79 @@ fn report(outcomes: &[Outcome]) -> VerifyReport {
 }
 
 #[test]
-fn an_environment_with_no_declared_checks_has_not_verified_anything() {
+fn an_environment_with_no_declared_checks_is_skipped_not_passed_or_failed() {
     // The dangerous default: zero checks trivially "all pass". A promotion
-    // gate reading that as authorization is worse than having no gate.
+    // gate reading that as authorization is worse than having no gate. It is
+    // not a failed check either: nothing ran, so the deployment job records
+    // `skipped` and stays green.
     let empty = report(&[]);
     assert!(empty.passed(), "vacuously");
     assert!(empty.is_empty());
-    assert_eq!(empty.exit_code(), VERIFY_FAILED_EXIT_CODE);
-    assert!(empty
-        .render_text()
-        .contains("has not been shown to serve it"));
+    assert_eq!(empty.status(), VerifyStatus::Skipped);
+    assert_eq!(empty.exit_code(), VERIFY_SKIPPED_EXIT_CODE);
+    let rendered = empty.render_text();
+    assert!(
+        rendered.contains("skipped: no smoke checks declared for staging"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("not a pass"), "{rendered}");
+    assert!(rendered.contains("authorizes no promotion"), "{rendered}");
+}
+
+#[test]
+fn the_three_verify_results_have_three_exit_codes() {
+    // 1 is "verify could not run". Skipped must be distinguishable from it
+    // and from a failed check, and must never be 0.
+    let codes = [0, 1, VERIFY_FAILED_EXIT_CODE, VERIFY_SKIPPED_EXIT_CODE];
+    for (index, code) in codes.iter().enumerate() {
+        assert!(!codes[index + 1..].contains(code), "{code} is reused");
+    }
+    let skipped = VerifyReport::skipped("production");
+    assert_eq!(skipped.environment, "production");
+    assert_eq!(skipped.status(), VerifyStatus::Skipped);
+    assert_eq!(skipped.exit_code(), VERIFY_SKIPPED_EXIT_CODE);
+    let failed = report(&[Outcome::Passed, Outcome::Unexpected]);
+    assert_eq!(failed.status(), VerifyStatus::Failed);
+    let passed = report(&[Outcome::Passed]);
+    assert_eq!(passed.status(), VerifyStatus::Passed);
+}
+
+#[test]
+fn the_json_report_states_its_status() {
+    // A machine reader must not infer "skipped" from an empty list.
+    for (verified, status) in [
+        (VerifyReport::skipped("production"), "skipped"),
+        (report(&[Outcome::Passed]), "passed"),
+        (report(&[Outcome::TimedOut]), "failed"),
+    ] {
+        let json = gitforgeops::json_output::pretty(&verified).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(value["status"], status, "{json}");
+        assert_eq!(value["environment"], verified.environment.as_str());
+        assert!(value["results"].is_array(), "{json}");
+    }
+}
+
+#[test]
+fn an_empty_or_absent_entry_declares_no_checks() {
+    let yaml = r#"
+version: 1
+environments:
+  staging:
+    checks:
+      - name: orders
+        path: /orders
+        expect_status: 200
+  production:
+    checks: []
+"#;
+    let config = load_smoke(yaml).expect("loads");
+    let staging = config.declared_checks("staging").expect("staging");
+    assert_eq!(staging.checks.len(), 1);
+    // Present but empty, and absent, are the same: nothing to verify.
+    assert!(config.for_environment("production").is_some());
+    assert!(config.declared_checks("production").is_none());
+    assert!(config.declared_checks("qa").is_none());
 }
 
 #[test]
@@ -525,8 +589,10 @@ fn the_shipped_smoke_example_loads_and_demonstrates_both_halves() {
         .iter()
         .any(|check| check.expect_status == 401));
     // ...and production deliberately has none, so a promotion gated on it
-    // stays blocked until someone says what "serving correctly" means.
+    // stays blocked until someone says what "serving correctly" means. Its
+    // own deployment records the verification as skipped and stays green.
     assert!(config.for_environment("production").is_none());
+    assert!(config.declared_checks("production").is_none());
 }
 
 #[test]

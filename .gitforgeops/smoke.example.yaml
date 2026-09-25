@@ -57,7 +57,9 @@ environments:
       # by itself).
 
   # `production` deliberately has no entry here. An environment with no
-  # declared check has verified nothing, and `gitforgeops verify` fails rather
-  # than reporting a pass — so a promotion gated on it stays blocked, and its
-  # own deployment job ends failed after the apply, until you say what
-  # "serving correctly" means for it.
+  # declared check has verified nothing and failed nothing: `gitforgeops
+  # verify` reports it as skipped (exit 5), never as a pass. Its own
+  # deployment job stays green and records the verification as `skipped`,
+  # and a promotion gated on it stays blocked until you say what "serving
+  # correctly" means for it. Only a declared check that fails (exit 4), or a
+  # verify that cannot run (exit 1), fails the deployment job.

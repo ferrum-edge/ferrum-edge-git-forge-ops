@@ -39,4 +39,5 @@ mod validate_tests;
 mod validator_labels_tests;
 mod validator_namespace_tests;
 mod verdict_tests;
+mod verify_exit_tests;
 mod version_tests;

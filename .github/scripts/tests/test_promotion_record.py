@@ -8,9 +8,12 @@ which it must not.
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -446,6 +449,128 @@ class WorkflowWiringTests(unittest.TestCase):
             # to the stale snapshot.
             self.assertIn('[ ! -s "$APPLIED_CREDS_FILE" ]', verify)
             self.assertNotIn("run: gitforgeops verify", verify)
+
+    @staticmethod
+    def _run_script(job: str, step: str) -> str:
+        # The step's `run: |` body, dedented, exactly as the runner gets it.
+        body = job[job.index(f"- name: {step}\n"):]
+        body = body[body.index("run: |\n") + len("run: |\n"):]
+        lines = []
+        for line in body.splitlines():
+            if line.strip() and not line.startswith(" " * 10):
+                break
+            lines.append(line)
+        return textwrap.dedent("\n".join(lines)).strip() + "\n"
+
+    def _verify_step(self, job: str, exit_code: int, bundle: bool = True):
+        # Run the job's `Verify traffic` script with a `gitforgeops` stub that
+        # exits `exit_code`. Returns the step's exit status and its outputs.
+        script = self._run_script(job, "Verify traffic")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            stub = bin_dir / "gitforgeops"
+            stub.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+            stub.chmod(0o755)
+            applied = root / "applied.json"
+            if bundle:
+                applied.write_text('{"FERRUM_CREDS_BUNDLE": {}}', encoding="utf-8")
+            outputs = root / "outputs"
+            outputs.write_text("", encoding="utf-8")
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                cwd=root,
+                env={
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "FERRUM_ENV": "production",
+                    "APPLIED_CREDS_FILE": str(applied),
+                    "GITHUB_OUTPUT": str(outputs),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return completed.returncode, outputs.read_text(encoding="utf-8")
+
+    def _recorded_verify_result(
+        self, job: str, mode: str, outcome: str, result: str
+    ) -> str:
+        # The `Record promotion result` mapping, up to the write it feeds.
+        script = self._run_script(job, "Record promotion result")
+        script = script[
+            : script.index("python3 .github/scripts/promotion_record.py write")
+        ]
+        script += 'printf "%s" "$verify"\n'
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "MODE": mode,
+                "VERIFY_OUTCOME": outcome,
+                "VERIFY_RESULT": result,
+            },
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout
+
+    @unittest.skipUnless(shutil.which("bash"), "bash runs the step scripts")
+    def test_no_declared_check_skips_verification_without_failing_the_job(self):
+        # An environment smoke.yaml declares no check for (the shipped example
+        # leaves out `production`) has not failed verification; it has none.
+        # `verify` exits 5 for it, and only that code becomes a green skip.
+        # A check that ran and failed (4), or a verify that could not run
+        # (1), fails the step, which the deferred guard turns into a red job.
+        for job in self._jobs():
+            for exit_code, status, result in (
+                (0, 0, "result=passed"),
+                (5, 0, "result=skipped"),
+                (4, 4, None),
+                (1, 1, None),
+            ):
+                with self.subTest(exit_code=exit_code):
+                    returncode, outputs = self._verify_step(job, exit_code)
+                    self.assertEqual(returncode, status)
+                    if result is None:
+                        self.assertNotIn("result=", outputs)
+                    else:
+                        self.assertEqual(outputs.strip(), result)
+            # No finalized bundle still fails, even where no check is declared:
+            # the apply did not complete.
+            returncode, outputs = self._verify_step(job, 5, bundle=False)
+            self.assertEqual(returncode, 1)
+            self.assertNotIn("result=", outputs)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash runs the step scripts")
+    def test_the_record_distinguishes_a_skip_from_a_pass_and_a_failure(self):
+        for job in self._jobs():
+            for mode, outcome, result, expected in (
+                ("api", "success", "passed", promotion_record.SUCCESS),
+                # No check declared for this environment.
+                ("api", "success", "skipped", promotion_record.SKIPPED),
+                ("api", "failure", "", promotion_record.FAILURE),
+                # No smoke.yaml at all: the step never ran.
+                ("api", "", "", promotion_record.NOT_RUN),
+                ("api", "skipped", "", promotion_record.NOT_RUN),
+                ("file", "", "", promotion_record.SKIPPED),
+                # A green step that never said every check passed is not one.
+                ("api", "success", "", promotion_record.FAILURE),
+            ):
+                with self.subTest(mode=mode, outcome=outcome, result=result):
+                    self.assertEqual(
+                        self._recorded_verify_result(job, mode, outcome, result),
+                        expected,
+                    )
+            record_step = job[job.index("- name: Record promotion result"):]
+            self.assertIn(
+                "VERIFY_RESULT: ${{ steps.verify.outputs.result }}", record_step
+            )
+            # A skip is never authorization.
+            self.assertNotIn(
+                promotion_record.SKIPPED, promotion_record.AUTHORIZING
+            )
 
     def test_both_privileged_jobs_keep_the_freshness_guard(self):
         # The promote job fixes its revision the same way, so a

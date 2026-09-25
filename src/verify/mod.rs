@@ -36,6 +36,13 @@ pub const SMOKE_CONFIG_VERSION: u32 = 1;
 /// "verified and the answer is no" from "we never verified".
 pub const VERIFY_FAILED_EXIT_CODE: i32 = 4;
 
+/// Exit code when no check is declared for the environment: `smoke.yaml` is
+/// absent, has no entry for it, or its entry lists no checks. Nothing was
+/// verified and nothing failed. Non-zero, so a caller that ignores the
+/// distinction still does not read it as a pass; distinct from 4 and 1, so a
+/// deployment job can record it as `skipped` rather than failing on it.
+pub const VERIFY_SKIPPED_EXIT_CODE: i32 = 5;
+
 fn default_version() -> u32 {
     SMOKE_CONFIG_VERSION
 }
@@ -199,6 +206,14 @@ impl SmokeConfig {
 
     pub fn for_environment(&self, environment: &str) -> Option<&EnvironmentChecks> {
         self.environments.get(environment)
+    }
+
+    /// The checks `environment` declares, or `None` when it declares none —
+    /// no entry and an empty `checks:` list alike. `verify` reports that as
+    /// skipped: never a pass, and never a failed check.
+    pub fn declared_checks(&self, environment: &str) -> Option<&EnvironmentChecks> {
+        self.for_environment(environment)
+            .filter(|entry| !entry.checks.is_empty())
     }
 }
 
@@ -380,28 +395,71 @@ pub struct CheckResult {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// What a verification run concluded, as a deployment job records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyStatus {
+    /// Every declared check passed.
+    Passed,
+    /// At least one declared check did not pass.
+    Failed,
+    /// No check is declared for the environment, so nothing was verified.
+    Skipped,
+}
+
+#[derive(Debug, Clone)]
 pub struct VerifyReport {
     pub environment: String,
     pub results: Vec<CheckResult>,
 }
 
+// Hand-written so the JSON carries `status`: a machine reader must not have
+// to infer "skipped" from an empty `results` list.
+impl Serialize for VerifyReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut report = serializer.serialize_struct("VerifyReport", 3)?;
+        report.serialize_field("environment", &self.environment)?;
+        report.serialize_field("status", &self.status())?;
+        report.serialize_field("results", &self.results)?;
+        report.end()
+    }
+}
+
 impl VerifyReport {
+    /// The report for an environment that declares no check.
+    pub fn skipped(environment: &str) -> Self {
+        Self {
+            environment: environment.to_string(),
+            results: Vec::new(),
+        }
+    }
+
     pub fn passed(&self) -> bool {
         self.results.iter().all(|result| result.outcome.passed())
     }
 
-    /// A configured environment with no declared check has verified nothing,
-    /// which a promotion gate must not read as a pass.
+    /// No check was declared, so nothing was verified. That is not a pass —
+    /// zero checks trivially "all pass" — and it is not a failure either.
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
 
-    pub fn exit_code(&self) -> i32 {
-        if self.passed() && !self.is_empty() {
-            0
+    pub fn status(&self) -> VerifyStatus {
+        if self.is_empty() {
+            VerifyStatus::Skipped
+        } else if self.passed() {
+            VerifyStatus::Passed
         } else {
-            VERIFY_FAILED_EXIT_CODE
+            VerifyStatus::Failed
+        }
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        match self.status() {
+            VerifyStatus::Passed => 0,
+            VerifyStatus::Failed => VERIFY_FAILED_EXIT_CODE,
+            VerifyStatus::Skipped => VERIFY_SKIPPED_EXIT_CODE,
         }
     }
 
@@ -416,9 +474,11 @@ impl VerifyReport {
         if self.results.is_empty() {
             let _ = writeln!(
                 out,
-                "No checks are declared for this environment in {SMOKE_CONFIG_PATH}. \
-                 A gateway that accepted a configuration write has not been shown to \
-                 serve it; declare at least one representative route."
+                "skipped: no smoke checks declared for {} in {SMOKE_CONFIG_PATH}. \
+                 Nothing was verified: this is not a pass, and it authorizes no \
+                 promotion. A gateway that accepted a configuration write has not \
+                 been shown to serve it; declare at least one representative route.",
+                crate::diagnostics::sanitize_line(&self.environment)
             );
             return out;
         }

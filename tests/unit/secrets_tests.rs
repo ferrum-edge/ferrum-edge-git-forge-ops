@@ -3696,8 +3696,8 @@ fn the_credential_handoff_is_opt_in_and_never_the_input_file() {
     let input_text = input.to_str().expect("utf-8 path");
     // Clearing a stale handoff would delete the very bundle apply is about to
     // read, and nothing promises the caller's input is writable.
-    let error = credential_handoff_destination(Some(input_text), Some(input_text))
-        .expect_err("same path");
+    let error =
+        credential_handoff_destination(Some(input_text), Some(input_text)).expect_err("same path");
     let message = error.to_string();
     assert!(message.contains("never rewrites its input"), "{message}");
     let aliased = directory.path().join(".").join("creds.json");

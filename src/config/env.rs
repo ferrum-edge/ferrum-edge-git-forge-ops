@@ -256,7 +256,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
-/// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run)  |
+/// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run declared checks) |
 /// | `FERRUM_ALLOW_INSECURE_HTTP` | `allow_insecure_http` | `false` (an `http://` gateway URL is refused) |
 /// | `FERRUM_GATEWAY_CA_CERT`     | `ca_cert`          | `None`                           |
 /// | `FERRUM_GATEWAY_CLIENT_CERT` | `client_cert`      | `None`                           |

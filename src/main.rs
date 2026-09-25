@@ -3518,56 +3518,54 @@ async fn cmd_review(
 /// traffic are different results, and collapsing them is what lets a
 /// promotion proceed on a gateway that took the write and serves a 502.
 ///
-/// Fails closed on every "we did not actually verify" case — no declared
-/// checks, no data-plane URL, an unresolvable credential slot — because a
-/// promotion gate reading any of those as a pass is worse than no gate.
+/// Three results, three exit codes. Every declared check passed: 0. A declared
+/// check did not pass: `VERIFY_FAILED_EXIT_CODE` (4). No check is declared for
+/// the environment (no `smoke.yaml`, or no checks in it for this
+/// environment): `VERIFY_SKIPPED_EXIT_CODE` (5), because nothing was verified
+/// and nothing failed, and a deployment job must be able to record that as
+/// `skipped` rather than fail on it. Everything else that stops a declared
+/// check from running — an unparsable `smoke.yaml`, no data-plane URL, an
+/// unreadable bundle — is an error (exit 1), never a pass.
 async fn cmd_verify(
     format: cli::ReportFormat,
     explicit_env: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
-    let smoke = gitforgeops::verify::SmokeConfig::load()?.ok_or_else(|| {
-        gitforgeops::error::Error::Config(format!(
-            "{} is absent, so there is nothing to verify. Declare at least one \
-             representative route for '{}' before gating a promotion on it.",
-            gitforgeops::verify::SMOKE_CONFIG_PATH,
-            resolved.name
-        ))
-    })?;
-    let checks = smoke.for_environment(&resolved.name).ok_or_else(|| {
-        gitforgeops::error::Error::Config(format!(
-            "{} declares no checks for environment '{}'. An environment with no \
-             declared check has verified nothing, which a promotion gate must not \
-             read as a pass.",
-            gitforgeops::verify::SMOKE_CONFIG_PATH,
-            resolved.name
-        ))
-    })?;
-    let base_url = env_config.verify_base_url.clone().ok_or_else(|| {
-        gitforgeops::error::Error::Config(
-            "FERRUM_VERIFY_BASE_URL is not set. Traffic verification reaches the \
-             gateway's DATA plane, which is a different endpoint from the admin API \
-             in FERRUM_GATEWAY_URL."
-                .to_string(),
-        )
-    })?;
-    // Header values may name credential-bundle slots. The bundle is loaded the
-    // same way every other command loads it; a slot that is not in it fails
-    // the check rather than sending an empty header.
-    let (bundle, _) = load_credential_bundles(&env_config)?;
+    let smoke = gitforgeops::verify::SmokeConfig::load()?;
+    let checks = smoke
+        .as_ref()
+        .and_then(|smoke| smoke.declared_checks(&resolved.name));
 
-    let report = gitforgeops::verify::runner::run(
-        &resolved.name,
-        &base_url,
-        checks,
-        &bundle,
-        // A private CA is configuration; `FERRUM_TLS_NO_VERIFY` is deliberately
-        // not honoured here. A check that accepts any certificate has not
-        // verified TLS, and a promotion gate that passes against an
-        // interceptor is worse than no gate.
-        env_config.ca_cert.as_deref(),
-    )
-    .await;
+    let report = match checks {
+        None => gitforgeops::verify::VerifyReport::skipped(&resolved.name),
+        Some(checks) => {
+            let base_url = env_config.verify_base_url.clone().ok_or_else(|| {
+                gitforgeops::error::Error::Config(
+                    "FERRUM_VERIFY_BASE_URL is not set. Traffic verification reaches the \
+                     gateway's DATA plane, which is a different endpoint from the admin API \
+                     in FERRUM_GATEWAY_URL."
+                        .to_string(),
+                )
+            })?;
+            // Header values may name credential-bundle slots. The bundle is
+            // loaded the same way every other command loads it; a slot that is
+            // not in it fails the check rather than sending an empty header.
+            let (bundle, _) = load_credential_bundles(&env_config)?;
+
+            gitforgeops::verify::runner::run(
+                &resolved.name,
+                &base_url,
+                checks,
+                &bundle,
+                // A private CA is configuration; `FERRUM_TLS_NO_VERIFY` is
+                // deliberately not honoured here. A check that accepts any
+                // certificate has not verified TLS, and a promotion gate that
+                // passes against an interceptor is worse than no gate.
+                env_config.ca_cert.as_deref(),
+            )
+            .await
+        }
+    };
 
     match format {
         cli::ReportFormat::Text => print!("{}", report.render_text()),

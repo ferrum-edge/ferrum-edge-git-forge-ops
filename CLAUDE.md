@@ -72,7 +72,7 @@ gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
                                                           # Post PR comment; optionally require live comparison.
                                                           # Exit stays 0 on offline apply blockers unless
                                                           # --fail-on-blockers (or GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true).
-gitforgeops verify [--format text|json]                   # Declared traffic checks vs the data plane (exit 4 on failure)
+gitforgeops verify [--format text|json]                   # Declared traffic checks vs the data plane (exit 4 on failure, 5 when none declared)
 
 gitforgeops doctor [--format text|json] [--scope local|github|gateway|all] \
   [--repo OWNER/REPO] [--state-writer-app-id N]           # Read-only readiness diagnosis (exit 3 on a blocker)
@@ -418,8 +418,9 @@ unless the named predecessor's record exists, applied `success`, verified
 ancestor of it that `deployment_scope.classify` finds differs only outside
 `DEPLOYMENT_INPUT_PATHS`. That clause is load-bearing: the predecessor's own
 ledger commit always moves the branch before the promote job refreshes it. Only
-`success` authorizes: `skipped` (file mode has no data plane), `not_run`
-(no declared checks) and `cancelled` all block. Staging and production
+`success` authorizes: `skipped` (file mode has no data plane, or `smoke.yaml`
+declares no check for the environment), `not_run` (no `smoke.yaml`) and
+`cancelled` all block. Staging and production
 legitimately assemble different bytes — different overlays — so what is bound
 is the source commit, never the assembled document.
 
@@ -447,7 +448,11 @@ Verification is authoritative, current and replay-safe (#350, #351, #353).
 Both deployment jobs end with `Fail on traffic verification failure`, after the
 record is published and the ledger committed, so a failed `verify` (exit 4 or
 1) fails the job even where no successor reads the record; a skipped verify (no
-`smoke.yaml`, file mode) does not. `apply` with `FERRUM_CREDS_JSON_OUTPUT_FILE`
+`smoke.yaml`, file mode, or `verify` exit 5 = `VERIFY_SKIPPED_EXIT_CODE` because
+`SmokeConfig::declared_checks` finds no check for the environment) does not.
+The verify step maps exit 5 to a green step with `result=skipped`, which the
+record step writes as `skipped`; a green step without `result=passed` records
+`failure`. `apply` with `FERRUM_CREDS_JSON_OUTPUT_FILE`
 clears that path first and, only on completion, writes `per_shard` there
 (`secrets::write_bundle_handoff`: wrapper shape, 0600, temp+fsync+rename,
 regular files only, never the input path); the workflow's verify step points
@@ -980,7 +985,7 @@ never restoring an obsolete ledger, which is a separate state-override repair.
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal; `ResourceKeys` is the prebuilt `namespace:Kind:id` set `record_op` and the journal/ledger reconciliations check existence against
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
-- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `exit_code` is `VERIFY_FAILED_EXIT_CODE` = 4), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, an ambiguous attempt of a non-idempotent method is never replayed without `replay_safe`, the response body is never read)
+- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `status` is passed/failed/skipped and whose `exit_code` is 0, `VERIFY_FAILED_EXIT_CODE` = 4 or `VERIFY_SKIPPED_EXIT_CODE` = 5 — an empty report is skipped, never a pass), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, an ambiguous attempt of a non-idempotent method is never replayed without `replay_safe`, the response body is never read)
 - `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
 - `src/diagnostics.rs` — the shared log sanitizer (`sanitize` / `sanitize_line` / `sanitize_block`
   and their `safe*` `Display` adapters) every diagnostic routes untrusted ids, namespaces,

@@ -1680,7 +1680,7 @@ Runtime variables supported by the binary include:
 | `FERRUM_ADMIN_JWT_TTL_SECS` | `3600` | Admin token lifetime. |
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validation binary path. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Accept any gateway TLS certificate. Dev only: warns loudly, and is refused under `GITHUB_ACTIONS` for a non-loopback host. See [Transport security](#transport-security). |
-| `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `gitforgeops verify` (a GitHub Environment secret in CI). Unset means `verify` refuses rather than passing vacuously. Same transport rule as `FERRUM_GATEWAY_URL`. |
+| `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `gitforgeops verify` (a GitHub Environment secret in CI). Unset means `verify` refuses (exit 1) to run declared checks rather than passing vacuously; an environment with no declared check does not need it. Same transport rule as `FERRUM_GATEWAY_URL`. |
 | `FERRUM_CREDS_JSON_OUTPUT_FILE` | unset | Where a completed `apply` writes its finalized credential bundle (the input plus every slot it allocated, same JSON shape, mode 0600, atomic). Cleared at the start of `apply`, so a failed or partial apply leaves none. Must differ from `FERRUM_CREDS_JSON_FILE`, which is never rewritten. The bundled workflow hands it to the same job's `verify` step. See [Traffic checks](#traffic-checks-are-data-not-hooks). |
 | `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Permit a cleartext `http://` `FERRUM_GATEWAY_URL`. Dev only: warns loudly, and is refused under `GITHUB_ACTIONS` for a non-loopback host. See [Transport security](#transport-security). |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS connect timeout for the Admin API. |
@@ -1710,7 +1710,7 @@ gitforgeops import --from-api | --from-file PATH --output-dir DIR \
   [--accept-unknown-field NAME] \
   [--allow-plaintext-plugin-config PLUGIN_NAME]  # --from-api requires an explicit namespace filter
 gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]
-gitforgeops verify [--format text|json]                 # declared traffic checks against the data plane
+gitforgeops verify [--format text|json]                 # declared traffic checks against the data plane (exit 4 failed, 5 none declared)
 
 gitforgeops doctor [--format text|json] [--scope local|github|gateway|all] \
   [--repo OWNER/REPO] [--state-writer-app-id N]  # read-only readiness diagnosis
@@ -2243,23 +2243,41 @@ body is never even read.
 | Staging applied, a declared route answers wrongly | **blocked** — the gateway accepted the write and is not serving it |
 | A check timed out, or the route was unreachable | blocked |
 | Staging job cancelled, or left no record | blocked |
-| No checks declared for the predecessor | blocked — an environment with no declared check has verified nothing |
+| No checks declared for the predecessor | blocked — recorded as `skipped`: an environment with no declared check has verified nothing |
 | File-mode predecessor (no data plane) | blocked — recorded as `skipped`, which authorizes nothing |
 | `main` moved a deployment input meanwhile | blocked — the newer merge promotes its own revision |
 
+`gitforgeops verify` has three results:
+
+| Exit | Result | Recorded as | Deployment job |
+| --- | --- | --- | --- |
+| `0` | every declared check passed | `success` | green |
+| `4` | a declared check ran and did not pass | `failure` | **failed** |
+| `5` | no check is declared for the environment | `skipped` | green |
+| `1` | `verify` could not run: an unparsable `smoke.yaml`, declared checks with no `FERRUM_VERIFY_BASE_URL`, an unreadable bundle | `failure` | **failed** |
+
+`--format json` states the same result as `"status": "passed" | "failed" |
+"skipped"`. Skipped means nothing was verified *and* nothing failed: the
+environment has no checks configured. It is non-zero so a caller that ignores
+the distinction still does not read it as a pass, and it authorizes no
+promotion.
+
 A failed probe blocks the *promotion*, and it fails the deployment job itself:
 after the promotion record is published and the ownership ledger committed, a
-final step turns a failed verification (a wrong status, a timeout, or a
-`verify` that could not run, such as a missing `FERRUM_VERIFY_BASE_URL` or an
-environment `.gitforgeops/smoke.yaml` declares no checks for) into a failed
-job. That matters most where no successor will ever read the record — an
-independent environment and the promoted environment itself. Because `promote`
-needs the whole independent phase to be green, a failed verification in any
-independent environment also keeps every promotion from starting, exactly as a
-failed apply does. A repository without `.gitforgeops/smoke.yaml`, and a
-file-mode environment, skip verification and stay green. Nothing is rolled
-back: automatic global rollback is not an assumed consequence of a failed check,
-and the environment is left exactly as it was applied so you can look at it.
+final step turns a failed verification (a wrong status, a timeout, a missing
+finalized bundle, or a `verify` that could not run, such as declared checks
+with no `FERRUM_VERIFY_BASE_URL`) into a failed job. That matters most where no
+successor will ever read the record — an independent environment and the
+promoted environment itself. Because `promote` needs the whole independent
+phase to be green, a failed verification in any independent environment also
+keeps every promotion from starting, exactly as a failed apply does. An
+environment `.gitforgeops/smoke.yaml` declares no checks for (the shipped
+example leaves out `production`), a repository without
+`.gitforgeops/smoke.yaml`, and a file-mode environment skip verification and
+stay green; the record says `skipped` (or `not_run` without a `smoke.yaml`),
+never `success`. Nothing is rolled back: automatic global rollback is not an
+assumed consequence of a failed check, and the environment is left exactly as
+it was applied so you can look at it.
 
 Every outcome lands in the run's job summary — environment, source revision,
 apply result, traffic result, and who authorized it — so a blocked promotion is
