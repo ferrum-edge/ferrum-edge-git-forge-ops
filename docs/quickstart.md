@@ -364,8 +364,8 @@ the matching private key handy — you decrypt with
 Install Rust and build this checked-out repository with `cargo build`; run the
 CLI as `./target/debug/gitforgeops` (or install it with `cargo install
 --path .`). `validate` invokes a separate Ferrum Edge validator. Use the
-repository-approved Ferrum Edge v0.9.5 binary (SHA-256
-`31573f0afab23694ce0cfe432f1220dd38099e3ee643e8c5d5b6d2bb3488297c`),
+repository-approved Ferrum Edge v0.9.7 binary (SHA-256
+`c26ba4c059be2d78f4044a3768ebfed5be4e7eb5640620fa93ea9199776b0902`),
 installed on `PATH` as `ferrum-edge` or selected with
 `FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The bundled workflows verify
 this digest against `.github/ferrum-edge-checksums.txt` before use.
