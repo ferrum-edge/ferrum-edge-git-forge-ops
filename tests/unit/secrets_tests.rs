@@ -3678,3 +3678,86 @@ async fn ssh_key_discovery_distinguishes_exhaustion_from_the_page_cap() {
         assert_eq!(server.join().unwrap().len(), count);
     }
 }
+
+// -- post-apply credential handoff (#351) -----------------------------------
+
+#[test]
+fn the_credential_handoff_is_opt_in_and_never_the_input_file() {
+    use gitforgeops::secrets::credential_handoff_destination;
+
+    let unset = credential_handoff_destination(None, Some("/tmp/in.json"));
+    assert!(matches!(unset, Ok(None)));
+    let blank = credential_handoff_destination(Some("  "), None);
+    assert!(matches!(blank, Ok(None)));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let input = directory.path().join("creds.json");
+    std::fs::write(&input, "{}").expect("write input");
+    let input_text = input.to_str().expect("utf-8 path");
+    // Clearing a stale handoff would delete the very bundle apply is about to
+    // read, and nothing promises the caller's input is writable.
+    let error =
+        credential_handoff_destination(Some(input_text), Some(input_text)).expect_err("same path");
+    let message = error.to_string();
+    assert!(message.contains("never rewrites its input"), "{message}");
+    let aliased = directory.path().join(".").join("creds.json");
+    let aliased_text = aliased.to_str().expect("utf-8 path");
+    let aliased_result = credential_handoff_destination(Some(aliased_text), Some(input_text));
+    assert!(aliased_result.is_err());
+
+    let output = directory.path().join("applied.json");
+    let output_text = output.to_str().expect("utf-8 path");
+    let destination = credential_handoff_destination(Some(output_text), Some(input_text))
+        .expect("distinct output");
+    assert_eq!(destination, Some(output));
+}
+
+#[test]
+fn a_stale_handoff_is_cleared_and_a_new_one_replaces_it_whole() {
+    use gitforgeops::secrets::{remove_bundle_handoff, write_bundle_handoff};
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let handoff = directory.path().join("applied.json");
+    // Nothing there yet: clearing is not an error.
+    remove_bundle_handoff(&handoff).expect("absent is fine");
+
+    // A previous run's file must not survive into a run that stops early.
+    let stale = r#"{"FERRUM_CREDS_BUNDLE":{"old/slot":"old"}}"#;
+    std::fs::write(&handoff, stale).expect("seed");
+    remove_bundle_handoff(&handoff).expect("clear");
+    assert!(!handoff.exists());
+
+    let first = BTreeMap::from([("a/b/keyauth/key".to_string(), "v0".to_string())]);
+    let fourth = BTreeMap::from([("c/d/keyauth/key".to_string(), "v3".to_string())]);
+    let shards = BTreeMap::from([(0, first), (3, fourth)]);
+    std::fs::write(&handoff, "stale").expect("seed");
+    write_bundle_handoff(&handoff, &shards).expect("write");
+    let raw = std::fs::read_to_string(&handoff).expect("read");
+    let (merged, per_shard) = load_bundles_from_env(&raw).expect("parses");
+    assert!(per_shard == shards);
+    assert_eq!(merged.len(), 2);
+    assert!(raw.contains(&shard_secret_name(3)));
+    // Only the handoff itself is left behind; the temp file was renamed.
+    let entries = std::fs::read_dir(directory.path()).expect("list").count();
+    assert_eq!(entries, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_credential_handoff_is_never_written_through_a_symlink() {
+    use gitforgeops::secrets::write_bundle_handoff;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let target = directory.path().join("elsewhere.json");
+    std::fs::write(&target, "untouched").expect("seed target");
+    let link = directory.path().join("applied.json");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let empty = BTreeMap::new();
+    let error = write_bundle_handoff(&link, &empty).expect_err("symlink");
+    let message = error.to_string();
+    assert!(message.contains("must be a regular file"), "{message}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read target"),
+        "untouched"
+    );
+}

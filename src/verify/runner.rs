@@ -70,6 +70,14 @@ fn join(base: &str, path: &str) -> String {
 /// A *wrong status* is not retried: the gateway answered, and answering
 /// differently later would mean the route is flapping, which is not a thing to
 /// paper over with another attempt.
+///
+/// Nor is an ambiguous attempt of a request that is unsafe to replay. A
+/// timeout, or a failure after the connection was established, says nothing
+/// about whether the endpoint acted on the request; for a `POST`, a `PATCH` or
+/// an extension method, sending it again could repeat the side effect and let
+/// the second answer pass the check. Only a connection that was never
+/// established — so carried no request — is retried for such a method, unless
+/// the check declares `replay_safe`.
 pub async fn run_check(
     base_url: &str,
     check: &SmokeCheck,
@@ -106,6 +114,7 @@ pub async fn run_check(
     let mut last = Outcome::Unreachable;
     let mut detail = String::from("no attempt was made");
     let mut attempts = 0;
+    let mut replay_refused = false;
 
     for attempt in 0..check.attempts {
         attempts = attempt + 1;
@@ -150,23 +159,42 @@ pub async fn run_check(
                     detail: format!("got {status}"),
                 };
             }
-            Err(error) if error.is_timeout() => {
-                last = Outcome::TimedOut;
-                detail = format!("timed out after {}s", check.timeout_secs);
-            }
             Err(error) => {
-                last = Outcome::Unreachable;
-                // `reqwest`'s Display can carry the URL; the path is already
-                // reported and the base URL is an environment secret.
-                detail = if error.is_connect() {
-                    "could not connect".to_string()
+                if error.is_timeout() {
+                    last = Outcome::TimedOut;
+                    detail = format!("timed out after {}s", check.timeout_secs);
                 } else {
-                    "request failed".to_string()
-                };
+                    last = Outcome::Unreachable;
+                    // `reqwest`'s Display can carry the URL; the path is
+                    // already reported and the base URL is an environment
+                    // secret.
+                    detail = if error.is_connect() {
+                        "could not connect".to_string()
+                    } else {
+                        "request failed".to_string()
+                    };
+                }
+                // Each attempt builds its own client, so there is no pooled
+                // connection: a connect error means this request was never
+                // written. Anything later may have reached the endpoint.
+                if !error.is_connect() && !check.replays_ambiguous_attempts() {
+                    replay_refused = true;
+                    break;
+                }
             }
         }
     }
 
+    let detail = if replay_refused {
+        format!(
+            "{detail} on attempt {attempts}; not retried, because {} is not idempotent and \
+             the endpoint may already have applied it (declare `replay_safe: true` only if \
+             a replay is harmless)",
+            check.method
+        )
+    } else {
+        format!("{detail} after {attempts} attempt(s)")
+    };
     CheckResult {
         name: check.name.clone(),
         method: check.method.clone(),
@@ -175,7 +203,7 @@ pub async fn run_check(
         actual_status: None,
         outcome: last,
         attempts,
-        detail: format!("{detail} after {attempts} attempt(s)"),
+        detail,
     }
 }
 

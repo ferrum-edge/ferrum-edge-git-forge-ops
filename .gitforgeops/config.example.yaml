@@ -48,7 +48,8 @@ environments:
       # staging and is not promoted from it.
       #
       # Declare the checks that authorize the promotion in
-      # .gitforgeops/smoke.yaml; an environment with none has verified nothing.
+      # .gitforgeops/smoke.yaml; an environment with none has verified nothing,
+      # so its record says `skipped` and authorizes no promotion.
       requires: staging
     ownership:
       mode: exclusive           # repo is the source of truth

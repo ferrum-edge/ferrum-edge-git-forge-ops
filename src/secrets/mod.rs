@@ -14,7 +14,8 @@ pub use allocator::{
     AllocatedSlot, AllocationFailure,
 };
 pub use bundle::{
-    load_bundles_from_env, merge_bundles, parse_bundles_from_json, serialize_bundle,
+    credential_handoff_destination, load_bundles_from_env, merge_bundles, parse_bundles_from_json,
+    remove_bundle_handoff, serialize_bundle, serialize_bundle_document, write_bundle_handoff,
     CredentialBundle, LoadedBundles,
 };
 pub use delivery::{deliver_to_author, DeliveryResult};
