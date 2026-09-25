@@ -662,6 +662,36 @@ impl StateFile {
         );
     }
 
+    /// Journal every slot an allocation committed to the GitHub Environment
+    /// Secret.
+    ///
+    /// `outcome` holds only slots whose shard PUT succeeded: the full outcome
+    /// of a completed allocation, or [`crate::secrets::AllocationFailure`]'s
+    /// `partial` when a later shard failed. A shard that never reached GitHub
+    /// is therefore never recorded. Only non-secret metadata is written (slot,
+    /// shard, recipient login and run id), never the value. The shard count
+    /// grows to cover every committed shard.
+    ///
+    /// An allocation recorded after the last clean apply is what lets
+    /// [`crate::secrets::ConsumerLedger`] recognize the retry of a failed
+    /// apply, instead of refusing the slots it already wrote as revived.
+    pub fn record_allocation(
+        &mut self,
+        outcome: &crate::secrets::AllocateOutcome,
+        delivered_run_id: Option<&str>,
+    ) {
+        for slot in &outcome.allocated {
+            self.record_credential(
+                &slot.slot,
+                slot.shard,
+                slot.delivered.as_ref().map(|d| d.login.as_str()),
+                delivered_run_id,
+            );
+            let covered = slot.shard.saturating_add(1);
+            self.credential_shard_count = self.credential_shard_count.max(covered);
+        }
+    }
+
     pub fn record_override(&mut self, rule_id: &str, commit: &str, approver: &str) {
         self.overrides.push(OverrideRecord {
             rule_id: rule_id.to_string(),

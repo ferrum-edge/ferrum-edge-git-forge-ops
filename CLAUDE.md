@@ -862,7 +862,8 @@ the two consequences by whether evidence exists:
     silently inherit a retired credential that is never delivered.
     `alloc=require` is exempt (the operator's seed), and so is an allocation
     `state.credentials` recorded after `last_applied_at` (the retry of an
-    apply that allocated and failed before recording the Consumer).
+    apply that allocated and failed before recording the Consumer, including
+    one whose allocation committed only some shards).
 - Plugin-config arrays get the same split through
   `check_plugin_array_slot_identity`, called from both plugin walks. Their
   slots carry an explicit `[N]` for every entry (no index-0 elision), so only a
@@ -937,7 +938,14 @@ Allocation (first apply, or rotation): generate random value → libsodium
 `crypto_box_seal` to the env's public key → PUT to
 `repos/.../environments/<env>/secrets/FERRUM_CREDS_BUNDLE[_N]`. Writes require
 `FERRUM_GH_PROVISIONER_TOKEN` (GitHub App installation token preferred, PAT
-with `Secrets: write` as fallback).
+with `Secrets: write` as fallback). Each shard PUT is its own external commit.
+`allocate_if_needed` journals every committed slot through
+`StateFile::record_allocation` and saves the ledger before it returns, in API
+and file mode alike, both on success and when a later shard fails
+(`AllocationFailure.partial` holds exactly the committed slots). The journal is
+non-secret (slot, shard, recipient, run id) and never records an unwritten
+shard, so a retry resolves the committed slots as pending allocations and
+allocates only the rest (#352).
 
 Delivery: after allocation or rotation, the value is age-encrypted to the PR
 author's (or dispatcher's) SSH public key fetched from

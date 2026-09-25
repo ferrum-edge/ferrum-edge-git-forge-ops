@@ -766,6 +766,82 @@ fn state_file_records_credential_metadata() {
     });
 }
 
+fn allocated_slot(
+    slot: &str,
+    shard: u32,
+    value: &str,
+    delivered: Option<gitforgeops::secrets::DeliveryResult>,
+) -> gitforgeops::secrets::AllocatedSlot {
+    gitforgeops::secrets::AllocatedSlot {
+        slot: slot.to_string(),
+        shard,
+        value: value.to_string(),
+        alloc: gitforgeops::secrets::PlaceholderAlloc::Generate,
+        delivered,
+    }
+}
+
+/// #352: an allocation journal records exactly the slots in the outcome,
+/// which after a partial failure are the ones whose shard PUT succeeded. It
+/// survives a save and reload, holds no credential value or ciphertext, and
+/// grows the shard count to the committed shards only, not to the count the
+/// allocator planned before a later shard failed.
+#[test]
+fn record_allocation_journals_committed_slots_without_their_values() {
+    use gitforgeops::secrets::{AllocateOutcome, DeliveryResult};
+
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        let mut state = StateFile::load("staging").unwrap();
+        state.record_allocation(&AllocateOutcome::default(), Some("7"));
+        assert!(state.credentials.is_empty());
+        assert_eq!(state.credential_shard_count, 1);
+
+        let delivery = DeliveryResult {
+            login: "alice".to_string(),
+            key_fingerprint: "SHA256:synthetic-fingerprint".to_string(),
+            encrypted_b64: "synthetic-delivery-ciphertext".to_string(),
+        };
+        let partial = AllocateOutcome {
+            allocated: vec![
+                allocated_slot("ferrum/alpha/keyauth/key", 0, "alpha-secret-value", None),
+                allocated_slot(
+                    "ferrum/bravo/keyauth/key",
+                    2,
+                    "bravo-secret-value",
+                    Some(delivery),
+                ),
+            ],
+            shard_count: 4,
+        };
+        state.record_allocation(&partial, Some("7"));
+        state.save().unwrap();
+
+        let reloaded = StateFile::load("staging").unwrap();
+        assert_eq!(reloaded.credentials.len(), 2);
+        let alpha = &reloaded.credentials["ferrum/alpha/keyauth/key"];
+        assert_eq!(alpha.shard, 0);
+        assert_eq!(alpha.delivered_to, None);
+        assert_eq!(alpha.delivered_run_id.as_deref(), Some("7"));
+        let bravo = &reloaded.credentials["ferrum/bravo/keyauth/key"];
+        assert_eq!(bravo.shard, 2);
+        assert_eq!(bravo.delivered_to.as_deref(), Some("alice"));
+        assert_eq!(
+            reloaded.credential_shard_count, 3,
+            "the count covers committed shards, not the four the allocator planned"
+        );
+
+        let saved = std::fs::read_to_string(StateFile::path_for("staging")).unwrap();
+        for secret in [
+            "alpha-secret-value",
+            "bravo-secret-value",
+            "synthetic-delivery-ciphertext",
+        ] {
+            assert!(!saved.contains(secret), "{secret} reached the ledger");
+        }
+    });
+}
+
 #[test]
 fn public_state_is_identical_when_only_a_consumer_secret_changes() {
     use gitforgeops::config::schema::GatewayConfig;
