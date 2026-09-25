@@ -141,8 +141,8 @@ FRESH_HEAD_CONTROLS = (
 # retired: it let the refreshed head approve its own helper changes.
 APPLY_REVISION_BINDINGS = (
     (
-        'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"',
-        'python3 "$trusted_classifier" classify \\',
+        'git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\',
+        "python3 - classify \\",
         '"$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"',
     ),
 )

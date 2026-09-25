@@ -1511,8 +1511,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path = root / ".github/workflows/apply-on-merge.yml"
             text = path.read_text(encoding="utf-8")
             text = text.replace(
-                '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
-                '          python3 "$trusted_classifier" classify \\\n'
+                '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\\n'
+                '            python3 - classify \\\n'
                 '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
                 "          true\n",
                 1,
@@ -1540,8 +1540,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             [],
         )
         legacy = workflow.replace(
-            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
-            '          python3 "$trusted_classifier" classify \\\n'
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\\n'
+            '            python3 - classify \\\n'
             '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n',
             '          git diff --quiet "$TRIGGER_SHA" "$fresh_head" -- . \\\n'
             "            ':(exclude).state/**' ':(exclude)assembled/**'\n",
@@ -1566,7 +1566,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('python3 "$trusted_classifier" classify \\\n', workflow)
+        self.assertIn("python3 - classify \\\n", workflow)
         self.assertEqual(
             check_supply_chain.stale_deployment_guard_violations(
                 "apply-on-merge.yml", workflow, contract
@@ -1575,7 +1575,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         # Extracting the trusted copy without running it is not a binding.
         unused = workflow.replace(
-            '          python3 "$trusted_classifier" classify \\\n',
+            "            python3 - classify \\\n",
             "          true \\\n",
         )
         self.assertTrue(
@@ -1589,7 +1589,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         # The retired checkout-executed form lets the refreshed head run its
         # own classifier, so it is no longer a recognized binding.
         checkout_executed = workflow.replace(
-            '          python3 "$trusted_classifier" classify \\\n',
+            "            python3 - classify \\\n",
             "          python3 .github/scripts/deployment_scope.py classify \\\n",
         )
         self.assertTrue(
@@ -1599,6 +1599,28 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     "apply-on-merge.yml", checkout_executed, contract
                 )
             )
+        )
+
+    def test_trigger_pinned_classifier_cannot_use_a_noop_destination(self):
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["apply-on-merge.yml"]
+        workflow = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        unsafe = workflow.replace(
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\\n'
+            '            python3 - classify \\\n',
+            '          trusted_classifier=/dev/null\n'
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" > "$trusted_classifier"\n'
+            '          python3 "$trusted_classifier" classify \\\n',
+            1,
+        )
+        self.assertNotEqual(unsafe, workflow, "the classifier binding moved")
+        violations = check_supply_chain.stale_deployment_guard_violations(
+            "apply-on-merge.yml", unsafe, contract
+        )
+        self.assertTrue(
+            any("no recognized implementation is complete" in item for item in violations),
+            violations,
         )
 
     def test_a_half_present_attribution_binding_is_still_rejected(self):
