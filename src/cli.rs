@@ -173,6 +173,10 @@ pub enum Commands {
     /// This proves it is serving it. Checks are declared in
     /// `.gitforgeops/smoke.yaml`; there is no hook and no shell, because a
     /// promotion gate runs with deployment credentials in its environment.
+    ///
+    /// Exits 0 when every declared check passes, 4 when one does not, and 5
+    /// (skipped) when no check is declared for the environment. Skipped is
+    /// not a pass: it authorizes no promotion.
     Verify {
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
         format: ReportFormat,

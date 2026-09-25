@@ -7,10 +7,13 @@ use std::time::Duration;
 use base64::Engine;
 use gitforgeops::error::Error;
 use gitforgeops::secrets::{
-    allocate_and_deliver_at, fetch_public_key_at, parse_placeholder, put_environment_secret_at,
-    rotate_and_deliver_at, slot_path, EnvSecretPublicKey, ResolveReport, ResolveResult, SlotStatus,
+    allocate_and_deliver_at, fetch_public_key_at, load_bundles_from_env, merge_bundles,
+    parse_placeholder, put_environment_secret_at, rotate_and_deliver_at, slot_path,
+    write_bundle_handoff, EnvSecretPublicKey, ResolveReport, ResolveResult, SlotStatus,
     DEFAULT_GITHUB_API_BASE,
 };
+use gitforgeops::verify::runner::run_check;
+use gitforgeops::verify::{HeaderValue, Outcome, SmokeCheck};
 
 const REPO: &str = "test/fixture";
 const ENVIRONMENT: &str = "staging";
@@ -654,4 +657,125 @@ async fn rotate_and_deliver_maps_a_put_validation_error() {
     assert!(failure.partial.allocated.is_empty());
     assert_eq!(shards, original);
     assert!(!failure.to_string().contains("existing-sensitive-value"));
+}
+
+/// A stand-in data plane: `200` only for the credential it was told to expect,
+/// `401` otherwise. Records the `X-API-Key` each request carried.
+fn spawn_data_plane(expected: String) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind data plane");
+    let addr = listener.local_addr().expect("data plane addr");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let thread_seen = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let Some(request) = read_request(&mut stream) else {
+                continue;
+            };
+            let key = header_value(&request, "x-api-key");
+            let status = if key.as_deref() == Some(expected.as_str()) {
+                200
+            } else {
+                401
+            };
+            thread_seen.lock().expect("record request").push(key);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} STUB\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// #351: a slot the apply generates lives only in memory and in the GitHub
+/// Environment Secret; the input bundle file is never updated, so a separate
+/// verify that rereads it reports the slot missing. The handoff carries it:
+/// the traffic check sends the newly generated value and passes, every
+/// pre-existing slot on every shard survives, and a slot that is genuinely
+/// missing still fails before any request is sent.
+#[tokio::test]
+async fn a_same_job_first_allocation_reaches_the_traffic_check_through_the_handoff() {
+    let (api_base, _requests) = spawn_github_stub(success_routes(204));
+    let seeded_a = slot_path("ferrum", "seeded-a", "keyauth/key");
+    let seeded_b = slot_path("ferrum", "seeded-b", "keyauth/key");
+    let pre_apply = BTreeMap::from([
+        (
+            0,
+            BTreeMap::from([(seeded_a.clone(), "seeded-value-a".to_string())]),
+        ),
+        (
+            1,
+            BTreeMap::from([(seeded_b.clone(), "seeded-value-b".to_string())]),
+        ),
+    ]);
+    let mut shards = pre_apply.clone();
+    let mut shard_count = 2;
+    let outcome = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        None,
+        &allocation_report(),
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect("allocate against stub");
+    let slot = outcome.allocated[0].slot.clone();
+    let generated = outcome.allocated[0].value.clone();
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let handoff = directory.path().join("ferrum-creds-applied.json");
+    write_bundle_handoff(&handoff, &shards).expect("write handoff");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&handoff)
+            .expect("handoff metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "handoff must be owner-only");
+    }
+    let raw = std::fs::read_to_string(&handoff).expect("read handoff");
+    let (finalized, per_shard) = load_bundles_from_env(&raw).expect("handoff is a bundle");
+    assert!(per_shard == shards, "every shard is handed on unchanged");
+    assert!(finalized[&seeded_a] == "seeded-value-a");
+    assert!(finalized[&seeded_b] == "seeded-value-b");
+    assert!(finalized.get(&slot) == Some(&generated));
+
+    let header = HeaderValue::slot(slot.clone());
+    let check = SmokeCheck {
+        name: "orders route serves authenticated traffic".to_string(),
+        method: "GET".to_string(),
+        path: "/orders/healthz".to_string(),
+        headers: BTreeMap::from([("X-API-Key".to_string(), header)]),
+        expect_status: 200,
+        timeout_secs: 5,
+        attempts: 1,
+        retry_backoff_ms: 0,
+        replay_safe: false,
+    };
+    let (base_url, seen) = spawn_data_plane(generated.clone());
+
+    // The pre-apply snapshot is what verify used to read: the slot is
+    // missing, and the check fails before sending anything.
+    let stale = merge_bundles(&pre_apply);
+    let result = run_check(&base_url, &check, &stale, None).await;
+    assert_eq!(result.outcome, Outcome::Unreachable);
+    assert_eq!(result.attempts, 0);
+    assert!(result.detail.contains("not in the bundle"));
+    assert!(seen.lock().expect("seen").is_empty());
+
+    let result = run_check(&base_url, &check, &finalized, None).await;
+    assert_eq!(result.outcome, Outcome::Passed);
+    assert_eq!(result.actual_status, Some(200));
+    assert!(!result.detail.contains(&generated));
+    let requests = seen.lock().expect("seen");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].as_deref() == Some(generated.as_str()),
+        "the check must send the value this apply generated"
+    );
 }

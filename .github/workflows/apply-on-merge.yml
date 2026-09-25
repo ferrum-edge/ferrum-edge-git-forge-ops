@@ -319,6 +319,15 @@ jobs:
           creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
           python3 .github/scripts/credential_bundles.py "$creds_file"
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
+          # Where a completed apply hands its FINALIZED bundle to the verify
+          # step: the input above plus every slot the apply allocated. The
+          # input is never rewritten, so without this a smoke check could not
+          # send a credential the same apply generated and deployed. A step
+          # output rather than $GITHUB_ENV, so only the two steps that name it
+          # see it. Same mode-0600 $RUNNER_TEMP discipline as the input.
+          applied_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-applied-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
+          rm -f "$applied_file"
+          echo "applied_file=$applied_file" >> "$GITHUB_OUTPUT"
 
       - name: Validate
         env:
@@ -411,6 +420,9 @@ jobs:
           # to the pusher of an unattributed direct commit.
           GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
+          # Written only when the apply completes; cleared first, so a failed
+          # or partial apply leaves nothing for verification to trust.
+          FERRUM_CREDS_JSON_OUTPUT_FILE: ${{ steps.load-bundles.outputs.applied_file }}
         run: gitforgeops apply --auto-approve
 
       # File mode: `gitforgeops apply` in file mode writes the placeholder-
@@ -465,7 +477,15 @@ jobs:
       # started. A repository that declares no `.gitforgeops/smoke.yaml` has
       # opted out of traffic checks: the step is skipped rather than failed on
       # every apply, and the record says `not_run`, which still authorizes no
-      # promotion.
+      # promotion. A `smoke.yaml` that declares no check for THIS environment
+      # is the same opt-out, per environment: `verify` exits 5, the step
+      # succeeds with `result=skipped`, and the record says `skipped` — not a
+      # pass, not a failure, and no promotion authorized.
+      #
+      # Credentials come from the apply's finalized bundle, not the pre-apply
+      # file: a slot this run generated exists only there and in the GitHub
+      # Environment Secret. No finalized bundle means the apply did not
+      # complete, and a check against it would verify some other deployment.
       - name: Verify traffic
         id: verify
         if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' && hashFiles('.gitforgeops/smoke.yaml') != '' }}
@@ -474,7 +494,30 @@ jobs:
           FERRUM_ENV: ${{ matrix.environment }}
           FERRUM_VERIFY_BASE_URL: ${{ secrets.FERRUM_VERIFY_BASE_URL }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
-        run: gitforgeops verify
+          APPLIED_CREDS_FILE: ${{ steps.load-bundles.outputs.applied_file }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLIED_CREDS_FILE" ] || [ ! -s "$APPLIED_CREDS_FILE" ]; then
+            echo "::error::The apply step left no finalized credential bundle, so traffic cannot be verified against what it deployed."
+            exit 1
+          fi
+          # 0: every check passed. 5: no check is declared for this
+          # environment, so nothing was verified and nothing failed. Anything
+          # else (4 a check failed, 1 verify could not run) fails the step.
+          status=0
+          FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify || status=$?
+          case "$status" in
+            0)
+              echo "result=passed" >> "$GITHUB_OUTPUT"
+              ;;
+            5)
+              echo "result=skipped" >> "$GITHUB_OUTPUT"
+              echo "::notice::Traffic verification skipped: .gitforgeops/smoke.yaml declares no checks for $FERRUM_ENV. Nothing was verified; this environment authorizes no promotion."
+              ;;
+            *)
+              exit "$status"
+              ;;
+          esac
 
       - name: Record promotion result
         if: ${{ !cancelled() }}
@@ -484,19 +527,27 @@ jobs:
           MODE: ${{ steps.deployment-mode.outputs.mode }}
           APPLY_RESULT: ${{ (steps.apply.outcome == 'success' || steps.apply-file.outcome == 'success') && 'success' || 'failure' }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
           ACTOR: ${{ steps.pr.outputs.author }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          # File mode has no data plane to send traffic to. It is recorded as
-          # `skipped`, which does NOT authorize a promotion — an environment
-          # nothing can verify must not be a promotion predecessor.
+          # File mode has no data plane to send traffic to, and an environment
+          # smoke.yaml declares no check for has nothing to send. Both are
+          # recorded as `skipped`, which does NOT authorize a promotion — an
+          # environment nothing verified must not be a promotion predecessor.
+          # A successful step counts as `success` only when it says every
+          # declared check passed.
           verify="$VERIFY_OUTCOME"
           if [ "$MODE" = file ]; then
             verify=skipped
           elif [ -z "$verify" ] || [ "$verify" = skipped ]; then
             verify=not_run
           elif [ "$verify" != success ]; then
+            verify=failure
+          elif [ "$VERIFY_RESULT" = skipped ]; then
+            verify=skipped
+          elif [ "$VERIFY_RESULT" != passed ]; then
             verify=failure
           fi
           python3 .github/scripts/promotion_record.py write \
@@ -612,6 +663,24 @@ jobs:
           done
 
           echo "ERROR: failed to push state for ${{ matrix.environment }} after 5 attempts" >&2
+          exit 1
+
+      # Traffic verification ran with `continue-on-error` so its result could
+      # be recorded and published and the ledger committed. None of that makes
+      # a failed verification a green deployment: the gateway took the write
+      # and is not serving it as declared. A successor's `require` gate would
+      # refuse the record, but a standalone environment — and the final
+      # promotion stage — has no successor, so the job itself must fail. Last,
+      # so everything that has to survive the failure has already run. No
+      # rollback. Only a real failure reaches here: a check that ran and did
+      # not pass, a missing finalized bundle, or a `verify` that could not run.
+      # A skipped verification (no smoke.yaml, file mode, or no check declared
+      # for this environment) leaves the outcome empty, `skipped` or
+      # `success`, and the job green.
+      - name: Fail on traffic verification failure
+        if: ${{ !cancelled() && steps.verify.outcome == 'failure' }}
+        run: |
+          echo "::error::Traffic verification failed; see the Verify traffic step above. The configuration write was accepted, but the gateway is not serving it as declared."
           exit 1
 
   # Staged promotion. An environment that declares `promotion.requires` is not
@@ -855,6 +924,15 @@ jobs:
           creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
           python3 .github/scripts/credential_bundles.py "$creds_file"
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
+          # Where a completed apply hands its FINALIZED bundle to the verify
+          # step: the input above plus every slot the apply allocated. The
+          # input is never rewritten, so without this a smoke check could not
+          # send a credential the same apply generated and deployed. A step
+          # output rather than $GITHUB_ENV, so only the two steps that name it
+          # see it. Same mode-0600 $RUNNER_TEMP discipline as the input.
+          applied_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-applied-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
+          rm -f "$applied_file"
+          echo "applied_file=$applied_file" >> "$GITHUB_OUTPUT"
 
       - name: Validate
         env:
@@ -947,6 +1025,9 @@ jobs:
           # to the pusher of an unattributed direct commit.
           GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
+          # Written only when the apply completes; cleared first, so a failed
+          # or partial apply leaves nothing for verification to trust.
+          FERRUM_CREDS_JSON_OUTPUT_FILE: ${{ steps.load-bundles.outputs.applied_file }}
         run: gitforgeops apply --auto-approve
 
       # File mode: `gitforgeops apply` in file mode writes the placeholder-
@@ -1001,7 +1082,15 @@ jobs:
       # started. A repository that declares no `.gitforgeops/smoke.yaml` has
       # opted out of traffic checks: the step is skipped rather than failed on
       # every apply, and the record says `not_run`, which still authorizes no
-      # promotion.
+      # promotion. A `smoke.yaml` that declares no check for THIS environment
+      # is the same opt-out, per environment: `verify` exits 5, the step
+      # succeeds with `result=skipped`, and the record says `skipped` — not a
+      # pass, not a failure, and no promotion authorized.
+      #
+      # Credentials come from the apply's finalized bundle, not the pre-apply
+      # file: a slot this run generated exists only there and in the GitHub
+      # Environment Secret. No finalized bundle means the apply did not
+      # complete, and a check against it would verify some other deployment.
       - name: Verify traffic
         id: verify
         if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' && hashFiles('.gitforgeops/smoke.yaml') != '' }}
@@ -1010,7 +1099,30 @@ jobs:
           FERRUM_ENV: ${{ matrix.scope.environment }}
           FERRUM_VERIFY_BASE_URL: ${{ secrets.FERRUM_VERIFY_BASE_URL }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
-        run: gitforgeops verify
+          APPLIED_CREDS_FILE: ${{ steps.load-bundles.outputs.applied_file }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLIED_CREDS_FILE" ] || [ ! -s "$APPLIED_CREDS_FILE" ]; then
+            echo "::error::The apply step left no finalized credential bundle, so traffic cannot be verified against what it deployed."
+            exit 1
+          fi
+          # 0: every check passed. 5: no check is declared for this
+          # environment, so nothing was verified and nothing failed. Anything
+          # else (4 a check failed, 1 verify could not run) fails the step.
+          status=0
+          FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify || status=$?
+          case "$status" in
+            0)
+              echo "result=passed" >> "$GITHUB_OUTPUT"
+              ;;
+            5)
+              echo "result=skipped" >> "$GITHUB_OUTPUT"
+              echo "::notice::Traffic verification skipped: .gitforgeops/smoke.yaml declares no checks for $FERRUM_ENV. Nothing was verified; this environment authorizes no promotion."
+              ;;
+            *)
+              exit "$status"
+              ;;
+          esac
 
       - name: Record promotion result
         if: ${{ !cancelled() }}
@@ -1020,19 +1132,27 @@ jobs:
           MODE: ${{ steps.deployment-mode.outputs.mode }}
           APPLY_RESULT: ${{ (steps.apply.outcome == 'success' || steps.apply-file.outcome == 'success') && 'success' || 'failure' }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
           ACTOR: ${{ steps.pr.outputs.author }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          # File mode has no data plane to send traffic to. It is recorded as
-          # `skipped`, which does NOT authorize a promotion — an environment
-          # nothing can verify must not be a promotion predecessor.
+          # File mode has no data plane to send traffic to, and an environment
+          # smoke.yaml declares no check for has nothing to send. Both are
+          # recorded as `skipped`, which does NOT authorize a promotion — an
+          # environment nothing verified must not be a promotion predecessor.
+          # A successful step counts as `success` only when it says every
+          # declared check passed.
           verify="$VERIFY_OUTCOME"
           if [ "$MODE" = file ]; then
             verify=skipped
           elif [ -z "$verify" ] || [ "$verify" = skipped ]; then
             verify=not_run
           elif [ "$verify" != success ]; then
+            verify=failure
+          elif [ "$VERIFY_RESULT" = skipped ]; then
+            verify=skipped
+          elif [ "$VERIFY_RESULT" != passed ]; then
             verify=failure
           fi
           python3 .github/scripts/promotion_record.py write \
@@ -1148,6 +1268,24 @@ jobs:
           done
 
           echo "ERROR: failed to push state for ${{ matrix.scope.environment }} after 5 attempts" >&2
+          exit 1
+
+      # Traffic verification ran with `continue-on-error` so its result could
+      # be recorded and published and the ledger committed. None of that makes
+      # a failed verification a green deployment: the gateway took the write
+      # and is not serving it as declared. A successor's `require` gate would
+      # refuse the record, but a standalone environment — and the final
+      # promotion stage — has no successor, so the job itself must fail. Last,
+      # so everything that has to survive the failure has already run. No
+      # rollback. Only a real failure reaches here: a check that ran and did
+      # not pass, a missing finalized bundle, or a `verify` that could not run.
+      # A skipped verification (no smoke.yaml, file mode, or no check declared
+      # for this environment) leaves the outcome empty, `skipped` or
+      # `success`, and the job green.
+      - name: Fail on traffic verification failure
+        if: ${{ !cancelled() && steps.verify.outcome == 'failure' }}
+        run: |
+          echo "::error::Traffic verification failed; see the Verify traffic step above. The configuration write was accepted, but the gateway is not serving it as declared."
           exit 1
 
   # One GitHub-native record of what was promoted, from what revision, on whose
