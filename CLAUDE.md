@@ -443,6 +443,21 @@ check rather than sending an empty header — an empty credential would make a
 `401`-expecting check pass for the wrong reason. Results carry name, method,
 path and status only; the response body is never read.
 
+Verification is authoritative, current and replay-safe (#350, #351, #353).
+Both deployment jobs end with `Fail on traffic verification failure`, after the
+record is published and the ledger committed, so a failed `verify` (exit 4 or
+1) fails the job even where no successor reads the record; a skipped verify (no
+`smoke.yaml`, file mode) does not. `apply` with `FERRUM_CREDS_JSON_OUTPUT_FILE`
+clears that path first and, only on completion, writes `per_shard` there
+(`secrets::write_bundle_handoff`: wrapper shape, 0600, temp+fsync+rename,
+regular files only, never the input path); the workflow's verify step points
+`FERRUM_CREDS_JSON_FILE` at it and fails if it is missing, so a slot allocated
+by the same apply resolves. `runner::run_check` retries an ambiguous attempt
+(timeout, or any failure except a connect error) only when
+`SmokeCheck::replays_ambiguous_attempts` — an RFC 9110 idempotent method
+(`GET HEAD OPTIONS TRACE PUT DELETE`, case-sensitive) or an explicit
+`replay_safe: true`.
+
 ### Ownership modes
 
 Configured per environment in repo config.
@@ -965,7 +980,7 @@ never restoring an obsolete ledger, which is a separate state-override repair.
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal; `ResourceKeys` is the prebuilt `namespace:Kind:id` set `record_op` and the journal/ledger reconciliations check existence against
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
-- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `exit_code` is `VERIFY_FAILED_EXIT_CODE` = 4), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, the response body is never read)
+- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `exit_code` is `VERIFY_FAILED_EXIT_CODE` = 4), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, an ambiguous attempt of a non-idempotent method is never replayed without `replay_safe`, the response body is never read)
 - `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
 - `src/diagnostics.rs` — the shared log sanitizer (`sanitize` / `sanitize_line` / `sanitize_block`
   and their `safe*` `Display` adapters) every diagnostic routes untrusted ids, namespaces,

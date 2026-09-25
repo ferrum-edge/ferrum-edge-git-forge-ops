@@ -49,7 +49,15 @@ environments:
         expect_status: 401
         attempts: 3
 
+      # Prefer GET/HEAD probes. A POST, PATCH or other non-idempotent check is
+      # retried only when its connection was never established: after a
+      # timeout the endpoint may already have applied it, and a replay would
+      # repeat the side effect. Add `replay_safe: true` only if the endpoint
+      # genuinely tolerates a replay (an Idempotency-Key header proves nothing
+      # by itself).
+
   # `production` deliberately has no entry here. An environment with no
   # declared check has verified nothing, and `gitforgeops verify` fails rather
-  # than reporting a pass — so a promotion gated on it stays blocked until you
-  # say what "serving correctly" means for it.
+  # than reporting a pass — so a promotion gated on it stays blocked, and its
+  # own deployment job ends failed after the apply, until you say what
+  # "serving correctly" means for it.

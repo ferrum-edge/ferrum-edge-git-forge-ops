@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -217,6 +219,107 @@ pub fn merge_bundles(shards: &BTreeMap<u32, CredentialBundle>) -> CredentialBund
 
 pub fn serialize_bundle(bundle: &CredentialBundle) -> crate::error::Result<String> {
     serde_json::to_string(bundle).map_err(crate::error::Error::SerdeJson)
+}
+
+/// Serialize every shard into the `FERRUM_CREDS_JSON` wrapper document
+/// (`{ "FERRUM_CREDS_BUNDLE": {...}, "FERRUM_CREDS_BUNDLE_1": {...} }`), the
+/// shape [`load_bundles_from_env`] reads back.
+pub fn serialize_bundle_document(
+    shards: &BTreeMap<u32, CredentialBundle>,
+) -> crate::error::Result<String> {
+    let document: BTreeMap<String, &CredentialBundle> = shards
+        .iter()
+        .map(|(index, bundle)| (shard_secret_name(*index), bundle))
+        .collect();
+    serde_json::to_string(&document).map_err(crate::error::Error::SerdeJson)
+}
+
+/// Where `apply` may publish its finalized bundle
+/// (`FERRUM_CREDS_JSON_OUTPUT_FILE`), checked against the input file.
+///
+/// The destination must not be the input (`FERRUM_CREDS_JSON_FILE`): that file
+/// belongs to the caller, nothing promises it is writable, and `apply` clears
+/// the handoff before it starts — which would delete the very bundle it is
+/// about to read.
+pub fn credential_handoff_destination(
+    output: Option<&str>,
+    input: Option<&str>,
+) -> crate::error::Result<Option<PathBuf>> {
+    let Some(output) = output.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let output = PathBuf::from(output);
+    if let Some(input) = input.map(str::trim).filter(|path| !path.is_empty()) {
+        let input = Path::new(input);
+        let same_file = match (output.canonicalize(), input.canonicalize()) {
+            (Ok(output), Ok(input)) => output == input,
+            _ => false,
+        };
+        if output == input || same_file {
+            return Err(crate::error::Error::Config(
+                "FERRUM_CREDS_JSON_OUTPUT_FILE names the same file as FERRUM_CREDS_JSON_FILE; \
+                 the finalized bundle is a separate handoff and never rewrites its input"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(Some(output))
+}
+
+/// Remove a previous handoff so that only a completed apply leaves one.
+///
+/// A file already at the destination describes some other run. If this apply
+/// stops early, `verify` must find nothing rather than trust it.
+pub fn remove_bundle_handoff(path: &Path) -> crate::error::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::error::Error::Io(error)),
+    }
+}
+
+/// Publish the finalized bundle for a later process of the same job.
+///
+/// `apply` may allocate a slot, write it to the GitHub Environment Secret and
+/// deploy it, but the input file still holds the pre-apply bundle, so a
+/// separate `verify` that rereads it cannot see the new value. This is the
+/// handoff: every shard, including the slots this run allocated, in the input
+/// document's own shape.
+///
+/// Plaintext credential material, so it is written like one: an owner-only
+/// (0600) temp file in the destination's directory, fsynced, then renamed into
+/// place — never a partially written file, never a world-readable one. The
+/// destination must be a regular file or absent; a symlink, pipe or device is
+/// refused rather than written through.
+pub fn write_bundle_handoff(
+    path: &Path,
+    shards: &BTreeMap<u32, CredentialBundle>,
+) -> crate::error::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        return Err(crate::error::Error::Config(format!(
+            "credential handoff destination {} must be a regular file",
+            safe_line(path.display())
+        )));
+    }
+    let document = serialize_bundle_document(shards)?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".gitforgeops-creds-").suffix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    let mut temp = builder.tempfile_in(parent)?;
+    temp.write_all(document.as_bytes())?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| crate::error::Error::Io(error.error))?;
+    Ok(())
 }
 
 /// Pick a shard for a new slot.

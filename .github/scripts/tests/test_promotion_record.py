@@ -377,6 +377,76 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("promotion_record.py summarize", self.text)
         self.assertIn("promotion-summary:", self.text)
 
+    def _jobs(self) -> list[str]:
+        # The independent `apply` job and the `promote` job, each its own
+        # step sequence. Measured across the whole file, an ordering assertion
+        # could compare one job's step with the other's.
+        start = self.text.index("\n  apply:\n")
+        promote = self.text.index("\n  promote:\n")
+        summary = self.text.index("\n  promotion-summary:\n")
+        return [self.text[start:promote], self.text[promote:summary]]
+
+    def test_a_failed_verification_fails_both_deployment_jobs(self):
+        # #350: `continue-on-error` let the record carry the failure while the
+        # job stayed green. A successor's gate refuses the record, but an
+        # independent environment and the final promotion stage have none.
+        guard = "- name: Fail on traffic verification failure"
+        for job in self._jobs():
+            self.assertEqual(job.count(guard), 1)
+            step = job[job.index(guard):]
+            self.assertIn(
+                "if: ${{ !cancelled() && steps.verify.outcome == 'failure' }}", step
+            )
+            self.assertIn("exit 1", step)
+            # Deferred: the record is published and the successful apply's
+            # ledger committed before the job is failed.
+            for earlier in (
+                "- name: Record promotion result",
+                "- name: Publish promotion record",
+                "- name: Commit state + assembled (if changed)",
+            ):
+                self.assertLess(job.index(earlier), job.index(guard), earlier)
+            # A missing smoke file or file mode skips the step; that outcome
+            # is never `failure`, so the documented opt-out stays green.
+            self.assertIn(
+                "hashFiles('.gitforgeops/smoke.yaml') != ''",
+                job[job.index("- name: Verify traffic"):],
+            )
+
+    def test_verification_reads_the_bundle_the_apply_finalized(self):
+        # #351: the apply allocates into memory and the GitHub Environment
+        # Secret, never into the input file, so verify must read the apply's
+        # handoff rather than the pre-apply snapshot.
+        for job in self._jobs():
+            loader = job[job.index("- name: Load credential bundles"):]
+            loader = loader[: loader.index("- name: Validate")]
+            self.assertIn(
+                'applied_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-applied-', loader
+            )
+            self.assertIn('rm -f "$applied_file"', loader)
+            self.assertIn('echo "applied_file=$applied_file" >> "$GITHUB_OUTPUT"', loader)
+            # Only the API-mode apply writes it; file mode has no data plane.
+            api_apply = job[job.index("- name: Apply\n"):]
+            api_apply = api_apply[: api_apply.index("- name: Apply (file mode)")]
+            self.assertIn(
+                "FERRUM_CREDS_JSON_OUTPUT_FILE: "
+                "${{ steps.load-bundles.outputs.applied_file }}",
+                api_apply,
+            )
+            verify = job[job.index("- name: Verify traffic"):]
+            verify = verify[: verify.index("- name: Record promotion result")]
+            self.assertIn(
+                "APPLIED_CREDS_FILE: ${{ steps.load-bundles.outputs.applied_file }}",
+                verify,
+            )
+            self.assertIn(
+                'FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify', verify
+            )
+            # No finalized bundle is a failed verification, never a fallback
+            # to the stale snapshot.
+            self.assertIn('[ ! -s "$APPLIED_CREDS_FILE" ]', verify)
+            self.assertNotIn("run: gitforgeops verify", verify)
+
     def test_both_privileged_jobs_keep_the_freshness_guard(self):
         # The promote job fixes its revision the same way, so a
         # deployment-affecting merge during staging verification refuses it

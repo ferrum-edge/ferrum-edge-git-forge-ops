@@ -106,6 +106,14 @@ pub struct EnvConfig {
     /// inline `creds_bundle_json` — routes the bundle around env-var size
     /// limits at scale.
     pub creds_bundle_json_file: Option<String>,
+    /// Where a completed `apply` writes its finalized credential bundle — the
+    /// input bundle plus every slot this run allocated — in the same JSON
+    /// shape, owner-only (0600) and atomically. Opt-in and private to the job:
+    /// the bundled workflow points the later `verify` step's
+    /// `FERRUM_CREDS_JSON_FILE` at it, so a smoke check can send a credential
+    /// the same apply generated. Must differ from `creds_bundle_json_file`;
+    /// the input is never rewritten.
+    pub creds_bundle_json_output_file: Option<String>,
     /// Output path for assembled file (file mode).
     pub file_output_path: String,
     /// Output path for the standalone mesh document (`{version, mesh}`).
@@ -196,6 +204,7 @@ impl Default for EnvConfig {
             github_provisioner_token: None,
             creds_bundle_json: None,
             creds_bundle_json_file: None,
+            creds_bundle_json_output_file: None,
             file_output_path: "./assembled/resources.yaml".to_string(),
             mesh_file_output_path: DEFAULT_MESH_FILE_OUTPUT_PATH.to_string(),
             edge_binary_path: "ferrum-edge".to_string(),
@@ -242,6 +251,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_GH_PROVISIONER_TOKEN`| `github_provisioner_token` | `None`                   |
 /// | `FERRUM_CREDS_JSON`          | `creds_bundle_json`| `None`                           |
 /// | `FERRUM_CREDS_JSON_FILE`     | `creds_bundle_json_file` | `None` (path, preferred at scale) |
+/// | `FERRUM_CREDS_JSON_OUTPUT_FILE` | `creds_bundle_json_output_file` | `None` (no handoff written) |
 /// | `FERRUM_FILE_OUTPUT_PATH`    | `file_output_path` | `./assembled/resources.yaml`     |
 /// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
@@ -342,6 +352,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         github_provisioner_token: non_empty_env("FERRUM_GH_PROVISIONER_TOKEN"),
         creds_bundle_json: non_empty_env("FERRUM_CREDS_JSON"),
         creds_bundle_json_file: non_empty_env("FERRUM_CREDS_JSON_FILE"),
+        creds_bundle_json_output_file: non_empty_env("FERRUM_CREDS_JSON_OUTPUT_FILE"),
         file_output_path: non_empty_env("FERRUM_FILE_OUTPUT_PATH")
             .unwrap_or_else(|| "./assembled/resources.yaml".to_string()),
         mesh_file_output_path: non_empty_env("FERRUM_MESH_FILE_OUTPUT_PATH")

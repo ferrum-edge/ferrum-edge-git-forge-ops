@@ -115,10 +115,35 @@ pub struct SmokeCheck {
     /// Total attempts, including the first. A freshly applied route can take a
     /// moment to become live, so the default retries; it is bounded because an
     /// unbounded wait is a hung promotion rather than a blocked one.
+    ///
+    /// A method that is not idempotent (see [`is_idempotent_method`]) spends
+    /// further attempts only on a connection that was never established. A
+    /// timeout or a failure after the request may have been sent is ambiguous
+    /// — the endpoint may already have acted on it — so it ends the check
+    /// unless `replay_safe` says a replay is harmless.
     #[serde(default = "default_attempts")]
     pub attempts: u32,
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: u64,
+    /// The operator's statement that replaying this request is harmless: the
+    /// endpoint is idempotent, or it deduplicates. Only a method that is not
+    /// idempotent by definition needs it. There is no inference from headers
+    /// — an `Idempotency-Key` proves nothing about what the server does with
+    /// it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replay_safe: bool,
+}
+
+/// Is `method` idempotent by definition (RFC 9110 §9.2.2)?
+///
+/// Exact, case-sensitive names only: HTTP methods are case-sensitive, so
+/// `get` is an extension method, and an extension method's semantics are
+/// unknown. Unknown is treated like `POST`.
+pub fn is_idempotent_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -268,6 +293,17 @@ impl SmokeCheck {
 
     pub fn backoff(&self, attempt: u32) -> Duration {
         Duration::from_millis(self.retry_backoff_ms.saturating_mul(u64::from(attempt)))
+    }
+
+    /// May an attempt whose outcome is unknown — a timeout, or a failure after
+    /// the request may have reached the server — be sent again?
+    ///
+    /// A slow response to a `POST` is not evidence that nothing happened; the
+    /// endpoint may have committed it and lost only the reply. Replaying it
+    /// would repeat the side effect, and a later success would then read as a
+    /// clean pass.
+    pub fn replays_ambiguous_attempts(&self) -> bool {
+        self.replay_safe || is_idempotent_method(&self.method)
     }
 }
 

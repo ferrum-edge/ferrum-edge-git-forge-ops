@@ -7,13 +7,19 @@
 //! chain validation, the declarative check contract, and the fail-closed rules
 //! that stop "we did not verify" from reading as "verified".
 
-use std::io::Write;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use gitforgeops::config::repo_config::RepoConfig;
+use gitforgeops::verify::runner::run_check;
 use gitforgeops::verify::{
-    resolve_headers, HeaderValue, Outcome, SmokeConfig, VerifyReport, SMOKE_CONFIG_VERSION,
-    VERIFY_FAILED_EXIT_CODE,
+    is_idempotent_method, resolve_headers, HeaderValue, Outcome, SmokeCheck, SmokeConfig,
+    VerifyReport, SMOKE_CONFIG_VERSION, VERIFY_FAILED_EXIT_CODE,
 };
 use tempfile::NamedTempFile;
 
@@ -251,6 +257,156 @@ fn a_missing_credential_slot_fails_the_check_rather_than_sending_nothing() {
     let resolved = resolve_headers(&headers, &bundle).expect("resolves");
     assert!(resolved.contains(&("X-Tenant".to_string(), "acme".to_string())));
     assert!(resolved.contains(&("X-API-Key".to_string(), "s3cret-value".to_string())));
+}
+
+// -- ambiguous attempts are not replayed (#353) ------------------------------
+
+/// A loopback endpoint that commits each request the moment its head arrives
+/// and answers the first one only after the check has given up on it. The
+/// counter is what a replay costs.
+fn spawn_committing_endpoint(status: u16) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind endpoint");
+    let addr = listener.local_addr().expect("endpoint addr");
+    let committed = Arc::new(AtomicUsize::new(0));
+    let thread_committed = Arc::clone(&committed);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let committed = Arc::clone(&thread_committed);
+            std::thread::spawn(move || {
+                if !read_request_head(&mut stream) {
+                    return;
+                }
+                // The side effect lands here, before any answer is written.
+                if committed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(2500));
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+            });
+        }
+    });
+    (format!("http://{addr}"), committed)
+}
+
+fn read_request_head(stream: &mut TcpStream) -> bool {
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .is_err()
+    {
+        return false;
+    }
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0_u8; 1024];
+    while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+        }
+    }
+    true
+}
+
+/// The check from #353: `attempts` omitted, so the default of three applies.
+fn enqueue_probe(extra: &str) -> SmokeCheck {
+    let config = load_smoke(&format!(
+        "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: enqueue probe\n\
+         \n        path: /smoke/enqueue\n        expect_status: 201\n        timeout_secs: 1\n\
+         \n        retry_backoff_ms: 0\n{extra}"
+    ))
+    .expect("loads");
+    let staging = config.for_environment("staging").expect("staging");
+    staging.checks[0].clone()
+}
+
+#[test]
+fn only_methods_idempotent_by_definition_are_replayed_automatically() {
+    for method in ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"] {
+        assert!(is_idempotent_method(method), "{method}");
+    }
+    // Methods are case-sensitive: `get` is an extension method, and an
+    // extension method's semantics are unknown.
+    for method in ["POST", "PATCH", "CONNECT", "PURGE", "get"] {
+        assert!(!is_idempotent_method(method), "{method}");
+    }
+    let probe = enqueue_probe("        method: POST\n");
+    assert_eq!(probe.attempts, 3);
+    assert!(!probe.replay_safe);
+    assert!(!probe.replays_ambiguous_attempts());
+    let opted_in = enqueue_probe("        method: POST\n        replay_safe: true\n");
+    assert!(opted_in.replays_ambiguous_attempts());
+    let put = enqueue_probe("        method: PUT\n");
+    assert!(put.replays_ambiguous_attempts());
+}
+
+#[tokio::test]
+async fn a_post_that_committed_but_answered_late_is_not_replayed() {
+    // The endpoint applied the first POST and lost only the reply. Sending it
+    // again duplicated the side effect, and the second 201 passed the check.
+    for extra in [
+        "        method: POST\n",
+        "        method: POST\n        replay_safe: false\n",
+    ] {
+        let (base_url, committed) = spawn_committing_endpoint(201);
+        let check = enqueue_probe(extra);
+        let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+        assert_eq!(committed.load(Ordering::SeqCst), 1, "{extra}");
+        assert_eq!(result.outcome, Outcome::TimedOut, "{extra}");
+        assert_eq!(result.attempts, 1, "{extra}");
+        assert_eq!(result.actual_status, None, "{extra}");
+        assert!(result.detail.contains("not retried"), "{}", result.detail);
+        assert!(result.detail.contains("replay_safe"), "{}", result.detail);
+    }
+}
+
+#[tokio::test]
+async fn patch_and_unknown_methods_are_not_replayed_either() {
+    for method in ["PATCH", "PURGE", "get"] {
+        let (base_url, committed) = spawn_committing_endpoint(201);
+        let check = enqueue_probe(&format!("        method: {method}\n"));
+        let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+        assert_eq!(committed.load(Ordering::SeqCst), 1, "{method}");
+        assert_eq!(result.outcome, Outcome::TimedOut, "{method}");
+        assert_eq!(result.attempts, 1, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn an_idempotent_check_still_retries_a_timeout_within_its_bound() {
+    // A freshly applied route can take a moment to become live; bounded
+    // retries of a GET remain the point of `attempts`.
+    let (base_url, committed) = spawn_committing_endpoint(201);
+    let check = enqueue_probe("        method: GET\n");
+    let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+    assert_eq!(committed.load(Ordering::SeqCst), 2);
+    assert_eq!(result.outcome, Outcome::Passed);
+    assert_eq!(result.attempts, 2);
+    assert_eq!(result.actual_status, Some(201));
+}
+
+#[tokio::test]
+async fn replay_safe_is_the_explicit_opt_in_for_a_non_idempotent_retry() {
+    let (base_url, committed) = spawn_committing_endpoint(201);
+    let check = enqueue_probe("        method: POST\n        replay_safe: true\n");
+    let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+    assert_eq!(committed.load(Ordering::SeqCst), 2);
+    assert_eq!(result.outcome, Outcome::Passed);
+    assert_eq!(result.attempts, 2);
+}
+
+#[tokio::test]
+async fn a_connection_that_was_never_established_is_retried_for_any_method() {
+    // A refused connection carried no request, so nothing can have been
+    // applied: that much is provable, and the bound still holds.
+    let closed = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base_url = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    let check = enqueue_probe("        method: POST\n");
+    let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+    assert_eq!(result.outcome, Outcome::Unreachable);
+    assert_eq!(result.attempts, 3);
+    assert!(!result.detail.contains("not retried"), "{}", result.detail);
 }
 
 // -- TLS is verified, always -------------------------------------------------

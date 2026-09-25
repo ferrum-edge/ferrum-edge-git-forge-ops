@@ -2210,6 +2210,16 @@ async fn cmd_apply(
     allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    // The finalized-bundle handoff describes this apply and nothing older.
+    // Clear it before anything else, so a run that stops early leaves no file
+    // for a later `verify` step to mistake for this deployment's credentials.
+    let credential_handoff = secrets::credential_handoff_destination(
+        env_config.creds_bundle_json_output_file.as_deref(),
+        env_config.creds_bundle_json_file.as_deref(),
+    )?;
+    if let Some(path) = &credential_handoff {
+        secrets::remove_bundle_handoff(path)?;
+    }
     let allow_nontransactional_plugin_attach =
         allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
@@ -3099,6 +3109,14 @@ async fn cmd_apply(
 
     if let Some(e) = deferred_apply_error {
         return Err(e.into());
+    }
+
+    // Only a completed apply hands its bundle on. The allocator updated
+    // `per_shard` in memory and the GitHub Environment Secret, never the input
+    // file, so a separate `verify` that rereads the input cannot see a slot
+    // this run generated and deployed.
+    if let Some(path) = &credential_handoff {
+        secrets::write_bundle_handoff(path, &per_shard)?;
     }
 
     Ok(())
