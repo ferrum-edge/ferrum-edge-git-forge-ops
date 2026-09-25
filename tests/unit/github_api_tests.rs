@@ -779,3 +779,217 @@ async fn a_same_job_first_allocation_reaches_the_traffic_check_through_the_hando
         "the check must send the value this apply generated"
     );
 }
+
+// --- Partial allocation journal (#352) ---------------------------------------
+
+const GENERATE: &str = "${gh-env-secret:alloc=generate}";
+/// A clean apply long before this run: every allocation recorded here is newer.
+const EARLIER_CLEAN_APPLY: &str = "2020-01-01T00:00:00+00:00";
+/// Shard 0 then has room for exactly one new 24-character slot with a
+/// 43-character value. The first candidate fits (`N + 88 <= 40960`), the second
+/// does not (`N + 161 > 40960`), so it spills onto a new shard 1.
+const FILLER_CHARS: usize = 40_836;
+
+fn put_shard_path(shard: u32) -> String {
+    format!(
+        "PUT /repos/{REPO}/environments/{ENVIRONMENT}/secrets/{} ",
+        gitforgeops::secrets::bundle::shard_secret_name(shard)
+    )
+}
+
+fn new_consumers_cfg(ids: &[&str]) -> gitforgeops::config::schema::GatewayConfig {
+    let mut consumers = Vec::new();
+    for id in ids {
+        consumers.push(serde_json::json!({
+            "id": id,
+            "username": id,
+            "namespace": "ferrum",
+            "credentials": {"keyauth": [{"key": GENERATE}]},
+        }));
+    }
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": consumers,
+    }))
+    .unwrap()
+}
+
+/// The first resolve of `apply`: the ledger decides whether a stored
+/// `alloc=generate` value is this environment's own or a revived one.
+fn report_against_ledger(
+    cfg: &gitforgeops::config::schema::GatewayConfig,
+    bundle: &BTreeMap<String, String>,
+    state: &gitforgeops::state::StateFile,
+) -> gitforgeops::error::Result<ResolveReport> {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, ConsumerCoverage, ConsumerLedger, ResolveOptions,
+        SlotRemapPolicy,
+    };
+
+    let ledger = ConsumerLedger::from_state(state, ConsumerCoverage::Complete);
+    let options = ResolveOptions {
+        slot_remap: SlotRemapPolicy::Refuse,
+        consumer_ledger: Some(&ledger),
+    };
+    report_secrets_with_mode_and_options(cfg, bundle, GatewayMode::Api, options)
+}
+
+fn status(report: &ResolveReport, slot: &str) -> Option<SlotStatus> {
+    report
+        .results
+        .iter()
+        .find(|result| result.slot == slot)
+        .map(|result| result.status.clone())
+}
+
+fn put_requests(requests: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    requests
+        .lock()
+        .expect("recorded")
+        .iter()
+        .filter(|request| request.starts_with("PUT "))
+        .map(|request| request.lines().next().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// #352: a batch spanning two shards commits shard 0, then fails on shard 1.
+/// The committed slot, and only it, is journaled as non-secret metadata. A
+/// fresh process holding the saved ledger and the bundle as GitHub now holds
+/// it resumes without `--allow-credential-slot-remap`: the committed slot
+/// resolves to the value already delivered and only the unwritten one is
+/// allocated. A stored value the ledger never recorded is still refused.
+#[tokio::test]
+async fn a_partially_committed_allocation_is_journaled_and_its_retry_resumes() {
+    use gitforgeops::state::StateFile;
+
+    let alpha = slot_path("ferrum", "alpha", "keyauth/key");
+    let bravo = slot_path("ferrum", "bravo", "keyauth/key");
+    let cfg = new_consumers_cfg(&["alpha", "bravo"]);
+    let state = StateFile {
+        environment: ENVIRONMENT.to_string(),
+        last_applied_at: Some(EARLIER_CLEAN_APPLY.to_string()),
+        ..StateFile::default()
+    };
+    let filler = BTreeMap::from([("filler".to_string(), "x".repeat(FILLER_CHARS))]);
+    let mut shards = BTreeMap::from([(0, filler)]);
+    let mut shard_count = state.credential_shard_count.max(1);
+
+    let first = report_against_ledger(&cfg, &merge_bundles(&shards), &state)
+        .expect("two first-time slots are ordinary allocation");
+    assert_eq!(status(&first, &alpha), Some(SlotStatus::NeedsAllocation));
+    assert_eq!(status(&first, &bravo), Some(SlotStatus::NeedsAllocation));
+
+    // Routes match by substring, so shard 1's name must precede shard 0's.
+    let bad_gateway = "{\"message\":\"Bad Gateway\"}".to_string();
+    let mut routes = vec![(put_shard_path(1), 502, bad_gateway)];
+    routes.extend(success_routes(204));
+    let (api_base, requests) = spawn_github_stub(routes);
+    let failure = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        None,
+        &first,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect_err("the second shard PUT fails");
+    assert_api_error(&failure.source, 502, "Bad Gateway");
+    assert_eq!(failure.partial.allocated.len(), 1);
+    let committed = &failure.partial.allocated[0];
+    assert_eq!(committed.slot, alpha);
+    assert_eq!(committed.shard, 0);
+    let committed_value = committed.value.clone();
+    assert!(shards[&0].get(&alpha) == Some(&committed_value));
+    assert!(!shards.contains_key(&1), "shard 1 never reached GitHub");
+    let puts = put_requests(&requests);
+    assert_eq!(puts.len(), 2);
+    assert!(puts[0].starts_with(&put_shard_path(0)), "{puts:?}");
+    assert!(puts[1].starts_with(&put_shard_path(1)), "{puts:?}");
+
+    // Without a journal, the retry refuses the slot this apply wrote.
+    let committed_bundle = merge_bundles(&shards);
+    let unjournaled = report_against_ledger(&cfg, &committed_bundle, &state)
+        .expect_err("an unrecorded committed slot reads as a revival")
+        .to_string();
+    assert!(
+        unjournaled.contains(&format!("'{alpha}'")) && unjournaled.contains("revive"),
+        "{unjournaled}"
+    );
+
+    let mut journaled = state.clone();
+    journaled.record_allocation(&failure.partial, Some("run-1"));
+    assert_eq!(journaled.credentials.len(), 1);
+    assert_eq!(journaled.credentials[&alpha].shard, 0);
+    assert!(!journaled.credentials.contains_key(&bravo));
+    assert_eq!(
+        journaled.credential_shard_count, 1,
+        "the failed shard is not claimed"
+    );
+    let saved = serde_json::to_string(&journaled).expect("serialize ledger");
+    assert!(
+        !saved.contains(&committed_value),
+        "the ledger must not hold the credential value"
+    );
+
+    // A fresh process: the saved ledger and the bundle GitHub now holds.
+    let reloaded: StateFile = serde_json::from_str(&saved).expect("reload ledger");
+    let retry = report_against_ledger(&cfg, &committed_bundle, &reloaded)
+        .expect("the retry recognizes its own committed slot");
+    assert!(retry.slot_remaps.is_empty());
+    assert_eq!(status(&retry, &alpha), Some(SlotStatus::Resolved));
+    assert_eq!(status(&retry, &bravo), Some(SlotStatus::NeedsAllocation));
+
+    let (api_base, requests) = spawn_github_stub(success_routes(204));
+    let mut shard_count = reloaded.credential_shard_count.max(1);
+    let outcome = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        None,
+        &retry,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect("the retry allocates what is still missing");
+    assert_eq!(outcome.allocated.len(), 1, "alpha is not generated again");
+    assert_eq!(outcome.allocated[0].slot, bravo);
+    assert_eq!(outcome.allocated[0].shard, 1);
+    let puts = put_requests(&requests);
+    assert_eq!(puts.len(), 1, "shard 0 is not rewritten: {puts:?}");
+    assert!(puts[0].starts_with(&put_shard_path(1)), "{puts:?}");
+    let finalized = merge_bundles(&shards);
+    assert!(finalized.get(&alpha) == Some(&committed_value));
+    assert!(finalized.contains_key(&bravo));
+
+    // The journal exempts exactly the slots this environment wrote. A stored
+    // value for a Consumer the ledger never recorded is still a revival.
+    let charlie = slot_path("ferrum", "charlie", "keyauth/key");
+    let mut revived = committed_bundle.clone();
+    revived.insert(charlie.clone(), "RETIRED-CHARLIE-KEY-VALUE".to_string());
+    let with_charlie = new_consumers_cfg(&["alpha", "bravo", "charlie"]);
+    let err = report_against_ledger(&with_charlie, &revived, &reloaded)
+        .expect_err("a reused id must not inherit a retired value")
+        .to_string();
+    assert!(err.contains(&format!("'{charlie}'")), "{err}");
+    assert!(!err.contains(&format!("'{alpha}'")), "{err}");
+    assert!(!err.contains("RETIRED-CHARLIE"), "{err}");
+
+    // Once a later clean apply supersedes the journal, the exemption lapses:
+    // a Consumer that is still unrecorded then cannot claim the stored value.
+    let superseded = StateFile {
+        last_applied_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        ..reloaded.clone()
+    };
+    let err = report_against_ledger(&cfg, &committed_bundle, &superseded)
+        .expect_err("a journal older than the last clean apply is not a retry")
+        .to_string();
+    assert!(err.contains(&format!("'{alpha}'")), "{err}");
+}

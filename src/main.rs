@@ -590,13 +590,6 @@ async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
         .and_then(|n| n.as_u64())
 }
 
-/// Generate + publish any credentials that need allocation or rotation, deliver
-/// them to the PR author (or workflow actor), and re-resolve placeholders so
-/// `desired` carries the real values for this apply run.
-///
-/// Returns the allocation outcome (or `None` if nothing needed allocation) and
-/// the final post-allocation shard map (for state-file updates).
-#[allow(clippy::too_many_arguments)]
 /// Build a reqwest::Client configured to hit api.github.com with the
 /// `FERRUM_GITHUB_*_TIMEOUT_SECS` bounds applied. Every GitHub-API call
 /// site in the binary (PR lookup, override check, secret provisioning,
@@ -732,6 +725,34 @@ async fn surface_delivered_credentials(
     Ok(())
 }
 
+/// Persist the allocation metadata for every slot whose shard PUT succeeded.
+///
+/// Each GitHub Environment Secret write is an external commit of its own, so
+/// its non-secret metadata is saved the moment the allocator returns, whether
+/// the batch completed or failed partway. A retry then finds the slots it
+/// already wrote recorded as pending allocations rather than as revived
+/// values, and allocates only what is still missing.
+fn journal_allocation(
+    state: &mut StateFile,
+    outcome: &secrets::AllocateOutcome,
+) -> gitforgeops::error::Result<()> {
+    if outcome.allocated.is_empty() {
+        return Ok(());
+    }
+    let run_id = std::env::var("GITHUB_RUN_ID").ok();
+    state.record_allocation(outcome, run_id.as_deref());
+    state.save()
+}
+
+/// Generate + publish any credentials that need allocation or rotation, deliver
+/// them to the PR author (or workflow actor), and re-resolve placeholders so
+/// `desired` carries the real values for this apply run.
+///
+/// Returns the allocation outcome (or `None` if nothing needed allocation);
+/// `per_shard` and `shard_count` carry the post-allocation shard map. Every
+/// committed slot is journaled in `state` and saved before this returns,
+/// on success and on a partial failure alike.
+#[allow(clippy::too_many_arguments)]
 async fn allocate_if_needed(
     desired: &mut GatewayConfig,
     env_config: &EnvConfig,
@@ -739,6 +760,7 @@ async fn allocate_if_needed(
     report: &secrets::ResolveReport,
     per_shard: &mut BTreeMap<u32, secrets::CredentialBundle>,
     shard_count: &mut u32,
+    state: &mut StateFile,
     resolve_options: secrets::ResolveOptions<'_>,
 ) -> Result<Option<secrets::AllocateOutcome>, Box<dyn std::error::Error>> {
     if report.needs_allocation().is_empty() {
@@ -792,12 +814,28 @@ async fn allocate_if_needed(
             // so no re-delivery fires. Subsequent shards in the batch are
             // not in `partial.allocated` (their PUT never succeeded), so
             // they'll show up as NeedsAllocation on the next apply.
+            //
+            // Journal the committed slots before the error propagates. The
+            // Consumers that own them are not in the ledger yet, so without
+            // this record the retry would refuse its own slots as revived
+            // values (#352). Unwritten shards are not in `partial` and stay
+            // unrecorded.
+            let journaled = journal_allocation(state, &failure.partial);
             if !failure.partial.allocated.is_empty() {
                 surface_delivered_credentials(env_config, &failure.partial).await?;
+            }
+            if let Err(journal_error) = journaled {
+                return Err(format!(
+                    "{}; recording the credential slots that were committed also failed: \
+                     {journal_error}",
+                    failure.source
+                )
+                .into());
             }
             return Err(failure.source.into());
         }
     };
+    journal_allocation(state, &outcome)?;
 
     // Re-resolve so `desired` picks up freshly allocated values. The
     // allocator only produces values for slots classified as NeedsAllocation
@@ -2482,11 +2520,6 @@ async fn cmd_apply(
     }
 
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
-    // Populated by both mode arms after their respective gates. State-record
-    // reads this after the match to persist credential metadata.
-    #[allow(unused_assignments)]
-    let mut allocation: Option<secrets::AllocateOutcome> = None;
-    let mut allocation_state_persisted = false;
 
     // Stash partial-failure errors from apply_api so state.record/save runs
     // BEFORE we propagate. In shared ownership this is critical: if some
@@ -2796,13 +2829,21 @@ async fn cmd_apply(
             // All safety gates passed — now allocate credentials. Rotation
             // on an already-allocated slot is a separate explicit operation
             // (`gitforgeops rotate`); apply never re-rotates automatically.
-            allocation = allocate_if_needed(
+            //
+            // The GitHub Environment Secret write is an external commit of
+            // its own. `allocate_if_needed` persists the shard and delivery
+            // metadata of every committed slot before it returns, including
+            // after a partial failure, so neither a later shard nor a gateway
+            // or reporting failure can leave the ledger claiming the slot was
+            // never allocated.
+            let allocation = allocate_if_needed(
                 &mut desired,
                 &env_config,
                 &resolved,
                 &secret_report,
                 &mut per_shard,
                 &mut shard_count,
+                &mut state,
                 resolve_options,
             )
             .await?;
@@ -2823,25 +2864,6 @@ async fn cmd_apply(
                         ),
                     }
                 }
-            }
-
-            // The GitHub Environment Secret write is an external commit of
-            // its own. Persist its shard and delivery metadata immediately so
-            // a later gateway or reporting failure cannot leave the ledger
-            // claiming the slot was never allocated.
-            state.credential_shard_count = shard_count;
-            if let Some(outcome) = &allocation {
-                let run_id = std::env::var("GITHUB_RUN_ID").ok();
-                for slot in &outcome.allocated {
-                    state.record_credential(
-                        &slot.slot,
-                        slot.shard,
-                        slot.delivered.as_ref().map(|d| d.login.as_str()),
-                        run_id.as_deref(),
-                    );
-                }
-                state.save()?;
-                allocation_state_persisted = true;
             }
 
             // Surface the encrypted delivery blob BEFORE apply_api. The
@@ -3011,14 +3033,17 @@ async fn cmd_apply(
             // Now allocate. The in-memory mutation after the disk write is
             // harmless — the file has already been serialized with
             // placeholders intact, and the allocated values go to the
-            // GitHub Env Secret for `materialize` to consume.
-            allocation = allocate_if_needed(
+            // GitHub Env Secret for `materialize` to consume. Committed slots
+            // are journaled before this returns, even when a later shard
+            // fails.
+            let allocation = allocate_if_needed(
                 &mut desired,
                 &env_config,
                 &resolved,
                 &secret_report,
                 &mut per_shard,
                 &mut shard_count,
+                &mut state,
                 resolve_options,
             )
             .await?;
@@ -3085,19 +3110,6 @@ async fn cmd_apply(
         }
     }
     state.credential_shard_count = shard_count;
-    if !allocation_state_persisted {
-        if let Some(outcome) = &allocation {
-            let run_id = std::env::var("GITHUB_RUN_ID").ok();
-            for slot in &outcome.allocated {
-                state.record_credential(
-                    &slot.slot,
-                    slot.shard,
-                    slot.delivered.as_ref().map(|d| d.login.as_str()),
-                    run_id.as_deref(),
-                );
-            }
-        }
-    }
     if let Some(decision) = &override_decision {
         // The verified actual source revision and reviewed PR head are distinct
         // for a merge and for later generated-state-only commits.
