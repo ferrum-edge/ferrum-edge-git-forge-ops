@@ -644,8 +644,9 @@ Rules that reason about plugins go through it rather than hard-coding names.
 `auth_coverage` is the shared auth classification for `require_auth_plugin` and
 the security audit. It keeps only authenticators the paired Edge runs on the
 proxy's protocol (`proxy_transport` from the effective scheme). On TCP/UDP stream
-listeners only `STREAM_AUTH_PLUGIN_NAMES` (`mtls_auth`, `spiffe_identity`, exact
-names) count. Custom and HTTP-only authenticators fail closed. A stream proxy is
+listeners only `STREAM_AUTH_PLUGIN_NAMES` (`mtls_auth`, exact name) count;
+`spiffe_identity` runs there but is extraction-only, so it is reported as
+ignored. Custom and HTTP-only authenticators fail closed. A stream proxy is
 authenticated only if its listener terminates TLS/DTLS (`frontend_tls` without
 `passthrough`). Update that list from Edge's `supported_protocols()` when the
 pinned version changes.

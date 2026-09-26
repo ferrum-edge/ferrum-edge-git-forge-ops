@@ -2391,20 +2391,20 @@ fn require_auth_plugin_assesses_stream_identity_separately() {
 
     // Terminating TLS/DTLS with a stream authenticator qualifies on both
     // transports.
-    for (scheme, name) in [
-        (BackendScheme::Tcp, "mtls_auth"),
-        (BackendScheme::Tcps, "spiffe_identity"),
-        (BackendScheme::Udp, "mtls_auth"),
-        (BackendScheme::Dtls, "spiffe_identity"),
+    for scheme in [
+        BackendScheme::Tcp,
+        BackendScheme::Tcps,
+        BackendScheme::Udp,
+        BackendScheme::Dtls,
     ] {
         let cfg = GatewayConfig {
             proxies: vec![stream_proxy("stream", scheme, true)],
-            plugin_configs: vec![global_plugin("auth-1", name)],
+            plugin_configs: vec![global_plugin("auth-1", "mtls_auth")],
             ..Default::default()
         };
         assert!(
             auth_findings(&cfg, &policies).is_empty(),
-            "{name} on a terminating {scheme:?} listener establishes an identity"
+            "mtls_auth on a terminating {scheme:?} listener establishes an identity"
         );
     }
 
@@ -2424,12 +2424,43 @@ fn require_auth_plugin_assesses_stream_identity_separately() {
     passthrough.passthrough = true;
     let passthrough = GatewayConfig {
         proxies: vec![passthrough],
-        plugin_configs: vec![global_plugin("spiffe-1", "spiffe_identity")],
+        plugin_configs: vec![global_plugin("mtls-1", "mtls_auth")],
         ..Default::default()
     };
     let findings = auth_findings(&passthrough, &policies);
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(findings[0].contains("does not terminate TLS/DTLS"));
+}
+
+#[test]
+fn require_auth_plugin_does_not_count_spiffe_identity_on_stream_listeners() {
+    // spiffe_identity runs on stream listeners but only extracts a SPIFFE ID:
+    // a peer without one is let through, so it authenticates nothing.
+    let policies = require_auth_policies(None);
+
+    for scheme in [BackendScheme::Tcp, BackendScheme::Udp] {
+        let cfg = GatewayConfig {
+            proxies: vec![stream_proxy("stream", scheme, true)],
+            plugin_configs: vec![global_plugin("spiffe-1", "spiffe_identity")],
+            ..Default::default()
+        };
+        let findings = evaluate_policies(&cfg, &policies);
+        assert_eq!(findings.len(), 1, "{scheme:?}: {findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding.rule_id, "require_auth_plugin");
+        assert!(finding.is_blocking());
+        assert!(
+            finding.message.contains("no enabled authentication plugin"),
+            "{finding:?}"
+        );
+        assert!(
+            finding.message.contains("spiffe_identity (spiffe-1)"),
+            "{finding:?}"
+        );
+        let remediation = finding.remediation.as_deref().unwrap_or_default();
+        assert!(remediation.contains("mtls_auth"), "{remediation}");
+        assert!(!remediation.contains("spiffe_identity"), "{remediation}");
+    }
 }
 
 #[test]
@@ -2521,6 +2552,9 @@ fn stream_auth_catalog_matches_the_gateway_protocol_contract() {
     assert_eq!(proxy_transport(&tcp), ProxyTransport::Tcp);
     assert_eq!(proxy_transport(&udp), ProxyTransport::Udp);
 
+    // Pinned to Ferrum Edge v0.9.7: mtls_auth is the only built-in that both
+    // runs on stream listeners and rejects an unauthenticated peer there.
+    assert_eq!(STREAM_AUTH_PLUGIN_NAMES, &["mtls_auth"]);
     for name in STREAM_AUTH_PLUGIN_NAMES {
         assert!(AUTH_PLUGIN_NAMES.contains(name) && is_builtin(name));
     }

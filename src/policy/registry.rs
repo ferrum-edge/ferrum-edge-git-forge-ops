@@ -1,4 +1,5 @@
 use crate::config::GatewayConfig;
+use crate::diagnostics::{sanitize, sanitize_line};
 
 use super::config::PolicyConfig;
 use super::rules::{
@@ -75,7 +76,25 @@ pub fn evaluate_policies(cfg: &GatewayConfig, policy_cfg: &PolicyConfig) -> Vec<
     let registry = build_registry(policy_cfg);
     let mut all = Vec::new();
     for rule in registry {
-        all.extend(rule.evaluate(cfg));
+        all.extend(rule.evaluate(cfg).into_iter().map(sanitize_finding));
     }
     all
+}
+
+/// Sanitize a finding's text once, where it leaves the rules.
+///
+/// Rule messages interpolate repository-authored ids, namespaces and plugin
+/// names, and the CLI and PR comment print them. Sanitizing here rather than
+/// in each rule gives every finding the guarantee `SecurityFinding` has: no
+/// line break into an Actions log and no line beginning with `::`. See
+/// [`crate::diagnostics`].
+fn sanitize_finding(finding: PolicyFinding) -> PolicyFinding {
+    PolicyFinding {
+        kind: sanitize(&finding.kind),
+        id: sanitize(&finding.id),
+        namespace: sanitize(&finding.namespace),
+        message: sanitize_line(&finding.message),
+        remediation: finding.remediation.as_deref().map(sanitize_line),
+        ..finding
+    }
 }

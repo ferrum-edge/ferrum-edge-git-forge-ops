@@ -1,7 +1,7 @@
-use crate::config::schema::{PluginConfig, Proxy};
+use crate::config::schema::Proxy;
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::{
-    auth_coverage, AuthCoverage, AUTH_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
+    auth_coverage, plugin_instance_list, AuthCoverage, AUTH_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
 };
 use crate::policy::config::RequireAuthPluginRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
@@ -53,8 +53,8 @@ fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
             String::new()
         } else {
             format!(
-                "; authenticators that do not run on {transport} listeners were ignored: {}",
-                plugin_list(&coverage.inapplicable)
+                "; authenticators that do not authenticate {transport} connections were ignored: {}",
+                plugin_instance_list(&coverage.inapplicable)
             )
         };
         return (
@@ -71,18 +71,10 @@ fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
     (
         format!(
             "{transport} stream proxy {id} in namespace {ns} carries stream authenticators ({}), but its listener does not terminate TLS/DTLS, so no client certificate reaches them and no identity is established",
-            plugin_list(&coverage.applicable)
+            plugin_instance_list(&coverage.applicable)
         ),
         format!("Configure proxy {id} to {terminate}"),
     )
-}
-
-fn plugin_list(plugins: &[&PluginConfig]) -> String {
-    plugins
-        .iter()
-        .map(|plugin| format!("{} ({})", plugin.plugin_name, plugin.id))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 impl PolicyCheck for RequireAuthPluginRule {

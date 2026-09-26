@@ -452,12 +452,23 @@ fn security_audit_assesses_stream_identity_separately() {
 
     let plaintext = GatewayConfig {
         proxies: vec![stream_proxy("stream", BackendScheme::Udp, false)],
-        plugin_configs: vec![plugin("sid-1", "spiffe_identity", serde_json::json!({}))],
+        plugin_configs: vec![plugin("mtls-1", "mtls_auth", serde_json::json!({}))],
         ..Default::default()
     };
     let msgs = auth_messages(&plaintext);
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     assert!(msgs[0].contains("can establish an identity on UDP stream proxy"));
+    assert!(msgs[0].contains("mtls_auth (mtls-1)"));
+
+    // spiffe_identity only extracts an identity; it never rejects a peer.
+    let extraction_only = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcps, true)],
+        plugin_configs: vec![plugin("sid-1", "spiffe_identity", serde_json::json!({}))],
+        ..Default::default()
+    };
+    let msgs = auth_messages(&extraction_only);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(msgs[0].contains("No auth plugin runs on TCP stream proxy"));
     assert!(msgs[0].contains("spiffe_identity (sid-1)"));
 }
 
@@ -504,8 +515,13 @@ fn skipped_stream_authenticator_triggers_are_not_reported_as_conditional_auth() 
         plugin_configs: vec![auth],
         ..Default::default()
     };
+    // The plugin-level trigger warning still surfaces the instance; only the
+    // proxy-level "authenticated by" claim must not appear.
     let msgs = messages(&cfg);
-    assert!(!msgs.iter().any(|m| m.contains("carries a trigger")), "{msgs:?}");
+    assert!(
+        !msgs.iter().any(|m| m.contains("is authenticated by")),
+        "{msgs:?}"
+    );
     assert_eq!(auth_messages(&cfg).len(), 1);
 }
 

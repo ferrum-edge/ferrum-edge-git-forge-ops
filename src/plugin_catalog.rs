@@ -486,13 +486,15 @@ pub fn proxy_transport(proxy: &Proxy) -> ProxyTransport {
     }
 }
 
-/// Built-in authenticators the paired gateway (v0.9.7) also runs on stream
-/// listeners. These are the only two whose `supported_protocols()` include
-/// `Tcp` and `Udp` (`HTTP_FAMILY_AND_STREAM_PROTOCOLS`); both derive the
-/// caller from the TLS/DTLS client certificate in `on_stream_connect`. Every
+/// Built-in authenticators that authenticate stream connections on the paired
+/// gateway (v0.9.7). `mtls_auth` declares `Tcp` and `Udp` in
+/// `supported_protocols()` and rejects a connection without a verified client
+/// certificate in `on_stream_connect`. `spiffe_identity` also runs on stream
+/// listeners but is extraction-only: it is not an auth plugin and continues
+/// when the peer presents no SPIFFE identity, so it does not count here. Every
 /// other built-in authenticator declares HTTP-family or HTTP-only support
 /// and is skipped on a stream connection.
-pub const STREAM_AUTH_PLUGIN_NAMES: &[&str] = &["spiffe_identity", "mtls_auth"];
+pub const STREAM_AUTH_PLUGIN_NAMES: &[&str] = &["mtls_auth"];
 
 /// Does the gateway run the authenticator `plugin_name` on `proxy`'s listener?
 ///
@@ -510,8 +512,8 @@ pub fn auth_plugin_applies_to_proxy(plugin_name: &str, proxy: &Proxy) -> bool {
 /// Stream authenticators read the client certificate from the TLS or DTLS
 /// handshake, which only exists when the gateway terminates it:
 /// `frontend_tls: true` without `passthrough`. The gateway rejects a stream
-/// `mtls_auth` otherwise; `spiffe_identity` silently derives nothing. Always
-/// `true` for an HTTP-family proxy, where the authenticators read the request.
+/// `mtls_auth` otherwise. Always `true` for an HTTP-family proxy, where the
+/// authenticators read the request.
 pub fn listener_can_establish_identity(proxy: &Proxy) -> bool {
     !proxy_transport(proxy).is_stream() || (proxy.frontend_tls && !proxy.passthrough)
 }
@@ -522,8 +524,10 @@ pub struct AuthCoverage<'a> {
     pub transport: ProxyTransport,
     /// Allowlisted authenticators the gateway runs on this listener.
     pub applicable: Vec<&'a PluginConfig>,
-    /// Allowlisted authenticators effective by scope but skipped on this
-    /// listener because they do not support its protocol.
+    /// Allowlisted authenticators effective by scope that do not
+    /// authenticate this listener's connections: skipped because they do not
+    /// support its protocol, or, like `spiffe_identity`, run without
+    /// rejecting an unidentified peer.
     pub inapplicable: Vec<&'a PluginConfig>,
     /// See [`listener_can_establish_identity`].
     pub listener_establishes_identity: bool,
@@ -555,6 +559,15 @@ pub fn auth_coverage<'a>(
         inapplicable,
         listener_establishes_identity: listener_can_establish_identity(proxy),
     }
+}
+
+/// `name (id), …` for findings that list the plugin instances involved.
+pub fn plugin_instance_list(plugins: &[&PluginConfig]) -> String {
+    plugins
+        .iter()
+        .map(|plugin| format!("{} ({})", plugin.plugin_name, plugin.id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // --- Shared plugin-configuration predicates ---

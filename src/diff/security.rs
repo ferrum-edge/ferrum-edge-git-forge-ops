@@ -5,9 +5,9 @@ use crate::diff::resource_diff::OwnershipScope;
 use crate::plugin_catalog::{
     allows_uninspectable_body, auth_coverage, cfg_array, cfg_bool, cfg_str, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
-    retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive,
-    waf_skips_oversized_body, AuthCoverage, RetiredRemediation, RETIRED_PLUGIN_NAMES,
-    STREAM_AUTH_PLUGIN_NAMES,
+    plugin_instance_list, retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode,
+    waf_mode_is_passive, waf_skips_oversized_body, AuthCoverage, RetiredRemediation,
+    RETIRED_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
 };
 use crate::policy::config::effective_auth_plugin_names;
 use crate::policy::PolicyConfig;
@@ -297,8 +297,8 @@ fn missing_auth_message(
             String::new()
         } else {
             format!(
-                "; authenticators that do not run on {transport} listeners were ignored: {}",
-                plugin_list(&coverage.inapplicable)
+                "; authenticators that do not authenticate {transport} connections were ignored: {}",
+                plugin_instance_list(&coverage.inapplicable)
             )
         };
         return format!(
@@ -309,18 +309,10 @@ fn missing_auth_message(
 
     format!(
         "No auth plugin can establish an identity on {transport} stream proxy {id} in namespace {ns} — its stream authenticators ({}) read the client certificate, but the listener does not terminate TLS/DTLS (frontend_tls: {}, passthrough: {}); set frontend_tls: true without passthrough",
-        plugin_list(&coverage.applicable),
+        plugin_instance_list(&coverage.applicable),
         proxy.frontend_tls,
         proxy.passthrough
     )
-}
-
-fn plugin_list(plugins: &[&PluginConfig]) -> String {
-    plugins
-        .iter()
-        .map(|plugin| format!("{} ({})", plugin.plugin_name, plugin.id))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Association errors must remain visible after assembly derives valid scoped
