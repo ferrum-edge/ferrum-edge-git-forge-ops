@@ -84,6 +84,26 @@ The lists live in `.github/scripts/template_update.py` (`UPSTREAM_MANAGED`,
 `CUSTOMER_OWNED`) and `.github/scripts/tests/test_template_update.py` asserts
 they stay disjoint and that this repository's own tree matches them.
 
+### Links are refused, not followed
+
+The lists are paths, and the tool keeps them true on disk: it reaches every
+file it reads or writes one real directory at a time from the repository root,
+without following a symbolic link. If an upstream-managed file, or any
+directory above it, is a symbolic link or a special file, `detect-baseline`,
+`status`, `plan` and `apply` stop with an error naming it **before anything is
+written**, and the baseline is not advanced. The same applies to
+`.gitforgeops/baseline.json` itself. Replace the link with the real file or
+directory and re-run. A path that does not normalize to somewhere under the
+repository root is refused outright, and an upstream revision that records a
+managed path as a link or a submodule is refused rather than adopted as a
+regular file.
+
+Adopted files are written to a temporary file beside the destination and
+renamed into place, so a file that is a hard link to one elsewhere is replaced
+in your repository and the other copy is left alone. The tool runs on Linux and
+macOS; it refuses to run on a platform that cannot open a file without
+following links.
+
 ## Finding out an update exists
 
 There is no push notification; you pull. Three ways, in decreasing order of
@@ -124,6 +144,13 @@ already edited upstream-managed files it reports the closest commit and how
 many paths differ; confirm that is the revision you copied, then record it
 with `--write --accept-closest`. Commit the result.
 
+In a Git work tree, "your files" are the ones Git itself lists: tracked files
+(including uncommitted edits and deletions) plus untracked files your ignore
+rules do not exclude. A `__pycache__/` or `.DS_Store` left behind by running
+the tools therefore does not spoil an exact match, while a new source file you
+have not committed yet still counts. A tree outside Git has no ignore rules to
+apply, so there every file under an upstream-managed path counts.
+
 ## Adopting one
 
 ```bash
@@ -140,6 +167,11 @@ python3 .github/scripts/template_update.py apply --to v0.2.0
 
 `--to` takes any upstream revision: a release tag, a branch, or a commit SHA.
 Omit it and the ref recorded in your baseline (`main` by default) is used.
+Branch names resolve the same way whether `--upstream` (or the baseline's
+`upstream`) is a URL — the HTTPS default included — or a local clone, so the
+default `main` needs no `origin/` prefix. The tool fetches into a temporary
+copy with background `git gc`/`git maintenance` disabled and removes it when it
+finishes.
 
 `apply` writes only the clean updates. If any conflict remains it prints them,
 **does not advance the baseline**, and exits 1 — a half-adopted update must not

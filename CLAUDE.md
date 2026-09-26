@@ -969,7 +969,18 @@ commit whose managed files match (an inexact match needs `--accept-closest`). `U
 the two fences; `CUSTOMER_OWNED` (`resources/`, `overlays/`,
 `.gitforgeops/config.yaml`, `.gitforgeops/policies.yaml`, `.state/`,
 `assembled/`, `.github/CODEOWNERS`) is applied to upstream's own tree too, so
-upstream shipping a `.state/` file cannot overwrite a live ledger. Secrets and
+upstream shipping a `.state/` file cannot overwrite a live ledger. Every local
+read and write (`read_local`/`write_local`/`remove_local`) walks the path one
+component at a time with `O_NOFOLLOW` relative to the previous directory
+descriptor: a symlink or special file at or above a managed path (or at
+`baseline.json`) fails the run before any write, non-normalized paths are
+refused, upstream entries that are not regular blobs (mode `120000`, gitlinks)
+are refused, and writes go temp-file-plus-rename so a hard-linked destination
+is replaced, not written through. The upstream copy is a bare repository fetched
+with `+refs/heads/*:refs/heads/*` plus tags (so URL upstreams resolve `main`,
+#361) and `gc.auto=0`/`maintenance.auto=false`/`core.fsmonitor=false`.
+`detect-baseline` lists local files with `git ls-files --cached --others
+--exclude-standard`, so ignored runtime files are not local edits (#362). Secrets and
 repository settings are outside Git. `POST_ADOPTION_CHECKS` is printed by
 `apply` and asserted against `docs/template-updates.md` so the tool and the
 runbook cannot disagree. Recovery is `git revert` of the adoption commit —
