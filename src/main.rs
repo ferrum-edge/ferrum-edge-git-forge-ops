@@ -1403,6 +1403,10 @@ async fn cmd_export(
             "`--encrypt-to` requires `--materialize` (encrypting placeholders is pointless)".into(),
         );
     }
+    // Refuse a bad recipient before the bundle, state or any request.
+    if let Some(login) = encrypt_to {
+        secrets::check_recipient_login(login)?;
+    }
     if materialize
         && encrypt_to.is_none()
         && output_path.is_none()
@@ -1445,7 +1449,7 @@ async fn cmd_export(
         refuse_materialize_security_blockers(&gateway_config, &resolved)?;
         let (bundle, _) = load_credential_bundles(&env_config)?;
         let state = StateFile::load(&resolved.name)?;
-        let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env());
+        let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env()?);
         let options = resolve_options.with_consumer_ledger(&ledger);
         let report = secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, options)?;
         let remaining = report.unresolved();
@@ -1832,7 +1836,7 @@ async fn cmd_plan(
     // Loaded before resolution: the ledger is the evidence for the
     // retired-Consumer slot checks apply will refuse on.
     let state = StateFile::load(&resolved.name)?;
-    let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env());
+    let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env()?);
     let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
     reportln!(json_mode, "=== Environment ===");
     reportln!(
@@ -2318,6 +2322,11 @@ async fn cmd_apply(
     if let Some(path) = &credential_handoff {
         secrets::remove_bundle_handoff(path)?;
     }
+    // The credential recipient and allocation revision, resolved once for the
+    // ledger, delivery and the journal. A set-but-blank or malformed
+    // recipient is refused here, before any state, bundle, gateway or GitHub
+    // access, rather than read as "no recipient".
+    let allocation_binding = AllocationBinding::from_env()?;
     let allow_nontransactional_plugin_attach =
         allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
@@ -2464,7 +2473,6 @@ async fn cmd_apply(
     // Only this first resolve consults the ledger. The re-resolve after
     // allocation sees this run's own new values for Consumers the ledger does
     // not record yet, which are not revived slots.
-    let allocation_binding = AllocationBinding::from_env();
     let ledger = consumer_ledger(&resolved, &state, &allocation_binding);
     let initial_options = resolve_options.with_consumer_ledger(&ledger);
     let secret_report = match env_config.gateway_mode {
@@ -3340,7 +3348,7 @@ async fn cmd_review(
         },
     );
     let state = StateFile::load(&resolved.name)?;
-    let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env());
+    let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env()?);
     let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
     let bundle_loaded = credential_bundle_loaded(&env_config);
 
@@ -3882,6 +3890,10 @@ async fn cmd_rotate(
     explicit_env: Option<&str>,
     resolve_options: secrets::ResolveOptions<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse a bad recipient before the bundle, the state lock or any request.
+    if let Some(login) = recipient {
+        secrets::check_recipient_login(login)?;
+    }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     // Validate the whole desired input before reading a bundle or creating a
     // state lock, including invalid identity placeholders in sibling consumers.

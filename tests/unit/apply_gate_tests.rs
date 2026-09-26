@@ -2218,3 +2218,114 @@ fn file_mode_apply_honours_an_environment_declared_namespace_filter() {
     assert!(published.contains("namespace: billing"), "{published}");
     assert!(!published.contains("namespace: ferrum"), "{published}");
 }
+
+/// #392: a `GITFORGEOPS_ACTOR` that is set but blank (what a mistyped workflow
+/// output expression evaluates to) is a configuration error, not "no
+/// recipient". Read as unset, apply would allocate this `alloc=generate` slot,
+/// write it to the Environment Secret and publish it, delivering it to nobody.
+/// A malformed login is refused at the same point.
+#[cfg(unix)]
+#[test]
+fn a_set_but_blank_or_malformed_actor_is_refused_before_any_side_effect() {
+    let repo = Repo::with_consumer(
+        r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    keyauth:
+      - key: "${gh-env-secret:alloc=generate}"
+"#,
+    );
+    for (actor, expected) in [
+        ("", "GITFORGEOPS_ACTOR is set but blank"),
+        ("   ", "GITFORGEOPS_ACTOR is set but blank"),
+        ("alice bob", "not a valid GitHub login"),
+        ("../alice", "not a valid GitHub login"),
+    ] {
+        for args in [vec!["plan"], vec!["apply", "--auto-approve"]] {
+            // Every GitHub request, including the secret-store public key
+            // read that precedes allocation, is trapped on loopback.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let output = repo.run(
+                &args,
+                &[
+                    ("GITFORGEOPS_ACTOR", actor),
+                    ("FERRUM_GH_PROVISIONER_TOKEN", "synthetic-provisioner"),
+                    ("GITHUB_REPOSITORY", "example/repository"),
+                    ("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", "1"),
+                    ("HTTPS_PROXY", &endpoint),
+                    ("HTTP_PROXY", &endpoint),
+                    ("ALL_PROXY", &endpoint),
+                    ("NO_PROXY", ""),
+                ],
+            );
+            let diagnostic = stderr(&output);
+            assert!(
+                !output.status.success(),
+                "{args:?} with actor {actor:?} must fail; stdout={} stderr={diagnostic}",
+                stdout(&output)
+            );
+            assert!(
+                diagnostic.contains(expected),
+                "{args:?} {actor:?}: {diagnostic}"
+            );
+            assert!(!repo.published().exists(), "{args:?} {actor:?}");
+            assert!(
+                !repo.dir.path().join(".state/default.json").exists(),
+                "{args:?} {actor:?}"
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "{args:?} {actor:?}: refusal must precede every GitHub request"
+            );
+        }
+    }
+}
+
+/// #392: `rotate --recipient` and `export --materialize --encrypt-to` refuse a
+/// malformed login before anything else, including loading the repository.
+/// The repository here has no resources directory, so any other first step
+/// would fail with a different error.
+#[test]
+fn rotate_and_export_refuse_a_malformed_recipient_first() {
+    let repo = Repo::with_files(&[]);
+    let output_path = repo.dir.path().join("materialized.yaml");
+    for login in ["", " alice", "alice bob", "../alice", "alice/keys"] {
+        let rotate = repo.run(
+            &[
+                "rotate",
+                "--consumer",
+                "app",
+                "--credential",
+                "keyauth/key",
+                "--recipient",
+                login,
+            ],
+            &[],
+        );
+        let export = repo.run(
+            &[
+                "export",
+                "--materialize",
+                "--output",
+                output_path.to_str().unwrap(),
+                "--encrypt-to",
+                login,
+            ],
+            &[],
+        );
+        for (command, output) in [("rotate", rotate), ("export", export)] {
+            let diagnostic = stderr(&output);
+            assert!(!output.status.success(), "{command} {login:?}");
+            assert!(
+                diagnostic.contains("not a valid GitHub login"),
+                "{command} {login:?}: {diagnostic}"
+            );
+        }
+        assert!(!output_path.exists(), "{login:?}");
+    }
+}

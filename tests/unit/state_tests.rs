@@ -904,7 +904,7 @@ fn allocation_binding_requires_both_values_on_both_sides() {
     let no_recipient = AllocationBinding::new(Some("trigger-sha"), None);
     assert!(!no_recipient.recorded(&entry(Some("trigger-sha"), None)));
     let blank_recipient = AllocationBinding::new(Some("trigger-sha"), Some("  "));
-    assert_eq!(blank_recipient, no_recipient, "blank is unset");
+    assert_eq!(blank_recipient, no_recipient, "new() normalizes a blank value");
     let unbound = AllocationBinding::default();
     assert!(!unbound.recorded(&entry(None, None)));
 }
@@ -914,19 +914,49 @@ fn allocation_binding_requires_both_values_on_both_sides() {
 #[test]
 fn allocation_binding_prefers_the_configured_revision() {
     let head = || Some("checkout-head".to_string());
-    let configured = AllocationBinding::resolve(Some("trigger-sha"), Some("alice"), head);
+    let configured = AllocationBinding::resolve(Some("trigger-sha"), Some("alice"), head).unwrap();
     assert_eq!(configured.revision.as_deref(), Some("trigger-sha"));
     assert_eq!(configured.recipient.as_deref(), Some("alice"));
     for unset in [None, Some(""), Some("   ")] {
-        let fallback = AllocationBinding::resolve(unset, Some("alice"), head);
+        let fallback = AllocationBinding::resolve(unset, Some("alice"), head).unwrap();
         assert_eq!(
             fallback.revision.as_deref(),
             Some("checkout-head"),
             "{unset:?}"
         );
     }
-    let unresolvable = AllocationBinding::resolve(None, Some("alice"), || None);
+    let unresolvable = AllocationBinding::resolve(None, Some("alice"), || None).unwrap();
     assert_eq!(unresolvable.revision, None);
+}
+
+/// #392: only an unset recipient means "no recipient". A set one is trimmed
+/// and must then be a GitHub login. A blank one is what a mistyped workflow
+/// output expression evaluates to; read as unset, apply would allocate and
+/// publish credentials that nobody receives, so it is refused instead.
+#[test]
+fn allocation_binding_refuses_a_set_but_blank_or_malformed_recipient() {
+    let head = || Some("checkout-head".to_string());
+    let unset = AllocationBinding::resolve(Some("trigger-sha"), None, head).unwrap();
+    assert_eq!(unset.recipient, None);
+    let padded = AllocationBinding::resolve(Some("trigger-sha"), Some(" alice\n"), head).unwrap();
+    assert_eq!(padded.recipient.as_deref(), Some("alice"));
+
+    for blank in ["", "   ", "\t\n"] {
+        let error = AllocationBinding::resolve(Some("trigger-sha"), Some(blank), head)
+            .expect_err("a blank recipient is not an unset one");
+        assert!(
+            error.to_string().contains("GITFORGEOPS_ACTOR is set but blank"),
+            "{blank:?}: {error}"
+        );
+    }
+    for malformed in ["alice bob", "../alice", "alice/keys", "-alice"] {
+        let error = AllocationBinding::resolve(Some("trigger-sha"), Some(malformed), head)
+            .expect_err("a set recipient must be a GitHub login");
+        assert!(
+            error.to_string().contains("not a valid GitHub login"),
+            "{malformed:?}: {error}"
+        );
+    }
 }
 
 #[test]

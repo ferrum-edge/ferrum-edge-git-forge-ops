@@ -19,8 +19,8 @@ pub use bundle::{
     CredentialBundle, LoadedBundles,
 };
 pub use delivery::{
-    deliver_to_author, discover_recipient, discover_recipient_at, is_valid_github_login,
-    DeliveryRecipient, DeliveryResult,
+    check_recipient_login, deliver_to_author, discover_recipient, discover_recipient_at,
+    is_valid_github_login, DeliveryRecipient, DeliveryResult,
 };
 pub use github_api::{
     fetch_public_key, fetch_public_key_at, put_environment_secret, put_environment_secret_at,
