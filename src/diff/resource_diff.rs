@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::config::schema::PassthroughFields;
+use crate::config::schema::{Consumer, PassthroughFields, PluginConfig, Upstream};
 use crate::config::GatewayConfig;
 use crate::secrets::plugin_config::ConfigPathComponent;
 use crate::secrets::resolver::{consumer_credential_slot, plugin_config_slot};
@@ -29,11 +29,16 @@ pub fn mask_indeterminate_secret_values(
     if unresolved.is_empty() {
         return;
     }
+
+    let mut desired_consumers: HashMap<(&str, &str), &Consumer> =
+        HashMap::with_capacity(desired.consumers.len());
+    for consumer in &desired.consumers {
+        desired_consumers
+            .entry((consumer.namespace.as_str(), consumer.id.as_str()))
+            .or_insert(consumer);
+    }
     for live in &mut actual.consumers {
-        if let Some(expected) = desired
-            .consumers
-            .iter()
-            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+        if let Some(expected) = desired_consumers.get(&(live.namespace.as_str(), live.id.as_str()))
         {
             for (credential_type, desired_value) in &expected.credentials {
                 if let Some(live_value) = live.credentials.get_mut(credential_type) {
@@ -51,11 +56,16 @@ pub fn mask_indeterminate_secret_values(
         }
     }
 
+    let mut desired_plugin_configs: HashMap<(&str, &str), &PluginConfig> =
+        HashMap::with_capacity(desired.plugin_configs.len());
+    for plugin in &desired.plugin_configs {
+        desired_plugin_configs
+            .entry((plugin.namespace.as_str(), plugin.id.as_str()))
+            .or_insert(plugin);
+    }
     for live in &mut actual.plugin_configs {
-        if let Some(expected) = desired
-            .plugin_configs
-            .iter()
-            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+        if let Some(expected) =
+            desired_plugin_configs.get(&(live.namespace.as_str(), live.id.as_str()))
         {
             mask_unresolved_leaves(
                 &expected.config,
@@ -76,11 +86,15 @@ pub fn mask_indeterminate_secret_values(
     // drift on a credential nobody touched. Only the classified leaves are
     // aligned; `consul.address`, `service_name`, `datacenter` and `tag` stay
     // authoritative.
+    let mut desired_upstreams: HashMap<(&str, &str), &Upstream> =
+        HashMap::with_capacity(desired.upstreams.len());
+    for upstream in &desired.upstreams {
+        desired_upstreams
+            .entry((upstream.namespace.as_str(), upstream.id.as_str()))
+            .or_insert(upstream);
+    }
     for live in &mut actual.upstreams {
-        let Some(expected) = desired
-            .upstreams
-            .iter()
-            .find(|candidate| candidate.namespace == live.namespace && candidate.id == live.id)
+        let Some(expected) = desired_upstreams.get(&(live.namespace.as_str(), live.id.as_str()))
         else {
             continue;
         };
