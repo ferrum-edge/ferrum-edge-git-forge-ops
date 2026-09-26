@@ -55,17 +55,32 @@ ones most closely. A repository created with "Use this template" inherits
 upstream's own `baseline.json`, which names whatever commit last wrote it —
 not the commit the copy was taken from — so a fresh copy should record its
 real baseline once before its first update.
+
+Every file this tool reads or writes in the repository is reached one real
+directory at a time from the repository root, never through a symbolic link:
+a link, or a special file, at a managed path or at any directory above it is
+refused with an error before anything is written, and a path that does not
+normalize to somewhere under the root is refused outright. Adopted files are
+written to a sibling temporary file and renamed into place, so a destination
+that is a link to (or a hard link of) a file elsewhere has its own directory
+entry replaced instead of the other file written through it.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
+import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -126,6 +141,7 @@ POST_ADOPTION_CHECKS = (
     ("cargo fmt --all -- --check", "the engine still formats"),
     ("cargo clippy --all-targets -- -D warnings", "the engine still lints"),
     ("cargo test --test unit_tests", "the engine's own suite"),
+    ("cargo test --lib", "the engine's inline library tests"),
     (
         "python3 .github/scripts/check_supply_chain.py",
         "every Action, container and validator input is still immutably pinned",
@@ -178,6 +194,234 @@ def validate_ref(value: object, field: str) -> str:
     return value
 
 
+# `HEAD`, `FETCH_HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, ... in any case, alone or as
+# the last component (`origin/HEAD`).
+PSEUDO_REF = re.compile(r"(?:[A-Z]+_)*HEAD\Z", re.IGNORECASE)
+
+
+def validate_target_ref(value: object, field: str) -> str:
+    """A valid ref that names a revision, not whatever a copy last pointed at."""
+    ref = validate_ref(value, field)
+    if PSEUDO_REF.fullmatch(ref.rsplit("/", 1)[-1]):
+        raise UpdateError(
+            f"{field} {ref} is ambiguous: HEAD and the other *HEAD pseudo-refs "
+            "move with whichever copy resolves them; provide an explicit branch, "
+            "tag, or SHA"
+        )
+    return ref
+
+
+# -- confined filesystem access ------------------------------------------------
+#
+# The path lists above are lexical. What keeps them true on disk is that every
+# component is opened with O_NOFOLLOW relative to the directory before it, so a
+# link cannot carry a read or a write anywhere the lists do not name.
+
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def require_confinement_support() -> None:
+    """Refuse to run where a path cannot be opened without following links."""
+    supported = (
+        hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and all(
+            call in os.supports_dir_fd
+            for call in (os.open, os.stat, os.mkdir, os.rename, os.unlink, os.readlink)
+        )
+        and os.listdir in os.supports_fd
+        and os.stat in os.supports_follow_symlinks
+        and hasattr(os, "fchmod")
+    )
+    if not supported:
+        raise UpdateError(
+            "this platform cannot open a file without following symbolic links, "
+            "so the template updater cannot keep its reads and writes inside the "
+            "repository; run it on Linux or macOS"
+        )
+
+
+def _components(relative: str) -> list[str]:
+    """The components of a repository-relative path that cannot leave the root."""
+    parts = relative.split("/")
+    if not relative or "\0" in relative or any(
+        part in ("", ".", "..") or part.lower() == ".git" for part in parts
+    ):
+        raise UpdateError(
+            f"refusing {relative!r}: it is not a normalized path inside the repository"
+        )
+    return parts
+
+
+def _kind(mode: int) -> str:
+    if stat.S_ISLNK(mode):
+        return "a symbolic link"
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    if stat.S_ISREG(mode):
+        return "a regular file"
+    return "a special file"
+
+
+def _lstat_at(parent: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _refusal(relative: str, shown: str, what: str) -> UpdateError:
+    return UpdateError(
+        f"refusing {relative}: {shown} is {what}. The template updater reads and "
+        "writes only regular files reached through real directories inside the "
+        "repository; replace the link or special file with the real file or "
+        "directory, then re-run"
+    )
+
+
+@contextlib.contextmanager
+def _parent_directory(
+    root: Path, relative: str, *, create: bool = False, missing_parent: bool = False
+):
+    """The directory holding `relative`, reached without following any link.
+
+    Yields (descriptor, final component), or (None, final component) when a
+    parent directory does not exist and `create` is false. Each component is
+    opened relative to the descriptor of the one before it, so a link swapped
+    in while the path is walked is refused rather than followed.
+    """
+    parts = _components(relative)
+    try:
+        current = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as error:
+        raise UpdateError(
+            f"repository root {root} cannot be opened: {error}"
+        ) from error
+    missing = False
+    try:
+        for index, part in enumerate(parts[:-1]):
+            shown = "/".join(parts[: index + 1])
+            try:
+                child = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    missing = True
+                    break
+                try:
+                    os.mkdir(part, dir_fd=current)
+                    child = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
+                except OSError as error:
+                    raise UpdateError(
+                        f"refusing {relative}: {shown} could not be created as a "
+                        f"directory: {error}"
+                    ) from error
+            except OSError as error:
+                if missing_parent and error.errno == errno.ENOTDIR:
+                    info = _lstat_at(current, part)
+                    if info is not None and stat.S_ISREG(info.st_mode):
+                        missing = True
+                        break
+                info = _lstat_at(current, part)
+                what = "not a directory" if info is None else _kind(info.st_mode)
+                raise _refusal(relative, shown, what) from None
+            os.close(current)
+            current = child
+        yield (None if missing else current), parts[-1]
+    finally:
+        os.close(current)
+
+
+def read_local(
+    root: Path, relative: str, *, missing_parent: bool = False
+) -> bytes | None:
+    """A regular file's bytes, or None when it (or a parent) does not exist."""
+    found = _read_local_file(root, relative, missing_parent=missing_parent)
+    return None if found is None else found[0]
+
+
+def _read_local_file(
+    root: Path, relative: str, *, missing_parent: bool = False
+) -> tuple[bytes, int] | None:
+    """A regular file's bytes and the mode of the very file they were read from."""
+    with _parent_directory(root, relative, missing_parent=missing_parent) as (parent, name):
+        if parent is None:
+            return None
+        try:
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            info = _lstat_at(parent, name)
+            what = "not readable" if info is None else _kind(info.st_mode)
+            raise _refusal(relative, relative, what) from None
+        with os.fdopen(descriptor, "rb") as handle:
+            mode = os.fstat(handle.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                raise _refusal(relative, relative, _kind(mode))
+            return handle.read(), mode
+
+
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def write_local(
+    root: Path, relative: str, content: bytes, executable: bool = False
+) -> None:
+    """Replace a regular file (or create it) without following any link.
+
+    The bytes go to a sibling temporary file that is renamed over the
+    destination, which replaces the destination's own directory entry: a hard
+    link to a file elsewhere is detached from it rather than written through.
+    The new file's mode is the one Git would check out, `0777` or `0666` less
+    the umask; the permission and special bits of the file it replaces are
+    not carried over.
+    """
+    mode = (0o777 if executable else 0o666) & ~_umask()
+    with _parent_directory(root, relative, create=True) as (parent, name):
+        existing = _lstat_at(parent, name)
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise _refusal(relative, relative, _kind(existing.st_mode))
+        temporary = f".{name}.template-update-{secrets.token_hex(8)}"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o666,
+            dir_fd=parent,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                os.fchmod(handle.fileno(), mode)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=parent)
+            raise
+
+
+def remove_local(root: Path, relative: str) -> bool:
+    """Unlink a regular file; False when there was nothing to remove."""
+    with _parent_directory(root, relative) as (parent, name):
+        if parent is None:
+            return False
+        existing = _lstat_at(parent, name)
+        if existing is None:
+            return False
+        if not stat.S_ISREG(existing.st_mode):
+            raise _refusal(relative, relative, _kind(existing.st_mode))
+        os.unlink(name, dir_fd=parent)
+        return True
+
+
 @dataclass
 class Baseline:
     upstream: str
@@ -186,12 +430,12 @@ class Baseline:
 
     @classmethod
     def load(cls, root: Path) -> "Baseline | None":
-        path = root / BASELINE_PATH
-        if not path.is_file():
+        content = read_local(root, BASELINE_PATH.as_posix())
+        if content is None:
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as error:
+            data = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise UpdateError(f"{BASELINE_PATH} is not valid JSON: {error}") from error
         if not isinstance(data, dict):
             raise UpdateError(f"{BASELINE_PATH} must contain a JSON object")
@@ -213,25 +457,26 @@ class Baseline:
         )
 
     def write(self, root: Path) -> None:
-        path = root / BASELINE_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "upstream": self.upstream,
-                    "ref": self.ref,
-                    "commit": self.commit,
-                    "_comment": (
-                        "The upstream revision this repository's upstream-managed "
-                        "files were last synced from. Written by "
-                        ".github/scripts/template_update.py; see "
-                        "docs/template-updates.md."
-                    ),
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+        write_local(
+            root,
+            BASELINE_PATH.as_posix(),
+            (
+                json.dumps(
+                    {
+                        "upstream": self.upstream,
+                        "ref": self.ref,
+                        "commit": self.commit,
+                        "_comment": (
+                            "The upstream revision this repository's upstream-managed "
+                            "files were last synced from. Written by "
+                            ".github/scripts/template_update.py; see "
+                            "docs/template-updates.md."
+                        ),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            ).encode("utf-8"),
         )
 
 
@@ -250,11 +495,38 @@ class Change:
     detail: str
 
 
+@dataclass(frozen=True)
+class TreeEntry:
+    """One `git ls-tree` row: the mode says whether the blob is a file or a link."""
+
+    mode: str
+    kind: str
+    object_id: str
+
+    @property
+    def regular(self) -> bool:
+        return self.kind == "blob" and self.mode in ("100644", "100755")
+
+    @property
+    def executable(self) -> bool:
+        return self.mode == "100755"
+
+    def describe(self) -> str:
+        if self.mode == "120000":
+            return "a symbolic link"
+        if self.kind == "commit":
+            return "a submodule"
+        return f"a {self.kind} with mode {self.mode}"
+
+
 @dataclass
 class Plan:
     baseline: Baseline
     target: str
     changes: list[Change] = field(default_factory=list)
+    # The target revision's managed entries, so `apply` writes exactly the blob
+    # and mode the plan was computed from.
+    target_tree: dict[str, TreeEntry] = field(default_factory=dict)
 
     @property
     def adoptable(self) -> list[Change]:
@@ -284,20 +556,66 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return result.stdout
 
 
-def _blob(repo: Path, rev: str, path: str) -> bytes | None:
-    """File content at a revision, or None when the path does not exist there."""
+def _c_locale() -> dict[str, str]:
+    """The environment with Git's messages in English, so they can be matched."""
+    return {**os.environ, "LC_ALL": "C"}
+
+
+def _object(mirror: Path, object_id: str) -> bytes:
     result = subprocess.run(
-        ["git", "show", f"{rev}:{path}"],
-        cwd=str(repo),
+        ["git", "cat-file", "blob", object_id],
+        cwd=str(mirror),
         check=False,
         capture_output=True,
     )
-    return result.stdout if result.returncode == 0 else None
+    if result.returncode != 0:
+        raise UpdateError(
+            f"upstream blob {object_id} could not be read: "
+            f"{result.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return result.stdout
 
 
-def _tracked(repo: Path, rev: str, prefix: str) -> list[str]:
-    listing = _git(repo, "ls-tree", "-r", "--name-only", rev, "--", prefix, check=False)
-    return [line for line in listing.splitlines() if line]
+def _local_state(
+    root: Path, relative: str, *, missing_parent: bool = False
+) -> tuple[bytes, bool] | None:
+    """A local file's bytes and, as Git records it, whether it is executable."""
+    found = _read_local_file(root, relative, missing_parent=missing_parent)
+    if found is None:
+        return None
+    content, mode = found
+    return content, bool(mode & stat.S_IXUSR)
+
+
+def _honours_file_mode(root: Path) -> bool:
+    """False when the customer repository sets `core.fileMode=false`.
+
+    Git then ignores the executable bit in the work tree, so neither does the
+    comparison: a checkout on a filesystem without one is not a local edit.
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "config",
+            "--type=bool",
+            "--get",
+            "core.fileMode",
+        ],
+        cwd=str(root),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_c_locale(),
+    )
+    if result.returncode == 1:
+        return True
+    if result.returncode != 0:
+        raise UpdateError(
+            f"git config core.fileMode failed in {root}: {result.stderr.strip()}"
+        )
+    return result.stdout.strip() != "false"
 
 
 def is_customer_owned(path: str) -> bool:
@@ -306,15 +624,26 @@ def is_customer_owned(path: str) -> bool:
     ) or path in GENERATED
 
 
-def upstream_paths(mirror: Path, revisions: tuple[str, ...]) -> list[str]:
-    """Every upstream-managed path present at any of the revisions."""
-    found: set[str] = set()
-    for rev in revisions:
-        for prefix in UPSTREAM_MANAGED:
-            found.update(_tracked(mirror, rev, prefix))
-    # The fence, applied to upstream's own tree: whatever upstream ships under
-    # a customer-owned path is not ours to copy.
-    return sorted(path for path in found if not is_customer_owned(path))
+def is_upstream_managed(path: str) -> bool:
+    """Inside the upstream-managed fence and outside the customer-owned one."""
+    return any(
+        path == managed or path.startswith(f"{managed}/")
+        for managed in UPSTREAM_MANAGED
+    ) and not is_customer_owned(path)
+
+
+def _tree_entries(mirror: Path, rev: str) -> dict[str, TreeEntry]:
+    """Every upstream-managed entry at a revision, with its mode."""
+    listing = _git(mirror, "ls-tree", "-r", "-z", rev, "--", *UPSTREAM_MANAGED)
+    entries: dict[str, TreeEntry] = {}
+    for record in listing.split("\0"):
+        meta, _, path = record.partition("\t")
+        parts = meta.split()
+        # The fence, applied to upstream's own tree: whatever upstream ships
+        # under a customer-owned path is not ours to copy.
+        if len(parts) == 3 and path and is_upstream_managed(path):
+            entries[path] = TreeEntry(*parts)
+    return entries
 
 
 def build_plan(
@@ -323,34 +652,60 @@ def build_plan(
     baseline: Baseline,
     target: str,
     keep: tuple[str, ...] = (),
+    *,
+    file_mode: bool = True,
 ) -> Plan:
-    plan = Plan(baseline=baseline, target=target)
-    for path in upstream_paths(mirror, (baseline.commit, target)):
-        before = _blob(mirror, baseline.commit, path)
-        after = _blob(mirror, target, path)
-        local_path = root / path
-        local = local_path.read_bytes() if local_path.is_file() else None
+    """Classify every upstream-managed path between the baseline and `target`.
 
-        if before == after:
+    Like Git, only a file's executable bit takes part in the comparison, and
+    not even that when `file_mode` is false (`core.fileMode=false`).
+    """
+    before_tree = _tree_entries(mirror, baseline.commit)
+    after_tree = _tree_entries(mirror, target)
+    removed_files = set(before_tree) - set(after_tree)
+    plan = Plan(baseline=baseline, target=target, target_tree=after_tree)
+    for path in sorted(set(before_tree) | set(after_tree)):
+        contents: list[bytes | None] = []
+        for tree, rev in ((before_tree, baseline.commit), (after_tree, target)):
+            entry = tree.get(path)
+            if entry is not None and not entry.regular:
+                raise UpdateError(
+                    f"upstream records {path} as {entry.describe()} at {rev}; the "
+                    "template updater adopts only regular files, so this path has "
+                    "to be reviewed and adopted by hand"
+                )
+            contents.append(None if entry is None else _object(mirror, entry.object_id))
+        before, after = contents
+        local_state = _local_state(
+            root,
+            path,
+            missing_parent=any(path.startswith(f"{removed}/") for removed in removed_files),
+        )
+        local = None if local_state is None else local_state[0]
+        local_executable = False if local_state is None else local_state[1]
+        before_executable = before_tree.get(path) is not None and before_tree[path].executable
+        after_executable = after_tree.get(path) is not None and after_tree[path].executable
+
+        def matches(content: bytes | None, executable: bool) -> bool:
+            return local == content and (not file_mode or local_executable == executable)
+
+        if before == after and before_executable == after_executable:
+            edited = not matches(before, before_executable)
             plan.changes.append(
                 Change(
                     path,
-                    LOCAL_ONLY if local != before else UNCHANGED,
+                    LOCAL_ONLY if edited else UNCHANGED,
                     "upstream did not change this file"
-                    + (
-                        "; your local edit is preserved"
-                        if local != before
-                        else ""
-                    ),
+                    + ("; your local edit is preserved" if edited else ""),
                 )
             )
             continue
-        if local == after:
+        if matches(after, after_executable):
             plan.changes.append(
                 Change(path, ALREADY, "already matches the target revision")
             )
             continue
-        if local == before:
+        if matches(before, before_executable):
             plan.changes.append(
                 Change(
                     path,
@@ -378,6 +733,42 @@ def build_plan(
             )
         )
 
+    # Upstream replaced a file with a directory. Nothing can be written under
+    # that path while the file's removal is itself a conflict or kept by
+    # --keep, so the new files there wait for the same decision instead of
+    # stopping `apply` half-way through.
+    actions = {change.path: change.action for change in plan.changes}
+    for change in plan.changes:
+        if change.action != ADOPT or change.path not in after_tree:
+            continue
+        blocking = [
+            removed
+            for removed in sorted(removed_files)
+            if change.path.startswith(f"{removed}/") and actions[removed] in (CONFLICT, KEPT)
+        ]
+        if not blocking:
+            continue
+        parent = blocking[0]
+        if change.path in keep:
+            change.action = KEPT
+            change.detail = (
+                f"upstream adds it under {parent}, which stays a file here; not "
+                "adopted, kept by --keep"
+            )
+        elif actions[parent] == KEPT:
+            change.action = CONFLICT
+            change.detail = (
+                f"upstream adds it under {parent}, which upstream made a directory "
+                "but --keep keeps as a file here; adopt the removal of "
+                f"{parent} instead, or name this path with --keep as well"
+            )
+        else:
+            change.action = CONFLICT
+            change.detail = (
+                f"upstream adds it under {parent}, which upstream made a directory "
+                f"but which is in conflict here; resolve {parent} first"
+            )
+
     # A `--keep` that matches no conflict is a typo or a stale decision. Either
     # way, silently ignoring it would let an operator believe they had resolved
     # something they had not.
@@ -399,32 +790,122 @@ def _blob_hash(content: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
 
 
-def _local_managed_hashes(root: Path) -> dict[str, str]:
-    hashes: dict[str, str] = {}
-    for prefix in UPSTREAM_MANAGED:
-        base = root / prefix
-        candidates = [base] if base.is_file() else (
-            sorted(item for item in base.rglob("*") if item.is_file())
-            if base.is_dir()
-            else []
-        )
-        for candidate in candidates:
-            relative = candidate.relative_to(root).as_posix()
-            if is_customer_owned(relative):
+def _walk_local(root: Path) -> list[str]:
+    """Every entry under the upstream-managed paths, walked without following links."""
+    found: list[str] = []
+    pending = list(UPSTREAM_MANAGED)
+    while pending:
+        relative = pending.pop()
+        with _parent_directory(root, relative) as (parent, name):
+            info = None if parent is None else _lstat_at(parent, name)
+            if info is None:
                 continue
-            hashes[relative] = _blob_hash(candidate.read_bytes())
+            if not stat.S_ISDIR(info.st_mode):
+                # A link or special file is refused when it is read.
+                found.append(relative)
+                continue
+            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent)
+            try:
+                names = os.listdir(descriptor)
+            finally:
+                os.close(descriptor)
+            # A nested clone's own `.git` is not part of this tree.
+            pending.extend(
+                f"{relative}/{child}" for child in names if child.lower() != ".git"
+            )
+    return found
+
+
+def _local_paths(root: Path) -> list[str]:
+    """Upstream-managed paths in this tree that Git would not ignore.
+
+    A Git work tree is listed by Git itself — tracked files plus untracked ones
+    its ignore rules do not exclude — so a `__pycache__/` or `.DS_Store` left by
+    running the tools is not mistaken for a local edit (#362), while a
+    genuinely added source file still is. A tree outside Git has no ignore
+    rules to apply, so every file counts.
+    """
+    inside = subprocess.run(
+        ["git", "-c", "core.fsmonitor=false", "rev-parse", "--is-inside-work-tree"],
+        cwd=str(root),
+        check=False,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        env=_c_locale(),
+    )
+    if inside.returncode != 0:
+        error = inside.stderr.strip()
+        if "not a git repository" in error.lower():
+            return _walk_local(root)
+        raise UpdateError(f"git rev-parse failed in {root}: {error or 'unknown error'}")
+    answer = inside.stdout.strip()
+    if answer != "true":
+        raise UpdateError(
+            f"git rev-parse in {root} did not identify a Git work tree: {answer!r}"
+        )
+    listing = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            *UPSTREAM_MANAGED,
+        ],
+        cwd=str(root),
+        check=False,
+        capture_output=True,
+        env=_c_locale(),
+    )
+    if listing.returncode != 0:
+        raise UpdateError(
+            f"git ls-files failed in {root}: "
+            f"{listing.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return sorted({os.fsdecode(path) for path in listing.stdout.split(b"\0") if path})
+
+
+def _local_managed_hashes(root: Path) -> dict[str, tuple[str, str]]:
+    hashes: dict[str, tuple[str, str]] = {}
+    for relative in _local_paths(root):
+        if not is_upstream_managed(relative):
+            continue
+        if relative.endswith("/"):
+            # Git lists a nested repository as its directory and does not look
+            # inside it. It is still something upstream never shipped there.
+            hashes[relative.rstrip("/")] = ("repository", "")
+            continue
+        with _parent_directory(root, relative) as (parent, name):
+            if parent is None:
+                continue
+            info = _lstat_at(parent, name)
+            if info is None:
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                target = os.fsencode(os.readlink(name, dir_fd=parent))
+                hashes[relative] = ("120000", _blob_hash(target))
+            elif stat.S_ISREG(info.st_mode):
+                content = read_local(root, relative)
+                if content is not None:
+                    hashes[relative] = ("file", _blob_hash(content))
+            else:
+                raise _refusal(relative, relative, _kind(info.st_mode))
     return hashes
 
 
-def _tree_hashes(mirror: Path, rev: str) -> dict[str, str]:
-    listing = _git(mirror, "ls-tree", "-r", rev, "--", *UPSTREAM_MANAGED, check=False)
-    hashes: dict[str, str] = {}
-    for line in listing.splitlines():
-        meta, _, path = line.partition("\t")
-        parts = meta.split()
-        if len(parts) == 3 and parts[1] == "blob" and not is_customer_owned(path):
-            hashes[path] = parts[2]
-    return hashes
+def _tree_hashes(mirror: Path, rev: str) -> dict[str, tuple[str, str]]:
+    # A link's blob holds its target, so the mode takes part in the comparison
+    # or a regular file containing that text would match it.
+    return {
+        path: ("file" if entry.regular else entry.mode, entry.object_id)
+        for path, entry in _tree_entries(mirror, rev).items()
+        if entry.kind == "blob"
+    }
 
 
 def detect_baseline(
@@ -459,25 +940,41 @@ def detect_baseline(
     return best[0], best[1], len(revisions)
 
 
+# Written into the throwaway upstream copy before its first fetch. A fetch
+# otherwise starts `git maintenance run --auto` (or `gc --auto`) detached, which
+# can still be writing `objects/` while the temporary directory is removed.
+# Nothing may outlive the git command that started it.
+MIRROR_CONFIG = (
+    ("gc.auto", "0"),
+    ("maintenance.auto", "false"),
+    ("core.fsmonitor", "false"),
+    ("fetch.fsckObjects", "true"),
+)
+
+
 def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
-    """A local clone of upstream with the revisions this run needs.
+    """A local bare copy of upstream with the revisions this run needs.
 
     Accepts a path as readily as a URL so the procedure can be rehearsed, and
-    tested, entirely offline.
+    tested, entirely offline. Both take the same fetch, and it maps upstream's
+    branches to `refs/heads/` and its tags to `refs/tags/`, so `main`, a tag
+    and a full commit ID resolve the same way whichever form upstream was given
+    in (#361). `origin/<branch>` keeps resolving too.
     """
     mirror = workdir / "upstream"
     source = Path(upstream)
-    if source.is_dir():
-        _git(
-            workdir, "clone", "--quiet", "--no-local", "--", str(source), str(mirror)
-        )
-    else:
-        mirror.mkdir(parents=True)
-        _git(mirror, "init", "--quiet")
-        _git(mirror, "remote", "add", "origin", "--", upstream)
-        _git(mirror, "fetch", "--quiet", "--tags", "origin")
+    # The fetch runs inside the mirror, so a relative directory is anchored to
+    # where the operator named it first.
+    location = str(source.resolve()) if source.is_dir() else upstream
+    _git(workdir, "init", "--quiet", "--bare", str(mirror))
+    for key, value in MIRROR_CONFIG:
+        _git(mirror, "config", key, value)
+    _git(mirror, "remote", "add", "origin", "--", location)
+    _git(mirror, "config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/heads/*")
+    _git(mirror, "fetch", "--quiet", "--tags", "origin")
     for ref in refs:
         # Fail here, with the ref named, rather than deep inside a comparison.
+        # A commit no branch or tag reaches can still be fetched by its ID.
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
             _git(mirror, "fetch", "--quiet", "origin", "--", ref, check=False)
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
@@ -494,21 +991,86 @@ def resolve(mirror: Path, ref: str) -> str:
     return resolved
 
 
+# The name `write_local` gives its temporary file, and how old one has to be
+# before no run can still be writing it.
+TEMPORARY_NAME = re.compile(r"\..+\.template-update-[0-9a-f]{16}")
+STALE_TEMPORARY_SECONDS = 10 * 60
+
+
+def _remove_stale_temporaries(root: Path, *, remove: bool) -> None:
+    """Deal with sibling files an interrupted atomic write left behind.
+
+    Only a command that writes (`apply`, `detect-baseline --write`) removes
+    one, and only once it is old enough that no other run can still own it;
+    otherwise it is reported and left in place. Nothing but a regular file
+    with exactly the name `write_local` gives is ever touched.
+    """
+    now = time.time()
+    minutes = STALE_TEMPORARY_SECONDS // 60
+    pending = list(UPSTREAM_MANAGED)
+    while pending:
+        relative = pending.pop()
+        with _parent_directory(root, relative) as (parent, name):
+            info = None if parent is None else _lstat_at(parent, name)
+            if info is None or not stat.S_ISDIR(info.st_mode):
+                continue
+            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent)
+            try:
+                for child in os.listdir(descriptor):
+                    # A nested clone's own `.git` is not part of this tree.
+                    if child.lower() == ".git":
+                        continue
+                    child_info = _lstat_at(descriptor, child)
+                    if child_info is None:
+                        continue
+                    if stat.S_ISDIR(child_info.st_mode):
+                        pending.append(f"{relative}/{child}")
+                        continue
+                    if not stat.S_ISREG(child_info.st_mode):
+                        continue
+                    if TEMPORARY_NAME.fullmatch(child) is None:
+                        continue
+                    shown = f"{relative}/{child}"
+                    stale = now - child_info.st_mtime >= STALE_TEMPORARY_SECONDS
+                    if remove and stale:
+                        os.unlink(child, dir_fd=descriptor)
+                        print(
+                            f"removed {shown}, left by an interrupted template update",
+                            file=sys.stderr,
+                        )
+                    elif remove:
+                        print(
+                            f"left {shown} in place: it is less than {minutes} "
+                            "minutes old, so another template update may still be "
+                            "writing it",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"found {shown}, apparently left by an interrupted "
+                            "template update; `apply` or `detect-baseline --write` "
+                            f"removes it once it is {minutes} minutes old",
+                            file=sys.stderr,
+                        )
+            finally:
+                os.close(descriptor)
+
+
 def identify(root: Path) -> dict:
     """Everything needed to say which versions this repository is running."""
     baseline = Baseline.load(root)
-    validator = root / ".github/ferrum-edge-checksums.txt"
+    validator = read_local(root, ".github/ferrum-edge-checksums.txt")
     pins = []
-    if validator.is_file():
+    if validator is not None:
         pins = [
             line.split()[0]
-            for line in validator.read_text(encoding="utf-8").splitlines()
+            for line in validator.decode("utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#") and line.split()
         ]
-    cargo = root / "Cargo.toml"
+    cargo = read_local(root, "Cargo.toml")
     version = None
-    if cargo.is_file():
-        for line in cargo.read_text(encoding="utf-8").splitlines():
+    if cargo is not None:
+        for line in cargo.decode("utf-8").splitlines():
             if line.startswith("version") and "=" in line:
                 version = line.split("=", 1)[1].strip().strip('"')
                 break
@@ -574,22 +1136,18 @@ def render_plan(plan: Plan) -> str:
 def apply_plan(root: Path, mirror: Path, plan: Plan) -> list[str]:
     written: list[str] = []
     for change in plan.adoptable:
-        destination = root / change.path
-        content = _blob(mirror, plan.target, change.path)
-        if content is None:
-            if destination.is_file():
-                destination.unlink()
+        # The plan only ever names managed paths; a write outside the fence
+        # would be a bug, and it is refused as one rather than carried out.
+        if not is_upstream_managed(change.path):
+            raise UpdateError(f"refusing {change.path}: it is not upstream-managed")
+        entry = plan.target_tree.get(change.path)
+        if entry is None:
+            if remove_local(root, change.path):
                 written.append(f"removed {change.path}")
             continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(content)
-        # `git show` drops the mode; carry the executable bit across so a
-        # helper script does not arrive un-runnable.
-        mode = _git(
-            mirror, "ls-tree", plan.target, "--", change.path, check=False
-        ).split()
-        if mode and mode[0].endswith("755"):
-            destination.chmod(destination.stat().st_mode | 0o111)
+        write_local(
+            root, change.path, _object(mirror, entry.object_id), entry.executable
+        )
         written.append(change.path)
     return written
 
@@ -634,6 +1192,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.repo_root)
 
     try:
+        require_confinement_support()
         if args.command == "identify":
             print(json.dumps(identify(root), indent=2))
             return 0
@@ -641,7 +1200,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "detect-baseline":
             recorded = Baseline.load(root)
             upstream = args.upstream or (recorded.upstream if recorded else DEFAULT_UPSTREAM)
-            ref = args.to or (recorded.ref if recorded else DEFAULT_REF)
+            if upstream.startswith("-"):
+                raise UpdateError("upstream must be a path or URL, not a Git option")
+            ref = validate_target_ref(
+                args.to or (recorded.ref if recorded else DEFAULT_REF), "target ref"
+            )
+            _remove_stale_temporaries(root, remove=args.write)
             with tempfile.TemporaryDirectory() as temporary:
                 mirror = prepare_mirror(upstream, (ref,), Path(temporary))
                 commit, differing, examined = detect_baseline(root, mirror, ref)
@@ -686,14 +1250,19 @@ def main(argv: list[str] | None = None) -> int:
         upstream = args.upstream or baseline.upstream or DEFAULT_UPSTREAM
         if upstream.startswith("-"):
             raise UpdateError("upstream must be a path or URL, not a Git option")
-        target_ref = args.to or baseline.ref or DEFAULT_REF
-        target_ref = validate_ref(target_ref, "target ref")
+        target_ref = validate_target_ref(
+            args.to or baseline.ref or DEFAULT_REF, "target ref"
+        )
+        _remove_stale_temporaries(root, remove=args.command == "apply")
+        file_mode = _honours_file_mode(root)
 
         with tempfile.TemporaryDirectory() as temporary:
             workdir = Path(temporary)
             mirror = prepare_mirror(upstream, (baseline.commit, target_ref), workdir)
             target = resolve(mirror, target_ref)
-            plan = build_plan(root, mirror, baseline, target, tuple(args.keep))
+            plan = build_plan(
+                root, mirror, baseline, target, tuple(args.keep), file_mode=file_mode
+            )
 
             if args.command in ("status", "plan"):
                 if args.format == "json":
@@ -737,6 +1306,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {command}\n      # {why}")
             return 0
     except UpdateError as error:
+        print(f"template update failed: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        # A path that changed underneath a confined walk lands here rather
+        # than being followed.
         print(f"template update failed: {error}", file=sys.stderr)
         return 1
 

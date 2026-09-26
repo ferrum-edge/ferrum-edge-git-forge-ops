@@ -84,6 +84,39 @@ The lists live in `.github/scripts/template_update.py` (`UPSTREAM_MANAGED`,
 `CUSTOMER_OWNED`) and `.github/scripts/tests/test_template_update.py` asserts
 they stay disjoint and that this repository's own tree matches them.
 
+### Links are refused, not followed
+
+The lists are paths, and the tool keeps them true on disk: it reaches every
+file it reads or writes one real directory at a time from the repository root,
+without following a symbolic link. If an upstream-managed file, or any
+directory above it, is a symbolic link or a special file, `detect-baseline`,
+`status`, `plan` and `apply` stop with an error naming it **before anything is
+written**, and the baseline is not advanced. The same applies to
+`.gitforgeops/baseline.json` itself. Replace the link with the real file or
+directory and re-run. A path that does not normalize to somewhere under the
+repository root is refused outright, and an upstream revision that records a
+managed path as a link or a submodule is refused rather than adopted as a
+regular file.
+
+Adopted files are written to a temporary file beside the destination and
+renamed into place, so a file that is a hard link to one elsewhere is replaced
+in your repository and the other copy is left alone. The tool runs on Linux and
+macOS; it refuses to run on a platform that cannot open a file without
+following links.
+
+An interrupted `apply` can leave such a temporary file behind, named
+`.<file>.template-update-<16 hex digits>`. Only `apply` and
+`detect-baseline --write` remove one, and only once it is at least ten minutes
+old, since a younger one may belong to an update that is still running; every
+other command, and a younger file, is reported on stderr and left in place.
+Nothing but a regular file with exactly that name is ever removed, and a
+nested clone's `.git` directory is never looked into.
+
+An adopted file gets the mode Git would check it out with: executable or not
+as upstream records it, less your umask. As in Git, only the owner's execute
+bit counts when a local file is compared, and not even that when your
+repository sets `core.fileMode=false`.
+
 ## Finding out an update exists
 
 There is no push notification; you pull. Three ways, in decreasing order of
@@ -106,6 +139,10 @@ how much attention they need from you:
 `plan` exits 1 when a conflict exists, so it is the one to wire into a job if
 you want a red signal.
 
+`plan` and `apply` compare only paths present in either the recorded upstream
+baseline tree or the selected target tree. Files added locally at paths absent
+from both trees are not part of that update comparison.
+
 ## Before your first update: record your real baseline
 
 "Use this template" copies upstream's own `.gitforgeops/baseline.json`, and
@@ -124,6 +161,13 @@ already edited upstream-managed files it reports the closest commit and how
 many paths differ; confirm that is the revision you copied, then record it
 with `--write --accept-closest`. Commit the result.
 
+In a Git work tree, "your files" are the ones Git itself lists: tracked files
+(including uncommitted edits and deletions) plus untracked files your ignore
+rules do not exclude. A `__pycache__/` or `.DS_Store` left behind by running
+the tools therefore does not spoil an exact match, while a new source file you
+have not committed yet still counts. A tree outside Git has no ignore rules to
+apply, so there every file under an upstream-managed path counts.
+
 ## Adopting one
 
 ```bash
@@ -140,6 +184,14 @@ python3 .github/scripts/template_update.py apply --to v0.2.0
 
 `--to` takes any upstream revision: a release tag, a branch, or a commit SHA.
 Omit it and the ref recorded in your baseline (`main` by default) is used.
+`HEAD` and the other `*HEAD` pseudo-refs (`FETCH_HEAD`, `ORIG_HEAD`,
+`origin/HEAD`, ...) are refused, whether given with `--to` or recorded in the
+baseline: they name whatever a copy last pointed at, not a revision.
+Branch names resolve the same way whether `--upstream` (or the baseline's
+`upstream`) is a URL — the HTTPS default included — or a local clone, so the
+default `main` needs no `origin/` prefix. The tool fetches into a temporary
+copy with background `git gc`/`git maintenance` disabled and removes it when it
+finishes.
 
 `apply` writes only the clean updates. If any conflict remains it prints them,
 **does not advance the baseline**, and exits 1 — a half-adopted update must not
@@ -154,6 +206,11 @@ be recorded as a completed one. Resolve each conflicting file deliberately:
 accepts a path that is actually in conflict for this update — a typo or a
 decision left over from an older update is refused rather than read as
 "resolved". Then commit, and re-run `apply` to record the baseline.
+
+When upstream turns a file into a directory, the new files under it are only
+adopted together with the file's removal. While that file is in conflict they
+are reported as conflicts too; if you keep the file with `--keep`, name each
+of them with `--keep` as well (or adopt the removal instead).
 
 ### Review it like the code change it is
 
@@ -173,6 +230,7 @@ controls, not your intent.
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --test unit_tests
+cargo test --lib
 python3 .github/scripts/check_supply_chain.py
 python3 -m unittest discover -s .github/scripts/tests
 gitforgeops validate

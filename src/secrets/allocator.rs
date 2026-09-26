@@ -9,7 +9,7 @@ use crate::config::GatewayMode;
 use super::bundle::{
     merge_bundles, reserve_shard, serialize_bundle, shard_secret_name, CredentialBundle,
 };
-use super::delivery::{deliver_to_author, DeliveryResult};
+use super::delivery::{discover_recipient_at, DeliveryResult};
 use super::github_api::{fetch_public_key_at, put_environment_secret_at, DEFAULT_GITHUB_API_BASE};
 use super::placeholder::PlaceholderAlloc;
 use super::resolver::{
@@ -221,32 +221,33 @@ pub async fn allocate_and_deliver_at(
         });
     }
 
-    for candidate in &mut planned {
-        // Encrypt delivery BEFORE any GitHub write. If recipient has no
-        // compatible SSH key, we abort phase 1 — nothing has been
-        // committed yet, so shards/outcome stay empty and the next run can
-        // retry once keys are fixed.
-        candidate.delivered = if let Some(login) = pr_author {
-            match deliver_to_author(client, login, candidate.value.as_bytes())
-                .await
-                .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?
-            {
-                Some(d) => Some(d),
-                None => {
-                    return Err(AllocationFailure::with_partial(
-                        crate::error::Error::Config(format!(
-                            "Refusing to allocate credential slot '{}': recipient @{} has no compatible SSH public key on GitHub. \
-                             Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys, then retry. \
-                             To allocate without delivery, unset the recipient (no GITFORGEOPS_ACTOR).",
-                            candidate.slot, login
-                        )),
-                        outcome.clone(),
-                    ));
-                }
-            }
-        } else {
-            None
+    // Discover the recipient's SSH key once for the whole batch, then encrypt
+    // every delivery locally. Key discovery is an unauthenticated GitHub
+    // request walk; repeating it per slot spends the anonymous rate limit on
+    // identical answers. All of this happens BEFORE any GitHub write: if the
+    // recipient has no compatible SSH key or discovery fails, phase 1 aborts
+    // with nothing committed, and the next run can retry once keys are fixed.
+    if let Some(login) = pr_author {
+        let Some(recipient) = discover_recipient_at(client, api_base, login)
+            .await
+            .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?
+        else {
+            let slots = planned.len();
+            return Err(AllocationFailure::with_partial(
+                crate::error::Error::Config(format!(
+                    "Refusing to allocate {slots} credential slot(s): recipient @{login} has no compatible SSH public key on GitHub. \
+                     Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys, then retry. \
+                     To allocate without delivery, unset the recipient (no GITFORGEOPS_ACTOR)."
+                )),
+                outcome.clone(),
+            ));
         };
+        for candidate in &mut planned {
+            let delivered = recipient
+                .encrypt(candidate.value.as_bytes())
+                .map_err(|source| AllocationFailure::with_partial(source, outcome.clone()))?;
+            candidate.delivered = Some(delivered);
+        }
     }
 
     // Group by target shard so we PUT each shard at most once.
@@ -318,8 +319,8 @@ pub async fn allocate_and_deliver_at(
 /// the invoking user.
 ///
 /// Ordering matters: encrypt the delivery ciphertext **before** PUT, and fail
-/// closed when the caller requested a recipient but `deliver_to_author`
-/// returns `None` (recipient has no compatible SSH key). This keeps rotation
+/// closed when the caller requested a recipient but key discovery finds no
+/// compatible SSH key. This keeps rotation
 /// atomic from the operator's perspective: the GitHub secret is changed only
 /// after the new value has a deliverable ciphertext.
 #[allow(clippy::too_many_arguments)]
@@ -393,11 +394,15 @@ pub async fn rotate_and_deliver_at(
     // once the recipient fixes their keys. Mirrors the same invariant
     // allocate_and_deliver already enforces.
     let delivered = if let Some(login) = recipient_login {
-        match deliver_to_author(client, login, value.as_bytes())
+        match discover_recipient_at(client, api_base, login)
             .await
             .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?
         {
-            Some(d) => Some(d),
+            Some(recipient) => Some(
+                recipient
+                    .encrypt(value.as_bytes())
+                    .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?,
+            ),
             None => {
                 return Err(AllocationFailure::with_partial(
                     crate::error::Error::Config(format!(
