@@ -21,6 +21,101 @@ pub struct CredentialMetadata {
     pub delivered_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_run_id: Option<String>,
+    /// The triggering revision of the apply that allocated this slot (see
+    /// [`AllocationBinding`]). Absent on rotations, on entries recorded before
+    /// allocations were bound, and when the apply could not name a revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_commit: Option<String>,
+    /// The login the allocating apply intended to deliver to. Absent when the
+    /// apply had no recipient; such an entry never marks a retry as pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_recipient: Option<String>,
+}
+
+/// Set by the apply workflow to the commit that triggered the run.
+pub const ALLOCATION_REVISION_ENV: &str = "GITFORGEOPS_ALLOCATION_REVISION";
+
+/// The apply a recorded credential allocation belongs to.
+///
+/// A recorded allocation newer than the last clean apply exempts its slot from
+/// the revived-slot refusal, but only for the apply that made it: the same
+/// revision and the same intended recipient (#352). Anything else — a later
+/// revision, another recipient — would inherit a value it was never meant to
+/// hold.
+///
+/// The revision is [`ALLOCATION_REVISION_ENV`] when set: the workflow binds it
+/// to the triggering merge commit, which stays the same across re-runs of one
+/// workflow run. The checked-out head does not — the apply job moves onto the
+/// refreshed protected branch, and a failed attempt pushes a state commit
+/// there before its retry starts. Without the variable (a local CLI run), it
+/// is the checked-out commit, so a retry from the same checkout matches and one
+/// after pulling new commits does not. Blank values count as unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllocationBinding {
+    pub revision: Option<String>,
+    pub recipient: Option<String>,
+}
+
+impl AllocationBinding {
+    pub fn new(revision: Option<&str>, recipient: Option<&str>) -> Self {
+        Self {
+            revision: non_blank(revision),
+            recipient: non_blank(recipient),
+        }
+    }
+
+    /// Resolve this process's binding from [`ALLOCATION_REVISION_ENV`] (or the
+    /// checked-out commit) and `GITFORGEOPS_ACTOR`. Call once per command and
+    /// pass the result to every consumer, so the ledger and the journal agree.
+    pub fn from_env() -> Self {
+        let configured = std::env::var(ALLOCATION_REVISION_ENV).ok();
+        let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
+        Self::resolve(
+            configured.as_deref(),
+            recipient.as_deref(),
+            git_rev_parse_head,
+        )
+    }
+
+    /// [`AllocationBinding::from_env`] with its inputs made explicit.
+    /// `checkout_head` is consulted only when no revision is configured.
+    pub fn resolve(
+        configured_revision: Option<&str>,
+        recipient: Option<&str>,
+        checkout_head: impl FnOnce() -> Option<String>,
+    ) -> Self {
+        let revision = non_blank(configured_revision).or_else(checkout_head);
+        Self::new(revision.as_deref(), recipient)
+    }
+
+    /// Whether `metadata` records an allocation made by this apply.
+    ///
+    /// Both bindings must be present on both sides and equal. A missing value
+    /// never matches, not even another missing value: an entry recorded before
+    /// allocations were bound, or by an apply that had no recipient, proves
+    /// nothing about who holds the value, and a run that cannot name its own
+    /// revision or recipient cannot claim one. An undelivered value has no
+    /// holder, so retiring its slot for a fresh one costs nothing.
+    pub fn recorded(&self, metadata: &CredentialMetadata) -> bool {
+        match (
+            self.revision.as_deref(),
+            self.recipient.as_deref(),
+            metadata.allocation_commit.as_deref(),
+            metadata.allocation_recipient.as_deref(),
+        ) {
+            (Some(revision), Some(recipient), Some(commit), Some(recorded)) => {
+                revision == commit && recipient == recorded
+            }
+            _ => false,
+        }
+    }
+}
+
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -650,16 +745,8 @@ impl StateFile {
         delivered_to: Option<&str>,
         delivered_run_id: Option<&str>,
     ) {
-        self.credentials.insert(
-            slot.to_string(),
-            CredentialMetadata {
-                slot: slot.to_string(),
-                shard,
-                last_rotated: chrono::Utc::now().to_rfc3339(),
-                delivered_to: delivered_to.map(str::to_string),
-                delivered_run_id: delivered_run_id.map(str::to_string),
-            },
-        );
+        let metadata = credential_metadata(slot, shard, delivered_to, delivered_run_id);
+        self.credentials.insert(slot.to_string(), metadata);
     }
 
     /// Journal every slot an allocation committed to the GitHub Environment
@@ -669,24 +756,28 @@ impl StateFile {
     /// of a completed allocation, or [`crate::secrets::AllocationFailure`]'s
     /// `partial` when a later shard failed. A shard that never reached GitHub
     /// is therefore never recorded. Only non-secret metadata is written (slot,
-    /// shard, recipient login and run id), never the value. The shard count
-    /// grows to cover every committed shard.
+    /// shard, delivered login, run id and the allocating apply's
+    /// [`AllocationBinding`]), never the value. The shard count grows to cover
+    /// every committed shard.
     ///
     /// An allocation recorded after the last clean apply is what lets
     /// [`crate::secrets::ConsumerLedger`] recognize the retry of a failed
-    /// apply, instead of refusing the slots it already wrote as revived.
+    /// apply, instead of refusing the slots it already wrote as revived. The
+    /// binding limits that to the same apply.
     pub fn record_allocation(
         &mut self,
         outcome: &crate::secrets::AllocateOutcome,
         delivered_run_id: Option<&str>,
+        binding: &AllocationBinding,
     ) {
         for slot in &outcome.allocated {
-            self.record_credential(
-                &slot.slot,
-                slot.shard,
-                slot.delivered.as_ref().map(|d| d.login.as_str()),
-                delivered_run_id,
-            );
+            let delivered_to = slot.delivered.as_ref().map(|d| d.login.as_str());
+            let metadata = CredentialMetadata {
+                allocation_commit: binding.revision.clone(),
+                allocation_recipient: binding.recipient.clone(),
+                ..credential_metadata(&slot.slot, slot.shard, delivered_to, delivered_run_id)
+            };
+            self.credentials.insert(slot.slot.clone(), metadata);
             let covered = slot.shard.saturating_add(1);
             self.credential_shard_count = self.credential_shard_count.max(covered);
         }
@@ -831,6 +922,25 @@ fn managed_resource_marker() -> String {
     // value for backwards-compatible JSON shape without hashing resource
     // content (which can include resolved credentials).
     "managed:v1".to_string()
+}
+
+/// Unbound metadata for a slot written now. A rotation records exactly this,
+/// so it clears any earlier [`AllocationBinding`].
+fn credential_metadata(
+    slot: &str,
+    shard: u32,
+    delivered_to: Option<&str>,
+    delivered_run_id: Option<&str>,
+) -> CredentialMetadata {
+    CredentialMetadata {
+        slot: slot.to_string(),
+        shard,
+        last_rotated: chrono::Utc::now().to_rfc3339(),
+        delivered_to: delivered_to.map(str::to_string),
+        delivered_run_id: delivered_run_id.map(str::to_string),
+        allocation_commit: None,
+        allocation_recipient: None,
+    }
 }
 
 fn git_rev_parse_head() -> Option<String> {

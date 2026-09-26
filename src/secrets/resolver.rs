@@ -143,6 +143,10 @@ pub struct ConsumerLedger {
     /// recording the Consumer leaves exactly this trace, and its retry must
     /// keep resolving the value it already delivered.
     pending_allocations: BTreeSet<String>,
+    /// Canonical slots recorded after the last clean apply by some other
+    /// apply, or without bindings at all. Still refused; tracked only so the
+    /// refusal can say why the exemption did not apply.
+    unbound_allocations: BTreeSet<String>,
     coverage: ConsumerCoverage,
 }
 
@@ -159,6 +163,7 @@ impl ConsumerLedger {
                 .map(|(namespace, id)| consumer_state_key(&namespace, &id))
                 .collect(),
             pending_allocations: pending_allocations.into_iter().collect(),
+            unbound_allocations: BTreeSet::new(),
             coverage,
         }
     }
@@ -168,24 +173,38 @@ impl ConsumerLedger {
     /// A pending create counts as managed: it was journaled before its POST,
     /// so its slots belong to the Consumer this repository declared. A
     /// recorded allocation counts as pending when it is newer than
-    /// `last_applied_at`, or when the ledger has no clean apply at all. An
-    /// unparseable timestamp is not pending, so the check fails closed.
-    pub fn from_state(state: &crate::state::StateFile, coverage: ConsumerCoverage) -> Self {
+    /// `last_applied_at` (or the ledger has no clean apply at all) and
+    /// `binding` shows this apply recorded it: the same triggering revision
+    /// and the same intended recipient ([`AllocationBinding::recorded`]). A
+    /// missing binding on either side, including an entry recorded before
+    /// allocations were bound, or an unparseable timestamp fails closed.
+    ///
+    /// [`AllocationBinding::recorded`]: crate::state::AllocationBinding::recorded
+    pub fn from_state(
+        state: &crate::state::StateFile,
+        coverage: ConsumerCoverage,
+        binding: &crate::state::AllocationBinding,
+    ) -> Self {
         let parse = |at: &str| chrono::DateTime::parse_from_rfc3339(at).ok();
         let last_clean_apply = state.last_applied_at.as_deref().and_then(parse);
-        let pending_allocations = state
-            .credentials
-            .iter()
-            .filter(|(_, metadata)| {
-                let allocated = parse(metadata.last_rotated.as_str());
-                match (last_clean_apply, allocated) {
-                    (None, _) => true,
-                    (Some(clean), Some(allocated)) => allocated > clean,
-                    (Some(_), None) => false,
-                }
-            })
-            .map(|(slot, _)| slot.clone())
-            .collect();
+        let mut pending_allocations = BTreeSet::new();
+        let mut unbound_allocations = BTreeSet::new();
+        for (slot, metadata) in &state.credentials {
+            let allocated = parse(metadata.last_rotated.as_str());
+            let since_clean_apply = match (last_clean_apply, allocated) {
+                (None, _) => true,
+                (Some(clean), Some(allocated)) => allocated > clean,
+                (Some(_), None) => false,
+            };
+            if !since_clean_apply {
+                continue;
+            }
+            if binding.recorded(metadata) {
+                pending_allocations.insert(slot.clone());
+            } else {
+                unbound_allocations.insert(slot.clone());
+            }
+        }
         Self {
             managed: state
                 .resources
@@ -194,6 +213,7 @@ impl ConsumerLedger {
                 .cloned()
                 .collect(),
             pending_allocations,
+            unbound_allocations,
             coverage,
         }
     }
@@ -1700,6 +1720,14 @@ fn check_omitted_credential_types(
     }
 }
 
+/// Appended to a revived-slot refusal when the ledger does record an allocation
+/// of the slot since the last clean apply, just not by this apply.
+const UNBOUND_ALLOCATION_HINT: &str = " The state ledger records an allocation of this slot since \
+     the last clean apply, but not by this apply: it names a different triggering revision or \
+     recipient, or none (an entry recorded before allocations were bound to them, or by an apply \
+     with no recipient). If this is the retry of that apply, re-run the same workflow run, which \
+     keeps its triggering merge commit; otherwise retire the slot.";
+
 /// The two retired-Consumer checks only the state ledger can decide.
 ///
 /// Must run after the Consumer walks and before any plugin or
@@ -1716,10 +1744,11 @@ fn check_omitted_credential_types(
 ///   asks for a new value to be generated and delivered, but the stored one
 ///   predates this Consumer: it can be a retired Consumer's credential behind
 ///   a reused id, and nothing would deliver it to the new holder. Recorded
-///   allocations newer than the last clean apply are the exception: that is
-///   the retry of an apply which allocated the slot and failed before it
-///   recorded the Consumer. `alloc=require` is also exempt, because it states
-///   that the operator seeds the value.
+///   allocations newer than the last clean apply, made by this same apply
+///   (triggering revision and recipient), are the exception: that is the retry
+///   of an apply which allocated the slot and failed before it recorded the
+///   Consumer. `alloc=require` is also exempt, because it states that the
+///   operator seeds the value.
 ///
 /// Both are proven remaps under the same [`SlotRemapPolicy`] as a shrink.
 fn check_consumer_ledger(
@@ -1739,6 +1768,11 @@ fn check_consumer_ledger(
         })
         .map(|result| {
             let alloc = alloc_label(result.placeholder.alloc);
+            let hint = if ledger.unbound_allocations.contains(&result.slot) {
+                UNBOUND_ALLOCATION_HINT
+            } else {
+                ""
+            };
             format!(
                 "credential slot '{}' would revive a stored value: consumer '{}/{}' is not in \
                  this environment's state ledger, yet the credential bundle already holds a value \
@@ -1746,7 +1780,7 @@ fn check_consumer_ledger(
                  reused id, and it would not be delivered to the new holder. Retire the slot from \
                  the credential bundle so a fresh value is generated, write alloc=require if the \
                  stored value is the intended seed, or pass --allow-credential-slot-remap to \
-                 accept it.",
+                 accept it.{hint}",
                 result.slot, result.namespace, result.consumer_id
             )
         })
