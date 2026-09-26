@@ -2583,8 +2583,9 @@ const LATER: &str = "2026-09-02T00:00:00+00:00";
 fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
     use gitforgeops::diff::resource_diff::state_key;
     use gitforgeops::secrets::{ConsumerCoverage, ConsumerLedger};
-    use gitforgeops::state::{CredentialMetadata, StateFile};
+    use gitforgeops::state::{AllocationBinding, CredentialMetadata, StateFile};
 
+    let binding = AllocationBinding::new(Some("revision-a"), Some("alice"));
     let bundle = retired_partner_and_other_bundle();
     let partner_key = state_key("ferrum", "Consumer", "partner");
     let other_key = state_key("ferrum", "Consumer", "other");
@@ -2600,7 +2601,7 @@ fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
                 .resources
                 .insert(partner_key.clone(), "managed".to_string());
         }
-        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete);
+        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete, &binding);
         let err = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
             .expect_err("the ledger attributes the deleted Consumer")
             .to_string();
@@ -2624,10 +2625,12 @@ fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
         let metadata = CredentialMetadata {
             slot: slot.to_string(),
             last_rotated: allocated.to_string(),
+            allocation_commit: Some("revision-a".to_string()),
+            allocation_recipient: Some("alice".to_string()),
             ..Default::default()
         };
         state.credentials.insert(slot.to_string(), metadata);
-        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete);
+        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete, &binding);
         let outcome = report_with_ledger(&regrown, &regrown_bundle, &ledger, false);
         assert_eq!(
             outcome.is_ok(),
@@ -2635,7 +2638,145 @@ fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
             "last_applied={last_applied:?} allocated={allocated}: {:?}",
             outcome.err().map(|e| e.to_string())
         );
+        if retry {
+            for (revision, recipient) in [
+                (Some("revision-b"), Some("alice")),
+                (Some("revision-a"), Some("bob")),
+                (None, Some("alice")),
+                (Some("revision-a"), None),
+            ] {
+                let other = AllocationBinding::new(revision, recipient);
+                let mismatched =
+                    ConsumerLedger::from_state(&state, ConsumerCoverage::Complete, &other);
+                let err = report_with_ledger(&regrown, &regrown_bundle, &mismatched, false)
+                    .expect_err("a pending allocation must not cross revisions or recipients")
+                    .to_string();
+                assert!(err.contains("not by this apply"), "{err}");
+            }
+        }
     }
+}
+
+/// A ledger holding `slot` as allocated after the last clean apply, with the
+/// given bindings.
+fn ledger_with_allocation(
+    slot: &str,
+    commit: Option<&str>,
+    recipient: Option<&str>,
+) -> gitforgeops::state::StateFile {
+    use gitforgeops::state::{CredentialMetadata, StateFile};
+
+    let mut state = StateFile {
+        last_applied_at: Some(EARLIER.to_string()),
+        ..Default::default()
+    };
+    let metadata = CredentialMetadata {
+        slot: slot.to_string(),
+        last_rotated: LATER.to_string(),
+        allocation_commit: commit.map(str::to_string),
+        allocation_recipient: recipient.map(str::to_string),
+        ..Default::default()
+    };
+    state.credentials.insert(slot.to_string(), metadata);
+    state
+}
+
+/// An allocation recorded before allocations were bound carries no revision
+/// or recipient. It is not pending for any apply, and the refusal says why
+/// and what to do instead of the bare revived-slot message.
+#[test]
+fn an_unbound_recorded_allocation_is_refused_with_a_hint() {
+    use gitforgeops::secrets::{ConsumerCoverage, ConsumerLedger};
+    use gitforgeops::state::AllocationBinding;
+
+    let regrown = partner_cfg(serde_json::json!({"keyauth": [{"key": GENERATE}]}));
+    let slot = "ferrum/partner/keyauth/key";
+    let bundle = BTreeMap::from([(slot.to_string(), "OLD-RETIRED-KEY-VALUE".to_string())]);
+    let legacy = ledger_with_allocation(slot, None, None);
+    for binding in [
+        AllocationBinding::new(Some("revision-a"), Some("alice")),
+        AllocationBinding::new(Some("revision-a"), None),
+        AllocationBinding::default(),
+    ] {
+        let ledger = ConsumerLedger::from_state(&legacy, ConsumerCoverage::Complete, &binding);
+        let err = report_with_ledger(&regrown, &bundle, &ledger, false)
+            .expect_err("an unbound allocation is not this apply's")
+            .to_string();
+        assert!(err.contains("would revive a stored value"), "{err}");
+        assert!(err.contains("not by this apply"), "{err}");
+        assert!(err.contains("re-run the same workflow run"), "{err}");
+        assert!(err.contains("retire the slot"), "{err}");
+    }
+
+    // A recipient missing on both sides is not a match either.
+    let undelivered = ledger_with_allocation(slot, Some("revision-a"), None);
+    let binding = AllocationBinding::new(Some("revision-a"), None);
+    let ledger = ConsumerLedger::from_state(&undelivered, ConsumerCoverage::Complete, &binding);
+    assert!(report_with_ledger(&regrown, &bundle, &ledger, false).is_err());
+
+    // A value the ledger never recorded is refused without the hint.
+    let unrecorded = gitforgeops::state::StateFile::default();
+    let binding = AllocationBinding::new(Some("revision-a"), Some("alice"));
+    let ledger = ConsumerLedger::from_state(&unrecorded, ConsumerCoverage::Complete, &binding);
+    let err = report_with_ledger(&regrown, &bundle, &ledger, false)
+        .expect_err("an unrecorded stored value is a revival")
+        .to_string();
+    assert!(!err.contains("not by this apply"), "{err}");
+}
+
+/// The apply job checks out the refreshed protected head, and a failed attempt
+/// pushes a state commit there before its retry starts. The retry therefore
+/// runs on a different checkout, but from the same triggering merge commit,
+/// which is the revision the workflow configures. It must still recognize the
+/// slots the failed attempt recorded.
+#[test]
+fn a_retry_after_a_state_commit_keeps_its_recorded_allocation() {
+    use gitforgeops::secrets::{AllocateOutcome, AllocatedSlot, ConsumerCoverage, ConsumerLedger};
+    use gitforgeops::state::{AllocationBinding, StateFile};
+
+    const TRIGGER: &str = "1111111111111111111111111111111111111111";
+    const FIRST_HEAD: &str = "2222222222222222222222222222222222222222";
+    const STATE_COMMIT: &str = "3333333333333333333333333333333333333333";
+
+    let regrown = partner_cfg(serde_json::json!({"keyauth": [{"key": GENERATE}]}));
+    let slot = "ferrum/partner/keyauth/key";
+    let bundle = BTreeMap::from([(slot.to_string(), "THIS-APPLY-KEY-VALUE".to_string())]);
+
+    let first_head = || Some(FIRST_HEAD.to_string());
+    let after_state_commit = || Some(STATE_COMMIT.to_string());
+
+    let first = AllocationBinding::resolve(Some(TRIGGER), Some("alice"), first_head);
+    let mut state = StateFile {
+        last_applied_at: Some(EARLIER.to_string()),
+        ..Default::default()
+    };
+    let outcome = AllocateOutcome {
+        allocated: vec![AllocatedSlot {
+            slot: slot.to_string(),
+            shard: 0,
+            value: "THIS-APPLY-KEY-VALUE".to_string(),
+            alloc: PlaceholderAlloc::Generate,
+            delivered: None,
+        }],
+        shard_count: 1,
+    };
+    state.record_allocation(&outcome, Some("run-1"), &first);
+    assert_eq!(
+        state.credentials[slot].allocation_commit.as_deref(),
+        Some(TRIGGER)
+    );
+
+    let retry = AllocationBinding::resolve(Some(TRIGGER), Some("alice"), after_state_commit);
+    let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete, &retry);
+    let report = report_with_ledger(&regrown, &bundle, &ledger, false)
+        .expect("the retry of the same trigger recognizes its own slot");
+    assert!(report.slot_remaps.is_empty());
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+
+    // Bound to the checkout instead, the state commit would break the match.
+    let by_head = AllocationBinding::resolve(None, Some("alice"), after_state_commit);
+    let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete, &by_head);
+    assert!(report_with_ledger(&regrown, &bundle, &ledger, false).is_err());
 }
 
 // --- Plugin-config array slot identity (#328) -------------------------------

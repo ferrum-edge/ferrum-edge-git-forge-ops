@@ -416,6 +416,11 @@ jobs:
           # (a `git rev-parse HEAD` of this same checkout).
           GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          # The triggering merge commit, which a recorded credential allocation
+          # is bound to. Unlike the applied head it survives a re-run: the
+          # failed attempt's state commit moves the head, not the trigger, so
+          # the retry still recognizes the slots that attempt allocated.
+          GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }}
           # The merge association is resolved exactly before apply; generated
           # credentials are never delivered to an arbitrary first match or
           # to the pusher of an unattributed direct commit.
@@ -459,6 +464,8 @@ jobs:
           # The refreshed protected head, for the same reason as api mode.
           GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          # The triggering merge commit, for the same reason as api mode.
+          GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }}
           GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
@@ -1022,6 +1029,11 @@ jobs:
           # (a `git rev-parse HEAD` of this same checkout).
           GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          # The triggering merge commit, which a recorded credential allocation
+          # is bound to. Unlike the applied head it survives a re-run: the
+          # failed attempt's state commit moves the head, not the trigger, so
+          # the retry still recognizes the slots that attempt allocated.
+          GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }}
           # The merge association is resolved exactly before apply; generated
           # credentials are never delivered to an arbitrary first match or
           # to the pusher of an unattributed direct commit.
@@ -1065,6 +1077,8 @@ jobs:
           # The refreshed protected head, for the same reason as api mode.
           GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          # The triggering merge commit, for the same reason as api mode.
+          GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }}
           GITFORGEOPS_ACTOR: ${{ steps.pr.outputs.author }}
           GITFORGEOPS_PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: gitforgeops apply --auto-approve
