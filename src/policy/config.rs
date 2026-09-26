@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::Severity;
+use crate::plugin_catalog::{AuthAllowlist, PluginProtocol};
 
 pub const POLICY_CONFIG_PATH: &str = ".gitforgeops/policies.yaml";
 /// The only `.gitforgeops/policies.yaml` contract this release reads; it is
@@ -57,6 +59,14 @@ pub struct RequireAuthPluginRuleConfig {
     /// names that merely contain auth-like substrings.
     #[serde(default = "default_auth_plugin_names")]
     pub auth_plugin_names: Vec<String>,
+    /// The `supported_protocols()` of custom authenticators listed in
+    /// `auth_plugin_names`, keyed by plugin name. A custom authenticator
+    /// without an entry runs on plain HTTP only, the gateway's trait default,
+    /// so it does not authenticate gRPC, WebSocket or stream traffic.
+    /// Built-in authenticators cannot be listed: their protocols are fixed by
+    /// the gateway.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_auth_plugin_protocols: BTreeMap<String, Vec<PluginProtocol>>,
 }
 
 impl Default for RequireAuthPluginRuleConfig {
@@ -65,41 +75,89 @@ impl Default for RequireAuthPluginRuleConfig {
             enabled: false,
             severity: Severity::default(),
             auth_plugin_names: default_auth_plugin_names(),
+            custom_auth_plugin_protocols: BTreeMap::new(),
         }
     }
 }
 
 impl RequireAuthPluginRuleConfig {
-    /// The configured allowlist, lowercased for case-insensitive matching
-    /// against a plugin's `plugin_name`.
-    pub fn normalized_auth_plugin_names(&self) -> Vec<String> {
-        self.auth_plugin_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect()
+    /// The configured allowlist with each authenticator's protocols.
+    pub fn auth_allowlist(&self) -> AuthAllowlist {
+        AuthAllowlist::new(&self.auth_plugin_names, &self.custom_auth_plugin_protocols)
     }
 }
 
-/// The plugin names that count as authentication for a repository: the
-/// resolved `require_auth_plugin.auth_plugin_names` allowlist when a policy is
-/// loaded (whether or not the rule itself is enabled), otherwise the built-in
-/// defaults. Lowercased.
+/// The authenticators of a repository: the resolved `require_auth_plugin`
+/// allowlist when a policy is loaded (whether or not the rule itself is
+/// enabled), otherwise the built-in defaults.
 ///
 /// The single classification shared by the policy rule, the security audit
 /// and breaking-change detection, so they cannot disagree about which plugin
-/// configs authenticate traffic.
-pub fn effective_auth_plugin_names(policy: Option<&PolicyConfig>) -> Vec<String> {
+/// configs authenticate traffic, or on which protocols.
+pub fn effective_auth_allowlist(policy: Option<&PolicyConfig>) -> AuthAllowlist {
     policy
         .map(|cfg| cfg.policies.require_auth_plugin.clone())
         .unwrap_or_default()
-        .normalized_auth_plugin_names()
+        .auth_allowlist()
+}
+
+/// Every allowlisted built-in must be an authenticator, and a protocol
+/// declaration must name a custom authenticator on the allowlist.
+///
+/// A built-in outside [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`] (`opa`,
+/// `access_control`, `spiffe_identity`, …) runs on no protocol as an
+/// authenticator and its protocols cannot be declared, so listing it could
+/// only ever report its instances as ignored. A built-in's protocols are the
+/// gateway's, a legacy alias is not a loadable `plugin_name`, and a name
+/// missing from the allowlist declares nothing. All of these are mistakes to
+/// fail on rather than silently ignore.
+fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::error::Result<()> {
+    for name in &cfg.auth_plugin_names {
+        let lowered = name.to_ascii_lowercase();
+        if crate::plugin_catalog::is_builtin(&lowered)
+            && !crate::plugin_catalog::is_auth_plugin(&lowered)
+        {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.auth_plugin_names lists built-in plugin '{name}', which \
+                 does not authenticate callers; the gateway never runs it as an authenticator, \
+                 so remove it (built-in authenticators: {})",
+                crate::plugin_catalog::AUTH_PLUGIN_NAMES.join(", ")
+            )));
+        }
+    }
+    let allowlist = cfg.auth_allowlist();
+    for name in cfg.custom_auth_plugin_protocols.keys() {
+        let lowered = name.to_ascii_lowercase();
+        if crate::plugin_catalog::is_builtin(&lowered) {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.custom_auth_plugin_protocols lists built-in plugin '{name}'; \
+                 the gateway fixes a built-in's protocols, so remove the entry"
+            )));
+        }
+        if LEGACY_AUTH_PLUGIN_ALIASES.contains(&lowered.as_str()) {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.custom_auth_plugin_protocols lists '{name}', a legacy \
+                 spelling that is not a gateway plugin_name and can never match a live \
+                 plugin; remove the entry"
+            )));
+        }
+        if !allowlist.contains(name) {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.custom_auth_plugin_protocols lists '{name}', which is not \
+                 in require_auth_plugin.auth_plugin_names"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Spellings that are not real `plugin_name` values but appear in
 /// hand-written policy files and in this repo's own examples from before the
-/// catalog was pinned down. Tolerated so an upgrade does not suddenly report
-/// every proxy as unauthenticated, but they can never match a live plugin —
-/// `plugin_name_is_known` flags them separately as unknown names.
+/// catalog was pinned down. They stay in the default allowlist, but they are
+/// not built-ins, so like any custom name they count for plain HTTP only, and
+/// they can never match a live plugin — `plugin_name_is_known` flags them
+/// separately as unknown names. They cannot be given protocols under
+/// `custom_auth_plugin_protocols`.
 const LEGACY_AUTH_PLUGIN_ALIASES: &[&str] = &[
     "jwt",
     "oauth2",
@@ -120,7 +178,7 @@ const LEGACY_AUTH_PLUGIN_ALIASES: &[&str] = &[
 /// Ferrum Edge built-in auth plugin ids. Matching is case-insensitive against
 /// the plugin's `plugin_name` field.
 ///
-/// The canonical eleven come from [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`]
+/// The canonical ten come from [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`]
 /// so this list cannot drift from the gateway's registry; the legacy aliases
 /// are appended for backwards compatibility with older policy files.
 pub fn default_auth_plugin_names() -> Vec<String> {
@@ -419,6 +477,7 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
         )));
     }
     validate_overrides(&loaded.overrides)?;
+    validate_require_auth_plugin(&loaded.policies.require_auth_plugin)?;
     Ok(Some(loaded))
 }
 

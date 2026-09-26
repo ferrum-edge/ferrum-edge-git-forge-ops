@@ -17,6 +17,10 @@
 //! (`docs/plugins.md`, "Plugin Scope Merging"), which the analysis passes and
 //! policy rules all share.
 
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
 use crate::config::schema::{BackendScheme, PluginConfig, PluginScope, Proxy};
 use crate::config::GatewayConfig;
 
@@ -200,9 +204,17 @@ pub fn retired_replacement(plugin_name: &str) -> RetiredRemediation {
 /// them by hand — a hand-written instance collides with the injected one.
 pub const RESERVED_PLUGIN_NAMES: &[&str] = &["__mesh_bpf_metrics"];
 
-/// Built-in plugins that establish a caller principal, in priority order.
+/// Built-in plugins that authenticate a caller, in priority order: each one
+/// rejects a request that does not present its credential.
+///
+/// `spiffe_identity` is deliberately absent. In Ferrum Edge v0.9.7
+/// (`src/plugins/mesh/spiffe_identity.rs`) it does not override the trait's
+/// `is_auth_plugin()` (default `false`), and both `on_request_received` and
+/// `on_stream_connect` return `Continue` when the peer presents no client
+/// certificate or a certificate without a SPIFFE ID. It only rejects a
+/// malformed or expired SVID, so it never refuses an unidentified caller and
+/// cannot be what protects a route.
 pub const AUTH_PLUGIN_NAMES: &[&str] = &[
-    "spiffe_identity",
     "mtls_auth",
     "jwks_auth",
     "oauth2_introspection",
@@ -441,17 +453,69 @@ pub fn scheme_is_http_family(scheme: BackendScheme) -> bool {
 // --- Protocol applicability ---
 //
 // A plugin that is effective by scope still only runs when the gateway invokes
-// it for the proxy's protocol. Each gateway plugin declares
-// `supported_protocols()`, and the stream listeners skip every plugin that
-// does not declare `Tcp` or `Udp` (`docs/tcp_udp_proxy.md`, "Compatible
-// Plugins"). Only the authenticator half of that matrix is mirrored here,
-// because auth coverage is the check that must not be satisfied by a plugin
-// the listener never runs.
+// it for the request's protocol. Each gateway plugin declares
+// `supported_protocols()`, and the plugin cache builds one chain per protocol
+// from the plugins that declare it (`filter_for_protocol` in Ferrum Edge
+// v0.9.7 `src/plugin_cache.rs`). An HTTP-family proxy has no single protocol:
+// the gateway classifies each request as plain HTTP, gRPC or a WebSocket
+// upgrade and runs that protocol's chain (`src/proxy/mod.rs`,
+// `request_protocol`). Only the authenticator half of that matrix is mirrored
+// here, because auth coverage is the check that must not be satisfied by a
+// plugin the gateway never runs.
 
-/// The listener family a proxy's plugins run on, as the gateway classifies it
-/// (`ferrum_edge::plugins::ProxyProtocol`). HTTP-family proxies share the HTTP
-/// listener and serve HTTP, gRPC and WebSocket requests; a stream proxy owns a
-/// TCP (`tcp` / `tcps`) or UDP (`udp` / `dtls`) listener.
+/// A protocol a plugin can declare in `supported_protocols()`
+/// (`ferrum_edge::plugins::ProxyProtocol`). Spelled in lowercase in
+/// `.gitforgeops/policies.yaml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginProtocol {
+    Http,
+    Grpc,
+    WebSocket,
+    Tcp,
+    Udp,
+}
+
+impl PluginProtocol {
+    /// Label for findings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PluginProtocol::Http => "HTTP",
+            PluginProtocol::Grpc => "gRPC",
+            PluginProtocol::WebSocket => "WebSocket",
+            PluginProtocol::Tcp => "TCP",
+            PluginProtocol::Udp => "UDP",
+        }
+    }
+}
+
+/// Plain HTTP, gRPC and WebSocket: every request an HTTP-family proxy serves.
+pub const HTTP_FAMILY_PROTOCOLS: &[PluginProtocol] = &[
+    PluginProtocol::Http,
+    PluginProtocol::Grpc,
+    PluginProtocol::WebSocket,
+];
+
+/// Plain HTTP requests only.
+pub const HTTP_ONLY_PROTOCOLS: &[PluginProtocol] = &[PluginProtocol::Http];
+
+/// Every protocol the gateway distinguishes.
+pub const ALL_PROTOCOLS: &[PluginProtocol] = &[
+    PluginProtocol::Http,
+    PluginProtocol::Grpc,
+    PluginProtocol::WebSocket,
+    PluginProtocol::Tcp,
+    PluginProtocol::Udp,
+];
+
+/// What a custom plugin runs on unless the repository declares otherwise: the
+/// gateway's `Plugin::supported_protocols()` trait default,
+/// `HTTP_ONLY_PROTOCOLS`.
+pub const CUSTOM_PLUGIN_DEFAULT_PROTOCOLS: &[PluginProtocol] = HTTP_ONLY_PROTOCOLS;
+
+/// The listener family a proxy's plugins run on. HTTP-family proxies share the
+/// HTTP listener and serve HTTP, gRPC and WebSocket requests; a stream proxy
+/// owns a TCP (`tcp` / `tcps`) or UDP (`udp` / `dtls`) listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyTransport {
     HttpFamily,
@@ -473,6 +537,16 @@ impl ProxyTransport {
             ProxyTransport::Udp => "UDP",
         }
     }
+
+    /// The request protocols the gateway serves on this listener, each with
+    /// its own plugin chain. Every one of them needs an authenticator.
+    pub fn request_protocols(self) -> &'static [PluginProtocol] {
+        match self {
+            ProxyTransport::HttpFamily => HTTP_FAMILY_PROTOCOLS,
+            ProxyTransport::Tcp => &[PluginProtocol::Tcp],
+            ProxyTransport::Udp => &[PluginProtocol::Udp],
+        }
+    }
 }
 
 /// The listener family `proxy` runs on. Keyed on the effective scheme, like
@@ -486,25 +560,109 @@ pub fn proxy_transport(proxy: &Proxy) -> ProxyTransport {
     }
 }
 
+/// The protocols a built-in authenticator declares in `supported_protocols()`
+/// on Ferrum Edge v0.9.7. Empty for every built-in outside
+/// [`AUTH_PLUGIN_NAMES`], which authenticates nothing on any protocol.
+///
+/// * `mtls_auth` declares `HTTP_FAMILY_AND_STREAM_PROTOCOLS` and rejects a
+///   stream connection without a verified client certificate in
+///   `on_stream_connect`.
+/// * `soap_ws_security` declares `HTTP_ONLY_PROTOCOLS`, so gRPC and WebSocket
+///   requests skip it.
+/// * Every other authenticator declares `HTTP_FAMILY_PROTOCOLS` and is
+///   skipped on a stream connection.
+pub fn builtin_auth_protocols(plugin_name: &str) -> &'static [PluginProtocol] {
+    match plugin_name {
+        "mtls_auth" => ALL_PROTOCOLS,
+        "soap_ws_security" => HTTP_ONLY_PROTOCOLS,
+        name if AUTH_PLUGIN_NAMES.contains(&name) => HTTP_FAMILY_PROTOCOLS,
+        _ => &[],
+    }
+}
+
 /// Built-in authenticators that authenticate stream connections on the paired
-/// gateway (v0.9.7). `mtls_auth` declares `Tcp` and `Udp` in
-/// `supported_protocols()` and rejects a connection without a verified client
-/// certificate in `on_stream_connect`. `spiffe_identity` also runs on stream
-/// listeners but is extraction-only: it is not an auth plugin and continues
-/// when the peer presents no SPIFFE identity, so it does not count here. Every
-/// other built-in authenticator declares HTTP-family or HTTP-only support
-/// and is skipped on a stream connection.
+/// gateway (v0.9.7): the members of [`AUTH_PLUGIN_NAMES`] whose
+/// [`builtin_auth_protocols`] include `Tcp` and `Udp`.
 pub const STREAM_AUTH_PLUGIN_NAMES: &[&str] = &["mtls_auth"];
 
-/// Does the gateway run the authenticator `plugin_name` on `proxy`'s listener?
-///
-/// Every authenticator counts on an HTTP-family proxy. On a stream proxy only
-/// [`STREAM_AUTH_PLUGIN_NAMES`] do, matched exactly as the gateway resolves
-/// `plugin_name`. Anything else fails closed: a custom plugin's
-/// `supported_protocols()` contract is not visible here, and the gateway's
-/// trait default is HTTP only.
-pub fn auth_plugin_applies_to_proxy(plugin_name: &str, proxy: &Proxy) -> bool {
-    !proxy_transport(proxy).is_stream() || STREAM_AUTH_PLUGIN_NAMES.contains(&plugin_name)
+/// Built-in authenticators that run on every request an HTTP-family proxy
+/// serves (plain HTTP, gRPC and WebSocket), in priority order.
+pub fn http_family_auth_plugin_names() -> Vec<&'static str> {
+    AUTH_PLUGIN_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            HTTP_FAMILY_PROTOCOLS
+                .iter()
+                .all(|protocol| builtin_auth_protocols(name).contains(protocol))
+        })
+        .collect()
+}
+
+/// `HTTP, gRPC` for findings that list protocols.
+pub fn protocol_list(protocols: &[PluginProtocol]) -> String {
+    protocols
+        .iter()
+        .map(|protocol| protocol.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which `plugin_name`s count as authentication for a repository, and which
+/// protocols the gateway runs each of them on. Shared by
+/// `require_auth_plugin`, the security audit and breaking-change detection so
+/// they cannot disagree about which authenticators run.
+#[derive(Debug, Clone)]
+pub struct AuthAllowlist {
+    /// Allowlisted names, lowercased.
+    names: Vec<String>,
+    /// Declared `supported_protocols()` of custom authenticators, keyed by
+    /// lowercased name.
+    custom_protocols: BTreeMap<String, Vec<PluginProtocol>>,
+}
+
+impl AuthAllowlist {
+    /// `names` are matched case-insensitively. `custom_protocols` declares the
+    /// protocols of custom authenticators; see [`AuthAllowlist::protocols`].
+    pub fn new(names: &[String], custom_protocols: &BTreeMap<String, Vec<PluginProtocol>>) -> Self {
+        Self {
+            names: names.iter().map(|name| name.to_ascii_lowercase()).collect(),
+            custom_protocols: custom_protocols
+                .iter()
+                .map(|(name, protocols)| (name.to_ascii_lowercase(), protocols.clone()))
+                .collect(),
+        }
+    }
+
+    /// The allowlisted names, lowercased.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Is `plugin_name` on the allowlist? Case-insensitive.
+    pub fn contains(&self, plugin_name: &str) -> bool {
+        self.names.contains(&plugin_name.to_ascii_lowercase())
+    }
+
+    /// The protocols the gateway runs `plugin_name` on. A built-in is matched
+    /// exactly, as the gateway resolves `plugin_name`, and its contract is
+    /// fixed by [`builtin_auth_protocols`]. Any other name is a custom plugin:
+    /// its protocols come from the repository's declaration and otherwise fail
+    /// closed to [`CUSTOM_PLUGIN_DEFAULT_PROTOCOLS`], because its
+    /// `supported_protocols()` implementation is not visible here.
+    pub fn protocols(&self, plugin_name: &str) -> &[PluginProtocol] {
+        if is_builtin(plugin_name) {
+            return builtin_auth_protocols(plugin_name);
+        }
+        self.custom_protocols
+            .get(&plugin_name.to_ascii_lowercase())
+            .map_or(CUSTOM_PLUGIN_DEFAULT_PROTOCOLS, Vec::as_slice)
+    }
+
+    /// Does the gateway run `plugin_name` on `protocol`?
+    pub fn runs_on(&self, plugin_name: &str, protocol: PluginProtocol) -> bool {
+        self.protocols(plugin_name).contains(&protocol)
+    }
 }
 
 /// Can a stream authenticator establish an identity on `proxy`'s listener?
@@ -522,41 +680,58 @@ pub fn listener_can_establish_identity(proxy: &Proxy) -> bool {
 #[derive(Debug, Clone)]
 pub struct AuthCoverage<'a> {
     pub transport: ProxyTransport,
-    /// Allowlisted authenticators the gateway runs on this listener.
+    /// Allowlisted authenticators the gateway runs on at least one of the
+    /// listener's request protocols.
     pub applicable: Vec<&'a PluginConfig>,
-    /// Allowlisted authenticators effective by scope that do not
-    /// authenticate this listener's connections: skipped because they do not
-    /// support its protocol, or, like `spiffe_identity`, run without
-    /// rejecting an unidentified peer.
+    /// Allowlisted authenticators effective by scope that the gateway runs on
+    /// none of the listener's request protocols.
     pub inapplicable: Vec<&'a PluginConfig>,
+    /// Request protocols the listener serves on which no applicable
+    /// authenticator runs. Those requests reach the backend unauthenticated.
+    pub uncovered: Vec<PluginProtocol>,
     /// See [`listener_can_establish_identity`].
     pub listener_establishes_identity: bool,
 }
 
 impl AuthCoverage<'_> {
-    /// Does an applicable authenticator run on a listener where it can
-    /// establish an identity?
+    /// Does an authenticator run on every request protocol the listener
+    /// serves, on a listener where it can establish an identity?
     pub fn is_authenticated(&self) -> bool {
-        !self.applicable.is_empty() && self.listener_establishes_identity
+        self.uncovered.is_empty() && self.listener_establishes_identity
     }
 }
 
-/// Classify the effective plugins of `proxy` against the lowercased
-/// authentication allowlist `auth_names`. Shared by `require_auth_plugin` and
-/// the security audit so they cannot disagree about which authenticators run.
+/// Classify the effective plugins of `proxy` against the authentication
+/// allowlist `auth`, per request protocol.
 pub fn auth_coverage<'a>(
     config: &'a GatewayConfig,
     proxy: &Proxy,
-    auth_names: &[String],
+    auth: &AuthAllowlist,
 ) -> AuthCoverage<'a> {
-    let (applicable, inapplicable) = effective_plugins(config, proxy)
+    let transport = proxy_transport(proxy);
+    let protocols = transport.request_protocols();
+    let (applicable, inapplicable): (Vec<_>, Vec<_>) = effective_plugins(config, proxy)
         .into_iter()
-        .filter(|plugin| auth_names.contains(&plugin.plugin_name.to_ascii_lowercase()))
-        .partition(|plugin| auth_plugin_applies_to_proxy(&plugin.plugin_name, proxy));
+        .filter(|plugin| auth.contains(&plugin.plugin_name))
+        .partition(|plugin| {
+            protocols
+                .iter()
+                .any(|protocol| auth.runs_on(&plugin.plugin_name, *protocol))
+        });
+    let uncovered = protocols
+        .iter()
+        .copied()
+        .filter(|protocol| {
+            !applicable
+                .iter()
+                .any(|plugin| auth.runs_on(&plugin.plugin_name, *protocol))
+        })
+        .collect();
     AuthCoverage {
-        transport: proxy_transport(proxy),
+        transport,
         applicable,
         inapplicable,
+        uncovered,
         listener_establishes_identity: listener_can_establish_identity(proxy),
     }
 }
