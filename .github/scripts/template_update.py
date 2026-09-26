@@ -210,8 +210,9 @@ def require_confinement_support() -> None:
         and hasattr(os, "O_DIRECTORY")
         and all(
             call in os.supports_dir_fd
-            for call in (os.open, os.stat, os.listdir, os.mkdir, os.rename, os.unlink)
+            for call in (os.open, os.stat, os.mkdir, os.rename, os.unlink, os.readlink)
         )
+        and os.listdir in os.supports_fd
         and os.stat in os.supports_follow_symlinks
         and hasattr(os, "fchmod")
     )
