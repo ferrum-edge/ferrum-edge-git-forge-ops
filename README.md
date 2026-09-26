@@ -1636,7 +1636,10 @@ mandatory to match: whatever you set here has to equal the gateway's own
 that reaches the admin API — `apply-on-merge.yml`, `rotate.yml`,
 `drift-check.yml`, and the live half of `trusted-pr-review.yml` — binds all four
 from the selected GitHub Environment, and an unset (or blank) secret means
-"use the default", not "empty issuer" / "empty audience".
+"use the default", not "empty issuer" / "empty audience". A non-blank
+`FERRUM_ADMIN_JWT_SECRET`, issuer, or audience is used byte-for-byte, as the
+gateway does: surrounding whitespace is not trimmed and counts toward the
+secret's 32-byte minimum.
 `materialize-file.yml` binds none of them: it refuses to run outside file mode
 and never opens an admin connection.
 
