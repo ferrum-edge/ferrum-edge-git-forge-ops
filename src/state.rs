@@ -21,6 +21,10 @@ pub struct CredentialMetadata {
     pub delivered_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_recipient: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -658,6 +662,8 @@ impl StateFile {
                 last_rotated: chrono::Utc::now().to_rfc3339(),
                 delivered_to: delivered_to.map(str::to_string),
                 delivered_run_id: delivered_run_id.map(str::to_string),
+                allocation_commit: None,
+                allocation_recipient: None,
             },
         );
     }
@@ -669,8 +675,9 @@ impl StateFile {
     /// of a completed allocation, or [`crate::secrets::AllocationFailure`]'s
     /// `partial` when a later shard failed. A shard that never reached GitHub
     /// is therefore never recorded. Only non-secret metadata is written (slot,
-    /// shard, recipient login and run id), never the value. The shard count
-    /// grows to cover every committed shard.
+    /// shard, recipient login, intended recipient, source revision and run
+    /// id), never the value. The shard count grows to cover every committed
+    /// shard.
     ///
     /// An allocation recorded after the last clean apply is what lets
     /// [`crate::secrets::ConsumerLedger`] recognize the retry of a failed
@@ -679,6 +686,8 @@ impl StateFile {
         &mut self,
         outcome: &crate::secrets::AllocateOutcome,
         delivered_run_id: Option<&str>,
+        allocation_commit: Option<&str>,
+        allocation_recipient: Option<&str>,
     ) {
         for slot in &outcome.allocated {
             self.record_credential(
@@ -687,6 +696,9 @@ impl StateFile {
                 slot.delivered.as_ref().map(|d| d.login.as_str()),
                 delivered_run_id,
             );
+            let metadata = self.credentials.get_mut(&slot.slot).expect("just inserted");
+            metadata.allocation_commit = allocation_commit.map(str::to_string);
+            metadata.allocation_recipient = allocation_recipient.map(str::to_string);
             let covered = slot.shard.saturating_add(1);
             self.credential_shard_count = self.credential_shard_count.max(covered);
         }

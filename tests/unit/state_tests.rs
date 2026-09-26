@@ -793,7 +793,12 @@ fn record_allocation_journals_committed_slots_without_their_values() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
         let mut state = StateFile::load("staging").unwrap();
-        state.record_allocation(&AllocateOutcome::default(), Some("7"));
+        state.record_allocation(
+            &AllocateOutcome::default(),
+            Some("7"),
+            Some("abc123"),
+            Some("alice"),
+        );
         assert!(state.credentials.is_empty());
         assert_eq!(state.credential_shard_count, 1);
 
@@ -814,7 +819,7 @@ fn record_allocation_journals_committed_slots_without_their_values() {
             ],
             shard_count: 4,
         };
-        state.record_allocation(&partial, Some("7"));
+        state.record_allocation(&partial, Some("7"), Some("abc123"), Some("alice"));
         state.save().unwrap();
 
         let reloaded = StateFile::load("staging").unwrap();
@@ -823,6 +828,8 @@ fn record_allocation_journals_committed_slots_without_their_values() {
         assert_eq!(alpha.shard, 0);
         assert_eq!(alpha.delivered_to, None);
         assert_eq!(alpha.delivered_run_id.as_deref(), Some("7"));
+        assert_eq!(alpha.allocation_commit.as_deref(), Some("abc123"));
+        assert_eq!(alpha.allocation_recipient.as_deref(), Some("alice"));
         let bravo = &reloaded.credentials["ferrum/bravo/keyauth/key"];
         assert_eq!(bravo.shard, 2);
         assert_eq!(bravo.delivered_to.as_deref(), Some("alice"));

@@ -167,16 +167,27 @@ impl ConsumerLedger {
     ///
     /// A pending create counts as managed: it was journaled before its POST,
     /// so its slots belong to the Consumer this repository declared. A
-    /// recorded allocation counts as pending when it is newer than
-    /// `last_applied_at`, or when the ledger has no clean apply at all. An
-    /// unparseable timestamp is not pending, so the check fails closed.
-    pub fn from_state(state: &crate::state::StateFile, coverage: ConsumerCoverage) -> Self {
+    /// recorded allocation counts as pending only for the same source
+    /// revision and intended recipient, and when it is newer than
+    /// `last_applied_at` (or the ledger has no clean apply at all). Missing
+    /// bindings or an unparseable timestamp fail closed.
+    pub fn from_state(
+        state: &crate::state::StateFile,
+        coverage: ConsumerCoverage,
+        source_revision: Option<&str>,
+        recipient: Option<&str>,
+    ) -> Self {
         let parse = |at: &str| chrono::DateTime::parse_from_rfc3339(at).ok();
         let last_clean_apply = state.last_applied_at.as_deref().and_then(parse);
         let pending_allocations = state
             .credentials
             .iter()
             .filter(|(_, metadata)| {
+                if metadata.allocation_commit.as_deref() != source_revision
+                    || metadata.allocation_recipient.as_deref() != recipient
+                {
+                    return false;
+                }
                 let allocated = parse(metadata.last_rotated.as_str());
                 match (last_clean_apply, allocated) {
                     (None, _) => true,

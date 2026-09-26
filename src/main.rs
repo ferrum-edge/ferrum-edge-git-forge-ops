@@ -479,7 +479,21 @@ fn consumer_ledger(resolved: &ResolvedEnv, state: &StateFile) -> secrets::Consum
         }
         Some(_) => secrets::ConsumerCoverage::Partial,
     };
-    secrets::ConsumerLedger::from_state(state, coverage)
+    let source_revision = std::env::var("GITHUB_SHA").ok().or_else(|| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    });
+    let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
+    secrets::ConsumerLedger::from_state(
+        state,
+        coverage,
+        source_revision.as_deref(),
+        recipient.as_deref(),
+    )
 }
 
 /// Is a credential bundle available to this invocation?
@@ -735,12 +749,14 @@ async fn surface_delivered_credentials(
 fn journal_allocation(
     state: &mut StateFile,
     outcome: &secrets::AllocateOutcome,
+    source_revision: Option<&str>,
+    recipient: Option<&str>,
 ) -> gitforgeops::error::Result<()> {
     if outcome.allocated.is_empty() {
         return Ok(());
     }
     let run_id = std::env::var("GITHUB_RUN_ID").ok();
-    state.record_allocation(outcome, run_id.as_deref());
+    state.record_allocation(outcome, run_id.as_deref(), source_revision, recipient);
     state.save()
 }
 
@@ -787,6 +803,14 @@ async fn allocate_if_needed(
         .ok_or(verdict::BlockerKind::ProvisioningRepository.remedy())?;
 
     let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
+    let source_revision = std::env::var("GITHUB_SHA").ok().or_else(|| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    });
 
     let client = build_github_api_client(env_config)?;
 
@@ -820,7 +844,12 @@ async fn allocate_if_needed(
             // this record the retry would refuse its own slots as revived
             // values (#352). Unwritten shards are not in `partial` and stay
             // unrecorded.
-            let journaled = journal_allocation(state, &failure.partial);
+            let journaled = journal_allocation(
+                state,
+                &failure.partial,
+                source_revision.as_deref(),
+                recipient.as_deref(),
+            );
             if !failure.partial.allocated.is_empty() {
                 surface_delivered_credentials(env_config, &failure.partial).await?;
             }
@@ -835,7 +864,12 @@ async fn allocate_if_needed(
             return Err(failure.source.into());
         }
     };
-    journal_allocation(state, &outcome)?;
+    journal_allocation(
+        state,
+        &outcome,
+        source_revision.as_deref(),
+        recipient.as_deref(),
+    )?;
 
     // Re-resolve so `desired` picks up freshly allocated values. The
     // allocator only produces values for slots classified as NeedsAllocation

@@ -827,7 +827,12 @@ fn report_against_ledger(
         SlotRemapPolicy,
     };
 
-    let ledger = ConsumerLedger::from_state(state, ConsumerCoverage::Complete);
+    let ledger = ConsumerLedger::from_state(
+        state,
+        ConsumerCoverage::Complete,
+        Some("revision-a"),
+        Some("alice"),
+    );
     let options = ResolveOptions {
         slot_remap: SlotRemapPolicy::Refuse,
         consumer_ledger: Some(&ledger),
@@ -922,7 +927,12 @@ async fn a_partially_committed_allocation_is_journaled_and_its_retry_resumes() {
     );
 
     let mut journaled = state.clone();
-    journaled.record_allocation(&failure.partial, Some("run-1"));
+    journaled.record_allocation(
+        &failure.partial,
+        Some("run-1"),
+        Some("revision-a"),
+        Some("alice"),
+    );
     assert_eq!(journaled.credentials.len(), 1);
     assert_eq!(journaled.credentials[&alpha].shard, 0);
     assert!(!journaled.credentials.contains_key(&bravo));

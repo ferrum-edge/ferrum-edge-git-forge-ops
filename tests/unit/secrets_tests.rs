@@ -2600,7 +2600,12 @@ fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
                 .resources
                 .insert(partner_key.clone(), "managed".to_string());
         }
-        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete);
+        let ledger = ConsumerLedger::from_state(
+            &state,
+            ConsumerCoverage::Complete,
+            Some("revision-a"),
+            Some("alice"),
+        );
         let err = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
             .expect_err("the ledger attributes the deleted Consumer")
             .to_string();
@@ -2624,10 +2629,17 @@ fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
         let metadata = CredentialMetadata {
             slot: slot.to_string(),
             last_rotated: allocated.to_string(),
+            allocation_commit: Some("revision-a".to_string()),
+            allocation_recipient: Some("alice".to_string()),
             ..Default::default()
         };
         state.credentials.insert(slot.to_string(), metadata);
-        let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete);
+        let ledger = ConsumerLedger::from_state(
+            &state,
+            ConsumerCoverage::Complete,
+            Some("revision-a"),
+            Some("alice"),
+        );
         let outcome = report_with_ledger(&regrown, &regrown_bundle, &ledger, false);
         assert_eq!(
             outcome.is_ok(),
@@ -2635,6 +2647,23 @@ fn ledger_from_state_reads_managed_consumers_and_pending_allocations() {
             "last_applied={last_applied:?} allocated={allocated}: {:?}",
             outcome.err().map(|e| e.to_string())
         );
+        if retry {
+            for (revision, recipient) in [
+                (Some("revision-b"), Some("alice")),
+                (Some("revision-a"), Some("bob")),
+            ] {
+                let mismatched = ConsumerLedger::from_state(
+                    &state,
+                    ConsumerCoverage::Complete,
+                    revision,
+                    recipient,
+                );
+                assert!(
+                    report_with_ledger(&regrown, &regrown_bundle, &mismatched, false).is_err(),
+                    "a pending allocation must not cross revisions or recipients"
+                );
+            }
+        }
     }
 }
 
