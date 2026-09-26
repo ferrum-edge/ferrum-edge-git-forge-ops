@@ -1,9 +1,11 @@
 use std::collections::{BTreeSet, HashSet};
 
-use crate::config::schema::{PluginConfig, Proxy};
+use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
-use crate::plugin_catalog::{effective_plugins, effective_scheme};
-use crate::policy::config::effective_auth_plugin_names;
+use crate::plugin_catalog::{
+    auth_coverage, effective_scheme, protocol_list, AuthAllowlist, AuthCoverage,
+};
+use crate::policy::config::effective_auth_allowlist;
 use crate::policy::PolicyConfig;
 
 use super::resource_diff::{DiffAction, ResourceDiff};
@@ -29,7 +31,7 @@ pub fn detect_breaking_changes(
 ///
 /// A plugin config counts as authentication when its `plugin_name` is on the
 /// same allowlist `require_auth_plugin` and the security audit use (see
-/// [`effective_auth_plugin_names`]), so a configured custom authenticator is
+/// [`effective_auth_allowlist`]), so a configured custom authenticator is
 /// reported exactly like a built-in one. Without a policy the built-in
 /// defaults apply.
 pub fn detect_breaking_changes_with_policy(
@@ -38,7 +40,7 @@ pub fn detect_breaking_changes_with_policy(
     actual: &GatewayConfig,
     policy: Option<&PolicyConfig>,
 ) -> Vec<BreakingChange> {
-    let auth_names = effective_auth_plugin_names(policy);
+    let auth = effective_auth_allowlist(policy);
     let mut breaking = Vec::new();
     // Auth plugin configs a PluginConfig-level finding already explains
     // (deleted, disabled, renamed). The per-proxy check below does not repeat
@@ -64,7 +66,7 @@ pub fn detect_breaking_changes_with_policy(
                 }
                 if diff.kind == "PluginConfig" {
                     let deleted_auth = find_plugin_config(actual, diff)
-                        .is_some_and(|p| is_auth_plugin(&auth_names, &p.plugin_name));
+                        .is_some_and(|p| auth.contains(&p.plugin_name));
                     if deleted_auth {
                         reported_auth_plugins.insert((diff.namespace.clone(), diff.id.clone()));
                         breaking.push(BreakingChange {
@@ -80,7 +82,7 @@ pub fn detect_breaking_changes_with_policy(
                     check_proxy_breaking_fields(diff, desired, actual, &mut breaking);
                 }
                 if diff.kind == "PluginConfig"
-                    && check_auth_plugin_modify(diff, desired, actual, &auth_names, &mut breaking)
+                    && check_auth_plugin_modify(diff, desired, actual, &auth, &mut breaking)
                 {
                     reported_auth_plugins.insert((diff.namespace.clone(), diff.id.clone()));
                 }
@@ -93,7 +95,7 @@ pub fn detect_breaking_changes_with_policy(
         diffs,
         desired,
         actual,
-        &auth_names,
+        &auth,
         &reported_auth_plugins,
         &mut breaking,
     );
@@ -157,18 +159,15 @@ fn projected_plugin_configs(
     projected
 }
 
-/// Enabled authenticators that `proxy` effectively runs under `config`, by
-/// `plugin_name`, with the ids of the instances providing each one.
-fn effective_authenticators(
-    config: &GatewayConfig,
-    proxy: &Proxy,
-    auth_names: &[String],
-) -> Vec<(String, Vec<String>)> {
+/// Enabled authenticators the gateway runs on a proxy, by `plugin_name`, with
+/// the ids of the instances providing each one. Only an authenticator that
+/// runs on one of the listener's request protocols counts ([`auth_coverage`],
+/// the classification `require_auth_plugin` and the security audit use), so
+/// dropping a `key_auth` that a TCP listener never runs is not an
+/// authentication loss.
+fn running_authenticators(coverage: &AuthCoverage<'_>) -> Vec<(String, Vec<String>)> {
     let mut by_name: Vec<(String, Vec<String>)> = Vec::new();
-    for plugin in effective_plugins(config, proxy) {
-        if !is_auth_plugin(auth_names, &plugin.plugin_name) {
-            continue;
-        }
+    for plugin in &coverage.applicable {
         match by_name
             .iter_mut()
             .find(|(name, _)| *name == plugin.plugin_name)
@@ -186,16 +185,22 @@ fn effective_authenticators(
 /// `proxy_group` association is dropped, a proxy-scoped instance is retargeted
 /// to another proxy, or a global instance is narrowed to a different proxy.
 ///
-/// Compares each proxy present on both sides by its effective plugin set
-/// ([`effective_plugins`]) live vs after the apply. Keyed on `plugin_name`, so
-/// swapping one instance for another of the same authenticator is not
-/// reported. A loss whose providing instances were all already reported at
-/// the PluginConfig level is not repeated per proxy.
+/// Evaluates every live proxy that survives the apply, whether or not the
+/// repository declares it: in shared mode an unmanaged proxy is retained, yet
+/// a managed global authenticator still decides its effective plugin list.
+/// Only a proxy the diff deletes is skipped (its deletion is reported on its
+/// own), and a proxy takes its desired shape only when the diff modifies it.
+///
+/// Compares the effective authenticators live vs after the apply, per request
+/// protocol ([`running_authenticators`]). Keyed on `plugin_name`, so swapping
+/// one instance for another of the same authenticator is not reported. A loss
+/// whose providing instances were all already reported at the PluginConfig
+/// level is not repeated per proxy.
 fn check_proxy_auth_coverage(
     diffs: &[ResourceDiff],
     desired: &GatewayConfig,
     actual: &GatewayConfig,
-    auth_names: &[String],
+    auth: &AuthAllowlist,
     reported_auth_plugins: &HashSet<(String, String)>,
     breaking: &mut Vec<BreakingChange>,
 ) {
@@ -205,25 +210,42 @@ fn check_proxy_auth_coverage(
     };
 
     for live_proxy in &actual.proxies {
-        let Some(desired_proxy) = desired
-            .proxies
-            .iter()
-            .find(|p| p.namespace == live_proxy.namespace && p.id == live_proxy.id)
-        else {
-            continue;
-        };
-        // A proxy only takes its desired shape when the apply writes it.
         let after_proxy = match diff_action(diffs, "Proxy", &live_proxy.namespace, &live_proxy.id) {
-            Some(DiffAction::Modify) => desired_proxy,
+            Some(DiffAction::Delete) => continue,
+            Some(DiffAction::Modify) => desired
+                .proxies
+                .iter()
+                .find(|p| p.namespace == live_proxy.namespace && p.id == live_proxy.id)
+                .unwrap_or(live_proxy),
             _ => live_proxy,
         };
 
-        let after: BTreeSet<String> = effective_authenticators(&projected, after_proxy, auth_names)
+        let before_coverage = auth_coverage(actual, live_proxy, auth);
+        let after_coverage = auth_coverage(&projected, after_proxy, auth);
+        let after: BTreeSet<String> = running_authenticators(&after_coverage)
             .into_iter()
             .map(|(name, _)| name)
             .collect();
+        let consequence = if after_coverage.applicable.is_empty() {
+            ", which is left with no enabled authenticator".to_string()
+        } else {
+            let newly_uncovered: Vec<_> = after_coverage
+                .uncovered
+                .iter()
+                .copied()
+                .filter(|protocol| !before_coverage.uncovered.contains(protocol))
+                .collect();
+            if newly_uncovered.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", which leaves its {} requests unauthenticated",
+                    protocol_list(&newly_uncovered)
+                )
+            }
+        };
 
-        for (name, ids) in effective_authenticators(actual, live_proxy, auth_names) {
+        for (name, ids) in running_authenticators(&before_coverage) {
             if after.contains(&name) {
                 continue;
             }
@@ -239,14 +261,7 @@ fn check_proxy_auth_coverage(
                 reason: format!(
                     "proxy {}/{} loses authenticator {} — consumer credentials for it no \
                      longer apply on this proxy{}",
-                    live_proxy.namespace,
-                    live_proxy.id,
-                    name,
-                    if after.is_empty() {
-                        ", which is left with no enabled authenticator"
-                    } else {
-                        ""
-                    }
+                    live_proxy.namespace, live_proxy.id, name, consequence
                 ),
             });
         }
@@ -263,10 +278,6 @@ fn find_plugin_config<'a>(
         .find(|p| p.id == diff.id && p.namespace == diff.namespace)
 }
 
-fn is_auth_plugin(auth_names: &[String], plugin_name: &str) -> bool {
-    auth_names.contains(&plugin_name.to_ascii_lowercase())
-}
-
 /// A live, enabled authenticator that stops authenticating strands every
 /// client that relies on it: disabling it leaves its proxies without that
 /// check, and renaming it to a different plugin kind orphans the credentials
@@ -276,7 +287,7 @@ fn check_auth_plugin_modify(
     diff: &ResourceDiff,
     desired: &GatewayConfig,
     actual: &GatewayConfig,
-    auth_names: &[String],
+    auth: &AuthAllowlist,
     breaking: &mut Vec<BreakingChange>,
 ) -> bool {
     let desired_plugin = find_plugin_config(desired, diff);
@@ -284,7 +295,7 @@ fn check_auth_plugin_modify(
     let (Some(d), Some(a)) = (desired_plugin, actual_plugin) else {
         return false;
     };
-    if !a.enabled || !is_auth_plugin(auth_names, &a.plugin_name) {
+    if !a.enabled || !auth.contains(&a.plugin_name) {
         return false;
     }
     let before = breaking.len();

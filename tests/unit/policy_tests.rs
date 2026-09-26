@@ -3,6 +3,7 @@ use gitforgeops::config::schema::{
     PluginAssociation, PluginConfig, PluginScope, Proxy, SdProvider, ServiceDiscoveryConfig,
     Upstream, UpstreamTarget,
 };
+use gitforgeops::plugin_catalog::{PluginProtocol, HTTP_FAMILY_PROTOCOLS};
 use gitforgeops::policy::config::{
     AllowedBackendDomainsRuleConfig, AllowedProxyPluginsRuleConfig, BackendSchemeRuleConfig,
     ForbidTlsVerifyDisabledRuleConfig, PolicyConfig, PolicyRules, TimeoutBand,
@@ -2153,7 +2154,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         extra: Default::default(),
         id: "jwt-on".to_string(),
         namespace: "ferrum".to_string(),
-        plugin_name: "jwt".to_string(),
+        plugin_name: "jwt_auth".to_string(),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -2209,27 +2210,23 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         ..Default::default()
     };
 
-    // Case 1: `jwt` is on the default allowlist — proxy passes.
-    let cfg_jwt = GatewayConfig {
-        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
-        plugin_configs: vec![make_plugin("jwt-1", "jwt")],
-        ..Default::default()
-    };
-    assert!(
-        evaluate_policies(&cfg_jwt, &policies).is_empty(),
-        "jwt should satisfy require_auth_plugin under default allowlist"
-    );
-
-    // Case 2: `basic-auth` is on the default allowlist — proxy passes.
-    let cfg_basic = GatewayConfig {
-        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
-        plugin_configs: vec![make_plugin("ba-1", "basic-auth")],
-        ..Default::default()
-    };
-    assert!(
-        evaluate_policies(&cfg_basic, &policies).is_empty(),
-        "basic-auth should satisfy under default allowlist"
-    );
+    // Cases 1 and 2: `jwt` and `basic-auth` are legacy aliases on the default
+    // allowlist, not gateway plugins. They count as custom authenticators,
+    // which run on plain HTTP only unless their protocols are declared, so
+    // gRPC and WebSocket requests stay unauthenticated.
+    for (id, name) in [("jwt-1", "jwt"), ("ba-1", "basic-auth")] {
+        let cfg = GatewayConfig {
+            proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
+            plugin_configs: vec![make_plugin(id, name)],
+            ..Default::default()
+        };
+        let findings = evaluate_policies(&cfg, &policies);
+        assert_eq!(findings.len(), 1, "{name}: {findings:?}");
+        assert!(
+            findings[0].message.contains("gRPC, WebSocket"),
+            "{findings:?}"
+        );
+    }
 
     // Case 3: plugin name containing `auth` substring but not on the
     // allowlist (e.g. an audit plugin) — policy must STILL fire.
@@ -2245,13 +2242,16 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         "substring-only match must not satisfy the rule under the allowlist"
     );
 
-    // Case 4: custom allowlist lets an org approve a non-default name.
+    // Case 4: custom allowlist lets an org approve a non-default name, once
+    // it declares the protocols the plugin authenticates.
+    let declared = custom_protocols(&[("company_sso", HTTP_FAMILY_PROTOCOLS)]);
     let custom_policies = PolicyConfig {
         policies: PolicyRules {
             require_auth_plugin: gitforgeops::policy::config::RequireAuthPluginRuleConfig {
                 enabled: true,
                 severity: Severity::Error,
                 auth_plugin_names: vec!["company_sso".to_string()],
+                custom_auth_plugin_protocols: declared,
             },
             ..Default::default()
         },
@@ -2277,6 +2277,16 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         1,
         "custom allowlist should not fall back to defaults"
     );
+}
+
+/// A `custom_auth_plugin_protocols` map.
+fn custom_protocols(
+    entries: &[(&str, &[PluginProtocol])],
+) -> std::collections::BTreeMap<String, Vec<PluginProtocol>> {
+    entries
+        .iter()
+        .map(|(name, protocols)| (name.to_string(), protocols.to_vec()))
+        .collect()
 }
 
 fn require_auth_policies(auth_plugin_names: Option<&[&str]>) -> PolicyConfig {
@@ -2433,19 +2443,27 @@ fn require_auth_plugin_assesses_stream_identity_separately() {
 }
 
 #[test]
-fn require_auth_plugin_does_not_count_spiffe_identity_on_stream_listeners() {
-    // spiffe_identity runs on stream listeners but only extracts a SPIFFE ID:
-    // a peer without one is let through, so it authenticates nothing.
-    let policies = require_auth_policies(None);
+fn require_auth_plugin_does_not_count_spiffe_identity() {
+    // spiffe_identity only extracts a SPIFFE ID. On HTTP requests and stream
+    // connections alike, a peer without one is let through, so it
+    // authenticates nothing and is not a default authenticator.
+    use gitforgeops::plugin_catalog::AUTH_PLUGIN_NAMES;
+    assert!(!AUTH_PLUGIN_NAMES.contains(&"spiffe_identity"));
 
-    for scheme in [BackendScheme::Tcp, BackendScheme::Udp] {
+    let policies = require_auth_policies(None);
+    let proxies = [
+        proxy("api", BackendScheme::Https, 30_000, true),
+        stream_proxy("stream", BackendScheme::Tcp, true),
+        stream_proxy("stream", BackendScheme::Udp, true),
+    ];
+    for listener in proxies {
         let cfg = GatewayConfig {
-            proxies: vec![stream_proxy("stream", scheme, true)],
+            proxies: vec![listener],
             plugin_configs: vec![global_plugin("spiffe-1", "spiffe_identity")],
             ..Default::default()
         };
         let findings = evaluate_policies(&cfg, &policies);
-        assert_eq!(findings.len(), 1, "{scheme:?}: {findings:?}");
+        assert_eq!(findings.len(), 1, "{findings:?}");
         let finding = &findings[0];
         assert_eq!(finding.rule_id, "require_auth_plugin");
         assert!(finding.is_blocking());
@@ -2453,14 +2471,102 @@ fn require_auth_plugin_does_not_count_spiffe_identity_on_stream_listeners() {
             finding.message.contains("no enabled authentication plugin"),
             "{finding:?}"
         );
-        assert!(
-            finding.message.contains("spiffe_identity (spiffe-1)"),
-            "{finding:?}"
-        );
         let remediation = finding.remediation.as_deref().unwrap_or_default();
         assert!(remediation.contains("mtls_auth"), "{remediation}");
         assert!(!remediation.contains("spiffe_identity"), "{remediation}");
     }
+
+    // Loading a policy file that allowlists it fails; an in-memory allowlist
+    // that names it still does not make it an authenticator: it is reported
+    // as ignored.
+    let explicit = require_auth_policies(Some(&["spiffe_identity"]));
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("spiffe-1", "spiffe_identity")],
+        ..Default::default()
+    };
+    let findings = auth_findings(&cfg, &explicit);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].contains("ignored: spiffe_identity (spiffe-1)"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn require_auth_plugin_requires_an_authenticator_for_every_http_family_protocol() {
+    // Ferrum Edge v0.9.7 filters each request's plugin chain by its protocol.
+    // soap_ws_security declares HTTP only, so gRPC and WebSocket requests to
+    // a proxy it alone protects reach the backend unauthenticated.
+    let policies = require_auth_policies(None);
+
+    let soap_only = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("soap-1", "soap_ws_security")],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&soap_only, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let finding = &findings[0];
+    assert!(finding.is_blocking());
+    assert!(
+        finding.message.contains("gRPC, WebSocket requests")
+            && finding.message.contains("soap_ws_security (soap-1)"),
+        "{finding:?}"
+    );
+    let remediation = finding.remediation.as_deref().unwrap_or_default();
+    assert!(remediation.contains("key_auth"), "{remediation}");
+    assert!(!remediation.contains("soap_ws_security"), "{remediation}");
+
+    // Adding an authenticator that runs on gRPC and WebSocket closes the gap.
+    let with_jwt = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![
+            global_plugin("soap-1", "soap_ws_security"),
+            global_plugin("jwt-1", "jwt_auth"),
+        ],
+        ..Default::default()
+    };
+    assert!(auth_findings(&with_jwt, &policies).is_empty());
+}
+
+#[test]
+fn require_auth_plugin_honours_declared_custom_authenticator_protocols() {
+    let mut policies = require_auth_policies(Some(&["company_sso"]));
+    policies
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols = custom_protocols(&[("company_sso", HTTP_FAMILY_PROTOCOLS)]);
+
+    let http = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("sso-1", "company_sso")],
+        ..Default::default()
+    };
+    assert!(auth_findings(&http, &policies).is_empty());
+
+    // Declaring the HTTP family does not extend it to stream listeners.
+    let stream = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
+        plugin_configs: vec![global_plugin("sso-1", "company_sso")],
+        ..Default::default()
+    };
+    assert_eq!(auth_findings(&stream, &policies).len(), 1);
+
+    // A custom stream authenticator is declared persistently rather than
+    // released per PR.
+    policies
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols =
+        custom_protocols(&[("company_sso", &[PluginProtocol::Tcp][..])]);
+    assert!(auth_findings(&stream, &policies).is_empty());
+    let findings = auth_findings(&http, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].contains("were ignored: company_sso (sso-1)"),
+        "{findings:?}"
+    );
 }
 
 #[test]
@@ -2503,8 +2609,9 @@ fn require_auth_plugin_applies_protocol_rules_to_proxy_group_attachments() {
 
 #[test]
 fn require_auth_plugin_fails_closed_for_unverified_stream_authenticators() {
-    // A custom authenticator's supported protocols are not visible here, so it
-    // counts on HTTP proxies only.
+    // A custom authenticator's supported protocols are not visible here, so
+    // without a declaration it counts for plain HTTP requests only, the
+    // gateway's trait default.
     let policies = require_auth_policies(Some(&["company_sso", "MTLS_AUTH"]));
 
     let http = GatewayConfig {
@@ -2512,7 +2619,13 @@ fn require_auth_plugin_fails_closed_for_unverified_stream_authenticators() {
         plugin_configs: vec![global_plugin("sso-1", "company_sso")],
         ..Default::default()
     };
-    assert!(auth_findings(&http, &policies).is_empty());
+    let findings = auth_findings(&http, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].contains("gRPC, WebSocket requests")
+            && findings[0].contains("company_sso (sso-1)"),
+        "{findings:?}"
+    );
 
     let stream = GatewayConfig {
         proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
@@ -2541,8 +2654,8 @@ fn require_auth_plugin_fails_closed_for_unverified_stream_authenticators() {
 #[test]
 fn stream_auth_catalog_matches_the_gateway_protocol_contract() {
     use gitforgeops::plugin_catalog::{
-        auth_plugin_applies_to_proxy, is_builtin, proxy_transport, ProxyTransport,
-        AUTH_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
+        builtin_auth_protocols, http_family_auth_plugin_names, is_builtin, proxy_transport,
+        AuthAllowlist, ProxyTransport, AUTH_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
     };
 
     let http = proxy("api", BackendScheme::Https, 30_000, true);
@@ -2551,20 +2664,40 @@ fn stream_auth_catalog_matches_the_gateway_protocol_contract() {
     assert_eq!(proxy_transport(&http), ProxyTransport::HttpFamily);
     assert_eq!(proxy_transport(&tcp), ProxyTransport::Tcp);
     assert_eq!(proxy_transport(&udp), ProxyTransport::Udp);
+    assert_eq!(
+        ProxyTransport::HttpFamily.request_protocols(),
+        HTTP_FAMILY_PROTOCOLS
+    );
 
     // Pinned to Ferrum Edge v0.9.7: mtls_auth is the only built-in that both
     // runs on stream listeners and rejects an unauthenticated peer there.
     assert_eq!(STREAM_AUTH_PLUGIN_NAMES, &["mtls_auth"]);
-    for name in STREAM_AUTH_PLUGIN_NAMES {
-        assert!(AUTH_PLUGIN_NAMES.contains(name) && is_builtin(name));
-    }
     for name in AUTH_PLUGIN_NAMES {
-        assert!(auth_plugin_applies_to_proxy(name, &http), "{name} on HTTP");
+        assert!(is_builtin(name), "{name}");
+        let protocols = builtin_auth_protocols(name);
         let stream_capable = STREAM_AUTH_PLUGIN_NAMES.contains(name);
-        assert_eq!(auth_plugin_applies_to_proxy(name, &tcp), stream_capable);
-        assert_eq!(auth_plugin_applies_to_proxy(name, &udp), stream_capable);
+        assert_eq!(protocols.contains(&PluginProtocol::Tcp), stream_capable);
+        assert_eq!(protocols.contains(&PluginProtocol::Udp), stream_capable);
+        assert!(protocols.contains(&PluginProtocol::Http), "{name} on HTTP");
     }
-    assert!(!auth_plugin_applies_to_proxy("company_sso", &tcp));
+    // soap_ws_security declares HTTP_ONLY_PROTOCOLS: gRPC and WebSocket
+    // requests skip it. Every other built-in covers the whole HTTP family.
+    assert_eq!(
+        builtin_auth_protocols("soap_ws_security"),
+        &[PluginProtocol::Http]
+    );
+    let http_family = http_family_auth_plugin_names();
+    for name in AUTH_PLUGIN_NAMES {
+        assert_eq!(http_family.contains(name), *name != "soap_ws_security");
+    }
+    // A built-in that is not an authenticator runs as one on no protocol.
+    assert!(builtin_auth_protocols("spiffe_identity").is_empty());
+    assert!(builtin_auth_protocols("rate_limiting").is_empty());
+
+    // An undeclared custom authenticator gets the gateway's trait default.
+    let allowlist = AuthAllowlist::new(&["company_sso".to_string()], &Default::default());
+    assert_eq!(allowlist.protocols("company_sso"), &[PluginProtocol::Http]);
+    assert!(!allowlist.runs_on("company_sso", PluginProtocol::Tcp));
 }
 
 #[test]
@@ -2728,6 +2861,95 @@ overrides:
 }
 
 #[test]
+fn policy_config_loads_custom_auth_plugin_protocols() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn rule(protocols: &str) -> String {
+        format!(
+            "version: 1
+policies:
+  require_auth_plugin:
+    auth_plugin_names: [company_sso, key_auth]
+    custom_auth_plugin_protocols:
+      {protocols}
+"
+        )
+    }
+    let load = |yaml: &str| {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{yaml}").unwrap();
+        load_policies_from_path(file.path())
+    };
+
+    let loaded = load(&rule("company_sso: [http, grpc, websocket, tcp]"))
+        .unwrap()
+        .unwrap();
+    let allowlist = loaded.policies.require_auth_plugin.auth_allowlist();
+    assert_eq!(
+        allowlist.protocols("company_sso"),
+        &[
+            PluginProtocol::Http,
+            PluginProtocol::Grpc,
+            PluginProtocol::WebSocket,
+            PluginProtocol::Tcp,
+        ]
+    );
+
+    // A built-in's protocols are the gateway's; declaring them is an error.
+    let err = load(&rule("key_auth: [tcp]")).unwrap_err().to_string();
+    assert!(err.contains("built-in plugin 'key_auth'"), "{err}");
+
+    // A declaration for a name missing from the allowlist declares nothing.
+    let err = load(&rule("company_ssso: [http]")).unwrap_err().to_string();
+    assert!(err.contains("'company_ssso'"), "{err}");
+
+    // A legacy alias is not a gateway plugin_name, so it can never match a
+    // live plugin; declaring its protocols is an error.
+    let err = load(&rule("jwt: [http, grpc, websocket]"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'jwt', a legacy spelling"), "{err}");
+
+    // Unknown protocols fail to parse.
+    assert!(load(&rule("company_sso: [quic]")).is_err());
+}
+
+#[test]
+fn policy_config_rejects_non_auth_builtins_in_auth_plugin_names() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let load = |names: &str| {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "version: 1\npolicies:\n  require_auth_plugin:\n    auth_plugin_names: {names}\n"
+        )
+        .unwrap();
+        load_policies_from_path(file.path())
+    };
+
+    // A non-auth built-in could only ever be reported as ignored, and its
+    // protocols cannot be declared, so it is rejected at load.
+    for name in ["opa", "access_control", "spiffe_identity", "Access_Control"] {
+        let names = format!("[jwt_auth, {name}]");
+        let err = load(&names).unwrap_err().to_string();
+        assert!(err.contains(&format!("built-in plugin '{name}'")), "{err}");
+        assert!(err.contains("does not authenticate callers"), "{err}");
+    }
+
+    // Authenticators, in any case, custom names and legacy aliases still load.
+    let loaded = load("[Jwt_Auth, mtls_auth, company_sso, jwt]")
+        .unwrap()
+        .unwrap();
+    let names = &loaded.policies.require_auth_plugin.auth_plugin_names;
+    assert_eq!(names.len(), 4);
+}
+
+#[test]
 fn policy_config_rejects_unknown_fields_at_every_owned_level() {
     use gitforgeops::policy::config::load_policies_from_path;
     use std::io::Write;
@@ -2861,7 +3083,7 @@ fn default_auth_plugin_names_cover_every_builtin_authenticator() {
     use gitforgeops::policy::config::{default_auth_plugin_names, is_default_auth_plugin_name};
 
     let defaults = default_auth_plugin_names();
-    assert_eq!(AUTH_PLUGIN_NAMES.len(), 11);
+    assert_eq!(AUTH_PLUGIN_NAMES.len(), 10);
     for name in AUTH_PLUGIN_NAMES {
         assert!(
             defaults.iter().any(|d| d == name),
@@ -2893,8 +3115,11 @@ fn default_auth_plugin_names_cover_every_builtin_authenticator() {
             )],
             ..Default::default()
         };
-        assert!(
+        // soap_ws_security runs on plain HTTP only; see
+        // require_auth_plugin_requires_an_authenticator_for_every_http_family_protocol.
+        assert_eq!(
             evaluate_policies(&cfg, &policies).is_empty(),
+            *name != "soap_ws_security",
             "{name} should satisfy require_auth_plugin"
         );
     }
