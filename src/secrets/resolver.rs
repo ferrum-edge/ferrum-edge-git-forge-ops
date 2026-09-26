@@ -1622,11 +1622,11 @@ fn check_array_slot_identity(
                      value for it, but array '{prefix}' now has {} entr{} (entry index {index} no \
                      longer exists). Slot identity is positional, so the entry that shifted into \
                      a vacated index has inherited a retired credential, and re-growing the array \
-                     would resurrect this value for a new entry. Rotation replaces and delivers a \
-                     value but does not remove the bundle key. Before shrinking or shifting the \
-                     array, update the private bundle to move surviving rotated values to their \
-                     new canonical slots and remove vacated keys, preserving unrelated entries — \
-                     or pass --allow-credential-slot-remap to accept the reassignment.",
+                     would resurrect this value for a new entry. Rotation replaces the value and \
+                     sends it to the gateway but does not remove the bundle key. Before shrinking or \
+                     shifting the array, update the private bundle to move surviving rotated values \
+                     to their new canonical slots and remove vacated keys, preserving unrelated \
+                     entries — or pass --allow-credential-slot-remap to accept the reassignment.",
                     items.len(),
                     if items.len() == 1 { "y" } else { "ies" }
                 ),

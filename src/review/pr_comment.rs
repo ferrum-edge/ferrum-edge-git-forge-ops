@@ -1109,8 +1109,8 @@ pub fn build_review_comment_with_preview(
         append_omitted_list_item(&mut md, secrets.slot_remaps.len(), "slot remap");
         md.push('\n');
         md.push_str(
-            "> **Apply is blocked.** Rotation replaces and delivers a value at its current slot but \
-             does not remove the bundle key. Before shrinking or shifting a Consumer array, move \
+            "> **Apply is blocked.** Rotation replaces the value and sends it at its current slot \
+             but does not remove the bundle key. Before shrinking or shifting a Consumer array, move \
              surviving rotated values to their new canonical slots in the private bundle and \
              remove vacated keys, preserving unrelated entries. Reseed plugin-config slots and \
              retire orphaned keys from the bundle, or re-run with `--allow-credential-slot-remap` \

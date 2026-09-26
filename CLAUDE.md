@@ -39,8 +39,8 @@ They also accept `--allow-credential-slot-remap`, which downgrades the
 credential slot-remap refusal (array shrinks, dropped credential types, deleted
 Consumers and revived slots) to a report (see Credential broker). It is
 CLI-only on purpose — no env var — because accepting a credential reassignment
-is a per-run decision, not a repository setting. Rotation replaces and delivers
-a value at its current slot but does not remove that bundle key. Before
+is a per-run decision, not a repository setting. Rotation replaces the value and sends it to the
+gateway at its current slot but does not remove that bundle key. Before
 shrinking or shifting an array, update the private bundle: move each surviving
 rotated value to its new canonical slot and remove vacated keys, preserving all
 unrelated entries. The bundled apply workflow does not pass this CLI-only

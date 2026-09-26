@@ -25,7 +25,7 @@ pub struct Cli {
     /// slot. Credential slot identity is the entry's array index, so shrinking
     /// a multi-entry credential hands the retired slot's value to whichever
     /// entry shifts into its index and orphans the rest; without this flag
-    /// that is refused. Rotation replaces and delivers a value at its current
+    /// that is refused. Rotation replaces the value and sends it at its current
     /// slot but does not remove the bundle key. Before shrinking or shifting
     /// the array, move each surviving rotated value to its new canonical slot
     /// in the private bundle and remove vacated keys, preserving unrelated
