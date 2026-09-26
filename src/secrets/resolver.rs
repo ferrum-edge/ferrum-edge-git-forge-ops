@@ -366,9 +366,8 @@ impl ResolveReport {
     /// `apply` allocates from this, excluding namespaces it is about to
     /// refuse: a credential generated and delivered for a row the gateway
     /// never receives would reach its recipient as a value that does not
-    /// work. Only the
-    /// per-slot results are filtered; the slot-keyed lookup tables are
-    /// consulted for listed slots alone.
+    /// work. Only the per-slot results are filtered; the slot-keyed lookup
+    /// tables are consulted for listed slots alone.
     pub fn without_namespaces<'a>(&self, namespaces: impl IntoIterator<Item = &'a str>) -> Self {
         let excluded: std::collections::BTreeSet<&str> = namespaces.into_iter().collect();
         let mut report = self.clone();

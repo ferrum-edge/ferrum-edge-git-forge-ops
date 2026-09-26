@@ -5632,7 +5632,108 @@ async fn a_resolved_credential_is_written_normally() {
             .lock()
             .unwrap()
             .iter()
-            .any(|request| request.starts_with("POST /consumers")),
-        "the consumer create was attempted"
+            .any(|request| {
+                request.starts_with("POST /batch")
+                    && request.contains("resolved-value-aaaaaaaaaaaaaaaa")
+                    && !request.contains("gh-env-secret")
+            }),
+        "the resolved credential was included in the batch without its placeholder"
     );
+}
+
+#[tokio::test]
+async fn apply_refuses_an_unresolved_plugin_config_secret_before_any_write() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let mut desired = GatewayConfig {
+        plugin_configs: vec![plugin_config("pc1", "team-alpha", "p1", None)],
+        ..Default::default()
+    };
+    desired.plugin_configs[0].plugin_name = "opa".to_string();
+    desired.plugin_configs[0].config = serde_json::json!({
+        "headers": {"authorization": placeholder}
+    });
+    let namespaces = vec!["team-alpha".to_string()];
+    let actuals = empty_actuals(&["team-alpha"]);
+    let extras = no_extras(&namespaces);
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "GET /health".into(),
+        200,
+        HEALTHY.into(),
+        vec![],
+    )]);
+
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(
+        error.contains("team-alpha/pc1/@plugin-config/config/headers/authorization"),
+        "{error}"
+    );
+    assert!(!error.contains(placeholder), "{error}");
+    assert_eq!(result.created, 0);
+    assert!(mutation_lines(&requests).is_empty());
+}
+
+#[tokio::test]
+async fn apply_refuses_an_unresolved_service_discovery_secret_before_any_write() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let desired = GatewayConfig {
+        upstreams: vec![serde_json::from_value(serde_json::json!({
+            "id": "u1",
+            "namespace": "team-alpha",
+            "targets": [{"host": "10.0.0.1", "port": 8080}],
+            "service_discovery": {
+                "provider": "consul",
+                "consul": {
+                    "address": "http://consul.internal:8500",
+                    "service_name": "api",
+                    "token": placeholder
+                }
+            }
+        }))
+        .expect("upstream fixture")],
+        ..Default::default()
+    };
+    let namespaces = vec!["team-alpha".to_string()];
+    let actuals = empty_actuals(&["team-alpha"]);
+    let extras = no_extras(&namespaces);
+    let (url, requests) = spawn_recording_gateway(vec![(
+        "GET /health".into(),
+        200,
+        HEALTHY.into(),
+        vec![],
+    )]);
+
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(
+        error.contains("team-alpha/u1/@service-discovery/consul/token"),
+        "{error}"
+    );
+    assert!(!error.contains(placeholder), "{error}");
+    assert_eq!(result.created, 0);
+    assert!(mutation_lines(&requests).is_empty());
 }
