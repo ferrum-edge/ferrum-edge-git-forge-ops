@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 import re
@@ -209,9 +210,10 @@ def require_confinement_support() -> None:
         and hasattr(os, "O_DIRECTORY")
         and all(
             call in os.supports_dir_fd
-            for call in (os.open, os.stat, os.mkdir, os.rename, os.unlink)
+            for call in (os.open, os.stat, os.listdir, os.mkdir, os.rename, os.unlink)
         )
         and os.stat in os.supports_follow_symlinks
+        and hasattr(os, "fchmod")
     )
     if not supported:
         raise UpdateError(
@@ -225,7 +227,7 @@ def _components(relative: str) -> list[str]:
     """The components of a repository-relative path that cannot leave the root."""
     parts = relative.split("/")
     if not relative or "\0" in relative or any(
-        part in ("", ".", "..") for part in parts
+        part in ("", ".", "..") or part.lower() == ".git" for part in parts
     ):
         raise UpdateError(
             f"refusing {relative!r}: it is not a normalized path inside the repository"
@@ -260,7 +262,9 @@ def _refusal(relative: str, shown: str, what: str) -> UpdateError:
 
 
 @contextlib.contextmanager
-def _parent_directory(root: Path, relative: str, *, create: bool = False):
+def _parent_directory(
+    root: Path, relative: str, *, create: bool = False, missing_parent: bool = False
+):
     """The directory holding `relative`, reached without following any link.
 
     Yields (descriptor, final component), or (None, final component) when a
@@ -293,7 +297,12 @@ def _parent_directory(root: Path, relative: str, *, create: bool = False):
                         f"refusing {relative}: {shown} could not be created as a "
                         f"directory: {error}"
                     ) from error
-            except OSError:
+            except OSError as error:
+                if missing_parent and error.errno == errno.ENOTDIR:
+                    info = _lstat_at(current, part)
+                    if info is not None and stat.S_ISREG(info.st_mode):
+                        missing = True
+                        break
                 info = _lstat_at(current, part)
                 what = "not a directory" if info is None else _kind(info.st_mode)
                 raise _refusal(relative, shown, what) from None
@@ -304,9 +313,11 @@ def _parent_directory(root: Path, relative: str, *, create: bool = False):
         os.close(current)
 
 
-def read_local(root: Path, relative: str) -> bytes | None:
+def read_local(
+    root: Path, relative: str, *, missing_parent: bool = False
+) -> bytes | None:
     """A regular file's bytes, or None when it (or a parent) does not exist."""
-    with _parent_directory(root, relative) as (parent, name):
+    with _parent_directory(root, relative, missing_parent=missing_parent) as (parent, name):
         if parent is None:
             return None
         try:
@@ -352,11 +363,7 @@ def write_local(
                 handle.write(content)
                 if existing is None:
                     existing = os.fstat(handle.fileno())
-                mode = stat.S_IMODE(existing.st_mode)
-                # `git cat-file` carries no mode; the tree entry's executable
-                # bit does, so a helper script does not arrive un-runnable.
-                if executable:
-                    mode |= 0o111
+                mode = 0o755 if executable else 0o644
                 os.fchmod(handle.fileno(), mode)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -530,6 +537,17 @@ def _object(mirror: Path, object_id: str) -> bytes:
     return result.stdout
 
 
+def _local_state(
+    root: Path, relative: str, *, missing_parent: bool = False
+) -> tuple[bytes, bool] | None:
+    content = read_local(root, relative, missing_parent=missing_parent)
+    if content is None:
+        return None
+    with _parent_directory(root, relative) as (parent, name):
+        info = _lstat_at(parent, name)
+        return content, bool(info.st_mode & 0o111)
+
+
 def is_customer_owned(path: str) -> bool:
     return any(
         path == owned or path.startswith(f"{owned}/") for owned in CUSTOMER_OWNED
@@ -567,6 +585,7 @@ def build_plan(
 ) -> Plan:
     before_tree = _tree_entries(mirror, baseline.commit)
     after_tree = _tree_entries(mirror, target)
+    removed_files = set(before_tree) - set(after_tree)
     plan = Plan(baseline=baseline, target=target, target_tree=after_tree)
     for path in sorted(set(before_tree) | set(after_tree)):
         contents: list[bytes | None] = []
@@ -580,28 +599,38 @@ def build_plan(
                 )
             contents.append(None if entry is None else _object(mirror, entry.object_id))
         before, after = contents
-        local = read_local(root, path)
+        local_state = _local_state(
+            root,
+            path,
+            missing_parent=any(path.startswith(f"{removed}/") for removed in removed_files),
+        )
+        local = None if local_state is None else local_state[0]
+        local_executable = False if local_state is None else local_state[1]
+        before_executable = before_tree.get(path) is not None and before_tree[path].executable
+        after_executable = after_tree.get(path) is not None and after_tree[path].executable
 
-        if before == after:
+        if before == after and before_executable == after_executable:
             plan.changes.append(
                 Change(
                     path,
-                    LOCAL_ONLY if local != before else UNCHANGED,
+                    LOCAL_ONLY
+                    if (local, local_executable) != (before, before_executable)
+                    else UNCHANGED,
                     "upstream did not change this file"
                     + (
                         "; your local edit is preserved"
-                        if local != before
+                        if (local, local_executable) != (before, before_executable)
                         else ""
                     ),
                 )
             )
             continue
-        if local == after:
+        if (local, local_executable) == (after, after_executable):
             plan.changes.append(
                 Change(path, ALREADY, "already matches the target revision")
             )
             continue
-        if local == before:
+        if (local, local_executable) == (before, before_executable):
             plan.changes.append(
                 Change(
                     path,
@@ -689,8 +718,16 @@ def _local_paths(root: Path) -> list[str]:
         capture_output=True,
         text=True,
     )
-    if inside.returncode != 0 or inside.stdout.strip() != "true":
-        return _walk_local(root)
+    if inside.returncode != 0:
+        error = inside.stderr.decode("utf-8", "replace").strip()
+        if "not a git repository" in error.lower():
+            return _walk_local(root)
+        raise UpdateError(f"git rev-parse failed in {root}: {error or 'unknown error'}")
+    if inside.stdout.strip() != "true":
+        raise UpdateError(
+            f"git rev-parse in {root} did not identify a Git work tree: "
+            f"{inside.stdout.strip()!r}"
+        )
     listing = subprocess.run(
         [
             "git",
@@ -721,9 +758,21 @@ def _local_managed_hashes(root: Path) -> dict[str, tuple[str, str]]:
     for relative in _local_paths(root):
         if not is_upstream_managed(relative):
             continue
-        content = read_local(root, relative)
-        if content is not None:
-            hashes[relative] = ("file", _blob_hash(content))
+        with _parent_directory(root, relative) as (parent, name):
+            if parent is None:
+                continue
+            info = _lstat_at(parent, name)
+            if info is None:
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(name, dir_fd=parent).encode("utf-8", "surrogateescape")
+                hashes[relative] = ("120000", _blob_hash(target))
+            elif stat.S_ISREG(info.st_mode):
+                content = read_local(root, relative)
+                if content is not None:
+                    hashes[relative] = ("file", _blob_hash(content))
+            else:
+                raise _refusal(relative, relative, _kind(info.st_mode))
     return hashes
 
 
@@ -777,6 +826,7 @@ MIRROR_CONFIG = (
     ("gc.auto", "0"),
     ("maintenance.auto", "false"),
     ("core.fsmonitor", "false"),
+    ("fetch.fsckObjects", "true"),
 )
 
 
@@ -817,6 +867,30 @@ def resolve(mirror: Path, ref: str) -> str:
     if not resolved:
         raise UpdateError(f"upstream revision {ref!r} could not be resolved")
     return resolved
+
+
+def _remove_stale_temporaries(root: Path) -> None:
+    """Remove abandoned sibling files left by an interrupted atomic write."""
+    pending = list(UPSTREAM_MANAGED)
+    while pending:
+        relative = pending.pop()
+        with _parent_directory(root, relative) as (parent, name):
+            info = None if parent is None else _lstat_at(parent, name)
+            if info is None or not stat.S_ISDIR(info.st_mode):
+                continue
+            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent)
+            try:
+                for child in os.listdir(descriptor):
+                    if re.fullmatch(r"\..+\.template-update-[0-9a-f]{16}", child):
+                        child_info = _lstat_at(descriptor, child)
+                        if child_info is not None and stat.S_ISREG(child_info.st_mode):
+                            os.unlink(child, dir_fd=descriptor)
+                    else:
+                        child_info = _lstat_at(descriptor, child)
+                        if child_info is not None and stat.S_ISDIR(child_info.st_mode):
+                            pending.append(f"{relative}/{child}")
+            finally:
+                os.close(descriptor)
 
 
 def identify(root: Path) -> dict:
@@ -968,6 +1042,11 @@ def main(argv: list[str] | None = None) -> int:
             ref = validate_ref(
                 args.to or (recorded.ref if recorded else DEFAULT_REF), "target ref"
             )
+            if args.to and args.to.upper() == "HEAD":
+                raise UpdateError(
+                    "--to HEAD is ambiguous; provide an explicit branch, tag, or SHA"
+                )
+            _remove_stale_temporaries(root)
             with tempfile.TemporaryDirectory() as temporary:
                 mirror = prepare_mirror(upstream, (ref,), Path(temporary))
                 commit, differing, examined = detect_baseline(root, mirror, ref)
@@ -1014,6 +1093,11 @@ def main(argv: list[str] | None = None) -> int:
             raise UpdateError("upstream must be a path or URL, not a Git option")
         target_ref = args.to or baseline.ref or DEFAULT_REF
         target_ref = validate_ref(target_ref, "target ref")
+        if args.to and args.to.upper() == "HEAD":
+            raise UpdateError(
+                "--to HEAD is ambiguous; provide an explicit branch, tag, or SHA"
+            )
+        _remove_stale_temporaries(root)
 
         with tempfile.TemporaryDirectory() as temporary:
             workdir = Path(temporary)

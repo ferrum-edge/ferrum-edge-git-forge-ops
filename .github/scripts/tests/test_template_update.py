@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -187,6 +188,29 @@ class TemplateUpdateTests(unittest.TestCase):
         result = self.fixture.run("apply")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((self.fixture.customer / "src/apply/api_target.rs").exists())
+
+    def test_upstream_mode_replaces_local_permission_and_special_bits(self):
+        path = self.fixture.customer / "src/main.rs"
+        upstream_path = self.fixture.upstream / "src/main.rs"
+        upstream_path.chmod(0o755)
+        self.fixture.upstream_change({}, "make upstream executable")
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(path.stat().st_mode & 0o7777, 0o755)
+
+        path.chmod(0o4755)
+        upstream_path.write_text("fn main() { println!(\"v2\"); }\n", encoding="utf-8")
+        self.fixture.upstream_change({}, "change executable upstream file")
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(path.stat().st_mode & 0o7777, 0o755)
+
+        upstream_path.chmod(0o644)
+        upstream_path.write_text("fn main() { println!(\"v3\"); }\n", encoding="utf-8")
+        self.fixture.upstream_change({}, "make upstream non-executable")
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(path.stat().st_mode & 0o7777, 0o644)
 
     # -- customer-owned files and state survive -----------------------------
 
@@ -520,6 +544,11 @@ class UrlUpstreamTests(unittest.TestCase):
             (self.url, "main", target),
         )
 
+    def test_head_target_requires_an_explicit_revision(self):
+        result = self.fixture.run("plan", "--to", "HEAD")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--to HEAD is ambiguous", result.stderr)
+
     def test_detect_baseline_searches_the_default_main_ref(self):
         copied = self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
         self.fixture.upstream_change({"src/main.rs": "// v3\n"}, "v3")
@@ -552,6 +581,7 @@ class UrlUpstreamTests(unittest.TestCase):
                 ("gc.auto", "0"),
                 ("maintenance.auto", "false"),
                 ("core.fsmonitor", "false"),
+                ("fetch.fsckObjects", "true"),
             ):
                 with self.subTest(key=key):
                     self.assertEqual(git(mirror, "config", "--get", key).strip(), value)
@@ -623,6 +653,32 @@ class IgnoredRuntimeFileTests(unittest.TestCase):
         self.assertEqual(extra.returncode, 1, extra.stdout + extra.stderr)
         self.assertIn("1 upstream-managed path(s) differ", extra.stdout)
 
+    def test_detect_baseline_counts_a_local_link_without_following_it(self):
+        path = self.fixture.customer / "src/main.rs"
+        path.unlink()
+        path.symlink_to("local-target.rs")
+        result = self.fixture.run("detect-baseline")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("1 upstream-managed path(s) differ", result.stdout)
+
+    def test_git_probe_errors_other_than_non_repository_fail_closed(self):
+        failure = subprocess.CompletedProcess(
+            ["git", "rev-parse"], 128, b"", b"fatal: unsafe repository (safe.directory)"
+        )
+        with mock.patch.object(template_update.subprocess, "run", return_value=failure):
+            with self.assertRaisesRegex(template_update.UpdateError, "git rev-parse failed"):
+                template_update._local_paths(self.fixture.customer)
+
+    def test_plan_cleans_up_abandoned_atomic_write_temporaries(self):
+        temporary = (
+            self.fixture.customer
+            / ".github/scripts/.helper.py.template-update-0123456789abcdef"
+        )
+        temporary.write_text("incomplete\n", encoding="utf-8")
+        result = self.fixture.run("plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(temporary.exists())
+
 
 class ConfinementTests(unittest.TestCase):
     """Reads and writes stay on real files under the managed paths.
@@ -639,6 +695,29 @@ class ConfinementTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
+
+    def test_upstream_file_to_directory_transition_is_planned_and_applied(self):
+        upstream_file = self.fixture.upstream / "docs/x"
+        customer_file = self.fixture.customer / "docs/x"
+        upstream_file.write_text("old\n", encoding="utf-8")
+        customer_file.write_text("old\n", encoding="utf-8")
+        baseline = commit(self.fixture.upstream, "add docs/x")
+        template_update.Baseline(
+            str(self.fixture.upstream), "main", baseline
+        ).write(self.fixture.customer)
+        upstream_file.unlink()
+        (self.fixture.upstream / "docs/x").mkdir()
+        (self.fixture.upstream / "docs/x/y").write_text("new\n", encoding="utf-8")
+        target = commit(self.fixture.upstream, "turn docs/x into directory")
+
+        plan = self.fixture.run("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(customer_file.exists())
+        self.assertEqual((self.fixture.customer / "docs/x/y").read_text(), "new\n")
+        recorded = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        self.assertEqual(recorded["commit"], target)
 
     def assert_refused(self, result: subprocess.CompletedProcess, message: str) -> None:
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

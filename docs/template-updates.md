@@ -126,6 +126,10 @@ how much attention they need from you:
 `plan` exits 1 when a conflict exists, so it is the one to wire into a job if
 you want a red signal.
 
+`plan` and `apply` compare only paths present in either the recorded upstream
+baseline tree or the selected target tree. Files added locally at paths absent
+from both trees are not part of that update comparison.
+
 ## Before your first update: record your real baseline
 
 "Use this template" copies upstream's own `.gitforgeops/baseline.json`, and
