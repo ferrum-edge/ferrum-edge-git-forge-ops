@@ -2792,7 +2792,7 @@ fn a_retry_after_a_state_commit_keeps_its_recorded_allocation() {
     let first_head = || Some(FIRST_HEAD.to_string());
     let after_state_commit = || Some(STATE_COMMIT.to_string());
 
-    let first = AllocationBinding::resolve(Some(TRIGGER), Some("alice"), first_head);
+    let first = AllocationBinding::resolve(Some(TRIGGER), Some("alice"), first_head).unwrap();
     let mut state = StateFile {
         last_applied_at: Some(EARLIER.to_string()),
         ..Default::default()
@@ -2813,7 +2813,8 @@ fn a_retry_after_a_state_commit_keeps_its_recorded_allocation() {
         Some(TRIGGER)
     );
 
-    let retry = AllocationBinding::resolve(Some(TRIGGER), Some("alice"), after_state_commit);
+    let retry =
+        AllocationBinding::resolve(Some(TRIGGER), Some("alice"), after_state_commit).unwrap();
     let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete, &retry);
     let report = report_with_ledger(&regrown, &bundle, &ledger, false)
         .expect("the retry of the same trigger recognizes its own slot");
@@ -2821,7 +2822,7 @@ fn a_retry_after_a_state_commit_keeps_its_recorded_allocation() {
     assert_eq!(report.results[0].status, SlotStatus::Resolved);
 
     // Bound to the checkout instead, the state commit would break the match.
-    let by_head = AllocationBinding::resolve(None, Some("alice"), after_state_commit);
+    let by_head = AllocationBinding::resolve(None, Some("alice"), after_state_commit).unwrap();
     let ledger = ConsumerLedger::from_state(&state, ConsumerCoverage::Complete, &by_head);
     assert!(report_with_ledger(&regrown, &bundle, &ledger, false).is_err());
 }

@@ -989,6 +989,11 @@ failed attempt's state commit. Without it (local CLI) the checked-out commit is
 used. `main.rs` resolves the binding once per command
 (`AllocationBinding::from_env`) and passes the same value to the ledger and the
 journal. An unmatched entry is still refused as a revived slot, with a hint.
+Only an unset `GITFORGEOPS_ACTOR` means no recipient: `AllocationBinding::resolve`
+refuses a set-but-blank or non-login value as a configuration error (#392), and
+`cmd_apply` resolves the binding before any state, bundle or network access.
+`rotate --recipient` and `export --encrypt-to` call
+`secrets::check_recipient_login` before anything else.
 
 Delivery: after allocation or rotation, the value is age-encrypted to the PR
 author's (or dispatcher's) SSH public key fetched from
