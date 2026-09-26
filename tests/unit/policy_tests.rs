@@ -3132,12 +3132,137 @@ fn waf_enforcement_accepts_a_promoted_rule_pack() {
         serde_json::json!({"mode": "enforce", "default_rule_action": "enforce"}),
         serde_json::json!({"mode": "enforce", "rule_modes": {"FE-SQLI-001": "enforce"}}),
         serde_json::json!({"mode": "enforce", "rule_overrides": {"FE-XSS-001": {"action": "enforce"}}}),
-        serde_json::json!({"mode": "enforce", "custom_rules": [{"id": "x", "action": "block"}]}),
+        serde_json::json!({"mode": "enforce", "custom_rules": [waf_custom_rule(Some("block"))]}),
     ] {
         let cfg = waf_config(promotion.clone());
         assert!(
             evaluate_policies(&cfg, &waf_policies(None)).is_empty(),
             "expected no finding for {promotion}"
+        );
+    }
+}
+
+/// A complete custom rule the gateway accepts; `action` is omitted when `None`.
+fn waf_custom_rule(action: Option<&str>) -> serde_json::Value {
+    let mut rule = serde_json::json!({
+        "id": "AUDIT-1",
+        "category": "custom",
+        "target": "url_path",
+        "match_kind": "contains",
+        "pattern": "/blocked",
+    });
+    if let Some(action) = action {
+        rule["action"] = serde_json::json!(action);
+    }
+    rule
+}
+
+/// WAF configs with no built-in rules whose only enforcement could come from
+/// the custom rule, paired with whether the gateway compiles it as enforcing.
+fn waf_custom_rule_cases() -> Vec<(serde_json::Value, bool)> {
+    let only = |extra: serde_json::Value, action: Option<&str>| {
+        let mut config = serde_json::json!({
+            "include_default_rules": false,
+            "custom_rules": [waf_custom_rule(action)],
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        config
+    };
+    vec![
+        // An omitted action defaults to enforce under global enforce mode,
+        // whether `mode` is spelled out or left at its default.
+        (only(serde_json::json!({"mode": "enforce"}), None), true),
+        (only(serde_json::json!({}), None), true),
+        (
+            only(serde_json::json!({"mode": "enforce"}), Some("enforce")),
+            true,
+        ),
+        (
+            only(serde_json::json!({"mode": "enforce"}), Some("monitor")),
+            false,
+        ),
+        (
+            only(serde_json::json!({"mode": "enforce"}), Some("disabled")),
+            false,
+        ),
+        // `rule_modes` and `rule_overrides` for the custom rule's id win over
+        // its own (or defaulted) action.
+        (
+            only(
+                serde_json::json!({"mode": "enforce", "rule_modes": {"AUDIT-1": "disabled"}}),
+                None,
+            ),
+            false,
+        ),
+        (
+            only(
+                serde_json::json!({
+                    "mode": "enforce",
+                    "rule_overrides": {"AUDIT-1": {"action": "monitor"}},
+                }),
+                Some("enforce"),
+            ),
+            false,
+        ),
+        (
+            only(
+                serde_json::json!({
+                    "mode": "enforce",
+                    "rule_modes": {"AUDIT-1": "monitor"},
+                    "rule_overrides": {"AUDIT-1": {"action": "enforce"}},
+                }),
+                None,
+            ),
+            false,
+        ),
+        // A rule above the active paranoia level is not compiled unless
+        // `rule_modes` forces it to enforce.
+        (
+            {
+                let mut config = only(serde_json::json!({"mode": "enforce"}), None);
+                config["custom_rules"][0]["paranoia_min"] = serde_json::json!(3);
+                config
+            },
+            false,
+        ),
+        (
+            only(
+                serde_json::json!({
+                    "mode": "enforce",
+                    "paranoia_level": 1,
+                    "rule_overrides": {"AUDIT-1": {"paranoia_min": 2}},
+                }),
+                None,
+            ),
+            false,
+        ),
+    ]
+}
+
+#[test]
+fn waf_enforcement_follows_the_effective_custom_rule_action() {
+    for (config, enforcing) in waf_custom_rule_cases() {
+        let cfg = waf_config(config.clone());
+        let findings = evaluate_policies(&cfg, &waf_policies(None));
+        if enforcing {
+            assert!(
+                findings.is_empty(),
+                "expected no finding for {config}: {findings:?}"
+            );
+        } else {
+            assert_eq!(findings.len(), 1, "expected one finding for {config}");
+            assert!(findings[0].message.contains("no rule enforces"));
+            assert!(findings[0].is_blocking());
+        }
+        // The security audit shares the predicate and must agree.
+        let audit_flags = gitforgeops::diff::security::audit_security(&cfg)
+            .iter()
+            .any(|f| f.message.contains("no rule enforces"));
+        assert_eq!(
+            audit_flags, !enforcing,
+            "security audit disagrees for {config}"
         );
     }
 }

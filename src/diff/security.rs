@@ -468,7 +468,7 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
                     id,
                     ns,
                     format!(
-                        "waf plugin {id} in namespace {ns} has mode: enforce but every built-in rule is monitor-only — no default_rule_action, rule_modes, rule_overrides or custom_rules entry promotes a rule to enforcement; set config.default_rule_action: enforce"
+                        "waf plugin {id} in namespace {ns} has mode: enforce but no rule enforces — the built-in rules are monitor-only and no default_rule_action, rule_modes, rule_overrides or enabled enforcing custom_rules entry promotes a rule to enforcement; set config.default_rule_action: enforce"
                     ),
                 ));
             }

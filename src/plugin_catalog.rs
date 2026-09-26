@@ -599,7 +599,8 @@ pub fn waf_mode_is_passive(mode: &str) -> bool {
 /// The built-in rule pack ships every rule at `monitor`, so `mode: enforce` on
 /// its own blocks nothing. Enforcement arrives through the bulk
 /// `default_rule_action` switch, a per-rule `rule_modes` entry, a
-/// `rule_overrides.<id>.action`, or a `custom_rules[].action`.
+/// `rule_overrides.<id>.action`, or a custom rule whose effective action
+/// enforces (see [`waf_custom_rule_enforces`]).
 pub fn waf_has_enforcing_rule(config: &serde_json::Value) -> bool {
     let enforcing = |value: Option<String>| {
         value.is_some_and(|action| WAF_ENFORCING_ACTIONS.contains(&action.as_str()))
@@ -608,7 +609,8 @@ pub fn waf_has_enforcing_rule(config: &serde_json::Value) -> bool {
     if enforcing(cfg_str(config, &["default_rule_action"])) {
         return true;
     }
-    if let Some(modes) = cfg_at(config, &["rule_modes"]).and_then(|v| v.as_object()) {
+    let modes = cfg_at(config, &["rule_modes"]).and_then(|v| v.as_object());
+    if let Some(modes) = modes {
         if modes
             .values()
             .any(|v| enforcing(v.as_str().map(|s| s.to_ascii_lowercase())))
@@ -616,20 +618,59 @@ pub fn waf_has_enforcing_rule(config: &serde_json::Value) -> bool {
             return true;
         }
     }
+    // A `rule_modes` entry for the same id is applied after the override's
+    // action, so an override only counts when `rule_modes` leaves it alone.
     if let Some(overrides) = cfg_at(config, &["rule_overrides"]).and_then(|v| v.as_object()) {
-        if overrides
-            .values()
-            .any(|v| enforcing(cfg_str(v, &["action"])))
-        {
+        if overrides.iter().any(|(id, v)| {
+            !modes.is_some_and(|m| m.contains_key(id)) && enforcing(cfg_str(v, &["action"]))
+        }) {
             return true;
         }
     }
     if let Some(custom) = cfg_array(config, &["custom_rules"]) {
-        if custom.iter().any(|v| enforcing(cfg_str(v, &["action"]))) {
+        if custom.iter().any(|rule| waf_custom_rule_enforces(config, rule)) {
             return true;
         }
     }
     false
+}
+
+/// Does the gateway compile the custom rule `rule` of the WAF `config` with an
+/// enforcing action?
+///
+/// Mirrors the paired gateway (v0.9.7, `src/plugins/waf/mod.rs` and
+/// `src/plugins/waf/rules.rs`): an omitted `custom_rules[].action` defaults to
+/// `enforce` when the global `mode` is `enforce` and to `monitor` otherwise.
+/// `rule_overrides.<id>.action` then replaces it, and `rule_modes.<id>` wins
+/// over both. A rule whose effective action is `disabled` is dropped, as is
+/// one whose `paranoia_min` (after `rule_overrides.<id>.paranoia_min`) exceeds
+/// `paranoia_level` unless `rule_modes.<id>` is `enforce`.
+pub fn waf_custom_rule_enforces(config: &serde_json::Value, rule: &serde_json::Value) -> bool {
+    let is_enforcing = |action: &str| WAF_ENFORCING_ACTIONS.contains(&action);
+    let id = rule.get("id").and_then(|v| v.as_str());
+    let rule_mode = id.and_then(|id| cfg_str(config, &["rule_modes", id]));
+    let overrides = id.and_then(|id| cfg_at(config, &["rule_overrides", id]));
+
+    let default_action = if waf_mode(config) == "enforce" {
+        "enforce".to_string()
+    } else {
+        "monitor".to_string()
+    };
+    let action = rule_mode
+        .clone()
+        .or_else(|| overrides.and_then(|ov| cfg_str(ov, &["action"])))
+        .or_else(|| cfg_str(rule, &["action"]))
+        .unwrap_or(default_action);
+    if !is_enforcing(action.as_str()) {
+        return false;
+    }
+
+    let paranoia_min = overrides
+        .and_then(|ov| cfg_u64(ov, &["paranoia_min"]))
+        .or_else(|| cfg_u64(rule, &["paranoia_min"]))
+        .unwrap_or(1);
+    let paranoia_level = cfg_u64(config, &["paranoia_level"]).unwrap_or(1);
+    paranoia_min <= paranoia_level || rule_mode.as_deref().is_some_and(is_enforcing)
 }
 
 /// Does this WAF instance wave through bodies it could not scan?
