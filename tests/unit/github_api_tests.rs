@@ -60,8 +60,28 @@ fn put_secret_path() -> String {
 }
 
 fn spawn_github_stub(routes: Vec<(String, u16, String)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let routes = routes
+        .into_iter()
+        .map(|(needle, status, body)| (needle, status, body, String::new()))
+        .collect();
+    spawn_github_stub_with_headers(routes)
+}
+
+/// [`spawn_github_stub`] whose routes also carry extra response header lines.
+/// `{base}` in a header is replaced with the stub's own origin, so a `Link`
+/// header can point back at the stub.
+fn spawn_github_stub_with_headers(
+    routes: Vec<(String, u16, String, String)>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let addr = listener.local_addr().expect("stub addr");
+    let base = format!("http://{addr}");
+    let routes: Vec<(String, u16, String, String)> = routes
+        .into_iter()
+        .map(|(needle, status, body, headers)| {
+            (needle, status, body, headers.replace("{base}", &base))
+        })
+        .collect();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let thread_requests = Arc::clone(&requests);
     std::thread::spawn(move || {
@@ -77,14 +97,14 @@ fn spawn_github_stub(routes: Vec<(String, u16, String)>) -> (String, Arc<Mutex<V
                     .lock()
                     .expect("record request")
                     .push(request.clone());
-                let (status, body) = routes
+                let (status, body, headers) = routes
                     .iter()
-                    .find(|(needle, _, _)| request.contains(needle))
-                    .map(|(_, status, body)| (*status, body.as_str()))
-                    .unwrap_or((404, "{\"message\":\"Not Found\"}"));
+                    .find(|(needle, _, _, _)| request.contains(needle))
+                    .map(|(_, status, body, headers)| (*status, body.as_str(), headers.as_str()))
+                    .unwrap_or((404, "{\"message\":\"Not Found\"}", ""));
                 if write!(
                     stream,
-                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{headers}\r\n{}",
                     body.len(),
                     body
                 )
@@ -95,7 +115,7 @@ fn spawn_github_stub(routes: Vec<(String, u16, String)>) -> (String, Arc<Mutex<V
             });
         }
     });
-    (format!("http://{addr}"), requests)
+    (base, requests)
 }
 
 fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
@@ -1177,6 +1197,201 @@ async fn a_failed_batch_discovery_writes_nothing() {
             requests.lock().expect("recorded").len(),
             1,
             "discovery is the only request of a refused batch"
+        );
+    }
+}
+
+// --- Recipient hardening (#384) ----------------------------------------------
+
+/// #384: rotation discovers the recipient's key against the injected API
+/// origin, before the shard write, and delivers a ciphertext of the new value.
+#[tokio::test]
+async fn rotate_and_deliver_discovers_the_recipient_against_the_api_base() {
+    let (public_key, identity) = recipient_keypair();
+    let keys_body = serde_json::json!([{"key": public_key}]).to_string();
+    let mut routes = vec![(keys_path(), 200, keys_body)];
+    routes.extend(success_routes(204));
+    let (api_base, requests) = spawn_github_stub(routes);
+    let slot = slot_path("ferrum", "app", "keyauth/key");
+    let mut shards = BTreeMap::new();
+    let mut shard_count = 1;
+    let allocated = rotate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        Some(RECIPIENT),
+        &slot,
+        32,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect("rotate against stub");
+
+    let delivered = allocated.delivered.as_ref().expect("rotation is delivered");
+    assert_eq!(delivered.login, RECIPIENT);
+    assert!(delivered.key_fingerprint.starts_with("SHA256:"));
+    assert_eq!(
+        decrypt_delivery(&delivered.encrypted_b64, &identity),
+        allocated.value
+    );
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    assert!(recorded[0].starts_with(&public_key_path()));
+    assert!(recorded[1].starts_with(&keys_path()));
+    assert!(recorded[2].starts_with(&put_secret_path()));
+    assert_eq!(header_value(&recorded[1], "Authorization"), None);
+}
+
+/// #384: a key listing that spans two pages is walked once for the whole
+/// batch: each page is requested exactly once however many slots it serves.
+#[tokio::test]
+async fn a_two_page_key_listing_is_walked_once_per_batch() {
+    const SLOTS: usize = 4;
+    let (public_key, identity) = recipient_keypair();
+    let first_page = format!("GET /users/{RECIPIENT}/keys?per_page=100 ");
+    let second_page = format!("GET /users/{RECIPIENT}/keys?per_page=100&page=2 ");
+    let next = format!("{{base}}/users/{RECIPIENT}/keys?per_page=100&page=2");
+    let link = format!("Link: <{next}>; rel=\"next\"\r\n");
+    let mut routes = vec![
+        (
+            second_page.clone(),
+            200,
+            serde_json::json!([{"key": public_key}]).to_string(),
+            String::new(),
+        ),
+        (
+            first_page.clone(),
+            200,
+            "[{\"key\":\"unsupported-public-key\"}]".to_string(),
+            link,
+        ),
+    ];
+    routes.extend(
+        success_routes(204)
+            .into_iter()
+            .map(|(needle, status, body)| (needle, status, body, String::new())),
+    );
+    let (api_base, requests) = spawn_github_stub_with_headers(routes);
+    let report = many_slot_report(SLOTS);
+    let mut shards = BTreeMap::new();
+    let mut shard_count = 1;
+    let outcome = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        Some(RECIPIENT),
+        &report,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect("allocate against stub");
+
+    assert_eq!(outcome.allocated.len(), SLOTS);
+    assert_eq!(count_requests(&requests, &first_page), 1);
+    assert_eq!(count_requests(&requests, &second_page), 1);
+    assert_eq!(count_requests(&requests, &keys_path()), 2);
+    for slot in &outcome.allocated {
+        let delivered = slot.delivered.as_ref().expect("every slot is delivered");
+        assert_eq!(
+            decrypt_delivery(&delivered.encrypted_b64, &identity),
+            slot.value
+        );
+    }
+}
+
+/// #384: the discovered recipient exposes its login and fingerprint read-only.
+#[tokio::test]
+async fn a_discovered_recipient_reports_its_login_and_fingerprint() {
+    use gitforgeops::secrets::discover_recipient_at;
+    let (public_key, _) = recipient_keypair();
+    let keys_body = serde_json::json!([{"key": public_key}]).to_string();
+    let (api_base, _) = spawn_github_stub(vec![(keys_path(), 200, keys_body)]);
+    let recipient = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect("discovery")
+        .expect("a compatible key");
+    assert_eq!(recipient.login(), RECIPIENT);
+    assert!(recipient.key_fingerprint().starts_with("SHA256:"));
+    let delivered = recipient.encrypt(b"synthetic").expect("encrypt");
+    assert_eq!(delivered.login, recipient.login());
+    assert_eq!(delivered.key_fingerprint, recipient.key_fingerprint());
+}
+
+const INVALID_LOGINS: [&str; 12] = [
+    "",
+    "-alice",
+    "alice/../../repos",
+    "alice?per_page=1",
+    "alice#x",
+    "alice bob",
+    "alice%2Fkeys",
+    "alice\n",
+    "[bot]",
+    "alice[bot]x",
+    "a012345678901234567890123456789012345678",
+    "a0123456789012345678901234567890123[bot]",
+];
+
+#[test]
+fn github_logins_follow_the_workflow_login_rule() {
+    use gitforgeops::secrets::is_valid_github_login;
+    for valid in [
+        "a",
+        "alice",
+        "Alice-Bob",
+        "0day",
+        "dependabot[bot]",
+        "a01234567890123456789012345678901234567",
+        "a012345678901234567890123456789012[bot]",
+    ] {
+        assert!(is_valid_github_login(valid), "{valid:?}");
+    }
+    for invalid in INVALID_LOGINS {
+        assert!(!is_valid_github_login(invalid), "{invalid:?}");
+    }
+}
+
+/// #384: a login that is not a GitHub login never reaches the key endpoint
+/// path, and a batch addressed to one writes nothing.
+#[tokio::test]
+async fn an_invalid_recipient_login_is_refused_before_any_request() {
+    use gitforgeops::secrets::discover_recipient_at;
+    for login in INVALID_LOGINS {
+        let mut routes = vec![(String::from("GET /"), 200, "[]".to_string())];
+        routes.extend(success_routes(204));
+        let (api_base, requests) = spawn_github_stub(routes);
+        let error = discover_recipient_at(&test_client(), &api_base, login)
+            .await
+            .expect_err("invalid login is refused");
+        assert!(error.to_string().contains("not a valid GitHub login"), "{error}");
+
+        let report = many_slot_report(2);
+        let mut shards = BTreeMap::new();
+        let mut shard_count = 1;
+        let failure = allocate_and_deliver_at(
+            &test_client(),
+            &api_base,
+            REPO,
+            ENVIRONMENT,
+            TOKEN,
+            Some(login),
+            &report,
+            &mut shards,
+            &mut shard_count,
+        )
+        .await
+        .expect_err("invalid login refuses the batch");
+        assert!(failure.partial.allocated.is_empty());
+        assert!(shards.is_empty());
+        assert!(
+            requests.lock().expect("recorded").is_empty(),
+            "{login:?} must not reach GitHub"
         );
     }
 }
