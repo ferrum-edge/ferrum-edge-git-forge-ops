@@ -167,6 +167,10 @@ fn publication_identity(output_path: &str) -> crate::error::Result<std::path::Pa
             }
             Component::Normal(name) => {
                 resolved.push(name);
+                // Deliberately follows a symlink in the final component too.
+                // The publication replaces the link rather than its target,
+                // but treating the target as the destination refuses a link
+                // pointing at the other document: the conservative choice.
                 if let Ok(canonical) = std::fs::canonicalize(&resolved) {
                     resolved = canonical;
                 }

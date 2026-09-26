@@ -11,8 +11,8 @@ pub use api_target::{
 };
 pub use file_target::{
     apply_file, apply_mesh_file, ensure_distinct_publication_paths, plan_mesh_publication,
-    publish_export, publish_private_export, reconcile_mesh_file, render_file_yaml, render_mesh_yaml,
-    MeshPublication, MeshRetractionScope, MESH_DOCUMENT_VERSION,
+    publish_export, publish_private_export, reconcile_mesh_file, render_file_yaml,
+    render_mesh_yaml, MeshPublication, MeshRetractionScope, MESH_DOCUMENT_VERSION,
 };
 
 /// Ownership changes must be explicit in every apply preview.

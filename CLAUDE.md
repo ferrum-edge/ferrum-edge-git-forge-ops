@@ -704,9 +704,12 @@ Two pure computations, shared so a preview and the run it previews cannot
 disagree.
 
 **`apply_blockers`** — every fail-closed gate `apply` refuses on that is
-decidable *without* a gateway, as `Vec<ApplyBlocker>` over eight
-`BlockerKind`s: `NarrowedFilePublication`, `Validation`, `Security`, `Policy`, `RequiredCredentials`,
-`SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
+decidable *without* a gateway, as `Vec<ApplyBlocker>` over ten
+`BlockerKind`s: `NarrowedFilePublication`, `PublicationPathCollision`, `InvalidSmokeChecks`,
+`Validation`, `Security`, `Policy`, `RequiredCredentials`,
+`SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` and `apply` refuse
+`PublicationPathCollision` / `InvalidSmokeChecks` before assembly through
+`preflight_deployment_inputs`; `review` feeds the same two checks into `apply_blockers`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
 non-empty. `review --fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`)
 uses that same computation for its exit code; default `review` still renders
@@ -1010,7 +1013,7 @@ never restoring an obsolete ledger, which is a separate state-override repair.
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
 - `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`; `validate`, `plan` and `apply` load it through the same `SmokeConfig::load` before any mutation, so a malformed or unknown-field check fails the preview instead of surfacing after the change; an absent file is fine): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `status` is passed/failed/skipped and whose `exit_code` is 0, `VERIFY_FAILED_EXIT_CODE` = 4 or `VERIFY_SKIPPED_EXIT_CODE` = 5 — an empty report is skipped, never a pass), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, an ambiguous attempt of a non-idempotent method is never replayed without `replay_safe`, the response body is never read)
-- `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
+- `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share; `PublicationPathCollision` and `InvalidSmokeChecks` are raised early by `plan`/`apply` through `preflight_deployment_inputs` and surface as blockers only in `review`) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
 - `src/diagnostics.rs` — the shared log sanitizer (`sanitize` / `sanitize_line` / `sanitize_block`
   and their `safe*` `Display` adapters) every diagnostic routes untrusted ids, namespaces,
   plugin names, YAML paths and gateway-sourced text through: control characters and line

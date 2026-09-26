@@ -1262,15 +1262,30 @@ fn mesh_retraction_line(
 /// * `verify` reads `.gitforgeops/smoke.yaml` only after `apply` has changed the
 ///   gateway, so a malformed check has to be refused here, by the same loader,
 ///   instead of surfacing after the change. An absent file is fine.
+///
+/// `review` reports the same two checks as [`verdict::BlockerKind`]s instead of
+/// failing outright; see [`preflight_publication_paths`] and
+/// [`preflight_smoke_checks`].
 fn preflight_deployment_inputs(env_config: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
-    if env_config.gateway_mode == GatewayMode::File {
-        apply::ensure_distinct_publication_paths(
-            &env_config.file_output_path,
-            &env_config.mesh_file_output_path,
-        )?;
-    }
-    gitforgeops::verify::SmokeConfig::load()?;
+    preflight_publication_paths(env_config)?;
+    preflight_smoke_checks()?;
     Ok(())
+}
+
+/// File mode only, whether or not the repository declares a `MeshConfig`: a
+/// later mesh fragment must not start overwriting the gateway document.
+fn preflight_publication_paths(env_config: &EnvConfig) -> gitforgeops::error::Result<()> {
+    if env_config.gateway_mode != GatewayMode::File {
+        return Ok(());
+    }
+    apply::ensure_distinct_publication_paths(
+        &env_config.file_output_path,
+        &env_config.mesh_file_output_path,
+    )
+}
+
+fn preflight_smoke_checks() -> gitforgeops::error::Result<()> {
+    gitforgeops::verify::SmokeConfig::load().map(|_| ())
 }
 
 /// Print one document's plan-time validation verdict and return whether it
@@ -2224,6 +2239,9 @@ async fn cmd_plan(
             &resolved,
             &namespace_scope,
         ),
+        // `preflight_deployment_inputs` already refused both before assembly.
+        publication_paths_collide: false,
+        smoke_checks_invalid: false,
     });
     let offline_summary = verdict::blocker_summary(&blockers);
     let conflict_namespaces: std::collections::BTreeSet<&str> = spec_owned
@@ -3281,6 +3299,15 @@ async fn cmd_review(
     }
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     let fail_on_blockers = fail_on_blockers || env_config.review_fail_on_blockers;
+    // The refusals `plan` and `apply` raise before assembly. Review reports
+    // them as offline blockers instead, so the comment is still posted and
+    // default `review` still exits 0.
+    let publication_path_error = preflight_publication_paths(&env_config).err();
+    let smoke_error = preflight_smoke_checks().err();
+    let preflight_errors = [&publication_path_error, &smoke_error];
+    for error in preflight_errors.into_iter().flatten() {
+        eprintln!("{}", safe_block(error));
+    }
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let file_publication_narrowed =
         file_publication_narrowed(&env_config, &resolved, &assembled.namespace_scope);
@@ -3468,6 +3495,16 @@ async fn cmd_review(
             ownership_note.push_str(&note);
         }
     }
+    // Neither refusal has a findings section of its own. The remedy is fixed
+    // text, so nothing from the environment or the smoke file reaches the PR.
+    let preflight_blockers = [
+        verdict::publication_path_collision_blocker(publication_path_error.is_some()),
+        verdict::invalid_smoke_checks_blocker(smoke_error.is_some()),
+    ];
+    for blocker in preflight_blockers.into_iter().flatten() {
+        let remedy = blocker.kind.remedy();
+        ownership_note.push_str(&format!("\n\n**Apply blocked** — {remedy}"));
+    }
 
     let provisioning_blockers = verdict::credential_provisioning_blockers(
         &secret_report,
@@ -3490,6 +3527,8 @@ async fn cmd_review(
         provisioner_token_present: env_config.github_provisioner_token.is_some(),
         github_repository_present: env_config.github_repository.is_some(),
         file_publication_narrowed,
+        publication_paths_collide: publication_path_error.is_some(),
+        smoke_checks_invalid: smoke_error.is_some(),
     });
 
     let comment = review::pr_comment::build_review_comment_with_preview(

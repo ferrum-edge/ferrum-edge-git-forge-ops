@@ -9,6 +9,10 @@
 //!   the gateway, so a malformed check must fail the preview commands and
 //!   refuse `apply` before it mutates anything.
 //!
+//! `review` reports both as offline apply blockers instead: the comment is
+//! still produced, default `review` exits 0, and `review --fail-on-blockers`
+//! exits 1 exactly as `plan` does.
+//!
 //! The CLI cases run the real binary hermetically in file mode against a stub
 //! validator; no gateway is involved.
 
@@ -247,6 +251,48 @@ fn cli_refuses_a_shared_gateway_and_mesh_destination_before_any_write() {
     }
 }
 
+/// Default `review` exits 0 and `--fail-on-blockers` exits 1, with the blocker
+/// named in the comment either way.
+fn assert_review_blocker(repo: &Repo, gateway: &str, mesh: &str, label: &str, detail: &str) {
+    for fail_on_blockers in [false, true] {
+        let mut args = vec!["review"];
+        if fail_on_blockers {
+            args.push("--fail-on-blockers");
+        }
+
+        let output = repo.run(&args, gateway, mesh);
+
+        let text = combined(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(fail_on_blockers)),
+            "{args:?}: {text}"
+        );
+        assert!(text.contains(detail), "{args:?}: {text}");
+        assert!(stdout.contains("Apply blocked"), "{args:?}: {text}");
+        if fail_on_blockers {
+            assert!(text.contains(label), "{args:?}: {text}");
+        }
+        repo.assert_no_state(&format!("{args:?}"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_review_reports_a_shared_destination_as_an_apply_blocker() {
+    let repo = Repo::new(None);
+
+    assert_review_blocker(
+        &repo,
+        "assembled/out.yaml",
+        "./assembled/out.yaml",
+        "publication-path-collision",
+        "resolve to the same file",
+    );
+    assert!(!repo.path("assembled/out.yaml").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_export_refuses_an_output_that_is_the_mesh_destination() {
@@ -352,17 +398,45 @@ fn cli_refuses_a_malformed_smoke_file_before_any_write() {
 
 #[cfg(unix)]
 #[test]
+fn cli_review_reports_a_malformed_smoke_file_as_an_apply_blocker() {
+    for (smoke, expected) in [
+        (SMOKE_ZERO_ATTEMPTS, "attempts must be at least 1"),
+        (SMOKE_UNKNOWN_FIELD, "run"),
+        (SMOKE_BAD_OTHER_ENVIRONMENT, "path must start with '/'"),
+    ] {
+        let repo = Repo::new(Some(smoke));
+
+        assert_review_blocker(
+            &repo,
+            "assembled/resources.yaml",
+            "assembled/mesh.yaml",
+            "invalid-smoke-checks",
+            expected,
+        );
+        assert!(!repo.path("assembled/resources.yaml").exists());
+        assert!(!repo.path("assembled/mesh.yaml").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_accepts_a_valid_or_absent_smoke_file() {
     for smoke in [None, Some(SMOKE_VALID)] {
         let repo = Repo::new(smoke);
         for args in [
             vec!["validate"],
             vec!["plan"],
+            vec!["review", "--fail-on-blockers"],
             vec!["apply", "--auto-approve"],
         ] {
             let output = repo.run(&args, "assembled/resources.yaml", "assembled/mesh.yaml");
             assert!(
                 output.status.success(),
+                "{smoke:?} {args:?}: {}",
+                combined(&output)
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains("Apply blocked"),
                 "{smoke:?} {args:?}: {}",
                 combined(&output)
             );
