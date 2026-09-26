@@ -19,7 +19,7 @@ use gitforgeops::policy;
 use gitforgeops::reconcile::{previously_managed, resolved_namespaces};
 use gitforgeops::review;
 use gitforgeops::secrets;
-use gitforgeops::state::StateFile;
+use gitforgeops::state::{AllocationBinding, StateFile};
 use gitforgeops::validate;
 use gitforgeops::verdict::{self, ApplyGateInputs};
 
@@ -471,7 +471,15 @@ fn resolve_credentials(
 /// own declared `namespace_filter`, which then covers that namespace only. An
 /// ad-hoc `FERRUM_NAMESPACE` covers nothing, because a Consumer it does not
 /// load may still be declared.
-fn consumer_ledger(resolved: &ResolvedEnv, state: &StateFile) -> secrets::ConsumerLedger {
+///
+/// `binding` names this apply, so a recorded allocation counts as pending only
+/// for the apply that made it. Resolve it once per command with
+/// [`AllocationBinding::from_env`] and hand the same value to the journal.
+fn consumer_ledger(
+    resolved: &ResolvedEnv,
+    state: &StateFile,
+    binding: &AllocationBinding,
+) -> secrets::ConsumerLedger {
     let coverage = match resolved.namespace_filter.as_deref() {
         None => secrets::ConsumerCoverage::Complete,
         Some(namespace) if resolved.namespace_filter_is_environment_scope => {
@@ -479,7 +487,7 @@ fn consumer_ledger(resolved: &ResolvedEnv, state: &StateFile) -> secrets::Consum
         }
         Some(_) => secrets::ConsumerCoverage::Partial,
     };
-    secrets::ConsumerLedger::from_state(state, coverage)
+    secrets::ConsumerLedger::from_state(state, coverage, binding)
 }
 
 /// Is a credential bundle available to this invocation?
@@ -735,12 +743,13 @@ async fn surface_delivered_credentials(
 fn journal_allocation(
     state: &mut StateFile,
     outcome: &secrets::AllocateOutcome,
+    binding: &AllocationBinding,
 ) -> gitforgeops::error::Result<()> {
     if outcome.allocated.is_empty() {
         return Ok(());
     }
     let run_id = std::env::var("GITHUB_RUN_ID").ok();
-    state.record_allocation(outcome, run_id.as_deref());
+    state.record_allocation(outcome, run_id.as_deref(), binding);
     state.save()
 }
 
@@ -762,6 +771,7 @@ async fn allocate_if_needed(
     shard_count: &mut u32,
     state: &mut StateFile,
     resolve_options: secrets::ResolveOptions<'_>,
+    binding: &AllocationBinding,
 ) -> Result<Option<secrets::AllocateOutcome>, Box<dyn std::error::Error>> {
     if report.needs_allocation().is_empty() {
         return Ok(None);
@@ -820,7 +830,7 @@ async fn allocate_if_needed(
             // this record the retry would refuse its own slots as revived
             // values (#352). Unwritten shards are not in `partial` and stay
             // unrecorded.
-            let journaled = journal_allocation(state, &failure.partial);
+            let journaled = journal_allocation(state, &failure.partial, binding);
             if !failure.partial.allocated.is_empty() {
                 surface_delivered_credentials(env_config, &failure.partial).await?;
             }
@@ -835,7 +845,7 @@ async fn allocate_if_needed(
             return Err(failure.source.into());
         }
     };
-    journal_allocation(state, &outcome)?;
+    journal_allocation(state, &outcome, binding)?;
 
     // Re-resolve so `desired` picks up freshly allocated values. The
     // allocator only produces values for slots classified as NeedsAllocation
@@ -1390,7 +1400,7 @@ async fn cmd_export(
         // is the evidence, under the operator's own remap policy.
         let (bundle, _) = load_credential_bundles(&env_config)?;
         let state = StateFile::load(&resolved.name)?;
-        let ledger = consumer_ledger(&resolved, &state);
+        let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env());
         let options = resolve_options.with_consumer_ledger(&ledger);
         let _ = secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, options)?;
         let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
@@ -1777,7 +1787,7 @@ async fn cmd_plan(
     // Loaded before resolution: the ledger is the evidence for the
     // retired-Consumer slot checks apply will refuse on.
     let state = StateFile::load(&resolved.name)?;
-    let ledger = consumer_ledger(&resolved, &state);
+    let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env());
     let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
     reportln!(json_mode, "=== Environment ===");
     reportln!(
@@ -2403,7 +2413,8 @@ async fn cmd_apply(
     // Only this first resolve consults the ledger. The re-resolve after
     // allocation sees this run's own new values for Consumers the ledger does
     // not record yet, which are not revived slots.
-    let ledger = consumer_ledger(&resolved, &state);
+    let allocation_binding = AllocationBinding::from_env();
+    let ledger = consumer_ledger(&resolved, &state, &allocation_binding);
     let initial_options = resolve_options.with_consumer_ledger(&ledger);
     let secret_report = match env_config.gateway_mode {
         GatewayMode::File => {
@@ -2847,6 +2858,7 @@ async fn cmd_apply(
                 &mut shard_count,
                 &mut state,
                 resolve_options,
+                &allocation_binding,
             )
             .await?;
 
@@ -3047,6 +3059,7 @@ async fn cmd_apply(
                 &mut shard_count,
                 &mut state,
                 resolve_options,
+                &allocation_binding,
             )
             .await?;
 
@@ -3261,7 +3274,7 @@ async fn cmd_review(
         },
     );
     let state = StateFile::load(&resolved.name)?;
-    let ledger = consumer_ledger(&resolved, &state);
+    let ledger = consumer_ledger(&resolved, &state, &AllocationBinding::from_env());
     let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
     let bundle_loaded = credential_bundle_loaded(&env_config);
 
