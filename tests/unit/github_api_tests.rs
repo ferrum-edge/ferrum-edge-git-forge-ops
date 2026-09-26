@@ -1369,7 +1369,10 @@ async fn an_invalid_recipient_login_is_refused_before_any_request() {
         let error = discover_recipient_at(&test_client(), &api_base, login)
             .await
             .expect_err("invalid login is refused");
-        assert!(error.to_string().contains("not a valid GitHub login"), "{error}");
+        assert!(
+            error.to_string().contains("not a valid GitHub login"),
+            "{error}"
+        );
 
         let report = many_slot_report(2);
         let mut shards = BTreeMap::new();
