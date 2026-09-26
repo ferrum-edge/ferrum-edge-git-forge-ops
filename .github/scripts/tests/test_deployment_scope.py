@@ -200,6 +200,15 @@ class DeploymentScopeTests(unittest.TestCase):
         self.assertIn(
             "GITHUB_SHA: ${{ steps.freshness.outputs.applied_sha }}", workflow
         )
+        # A recorded credential allocation is bound to the triggering merge,
+        # which a re-run keeps; the applied head moves with every state commit.
+        self.assertEqual(
+            workflow.count("GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }}"),
+            workflow.count("run: gitforgeops apply"),
+        )
+        self.assertNotIn(
+            "GITFORGEOPS_ALLOCATION_REVISION: ${{ steps.freshness", workflow
+        )
         # And the guard runs the shared classifier rather than an ad-hoc diff,
         # piped from the triggering commit into an isolated interpreter.
         self.assertIn(
