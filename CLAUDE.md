@@ -820,9 +820,18 @@ public identity leaves reject broker syntax even when seeded.
 including indexed entries. Both the CLI and `rotate_and_deliver` enforce it.
 The command has no PluginConfig/Upstream publication path: reserved slots cannot
 be rotated even when those resources share a Consumer id. Plugin allocation via
-apply remains supported. Target placeholder, generation, namespace/ownership,
+apply remains supported. Rotation `PUT`s the whole desired Consumer, so
+`diff::consumer_security_blockers` audits that unresolved row with apply's
+literal-credential gate before the bundle read, state lock, secret write or
+gateway call, and the publisher re-audits it. A literal secret sibling is
+refused with no override (identities stay exempt): rotation has no reviewed
+revision to bind one to. Target placeholder, generation, namespace/ownership,
 sibling resolution and gateway-client construction all precede secret writes;
-publication reuses the preflight's desired Consumer snapshot. Externally issued
+publication reuses the preflight's desired Consumer snapshot. Sibling
+resolution, the publisher and `export --materialize` decide what is still
+unresolved from `ResolveReport::unresolved` (the report of the resolve that
+consumed the bundle), never by re-scanning resolved bytes, so a seeded value
+that resembles a placeholder is published byte-for-byte. Externally issued
 secrets must be reissued, reseeded into the bundle and applied. A value destroyed
 by an older rotation cannot be recovered from GitHub's write-only secret API.
 
@@ -878,7 +887,8 @@ document before the state lock, the bundle read, and any gateway call, health
 preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
 label + revision-bound review + current repo permission and input verification),
-resolved once and shared by both gates.
+resolved once and shared by both gates. `rotate` runs the same audit on the
+Consumer row it publishes and has no override.
 
 #### Secrets outside `Consumer.credentials`
 

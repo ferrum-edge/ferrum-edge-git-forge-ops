@@ -1378,12 +1378,11 @@ async fn cmd_export(
         // strings in it, and we won't allocate fresh secrets during export
         // (that's the job of `apply`).
         //
-        // After resolve, any placeholder still present in the config is a
-        // truly-unresolved slot. We run the post-resolve config through
-        // report_secrets with an empty bundle as a defensive re-scan rather
-        // than trusting the pre-resolve report's NeedsAllocation
-        // classification, since that classification is computed against the
-        // PRE-resolve bundle snapshot.
+        // The resolution report is the authority on what is still
+        // unresolved: it classifies every slot against the same bundle the
+        // resolve consumed. Re-scanning the resolved document instead would
+        // read a seeded value that happens to spell a broker placeholder as
+        // an empty slot (#364).
         //
         // Materializing writes resolved values out, so it refuses a retired
         // Consumer's slot (#332) exactly like `apply` does: the state ledger
@@ -1392,14 +1391,13 @@ async fn cmd_export(
         let state = StateFile::load(&resolved.name)?;
         let ledger = consumer_ledger(&resolved, &state);
         let options = resolve_options.with_consumer_ledger(&ledger);
-        let _ = secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, options)?;
-        let remaining = secrets::report_secrets(&gateway_config, &BTreeMap::new())?;
-        if !remaining.results.is_empty() {
+        let report = secrets::resolve_secrets_with_options(&mut gateway_config, &bundle, options)?;
+        let remaining = report.unresolved();
+        if !remaining.is_empty() {
             return Err(format!(
                 "refusing to materialize: {} credential slot(s) have no value yet — run `gitforgeops apply` to allocate/rotate, then retry:\n  {}",
-                remaining.results.len(),
+                remaining.len(),
                 remaining
-                    .results
                     .iter()
                     .map(|r| r.slot.as_str())
                     .collect::<Vec<_>>()
@@ -3793,6 +3791,13 @@ async fn cmd_rotate(
     // Validate the whole desired input before reading a bundle or creating a
     // state lock, including invalid identity placeholders in sibling consumers.
     let desired_for_check = load_and_assemble_for(&resolved, &env_config)?;
+    let ns = namespace
+        .or(resolved.namespace_filter.as_deref())
+        .unwrap_or("ferrum");
+    // Rotation publishes the whole desired Consumer row, so the row must pass
+    // the literal-credential gate `apply` runs, on the unresolved document and
+    // before any bundle read, state lock, secret write or gateway call.
+    refuse_rotation_security_blockers(&desired_for_check, ns, consumer)?;
 
     let repo = env_config
         .github_repository
@@ -3812,9 +3817,6 @@ async fn cmd_rotate(
 
     let _state_lock = StateFile::lock(&resolved.name)?;
     let mut state = StateFile::load(&resolved.name)?;
-    let ns = namespace
-        .or(resolved.namespace_filter.as_deref())
-        .unwrap_or("ferrum");
     let slot = secrets::resolver::slot_path(ns, consumer, credential);
 
     // ALL preflight checks must run BEFORE rotate_and_deliver mutates the
@@ -3897,25 +3899,25 @@ async fn cmd_rotate(
         .iter()
         .find(|c| c.namespace == ns && c.id == consumer)
         .cloned();
-    if let Some(mut c) = sibling_consumer {
+    if let Some(c) = sibling_consumer {
         let mut single = gitforgeops::config::GatewayConfig::default();
         // Note: replace the target slot as if it were already rotated, so
         // sibling-placeholder detection doesn't flag the slot we're about
         // to rotate.
         let mut shim_bundle = current_bundle.clone();
         shim_bundle.insert(slot.clone(), "__rotate-preflight-shim__".to_string());
-        single.consumers.push(c.clone());
-        let _ = secrets::resolve_secrets_with_options(&mut single, &shim_bundle, resolve_options)?;
-        c = single.consumers.remove(0);
-        let mut remaining_cfg = gitforgeops::config::GatewayConfig::default();
-        remaining_cfg.consumers.push(c);
-        let sibling_report = secrets::report_secrets(&remaining_cfg, &BTreeMap::new())?;
-        if !sibling_report.results.is_empty() {
+        single.consumers.push(c);
+        // The report says which slots found a value; a sibling whose seeded
+        // value resembles a placeholder is resolved, not pending (#364).
+        let sibling_report =
+            secrets::resolve_secrets_with_options(&mut single, &shim_bundle, resolve_options)?;
+        let unresolved_siblings = sibling_report.unresolved();
+        if !unresolved_siblings.is_empty() {
             return Err(format!(
                 "Refusing to rotate: consumer '{ns}/{consumer}' has {} other unresolved placeholder(s):\n  {}\n\
                  Run `gitforgeops apply` to allocate missing slots before rotating — otherwise the gateway push would fail after the new secret is already written.",
-                sibling_report.results.len(),
-                sibling_report.results.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
+                unresolved_siblings.len(),
+                unresolved_siblings.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
             )
             .into());
         }
@@ -4029,10 +4031,44 @@ async fn cmd_rotate(
     Ok(())
 }
 
+/// Refuse a rotation whose Consumer row carries a finding the `apply`
+/// security gate blocks, above all a literal credential.
+///
+/// Rotation `PUT`s the whole desired Consumer, so a repository-readable key
+/// beside the brokered slot would be published as live authentication
+/// material. There is no override: `apply`'s override is bound to a reviewed
+/// revision, and a dispatched rotation has none. Findings name the field,
+/// never its value.
+fn refuse_rotation_security_blockers(
+    desired: &GatewayConfig,
+    namespace: &str,
+    consumer_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let blockers = diff::consumer_security_blockers(desired, namespace, consumer_id);
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    print_security_findings(&blockers);
+    Err(format!(
+        "Refusing to rotate: consumer '{}/{}' has {} security blocker(s) that `apply` also \
+         refuses. Rotation publishes the whole Consumer, so every credential on it must be \
+         brokered: replace each literal with a `${{gh-env-secret:alloc=require}}` placeholder, \
+         seed its slot in the credential bundle and run `gitforgeops apply` before rotating.",
+        safe(namespace),
+        safe(consumer_id),
+        blockers.len()
+    )
+    .into())
+}
+
 /// Push just the rotated consumer to the live gateway so the new credential
 /// is immediately usable. Reuses the preflight's desired snapshot and resolves
 /// only the target Consumer, so unrelated generation failures cannot surface
 /// after the secret has been written.
+///
+/// `desired_snapshot` must be the unresolved document: the row is re-audited
+/// here so no caller can publish a repository-readable credential through
+/// this path.
 async fn push_rotated_consumer_to_gateway(
     client: &AdminClient,
     desired_snapshot: &GatewayConfig,
@@ -4041,6 +4077,7 @@ async fn push_rotated_consumer_to_gateway(
     consumer_id: &str,
     resolve_options: secrets::ResolveOptions<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    refuse_rotation_security_blockers(desired_snapshot, namespace, consumer_id)?;
     let mut desired = GatewayConfig {
         consumers: desired_snapshot
             .consumers
@@ -4055,7 +4092,7 @@ async fn push_rotated_consumer_to_gateway(
     // resolve picks it up for the consumer being pushed to the gateway. The
     // operator's slot-remap policy applies here too, so an acknowledged
     // shrink does not clear the shim resolve only to fail on the push.
-    let _ = secrets::resolve_secrets_with_options(&mut desired, &merged, resolve_options)?;
+    let report = secrets::resolve_secrets_with_options(&mut desired, &merged, resolve_options)?;
 
     let consumer = desired
         .consumers
@@ -4073,18 +4110,16 @@ async fn push_rotated_consumer_to_gateway(
     // pre-populated, or alloc=generate never run through apply), pushing
     // the consumer now would send a literal `${gh-env-secret:...}` string
     // to the gateway as a credential value — breaking auth for that
-    // credential. Refuse and tell the operator to run apply first.
-    let single_consumer_cfg = gitforgeops::config::GatewayConfig {
-        consumers: vec![consumer.clone()],
-        ..Default::default()
-    };
-    let remaining = secrets::report_secrets(&single_consumer_cfg, &BTreeMap::new())?;
-    if !remaining.results.is_empty() {
+    // credential. Refuse and tell the operator to run apply first. The
+    // resolution report decides this, not the resolved bytes: a seeded value
+    // that resembles a placeholder is a value (#364).
+    let remaining = report.unresolved();
+    if !remaining.is_empty() {
         return Err(format!(
             "refusing to push rotated consumer '{namespace}/{consumer_id}': {} unresolved placeholder(s) remain on this consumer:\n  {}\n\
              Run `gitforgeops apply` to allocate missing slots before rotating (or pre-populate FERRUM_CREDS_JSON).",
-            remaining.results.len(),
-            remaining.results.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
+            remaining.len(),
+            remaining.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
         ).into());
     }
 

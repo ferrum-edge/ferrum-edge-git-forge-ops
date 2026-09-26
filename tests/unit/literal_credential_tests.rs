@@ -9,8 +9,8 @@
 
 use std::path::PathBuf;
 
-use gitforgeops::config::{assemble, load_resources};
-use gitforgeops::diff::security::{audit_security, security_blockers};
+use gitforgeops::config::{assemble, load_resources, GatewayConfig};
+use gitforgeops::diff::security::{audit_security, consumer_security_blockers, security_blockers};
 
 fn simple_config_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-config")
@@ -82,4 +82,61 @@ fn literal_credential_fixture_blocks_apply_without_echoing_the_value() {
             finding.message
         );
     }
+}
+
+/// `rotate` publishes one whole Consumer row, so it audits exactly that row:
+/// every literal secret on it blocks, a literal identity does not, and a
+/// literal on another Consumer or namespace does not block this rotation.
+#[test]
+fn consumer_row_blockers_cover_every_credential_on_the_published_row_only() {
+    const BROKERED: &str = "${gh-env-secret:alloc=require}";
+    let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [
+            {
+                "id": "app", "username": "app", "namespace": "ferrum",
+                "credentials": {
+                    "keyauth": [{ "key": BROKERED }, { "key": "row-literal-one" }],
+                    "basicauth": [{ "username": "public-identity", "password": BROKERED }],
+                    "hmac_auth": [{ "secret": "row-literal-two" }]
+                }
+            },
+            {
+                "id": "other", "username": "other", "namespace": "ferrum",
+                "credentials": { "keyauth": [{ "key": "other-row-literal" }] }
+            },
+            {
+                "id": "app", "username": "app", "namespace": "platform",
+                "credentials": { "keyauth": [{ "key": "other-namespace-literal" }] }
+            }
+        ]
+    }))
+    .unwrap();
+
+    let blockers = consumer_security_blockers(&config, "ferrum", "app");
+    let mut paths: Vec<&str> = blockers
+        .iter()
+        .filter_map(|finding| finding.message.split('\'').nth(1))
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(paths, ["hmac_auth[0].secret", "keyauth[1].key"]);
+    for finding in &blockers {
+        assert_eq!(finding.namespace, "ferrum");
+        assert_eq!(finding.id, "app");
+        assert!(!finding.message.contains("row-literal"));
+    }
+
+    let brokered: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [{
+            "id": "app", "username": "app", "namespace": "ferrum",
+            "credentials": {
+                "keyauth": [{ "key": BROKERED }],
+                "mtls_auth": [{ "identity": "public-identity" }]
+            }
+        }]
+    }))
+    .unwrap();
+    assert!(consumer_security_blockers(&brokered, "ferrum", "app").is_empty());
+    assert!(consumer_security_blockers(&config, "ferrum", "absent").is_empty());
 }

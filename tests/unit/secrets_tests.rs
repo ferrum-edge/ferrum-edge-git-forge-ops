@@ -2054,12 +2054,63 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
     let report = report_secrets(&cfg, &bundle).expect("rotation preflight must not be blocked");
 
     let target = slot_path("ferrum", "app", "keyauth/[1]/key");
+    let found = report.results.iter().any(|r| r.slot == target);
     assert!(
-        report.results.iter().any(|r| r.slot == target),
-        "rotate --credential keyauth/[1]/key must still find its slot: {:?}",
-        report.results.iter().map(|r| &r.slot).collect::<Vec<_>>()
+        found,
+        "rotate --credential keyauth/[1]/key must still find its slot"
     );
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(
+        report.slot_remaps.is_empty(),
+        "{} unexpected slot remap(s)",
+        report.slot_remaps.len()
+    );
+}
+
+/// After a mutating resolve, the report, not the resolved bytes, says which
+/// slots are still unresolved. A seeded value that spells a broker placeholder
+/// is a supplied value; missing required values and pending allocations stay
+/// unresolved (#364).
+#[test]
+fn unresolved_slots_follow_resolution_provenance_not_value_shape() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode, resolve_secrets_with_mode};
+
+    let mut cfg = consumer_with(
+        "keyauth",
+        serde_json::Value::Array(vec![
+            entry("key", REQUIRE),
+            entry("key", REQUIRE),
+            entry("key", GENERATE),
+        ]),
+    );
+    let seeded_slot = slot_path("ferrum", "app", "keyauth/key");
+    let mut bundle = BTreeMap::new();
+    bundle.insert(seeded_slot.clone(), GENERATE.to_string());
+
+    let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::Api).unwrap();
+    let unresolved: Vec<String> = report
+        .unresolved()
+        .into_iter()
+        .map(|result| result.slot.clone())
+        .collect();
+    let expected = [
+        slot_path("ferrum", "app", "keyauth/[1]/key"),
+        slot_path("ferrum", "app", "keyauth/[2]/key"),
+    ];
+    assert!(
+        unresolved == expected,
+        "only the two slots without a bundle value are unresolved"
+    );
+    let entries = &cfg.consumers[0].credentials["keyauth"];
+    assert!(
+        entries[0]["key"] == GENERATE,
+        "the seeded value must be kept byte-for-byte"
+    );
+
+    // Re-reading the resolved document, as materialize and rotate once did,
+    // mistakes that value for a pending allocation.
+    let rescan = report_secrets_with_mode(&cfg, &BTreeMap::new(), GatewayMode::Api).unwrap();
+    assert!(rescan.results.iter().any(|r| r.slot == seeded_slot));
 }
 
 // --- Omitted credential types (#332) ----------------------------------------

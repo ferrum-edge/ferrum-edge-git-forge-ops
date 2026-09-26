@@ -77,6 +77,34 @@ pub fn security_blockers(findings: &[SecurityFinding]) -> Vec<&SecurityFinding> 
         .collect()
 }
 
+/// The apply-blocking findings on one declared Consumer row.
+///
+/// `rotate` publishes the whole desired Consumer with a single `PUT`, so every
+/// credential on that row, not only the rotated slot, must pass the
+/// literal-credential gate `apply` runs. Auditing only the published row keeps
+/// an unrelated proxy or plugin finding from blocking the rotation, while a
+/// secret the repository can read never rides along with a brokered one.
+///
+/// Like [`audit_security_with_policy`], this must see the **unresolved**
+/// document.
+pub fn consumer_security_blockers(
+    config: &GatewayConfig,
+    namespace: &str,
+    consumer_id: &str,
+) -> Vec<SecurityFinding> {
+    let row = GatewayConfig {
+        consumers: config
+            .consumers
+            .iter()
+            .filter(|consumer| consumer.namespace == namespace && consumer.id == consumer_id)
+            .cloned()
+            .collect(),
+        ..Default::default()
+    };
+    let findings = audit_security(&row);
+    security_blockers(&findings).into_iter().cloned().collect()
+}
+
 /// Audit with the repository's default notion of what counts as authentication.
 pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
     audit_security_with_policy(config, None)

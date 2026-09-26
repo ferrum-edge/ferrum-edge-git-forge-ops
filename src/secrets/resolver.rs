@@ -354,6 +354,20 @@ impl ResolveReport {
             .filter(|r| matches!(r.status, SlotStatus::MissingRequired))
             .collect()
     }
+
+    /// Every slot this walk found no bundle value for: missing required
+    /// values and pending allocations alike.
+    ///
+    /// After a mutating resolve, this is the only sound answer to "what is
+    /// still a placeholder". Re-scanning the resolved document would read a
+    /// supplied value that happens to spell `${gh-env-secret:...}` as a new
+    /// instruction; the report records where each value came from instead.
+    pub fn unresolved(&self) -> Vec<&ResolveResult> {
+        self.results
+            .iter()
+            .filter(|r| r.status != SlotStatus::Resolved)
+            .collect()
+    }
 }
 
 /// A single slot-path component. `Literal` covers user-controlled names

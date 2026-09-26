@@ -1102,7 +1102,15 @@ The rotation re-generates the value, overwrites the env secret, delivers it age-
 Rotation supports only Consumer `keyauth/key`, `jwt/secret`, `hmac_auth/secret`
 and api-mode `basicauth/password`, including indexed entries. The target must
 be a placeholder on the declared Consumer in the selected namespace, and its
-siblings must already resolve. Password hashes, identities, unknown credential
+siblings must already resolve. A sibling counts as resolved when the bundle
+supplies its slot, whatever the value looks like; a seeded value that resembles
+a placeholder is pushed unchanged. Rotation pushes the whole Consumer, so the
+Consumer must also pass the literal-credential check `apply` runs: a literal
+secret anywhere on it (for example a second `keyauth` key or an `hmac_auth`
+secret) refuses the rotation before the bundle is read or anything is written.
+Literal identities (`basicauth` usernames, `mtls_auth` identities) are allowed.
+There is no override for rotation; broker the literal with
+`${gh-env-secret:alloc=require}`, seed its slot and apply first. Password hashes, identities, unknown credential
 fields and reserved `@plugin-config` / `@service-discovery` slots are refused
 before GitHub key discovery, secret writes or gateway publication. A PluginConfig
 or Upstream sharing the Consumer's id does not make its slots Consumer credentials.
@@ -1141,8 +1149,8 @@ The workflow:
 
 1. Binds `environment: production` — pulls that env's `FERRUM_CREDS_BUNDLE*` secrets.
 2. Runs `gitforgeops export --materialize --encrypt-to ${{ github.actor }} --output out/assembled-<env>.age`:
-   - Replaces placeholders with real values from the bundle.
-   - Refuses if any slot needs allocation (tells the admin to run `apply` first).
+   - Replaces placeholders with real values from the bundle. A seeded value is written byte-for-byte, even one that resembles a placeholder.
+   - Refuses if any slot has no bundle value, whether `alloc=require` or pending allocation (tells the admin to run `apply` first). The check uses the resolution result, not the text of the resolved file.
    - Age-encrypts the entire YAML to the actor's GitHub-published SSH public key.
 3. Uploads the `.age` blob as a workflow artifact with **1-day retention**.
 
