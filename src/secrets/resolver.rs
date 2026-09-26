@@ -1614,8 +1614,9 @@ fn check_array_slot_identity(
                 "credential array '{prefix}' has {} entries and entry ORDER is the slot identity \
                  (entry 0 uses the unindexed slot, later entries use '[1]', '[2]', …). Removing or \
                  reordering an entry reassigns the retired slot's value to whichever entry shifts \
-                 into its index. Rotate with 'gitforgeops rotate --credential' instead of deleting \
-                 entries.",
+                 into its index. Before changing the array, rotate affected Consumer slots and \
+                 update the private bundle to move surviving values to their new canonical slots \
+                 and remove vacated keys.",
                 items.len()
             ),
         );
@@ -1635,10 +1636,11 @@ fn check_array_slot_identity(
                      value for it, but array '{prefix}' now has {} entr{} (entry index {index} no \
                      longer exists). Slot identity is positional, so the entry that shifted into \
                      a vacated index has inherited a retired credential, and re-growing the array \
-                     would resurrect this value for a new entry. Rotate the slot in place first \
-                     ('gitforgeops rotate --consumer <id> --credential <type>/[{index}]/<key>'), \
-                     then remove the entry — or pass --allow-credential-slot-remap to accept the \
-                     reassignment.",
+                     would resurrect this value for a new entry. Rotation replaces the value and \
+                     sends it to the gateway but does not remove the bundle key. Before shrinking or \
+                     shifting the array, update the private bundle to move surviving rotated values \
+                     to their new canonical slots and remove vacated keys, preserving unrelated \
+                     entries — or pass --allow-credential-slot-remap to accept the reassignment.",
                     items.len(),
                     if items.len() == 1 { "y" } else { "ies" }
                 ),

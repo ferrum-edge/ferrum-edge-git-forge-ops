@@ -149,6 +149,12 @@ class LedgerCommitTests(unittest.TestCase):
             ("config", "user.email", "test@example.invalid"),
             ("config", "user.name", "Test"),
             ("config", "commit.gpgsign", "false"),
+            # `git commit` otherwise detaches `git maintenance run --auto`, which
+            # can still be writing `.git/objects` when the directory is removed
+            # (#374). Nothing may outlive the git command that started it.
+            ("config", "maintenance.auto", "false"),
+            ("config", "gc.auto", "0"),
+            ("config", "core.fsmonitor", "false"),
         ):
             self._git(*args)
         self.applied = self._commit({"resources/ferrum/proxies/orders.yaml": "a\n"})
