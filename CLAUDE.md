@@ -826,9 +826,18 @@ public identity leaves reject broker syntax even when seeded.
 including indexed entries. Both the CLI and `rotate_and_deliver` enforce it.
 The command has no PluginConfig/Upstream publication path: reserved slots cannot
 be rotated even when those resources share a Consumer id. Plugin allocation via
-apply remains supported. Target placeholder, generation, namespace/ownership,
+apply remains supported. Rotation `PUT`s the whole desired Consumer, so
+`diff::consumer_security_blockers` audits that unresolved row with apply's
+literal-credential gate before the bundle read, state lock, secret write or
+gateway call, and the publisher re-audits it. A literal secret sibling is
+refused with no override (identities stay exempt): rotation has no reviewed
+revision to bind one to. Target placeholder, generation, namespace/ownership,
 sibling resolution and gateway-client construction all precede secret writes;
-publication reuses the preflight's desired Consumer snapshot. Externally issued
+publication reuses the preflight's desired Consumer snapshot. Sibling
+resolution, the publisher and `export --materialize` decide what is still
+unresolved from `ResolveReport::unresolved` (the report of the resolve that
+consumed the bundle), never by re-scanning resolved bytes, so a seeded value
+that resembles a placeholder is published byte-for-byte. Externally issued
 secrets must be reissued, reseeded into the bundle and applied. A value destroyed
 by an older rotation cannot be recovered from GitHub's write-only secret API.
 
@@ -868,9 +877,10 @@ the two consequences by whether evidence exists:
     `alloc=generate`/`alloc=rotate` slot from the bundle, so a reused id would
     silently inherit a retired credential that is never delivered.
     `alloc=require` is exempt (the operator's seed), and so is an allocation
-    `state.credentials` recorded after `last_applied_at` (the retry of an
-    apply that allocated and failed before recording the Consumer, including
-    one whose allocation committed only some shards).
+    `state.credentials` recorded after `last_applied_at` by this same apply
+    (matching `AllocationBinding`; the retry of an apply that allocated and
+    failed before recording the Consumer, including one whose allocation
+    committed only some shards).
 - Plugin-config arrays get the same split through
   `check_plugin_array_slot_identity`, called from both plugin walks. Their
   slots carry an explicit `[N]` for every entry (no index-0 elision), so only a
@@ -884,7 +894,10 @@ document before the state lock, the bundle read, and any gateway call, health
 preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
 label + revision-bound review + current repo permission and input verification),
-resolved once and shared by both gates.
+resolved once and shared by both gates. `rotate` runs the same audit on the
+Consumer row it publishes, and `export --materialize` on the whole document
+before the bundle read; neither has an override, and an `apply` override does
+not carry over to them. A number or boolean at a secret leaf is a literal too.
 
 #### Secrets outside `Consumer.credentials`
 
@@ -952,7 +965,18 @@ and file mode alike, both on success and when a later shard fails
 (`AllocationFailure.partial` holds exactly the committed slots). The journal is
 non-secret (slot, shard, recipient, run id) and never records an unwritten
 shard, so a retry resolves the committed slots as pending allocations and
-allocates only the rest (#352).
+allocates only the rest (#352). Each entry carries a `state::AllocationBinding`
+(`allocation_commit`, `allocation_recipient`), and `ConsumerLedger::from_state`
+counts an entry as pending only when both equal the current run's; a missing
+value never matches, not even another missing one, and `record_credential`
+(rotation) clears both. The revision is `GITFORGEOPS_ALLOCATION_REVISION`,
+which `apply-on-merge.yml` binds to `github.sha` in every apply step
+(`check_supply_chain.py::allocation_revision_binding_violations`): the
+triggering merge survives a re-run, while the refreshed head moves with the
+failed attempt's state commit. Without it (local CLI) the checked-out commit is
+used. `main.rs` resolves the binding once per command
+(`AllocationBinding::from_env`) and passes the same value to the ledger and the
+journal. An unmatched entry is still refused as a revived slot, with a hint.
 
 Delivery: after allocation or rotation, the value is age-encrypted to the PR
 author's (or dispatcher's) SSH public key fetched from

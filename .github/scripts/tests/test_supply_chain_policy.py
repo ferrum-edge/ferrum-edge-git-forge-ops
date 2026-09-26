@@ -1349,6 +1349,57 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_apply_steps_bind_the_allocation_revision_to_the_trigger(self):
+        text = (ROOT / ".github/workflows/apply-on-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            text.count(check_supply_chain.ALLOCATION_REVISION_BINDING),
+            text.count(check_supply_chain.APPLY_COMMAND),
+        )
+        self.assertEqual(
+            check_supply_chain.allocation_revision_binding_violations(
+                "apply-on-merge.yml", text
+            ),
+            [],
+        )
+
+        # Bound to the applied head instead, a retry would miss its own slots.
+        head_bound = text.replace(
+            check_supply_chain.ALLOCATION_REVISION_BINDING,
+            "GITFORGEOPS_ALLOCATION_REVISION: ${{ steps.freshness.outputs.applied_sha }}",
+            1,
+        )
+        violations = check_supply_chain.allocation_revision_binding_violations(
+            "apply-on-merge.yml", head_bound
+        )
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn("'Apply'", violations[0])
+
+        unrelated = "      - name: Validate\n        run: gitforgeops validate\n"
+        self.assertEqual(
+            check_supply_chain.allocation_revision_binding_violations(
+                "apply-on-merge.yml", unrelated
+            ),
+            [],
+        )
+
+    def test_dropping_the_allocation_revision_fails_the_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    f"          {check_supply_chain.ALLOCATION_REVISION_BINDING}\n", ""
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any("GITFORGEOPS_ALLOCATION_REVISION" in item for item in violations),
+            violations,
+        )
+
     def test_privileged_reconcile_must_refresh_the_protected_head(self):
         # The concurrency group serializes per environment; it does not move
         # the checkout. Dropping the freshness guard is exactly the bug: the

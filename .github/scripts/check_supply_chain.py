@@ -88,6 +88,12 @@ ADMIN_API_WORKFLOWS = (
     "rotate.yml",
     "trusted-pr-review.yml",
 )
+# The revision a recorded credential allocation is bound to, which lets the
+# retry of a failed apply keep the slots it already wrote. It must be the
+# triggering merge: the applied head moves when the failed attempt pushes its
+# state commit, so a retry bound to that head would refuse its own slots.
+ALLOCATION_REVISION_BINDING = "GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }}"
+APPLY_COMMAND = "run: gitforgeops apply"
 STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 CARGO_AUDIT_ACTION = "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af"
@@ -388,6 +394,29 @@ def admin_jwt_binding_violations(workflow: str, text: str) -> list[str]:
                 f"{', '.join(missing)}; a documented per-environment secret that "
                 "never reaches the process is a 401 the operator cannot explain"
             )
+    return violations
+
+
+def allocation_revision_binding_violations(workflow: str, text: str) -> list[str]:
+    """Every apply step must bind the allocation revision to the triggering merge.
+
+    A recorded allocation newer than the last clean apply is exempt from the
+    revived-slot refusal only for the apply that recorded it, identified by
+    `GITFORGEOPS_ALLOCATION_REVISION`. Unbound, the binary falls back to the
+    checked-out commit — the refreshed head, which a failed attempt's state
+    commit moves — and a re-run refuses the slots its first attempt allocated.
+    """
+    violations: list[str] = []
+    for step in STEP_SPLIT.split(text):
+        if APPLY_COMMAND not in step or ALLOCATION_REVISION_BINDING in step:
+            continue
+        name_match = STEP_NAME.search(step)
+        name = name_match.group(1) if name_match else "<unnamed step>"
+        violations.append(
+            f"{workflow}: step {name!r} must bind {ALLOCATION_REVISION_BINDING!r}; "
+            "the applied head moves between attempts, so a retry could not "
+            "recognize the credential slots its failed attempt allocated"
+        )
     return violations
 
 
@@ -1586,6 +1615,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"apply-on-merge.yml: explicit validated mode mapping is missing {required!r}"
             )
     violations.extend(unconfigured_repo_skip_violations(apply_workflow))
+    violations.extend(
+        allocation_revision_binding_violations("apply-on-merge.yml", apply_workflow)
+    )
 
     shard_limit, shard_limit_violations = credential_shard_limit(root)
     violations.extend(shard_limit_violations)
