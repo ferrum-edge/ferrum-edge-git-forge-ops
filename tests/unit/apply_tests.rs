@@ -5628,15 +5628,11 @@ async fn a_resolved_credential_is_written_normally() {
         result.errors
     );
     assert!(
-        requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|request| {
-                request.starts_with("POST /batch")
-                    && request.contains("resolved-value-aaaaaaaaaaaaaaaa")
-                    && !request.contains("gh-env-secret")
-            }),
+        requests.lock().unwrap().iter().any(|request| {
+            request.starts_with("POST /batch")
+                && request.contains("resolved-value-aaaaaaaaaaaaaaaa")
+                && !request.contains("gh-env-secret")
+        }),
         "the resolved credential was included in the batch without its placeholder"
     );
 }
@@ -5655,12 +5651,8 @@ async fn apply_refuses_an_unresolved_plugin_config_secret_before_any_write() {
     let namespaces = vec!["team-alpha".to_string()];
     let actuals = empty_actuals(&["team-alpha"]);
     let extras = no_extras(&namespaces);
-    let (url, requests) = spawn_recording_gateway(vec![(
-        "GET /health".into(),
-        200,
-        HEALTHY.into(),
-        vec![],
-    )]);
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
 
     let result = apply_api(
         &desired,
@@ -5708,12 +5700,8 @@ async fn apply_refuses_an_unresolved_service_discovery_secret_before_any_write()
     let namespaces = vec!["team-alpha".to_string()];
     let actuals = empty_actuals(&["team-alpha"]);
     let extras = no_extras(&namespaces);
-    let (url, requests) = spawn_recording_gateway(vec![(
-        "GET /health".into(),
-        200,
-        HEALTHY.into(),
-        vec![],
-    )]);
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
 
     let result = apply_api(
         &desired,
