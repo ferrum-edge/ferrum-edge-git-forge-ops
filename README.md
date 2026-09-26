@@ -1689,7 +1689,7 @@ Runtime variables supported by the binary include:
 | `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same opt-in as `review --fail-on-blockers`: exit 1 when the same offline apply blockers that make `plan` exit 1 are present. Default `review` stays 0; the PR comment is identical either way. Accepts `true`, `false`, `1`, `0`; invalid values fail. |
 | `FERRUM_OVERLAY` | — | Overlay selector used only without repo config/env selection. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode output path. Bundled file-mode apply sets this to `assembled/<env>.yaml`. |
-| `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`, and retracted (rewritten as `mesh: {}`, never deleted) when the last `MeshConfig` fragment is removed. Separate document, separate path — see [Mesh configuration](#mesh-configuration). Bundled workflows set `assembled/<env>-mesh.yaml`. |
+| `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Where the standalone `{version, mesh}` document is published by `export` and file-mode `apply`, and retracted (rewritten as `mesh: {}`, never deleted) when the last `MeshConfig` fragment is removed. Separate document, separate path — see [Mesh configuration](#mesh-configuration). File-mode `validate`, `plan` and `apply` (and `export --output`) refuse before writing anything when this and the gateway destination resolve to the same file, including through `./` or `..` spellings or a symlinked parent directory. Bundled workflows set `assembled/<env>-mesh.yaml`. |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | `iss` claim minted into admin tokens. |
 | `FERRUM_ADMIN_JWT_ROLE` | `admin` | `role` claim. `viewer` / `operator` are insufficient for what gitforgeops does. |
 | `FERRUM_ADMIN_JWT_AUDIENCE` | — | `aud` claim; emitted only when set. |
@@ -2208,6 +2208,13 @@ holds deployment credentials, and an arbitrary command in a repository file
 would be a way to spend them. The closed `deny_unknown_fields` schema is the
 entire execution surface — a `run:` or `command:` key is a load error, not a
 silently ignored one.
+
+`validate`, `plan` and `apply` load the same file with the same parser before
+anything changes, so a malformed check (an unknown key, `attempts: 0`, a path
+without a leading `/`, …) in any environment fails the preview and refuses the
+apply instead of being discovered by `verify` after the gateway has changed.
+An absent `smoke.yaml` is still fine; only running the checks needs a data
+plane.
 
 Requests go to `FERRUM_VERIFY_BASE_URL`, the gateway's **data plane**, which is
 a different endpoint from the admin API in `FERRUM_GATEWAY_URL`, and is held to

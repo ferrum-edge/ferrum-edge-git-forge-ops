@@ -1243,6 +1243,26 @@ fn mesh_retraction_line(
     }
 }
 
+/// Offline refusals every deployment-preview command shares with `apply`,
+/// checked before anything is assembled, resolved, published or recorded.
+///
+/// * A file-mode run publishes the gateway and mesh documents one after the
+///   other; destinations naming one file would keep only the last write while
+///   the run reported both.
+/// * `verify` reads `.gitforgeops/smoke.yaml` only after `apply` has changed the
+///   gateway, so a malformed check has to be refused here, by the same loader,
+///   instead of surfacing after the change. An absent file is fine.
+fn preflight_deployment_inputs(env_config: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if env_config.gateway_mode == GatewayMode::File {
+        apply::ensure_distinct_publication_paths(
+            &env_config.file_output_path,
+            &env_config.mesh_file_output_path,
+        )?;
+    }
+    gitforgeops::verify::SmokeConfig::load()?;
+    Ok(())
+}
+
 /// Print one document's plan-time validation verdict and return whether it
 /// counts as passing.
 ///
@@ -1281,6 +1301,7 @@ fn cmd_validate(
     allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    preflight_deployment_inputs(&env_config)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
     let namespace_scope = assembled.namespace_scope;
@@ -1368,6 +1389,11 @@ async fn cmd_export(
     }
 
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    // Export reconciles the mesh destination before it writes `--output`, so
+    // a shared path would leave only the gateway document behind.
+    if let Some(path) = output_path {
+        apply::ensure_distinct_publication_paths(path, &env_config.mesh_file_output_path)?;
+    }
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut gateway_config = assembled.gateway;
     enforce_exclusive_scope(&resolved, &gateway_config)?;
@@ -1743,6 +1769,7 @@ async fn cmd_plan(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json_mode = matches!(format, cli::ReportFormat::Json);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    preflight_deployment_inputs(&env_config)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
@@ -2284,6 +2311,9 @@ async fn cmd_apply(
         &assembled.namespace_scope,
     )) {
         return Err(format!("Refusing to apply: {}", blocker.summary()).into());
+    }
+    if let Err(error) = preflight_deployment_inputs(&env_config) {
+        return Err(format!("Refusing to apply: {error}").into());
     }
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;

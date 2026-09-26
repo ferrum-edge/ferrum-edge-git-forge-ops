@@ -112,6 +112,87 @@ pub fn apply_mesh_file(mesh: &MeshConfigSpec, output_path: &str) -> crate::error
     publish_document(output_path, render_mesh_yaml(mesh)?.as_bytes())
 }
 
+/// Refuse a gateway destination and a mesh destination that name one file.
+///
+/// Both documents are published by the same run, one after the other, so a
+/// shared destination keeps only whichever landed last while the run reports
+/// both as published and the ledger records the gateway rows as applied.
+/// Checked before the first publication, state write or broker write.
+///
+/// String equality is not enough: `out.yaml`, `./out.yaml` and a spelling
+/// through a symlinked parent directory all reach the same file. Each path is
+/// resolved through the filesystem as far as it exists, with the rest applied
+/// lexically, the way the publication itself creates missing directories.
+/// Two destinations that already exist are also compared by file identity.
+pub fn ensure_distinct_publication_paths(
+    gateway_path: &str,
+    mesh_path: &str,
+) -> crate::error::Result<()> {
+    let gateway = publication_identity(gateway_path)?;
+    let mesh = publication_identity(mesh_path)?;
+    if gateway == mesh || same_existing_file(&gateway, &mesh) {
+        return Err(crate::error::Error::Config(format!(
+            "the gateway document destination {} and the mesh document destination {} \
+             (FERRUM_MESH_FILE_OUTPUT_PATH) resolve to the same file {}; each document \
+             must be published to its own path, or one silently overwrites the other",
+            safe_line(gateway_path),
+            safe_line(mesh_path),
+            safe_path(&gateway)
+        )));
+    }
+    Ok(())
+}
+
+/// The file a publication to `output_path` would replace.
+///
+/// Every component that exists is canonicalized as soon as it is appended, so
+/// the prefix is always free of symlinks and a following `..` pops the
+/// physical parent. Components past the first missing one are appended
+/// lexically: `create_dir_all` creates them as spelled.
+fn publication_identity(output_path: &str) -> crate::error::Result<std::path::PathBuf> {
+    use std::path::Component;
+
+    let path = Path::new(output_path);
+    let mut resolved = if path.is_absolute() {
+        std::path::PathBuf::new()
+    } else {
+        std::fs::canonicalize(std::env::current_dir()?)?
+    };
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Two existing paths naming one file, e.g. case variants on a
+/// case-insensitive filesystem.
+#[cfg(unix)]
+fn same_existing_file(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_existing_file(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
 /// What reconciling the mesh destination against the repository's desired
 /// state does, or would do.
 ///
