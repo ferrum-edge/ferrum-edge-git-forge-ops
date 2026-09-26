@@ -140,6 +140,63 @@ fn credential_indeterminate_review_masks_only_matching_consumer_values() {
 }
 
 #[test]
+fn unresolved_secret_masking_matches_large_consumer_fixture() {
+    const CONSUMER_COUNT: usize = 2_048;
+    let mut desired_consumers = Vec::with_capacity(CONSUMER_COUNT);
+    let mut live_consumers = Vec::with_capacity(CONSUMER_COUNT + 1);
+    for index in 0..CONSUMER_COUNT {
+        let id = format!("consumer-{index:05}");
+        let mut desired_consumer = make_consumer(&id, &id);
+        desired_consumer.credentials.insert(
+            "keyauth".to_string(),
+            serde_json::json!([{"key": "${gh-env-secret:alloc=require}"}]),
+        );
+        desired_consumers.push(desired_consumer);
+
+        let mut live_consumer = make_consumer(&id, &id);
+        live_consumer.credentials.insert(
+            "keyauth".to_string(),
+            serde_json::json!([{"key": format!("live-secret-{index:05}")}]),
+        );
+        live_consumers.push(live_consumer);
+    }
+    let mut unmatched_live = make_consumer("live-only", "live-only");
+    unmatched_live.credentials.insert(
+        "keyauth".to_string(),
+        serde_json::json!([{"key": "live-only-secret"}]),
+    );
+    live_consumers.push(unmatched_live);
+
+    let desired = GatewayConfig {
+        consumers: desired_consumers,
+        ..GatewayConfig::default()
+    };
+    let mut actual = GatewayConfig {
+        consumers: live_consumers,
+        ..GatewayConfig::default()
+    };
+
+    mask_without_bundle(&desired, &mut actual);
+
+    let placeholder = "${gh-env-secret:alloc=require}";
+    assert_eq!(actual.consumers.len(), CONSUMER_COUNT + 1);
+    for (index, consumer) in actual.consumers.iter().take(CONSUMER_COUNT).enumerate() {
+        assert_eq!(consumer.id, format!("consumer-{index:05}"));
+        assert_eq!(
+            consumer.credentials["keyauth"][0]["key"],
+            placeholder,
+            "consumer {} was not masked",
+            consumer.id
+        );
+    }
+    assert_eq!(
+        actual.consumers[CONSUMER_COUNT].credentials["keyauth"][0]["key"],
+        "live-only-secret",
+        "unmatched live resources must remain visible"
+    );
+}
+
+#[test]
 fn credential_indeterminate_review_keeps_known_literal_values_comparable() {
     let mut desired_consumer = make_consumer("app", "app");
     desired_consumer.credentials.insert(
