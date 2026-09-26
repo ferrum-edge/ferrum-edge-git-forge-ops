@@ -628,7 +628,10 @@ pub fn waf_has_enforcing_rule(config: &serde_json::Value) -> bool {
         }
     }
     if let Some(custom) = cfg_array(config, &["custom_rules"]) {
-        if custom.iter().any(|rule| waf_custom_rule_enforces(config, rule)) {
+        if custom
+            .iter()
+            .any(|rule| waf_custom_rule_enforces(config, rule))
+        {
             return true;
         }
     }
