@@ -11,6 +11,8 @@ the set that supersedes a queued run equals the set that schedules a new one.
 """
 
 import importlib.util
+import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -263,6 +265,33 @@ class DeploymentScopeTests(unittest.TestCase):
             "".join(decision.messages(trigger, trigger, "main")),
         )
 
+    # -- the fixture itself -------------------------------------------------
+
+    def test_fixture_commits_start_no_background_git_process(self):
+        # #374: `git commit` detached `git maintenance run --auto`, which was
+        # still writing `.git/objects` when cleanup ran (ENOTEMPTY). Trace a
+        # fixture commit and require that git starts no gc/maintenance child.
+        with self._repo() as repo, tempfile.TemporaryDirectory() as traces:
+            trace = Path(traces) / "trace2.json"
+            (repo / "README.md").write_text("traced\n", encoding="utf-8")
+            self._git(repo, "add", "-A")
+            subprocess.run(
+                ["git", "commit", "-m", "traced", "--no-gpg-sign"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+                env={**os.environ, "GIT_TRACE2_EVENT": str(trace)},
+            )
+            events = [
+                json.loads(line)
+                for line in trace.read_text(encoding="utf-8").splitlines()
+            ]
+        # Guard against a vacuous pass: the trace must have recorded the commit.
+        self.assertIn("start", [event.get("event") for event in events])
+        for event in events:
+            if event.get("event") == "child_start":
+                self.assertNotIn(event.get("argv", [])[1:2], (["gc"], ["maintenance"]), event)
+
     # -- helpers ------------------------------------------------------------
 
     def _sample(self, trigger_path: str) -> str:
@@ -359,6 +388,12 @@ class _TemporaryRepo:
             ("config", "user.email", "test@example.invalid"),
             ("config", "user.name", "Test"),
             ("config", "commit.gpgsign", "false"),
+            # `git commit` otherwise detaches `git maintenance run --auto`, which
+            # can still be writing `.git/objects` when the directory is removed
+            # (#374). Nothing may outlive the git command that started it.
+            ("config", "maintenance.auto", "false"),
+            ("config", "gc.auto", "0"),
+            ("config", "core.fsmonitor", "false"),
         ):
             subprocess.run(
                 ["git", *args], cwd=str(repo), check=True, capture_output=True

@@ -36,6 +36,7 @@ pub async fn import_from_api(
     let mut skipped_trust_bundles = 0;
     let mut unsupported_sections = std::collections::BTreeSet::new();
     let mut sources = Vec::new();
+    let mut unmodeled_nested_fields = Vec::new();
 
     for namespace in namespaces {
         let snapshot = client.get_backup_snapshot(&namespace).await?;
@@ -44,10 +45,10 @@ pub async fn import_from_api(
                 "refusing to import namespace '{namespace}' from X-Data-Source: cached: the snapshot may be stale and omits API-spec ownership metadata; wait for the config database to recover"
             )));
         }
-        // Live reads treat a mismatched count seal as advisory so a single
-        // gateway quirk cannot take `diff`/`plan`/`apply` down. Import is the
-        // opposite case: this document becomes the repository's permanent
-        // desired state, and a seal that disagrees means it may be truncated.
+        // Read-only live comparisons treat a mismatched count seal as
+        // advisory. Mutation-authorizing reads refuse it, and import also
+        // refuses because this document would become permanent repository
+        // state and a mismatch means it may be truncated.
         if let Some(notice) = snapshot.seal_violation_notice() {
             return Err(crate::error::Error::Config(format!(
                 "refusing to import namespace '{namespace}': the backup's count seal does not match the document it sealed ({notice}). The snapshot may be truncated; publishing it would make a partial configuration the repository's desired state."
@@ -84,6 +85,7 @@ pub async fn import_from_api(
         skipped_api_specs += snapshot.extras.api_spec_count();
         skipped_trust_bundles += snapshot.extras.trust_bundle_count();
         unsupported_sections.extend(snapshot.unsupported_sections);
+        unmodeled_nested_fields.extend(snapshot.unmodeled_nested_fields);
     }
 
     if let Some(version) = backup_version {
@@ -97,6 +99,7 @@ pub async fn import_from_api(
             skipped_trust_bundles,
             unsupported_sections: unsupported_sections.into_iter().collect(),
             sources,
+            unmodeled_nested_fields,
         },
         credential_bundle_output,
         true,
