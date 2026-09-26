@@ -48,9 +48,9 @@ whole resolution succeeds; any error preserves the caller's complete input.
 | `review` | Shared load check precedes resolution, validation, gateway reads and comment delivery. Review validation receives resolution provenance. |
 | API `apply`, including interactive preview | Shared load check precedes security/override evaluation, bundle/state work, validator execution and allocation. Validation receives resolution provenance. |
 | File `apply`, including allocation preview | Shared load check precedes the read-only report and all publication/allocation. Validation sees the unresolved publication document. |
-| `rotate` | Desired resources load before bundle/state work. The lenient report also refuses identity placeholders, including in sibling consumers, before provisioning or delivery. |
+| `rotate` | Desired resources load before bundle/state work. The published Consumer row then passes apply's literal-credential check, which exempts literal identities and refuses literal secrets, before the bundle is read. The lenient report also refuses identity placeholders, including in sibling consumers, before provisioning or delivery. |
 | Plain `export` | Shared load check runs even though export preserves placeholders and does not resolve secrets. |
-| Materialized/encrypted `export` | Shared load check and resolution precede output publication and recipient discovery. |
+| Materialized/encrypted `export` | Shared load check, then apply's security audit on the unresolved document (no override), precede the bundle read, resolution, output publication and recipient discovery. |
 
 The scrubber combines literal-secret classification with values at the report's
 successfully resolved slots. It uses the resolver's canonical path constructors,

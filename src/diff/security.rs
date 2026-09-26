@@ -77,6 +77,34 @@ pub fn security_blockers(findings: &[SecurityFinding]) -> Vec<&SecurityFinding> 
         .collect()
 }
 
+/// The apply-blocking findings on one declared Consumer row.
+///
+/// `rotate` publishes the whole desired Consumer with a single `PUT`, so every
+/// credential on that row, not only the rotated slot, must pass the
+/// literal-credential gate `apply` runs. Auditing only the published row keeps
+/// an unrelated proxy or plugin finding from blocking the rotation, while a
+/// secret the repository can read never rides along with a brokered one.
+///
+/// Like [`audit_security_with_policy`], this must see the **unresolved**
+/// document.
+pub fn consumer_security_blockers(
+    config: &GatewayConfig,
+    namespace: &str,
+    consumer_id: &str,
+) -> Vec<SecurityFinding> {
+    let row = GatewayConfig {
+        consumers: config
+            .consumers
+            .iter()
+            .filter(|consumer| consumer.namespace == namespace && consumer.id == consumer_id)
+            .cloned()
+            .collect(),
+        ..Default::default()
+    };
+    let findings = audit_security(&row);
+    security_blockers(&findings).into_iter().cloned().collect()
+}
+
 /// Audit with the repository's default notion of what counts as authentication.
 pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
     audit_security_with_policy(config, None)
@@ -644,14 +672,16 @@ fn check_literal_credentials(
             if is_identity_credential_leaf(credential_type, leaf) {
                 return;
             }
-            findings.push(SecurityFinding::error(
-                "Consumer",
-                consumer_id,
-                namespace,
-                format!(
-                    "Literal credential in '{path}' on consumer {consumer_id} in namespace {namespace} (use ${{gh-env-secret:...}} for secrets)"
-                ),
-            ));
+            findings.push(literal_credential_finding(consumer_id, namespace, path));
+        }
+        // YAML reads an unquoted `key: 12345` or `secret: true` as a number
+        // or boolean, yet the gateway still receives it as authentication
+        // material. A non-string scalar at a secret leaf is as literal as a
+        // string; identity leaves stay exempt, exactly as above.
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_)
+            if !is_identity_credential_leaf(credential_type, leaf) =>
+        {
+            findings.push(literal_credential_finding(consumer_id, namespace, path));
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map {
@@ -683,4 +713,15 @@ fn check_literal_credentials(
         }
         _ => {}
     }
+}
+
+fn literal_credential_finding(consumer_id: &str, namespace: &str, path: &str) -> SecurityFinding {
+    SecurityFinding::error(
+        "Consumer",
+        consumer_id,
+        namespace,
+        format!(
+            "Literal credential in '{path}' on consumer {consumer_id} in namespace {namespace} (use ${{gh-env-secret:...}} for secrets)"
+        ),
+    )
 }
