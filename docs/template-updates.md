@@ -105,12 +105,17 @@ macOS; it refuses to run on a platform that cannot open a file without
 following links.
 
 An interrupted `apply` can leave such a temporary file behind, named
-`.<file>.template-update-<16 hex digits>`. Only `apply` and
-`detect-baseline --write` remove one, and only once it is at least ten minutes
-old, since a younger one may belong to an update that is still running; every
-other command, and a younger file, is reported on stderr and left in place.
-Nothing but a regular file with exactly that name is ever removed, and a
-nested clone's `.git` directory is never looked into.
+`.<file>.template-update-<16 hex digits>`. `detect-baseline`, `status`,
+`plan` and `apply` look for one under each upstream-managed directory and
+beside each upstream-managed file, including those directly in the repository
+root, `.github/` and `.gitforgeops/` (where `baseline.json` is written too); in
+those three they look only for the temporary of a managed path's own name and
+do not descend into anything else. Only `apply` and `detect-baseline --write`
+remove one, and only once it is at least ten minutes old, since a younger one
+may belong to an update that is still running; every other command, and a
+younger file, is reported on stderr and left in place. Nothing but a regular
+file with exactly that name is ever removed, and a nested clone's `.git`
+directory is never looked into.
 
 An adopted file gets the mode Git would check it out with: executable or not
 as upstream records it, less your umask. As in Git, only the owner's execute
@@ -186,7 +191,9 @@ python3 .github/scripts/template_update.py apply --to v0.2.0
 Omit it and the ref recorded in your baseline (`main` by default) is used.
 `HEAD` and the other `*HEAD` pseudo-refs (`FETCH_HEAD`, `ORIG_HEAD`,
 `origin/HEAD`, ...) are refused, whether given with `--to` or recorded in the
-baseline: they name whatever a copy last pointed at, not a revision.
+baseline: they name whatever a copy last pointed at, not a revision. A bare
+`origin` is refused for the same reason, since Git reads it as `origin/HEAD`;
+a branch that really is named `origin` is `refs/heads/origin`.
 Branch names resolve the same way whether `--upstream` (or the baseline's
 `upstream`) is a URL — the HTTPS default included — or a local clone, so the
 default `main` needs no `origin/` prefix. The tool fetches into a temporary
