@@ -32,19 +32,20 @@ policies:
 
   # Every proxy must have an auth plugin in its effective plugin list
   # (global plugins included; disabled instances never count). Only
-  # authenticators that authenticate the proxy's protocol count: TCP/UDP
+  # authenticators the gateway runs on each of the proxy's request protocols
+  # count. HTTP-family proxies serve HTTP, gRPC and WebSocket requests, so
+  # soap_ws_security (plain HTTP only) is not enough on its own. TCP/UDP
   # stream proxies need mtls_auth plus TLS/DTLS termination
-  # (frontend_tls: true, no passthrough). HTTP-only plugins such as key_auth
-  # never run on a stream listener, and spiffe_identity only extracts an
-  # identity there without rejecting unidentified peers.
+  # (frontend_tls: true, no passthrough); HTTP-family plugins such as
+  # key_auth never run on a stream listener. spiffe_identity only extracts
+  # an identity and rejects no unidentified caller, so it never counts.
   require_auth_plugin:
     enabled: false
     severity: error
     # Plugin names that count as authentication. Matching is case-insensitive.
-    # Omit the key entirely to use all eleven built-in authenticators:
-    # spiffe_identity, mtls_auth, jwks_auth, oauth2_introspection,
-    # oidc_relying_party, jwt_auth, key_auth, ldap_auth, basic_auth,
-    # hmac_auth, soap_ws_security.
+    # Omit the key entirely to use all ten built-in authenticators:
+    # mtls_auth, jwks_auth, oauth2_introspection, oidc_relying_party,
+    # jwt_auth, key_auth, ldap_auth, basic_auth, hmac_auth, soap_ws_security.
     auth_plugin_names:
       - jwt_auth
       - jwks_auth
@@ -52,6 +53,12 @@ policies:
       - basic_auth
       - oauth2_introspection
       - oidc_relying_party
+    # Protocols each custom authenticator in auth_plugin_names implements
+    # (its supported_protocols(): http, grpc, websocket, tcp, udp). An
+    # undeclared custom authenticator counts for plain HTTP only, the
+    # gateway's default. Built-in names cannot be listed here.
+    # custom_auth_plugin_protocols:
+    #   company_sso: [http, grpc, websocket]
 
   # Refuse `backend_tls_verify_server_cert: false` on proxies and upstreams.
   forbid_tls_verify_disabled:

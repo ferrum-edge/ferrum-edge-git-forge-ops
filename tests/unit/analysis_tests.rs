@@ -9,6 +9,7 @@ use gitforgeops::config::schema::{
 };
 use gitforgeops::diff::best_practice::check_best_practices;
 use gitforgeops::diff::security::{audit_security, audit_security_with_policy};
+use gitforgeops::plugin_catalog::HTTP_FAMILY_PROTOCOLS;
 use gitforgeops::policy::config::{PolicyConfig, PolicyRules, RequireAuthPluginRuleConfig};
 
 /// Fixtures go through serde rather than struct literals: every field these
@@ -355,10 +356,12 @@ fn disabled_plugins_skip_configuration_checks_but_not_name_checks() {
 
 #[test]
 fn security_audit_honours_the_configured_auth_allowlist() {
+    let declared = [("company_sso".to_string(), HTTP_FAMILY_PROTOCOLS.to_vec())];
     let policy = PolicyConfig {
         policies: PolicyRules {
             require_auth_plugin: RequireAuthPluginRuleConfig {
                 auth_plugin_names: vec!["company_sso".to_string()],
+                custom_auth_plugin_protocols: declared.into_iter().collect(),
                 ..Default::default()
             },
             ..Default::default()
@@ -380,6 +383,15 @@ fn security_audit_honours_the_configured_auth_allowlist() {
     assert!(!audit_security_with_policy(&cfg, Some(&policy))
         .iter()
         .any(|f| f.message.contains("No auth plugin")));
+
+    // Undeclared, a custom authenticator runs on plain HTTP only, the
+    // gateway's trait default.
+    let mut undeclared = policy.clone();
+    let rule = &mut undeclared.policies.require_auth_plugin;
+    rule.custom_auth_plugin_protocols.clear();
+    assert!(audit_security_with_policy(&cfg, Some(&undeclared))
+        .iter()
+        .any(|f| f.message.contains("on gRPC, WebSocket requests")));
 
     // And a built-in authenticator no longer counts once the operator has
     // narrowed the list.
@@ -469,7 +481,51 @@ fn security_audit_assesses_stream_identity_separately() {
     let msgs = auth_messages(&extraction_only);
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     assert!(msgs[0].contains("No auth plugin runs on TCP stream proxy"));
-    assert!(msgs[0].contains("spiffe_identity (sid-1)"));
+}
+
+#[test]
+fn security_audit_does_not_count_spiffe_identity_on_http_proxies() {
+    // On HTTP requests too, spiffe_identity continues when the caller presents
+    // no client certificate, so it protects nothing.
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("api", Some(BackendScheme::Https))],
+        plugin_configs: vec![plugin("sid-1", "spiffe_identity", serde_json::json!({}))],
+        ..Default::default()
+    };
+    let msgs = auth_messages(&cfg);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(
+        msgs[0].starts_with("No auth plugin attached to proxy api"),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn security_audit_requires_an_authenticator_for_grpc_and_websocket_requests() {
+    // soap_ws_security declares HTTP_ONLY_PROTOCOLS in Ferrum Edge v0.9.7, so
+    // gRPC and WebSocket requests to the proxy skip it.
+    let soap_only = GatewayConfig {
+        proxies: vec![proxy("api", Some(BackendScheme::Https))],
+        plugin_configs: vec![plugin("soap-1", "soap_ws_security", serde_json::json!({}))],
+        ..Default::default()
+    };
+    let msgs = auth_messages(&soap_only);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(
+        msgs[0].contains("gRPC, WebSocket requests to proxy api")
+            && msgs[0].contains("soap_ws_security (soap-1)"),
+        "{msgs:?}"
+    );
+
+    let with_key_auth = GatewayConfig {
+        proxies: vec![proxy("api", Some(BackendScheme::Https))],
+        plugin_configs: vec![
+            plugin("soap-1", "soap_ws_security", serde_json::json!({})),
+            plugin("key-1", "key_auth", serde_json::json!({})),
+        ],
+        ..Default::default()
+    };
+    assert!(auth_messages(&with_key_auth).is_empty());
 }
 
 #[test]

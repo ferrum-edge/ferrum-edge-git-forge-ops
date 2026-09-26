@@ -1085,6 +1085,142 @@ fn breaking_ignores_undeclared_unmanaged_authenticator_in_shared_mode() {
     assert!(breaking.is_empty(), "{breaking:?}");
 }
 
+/// Diff `desired` against `actual` in shared mode with no prior ownership
+/// state, returning the diff and the breaking reasons.
+fn shared_auth_coverage_reasons(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+) -> (Vec<gitforgeops::diff::resource_diff::ResourceDiff>, Vec<String>) {
+    let managed = std::collections::HashSet::new();
+    let result = compute_diff_with_scope(
+        desired,
+        actual,
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+    )
+    .unwrap();
+    let reasons = detect_breaking_changes(&result.diffs, desired, actual)
+        .into_iter()
+        .map(|bc| bc.reason)
+        .collect();
+    (result.diffs, reasons)
+}
+
+const ORDERS_LEFT_WITHOUT_KEY_AUTH: &str = "proxy ferrum/orders loses authenticator key_auth \
+     — consumer credentials for it no longer apply on this proxy, which is left with no \
+     enabled authenticator";
+
+/// In shared mode a live proxy the repo does not declare is unmanaged and
+/// survives the apply, yet a managed global authenticator still decides its
+/// effective plugin list. Narrowing that global strands the proxy exactly as
+/// it would a declared one.
+#[test]
+fn breaking_detects_auth_loss_on_surviving_unmanaged_proxy_in_shared_mode() {
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let mut desired = auth_coverage_config("", KEY_AUTH_ON_PAYMENTS);
+    desired.proxies.retain(|p| p.id != "orders");
+
+    let (diffs, reasons) = shared_auth_coverage_reasons(&desired, &actual);
+    // orders is unmanaged: the apply neither writes nor deletes it.
+    assert!(diffs.iter().all(|d| d.id != "orders"), "{diffs:?}");
+    assert_eq!(reasons, vec![ORDERS_LEFT_WITHOUT_KEY_AUTH.to_string()]);
+}
+
+#[test]
+fn breaking_shared_mode_controls_for_unmanaged_proxy_auth() {
+    // Unchanged auth on a surviving unmanaged proxy is not a loss.
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let mut desired = actual.clone();
+    desired.proxies.retain(|p| p.id != "orders");
+    let (_, reasons) = shared_auth_coverage_reasons(&desired, &actual);
+    assert!(reasons.is_empty(), "{reasons:?}");
+
+    // A declared proxy is reported the same way in shared mode.
+    let desired = auth_coverage_config("", KEY_AUTH_ON_PAYMENTS);
+    let (_, reasons) = shared_auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons, vec![ORDERS_LEFT_WITHOUT_KEY_AUTH.to_string()]);
+}
+
+/// A proxy the diff deletes is reported as deleted, not as losing its
+/// authenticators.
+#[test]
+fn breaking_skips_auth_coverage_for_deleted_proxies() {
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let mut desired = auth_coverage_config("", KEY_AUTH_ON_PAYMENTS);
+    desired.proxies.retain(|p| p.id != "orders");
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons, vec!["Proxy deleted".to_string()]);
+}
+
+/// `orders` (the first proxy) as a TCP stream proxy that terminates TLS.
+fn stream_orders_config(plugin_configs: &str) -> GatewayConfig {
+    let mut config = auth_coverage_config("", plugin_configs);
+    let orders = &mut config.proxies[0];
+    orders.backend_scheme = Some(BackendScheme::Tcp);
+    orders.listen_path = None;
+    orders.listen_port = Some(19001);
+    orders.frontend_tls = true;
+    config
+}
+
+/// A TCP listener never runs `key_auth` (Ferrum Edge v0.9.7 declares it for
+/// HTTP-family protocols only), so narrowing it away from the stream proxy
+/// removes nothing that authenticated its connections.
+#[test]
+fn breaking_ignores_losing_an_authenticator_the_listener_never_ran() {
+    let actual = stream_orders_config(GLOBAL_KEY_AUTH);
+    let desired = stream_orders_config(KEY_AUTH_ON_PAYMENTS);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert!(reasons.is_empty(), "{reasons:?}");
+
+    // mtls_auth does run on the listener, so losing it is reported.
+    let actual = stream_orders_config(
+        "  - id: sso
+    plugin_name: mtls_auth
+    scope: global
+",
+    );
+    let desired = stream_orders_config(
+        "  - id: sso
+    plugin_name: mtls_auth
+    scope: proxy
+    proxy_id: payments
+",
+    );
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].starts_with("proxy ferrum/orders loses authenticator mtls_auth"),
+        "{reasons:?}"
+    );
+}
+
+/// soap_ws_security runs on plain HTTP only, so a proxy left with just it
+/// serves gRPC and WebSocket requests unauthenticated.
+#[test]
+fn breaking_reports_protocols_left_unauthenticated() {
+    let plugins = "  - id: sso
+    plugin_name: key_auth
+    scope: proxy_group
+  - id: soap
+    plugin_name: soap_ws_security
+    scope: global
+";
+    let actual = auth_coverage_config("plugins: [{plugin_config_id: sso}]", plugins);
+    let desired = auth_coverage_config("", plugins);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(
+        reasons,
+        vec![
+            "proxy ferrum/orders loses authenticator key_auth — consumer credentials for it \
+             no longer apply on this proxy, which leaves its gRPC, WebSocket requests \
+             unauthenticated"
+                .to_string()
+        ]
+    );
+}
+
 #[test]
 fn security_detects_literal_credential() {
     let mut creds = std::collections::BTreeMap::new();
@@ -1691,7 +1827,7 @@ fn security_audit_uses_auth_allowlist() {
         plugin_configs: vec![make_plugin_config(
             "global-auth",
             "ferrum",
-            "jwt",
+            "jwt_auth",
             PluginScope::Global,
         )],
         ..GatewayConfig::default()

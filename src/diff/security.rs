@@ -6,10 +6,10 @@ use crate::plugin_catalog::{
     allows_uninspectable_body, auth_coverage, cfg_array, cfg_bool, cfg_str, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
     plugin_instance_list, retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode,
-    waf_mode_is_passive, waf_skips_oversized_body, AuthCoverage, RetiredRemediation,
+    waf_mode_is_passive, waf_skips_oversized_body, AuthAllowlist, AuthCoverage, RetiredRemediation,
     RETIRED_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
 };
-use crate::policy::config::effective_auth_plugin_names;
+use crate::policy::config::effective_auth_allowlist;
 use crate::policy::PolicyConfig;
 use crate::secrets::plugin_config::{render_config_path, sensitive_string_paths, value_at};
 use crate::secrets::resolver::is_identity_credential_leaf;
@@ -138,7 +138,7 @@ pub fn audit_security_with_scope(
 ) -> Vec<SecurityFinding> {
     let mut findings = Vec::new();
 
-    let auth_names = effective_auth_plugin_names(policy);
+    let auth = effective_auth_allowlist(policy);
 
     for consumer in &config.consumers {
         for (cred_type, cred_value) in &consumer.credentials {
@@ -168,7 +168,7 @@ pub fn audit_security_with_scope(
     }
 
     for proxy in &config.proxies {
-        check_proxy(config, proxy, &auth_names, &mut findings);
+        check_proxy(config, proxy, &auth, &mut findings);
         check_proxy_plugin_associations(config, proxy, ownership_scope, &mut findings);
     }
 
@@ -202,19 +202,21 @@ pub fn audit_security_with_scope(
 fn check_proxy(
     config: &GatewayConfig,
     proxy: &Proxy,
-    auth_names: &[String],
+    auth: &AuthAllowlist,
     findings: &mut Vec<SecurityFinding>,
 ) {
-    // Only authenticators the gateway runs on this proxy's listener count: a
-    // TCP or UDP listener skips every HTTP-only plugin, `key_auth` included.
-    let coverage = auth_coverage(config, proxy, auth_names);
+    // Only authenticators the gateway runs on each of this proxy's request
+    // protocols count: a TCP or UDP listener skips every HTTP-family plugin,
+    // `key_auth` included, and gRPC and WebSocket requests skip an HTTP-only
+    // one such as `soap_ws_security`.
+    let coverage = auth_coverage(config, proxy, auth);
 
     if !coverage.is_authenticated() {
         findings.push(SecurityFinding::warning(
             "Proxy",
             &proxy.id,
             &proxy.namespace,
-            missing_auth_message(proxy, &coverage, auth_names),
+            missing_auth_message(proxy, &coverage, auth),
         ));
     }
 
@@ -279,16 +281,23 @@ fn check_proxy(
 fn missing_auth_message(
     proxy: &Proxy,
     coverage: &AuthCoverage<'_>,
-    auth_names: &[String],
+    auth: &AuthAllowlist,
 ) -> String {
     let id = proxy.id.as_str();
     let ns = proxy.namespace.as_str();
     let transport = coverage.transport.as_str();
 
     if !coverage.transport.is_stream() {
+        if coverage.applicable.is_empty() {
+            return format!(
+                "No auth plugin attached to proxy {id} in namespace {ns} — its effective plugin list contains no enabled authenticator; attach one of: {}",
+                auth.names().join(", ")
+            );
+        }
         return format!(
-            "No auth plugin attached to proxy {id} in namespace {ns} — its effective plugin list contains no enabled authenticator; attach one of: {}",
-            auth_names.join(", ")
+            "No auth plugin runs on {} requests to proxy {id} in namespace {ns} — the gateway skips its authenticators ({}) for them, so they reach the backend unauthenticated; attach an authenticator that runs on HTTP, gRPC and WebSocket requests, or declare a custom authenticator's protocols under require_auth_plugin.custom_auth_plugin_protocols",
+            crate::plugin_catalog::protocol_list(&coverage.uncovered),
+            plugin_instance_list(&coverage.applicable)
         );
     }
 
