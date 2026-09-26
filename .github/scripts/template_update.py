@@ -219,8 +219,8 @@ def validate_target_ref(value: object, field: str) -> str:
         raise UpdateError(
             f"{field} {ref} is ambiguous: it names the upstream remote, which "
             "resolves to whichever branch upstream marks as its default; provide "
-            "an explicit branch, tag, or SHA (a branch that is really named "
-            f"{ref} is refs/heads/{ref})"
+            "an explicit branch, tag, or SHA (a branch or tag that is really "
+            f"named {ref} is refs/heads/{ref} or refs/tags/{ref})"
         )
     return ref
 
@@ -1056,11 +1056,12 @@ def _sweep_temporaries(
         shown = f"{directory}/{child}" if directory else child
         stale = now - child_info.st_mtime >= STALE_TEMPORARY_SECONDS
         if remove and stale:
-            os.unlink(child, dir_fd=descriptor)
-            print(
-                f"removed {shown}, left by an interrupted template update",
-                file=sys.stderr,
-            )
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(child, dir_fd=descriptor)
+                print(
+                    f"removed {shown}, left by an interrupted template update",
+                    file=sys.stderr,
+                )
         elif remove:
             print(
                 f"left {shown} in place: it is less than {minutes} "
