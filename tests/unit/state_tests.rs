@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use gitforgeops::config::schema::GatewayConfig;
 use gitforgeops::diff::resource_diff::{state_key, state_key_namespace, DiffAction, ResourceDiff};
-use gitforgeops::state::{PendingCreateScope, StateFile};
+use gitforgeops::state::{AllocationBinding, PendingCreateScope, StateFile};
 use tempfile::TempDir;
 
 // Process-wide lock — tests in this file all mutate CWD, and cargo runs tests
@@ -793,7 +793,8 @@ fn record_allocation_journals_committed_slots_without_their_values() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
         let mut state = StateFile::load("staging").unwrap();
-        state.record_allocation(&AllocateOutcome::default(), Some("7"));
+        let binding = AllocationBinding::new(Some("abc123"), Some("alice"));
+        state.record_allocation(&AllocateOutcome::default(), Some("7"), &binding);
         assert!(state.credentials.is_empty());
         assert_eq!(state.credential_shard_count, 1);
 
@@ -814,7 +815,7 @@ fn record_allocation_journals_committed_slots_without_their_values() {
             ],
             shard_count: 4,
         };
-        state.record_allocation(&partial, Some("7"));
+        state.record_allocation(&partial, Some("7"), &binding);
         state.save().unwrap();
 
         let reloaded = StateFile::load("staging").unwrap();
@@ -823,9 +824,12 @@ fn record_allocation_journals_committed_slots_without_their_values() {
         assert_eq!(alpha.shard, 0);
         assert_eq!(alpha.delivered_to, None);
         assert_eq!(alpha.delivered_run_id.as_deref(), Some("7"));
+        assert_eq!(alpha.allocation_commit.as_deref(), Some("abc123"));
+        assert_eq!(alpha.allocation_recipient.as_deref(), Some("alice"));
         let bravo = &reloaded.credentials["ferrum/bravo/keyauth/key"];
         assert_eq!(bravo.shard, 2);
         assert_eq!(bravo.delivered_to.as_deref(), Some("alice"));
+        assert!(binding.recorded(alpha) && binding.recorded(bravo));
         assert_eq!(
             reloaded.credential_shard_count, 3,
             "the count covers committed shards, not the four the allocator planned"
@@ -843,6 +847,86 @@ fn record_allocation_journals_committed_slots_without_their_values() {
             );
         }
     });
+}
+
+/// A rotation replaces the slot's value outside any apply, so it must not keep
+/// the allocating apply's binding: a retry of that apply would otherwise claim
+/// the rotated value as its own.
+#[test]
+fn record_credential_clears_the_allocation_binding() {
+    use gitforgeops::secrets::AllocateOutcome;
+
+    let slot = "ferrum/alpha/keyauth/key";
+    let binding = AllocationBinding::new(Some("trigger-sha"), Some("alice"));
+    let mut state = StateFile::default();
+    let outcome = AllocateOutcome {
+        allocated: vec![allocated_slot(slot, 0, "alpha-secret-value", None)],
+        shard_count: 1,
+    };
+    state.record_allocation(&outcome, Some("7"), &binding);
+    assert!(binding.recorded(&state.credentials[slot]));
+
+    state.record_credential(slot, 0, Some("alice"), Some("8"));
+    let rotated = &state.credentials[slot];
+    assert_eq!(rotated.allocation_commit, None);
+    assert_eq!(rotated.allocation_recipient, None);
+    assert!(!binding.recorded(rotated));
+    let serialized = serde_json::to_string(rotated).unwrap();
+    assert!(!serialized.contains("allocation_"), "{serialized}");
+}
+
+/// A binding matches only when both sides name both values: a missing value
+/// never matches another missing value.
+#[test]
+fn allocation_binding_requires_both_values_on_both_sides() {
+    use gitforgeops::state::CredentialMetadata;
+
+    let entry = |commit: Option<&str>, recipient: Option<&str>| CredentialMetadata {
+        allocation_commit: commit.map(str::to_string),
+        allocation_recipient: recipient.map(str::to_string),
+        ..Default::default()
+    };
+    let bound = AllocationBinding::new(Some("trigger-sha"), Some("alice"));
+    assert!(bound.recorded(&entry(Some("trigger-sha"), Some("alice"))));
+    for (commit, recipient) in [
+        (None, None),
+        (Some("trigger-sha"), None),
+        (None, Some("alice")),
+        (Some("other-sha"), Some("alice")),
+        (Some("trigger-sha"), Some("bob")),
+    ] {
+        assert!(
+            !bound.recorded(&entry(commit, recipient)),
+            "commit={commit:?} recipient={recipient:?}"
+        );
+    }
+
+    let no_recipient = AllocationBinding::new(Some("trigger-sha"), None);
+    assert!(!no_recipient.recorded(&entry(Some("trigger-sha"), None)));
+    let blank_recipient = AllocationBinding::new(Some("trigger-sha"), Some("  "));
+    assert_eq!(blank_recipient, no_recipient, "blank is unset");
+    let unbound = AllocationBinding::default();
+    assert!(!unbound.recorded(&entry(None, None)));
+}
+
+/// The configured revision wins over the checkout; the checkout is the
+/// fallback only when none is configured, and a blank value counts as unset.
+#[test]
+fn allocation_binding_prefers_the_configured_revision() {
+    let head = || Some("checkout-head".to_string());
+    let configured = AllocationBinding::resolve(Some("trigger-sha"), Some("alice"), head);
+    assert_eq!(configured.revision.as_deref(), Some("trigger-sha"));
+    assert_eq!(configured.recipient.as_deref(), Some("alice"));
+    for unset in [None, Some(""), Some("   ")] {
+        let fallback = AllocationBinding::resolve(unset, Some("alice"), head);
+        assert_eq!(
+            fallback.revision.as_deref(),
+            Some("checkout-head"),
+            "{unset:?}"
+        );
+    }
+    let unresolvable = AllocationBinding::resolve(None, Some("alice"), || None);
+    assert_eq!(unresolvable.revision, None);
 }
 
 #[test]

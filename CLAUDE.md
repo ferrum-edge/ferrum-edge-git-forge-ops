@@ -865,9 +865,10 @@ the two consequences by whether evidence exists:
     `alloc=generate`/`alloc=rotate` slot from the bundle, so a reused id would
     silently inherit a retired credential that is never delivered.
     `alloc=require` is exempt (the operator's seed), and so is an allocation
-    `state.credentials` recorded after `last_applied_at` (the retry of an
-    apply that allocated and failed before recording the Consumer, including
-    one whose allocation committed only some shards).
+    `state.credentials` recorded after `last_applied_at` by this same apply
+    (matching `AllocationBinding`; the retry of an apply that allocated and
+    failed before recording the Consumer, including one whose allocation
+    committed only some shards).
 - Plugin-config arrays get the same split through
   `check_plugin_array_slot_identity`, called from both plugin walks. Their
   slots carry an explicit `[N]` for every entry (no index-0 elision), so only a
@@ -949,7 +950,18 @@ and file mode alike, both on success and when a later shard fails
 (`AllocationFailure.partial` holds exactly the committed slots). The journal is
 non-secret (slot, shard, recipient, run id) and never records an unwritten
 shard, so a retry resolves the committed slots as pending allocations and
-allocates only the rest (#352).
+allocates only the rest (#352). Each entry carries a `state::AllocationBinding`
+(`allocation_commit`, `allocation_recipient`), and `ConsumerLedger::from_state`
+counts an entry as pending only when both equal the current run's; a missing
+value never matches, not even another missing one, and `record_credential`
+(rotation) clears both. The revision is `GITFORGEOPS_ALLOCATION_REVISION`,
+which `apply-on-merge.yml` binds to `github.sha` in every apply step
+(`check_supply_chain.py::allocation_revision_binding_violations`): the
+triggering merge survives a re-run, while the refreshed head moves with the
+failed attempt's state commit. Without it (local CLI) the checked-out commit is
+used. `main.rs` resolves the binding once per command
+(`AllocationBinding::from_env`) and passes the same value to the ledger and the
+journal. An unmatched entry is still refused as a revived slot, with a hint.
 
 Delivery: after allocation or rotation, the value is age-encrypted to the PR
 author's (or dispatcher's) SSH public key fetched from
