@@ -141,6 +141,7 @@ POST_ADOPTION_CHECKS = (
     ("cargo fmt --all -- --check", "the engine still formats"),
     ("cargo clippy --all-targets -- -D warnings", "the engine still lints"),
     ("cargo test --test unit_tests", "the engine's own suite"),
+    ("cargo test --lib", "the engine's inline library tests"),
     (
         "python3 .github/scripts/check_supply_chain.py",
         "every Action, container and validator input is still immutably pinned",

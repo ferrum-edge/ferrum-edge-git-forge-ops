@@ -27,6 +27,7 @@ MANDATORY_COMMANDS = (
     "cargo fmt --all",
     "cargo clippy --all-targets -- -D warnings",
     "cargo test --test unit_tests",
+    "cargo test --lib",
 )
 BRIEF_INVARIANTS = (
     "Register every new `tests/unit/<name>.rs` module in `tests/unit/mod.rs`.",

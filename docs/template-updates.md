@@ -230,6 +230,7 @@ controls, not your intent.
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --test unit_tests
+cargo test --lib
 python3 .github/scripts/check_supply_chain.py
 python3 -m unittest discover -s .github/scripts/tests
 gitforgeops validate

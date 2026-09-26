@@ -91,6 +91,7 @@ gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential 
 cargo build                                   # Debug
 cargo build --release
 cargo test --test unit_tests                  # Single aggregated test binary
+cargo test --lib                              # Inline #[cfg(test)] modules in src/
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all && cargo fmt --all -- --check
 ```
@@ -100,11 +101,13 @@ cargo fmt --all && cargo fmt --all -- --check
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test --test unit_tests`
+4. `cargo test --lib`
 
 `.github/workflows/rust-ci.yml` reports its required status on every PR and
-runs those same three commands when the PR touches current **or previous**
-Rust/build/workspace input paths (`src`, `tests`, benches/examples, `build.rs`,
-`.cargo`, Cargo manifests/lockfiles, toolchain/lint config, or Dockerfile), or
+runs those same four commands (coverage measures both test targets) when the
+PR touches current **or previous** Rust/build/workspace input paths (`src`,
+`tests`, benches/examples, `build.rs`, `.cargo`, Cargo manifests/lockfiles,
+toolchain/lint config, or Dockerfile), or
 a non-Rust file the unit suite reads or the binary embeds (`docs/quickstart.md`,
 `.gitforgeops/*.example.yaml`, `.github/scripts/audit_settings.py`). Unit tests
 never read the customer-owned `resources/` tree; shipped-example checks use the
@@ -978,6 +981,9 @@ journal. An unmatched entry is still refused as a revived slot, with a hint.
 Delivery: after allocation or rotation, the value is age-encrypted to the PR
 author's (or dispatcher's) SSH public key fetched from
 `GET /users/{login}/keys`, then posted as a PR comment or workflow output.
+The allocator discovers that key once per batch (`discover_recipient_at`) and
+encrypts every slot locally with `DeliveryRecipient::encrypt`; discovery is
+unauthenticated and rate-limited, so never call it per slot.
 Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 ### Downstream template updates
@@ -1161,7 +1167,7 @@ submission is required. Forks do not inherit repository settings automatically.
 
 1. `cargo fmt --all` clean
 2. `cargo clippy --all-targets -- -D warnings` clean
-3. `cargo test --test unit_tests` passes
+3. `cargo test --test unit_tests` and `cargo test --lib` pass
 4. Agent/rule changes → `python3 .github/scripts/check_agent_setup.py` and
    `python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'`
 5. No `.unwrap()` / `.expect()` in prod code
