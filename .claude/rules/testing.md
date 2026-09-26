@@ -18,10 +18,13 @@ Run these sequentially with `CARGO_TARGET_DIR` unset:
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --test unit_tests
+cargo test --lib
 ```
 
 Do not delegate these checks to CI and do not replace them with narrower commands. Additional
-focused tests are welcome, but they do not replace the mandatory three-command gate.
+focused tests are welcome, but they do not replace the mandatory four-command gate.
+`cargo test --lib` runs the inline `#[cfg(test)]` modules under `src/`, which the aggregated
+binary never reaches; never add a name filter to it.
 
 ## Test layout
 

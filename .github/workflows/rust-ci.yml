@@ -138,8 +138,20 @@ jobs:
       - name: cargo test
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
         run: |
+          set -euo pipefail
           cargo test --test unit_tests
-          cargo test --lib prepared_apply_tests::missing_prepared_restore_preserves_completed_namespace_and_failed_verdict
+          # Inline `#[cfg(test)]` modules live in the library target, not the
+          # aggregated binary. Run the whole target unfiltered, and refuse a
+          # target that silently lists none of its known suites (a cfg,
+          # feature or filter change would otherwise pass with zero tests).
+          cargo test --lib
+          lib_tests=$(cargo test --lib -- --list --format terse)
+          for suite in 'secrets::plugin_config::tests::' 'apply::api_target::prepared_apply_tests::'; do
+            grep -q "^${suite}.*: test\$" <<< "$lib_tests" || {
+              echo "::error::cargo test --lib no longer lists ${suite} tests"
+              exit 1
+            }
+          done
 
   coverage:
     runs-on: ubuntu-24.04
@@ -238,7 +250,7 @@ jobs:
 
       - name: cargo llvm-cov
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
-        run: cargo llvm-cov --test unit_tests --lcov --output-path lcov.info
+        run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'

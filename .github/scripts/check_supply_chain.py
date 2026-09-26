@@ -832,6 +832,36 @@ def rust_toolchain_violations(workflow: str, text: str) -> list[str]:
     return []
 
 
+def rust_ci_test_scope_violations(text: str) -> list[str]:
+    """Rust CI must execute the library target unfiltered, beside the suite.
+
+    Inline `#[cfg(test)]` modules compile under clippy's `--all-targets` but
+    only run under `cargo test --lib`. A name filter on that command once
+    skipped every library test but one, and coverage measured only the
+    aggregated binary. Exact lines keep a filtered or dropped invocation
+    from satisfying the gate.
+    """
+    violations: list[str] = []
+    test_lines = [
+        line.strip()
+        for line in policy_step(workflow_job(text, "rust-ci-check"), "cargo test")
+    ]
+    for command in ("cargo test --test unit_tests", "cargo test --lib"):
+        if command not in test_lines:
+            violations.append(
+                f"rust-ci.yml: the cargo test step must run `{command}` unfiltered"
+            )
+    coverage = [
+        line.strip()
+        for line in policy_step(workflow_job(text, "coverage"), "cargo llvm-cov")
+    ]
+    if "run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info" not in coverage:
+        violations.append(
+            "rust-ci.yml: coverage must measure the library target and the aggregated suite"
+        )
+    return violations
+
+
 def unconfigured_repo_skip_violations(text: str) -> list[str]:
     """`apply-on-merge.yml` must SKIP, not fail, on an unconfigured repository.
 
@@ -1491,6 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
     rust_ci = (workflows / "rust-ci.yml").read_text(encoding="utf-8")
     if "tool: cargo-llvm-cov@0.9.0" not in rust_ci:
         violations.append("rust-ci.yml: cargo-llvm-cov must use exact version 0.9.0")
+    violations.extend(rust_ci_test_scope_violations(rust_ci))
 
     for workflow_name, expected_name in (
         ("rust-ci.yml", "Rust CI"),

@@ -1153,6 +1153,45 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_rust_ci_runs_the_library_target_unfiltered(self):
+        text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(text), [])
+
+        # A name filter compiled every library test but ran only one.
+        filtered = text.replace(
+            "          cargo test --lib\n",
+            "          cargo test --lib prepared_apply_tests::only_this_one\n",
+            1,
+        )
+        self.assertNotEqual(filtered, text)
+        violations = check_supply_chain.rust_ci_test_scope_violations(filtered)
+        self.assertTrue(
+            any("`cargo test --lib` unfiltered" in item for item in violations),
+            violations,
+        )
+
+        # A comment naming the command must not stand in for running it.
+        commented = text.replace(
+            "          cargo test --lib\n", "          # cargo test --lib\n", 1
+        )
+        self.assertNotEqual(commented, text)
+        self.assertTrue(
+            any(
+                "`cargo test --lib` unfiltered" in item
+                for item in check_supply_chain.rust_ci_test_scope_violations(commented)
+            )
+        )
+
+        suite_only = text.replace(
+            "cargo llvm-cov --lib --test unit_tests", "cargo llvm-cov --test unit_tests", 1
+        )
+        self.assertNotEqual(suite_only, text)
+        violations = check_supply_chain.rust_ci_test_scope_violations(suite_only)
+        self.assertTrue(
+            any("coverage must measure the library target" in item for item in violations),
+            violations,
+        )
+
     def test_unconfigured_repository_skips_instead_of_failing_the_merge(self):
         secure = "\n".join(
             [
