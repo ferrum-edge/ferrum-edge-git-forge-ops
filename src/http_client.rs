@@ -1232,6 +1232,10 @@ pub struct BackupExtras {
     /// understand. Incremental reconciliation can leave them alone; a
     /// full-replace must fail closed rather than omit them from `/restore`.
     pub unsupported_sections: Vec<String>,
+    /// Copy of [`BackupSnapshot::unmodeled_nested_fields`], carried here so
+    /// every apply path that receives a live view also learns which rows it
+    /// cannot rewrite without truncating them.
+    pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
 }
 
 impl BackupExtras {
@@ -1256,6 +1260,7 @@ impl BackupExtras {
         self.api_specs.is_none()
             && self.gateway_trust_bundles.is_none()
             && self.unsupported_sections.is_empty()
+            && self.unmodeled_nested_fields.is_empty()
     }
 }
 
@@ -1317,8 +1322,10 @@ pub struct BackupSnapshot {
     /// Unknown *top-level* resource fields survive in each resource's
     /// `#[serde(flatten)]` `extra` map; nested ones cannot, so the typed decode
     /// discards them. They are recorded here instead so import can refuse the
-    /// source rather than publish a silently truncated resource tree. Read-only
-    /// live comparisons ignore this list.
+    /// source rather than publish a silently truncated resource tree, and apply
+    /// refuses to rewrite the affected rows (the list is also carried on
+    /// [`BackupExtras::unmodeled_nested_fields`]). Read-only live comparisons
+    /// ignore it.
     pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
 }
 
@@ -1334,6 +1341,50 @@ pub struct UnmodeledNestedField {
     /// Resource-relative path in the repository loader's notation, for
     /// example `.spec.targets[0].future_option`.
     pub path: String,
+}
+
+/// Most distinct offenders one unmodeled-nested-field diagnostic lists. A
+/// crafted backup could otherwise turn one refusal into megabytes of output.
+pub const MAX_LISTED_UNMODELED_NESTED_FIELDS: usize = 20;
+
+/// Render the distinct offenders as sanitized
+/// `Kind 'id' (namespace 'ns'): path` entries in a stable order, listing at
+/// most [`MAX_LISTED_UNMODELED_NESTED_FIELDS`] followed by an
+/// `…and N more` entry.
+pub fn describe_unmodeled_nested_fields<'a>(
+    fields: impl IntoIterator<Item = &'a UnmodeledNestedField>,
+) -> Vec<String> {
+    let offenders = fields
+        .into_iter()
+        .map(|field| {
+            (
+                field.kind.as_str(),
+                field.namespace.as_str(),
+                field.id.as_str(),
+                field.path.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut entries = offenders
+        .iter()
+        .take(MAX_LISTED_UNMODELED_NESTED_FIELDS)
+        .map(|(kind, namespace, id, path)| {
+            format!(
+                "{} '{}' (namespace '{}'): {}",
+                safe(kind),
+                safe(id),
+                safe(namespace),
+                safe(path)
+            )
+        })
+        .collect::<Vec<_>>();
+    if offenders.len() > MAX_LISTED_UNMODELED_NESTED_FIELDS {
+        entries.push(format!(
+            "…and {} more",
+            offenders.len() - MAX_LISTED_UNMODELED_NESTED_FIELDS
+        ));
+    }
+    entries
 }
 
 impl BackupSnapshot {
@@ -1461,10 +1512,11 @@ impl BackupSnapshot {
         })
         .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
         crate::config::validate_unique_live_resource_keys(&config)?;
-        let unmodeled_nested_fields = ignored
+        let unmodeled_nested_fields: Vec<UnmodeledNestedField> = ignored
             .into_iter()
             .map(|field| field.attribute(&config))
             .collect();
+        extras.unmodeled_nested_fields = unmodeled_nested_fields.clone();
         let mut seal_violations = Vec::new();
         counts = canonicalize_count_seal(
             "counts",

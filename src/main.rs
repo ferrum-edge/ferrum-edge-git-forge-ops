@@ -2771,11 +2771,17 @@ async fn cmd_apply(
             // A repo/spec ownership conflict is deliberately *not* one of
             // these: it blocks its own namespace only, and surfaces as a
             // per-namespace error during apply so the rest of the environment
-            // still reconciles.
+            // still reconciles. So is a refusal to rewrite a row carrying
+            // unmodeled nested fields, for the same reason.
+            let preflight_managed = previously_managed(&resolved, &state);
             apply::preflight_api_apply(
                 &desired,
                 &client,
                 &namespaces,
+                match preflight_managed.as_ref() {
+                    Some(previously_managed) => diff::OwnershipScope::Shared { previously_managed },
+                    None => diff::OwnershipScope::Exclusive,
+                },
                 Some(&actual_by_namespace),
                 Some(&extras_by_namespace),
                 &apply::ApplyOptions {

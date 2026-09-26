@@ -237,15 +237,32 @@ pub struct UpstreamTarget {
 }
 
 /// A named subset of upstream targets identified by label selectors.
-///
-/// `traffic_policy` is deliberately not mirrored: ferrum-edge rejects it as
-/// operator input (it is projected from mesh DestinationRules).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubsetDefinition {
     pub name: String,
     /// Ordered for the same reason as [`UpstreamTarget::tags`].
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_policy: Option<SubsetTrafficPolicy>,
+}
+
+/// Per-subset overrides of the upstream's load-balancing settings.
+///
+/// Only the operator-settable members of ferrum-edge's `SubsetTrafficPolicy`
+/// are mirrored. The rest (`tls`, `connect_timeout_ms`, the HTTP
+/// connection-pool caps, `max_retries`, `passive_health_check`) are projected
+/// from mesh DestinationRules, and the gateway rejects them on every
+/// operator-provided load. Left unmodeled, a live row carrying them is
+/// refused by import and by any apply that would rewrite it, rather than
+/// being silently truncated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubsetTrafficPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancer_algorithm: Option<LoadBalancerAlgorithm>,
+    /// Same format as [`Upstream::hash_on`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_on: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +323,13 @@ pub struct PassiveHealthCheck {
     pub gateway_error_codes: Option<Vec<u16>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_external_local_origin_errors: Option<bool>,
+    /// Count `unhealthy_threshold` against the consecutive failure streak
+    /// instead of the sliding window (Istio `consecutive5xxErrors`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consecutive_error_mode: bool,
+    /// Disable the consecutive-5xx detector (Istio `consecutive5xxErrors: 0`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consecutive_5xx_ejection_disabled: bool,
 }
 
 fn default_passive_unhealthy_codes() -> Vec<u16> {

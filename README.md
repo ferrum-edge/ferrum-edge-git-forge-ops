@@ -572,9 +572,35 @@ rejects them: there is nowhere in a resource file to keep them, so writing the
 tree would silently drop them. The refusal names each resource and the full
 field path (`.spec.targets[1].future_option`), and nothing — neither tree nor
 credential import bundle — is written. `--accept-unknown-field` does not cover
-nested fields; upgrade gitforgeops or remove the field on the gateway.
+nested fields; upgrade gitforgeops or remove the field on the gateway. The
+refusal lists the first 20 offenders and counts the rest.
 Deliberately opaque sections (plugin `config`, credential entries) are carried
 verbatim and are not affected.
+
+`apply` applies the same rule to live rows it would rewrite. Every write to
+an existing resource is a full-resource `PUT` (and full replace re-creates every
+row in its `/restore` body), so a nested field the build cannot represent would
+be omitted and the gateway would reset it to its default. The rows that count
+are the ones this run will actually write: an incremental update (the
+declaration differs from the live row), a pending-create ownership assertion,
+in `shared` mode a declared row not yet in the ledger (adoption claims it with
+an idempotent `PUT`), and in `full_replace` every row of the restore body,
+including preserved API-spec-owned rows. When one of them has such a field
+live, the namespace is refused before anything in it is written; other
+namespaces still reconcile and the run exits non-zero. A declared row that
+already matches and needs no claim — including every such row in `exclusive`
+mode — is not written, so it does not block, nor does leaving an undeclared row
+alone or deleting it.
+
+The remedy is to upgrade gitforgeops to a version that models the field, or to
+remove the field on the gateway. Do not work around the refusal by deleting the
+declaration: in `exclusive` mode an undeclared live row is **deleted** by the
+next apply.
+
+This refusal covers nested fields only. An unknown *top-level* field present
+only on the live row is not drift (see "A field only the gateway carries is not
+drift" above), and a `PUT` built from the declaration does not carry it, so a
+rewrite may reset it without a refusal; that asymmetry is tracked separately.
 
 Upgrading gitforgeops is the real fix. When you cannot wait, read the source,
 confirm the field is not a credential, and re-run with one

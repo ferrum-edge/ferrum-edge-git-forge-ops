@@ -398,6 +398,7 @@ fn spec_extras_hashed(specs: &[(&str, &str)]) -> gitforgeops::http_client::Backu
         })),
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
+        unmodeled_nested_fields: Vec::new(),
     }
 }
 
@@ -917,6 +918,15 @@ fn empty_actuals(namespaces: &[&str]) -> BTreeMap<String, GatewayConfig> {
         .collect()
 }
 
+/// Backup extras reporting nothing unusual, one per namespace. A supplied live
+/// view must come with its extras, or `apply_api` refuses the namespace.
+fn no_extras(namespaces: &[String]) -> BTreeMap<String, gitforgeops::http_client::BackupExtras> {
+    namespaces
+        .iter()
+        .map(|ns| (ns.clone(), Default::default()))
+        .collect()
+}
+
 #[tokio::test]
 async fn full_replace_rejects_unknown_backup_sections_before_preflight_or_mutation() {
     let client = stub_client("http://127.0.0.1:9".to_string());
@@ -982,7 +992,7 @@ async fn a_rejected_batch_chunk_falls_back_to_named_per_resource_creates() {
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["team-alpha"])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -1032,7 +1042,7 @@ async fn ambiguous_batch_is_not_replayed_and_is_recovered_from_authoritative_bac
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["team-alpha"])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -1095,7 +1105,7 @@ async fn ambiguous_create_is_sent_once_and_recovered_from_authoritative_backup()
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["team-alpha"])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -1143,7 +1153,7 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
             "team-alpha".to_string(),
             desired.clone(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions {
             pending_create_assertions: std::collections::BTreeSet::from([state_key(
                 "team-alpha",
@@ -1215,7 +1225,7 @@ async fn pending_assertion_is_not_duplicated_by_an_ordinary_modify() {
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), live)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions {
             pending_create_assertions: pending,
             ..Default::default()
@@ -1263,7 +1273,7 @@ async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
         &["ferrum".to_string()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("ferrum".to_string(), live)])),
-        None,
+        Some(&no_extras(&["ferrum".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -1325,7 +1335,7 @@ async fn a_create_proven_uncommitted_is_an_ordinary_error_and_later_namespaces_s
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["ferrum", "team-b"])),
-        None,
+        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -1410,7 +1420,7 @@ async fn a_create_whose_readback_finds_a_different_row_still_stops_the_run() {
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["ferrum", "team-b"])),
-        None,
+        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -1446,7 +1456,7 @@ async fn committed_but_not_live_create_is_failed_without_reconciliation_success(
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["team-alpha"])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -1913,6 +1923,7 @@ async fn empty_spec_snapshot_omits_api_specs_and_trust_to_close_lost_update_race
         api_specs: Some(serde_json::json!({"section_version": "2", "items": []})),
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
+        unmodeled_nested_fields: Vec::new(),
     };
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
@@ -2045,7 +2056,7 @@ async fn a_spec_owned_conflict_blocks_only_the_conflicting_namespace() {
         &["alpha".to_string(), "beta".to_string()],
         OwnershipScope::Exclusive,
         Some(&actuals),
-        None,
+        Some(&no_extras(&["alpha".to_string(), "beta".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2104,7 +2115,7 @@ async fn three_xx_batch_response_never_records_an_applied_operation() {
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["team-alpha"])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2202,7 +2213,7 @@ async fn a_read_only_plane_stops_the_run_but_keeps_earlier_namespaces_recorded()
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["ferrum", "team-b"])),
-        None,
+        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2252,7 +2263,7 @@ async fn a_read_only_plane_at_the_first_namespace_stops_immediately() {
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["ferrum", "team-b"])),
-        None,
+        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2280,7 +2291,7 @@ async fn a_read_only_preflight_fails_before_any_mutation() {
         &["ferrum".to_string()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["ferrum"])),
-        None,
+        Some(&no_extras(&["ferrum".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2399,7 +2410,7 @@ async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_no
                 previously_managed: &managed,
             },
             Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &ApplyOptions {
                 managed_ledger: BTreeSet::from([key]),
                 ..Default::default()
@@ -2439,7 +2450,7 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
             &["team-alpha".into()],
             OwnershipScope::Exclusive,
             Some(&BTreeMap::from([("team-alpha".into(), desired.clone())])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &ApplyOptions::default(),
         )
         .await
@@ -2473,7 +2484,7 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2507,7 +2518,7 @@ async fn failed_plugin_write_blocks_its_proxy_and_defers_pruning() {
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2587,7 +2598,7 @@ async fn failed_plugin_withholds_only_its_own_cyclic_create_group() {
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2669,7 +2680,7 @@ async fn failed_proxy_delete_retains_its_plugin_and_ledger() {
             "team-alpha".into(),
             scoped_plugin_desired(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -2736,7 +2747,7 @@ async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_unt
                 previously_managed: &managed,
             },
             Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &options,
         )
         .await
@@ -2786,7 +2797,7 @@ async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespace
                 &["team-alpha".into()],
                 OwnershipScope::Exclusive,
                 Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-                None,
+                Some(&no_extras(&["team-alpha".into()])),
                 &ApplyOptions::default(),
             )
             .await
@@ -2838,7 +2849,7 @@ async fn opted_in_batch_fallback_publishes_proxy_then_attaches_scoped_plugin() {
                 &["team-alpha".into()],
                 OwnershipScope::Exclusive,
                 Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-                None,
+                Some(&no_extras(&["team-alpha".into()])),
                 &ApplyOptions {
                     allow_nontransactional_plugin_attach: true,
                     ..Default::default()
@@ -2890,7 +2901,7 @@ async fn failed_opted_in_attachment_preserves_proxy_ownership_and_defers_pruning
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions {
             allow_nontransactional_plugin_attach: true,
             ..Default::default()
@@ -2939,7 +2950,7 @@ async fn opted_in_proxy_create_preserves_external_associations_and_gates_failed_
                 previously_managed: &HashSet::new(),
             },
             Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &ApplyOptions {
                 allow_nontransactional_plugin_attach: true,
                 ..Default::default()
@@ -2989,7 +3000,7 @@ async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure
             "team-alpha".into(),
             GatewayConfig::default(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -3033,7 +3044,7 @@ async fn one_post_plugin_snapshot_adopts_all_unchanged_exclusive_proxies() {
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -3080,7 +3091,7 @@ async fn existing_plugin_retarget_to_new_proxy_fails_closed_even_with_opt_in() {
             &["team-alpha".into()],
             OwnershipScope::Exclusive,
             Some(&BTreeMap::from([("team-alpha".into(), actual.clone())])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &ApplyOptions {
                 allow_nontransactional_plugin_attach: allow,
                 ..Default::default()
@@ -3127,7 +3138,7 @@ async fn non_proxy_scope_with_stray_target_does_not_enter_batch_only_path() {
                 "team-alpha".into(),
                 GatewayConfig::default(),
             )])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &ApplyOptions::default(),
         )
         .await
@@ -3211,7 +3222,7 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -3782,7 +3793,7 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
             previously_managed: &empty_fence,
         },
         Some(&BTreeMap::from([("team-alpha".to_string(), live.clone())])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -3845,7 +3856,7 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
             previously_managed: &managed,
         },
         Some(&BTreeMap::from([("team-alpha".to_string(), live.clone())])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions {
             managed_ledger: managed.iter().cloned().collect(),
             ..Default::default()
@@ -3912,7 +3923,7 @@ async fn a_row_that_changed_between_diff_and_assertion_is_skipped_and_reported()
             "team-alpha".to_string(),
             desired.clone(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -3992,7 +4003,7 @@ async fn a_spec_owner_added_during_confirmation_prevents_adoption() {
             "team-alpha".to_string(),
             desired.clone(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -4073,7 +4084,7 @@ async fn duplicate_confirmation_rows_fail_adoption_without_claiming_ownership() 
                 "team-alpha".to_string(),
                 desired.clone(),
             )])),
-            None,
+            Some(&no_extras(&["team-alpha".to_string()])),
             &ApplyOptions::default(),
         )
         .await
@@ -4234,7 +4245,7 @@ async fn a_cached_backup_blocks_adoption() {
             "team-alpha".to_string(),
             desired.clone(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -4275,7 +4286,7 @@ async fn exclusive_mode_records_adoption_without_a_put() {
             "team-alpha".to_string(),
             desired.clone(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -4324,7 +4335,7 @@ async fn a_failed_adoption_put_is_reported_and_not_recorded() {
             "team-alpha".to_string(),
             desired.clone(),
         )])),
-        None,
+        Some(&no_extras(&["team-alpha".to_string()])),
         &ApplyOptions::default(),
     )
     .await
@@ -4421,7 +4432,7 @@ async fn batch_acknowledgement_requires_matching_counts_and_a_commit_status() {
             &["team-alpha".into()],
             OwnershipScope::Exclusive,
             Some(&empty_actuals(&["team-alpha"])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &ApplyOptions::default(),
         )
         .await
@@ -4497,7 +4508,7 @@ async fn ambiguous_batch_acknowledgement_uses_authoritative_readback_and_ownersh
                 previously_managed: &HashSet::new(),
             },
             Some(&empty_actuals(&["team-alpha"])),
-            None,
+            Some(&no_extras(&["team-alpha".into()])),
             &ApplyOptions::default(),
         )
         .await
@@ -4557,7 +4568,7 @@ async fn invalid_batch_acknowledgement_preserves_prior_namespace_operations() {
         &["alpha".into(), "team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&empty_actuals(&["alpha", "team-alpha"])),
-        None,
+        Some(&no_extras(&["alpha".into(), "team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -4587,7 +4598,7 @@ async fn uncommitted_cycle_batch_defers_deletes_after_invalid_acknowledgement() 
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
         Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        None,
+        Some(&no_extras(&["team-alpha".into()])),
         &ApplyOptions::default(),
     )
     .await
@@ -4599,4 +4610,375 @@ async fn uncommitted_cycle_batch_defers_deletes_after_invalid_acknowledgement() 
     assert_eq!(result.errors.len(), 1);
     assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"]);
     assert!(result.into_result().is_err());
+}
+
+/// Live view and extras for one namespace, decoded the way `cmd_apply`
+/// decodes a `/backup` body, so `unmodeled_nested_fields` is populated.
+fn decoded_live(
+    namespace: &str,
+    backup: serde_json::Value,
+) -> (GatewayConfig, gitforgeops::http_client::BackupExtras) {
+    let snapshot =
+        gitforgeops::http_client::BackupSnapshot::from_scoped_body(&backup.to_string(), namespace)
+            .unwrap();
+    (snapshot.config, snapshot.extras)
+}
+
+fn live_upstream(id: &str, namespace: &str, target_extra: serde_json::Value) -> serde_json::Value {
+    let mut target = serde_json::json!({"host": "10.0.0.1", "port": 8080});
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), target_extra.as_object()) {
+        target.extend(extra.clone());
+    }
+    serde_json::json!({"id": id, "namespace": namespace, "targets": [target]})
+}
+
+#[tokio::test]
+async fn incremental_apply_refuses_to_rewrite_a_row_carrying_unmodeled_nested_fields() {
+    let (alpha_live, alpha_extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [
+                live_upstream("u1", "team-alpha", serde_json::json!({"future_target_option": 7})),
+                live_upstream("u2", "team-alpha", serde_json::json!({})),
+            ]
+        }),
+    );
+    assert_eq!(alpha_extras.unmodeled_nested_fields.len(), 1);
+    let (beta_live, beta_extras) = decoded_live(
+        "team-b",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream("v1", "team-b", serde_json::json!({}))]
+        }),
+    );
+
+    // An unrelated field changes on the affected row, on a clean sibling in
+    // the same namespace, and on a row in another namespace.
+    let mut desired = GatewayConfig {
+        upstreams: vec![
+            upstream("u1", "team-alpha"),
+            upstream("u2", "team-alpha"),
+            upstream("v1", "team-b"),
+        ],
+        ..Default::default()
+    };
+    for row in &mut desired.upstreams {
+        row.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+    }
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/v1".into(), 200, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([
+            ("team-alpha".to_string(), alpha_live),
+            ("team-b".to_string(), beta_live),
+        ])),
+        Some(&BTreeMap::from([
+            ("team-alpha".to_string(), alpha_extras),
+            ("team-b".to_string(), beta_extras),
+        ])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(error.starts_with("[team-alpha] refusing apply"), "{error}");
+    assert!(
+        error.contains(
+            "Upstream 'u1' (namespace 'team-alpha'): .spec.targets[0].future_target_option"
+        ),
+        "{error}"
+    );
+    // Nothing in the blocked namespace is written, not even the clean sibling;
+    // the other namespace still reconciles.
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["PUT /upstreams/v1 HTTP/1.1"]
+    );
+    assert_eq!(result.updated, 1);
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn incremental_apply_may_delete_an_undeclared_row_carrying_unmodeled_nested_fields() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [
+                live_upstream("u1", "team-alpha", serde_json::json!({"future_target_option": 7})),
+                live_upstream("u2", "team-alpha", serde_json::json!({})),
+            ]
+        }),
+    );
+    let mut desired = GatewayConfig {
+        upstreams: vec![upstream("u2", "team-alpha")],
+        ..Default::default()
+    };
+    desired.upstreams[0].algorithm =
+        gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/u2".into(), 200, "{}".into(), vec![]),
+        ("DELETE /upstreams/u1".into(), 204, String::new(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let mut lines = mutation_lines(&requests);
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec![
+            "DELETE /upstreams/u1 HTTP/1.1",
+            "PUT /upstreams/u2 HTTP/1.1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn full_replace_refuses_a_restore_body_that_would_truncate_a_live_row() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [serde_json::json!({
+                "id": "u1",
+                "namespace": "team-alpha",
+                "targets": [{"host": "10.0.0.1", "port": 8080}],
+                "health_checks": {"passive": {"future_passive_option": true}}
+            })]
+        }),
+    );
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(
+        error.contains("Upstream 'u1' (namespace 'team-alpha'): "),
+        "{error}"
+    );
+    assert!(
+        error.contains(".spec.health_checks.passive.future_passive_option"),
+        "{error}"
+    );
+    assert!(mutation_lines(&requests).is_empty());
+    assert!(result.fully_replaced_namespaces.is_empty());
+}
+
+#[test]
+fn unmodeled_nested_field_listing_is_deduplicated_and_bounded() {
+    use gitforgeops::http_client::{
+        describe_unmodeled_nested_fields, UnmodeledNestedField, MAX_LISTED_UNMODELED_NESTED_FIELDS,
+    };
+    let field = |id: String| UnmodeledNestedField {
+        kind: "Proxy".to_string(),
+        namespace: "ferrum".to_string(),
+        id,
+        path: ".spec.retry.future\noption".to_string(),
+    };
+    let mut fields = (0..MAX_LISTED_UNMODELED_NESTED_FIELDS + 3)
+        .map(|index| field(format!("p{index:03}")))
+        .collect::<Vec<_>>();
+    fields.push(field("p000".to_string()));
+
+    let entries = describe_unmodeled_nested_fields(&fields);
+
+    assert_eq!(entries.len(), MAX_LISTED_UNMODELED_NESTED_FIELDS + 1);
+    assert!(entries[0].starts_with("Proxy 'p000' "), "{entries:?}");
+    assert!(entries.iter().all(|entry| !entry.contains('\n')));
+    assert_eq!(entries.last().unwrap(), "…and 3 more");
+
+    let exact = describe_unmodeled_nested_fields(&fields[..MAX_LISTED_UNMODELED_NESTED_FIELDS]);
+    assert_eq!(exact.len(), MAX_LISTED_UNMODELED_NESTED_FIELDS);
+    assert!(!exact.iter().any(|entry| entry.contains("more")));
+}
+
+#[tokio::test]
+async fn incremental_apply_blocks_only_the_rows_it_will_rewrite() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [
+                live_upstream("u1", "team-alpha", serde_json::json!({"future_target_option": 7})),
+            ]
+        }),
+    );
+    // Identical to the live row as this build decodes it: no Modify.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let key = state_key("team-alpha", "Upstream", "u1");
+    // (case, shared mode, in the ledger, pending create, refused)
+    let cases = [
+        ("exclusive, unchanged", false, false, false, false),
+        (
+            "exclusive, unchanged, in the ledger",
+            false,
+            true,
+            false,
+            false,
+        ),
+        ("shared, unchanged, in the ledger", true, true, false, false),
+        (
+            "exclusive, pending-create assertion",
+            false,
+            true,
+            true,
+            true,
+        ),
+        ("shared, pending-create assertion", true, true, true, true),
+        ("shared, adoption", true, false, false, true),
+    ];
+    for (case, shared, in_ledger, pending, refused) in cases {
+        let mut options = ApplyOptions::default();
+        if in_ledger {
+            options.managed_ledger.insert(key.clone());
+        }
+        if pending {
+            options.pending_create_assertions.insert(key.clone());
+        }
+        let managed: HashSet<String> = options.managed_ledger.iter().cloned().collect();
+        let scope = if shared {
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            }
+        } else {
+            OwnershipScope::Exclusive
+        };
+        let actuals = BTreeMap::from([("team-alpha".to_string(), live.clone())]);
+        let live_extras = BTreeMap::from([("team-alpha".to_string(), extras.clone())]);
+        let (url, requests) =
+            spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+        let result = apply_api(
+            &desired,
+            &stub_client(url),
+            &["team-alpha".to_string()],
+            scope,
+            Some(&actuals),
+            Some(&live_extras),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(mutation_lines(&requests).is_empty(), "{case}");
+        if refused {
+            assert_eq!(result.errors.len(), 1, "{case}: {:?}", result.errors);
+            assert!(
+                result.errors[0].contains(
+                    "Upstream 'u1' (namespace 'team-alpha'): .spec.targets[0].future_target_option"
+                ),
+                "{case}: {}",
+                result.errors[0]
+            );
+            assert!(result.adopted.is_empty(), "{case}");
+        } else {
+            assert!(result.errors.is_empty(), "{case}: {:?}", result.errors);
+        }
+    }
+}
+
+#[tokio::test]
+async fn incremental_apply_refuses_a_live_view_supplied_without_its_extras() {
+    let (url, requests) = spawn_recording_gateway(vec![]);
+    let error = apply_api(
+        &GatewayConfig::default(),
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        None,
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("backup extras"), "{error}");
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn full_replace_refuses_a_preserved_spec_owned_row_carrying_unmodeled_nested_fields() {
+    // The repository declares only `repo-upstream`, but the restore body also
+    // carries the live spec-owned graph, and `/restore` rewrites every row.
+    let (desired, actual) = spec_owned_graph();
+    let mut extras = spec_extras(&["spec-a"]);
+    let field = gitforgeops::http_client::UnmodeledNestedField {
+        kind: "Upstream".to_string(),
+        namespace: "team-alpha".to_string(),
+        id: "spec-upstream".to_string(),
+        path: ".spec.targets[0].future_target_option".to_string(),
+    };
+    extras.unmodeled_nested_fields.push(field);
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), actual)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].contains(
+            "Upstream 'spec-upstream' (namespace 'team-alpha'): .spec.targets[0].future_target_option"
+        ),
+        "{}",
+        result.errors[0]
+    );
+    assert!(mutation_lines(&requests).is_empty());
+    assert!(result.fully_replaced_namespaces.is_empty());
 }
