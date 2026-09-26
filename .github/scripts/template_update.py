@@ -225,6 +225,14 @@ def validate_target_ref(value: object, field: str) -> str:
     return ref
 
 
+def _mirror_ref(ref: str) -> str:
+    """Resolve documented remote-tracking names without Git's DWIM rules."""
+    prefix = f"{MIRROR_REMOTE}/"
+    if ref.startswith(prefix):
+        return f"refs/remotes/{ref}"
+    return ref
+
+
 # -- confined filesystem access ------------------------------------------------
 #
 # The path lists above are lexical. What keeps them true on disk is that every
@@ -939,7 +947,7 @@ def detect_baseline(
     """
     local = _local_managed_hashes(root)
     revisions = _git(
-        mirror, "rev-list", "--first-parent", f"--max-count={limit}", ref
+        mirror, "rev-list", "--first-parent", f"--max-count={limit}", _mirror_ref(ref)
     ).split()
     if not revisions:
         raise UpdateError(f"upstream revision {ref!r} has no history to search")
@@ -998,11 +1006,24 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
     )
     _git(mirror, "fetch", "--quiet", "--tags", MIRROR_REMOTE)
     for ref in refs:
+        mirror_ref = _mirror_ref(ref)
         # Fail here, with the ref named, rather than deep inside a comparison.
         # A commit no branch or tag reaches can still be fetched by its ID.
-        if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
+        if not _git(
+            mirror,
+            "rev-parse",
+            "--verify",
+            f"{mirror_ref}^{{commit}}",
+            check=False,
+        ):
             _git(mirror, "fetch", "--quiet", MIRROR_REMOTE, "--", ref, check=False)
-        if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
+        if not _git(
+            mirror,
+            "rev-parse",
+            "--verify",
+            f"{mirror_ref}^{{commit}}",
+            check=False,
+        ):
             raise UpdateError(
                 f"upstream revision {ref!r} could not be resolved in {upstream}"
             )
@@ -1010,7 +1031,7 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
 
 
 def resolve(mirror: Path, ref: str) -> str:
-    resolved = _git(mirror, "rev-parse", f"{ref}^{{commit}}").strip()
+    resolved = _git(mirror, "rev-parse", f"{_mirror_ref(ref)}^{{commit}}").strip()
     if not resolved:
         raise UpdateError(f"upstream revision {ref!r} could not be resolved")
     return resolved

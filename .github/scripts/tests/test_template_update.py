@@ -665,6 +665,23 @@ class UrlUpstreamTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"target:   {expected}", result.stdout)
 
+    def test_remote_tracking_name_cannot_be_shadowed_by_an_upstream_branch(self):
+        attacker = self.fixture.upstream_change(
+            {"src/main.rs": "// attacker branch\n"}, "attacker"
+        )
+        git(self.fixture.upstream, "branch", "origin/main")
+        protected = self.fixture.upstream_change(
+            {"src/main.rs": "// protected main\n"}, "protected"
+        )
+
+        result = self.fixture.run(
+            "status", "--to", "origin/main", upstream=self.url
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"target:   {protected}", result.stdout)
+        self.assertNotIn(f"target:   {attacker}", result.stdout)
+
     def test_the_upstream_copy_never_starts_background_maintenance(self):
         # A detached `git maintenance` or `gc --auto` started by the fetch can
         # still be writing objects/ when the temporary copy is removed.

@@ -195,6 +195,10 @@ baseline: they name whatever a copy last pointed at, not a revision. A bare
 `origin` is refused for the same reason, since Git reads it as `origin/HEAD`.
 The check ignores case, and a branch or tag that really is named `origin` is
 `refs/heads/origin` or `refs/tags/origin`.
+An `origin/<branch>` target is resolved explicitly under
+`refs/remotes/origin/`; an upstream branch whose literal name starts with
+`origin/` cannot shadow it. Select such a literal branch only by its full
+`refs/heads/origin/<branch>` name.
 Branch names resolve the same way whether `--upstream` (or the baseline's
 `upstream`) is a URL — the HTTPS default included — or a local clone, so the
 default `main` needs no `origin/` prefix. The tool fetches into a temporary
