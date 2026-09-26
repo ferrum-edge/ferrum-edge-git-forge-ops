@@ -3,10 +3,11 @@ use crate::config::GatewayConfig;
 use crate::diagnostics::{sanitize, sanitize_line};
 use crate::diff::resource_diff::OwnershipScope;
 use crate::plugin_catalog::{
-    allows_uninspectable_body, cfg_array, cfg_bool, cfg_str, effective_plugins, effective_scheme,
+    allows_uninspectable_body, auth_coverage, cfg_array, cfg_bool, cfg_str, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
-    retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode, waf_mode_is_passive,
-    waf_skips_oversized_body, RetiredRemediation, RETIRED_PLUGIN_NAMES,
+    plugin_instance_list, retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode,
+    waf_mode_is_passive, waf_skips_oversized_body, AuthCoverage, RetiredRemediation,
+    RETIRED_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
 };
 use crate::policy::config::effective_auth_plugin_names;
 use crate::policy::PolicyConfig;
@@ -204,24 +205,16 @@ fn check_proxy(
     auth_names: &[String],
     findings: &mut Vec<SecurityFinding>,
 ) {
-    let effective = effective_plugins(config, proxy);
+    // Only authenticators the gateway runs on this proxy's listener count: a
+    // TCP or UDP listener skips every HTTP-only plugin, `key_auth` included.
+    let coverage = auth_coverage(config, proxy, auth_names);
 
-    let auth_plugins: Vec<&&PluginConfig> = effective
-        .iter()
-        .filter(|plugin| auth_names.contains(&plugin.plugin_name.to_ascii_lowercase()))
-        .collect();
-
-    if auth_plugins.is_empty() {
+    if !coverage.is_authenticated() {
         findings.push(SecurityFinding::warning(
             "Proxy",
             &proxy.id,
             &proxy.namespace,
-            format!(
-                "No auth plugin attached to proxy {} in namespace {} — its effective plugin list contains no enabled authenticator; attach one of: {}",
-                proxy.id,
-                proxy.namespace,
-                auth_names.join(", ")
-            ),
+            missing_auth_message(proxy, &coverage, auth_names),
         ));
     }
 
@@ -229,7 +222,7 @@ fn check_proxy(
     // request the predicate misses reaches the backend unauthenticated. That is
     // a legitimate pattern (public health endpoints) but never an accident
     // worth leaving unreviewed.
-    for plugin in &auth_plugins {
+    for plugin in &coverage.applicable {
         if plugin.trigger.is_some() {
             findings.push(SecurityFinding::warning(
                 "Proxy",
@@ -281,6 +274,45 @@ fn check_proxy(
             ),
         ));
     }
+}
+
+fn missing_auth_message(
+    proxy: &Proxy,
+    coverage: &AuthCoverage<'_>,
+    auth_names: &[String],
+) -> String {
+    let id = proxy.id.as_str();
+    let ns = proxy.namespace.as_str();
+    let transport = coverage.transport.as_str();
+
+    if !coverage.transport.is_stream() {
+        return format!(
+            "No auth plugin attached to proxy {id} in namespace {ns} — its effective plugin list contains no enabled authenticator; attach one of: {}",
+            auth_names.join(", ")
+        );
+    }
+
+    if coverage.applicable.is_empty() {
+        let ignored = if coverage.inapplicable.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; authenticators that do not authenticate {transport} connections were ignored: {}",
+                plugin_instance_list(&coverage.inapplicable)
+            )
+        };
+        return format!(
+            "No auth plugin runs on {transport} stream proxy {id} in namespace {ns}{ignored} — attach one of: {} and terminate TLS/DTLS on the listener (frontend_tls: true)",
+            STREAM_AUTH_PLUGIN_NAMES.join(", ")
+        );
+    }
+
+    format!(
+        "No auth plugin can establish an identity on {transport} stream proxy {id} in namespace {ns} — its stream authenticators ({}) read the client certificate, but the listener does not terminate TLS/DTLS (frontend_tls: {}, passthrough: {}); set frontend_tls: true without passthrough",
+        plugin_instance_list(&coverage.applicable),
+        proxy.frontend_tls,
+        proxy.passthrough
+    )
 }
 
 /// Association errors must remain visible after assembly derives valid scoped
