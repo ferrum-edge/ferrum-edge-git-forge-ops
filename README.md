@@ -1113,7 +1113,17 @@ The rotation re-generates the value, overwrites the env secret, delivers it age-
 Rotation supports only Consumer `keyauth/key`, `jwt/secret`, `hmac_auth/secret`
 and api-mode `basicauth/password`, including indexed entries. The target must
 be a placeholder on the declared Consumer in the selected namespace, and its
-siblings must already resolve. Password hashes, identities, unknown credential
+siblings must already resolve. A sibling counts as resolved when the bundle
+supplies its slot, whatever the value looks like; a seeded value that resembles
+a placeholder is pushed unchanged. Rotation pushes the whole Consumer, so the
+Consumer must also pass the literal-credential check `apply` runs: a literal
+secret anywhere on it (for example a second `keyauth` key or an `hmac_auth`
+secret) refuses the rotation before the bundle is read or anything is written.
+Literal identities (`basicauth` usernames, `mtls_auth` identities) are allowed.
+There is no override for rotation, and an `apply` security override does not
+carry over to `rotate`: a Consumer that `apply` published under an override is
+still refused here. Broker the literal with `${gh-env-secret:alloc=require}`,
+seed its slot and apply first. Password hashes, identities, unknown credential
 fields and reserved `@plugin-config` / `@service-discovery` slots are refused
 before GitHub key discovery, secret writes or gateway publication. A PluginConfig
 or Upstream sharing the Consumer's id does not make its slots Consumer credentials.
@@ -1152,8 +1162,9 @@ The workflow:
 
 1. Binds `environment: production` — pulls that env's `FERRUM_CREDS_BUNDLE*` secrets.
 2. Runs `gitforgeops export --materialize --encrypt-to ${{ github.actor }} --output out/assembled-<env>.age`:
-   - Replaces placeholders with real values from the bundle.
-   - Refuses if any slot needs allocation (tells the admin to run `apply` first).
+   - Refuses, before reading the bundle, anything `apply`'s security gate refuses, above all a literal credential committed to `resources/`. An `apply` security override does not carry over to materialization.
+   - Replaces placeholders with real values from the bundle. A seeded value is written byte-for-byte, even one that resembles a placeholder.
+   - Refuses if any slot has no bundle value, whether `alloc=require` or pending allocation (tells the admin to run `apply` first). The check uses the resolution result, not the text of the resolved file.
    - Age-encrypts the entire YAML to the actor's GitHub-published SSH public key.
 3. Uploads the `.age` blob as a workflow artifact with **1-day retention**.
 
@@ -1748,7 +1759,7 @@ Notes:
 - `--output-dir` is required and has no default. `import` refuses a destination that is not empty, and this repo ships `_example.yaml` files under `resources/`, so importing straight into `resources/` can only fail. See [Adopting an existing gateway](#adopting-an-existing-gateway).
 - `--format github` is an alias for `github-annotations`.
 - **Unknown credential types fail closed.** Ferrum Edge authenticates only `keyauth`, `jwt`, `hmac_auth`, `mtls_auth`, and `basicauth`. Any other Consumer `credentials` map key is an error-severity finding that blocks `validate`, `plan`, and `apply` (including `--auto-approve`). `import` refuses the same keys before writing any tree file or credential import bundle. The finding names the unknown key, the consumer, and the recognized set; `api_key` suggests `keyauth` and `basic_auth` suggests `basicauth`.
-- **The literal-credential gate blocks secrets, not identities.** Any Consumer credential *secret* committed to repository YAML instead of the broker is an error-severity finding that blocks `apply`. `basicauth[].username` and `mtls_auth[].identity` are exempt: they are the public halves of their credentials, `import` writes them verbatim on purpose, the broker cannot generate them, and a resource file that cannot say which login or certificate it means is useless. The exemption keys on the credential *type* and the leaf key together. Unknown map keys are refused before leaf classification.
+- **The literal-credential gate blocks secrets, not identities.** Any Consumer credential *secret* committed to repository YAML instead of the broker is an error-severity finding that blocks `apply`, including an unquoted number or boolean such as `key: 12345`. `basicauth[].username` and `mtls_auth[].identity` are exempt: they are the public halves of their credentials, `import` writes them verbatim on purpose, the broker cannot generate them, and a resource file that cannot say which login or certificate it means is useless. The exemption keys on the credential *type* and the leaf key together. Unknown map keys are refused before leaf classification.
 - **Plugin-config literals use the same gate.** Before resolving broker values, `plan` and `apply` reject literal strings at every plugin-config path classified by import and the diagnostic scrubber. This includes classified header values and endpoints, even on disabled plugins. Findings name the plugin and config path without printing the value. Use `${gh-env-secret:alloc=require}` and seed the corresponding broker slot; ordinary unclassified settings remain literal.
 - **Only valid broker placeholders are exempt.** Consumer, plugin-config, and modeled service-discovery secret checks use the broker's parser. Other interpolation syntax, incomplete placeholders, trailing characters, and invalid placeholder options are rejected. Parser diagnostics describe the error category without echoing rejected values. Consumer identity-field exemptions are unchanged.
 - **Validator diagnostics are redacted, not withheld.** `validate` / `plan` / `apply` resolve credentials before shelling out, so `ferrum-edge validate` quotes live secrets back in its errors. gitforgeops removes exactly those byte sequences — every resolved or literal Consumer credential leaf, every sensitivity-classified plugin-config leaf, and every modeled `Upstream.service_discovery` secret, plus their standard base64 and percent-encoded forms — replacing each with `[REDACTED]`. Everything else the validator said stays visible, so a proxy typo still reports as a proxy typo on a bundle-loaded apply. `basicauth[].username` and `mtls_auth[].identity` are identities rather than secrets and are left readable. Credentials shorter than 8 bytes cannot be substring-replaced without corrupting the surrounding diagnostic; if one of those is echoed back, the whole stream is withheld instead.
