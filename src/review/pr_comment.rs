@@ -1109,10 +1109,12 @@ pub fn build_review_comment_with_preview(
         append_omitted_list_item(&mut md, secrets.slot_remaps.len(), "slot remap");
         md.push('\n');
         md.push_str(
-            "> **Apply is blocked.** Rotate the affected Consumer slot in place \
-             (`gitforgeops rotate --credential <type>/[N]/<key>`) before removing the entry, \
-             reseed plugin-config slots and retire the orphaned slot from the credential bundle, \
-             or re-run with `--allow-credential-slot-remap` to accept the reassignment.\n\n",
+            "> **Apply is blocked.** Rotation replaces the value and sends it at its current slot \
+             but does not remove the bundle key. Before shrinking or shifting a Consumer array, move \
+             surviving rotated values to their new canonical slots in the private bundle and \
+             remove vacated keys, preserving unrelated entries. Reseed plugin-config slots and \
+             retire orphaned keys from the bundle, or re-run with `--allow-credential-slot-remap` \
+             to accept the reassignment.\n\n",
         );
     }
 
