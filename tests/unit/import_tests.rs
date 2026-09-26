@@ -2782,7 +2782,9 @@ fn nested_unknown_import_refusal_lists_a_bounded_number_of_offenders() {
     .to_string();
 
     assert_eq!(
-        error.matches(".spec.targets[0].future_target_option").count(),
+        error
+            .matches(".spec.targets[0].future_target_option")
+            .count(),
         limit,
         "{error}"
     );

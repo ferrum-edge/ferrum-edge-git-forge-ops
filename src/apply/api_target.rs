@@ -603,7 +603,9 @@ async fn prepare_apply<'a>(
                 prepared.blocked.insert(namespace.clone(), block);
                 continue;
             }
-            prepared.full_replaces.insert(namespace.clone(), full_replace);
+            prepared
+                .full_replaces
+                .insert(namespace.clone(), full_replace);
         } else if let Some(live_extras) = extras.get(namespace) {
             // Every incremental write to an existing row (update, pending-create
             // assertion, adoption, ambiguous-create ownership assertion) is a

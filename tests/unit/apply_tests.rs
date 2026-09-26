@@ -4740,7 +4740,10 @@ async fn incremental_apply_may_delete_an_undeclared_row_carrying_unmodeled_neste
     lines.sort();
     assert_eq!(
         lines,
-        vec!["DELETE /upstreams/u1 HTTP/1.1", "PUT /upstreams/u2 HTTP/1.1"]
+        vec![
+            "DELETE /upstreams/u1 HTTP/1.1",
+            "PUT /upstreams/u2 HTTP/1.1"
+        ]
     );
 }
 
