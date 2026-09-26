@@ -25,6 +25,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[3]
+UMASK = os.umask(0)
+os.umask(UMASK)
 SCRIPT = Path(__file__).parents[1] / "template_update.py"
 SPEC = importlib.util.spec_from_file_location("template_update", SCRIPT)
 template_update = importlib.util.module_from_spec(SPEC)
@@ -196,21 +198,44 @@ class TemplateUpdateTests(unittest.TestCase):
         self.fixture.upstream_change({}, "make upstream executable")
         result = self.fixture.run("apply")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(path.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(path.stat().st_mode & 0o7777, 0o777 & ~UMASK)
 
         path.chmod(0o4755)
         upstream_path.write_text("fn main() { println!(\"v2\"); }\n", encoding="utf-8")
         self.fixture.upstream_change({}, "change executable upstream file")
         result = self.fixture.run("apply")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(path.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(path.stat().st_mode & 0o7777, 0o777 & ~UMASK)
 
         upstream_path.chmod(0o644)
         upstream_path.write_text("fn main() { println!(\"v3\"); }\n", encoding="utf-8")
         self.fixture.upstream_change({}, "make upstream non-executable")
         result = self.fixture.run("apply")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(path.stat().st_mode & 0o7777, 0o644)
+        self.assertEqual(path.stat().st_mode & 0o7777, 0o666 & ~UMASK)
+
+    def test_only_the_owner_execute_bit_counts_as_a_mode_change(self):
+        # Git records a file as executable by its owner bit alone, so a group
+        # or other execute bit is not a local edit that blocks an upstream fix.
+        (self.fixture.customer / "src/main.rs").chmod(0o645)
+        self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.read("src/main.rs"), "// v2\n")
+
+    def test_a_local_execute_bit_conflicts_unless_file_mode_is_off(self):
+        (self.fixture.customer / "src/main.rs").chmod(0o755)
+        self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+        conflict = self.fixture.run("plan")
+        self.assertEqual(conflict.returncode, 1, conflict.stdout + conflict.stderr)
+        self.assertIn("CONFLICTS (1)", conflict.stdout)
+
+        # With core.fileMode=false Git ignores the work tree's execute bit,
+        # and so does the comparison.
+        git(self.fixture.customer, "config", "core.fileMode", "false")
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.read("src/main.rs"), "// v2\n")
 
     # -- customer-owned files and state survive -----------------------------
 
@@ -545,9 +570,30 @@ class UrlUpstreamTests(unittest.TestCase):
         )
 
     def test_head_target_requires_an_explicit_revision(self):
-        result = self.fixture.run("plan", "--to", "HEAD")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("--to HEAD is ambiguous", result.stderr)
+        for ref in ("HEAD", "head", "FETCH_HEAD", "ORIG_HEAD", "CHERRY_PICK_HEAD", "origin/HEAD"):
+            for command in ("plan", "apply", "detect-baseline"):
+                with self.subTest(ref=ref, command=command):
+                    result = self.fixture.run(command, "--to", ref, upstream=self.url)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f"target ref {ref} is ambiguous", result.stderr)
+
+    def test_a_recorded_head_ref_requires_an_explicit_revision(self):
+        payload = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        payload["ref"] = "HEAD"
+        write(self.fixture.customer, {".gitforgeops/baseline.json": json.dumps(payload)})
+        for command in ("plan", "apply", "detect-baseline"):
+            with self.subTest(command=command):
+                result = self.fixture.run(command, upstream=self.url)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("target ref HEAD is ambiguous", result.stderr)
+        self.assertEqual(
+            json.loads(self.fixture.read(".gitforgeops/baseline.json"))["ref"], "HEAD"
+        )
+
+    def test_branch_names_that_merely_end_in_head_are_accepted(self):
+        for ref in ("ahead", "release/overhead", "HEADS", "v1-HEAD"):
+            with self.subTest(ref=ref):
+                self.assertEqual(template_update.validate_target_ref(ref, "target ref"), ref)
 
     def test_detect_baseline_searches_the_default_main_ref(self):
         copied = self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
@@ -644,14 +690,29 @@ class IgnoredRuntimeFileTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("1 upstream-managed path(s) differ", result.stdout)
 
-    def test_a_tree_outside_git_has_no_ignore_rules_to_apply(self):
+    def _outside_git(self):
+        # Git stops looking for a repository at the fixture's own directory,
+        # whatever happens to enclose the temporary directory.
         shutil.rmtree(self.fixture.customer / ".git")
-        exact = self.fixture.run("detect-baseline")
-        self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
-        write(self.fixture.customer, {"src/.DS_Store": "finder\n"})
-        extra = self.fixture.run("detect-baseline")
+        return mock.patch.dict(
+            os.environ, {"GIT_CEILING_DIRECTORIES": str(self.fixture.customer.parent)}
+        )
+
+    def test_a_tree_outside_git_has_no_ignore_rules_to_apply(self):
+        with self._outside_git():
+            exact = self.fixture.run("detect-baseline")
+            self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
+            write(self.fixture.customer, {"src/.DS_Store": "finder\n"})
+            extra = self.fixture.run("detect-baseline")
         self.assertEqual(extra.returncode, 1, extra.stdout + extra.stderr)
         self.assertIn("1 upstream-managed path(s) differ", extra.stdout)
+
+    def test_the_git_probe_falls_back_to_a_walk_outside_a_repository(self):
+        self._leave_runtime_files()
+        with self._outside_git():
+            paths = template_update._local_paths(self.fixture.customer)
+        self.assertIn("src/main.rs", paths)
+        self.assertIn("src/.DS_Store", paths)
 
     def test_detect_baseline_counts_a_local_link_without_following_it(self):
         path = self.fixture.customer / "src/main.rs"
@@ -662,22 +723,133 @@ class IgnoredRuntimeFileTests(unittest.TestCase):
         self.assertIn("1 upstream-managed path(s) differ", result.stdout)
 
     def test_git_probe_errors_other_than_non_repository_fail_closed(self):
-        failure = subprocess.CompletedProcess(
-            ["git", "rev-parse"], 128, b"", b"fatal: unsafe repository (safe.directory)"
-        )
-        with mock.patch.object(template_update.subprocess, "run", return_value=failure):
-            with self.assertRaisesRegex(template_update.UpdateError, "git rev-parse failed"):
+        # A repository Git refuses to open is not a tree outside Git: walking
+        # it instead would count every ignored cache as a local edit.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+            },
+        ):
+            with self.assertRaisesRegex(
+                template_update.UpdateError, "git rev-parse failed.*dubious ownership"
+            ):
                 template_update._local_paths(self.fixture.customer)
 
-    def test_plan_cleans_up_abandoned_atomic_write_temporaries(self):
-        temporary = (
-            self.fixture.customer
-            / ".github/scripts/.helper.py.template-update-0123456789abcdef"
-        )
-        temporary.write_text("incomplete\n", encoding="utf-8")
-        result = self.fixture.run("plan")
+
+class AbandonedTemporaryTests(unittest.TestCase):
+    """What an interrupted atomic write leaves behind, and who may remove it."""
+
+    NAME = ".helper.py.template-update-0123456789abcdef"
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.fixture = Fixture(Path(self._temporary.name))
+        self.scripts = self.fixture.customer / ".github/scripts"
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    def _leave(self, relative: str, *, age: int = 3600) -> Path:
+        path = self.fixture.customer / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("incomplete\n", encoding="utf-8")
+        then = path.stat().st_mtime - age
+        os.utime(path, (then, then))
+        return path
+
+    def test_read_only_commands_report_but_keep_it(self):
+        temporary = self._leave(f".github/scripts/{self.NAME}")
+        for command in ("plan", "status", "detect-baseline"):
+            with self.subTest(command=command):
+                result = self.fixture.run(command)
+                self.assertIn(f"found .github/scripts/{self.NAME}", result.stderr)
+                self.assertTrue(temporary.exists())
+
+    def test_apply_removes_an_old_one(self):
+        temporary = self._leave(f".github/scripts/{self.NAME}")
+        result = self.fixture.run("apply")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(temporary.exists())
+        self.assertIn(f"removed .github/scripts/{self.NAME}", result.stderr)
+        self.assertFalse(os.path.lexists(temporary))
+
+    def test_detect_baseline_write_removes_an_old_one(self):
+        # Left in place it is an untracked file, so it spoils the exact match.
+        temporary = self._leave(f"src/{self.NAME}")
+        report = self.fixture.run("detect-baseline")
+        self.assertEqual(report.returncode, 1, report.stdout + report.stderr)
+        written = self.fixture.run("detect-baseline", "--write")
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        self.assertIn("exact match", written.stdout)
+        self.assertFalse(os.path.lexists(temporary))
+
+    def test_a_recent_one_may_belong_to_a_running_update_and_is_kept(self):
+        temporary = self._leave(f".github/scripts/{self.NAME}", age=0)
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"left .github/scripts/{self.NAME} in place", result.stderr)
+        self.assertTrue(temporary.exists())
+
+    def test_only_a_regular_file_with_exactly_that_name_is_removed(self):
+        outside = Path(self._temporary.name) / "outside.txt"
+        outside.write_text("not ours\n", encoding="utf-8")
+        then = outside.stat().st_mtime - 3600
+        survivors = [
+            self._leave(f".github/scripts/{name}")
+            for name in (
+                "helper.py.template-update-0123456789abcdef",
+                ".helper.py.template-update-0123456789ABCDEF",
+                ".helper.py.template-update-0123456789abcde",
+                ".helper.py.template-update-0123456789abcdef0",
+                ".helper.py.template-update-0123456789abcdef.bak",
+                ".template-update-0123456789abcdef",
+            )
+        ]
+        directory = self.scripts / ".dir.template-update-0123456789abcdef"
+        directory.mkdir()
+        os.utime(directory, (then, then))
+        link = self.scripts / ".link.template-update-0123456789abcdef"
+        link.symlink_to(outside)
+        os.utime(link, (then, then), follow_symlinks=False)
+        removed = self._leave(f".github/scripts/{self.NAME}")
+
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(os.path.lexists(removed))
+        for path in survivors:
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file())
+        self.assertTrue(directory.is_dir())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "not ours\n")
+
+    def test_a_nested_clone_does_not_stop_plan_or_apply(self):
+        nested = self.fixture.customer / "src/vendor/lib"
+        nested.mkdir(parents=True)
+        init(nested)
+        write(nested, {"lib.rs": "// vendored\n"})
+        commit(nested, "vendored")
+        inside = self._leave(f"src/vendor/lib/.git/{self.NAME}")
+        self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+
+        for command in ("plan", "apply"):
+            with self.subTest(command=command):
+                result = self.fixture.run(command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.read("src/main.rs"), "// v2\n")
+        self.assertTrue(inside.exists())
+
+    def test_a_nested_clone_is_one_local_difference_to_detect_baseline(self):
+        nested = self.fixture.customer / "src/vendor/lib"
+        nested.mkdir(parents=True)
+        init(nested)
+        write(nested, {"lib.rs": "// vendored\n"})
+        commit(nested, "vendored")
+        result = self.fixture.run("detect-baseline")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("1 upstream-managed path(s) differ", result.stdout)
 
 
 class ConfinementTests(unittest.TestCase):
@@ -719,6 +891,44 @@ class ConfinementTests(unittest.TestCase):
         self.assertTrue(customer_file.is_dir())
         self.assertEqual(sorted(path.name for path in customer_file.iterdir()), ["y"])
         self.assertEqual((self.fixture.customer / "docs/x/y").read_text(), "new\n")
+        recorded = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        self.assertEqual(recorded["commit"], target)
+
+    def test_a_directory_waits_while_the_file_it_replaces_is_in_conflict(self):
+        (self.fixture.upstream / "docs/x").write_text("old\n", encoding="utf-8")
+        (self.fixture.customer / "docs/x").write_text("ours\n", encoding="utf-8")
+        baseline = commit(self.fixture.upstream, "add docs/x")
+        template_update.Baseline(
+            str(self.fixture.upstream), "main", baseline
+        ).write(self.fixture.customer)
+        (self.fixture.upstream / "docs/x").unlink()
+        target = self.fixture.upstream_change(
+            {"docs/x/y": "new\n", "src/main.rs": "// v2\n"}, "docs/x becomes a directory"
+        )
+
+        plan = self.fixture.run("plan")
+        self.assertEqual(plan.returncode, 1, plan.stdout + plan.stderr)
+        self.assertIn("CONFLICTS (2)", plan.stdout)
+        self.assertIn("docs/x/y — upstream adds it under docs/x", plan.stdout)
+        self.assertIn("resolve docs/x first", plan.stdout)
+
+        # Reported as a conflict, not a refusal half-way through the writes.
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("refusing", result.stderr)
+        self.assertIn("Baseline NOT advanced", result.stderr)
+        self.assertEqual(self.fixture.read("docs/x"), "ours\n")
+        self.assertEqual(self.fixture.read("src/main.rs"), "// v2\n")
+        recorded = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        self.assertEqual(recorded["commit"], baseline)
+
+        kept = self.fixture.run("apply", "--keep", "docs/x")
+        self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
+        self.assertIn("name this path with --keep as well", kept.stdout)
+
+        both = self.fixture.run("apply", "--keep", "docs/x", "--keep", "docs/x/y")
+        self.assertEqual(both.returncode, 0, both.stdout + both.stderr)
+        self.assertEqual(self.fixture.read("docs/x"), "ours\n")
         recorded = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
         self.assertEqual(recorded["commit"], target)
 

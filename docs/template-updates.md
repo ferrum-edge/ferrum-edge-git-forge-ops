@@ -104,6 +104,19 @@ in your repository and the other copy is left alone. The tool runs on Linux and
 macOS; it refuses to run on a platform that cannot open a file without
 following links.
 
+An interrupted `apply` can leave such a temporary file behind, named
+`.<file>.template-update-<16 hex digits>`. Only `apply` and
+`detect-baseline --write` remove one, and only once it is at least ten minutes
+old, since a younger one may belong to an update that is still running; every
+other command, and a younger file, is reported on stderr and left in place.
+Nothing but a regular file with exactly that name is ever removed, and a
+nested clone's `.git` directory is never looked into.
+
+An adopted file gets the mode Git would check it out with: executable or not
+as upstream records it, less your umask. As in Git, only the owner's execute
+bit counts when a local file is compared, and not even that when your
+repository sets `core.fileMode=false`.
+
 ## Finding out an update exists
 
 There is no push notification; you pull. Three ways, in decreasing order of
@@ -171,6 +184,9 @@ python3 .github/scripts/template_update.py apply --to v0.2.0
 
 `--to` takes any upstream revision: a release tag, a branch, or a commit SHA.
 Omit it and the ref recorded in your baseline (`main` by default) is used.
+`HEAD` and the other `*HEAD` pseudo-refs (`FETCH_HEAD`, `ORIG_HEAD`,
+`origin/HEAD`, ...) are refused, whether given with `--to` or recorded in the
+baseline: they name whatever a copy last pointed at, not a revision.
 Branch names resolve the same way whether `--upstream` (or the baseline's
 `upstream`) is a URL — the HTTPS default included — or a local clone, so the
 default `main` needs no `origin/` prefix. The tool fetches into a temporary
@@ -190,6 +206,11 @@ be recorded as a completed one. Resolve each conflicting file deliberately:
 accepts a path that is actually in conflict for this update — a typo or a
 decision left over from an older update is refused rather than read as
 "resolved". Then commit, and re-run `apply` to record the baseline.
+
+When upstream turns a file into a directory, the new files under it are only
+adopted together with the file's removal. While that file is in conflict they
+are reported as conflicts too; if you keep the file with `--keep`, name each
+of them with `--keep` as well (or adopt the removal instead).
 
 ### Review it like the code change it is
 
