@@ -50,6 +50,13 @@ pub struct ApplyOptions {
     pub confirm_api_spec_deletion: bool,
     /// Accept a temporarily unprotected proxy during batch 501/413 fallback.
     pub allow_nontransactional_plugin_attach: bool,
+    /// Namespaces the caller's own preflight refused, keyed to the reason.
+    ///
+    /// `cmd_apply` withholds credential allocation, delivery and create
+    /// journaling for these, so their rows may still carry unallocated slots.
+    /// The apply refuses them unconditionally rather than re-deriving the
+    /// verdict from state the caller has since reconciled.
+    pub refused_namespaces: BlockedNamespaces,
 }
 
 #[derive(Debug, Default)]
@@ -418,7 +425,7 @@ pub async fn apply_api(
     extras_by_namespace: Option<&BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
 ) -> crate::error::Result<ApplyResult> {
-    let prepared = prepare_apply(
+    let mut prepared = prepare_apply(
         desired,
         client,
         namespaces,
@@ -428,6 +435,7 @@ pub async fn apply_api(
         options,
     )
     .await?;
+    block_unresolved_placeholders(desired, namespaces, &mut prepared.blocked);
     preflight_writes(client).await?;
     Ok(apply_prepared(
         desired,
@@ -438,6 +446,45 @@ pub async fn apply_api(
         options,
     )
     .await)
+}
+
+/// Refuse every namespace whose rows still spell a broker slot as its
+/// `${gh-env-secret:...}` placeholder.
+///
+/// Resolution only writes back values it found, so an unallocated or withheld
+/// slot keeps its placeholder text, and a PUT or `/restore` would store that
+/// text as the credential. Only the write path runs this: the preflight and
+/// the preview see the configuration before allocation, where a slot awaiting
+/// its value legitimately still holds a placeholder. Messages name slots,
+/// never values.
+fn block_unresolved_placeholders(
+    desired: &GatewayConfig,
+    namespaces: &[String],
+    blocked: &mut BTreeMap<String, String>,
+) {
+    for namespace in namespaces {
+        if blocked.contains_key(namespace) {
+            continue;
+        }
+        let desired_namespace = crate::config::filter_config_by_namespace(desired, namespace);
+        let reason = match crate::secrets::unresolved_placeholder_slots(&desired_namespace) {
+            Ok(slots) if slots.is_empty() => continue,
+            Ok(slots) => {
+                let slots = slots
+                    .iter()
+                    .map(|slot| format!("`{slot}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "refusing apply for namespace `{namespace}`: credential slot(s) {slots} still hold an unresolved `${{gh-env-secret:...}}` placeholder, which would be written to the gateway as the credential value. Allocate or seed each slot and re-run. No resource in this namespace was written"
+                )
+            }
+            Err(error) => format!(
+                "refusing apply for namespace `{namespace}`: its credential slots could not be checked for unresolved placeholders: {error}. No resource in this namespace was written"
+            ),
+        };
+        blocked.insert(namespace.clone(), reason);
+    }
 }
 
 // Keep the aggregation boundary private: preparation and write preflight must
@@ -619,6 +666,10 @@ async fn prepare_apply<'a>(
     ensure_authoritative_view(client)?;
 
     for namespace in namespaces {
+        if let Some(reason) = options.refused_namespaces.get(namespace) {
+            prepared.blocked.insert(namespace.clone(), reason.clone());
+            continue;
+        }
         let desired_namespace = crate::config::filter_config_by_namespace(desired, namespace);
         let actual = prepared.actuals.get(namespace).ok_or_else(|| {
             crate::error::Error::Config(format!(

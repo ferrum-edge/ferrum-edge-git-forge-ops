@@ -363,9 +363,10 @@ impl ResolveReport {
 
     /// This report without the slots of `namespaces`.
     ///
-    /// `apply` allocates from this for namespaces it is about to refuse: a
-    /// credential generated and delivered for a row the gateway never receives
-    /// would reach its recipient as a value that does not work. Only the
+    /// `apply` allocates from this, excluding namespaces it is about to
+    /// refuse: a credential generated and delivered for a row the gateway
+    /// never receives would reach its recipient as a value that does not
+    /// work. Only the
     /// per-slot results are filtered; the slot-keyed lookup tables are
     /// consulted for listed slots alone.
     pub fn without_namespaces<'a>(&self, namespaces: impl IntoIterator<Item = &'a str>) -> Self {
@@ -1271,6 +1272,26 @@ fn report_secrets_with_mode_inner(
     detect_slot_collisions(&report)?;
     enforce_slot_remap_policy(&report, &options)?;
     Ok(report)
+}
+
+/// Every broker slot in `cfg` whose leaf still holds a `${gh-env-secret:...}`
+/// placeholder, by slot name.
+///
+/// The write path's last check: after resolution and allocation, any slot left
+/// here was never given a value, and writing its row would send the
+/// placeholder text as the credential. Walks the same leaves as
+/// [`report_secrets`] (Consumer credentials, `PluginConfig.config`, modeled
+/// service-discovery secrets) against an empty bundle, so every placeholder
+/// reports regardless of what the bundle holds.
+pub fn unresolved_placeholder_slots(cfg: &GatewayConfig) -> crate::error::Result<Vec<String>> {
+    let report = report_secrets_with_mode_inner(
+        cfg,
+        &CredentialBundle::new(),
+        GatewayMode::Api,
+        ConstraintMode::ReportOnly,
+        ResolveOptions::default(),
+    )?;
+    Ok(report.results.into_iter().map(|r| r.slot).collect())
 }
 
 /// Walk the consumers in `cfg` and replace `${gh-env-secret:...}` placeholders

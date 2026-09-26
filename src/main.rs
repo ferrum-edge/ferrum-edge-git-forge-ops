@@ -2690,6 +2690,7 @@ async fn cmd_apply(
                         managed_ledger: ledger_keys(&state),
                         confirm_api_spec_deletion,
                         allow_nontransactional_plugin_attach,
+                        refused_namespaces: apply::BlockedNamespaces::new(),
                     },
                 )
                 .await;
@@ -2699,6 +2700,22 @@ async fn cmd_apply(
                 };
                 let refused = blocked.keys().map(String::as_str);
                 let allocatable = secret_report.without_namespaces(refused);
+                // A refused namespace is listed once, under REFUSE with its
+                // reason. Nothing in it would be applied, so its changes,
+                // adoptions and spec-owned rows stay out of the lists above.
+                let applies = |namespace: &str| !blocked.contains_key(namespace);
+                let diffs: Vec<_> = diffs
+                    .into_iter()
+                    .filter(|d| applies(d.namespace.as_str()))
+                    .collect();
+                let adoptions: Vec<_> = adoptions
+                    .into_iter()
+                    .filter(|candidate| applies(candidate.namespace.as_str()))
+                    .collect();
+                let spec_owned: Vec<_> = spec_owned
+                    .into_iter()
+                    .filter(|resource| applies(resource.namespace.as_str()))
+                    .collect();
 
                 if diffs.is_empty()
                     && unmanaged.is_empty()
@@ -2858,6 +2875,7 @@ async fn cmd_apply(
                     managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
                     allow_nontransactional_plugin_attach,
+                    refused_namespaces: apply::BlockedNamespaces::new(),
                 },
             )
             .await?;
@@ -2984,10 +3002,18 @@ async fn cmd_apply(
             let withheld =
                 secret_report.needs_allocation().len() - allocatable.needs_allocation().len();
             if withheld > 0 {
+                let mut held_back: Vec<&str> = secret_report
+                    .needs_allocation()
+                    .into_iter()
+                    .map(|result| result.namespace.as_str())
+                    .filter(|namespace| blocked.contains_key(*namespace))
+                    .collect();
+                held_back.sort_unstable();
+                held_back.dedup();
                 eprintln!(
                     "Not allocating {} credential slot(s) in namespace(s) this apply refuses: {}",
                     withheld,
-                    safe(blocked.keys().cloned().collect::<Vec<_>>().join(", "))
+                    safe(held_back.join(", "))
                 );
             }
             let allocation = allocate_if_needed(
@@ -3073,6 +3099,12 @@ async fn cmd_apply(
                     managed_ledger: ledger_keys(&state),
                     confirm_api_spec_deletion,
                     allow_nontransactional_plugin_attach,
+                    // The preflight's verdict, not a fresh one: the journal
+                    // reconciliation above can change what a re-derivation
+                    // would conclude, and the side effects skipped for these
+                    // namespaces (allocation, delivery, journaling) mean their
+                    // rows are not fit to write.
+                    refused_namespaces: blocked,
                 },
             )
             .await?;

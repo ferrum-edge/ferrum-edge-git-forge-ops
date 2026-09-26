@@ -5370,3 +5370,269 @@ async fn preflight_returns_every_namespace_the_apply_will_refuse() {
         "only the preflight's /health"
     );
 }
+
+/// Two namespaces whose declared upstream differs from live, so an unrefused
+/// apply PUTs one row in each.
+fn two_modified_namespaces() -> (
+    GatewayConfig,
+    Vec<String>,
+    BTreeMap<String, GatewayConfig>,
+    BTreeMap<String, gitforgeops::http_client::BackupExtras>,
+) {
+    let (alpha_live, alpha_extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream("u1", "team-alpha", serde_json::json!({}))]
+        }),
+    );
+    let (beta_live, beta_extras) = decoded_live(
+        "team-b",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream("v1", "team-b", serde_json::json!({}))]
+        }),
+    );
+    let mut desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha"), upstream("v1", "team-b")],
+        ..Default::default()
+    };
+    for row in &mut desired.upstreams {
+        row.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+    }
+    let namespaces = vec!["team-alpha".to_string(), "team-b".to_string()];
+    let actuals = BTreeMap::from([
+        ("team-alpha".to_string(), alpha_live),
+        ("team-b".to_string(), beta_live),
+    ]);
+    let extras = BTreeMap::from([
+        ("team-alpha".to_string(), alpha_extras),
+        ("team-b".to_string(), beta_extras),
+    ]);
+    (desired, namespaces, actuals, extras)
+}
+
+#[tokio::test]
+async fn incremental_apply_refuses_a_namespace_the_caller_preflight_refused() {
+    let (desired, namespaces, actuals, extras) = two_modified_namespaces();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/".into(), 200, "{}".into(), vec![]),
+    ]);
+
+    // Nothing in the inputs themselves blocks `team-alpha`: the verdict comes
+    // only from the caller, as it does when `cmd_apply` withheld allocation
+    // for a namespace its preflight refused.
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions {
+            refused_namespaces: BTreeMap::from([(
+                "team-alpha".to_string(),
+                "refused by the preflight".to_string(),
+            )]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.errors,
+        vec!["[team-alpha] refused by the preflight".to_string()]
+    );
+    assert_eq!(result.updated, 1);
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["PUT /upstreams/v1 HTTP/1.1"]
+    );
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn full_replace_refuses_a_namespace_the_caller_preflight_refused() {
+    let (desired, _, actuals, extras) = two_modified_namespaces();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("POST /restore".into(), 200, "{}".into(), vec![]),
+    ]);
+
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            refused_namespaces: BTreeMap::from([(
+                "team-alpha".to_string(),
+                "refused by the preflight".to_string(),
+            )]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.errors,
+        vec!["[team-alpha] refused by the preflight".to_string()]
+    );
+    assert!(result.fully_replaced_namespaces.is_empty());
+    assert!(mutation_lines(&requests).is_empty());
+}
+
+/// `team-alpha` declares a new Consumer whose API key is still spelled as its
+/// broker placeholder; `team-b` modifies an upstream.
+fn placeholder_consumer_inputs() -> (
+    GatewayConfig,
+    Vec<String>,
+    BTreeMap<String, GatewayConfig>,
+    BTreeMap<String, gitforgeops::http_client::BackupExtras>,
+) {
+    let (mut desired, namespaces, mut actuals, extras) = two_modified_namespaces();
+    desired.upstreams.retain(|row| row.namespace == "team-b");
+    actuals.insert("team-alpha".to_string(), GatewayConfig::default());
+    let placeholder: Consumer = serde_json::from_value(serde_json::json!({
+        "id": "c1",
+        "username": "c1",
+        "namespace": "team-alpha",
+        "credentials": {"keyauth": {"key": "${gh-env-secret:alloc=generate}"}},
+    }))
+    .expect("consumer fixture");
+    desired.consumers.push(placeholder);
+    (desired, namespaces, actuals, extras)
+}
+
+#[tokio::test]
+async fn apply_refuses_a_namespace_whose_credential_slot_still_holds_its_placeholder() {
+    let (desired, namespaces, actuals, extras) = placeholder_consumer_inputs();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/".into(), 200, "{}".into(), vec![]),
+    ]);
+    let client = stub_client(url);
+
+    // Before allocation a slot awaiting its value legitimately holds the
+    // placeholder, so the preflight and the preview do not refuse it.
+    let blocked = gitforgeops::apply::preflight_api_apply(
+        &desired,
+        &client,
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(blocked.is_empty(), "{blocked:?}");
+
+    let result = apply_api(
+        &desired,
+        &client,
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(error.starts_with("[team-alpha] refusing apply"), "{error}");
+    assert!(error.contains("`team-alpha/c1/keyauth/key`"), "{error}");
+    assert!(error.contains("unresolved"), "{error}");
+    assert!(!error.contains("alloc=generate"), "{error}");
+    assert_eq!(result.created, 0);
+    assert_eq!(result.updated, 1);
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["PUT /upstreams/v1 HTTP/1.1"]
+    );
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| !request.contains("gh-env-secret")));
+}
+
+#[tokio::test]
+async fn full_replace_refuses_a_restore_body_carrying_an_unresolved_placeholder() {
+    let (desired, _, actuals, extras) = placeholder_consumer_inputs();
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("POST /restore".into(), 200, "{}".into(), vec![]),
+    ]);
+
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0].contains("`team-alpha/c1/keyauth/key`"),
+        "{}",
+        result.errors[0]
+    );
+    assert!(result.fully_replaced_namespaces.is_empty());
+    assert!(mutation_lines(&requests).is_empty());
+}
+
+#[tokio::test]
+async fn a_resolved_credential_is_written_normally() {
+    let (mut desired, namespaces, actuals, extras) = placeholder_consumer_inputs();
+    desired.consumers[0].credentials = BTreeMap::from([(
+        "keyauth".to_string(),
+        serde_json::json!({"key": "resolved-value-aaaaaaaaaaaaaaaa"}),
+    )]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/".into(), 200, "{}".into(), vec![]),
+    ]);
+
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !result.errors.iter().any(|e| e.contains("unresolved")),
+        "{:?}",
+        result.errors
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.starts_with("POST /consumers")),
+        "the consumer create was attempted"
+    );
+}

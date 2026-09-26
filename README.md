@@ -610,8 +610,13 @@ generate, store or deliver a credential for a refused namespace, and it does not
 journal that namespace's creates; the next apply that is not refused allocates
 them. The same holds for a namespace refused because a declaration collides
 with an API-spec-owned row. The interactive `apply` preview (without
-`--auto-approve`) lists each refused namespace with its reason and leaves its
-slots out of the allocation count.
+`--auto-approve`) lists each refused namespace once, with its reason, leaves
+its changes out of the change list and its slots out of the allocation count.
+The apply itself refuses exactly the namespaces that check refused, rather than
+re-deciding after the journal is reconciled. As a last check before any write,
+it also refuses a namespace in which a credential slot still holds its
+`${gh-env-secret:...}` placeholder, naming the slot, so placeholder text is
+never sent to the gateway as a credential value.
 
 The remedy is to upgrade gitforgeops to a version that models the field, or to
 remove the field on the gateway. For a top-level field there is a third option:
