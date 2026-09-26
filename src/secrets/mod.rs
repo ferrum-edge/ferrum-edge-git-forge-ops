@@ -18,7 +18,9 @@ pub use bundle::{
     remove_bundle_handoff, serialize_bundle, serialize_bundle_document, write_bundle_handoff,
     CredentialBundle, LoadedBundles,
 };
-pub use delivery::{deliver_to_author, DeliveryResult};
+pub use delivery::{
+    deliver_to_author, discover_recipient, discover_recipient_at, DeliveryRecipient, DeliveryResult,
+};
 pub use github_api::{
     fetch_public_key, fetch_public_key_at, put_environment_secret, put_environment_secret_at,
     EnvSecretPublicKey, DEFAULT_GITHUB_API_BASE,
