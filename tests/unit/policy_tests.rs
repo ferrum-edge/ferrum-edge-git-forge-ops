@@ -2279,6 +2279,260 @@ fn require_auth_plugin_uses_explicit_allowlist() {
     );
 }
 
+fn require_auth_policies(auth_plugin_names: Option<&[&str]>) -> PolicyConfig {
+    let mut rule = gitforgeops::policy::config::RequireAuthPluginRuleConfig {
+        enabled: true,
+        severity: Severity::Error,
+        ..Default::default()
+    };
+    if let Some(names) = auth_plugin_names {
+        rule.auth_plugin_names = names.iter().map(|name| (*name).to_string()).collect();
+    }
+    PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: rule,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// A stream listener as the gateway sees it: its own port, no HTTP route and,
+/// unless `frontend_tls`, no TLS/DTLS termination.
+fn stream_proxy(id: &str, scheme: BackendScheme, frontend_tls: bool) -> Proxy {
+    let mut p = proxy(id, scheme, 30_000, true);
+    p.listen_path = None;
+    p.listen_port = Some(19001);
+    p.frontend_tls = frontend_tls;
+    p
+}
+
+fn global_plugin(id: &str, name: &str) -> PluginConfig {
+    catalog_plugin(id, name, PluginScope::Global, None, serde_json::json!({}))
+}
+
+fn group_plugin(id: &str, name: &str) -> PluginConfig {
+    catalog_plugin(
+        id,
+        name,
+        PluginScope::ProxyGroup,
+        None,
+        serde_json::json!({}),
+    )
+}
+
+fn auth_findings(cfg: &GatewayConfig, policies: &PolicyConfig) -> Vec<String> {
+    evaluate_policies(cfg, policies)
+        .into_iter()
+        .filter(|finding| finding.rule_id == "require_auth_plugin")
+        .map(|finding| finding.message)
+        .collect()
+}
+
+#[test]
+fn require_auth_plugin_ignores_http_only_authenticators_on_stream_listeners() {
+    let policies = require_auth_policies(None);
+
+    // HTTP + a global key_auth still qualifies.
+    let http = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("key-1", "key_auth")],
+        ..Default::default()
+    };
+    assert!(auth_findings(&http, &policies).is_empty());
+
+    // A plain TCP or UDP listener never runs key_auth, so it stays
+    // unauthenticated however the plugin is scoped.
+    for scheme in [
+        BackendScheme::Tcp,
+        BackendScheme::Tcps,
+        BackendScheme::Udp,
+        BackendScheme::Dtls,
+    ] {
+        let cfg = GatewayConfig {
+            proxies: vec![stream_proxy("stream", scheme, false)],
+            plugin_configs: vec![global_plugin("key-1", "key_auth")],
+            ..Default::default()
+        };
+        let findings = auth_findings(&cfg, &policies);
+        assert_eq!(findings.len(), 1, "{scheme:?}: {findings:?}");
+        assert!(findings[0].contains("stream proxy stream"), "{findings:?}");
+        assert!(findings[0].contains("key_auth (key-1)"), "{findings:?}");
+    }
+
+    // Every HTTP-family authenticator is skipped, even behind TLS termination.
+    for name in [
+        "jwks_auth",
+        "oauth2_introspection",
+        "oidc_relying_party",
+        "jwt_auth",
+        "key_auth",
+        "ldap_auth",
+        "basic_auth",
+        "hmac_auth",
+        "soap_ws_security",
+    ] {
+        let cfg = GatewayConfig {
+            proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
+            plugin_configs: vec![global_plugin("auth-1", name)],
+            ..Default::default()
+        };
+        assert_eq!(
+            auth_findings(&cfg, &policies).len(),
+            1,
+            "{name} does not run on a TCP listener"
+        );
+    }
+}
+
+#[test]
+fn require_auth_plugin_assesses_stream_identity_separately() {
+    let policies = require_auth_policies(None);
+
+    // Terminating TLS/DTLS with a stream authenticator qualifies on both
+    // transports.
+    for (scheme, name) in [
+        (BackendScheme::Tcp, "mtls_auth"),
+        (BackendScheme::Tcps, "spiffe_identity"),
+        (BackendScheme::Udp, "mtls_auth"),
+        (BackendScheme::Dtls, "spiffe_identity"),
+    ] {
+        let cfg = GatewayConfig {
+            proxies: vec![stream_proxy("stream", scheme, true)],
+            plugin_configs: vec![global_plugin("auth-1", name)],
+            ..Default::default()
+        };
+        assert!(
+            auth_findings(&cfg, &policies).is_empty(),
+            "{name} on a terminating {scheme:?} listener establishes an identity"
+        );
+    }
+
+    // The same authenticator on a listener that never sees a client
+    // certificate is reported as a listener problem, not a missing plugin.
+    let plaintext = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcp, false)],
+        plugin_configs: vec![global_plugin("mtls-1", "mtls_auth")],
+        ..Default::default()
+    };
+    let findings = auth_findings(&plaintext, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("does not terminate TLS/DTLS"));
+    assert!(findings[0].contains("mtls_auth (mtls-1)"));
+
+    let mut passthrough = stream_proxy("stream", BackendScheme::Udp, true);
+    passthrough.passthrough = true;
+    let passthrough = GatewayConfig {
+        proxies: vec![passthrough],
+        plugin_configs: vec![global_plugin("spiffe-1", "spiffe_identity")],
+        ..Default::default()
+    };
+    let findings = auth_findings(&passthrough, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("does not terminate TLS/DTLS"));
+}
+
+#[test]
+fn require_auth_plugin_applies_protocol_rules_to_proxy_group_attachments() {
+    let policies = require_auth_policies(None);
+
+    let key_group = GatewayConfig {
+        proxies: vec![attach(
+            stream_proxy("stream", BackendScheme::Tcp, true),
+            &["key-group"],
+        )],
+        plugin_configs: vec![group_plugin("key-group", "key_auth")],
+        ..Default::default()
+    };
+    let findings = auth_findings(&key_group, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("key_auth (key-group)"));
+
+    let mtls_group = GatewayConfig {
+        proxies: vec![attach(
+            stream_proxy("stream", BackendScheme::Udp, true),
+            &["mtls-group"],
+        )],
+        plugin_configs: vec![group_plugin("mtls-group", "mtls_auth")],
+        ..Default::default()
+    };
+    assert!(auth_findings(&mtls_group, &policies).is_empty());
+
+    // The same group authenticator still protects an HTTP member.
+    let http_member = GatewayConfig {
+        proxies: vec![attach(
+            proxy("api", BackendScheme::Https, 30_000, true),
+            &["key-group"],
+        )],
+        plugin_configs: vec![group_plugin("key-group", "key_auth")],
+        ..Default::default()
+    };
+    assert!(auth_findings(&http_member, &policies).is_empty());
+}
+
+#[test]
+fn require_auth_plugin_fails_closed_for_unverified_stream_authenticators() {
+    // A custom authenticator's supported protocols are not visible here, so it
+    // counts on HTTP proxies only.
+    let policies = require_auth_policies(Some(&["company_sso", "MTLS_AUTH"]));
+
+    let http = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("sso-1", "company_sso")],
+        ..Default::default()
+    };
+    assert!(auth_findings(&http, &policies).is_empty());
+
+    let stream = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
+        plugin_configs: vec![global_plugin("sso-1", "company_sso")],
+        ..Default::default()
+    };
+    assert_eq!(auth_findings(&stream, &policies).len(), 1);
+
+    // The allowlist matches case-insensitively, but only the exact built-in
+    // name runs on a stream listener.
+    let case_variant = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
+        plugin_configs: vec![global_plugin("mtls-1", "MTLS_AUTH")],
+        ..Default::default()
+    };
+    assert_eq!(auth_findings(&case_variant, &policies).len(), 1);
+
+    let canonical = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
+        plugin_configs: vec![global_plugin("mtls-1", "mtls_auth")],
+        ..Default::default()
+    };
+    assert!(auth_findings(&canonical, &policies).is_empty());
+}
+
+#[test]
+fn stream_auth_catalog_matches_the_gateway_protocol_contract() {
+    use gitforgeops::plugin_catalog::{
+        auth_plugin_applies_to_proxy, is_builtin, proxy_transport, ProxyTransport,
+        AUTH_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
+    };
+
+    let http = proxy("api", BackendScheme::Https, 30_000, true);
+    let tcp = stream_proxy("tcp", BackendScheme::Tcps, true);
+    let udp = stream_proxy("udp", BackendScheme::Dtls, true);
+    assert_eq!(proxy_transport(&http), ProxyTransport::HttpFamily);
+    assert_eq!(proxy_transport(&tcp), ProxyTransport::Tcp);
+    assert_eq!(proxy_transport(&udp), ProxyTransport::Udp);
+
+    for name in STREAM_AUTH_PLUGIN_NAMES {
+        assert!(AUTH_PLUGIN_NAMES.contains(name) && is_builtin(name));
+    }
+    for name in AUTH_PLUGIN_NAMES {
+        assert!(auth_plugin_applies_to_proxy(name, &http), "{name} on HTTP");
+        let stream_capable = STREAM_AUTH_PLUGIN_NAMES.contains(name);
+        assert_eq!(auth_plugin_applies_to_proxy(name, &tcp), stream_capable);
+        assert_eq!(auth_plugin_applies_to_proxy(name, &udp), stream_capable);
+    }
+    assert!(!auth_plugin_applies_to_proxy("company_sso", &tcp));
+}
+
 #[test]
 fn forbid_tls_verify_disabled_covers_upstreams() {
     // Regression guard: the rule used to scan proxies only. Upstream

@@ -438,6 +438,125 @@ pub fn scheme_is_http_family(scheme: BackendScheme) -> bool {
     matches!(scheme, BackendScheme::Http | BackendScheme::Https)
 }
 
+// --- Protocol applicability ---
+//
+// A plugin that is effective by scope still only runs when the gateway invokes
+// it for the proxy's protocol. Each gateway plugin declares
+// `supported_protocols()`, and the stream listeners skip every plugin that
+// does not declare `Tcp` or `Udp` (`docs/tcp_udp_proxy.md`, "Compatible
+// Plugins"). Only the authenticator half of that matrix is mirrored here,
+// because auth coverage is the check that must not be satisfied by a plugin
+// the listener never runs.
+
+/// The listener family a proxy's plugins run on, as the gateway classifies it
+/// (`ferrum_edge::plugins::ProxyProtocol`). HTTP-family proxies share the HTTP
+/// listener and serve HTTP, gRPC and WebSocket requests; a stream proxy owns a
+/// TCP (`tcp` / `tcps`) or UDP (`udp` / `dtls`) listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyTransport {
+    HttpFamily,
+    Tcp,
+    Udp,
+}
+
+impl ProxyTransport {
+    /// Is this a raw L4 stream listener?
+    pub fn is_stream(self) -> bool {
+        matches!(self, ProxyTransport::Tcp | ProxyTransport::Udp)
+    }
+
+    /// Label for findings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProxyTransport::HttpFamily => "HTTP",
+            ProxyTransport::Tcp => "TCP",
+            ProxyTransport::Udp => "UDP",
+        }
+    }
+}
+
+/// The listener family `proxy` runs on. Keyed on the effective scheme, like
+/// the gateway's `effective_scheme().is_stream()`: an HTTP-family proxy may
+/// also carry a `listen_port`.
+pub fn proxy_transport(proxy: &Proxy) -> ProxyTransport {
+    match effective_scheme(proxy) {
+        BackendScheme::Http | BackendScheme::Https => ProxyTransport::HttpFamily,
+        BackendScheme::Tcp | BackendScheme::Tcps => ProxyTransport::Tcp,
+        BackendScheme::Udp | BackendScheme::Dtls => ProxyTransport::Udp,
+    }
+}
+
+/// Built-in authenticators the paired gateway (v0.9.7) also runs on stream
+/// listeners. These are the only two whose `supported_protocols()` include
+/// `Tcp` and `Udp` (`HTTP_FAMILY_AND_STREAM_PROTOCOLS`); both derive the
+/// caller from the TLS/DTLS client certificate in `on_stream_connect`. Every
+/// other built-in authenticator declares HTTP-family or HTTP-only support
+/// and is skipped on a stream connection.
+pub const STREAM_AUTH_PLUGIN_NAMES: &[&str] = &["spiffe_identity", "mtls_auth"];
+
+/// Does the gateway run the authenticator `plugin_name` on `proxy`'s listener?
+///
+/// Every authenticator counts on an HTTP-family proxy. On a stream proxy only
+/// [`STREAM_AUTH_PLUGIN_NAMES`] do, matched exactly as the gateway resolves
+/// `plugin_name`. Anything else fails closed: a custom plugin's
+/// `supported_protocols()` contract is not visible here, and the gateway's
+/// trait default is HTTP only.
+pub fn auth_plugin_applies_to_proxy(plugin_name: &str, proxy: &Proxy) -> bool {
+    !proxy_transport(proxy).is_stream() || STREAM_AUTH_PLUGIN_NAMES.contains(&plugin_name)
+}
+
+/// Can a stream authenticator establish an identity on `proxy`'s listener?
+///
+/// Stream authenticators read the client certificate from the TLS or DTLS
+/// handshake, which only exists when the gateway terminates it:
+/// `frontend_tls: true` without `passthrough`. The gateway rejects a stream
+/// `mtls_auth` otherwise; `spiffe_identity` silently derives nothing. Always
+/// `true` for an HTTP-family proxy, where the authenticators read the request.
+pub fn listener_can_establish_identity(proxy: &Proxy) -> bool {
+    !proxy_transport(proxy).is_stream() || (proxy.frontend_tls && !proxy.passthrough)
+}
+
+/// How a proxy's effective authenticators relate to the listener they guard.
+#[derive(Debug, Clone)]
+pub struct AuthCoverage<'a> {
+    pub transport: ProxyTransport,
+    /// Allowlisted authenticators the gateway runs on this listener.
+    pub applicable: Vec<&'a PluginConfig>,
+    /// Allowlisted authenticators effective by scope but skipped on this
+    /// listener because they do not support its protocol.
+    pub inapplicable: Vec<&'a PluginConfig>,
+    /// See [`listener_can_establish_identity`].
+    pub listener_establishes_identity: bool,
+}
+
+impl AuthCoverage<'_> {
+    /// Does an applicable authenticator run on a listener where it can
+    /// establish an identity?
+    pub fn is_authenticated(&self) -> bool {
+        !self.applicable.is_empty() && self.listener_establishes_identity
+    }
+}
+
+/// Classify the effective plugins of `proxy` against the lowercased
+/// authentication allowlist `auth_names`. Shared by `require_auth_plugin` and
+/// the security audit so they cannot disagree about which authenticators run.
+pub fn auth_coverage<'a>(
+    config: &'a GatewayConfig,
+    proxy: &Proxy,
+    auth_names: &[String],
+) -> AuthCoverage<'a> {
+    let (applicable, inapplicable) = effective_plugins(config, proxy)
+        .into_iter()
+        .filter(|plugin| auth_names.contains(&plugin.plugin_name.to_ascii_lowercase()))
+        .partition(|plugin| auth_plugin_applies_to_proxy(&plugin.plugin_name, proxy));
+    AuthCoverage {
+        transport: proxy_transport(proxy),
+        applicable,
+        inapplicable,
+        listener_establishes_identity: listener_can_establish_identity(proxy),
+    }
+}
+
 // --- Shared plugin-configuration predicates ---
 //
 // These read the untyped `PluginConfig.config` and answer a question about the

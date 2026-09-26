@@ -394,6 +394,122 @@ fn security_audit_honours_the_configured_auth_allowlist() {
 }
 
 // ---------------------------------------------------------------------------
+// Protocol-aware auth coverage
+// ---------------------------------------------------------------------------
+
+/// A stream listener: its own port, no HTTP route and, unless `frontend_tls`,
+/// no TLS/DTLS termination.
+fn stream_proxy(id: &str, scheme: BackendScheme, frontend_tls: bool) -> Proxy {
+    from_json(serde_json::json!({
+        "id": id,
+        "namespace": "ferrum",
+        "backend_scheme": scheme.as_str(),
+        "backend_host": "backend.internal",
+        "backend_port": 9000,
+        "listen_port": 19001,
+        "frontend_tls": frontend_tls,
+    }))
+}
+
+fn auth_messages(config: &GatewayConfig) -> Vec<String> {
+    messages(config)
+        .into_iter()
+        .filter(|m| m.starts_with("No auth plugin"))
+        .collect()
+}
+
+#[test]
+fn security_audit_ignores_http_only_authenticators_on_stream_listeners() {
+    let http = GatewayConfig {
+        proxies: vec![proxy("api", Some(BackendScheme::Https))],
+        plugin_configs: vec![plugin("key-1", "key_auth", serde_json::json!({}))],
+        ..Default::default()
+    };
+    assert!(auth_messages(&http).is_empty());
+
+    for (scheme, transport) in [(BackendScheme::Tcp, "TCP"), (BackendScheme::Udp, "UDP")] {
+        let cfg = GatewayConfig {
+            proxies: vec![stream_proxy("stream", scheme, false)],
+            plugin_configs: vec![plugin("key-1", "key_auth", serde_json::json!({}))],
+            ..Default::default()
+        };
+        let msgs = auth_messages(&cfg);
+        let expected = format!("No auth plugin runs on {transport} stream proxy stream");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains(&expected), "{msgs:?}");
+        assert!(msgs[0].contains("key_auth (key-1)"), "{msgs:?}");
+    }
+}
+
+#[test]
+fn security_audit_assesses_stream_identity_separately() {
+    let terminated = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcps, true)],
+        plugin_configs: vec![plugin("mtls-1", "mtls_auth", serde_json::json!({}))],
+        ..Default::default()
+    };
+    assert!(auth_messages(&terminated).is_empty());
+
+    let plaintext = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Udp, false)],
+        plugin_configs: vec![plugin("sid-1", "spiffe_identity", serde_json::json!({}))],
+        ..Default::default()
+    };
+    let msgs = auth_messages(&plaintext);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(msgs[0].contains("can establish an identity on UDP stream proxy"));
+    assert!(msgs[0].contains("spiffe_identity (sid-1)"));
+}
+
+#[test]
+fn security_audit_applies_protocol_rules_to_proxy_group_attachments() {
+    let group = |id: &str, name: &str| {
+        let mut config = plugin(id, name, serde_json::json!({}));
+        config.scope = PluginScope::ProxyGroup;
+        config
+    };
+    let member = |scheme: BackendScheme, plugin_id: &str| {
+        let mut p = stream_proxy("stream", scheme, true);
+        p.plugins = vec![PluginAssociation {
+            plugin_config_id: plugin_id.to_string(),
+        }];
+        p
+    };
+
+    let key_group = GatewayConfig {
+        proxies: vec![member(BackendScheme::Tcp, "key-group")],
+        plugin_configs: vec![group("key-group", "key_auth")],
+        ..Default::default()
+    };
+    let msgs = auth_messages(&key_group);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(msgs[0].contains("key_auth (key-group)"));
+
+    let mtls_group = GatewayConfig {
+        proxies: vec![member(BackendScheme::Dtls, "mtls-group")],
+        plugin_configs: vec![group("mtls-group", "mtls_auth")],
+        ..Default::default()
+    };
+    assert!(auth_messages(&mtls_group).is_empty());
+}
+
+#[test]
+fn skipped_stream_authenticator_triggers_are_not_reported_as_conditional_auth() {
+    let mut auth = plugin("key-1", "key_auth", serde_json::json!({}));
+    auth.trigger = Some(from_json::<PluginTrigger>(serde_json::json!({
+        "when": {"match": {"path": {"prefix": ["/private"]}}},
+    })));
+    let cfg = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
+        plugin_configs: vec![auth],
+        ..Default::default()
+    };
+    let msgs = messages(&cfg);
+    assert!(!msgs.iter().any(|m| m.contains("carries a trigger")), "{msgs:?}");
+    assert_eq!(auth_messages(&cfg).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Best practices
 // ---------------------------------------------------------------------------
 

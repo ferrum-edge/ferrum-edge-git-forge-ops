@@ -641,6 +641,14 @@ Plugin-name knowledge lives in `src/plugin_catalog.rs` (82 builtins, retired and
 reserved names, the 11 auth plugins, and `effective_plugins` merge semantics
 where a scoped plugin config replaces a global one of the same `plugin_name`).
 Rules that reason about plugins go through it rather than hard-coding names.
+`auth_coverage` is the shared auth classification for `require_auth_plugin` and
+the security audit. It keeps only authenticators the paired Edge runs on the
+proxy's protocol (`proxy_transport` from the effective scheme). On TCP/UDP stream
+listeners only `STREAM_AUTH_PLUGIN_NAMES` (`mtls_auth`, `spiffe_identity`, exact
+names) count. Custom and HTTP-only authenticators fail closed. A stream proxy is
+authenticated only if its listener terminates TLS/DTLS (`frontend_tls` without
+`passthrough`). Update that list from Edge's `supported_protocols()` when the
+pinned version changes.
 
 The pre-resolve security audit (`audit_security_with_scope`) classifies plugin
 association conflicts using the environment's ownership mode. References to a
