@@ -590,6 +590,41 @@ class UrlUpstreamTests(unittest.TestCase):
             json.loads(self.fixture.read(".gitforgeops/baseline.json"))["ref"], "HEAD"
         )
 
+    def test_a_bare_remote_name_requires_an_explicit_revision(self):
+        # `origin` resolves through the copy's `refs/remotes/origin/HEAD`,
+        # which is upstream's default branch rather than a named revision.
+        self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+        for ref in ("origin", "ORIGIN", "Origin"):
+            for command in ("plan", "apply", "detect-baseline"):
+                with self.subTest(ref=ref, command=command):
+                    result = self.fixture.run(command, "--to", ref, upstream=self.url)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f"target ref {ref} is ambiguous", result.stderr)
+        self.assertEqual(self.fixture.read("src/main.rs"), UPSTREAM_TREE["src/main.rs"])
+
+        payload = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        payload["ref"] = "origin"
+        write(self.fixture.customer, {".gitforgeops/baseline.json": json.dumps(payload)})
+        for command in ("plan", "apply", "detect-baseline"):
+            with self.subTest(recorded="origin", command=command):
+                result = self.fixture.run(command, upstream=self.url)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("target ref origin is ambiguous", result.stderr)
+        self.assertEqual(
+            json.loads(self.fixture.read(".gitforgeops/baseline.json"))["ref"], "origin"
+        )
+
+    def test_a_branch_really_named_origin_resolves_by_its_full_name(self):
+        named = self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+        git(self.fixture.upstream, "branch", "origin")
+        self.fixture.upstream_change({"src/main.rs": "// v3\n"}, "v3")
+        result = self.fixture.run("status", "--to", "refs/heads/origin", upstream=self.url)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"target:   {named}", result.stdout)
+        for ref in ("origin/main", "origins", "release/origin"):
+            with self.subTest(ref=ref):
+                self.assertEqual(template_update.validate_target_ref(ref, "target ref"), ref)
+
     def test_branch_names_that_merely_end_in_head_are_accepted(self):
         for ref in ("ahead", "release/overhead", "HEADS", "v1-HEAD"):
             with self.subTest(ref=ref):
@@ -731,10 +766,25 @@ class IgnoredRuntimeFileTests(unittest.TestCase):
                 "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_NOSYSTEM": "1",
+                "LC_ALL": "C",
             },
         ):
+            # Git older than the ownership check ignores the variable and
+            # opens the repository, which leaves nothing here to test.
+            probe = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=str(self.fixture.customer),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode == 0:
+                self.skipTest(
+                    "this Git does not honour GIT_TEST_ASSUME_DIFFERENT_OWNER"
+                )
             with self.assertRaisesRegex(
-                template_update.UpdateError, "git rev-parse failed.*dubious ownership"
+                template_update.UpdateError,
+                "git rev-parse failed.*(?:dubious ownership|unsafe repository)",
             ):
                 template_update._local_paths(self.fixture.customer)
 
@@ -823,6 +873,86 @@ class AbandonedTemporaryTests(unittest.TestCase):
                 self.assertTrue(path.is_file())
         self.assertTrue(directory.is_dir())
         self.assertTrue(link.is_symlink())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "not ours\n")
+
+    # Managed files that sit directly in a directory the recursive walk never
+    # enters: the repository root, `.github/` and `.gitforgeops/`.
+    BESIDE_FILES = (
+        ".Cargo.toml.template-update-0123456789abcdef",
+        ".README.md.template-update-0123456789abcdef",
+        ".github/.ferrum-edge-checksums.txt.template-update-0123456789abcdef",
+        ".github/.dependabot.yml.template-update-0123456789abcdef",
+        ".gitforgeops/.smoke.example.yaml.template-update-0123456789abcdef",
+        ".gitforgeops/.baseline.json.template-update-0123456789abcdef",
+    )
+
+    def test_read_only_commands_report_one_beside_a_top_level_file(self):
+        left = [self._leave(relative) for relative in self.BESIDE_FILES]
+        for command in ("plan", "status", "detect-baseline"):
+            with self.subTest(command=command):
+                result = self.fixture.run(command)
+                for relative in self.BESIDE_FILES:
+                    self.assertIn(f"found {relative}", result.stderr)
+        for path in left:
+            self.assertTrue(path.is_file(), path)
+
+    def test_apply_removes_an_old_one_beside_a_top_level_file(self):
+        left = [self._leave(relative) for relative in self.BESIDE_FILES]
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for relative, path in zip(self.BESIDE_FILES, left):
+            with self.subTest(path=relative):
+                self.assertIn(f"removed {relative}", result.stderr)
+                self.assertFalse(os.path.lexists(path))
+
+    def test_detect_baseline_write_removes_an_old_one_beside_the_baseline(self):
+        temporary = self._leave(".gitforgeops/.baseline.json.template-update-0123456789abcdef")
+        written = self.fixture.run("detect-baseline", "--write")
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        self.assertFalse(os.path.lexists(temporary))
+
+    def test_a_recent_one_beside_a_top_level_file_is_kept(self):
+        temporary = self._leave(".Cargo.toml.template-update-0123456789abcdef", age=0)
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "left .Cargo.toml.template-update-0123456789abcdef in place", result.stderr
+        )
+        self.assertTrue(temporary.is_file())
+
+    def test_beside_a_top_level_file_only_that_files_own_temporary_is_removed(self):
+        # The directories holding top-level managed files also hold the
+        # customer's own files, so only the name `write_local` gives one of
+        # those managed files is touched, and nothing below them is walked.
+        outside = Path(self._temporary.name) / "outside.txt"
+        outside.write_text("not ours\n", encoding="utf-8")
+        then = outside.stat().st_mtime - 3600
+        survivors = [
+            self._leave(relative)
+            for relative in (
+                ".notes.md.template-update-0123456789abcdef",
+                ".gitforgeops/.config.yaml.template-update-0123456789abcdef",
+                ".github/.CODEOWNERS.template-update-0123456789abcdef",
+                "resources/.orders.yaml.template-update-0123456789abcdef",
+                ".Cargo.toml.template-update-0123456789ABCDEF",
+                "Cargo.toml.template-update-0123456789abcdef",
+            )
+        ]
+        link = self.fixture.customer / ".README.md.template-update-fedcba9876543210"
+        link.symlink_to(outside)
+        os.utime(link, (then, then), follow_symlinks=False)
+        directory = self.fixture.customer / ".Cargo.toml.template-update-fedcba9876543210"
+        directory.mkdir()
+        os.utime(directory, (then, then))
+
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for path in survivors:
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file())
+                self.assertNotIn(path.name, result.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(directory.is_dir())
         self.assertEqual(outside.read_text(encoding="utf-8"), "not ours\n")
 
     def test_a_nested_clone_does_not_stop_plan_or_apply(self):
@@ -926,8 +1056,25 @@ class ConfinementTests(unittest.TestCase):
         self.assertEqual(kept.returncode, 1, kept.stdout + kept.stderr)
         self.assertIn("name this path with --keep as well", kept.stdout)
 
+        # Keeping only the new file says why it waits: its parent is still
+        # undecided, not a file anybody chose to keep.
+        child = self.fixture.run("plan", "--keep", "docs/x/y")
+        self.assertEqual(child.returncode, 1, child.stdout + child.stderr)
+        self.assertIn("CONFLICTS (1)", child.stdout)
+        self.assertIn(
+            "docs/x/y — upstream adds it under docs/x, which upstream made a "
+            "directory but which is in conflict here; not adopted, kept by --keep",
+            child.stdout,
+        )
+        self.assertNotIn("stays a file", child.stdout)
+
         both = self.fixture.run("apply", "--keep", "docs/x", "--keep", "docs/x/y")
         self.assertEqual(both.returncode, 0, both.stdout + both.stderr)
+        self.assertIn(
+            "docs/x/y — upstream adds it under docs/x, which upstream made a "
+            "directory but --keep keeps as a file here; not adopted, kept by --keep",
+            both.stdout,
+        )
         self.assertEqual(self.fixture.read("docs/x"), "ours\n")
         recorded = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
         self.assertEqual(recorded["commit"], target)
