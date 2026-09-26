@@ -23,6 +23,36 @@ SPEC.loader.exec_module(check_agent_setup)
 FIXTURE_CODEOWNER = "@example-maintainer"
 
 
+def init_repo_with_linked_worktree(root: Path, linked: Path) -> None:
+    """A one-commit repository at `root` plus a detached worktree at `linked`."""
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    # `git commit` otherwise detaches `git maintenance run --auto`, which can
+    # still be writing `.git/objects` when the directory is removed (#374).
+    # Nothing may outlive the git command that started it.
+    for key, value in (
+        ("maintenance.auto", "false"),
+        ("gc.auto", "0"),
+        ("core.fsmonitor", "false"),
+    ):
+        subprocess.run(["git", "-C", str(root), "config", key, value], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        },
+        stdout=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
+        check=True,
+    )
+
+
 def skill_text(name: str, *, claude: bool = False) -> str:
     linked = (
         "Every dispatch uses a dedicated linked git worktree.\n" if claude else ""
@@ -553,23 +583,7 @@ class AgentSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             linked = Path(directory) / "linked"
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
-                check=True,
-                env={
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": "Test",
-                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
-                    "GIT_COMMITTER_NAME": "Test",
-                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
-                },
-                stdout=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
-                check=True,
-            )
+            init_repo_with_linked_worktree(root, linked)
             command = (
                 'source "$1"; require_linked_worktree "$2"'
             )
@@ -633,23 +647,7 @@ class AgentSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             linked = Path(directory) / "linked"
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
-                check=True,
-                env={
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": "Test",
-                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
-                    "GIT_COMMITTER_NAME": "Test",
-                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
-                },
-                stdout=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
-                check=True,
-            )
+            init_repo_with_linked_worktree(root, linked)
             helper = str(
                 check_agent_setup.ROOT
                 / ".agents/skills/_lib/resolve-agent-bin.sh"
@@ -730,23 +728,7 @@ class AgentSetupTests(unittest.TestCase):
             temp = Path(directory)
             root = temp / "repo"
             linked = temp / "linked"
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
-                check=True,
-                env={
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": "Test",
-                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
-                    "GIT_COMMITTER_NAME": "Test",
-                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
-                },
-                stdout=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
-                check=True,
-            )
+            init_repo_with_linked_worktree(root, linked)
             helper = str(
                 check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
             )
@@ -885,23 +867,7 @@ class AgentSetupTests(unittest.TestCase):
             temp = Path(directory)
             root = temp / "repo"
             linked = temp / "linked"
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
-            subprocess.run(
-                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "init"],
-                check=True,
-                env={
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": "Test",
-                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
-                    "GIT_COMMITTER_NAME": "Test",
-                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
-                },
-                stdout=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(linked)],
-                check=True,
-            )
+            init_repo_with_linked_worktree(root, linked)
             fake_cursor = temp / "cursor-agent"
             fake_cursor.write_text(
                 "#!/usr/bin/env bash\n"

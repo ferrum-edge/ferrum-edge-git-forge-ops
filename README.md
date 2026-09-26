@@ -565,6 +565,17 @@ keys: a live backup that carries a type Ferrum Edge never authenticates is
 refused before any tree file or credential import bundle is written, naming the
 consumer, namespace, key, and recognized set, with no acknowledgement flag.
 
+Unmodelled fields *inside* a modelled structure (for example
+`retry.future_option` on a Proxy, or a new key on one of an Upstream's
+`targets`) are refused on import as well, for the same reason the loader
+rejects them: there is nowhere in a resource file to keep them, so writing the
+tree would silently drop them. The refusal names each resource and the full
+field path (`.spec.targets[1].future_option`), and nothing — neither tree nor
+credential import bundle — is written. `--accept-unknown-field` does not cover
+nested fields; upgrade gitforgeops or remove the field on the gateway.
+Deliberately opaque sections (plugin `config`, credential entries) are carried
+verbatim and are not affected.
+
 Upgrading gitforgeops is the real fix. When you cannot wait, read the source,
 confirm the field is not a credential, and re-run with one
 `--accept-unknown-field <NAME>` per field plus `FERRUM_ALLOW_UNKNOWN_FIELDS=true`.
