@@ -31,7 +31,12 @@ policies:
     allowed_protocols: [https, tcps, dtls]
 
   # Every proxy must have an auth plugin in its effective plugin list
-  # (global plugins included; disabled instances never count).
+  # (global plugins included; disabled instances never count). Only
+  # authenticators that authenticate the proxy's protocol count: TCP/UDP
+  # stream proxies need mtls_auth plus TLS/DTLS termination
+  # (frontend_tls: true, no passthrough). HTTP-only plugins such as key_auth
+  # never run on a stream listener, and spiffe_identity only extracts an
+  # identity there without rejecting unidentified peers.
   require_auth_plugin:
     enabled: false
     severity: error

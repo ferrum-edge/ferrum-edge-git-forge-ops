@@ -18,6 +18,8 @@ use gitforgeops::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, 
 use gitforgeops::diagnostics::{sanitize, sanitize_block, sanitize_line, MAX_INLINE_CHARS};
 use gitforgeops::diff::security::audit_security;
 use gitforgeops::error::Error;
+use gitforgeops::policy::config::{PolicyRules, RequireAuthPluginRuleConfig};
+use gitforgeops::policy::{evaluate_policies, PolicyConfig, Severity};
 
 use tempfile::TempDir;
 
@@ -248,6 +250,63 @@ fn security_findings_cannot_emit_a_workflow_command() {
     }
     let sanitized = findings.iter().any(|f| f.id.contains('\u{fffd}'));
     assert!(sanitized, "hostile id was recorded verbatim");
+}
+
+/// Policy rules interpolate repository-authored ids and plugin names into
+/// their messages and remediations, which `plan`, `apply` and the PR comment
+/// print. A hostile plugin id reaches `require_auth_plugin`'s message through
+/// the list of authenticators a TCP listener ignores.
+#[test]
+fn policy_findings_cannot_emit_a_workflow_command() {
+    let id = quoted_hostile();
+    let yaml = format!(
+        "id: {id}\nnamespace: ferrum\nbackend_scheme: tcp\nbackend_host: h.internal\nbackend_port: 9000\nlisten_port: 19001\nfrontend_tls: true\n"
+    );
+    let proxy: Proxy = serde_yaml::from_str(&yaml).expect("stream proxy");
+    let yaml = format!("id: {id}\nnamespace: ferrum\nplugin_name: key_auth\nscope: global\n");
+    let plugin: PluginConfig = serde_yaml::from_str(&yaml).expect("key_auth plugin");
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![plugin],
+        ..GatewayConfig::default()
+    };
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: RequireAuthPluginRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&config, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let finding = &findings[0];
+    assert!(finding.message.contains("key_auth ("), "{finding:?}");
+    let remediation = finding.remediation.as_deref().expect("remediation");
+    for (field, value) in [
+        ("kind", finding.kind.as_str()),
+        ("id", finding.id.as_str()),
+        ("namespace", finding.namespace.as_str()),
+        ("message", finding.message.as_str()),
+        ("remediation", remediation),
+    ] {
+        assert_single_line(value, field);
+        assert_no_workflow_command(value, field);
+    }
+    let rendered = format!(
+        "  [{}] {} ({}): {}",
+        finding.rule_id, finding.id, finding.namespace, finding.message
+    );
+    assert_single_line(&rendered, "finding line");
+    assert_no_workflow_command(&rendered, "finding line");
+    assert!(
+        finding.message.contains('\u{fffd}'),
+        "hostile plugin id was recorded verbatim"
+    );
 }
 
 // ---------------------------------------------------------------------------
