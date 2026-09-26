@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::config::schema::{
     is_known_credential_type, unknown_credential_type_message, GatewayConfig, Resource,
 };
-use crate::http_client::BackupSnapshot;
+use crate::http_client::{BackupSnapshot, UnmodeledNestedField};
 use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
@@ -90,6 +90,9 @@ pub(crate) struct ImportInventory {
     pub skipped_trust_bundles: usize,
     pub unsupported_sections: Vec<String>,
     pub sources: Vec<ImportSourceMetadata>,
+    /// Nested fields the typed decode discarded; see
+    /// [`reject_import_unmodeled_nested_fields`].
+    pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -455,6 +458,7 @@ pub(crate) fn split_config_with_inventory(
     passthrough_policy: &ImportPassthroughPolicy,
     allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
+    reject_import_unmodeled_nested_fields(&inventory.unmodeled_nested_fields)?;
     let mut safe_config = config.clone();
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
     reject_import_unknown_credential_types(&safe_config)?;
@@ -729,6 +733,51 @@ fn reject_import_passthrough_fields(
     }
 
     Ok(())
+}
+
+/// Refuse a source whose resources carry fields this build does not model
+/// below the top level, before any import output (including a migration
+/// bundle) is planned or published.
+///
+/// The typed decode has already dropped these values, so writing the tree
+/// would silently truncate the resource. Unlike top-level fields there is no
+/// acknowledgement flag: the repository loader rejects nested unknown fields
+/// even under `FERRUM_ALLOW_UNKNOWN_FIELDS`, so there is no representation to
+/// carry them into. Deliberately opaque islands (plugin `config`, credential
+/// entries) are JSON values and never reach this list.
+fn reject_import_unmodeled_nested_fields(
+    fields: &[UnmodeledNestedField],
+) -> crate::error::Result<()> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let offenders = fields
+        .iter()
+        .map(|field| {
+            (
+                field.kind.as_str(),
+                field.namespace.as_str(),
+                field.id.as_str(),
+                field.path.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut message = String::from(
+        "refusing to import: the source carries nested field(s) this build of gitforgeops does \
+         not model, and writing the resource tree would silently discard them. Upgrade \
+         gitforgeops to a version that models them, or remove them on the gateway and \
+         re-import. Nothing has been written.",
+    );
+    for (kind, namespace, id, path) in offenders {
+        message.push_str(&format!(
+            "\n  {} '{}' (namespace '{}'): {}",
+            diagnostic_metadata(kind),
+            diagnostic_metadata(id),
+            diagnostic_metadata(namespace),
+            diagnostic_metadata(path)
+        ));
+    }
+    Err(crate::error::Error::Config(message))
 }
 
 /// Refuse Consumer `credentials` map keys Ferrum Edge never authenticates,

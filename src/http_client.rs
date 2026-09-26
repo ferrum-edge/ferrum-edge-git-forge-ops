@@ -1311,6 +1311,29 @@ pub struct BackupSnapshot {
     /// [`SealStrictness::Advisory`] this is what the caller warns about, and
     /// `counts` / `resource_counts` are `None`.
     pub seal_violations: Vec<String>,
+    /// Fields inside a modeled nested structure of a resource (for example
+    /// `retry.future_option` on a Proxy) that this build does not model.
+    ///
+    /// Unknown *top-level* resource fields survive in each resource's
+    /// `#[serde(flatten)]` `extra` map; nested ones cannot, so the typed decode
+    /// discards them. They are recorded here instead so import can refuse the
+    /// source rather than publish a silently truncated resource tree. Read-only
+    /// live comparisons ignore this list.
+    pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
+}
+
+/// One unmodeled field found below the top level of a backup resource. Every
+/// member comes from an untrusted document; sanitize before printing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmodeledNestedField {
+    /// `Proxy`, `Consumer`, `Upstream` or `PluginConfig`, or the raw backup
+    /// section name when the path could not be attributed to a resource.
+    pub kind: String,
+    pub namespace: String,
+    pub id: String,
+    /// Resource-relative path in the repository loader's notation, for
+    /// example `.spec.targets[0].future_option`.
+    pub path: String,
 }
 
 impl BackupSnapshot {
@@ -1428,9 +1451,20 @@ impl BackupSnapshot {
             resource_counts = map.remove("resource_counts");
         }
 
-        let config: GatewayConfig = serde_json::from_value(value)
-            .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
+        // `serde_ignored` reports every field the typed mirror skipped. Unknown
+        // top-level sections were removed above and unknown top-level resource
+        // fields land in each resource's flattened `extra` map, so what is
+        // reported here is exactly the nested data the decode would lose.
+        let mut ignored = Vec::new();
+        let config: GatewayConfig = serde_ignored::deserialize(value, |path| {
+            ignored.push(ignored_backup_field(&path));
+        })
+        .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
         crate::config::validate_unique_live_resource_keys(&config)?;
+        let unmodeled_nested_fields = ignored
+            .into_iter()
+            .map(|field| field.attribute(&config))
+            .collect();
         let mut seal_violations = Vec::new();
         counts = canonicalize_count_seal(
             "counts",
@@ -1465,6 +1499,7 @@ impl BackupSnapshot {
             resource_counts,
             unsupported_sections,
             seal_violations,
+            unmodeled_nested_fields,
         })
     }
 
@@ -1485,6 +1520,119 @@ impl BackupSnapshot {
             )));
         }
         Ok(())
+    }
+}
+
+/// A field `serde_ignored` reported while decoding a backup, split into the
+/// resource section, the resource's index in it, and the remaining path.
+struct IgnoredBackupField {
+    section: String,
+    index: Option<usize>,
+    path: String,
+}
+
+enum IgnoredPathSegment {
+    Key(String),
+    Index(usize),
+}
+
+fn ignored_path_segments(path: &serde_ignored::Path<'_>, segments: &mut Vec<IgnoredPathSegment>) {
+    match path {
+        serde_ignored::Path::Root => {}
+        serde_ignored::Path::Seq { parent, index } => {
+            ignored_path_segments(parent, segments);
+            segments.push(IgnoredPathSegment::Index(*index));
+        }
+        serde_ignored::Path::Map { parent, key } => {
+            ignored_path_segments(parent, segments);
+            segments.push(IgnoredPathSegment::Key(key.clone()));
+        }
+        // `Option` / newtype traversal is a decoding detail, not part of the
+        // document's shape.
+        serde_ignored::Path::Some { parent }
+        | serde_ignored::Path::NewtypeStruct { parent }
+        | serde_ignored::Path::NewtypeVariant { parent } => {
+            ignored_path_segments(parent, segments);
+        }
+    }
+}
+
+fn ignored_backup_field(path: &serde_ignored::Path<'_>) -> IgnoredBackupField {
+    let mut segments = Vec::new();
+    ignored_path_segments(path, &mut segments);
+    let mut segments = segments.into_iter().peekable();
+    let section = match segments.next() {
+        Some(IgnoredPathSegment::Key(section)) => section,
+        Some(IgnoredPathSegment::Index(index)) => index.to_string(),
+        None => String::new(),
+    };
+    let index = match segments.peek() {
+        Some(IgnoredPathSegment::Index(index)) => Some(*index),
+        _ => None,
+    };
+    if index.is_some() {
+        segments.next();
+    }
+    let mut rendered = String::from(if index.is_some() { ".spec" } else { "" });
+    for segment in segments {
+        match segment {
+            IgnoredPathSegment::Key(key) => {
+                rendered.push('.');
+                rendered.push_str(&key);
+            }
+            IgnoredPathSegment::Index(index) => {
+                rendered.push('[');
+                rendered.push_str(&index.to_string());
+                rendered.push(']');
+            }
+        }
+    }
+    IgnoredBackupField {
+        section,
+        index,
+        path: rendered,
+    }
+}
+
+impl IgnoredBackupField {
+    /// Name the resource the field belongs to, using the decoded identity.
+    fn attribute(self, config: &GatewayConfig) -> UnmodeledNestedField {
+        let identity = self.index.and_then(|index| match self.section.as_str() {
+            "proxies" => config
+                .proxies
+                .get(index)
+                .map(|resource| ("Proxy", &resource.namespace, &resource.id)),
+            "consumers" => config
+                .consumers
+                .get(index)
+                .map(|resource| ("Consumer", &resource.namespace, &resource.id)),
+            "upstreams" => config
+                .upstreams
+                .get(index)
+                .map(|resource| ("Upstream", &resource.namespace, &resource.id)),
+            "plugin_configs" => config
+                .plugin_configs
+                .get(index)
+                .map(|resource| ("PluginConfig", &resource.namespace, &resource.id)),
+            _ => None,
+        });
+        match identity {
+            Some((kind, namespace, id)) => UnmodeledNestedField {
+                kind: kind.to_string(),
+                namespace: namespace.clone(),
+                id: id.clone(),
+                path: self.path,
+            },
+            None => UnmodeledNestedField {
+                kind: self.section,
+                namespace: String::new(),
+                id: self
+                    .index
+                    .map(|index| format!("[{index}]"))
+                    .unwrap_or_default(),
+                path: self.path,
+            },
+        }
     }
 }
 
