@@ -627,12 +627,8 @@ async fn prepare_apply<'a>(
                     "backup extras (the unmodeled nested field inventory) for namespace `{namespace}` were not supplied alongside its live view; pass both from the same `/backup` snapshot"
                 ))
             })?;
-            let rewritten = incremental_rewrite_keys(
-                &desired_namespace,
-                &diff,
-                ownership_scope,
-                options,
-            );
+            let rewritten =
+                incremental_rewrite_keys(&desired_namespace, &diff, ownership_scope, options);
             if let Some(block) = unmodeled_nested_field_block(
                 &live_extras.unmodeled_nested_fields,
                 &rewritten,

@@ -719,8 +719,14 @@ fn apply_exits_non_zero_when_a_rewritten_row_carries_unmodeled_nested_fields() {
 
     let error = stderr(&output);
     assert_eq!(output.status.code(), Some(1), "{error}");
-    assert!(error.contains("refusing apply for namespace `ferrum`"), "{error}");
-    assert!(error.contains("Proxy 'app' (namespace 'ferrum')"), "{error}");
+    assert!(
+        error.contains("refusing apply for namespace `ferrum`"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Proxy 'app' (namespace 'ferrum')"),
+        "{error}"
+    );
     assert!(error.contains(".spec.retry.future_retry_option"), "{error}");
     for request in repo.requests.lock().unwrap().iter() {
         assert!(request.starts_with("GET "), "{request}");

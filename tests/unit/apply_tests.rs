@@ -4854,9 +4854,21 @@ async fn incremental_apply_blocks_only_the_rows_it_will_rewrite() {
     // (case, shared mode, in the ledger, pending create, refused)
     let cases = [
         ("exclusive, unchanged", false, false, false, false),
-        ("exclusive, unchanged, in the ledger", false, true, false, false),
+        (
+            "exclusive, unchanged, in the ledger",
+            false,
+            true,
+            false,
+            false,
+        ),
         ("shared, unchanged, in the ledger", true, true, false, false),
-        ("exclusive, pending-create assertion", false, true, true, true),
+        (
+            "exclusive, pending-create assertion",
+            false,
+            true,
+            true,
+            true,
+        ),
         ("shared, pending-create assertion", true, true, true, true),
         ("shared, adoption", true, false, false, true),
     ];
