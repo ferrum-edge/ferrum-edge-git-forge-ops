@@ -1862,9 +1862,11 @@ async fn cmd_plan(
         if remap_blocked {
             reportln!(
                 json_mode,
-                "\nThe slot reassignment(s) above block apply. Rotate the affected Consumer slot \
-                 in place before removing the entry, reseed plugin-config slots and retire the \
-                 orphaned slot from the credential bundle, or re-run with \
+                "\nThe slot reassignment(s) above block apply. Rotation replaces and delivers a \
+                 value at its current slot but does not remove the bundle key. Before shrinking or \
+                 shifting a Consumer array, move surviving rotated values to their new canonical \
+                 slots in the private bundle and remove vacated keys, preserving unrelated entries. \
+                 Reseed plugin-config slots and retire orphaned keys from the bundle, or re-run with \
                  --allow-credential-slot-remap to accept the reassignment."
             );
         } else {
