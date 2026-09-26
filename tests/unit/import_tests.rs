@@ -2337,3 +2337,244 @@ fn builtin_plaintext_allowance_writes_and_lists_unbrokered_paths() {
         assert!(!notice.contains("endpoint"), "{notice}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// #363: unknown fields *inside* modeled nested structures used to be dropped
+// by the typed decode, so import succeeded with a truncated resource. They now
+// fail the import, naming the resource and the full field path.
+// ---------------------------------------------------------------------------
+
+fn nested_unknown_backup() -> serde_json::Value {
+    serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "p",
+            "namespace": "ferrum",
+            "backend_host": "example.invalid",
+            "backend_port": 443,
+            "retry": {"max_retries": 2, "future_safety_option": false}
+        }],
+        "upstreams": [{
+            "id": "u",
+            "namespace": "ferrum",
+            "targets": [
+                {"host": "a.example.invalid", "port": 80},
+                {"host": "b.example.invalid", "port": 80, "future_target_option": 7}
+            ],
+            "health_checks": {
+                "active": {"http_path": "/healthz", "future_probe_option": {"deep": true}}
+            }
+        }]
+    })
+}
+
+#[test]
+fn file_import_rejects_nested_unknown_fields_at_every_depth_without_writing() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.json");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("credential-migration.json");
+    std::fs::write(&backup_path, nested_unknown_backup().to_string()).unwrap();
+
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("Proxy 'p' (namespace 'ferrum'): .spec.retry.future_safety_option"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Upstream 'u' (namespace 'ferrum'): .spec.targets[1].future_target_option"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "Upstream 'u' (namespace 'ferrum'): .spec.health_checks.active.future_probe_option"
+        ),
+        "{error}"
+    );
+    assert!(!error.contains("targets[0]"), "{error}");
+    assert!(error.contains("Nothing has been written"), "{error}");
+    assert!(
+        !output.exists(),
+        "a rejected import must not publish an output tree"
+    );
+    assert!(
+        !bundle_path.exists(),
+        "a rejected import must not write a credential bundle"
+    );
+}
+
+#[test]
+fn file_import_rejects_nested_unknown_fields_even_with_the_passthrough_opt_in() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    std::fs::write(
+        &backup_path,
+        serde_yaml::to_string(&nested_unknown_backup()).unwrap(),
+    )
+    .unwrap();
+    let policy = gitforgeops::import::ImportPassthroughPolicy {
+        allow_unknown_fields: true,
+        acknowledged: [
+            "retry".to_string(),
+            "future_safety_option".to_string(),
+            "targets".to_string(),
+            "health_checks".to_string(),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let error =
+        gitforgeops::import::from_file::import_from_file(&backup_path, &output, None, &policy, &[])
+            .unwrap_err()
+            .to_string();
+
+    assert!(
+        error.contains(".spec.retry.future_safety_option"),
+        "{error}"
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn file_import_keeps_opaque_nested_plugin_config_and_modeled_nested_fields() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.json");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let backup = serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "p",
+            "namespace": "ferrum",
+            "backend_host": "example.invalid",
+            "backend_port": 443,
+            "retry": {"max_retries": 2}
+        }],
+        "plugin_configs": [{
+            "id": "otel",
+            "plugin_name": "otel_tracing",
+            "namespace": "ferrum",
+            "scope": "global",
+            "config": {"exporter": {"batch": {"max_queue": 2048, "future_knob": true}}}
+        }]
+    });
+    std::fs::write(&backup_path, backup.to_string()).unwrap();
+
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+
+    let proxy_yaml = std::fs::read_to_string(output.join("ferrum/proxies/p.yaml")).unwrap();
+    assert!(proxy_yaml.contains("max_retries: 2"), "{proxy_yaml}");
+    let plugin_yaml = std::fs::read_to_string(output.join("ferrum/plugins/otel.yaml")).unwrap();
+    assert!(plugin_yaml.contains("future_knob: true"), "{plugin_yaml}");
+}
+
+#[test]
+fn live_backup_reads_record_nested_unknown_fields_without_failing() {
+    let body = nested_unknown_backup().to_string();
+    let snapshot = gitforgeops::http_client::BackupSnapshot::from_body(&body).unwrap();
+
+    assert_eq!(snapshot.config.proxies.len(), 1);
+    assert_eq!(snapshot.config.upstreams.len(), 1);
+    let paths = snapshot
+        .unmodeled_nested_fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{} {}/{} {}",
+                field.kind, field.namespace, field.id, field.path
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        paths,
+        [
+            "Proxy ferrum/p .spec.retry.future_safety_option",
+            "Upstream ferrum/u .spec.health_checks.active.future_probe_option",
+            "Upstream ferrum/u .spec.targets[1].future_target_option",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+    );
+}
+
+#[tokio::test]
+async fn api_import_rejects_nested_unknown_fields_before_writing() {
+    use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
+    use gitforgeops::http_client::AdminClient;
+
+    let body = serde_json::json!({
+        "version": "1",
+        "upstreams": [{
+            "id": "u",
+            "namespace": "ferrum",
+            "targets": [{"host": "a.example.invalid", "port": 80}],
+            "hash_on_cookie_config": {"path": "/", "future_cookie_option": "strict"}
+        }]
+    })
+    .to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let env = EnvConfig {
+        gateway_url: Some(format!("http://{address}")),
+        admin_jwt_secret: Some("test-secret-must-be-at-least-32-chars".to_string()),
+        gateway_mode: GatewayMode::Api,
+        apply_strategy: ApplyStrategy::Incremental,
+        ..EnvConfig::default()
+    };
+    let client = AdminClient::new_scoped(&env, ["ferrum"]).unwrap();
+    let output = tempfile::tempdir().unwrap();
+
+    let error = gitforgeops::import::from_api::import_from_api(
+        &client,
+        output.path(),
+        Some("ferrum"),
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains(
+            "Upstream 'u' (namespace 'ferrum'): .spec.hash_on_cookie_config.future_cookie_option"
+        ),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+}

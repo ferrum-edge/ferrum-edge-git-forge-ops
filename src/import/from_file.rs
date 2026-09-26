@@ -45,6 +45,7 @@ pub fn import_from_file(
             skipped_trust_bundles: snapshot.extras.trust_bundle_count(),
             unsupported_sections: snapshot.unsupported_sections.clone(),
             sources: vec![source],
+            unmodeled_nested_fields: snapshot.unmodeled_nested_fields.clone(),
         },
         credential_bundle_output,
         true,
