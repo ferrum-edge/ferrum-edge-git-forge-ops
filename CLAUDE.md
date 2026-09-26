@@ -91,6 +91,7 @@ gitforgeops rotate --consumer ID --credential KEY \       # Rotate a credential 
 cargo build                                   # Debug
 cargo build --release
 cargo test --test unit_tests                  # Single aggregated test binary
+cargo test --lib                              # Inline #[cfg(test)] modules in src/
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all && cargo fmt --all -- --check
 ```
@@ -100,11 +101,13 @@ cargo fmt --all && cargo fmt --all -- --check
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test --test unit_tests`
+4. `cargo test --lib`
 
 `.github/workflows/rust-ci.yml` reports its required status on every PR and
-runs those same three commands when the PR touches current **or previous**
-Rust/build/workspace input paths (`src`, `tests`, benches/examples, `build.rs`,
-`.cargo`, Cargo manifests/lockfiles, toolchain/lint config, or Dockerfile), or
+runs those same four commands (coverage measures both test targets) when the
+PR touches current **or previous** Rust/build/workspace input paths (`src`,
+`tests`, benches/examples, `build.rs`, `.cargo`, Cargo manifests/lockfiles,
+toolchain/lint config, or Dockerfile), or
 a non-Rust file the unit suite reads or the binary embeds (`docs/quickstart.md`,
 `.gitforgeops/*.example.yaml`, `.github/scripts/audit_settings.py`). Unit tests
 never read the customer-owned `resources/` tree; shipped-example checks use the
@@ -823,9 +826,18 @@ public identity leaves reject broker syntax even when seeded.
 including indexed entries. Both the CLI and `rotate_and_deliver` enforce it.
 The command has no PluginConfig/Upstream publication path: reserved slots cannot
 be rotated even when those resources share a Consumer id. Plugin allocation via
-apply remains supported. Target placeholder, generation, namespace/ownership,
+apply remains supported. Rotation `PUT`s the whole desired Consumer, so
+`diff::consumer_security_blockers` audits that unresolved row with apply's
+literal-credential gate before the bundle read, state lock, secret write or
+gateway call, and the publisher re-audits it. A literal secret sibling is
+refused with no override (identities stay exempt): rotation has no reviewed
+revision to bind one to. Target placeholder, generation, namespace/ownership,
 sibling resolution and gateway-client construction all precede secret writes;
-publication reuses the preflight's desired Consumer snapshot. Externally issued
+publication reuses the preflight's desired Consumer snapshot. Sibling
+resolution, the publisher and `export --materialize` decide what is still
+unresolved from `ResolveReport::unresolved` (the report of the resolve that
+consumed the bundle), never by re-scanning resolved bytes, so a seeded value
+that resembles a placeholder is published byte-for-byte. Externally issued
 secrets must be reissued, reseeded into the bundle and applied. A value destroyed
 by an older rotation cannot be recovered from GitHub's write-only secret API.
 
@@ -882,7 +894,10 @@ document before the state lock, the bundle read, and any gateway call, health
 preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
 label + revision-bound review + current repo permission and input verification),
-resolved once and shared by both gates.
+resolved once and shared by both gates. `rotate` runs the same audit on the
+Consumer row it publishes, and `export --materialize` on the whole document
+before the bundle read; neither has an override, and an `apply` override does
+not carry over to them. A number or boolean at a secret leaf is a literal too.
 
 #### Secrets outside `Consumer.credentials`
 
@@ -1141,7 +1156,7 @@ submission is required. Forks do not inherit repository settings automatically.
 
 1. `cargo fmt --all` clean
 2. `cargo clippy --all-targets -- -D warnings` clean
-3. `cargo test --test unit_tests` passes
+3. `cargo test --test unit_tests` and `cargo test --lib` pass
 4. Agent/rule changes → `python3 .github/scripts/check_agent_setup.py` and
    `python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'`
 5. No `.unwrap()` / `.expect()` in prod code
