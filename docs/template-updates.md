@@ -192,8 +192,9 @@ Omit it and the ref recorded in your baseline (`main` by default) is used.
 `HEAD` and the other `*HEAD` pseudo-refs (`FETCH_HEAD`, `ORIG_HEAD`,
 `origin/HEAD`, ...) are refused, whether given with `--to` or recorded in the
 baseline: they name whatever a copy last pointed at, not a revision. A bare
-`origin` is refused for the same reason, since Git reads it as `origin/HEAD`;
-a branch that really is named `origin` is `refs/heads/origin`.
+`origin` is refused for the same reason, since Git reads it as `origin/HEAD`.
+The check ignores case, and a branch or tag that really is named `origin` is
+`refs/heads/origin` or `refs/tags/origin`.
 Branch names resolve the same way whether `--upstream` (or the baseline's
 `upstream`) is a URL — the HTTPS default included — or a local clone, so the
 default `main` needs no `origin/` prefix. The tool fetches into a temporary
