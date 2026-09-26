@@ -3391,6 +3391,7 @@ mod prepared_apply_tests {
             &desired,
             &client,
             &namespaces,
+            OwnershipScope::Exclusive,
             Some(&actuals),
             Some(&extras),
             &options,
