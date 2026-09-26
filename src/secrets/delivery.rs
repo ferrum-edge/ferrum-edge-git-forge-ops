@@ -59,12 +59,22 @@ pub fn encrypt_for_ssh_recipient(
 /// snapshot holds only public key material.
 #[derive(Debug, Clone)]
 pub struct DeliveryRecipient {
-    pub login: String,
-    pub key_fingerprint: String,
+    login: String,
+    key_fingerprint: String,
     recipient: Recipient,
 }
 
 impl DeliveryRecipient {
+    /// The GitHub login whose published key this snapshot holds.
+    pub fn login(&self) -> &str {
+        &self.login
+    }
+
+    /// SHA-256 fingerprint of the discovered key, or `"unknown"`.
+    pub fn key_fingerprint(&self) -> &str {
+        &self.key_fingerprint
+    }
+
     /// Age-encrypt `value` to this recipient's discovered key. No network I/O.
     pub fn encrypt(&self, value: &[u8]) -> crate::error::Result<DeliveryResult> {
         Ok(DeliveryResult {
@@ -92,11 +102,20 @@ pub async fn discover_recipient(
 /// Production callers use [`discover_recipient`], which pins
 /// [`crate::secrets::DEFAULT_GITHUB_API_BASE`]. Tests inject an in-process
 /// loopback origin.
+///
+/// Refuses a `login` that is not a GitHub login (see
+/// [`is_valid_github_login`]) before any request, since it is interpolated
+/// into the key endpoint path.
 pub async fn discover_recipient_at(
     client: &Client,
     api_base: &str,
     login: &str,
 ) -> crate::error::Result<Option<DeliveryRecipient>> {
+    if !is_valid_github_login(login) {
+        return Err(crate::error::Error::Config(format!(
+            "Refusing SSH key discovery: recipient {login:?} is not a valid GitHub login"
+        )));
+    }
     let url = format!("{}/users/{login}/keys", api_base.trim_end_matches('/'));
     let Some((recipient, fingerprint)) = fetch_ssh_recipient(client, &url).await? else {
         return Ok(None);
@@ -106,6 +125,22 @@ pub async fn discover_recipient_at(
         key_fingerprint: fingerprint,
         recipient,
     }))
+}
+
+/// Whether `login` is a GitHub user or app bot login.
+///
+/// Same rule as `LOGIN_RE` in `.github/scripts/merge_context.py`: an ASCII
+/// alphanumeric first character followed by at most 38 alphanumerics or
+/// hyphens, or by at most 33 of them and a `[bot]` suffix.
+pub fn is_valid_github_login(login: &str) -> bool {
+    let Some(rest) = login.strip_prefix(|c: char| c.is_ascii_alphanumeric()) else {
+        return false;
+    };
+    let (body, max) = match rest.strip_suffix("[bot]") {
+        Some(body) => (body, 33),
+        None => (rest, 38),
+    };
+    body.len() <= max && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// Fetch the PR author's SSH public keys from GitHub and age-encrypt `value`
