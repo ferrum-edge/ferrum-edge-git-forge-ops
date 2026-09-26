@@ -904,7 +904,10 @@ fn allocation_binding_requires_both_values_on_both_sides() {
     let no_recipient = AllocationBinding::new(Some("trigger-sha"), None);
     assert!(!no_recipient.recorded(&entry(Some("trigger-sha"), None)));
     let blank_recipient = AllocationBinding::new(Some("trigger-sha"), Some("  "));
-    assert_eq!(blank_recipient, no_recipient, "new() normalizes a blank value");
+    assert_eq!(
+        blank_recipient, no_recipient,
+        "new() normalizes a blank value"
+    );
     let unbound = AllocationBinding::default();
     assert!(!unbound.recorded(&entry(None, None)));
 }
@@ -945,7 +948,9 @@ fn allocation_binding_refuses_a_set_but_blank_or_malformed_recipient() {
         let error = AllocationBinding::resolve(Some("trigger-sha"), Some(blank), head)
             .expect_err("a blank recipient is not an unset one");
         assert!(
-            error.to_string().contains("GITFORGEOPS_ACTOR is set but blank"),
+            error
+                .to_string()
+                .contains("GITFORGEOPS_ACTOR is set but blank"),
             "{blank:?}: {error}"
         );
     }
