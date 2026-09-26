@@ -51,30 +51,81 @@ pub fn encrypt_for_ssh_recipient(
         .map_err(|e| crate::error::Error::HttpClient(format!("age output was not UTF-8: {e}")))
 }
 
-/// Fetch the PR author's SSH public keys from GitHub and age-encrypt `value`
-/// to the first compatible key.
+/// A recipient's first age-compatible SSH public key, discovered once.
+///
+/// Discovery is an unauthenticated GitHub request walk, so a batch that
+/// delivers several credentials to one recipient resolves this snapshot once
+/// and encrypts each value locally with [`DeliveryRecipient::encrypt`]. The
+/// snapshot holds only public key material.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecipient {
+    pub login: String,
+    pub key_fingerprint: String,
+    recipient: Recipient,
+}
+
+impl DeliveryRecipient {
+    /// Age-encrypt `value` to this recipient's discovered key. No network I/O.
+    pub fn encrypt(&self, value: &[u8]) -> crate::error::Result<DeliveryResult> {
+        Ok(DeliveryResult {
+            login: self.login.clone(),
+            key_fingerprint: self.key_fingerprint.clone(),
+            encrypted_b64: encrypt_for_ssh_recipient(&self.recipient, value)?,
+        })
+    }
+}
+
+/// Discover `login`'s first compatible SSH public key from GitHub.
 ///
 /// Returns `Ok(None)` only after all public-key pages were searched without a
 /// usable recipient. Callers refuse credential publication when delivery is
 /// required; incomplete discovery returns an error instead of "no usable keys".
+pub async fn discover_recipient(
+    client: &Client,
+    login: &str,
+) -> crate::error::Result<Option<DeliveryRecipient>> {
+    discover_recipient_at(client, crate::secrets::DEFAULT_GITHUB_API_BASE, login).await
+}
+
+/// [`discover_recipient`] against an explicit GitHub API origin.
+///
+/// Production callers use [`discover_recipient`], which pins
+/// [`crate::secrets::DEFAULT_GITHUB_API_BASE`]. Tests inject an in-process
+/// loopback origin.
+pub async fn discover_recipient_at(
+    client: &Client,
+    api_base: &str,
+    login: &str,
+) -> crate::error::Result<Option<DeliveryRecipient>> {
+    let url = format!("{}/users/{login}/keys", api_base.trim_end_matches('/'));
+    let Some((recipient, fingerprint)) = fetch_ssh_recipient(client, &url).await? else {
+        return Ok(None);
+    };
+    Ok(Some(DeliveryRecipient {
+        login: login.to_string(),
+        key_fingerprint: fingerprint,
+        recipient,
+    }))
+}
+
+/// Fetch the PR author's SSH public keys from GitHub and age-encrypt `value`
+/// to the first compatible key.
+///
+/// For a single value only. Callers delivering several values to one
+/// recipient use [`discover_recipient`] once and [`DeliveryRecipient::encrypt`]
+/// per value. `Ok(None)` has the same meaning as for [`discover_recipient`].
 pub async fn deliver_to_author(
     client: &Client,
     login: &str,
     value: &[u8],
 ) -> crate::error::Result<Option<DeliveryResult>> {
-    let url = format!("https://api.github.com/users/{login}/keys");
-    let Some((recipient, fingerprint)) = fetch_ssh_recipient(client, &url).await? else {
-        return Ok(None);
-    };
-    let encoded = encrypt_for_ssh_recipient(&recipient, value)?;
-    Ok(Some(DeliveryResult {
-        login: login.to_string(),
-        key_fingerprint: fingerprint,
-        encrypted_b64: encoded,
-    }))
+    match discover_recipient(client, login).await? {
+        Some(recipient) => recipient.encrypt(value).map(Some),
+        None => Ok(None),
+    }
 }
 
-/// Maximum key-discovery requests per delivery attempt.
+/// Maximum key-discovery requests per recipient discovery.
 pub const MAX_SSH_KEY_PAGES: usize = 20;
 
 /// Discover the first age-compatible public recipient from a GitHub-style key

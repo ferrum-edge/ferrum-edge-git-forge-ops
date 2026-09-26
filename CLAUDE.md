@@ -981,6 +981,9 @@ journal. An unmatched entry is still refused as a revived slot, with a hint.
 Delivery: after allocation or rotation, the value is age-encrypted to the PR
 author's (or dispatcher's) SSH public key fetched from
 `GET /users/{login}/keys`, then posted as a PR comment or workflow output.
+The allocator discovers that key once per batch (`discover_recipient_at`) and
+encrypts every slot locally with `DeliveryRecipient::encrypt`; discovery is
+unauthenticated and rate-limited, so never call it per slot.
 Author decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 ### Downstream template updates

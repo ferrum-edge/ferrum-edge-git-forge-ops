@@ -998,3 +998,185 @@ async fn a_partially_committed_allocation_is_journaled_and_its_retry_resumes() {
         .to_string();
     assert!(err.contains(&format!("'{alpha}'")), "{err}");
 }
+
+// --- Recipient key discovery once per batch (#365) ---------------------------
+
+const RECIPIENT: &str = "alice";
+
+fn keys_path() -> String {
+    format!("GET /users/{RECIPIENT}/keys")
+}
+
+/// A deterministic Ed25519 recipient: its OpenSSH public key for the key
+/// endpoint, and the matching age identity to decrypt deliveries.
+fn recipient_keypair() -> (String, age::ssh::Identity) {
+    let keypair = ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]);
+    let public = ssh_key::PublicKey::from(keypair.public)
+        .to_openssh()
+        .expect("encode public key");
+    let private = ssh_key::PrivateKey::from(keypair)
+        .to_openssh(ssh_key::LineEnding::LF)
+        .expect("encode private key");
+    let identity =
+        age::ssh::Identity::from_buffer(private.as_bytes(), None).expect("parse identity");
+    (public, identity)
+}
+
+fn decrypt_delivery(armored: &str, identity: &age::ssh::Identity) -> String {
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(armored.as_bytes()))
+        .expect("age header");
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .expect("decrypt delivery");
+    let mut plaintext = String::new();
+    reader
+        .read_to_string(&mut plaintext)
+        .expect("read plaintext");
+    plaintext
+}
+
+fn many_slot_report(count: usize) -> ResolveReport {
+    let mut report = ResolveReport::default();
+    for index in 0..count {
+        let consumer = format!("app-{index}");
+        report.results.push(ResolveResult {
+            consumer_id: consumer.clone(),
+            namespace: "ferrum".into(),
+            cred_key: "keyauth/key".into(),
+            slot: slot_path("ferrum", &consumer, "keyauth/key"),
+            placeholder: parse_placeholder(GENERATE).unwrap().unwrap(),
+            status: SlotStatus::NeedsAllocation,
+        });
+    }
+    report
+}
+
+fn count_requests(requests: &Arc<Mutex<Vec<String>>>, prefix: &str) -> usize {
+    requests
+        .lock()
+        .expect("recorded")
+        .iter()
+        .filter(|request| request.starts_with(prefix))
+        .count()
+}
+
+/// #365: every slot in a batch goes to the same recipient, so the batch walks
+/// the recipient's key pages once and encrypts each value locally. Each slot
+/// still gets its own ciphertext, decryptable to its own value.
+#[tokio::test]
+async fn a_batch_discovers_the_recipient_key_once_for_every_slot() {
+    const SLOTS: usize = 8;
+    let (public_key, identity) = recipient_keypair();
+    let keys_body = serde_json::json!([{"key": public_key}]).to_string();
+    let mut routes = vec![(keys_path(), 200, keys_body)];
+    routes.extend(success_routes(204));
+    let (api_base, requests) = spawn_github_stub(routes);
+    let report = many_slot_report(SLOTS);
+    let mut shards = BTreeMap::new();
+    let mut shard_count = 1;
+    let outcome = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        Some(RECIPIENT),
+        &report,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect("allocate against stub");
+
+    assert_eq!(outcome.allocated.len(), SLOTS);
+    assert_eq!(
+        count_requests(&requests, &keys_path()),
+        1,
+        "one key discovery serves the whole batch"
+    );
+    let discovery = requests
+        .lock()
+        .expect("recorded")
+        .iter()
+        .find(|request| request.starts_with(&keys_path()))
+        .cloned()
+        .expect("discovery request");
+    assert_eq!(
+        header_value(&discovery, "Authorization"),
+        None,
+        "the provisioner token must not reach public key discovery"
+    );
+
+    let mut ciphertexts = std::collections::BTreeSet::new();
+    for slot in &outcome.allocated {
+        let delivered = slot.delivered.as_ref().expect("every slot is delivered");
+        assert_eq!(delivered.login, RECIPIENT);
+        assert!(delivered.key_fingerprint.starts_with("SHA256:"));
+        assert!(!delivered.encrypted_b64.contains(&slot.value));
+        assert!(
+            decrypt_delivery(&delivered.encrypted_b64, &identity) == slot.value,
+            "slot {} must decrypt to its own value",
+            slot.slot
+        );
+        ciphertexts.insert(delivered.encrypted_b64.clone());
+    }
+    assert_eq!(ciphertexts.len(), SLOTS, "each slot has its own ciphertext");
+    let fingerprints: std::collections::BTreeSet<_> = outcome
+        .allocated
+        .iter()
+        .filter_map(|slot| slot.delivered.as_ref())
+        .map(|delivered| delivered.key_fingerprint.clone())
+        .collect();
+    assert_eq!(fingerprints.len(), 1, "one key snapshot for the batch");
+}
+
+/// #365: a failed or empty discovery refuses the whole batch after one
+/// discovery walk, before the Environment Secret key is fetched or any shard
+/// is written.
+#[tokio::test]
+async fn a_failed_batch_discovery_writes_nothing() {
+    let not_found = "{\"message\":\"Not Found\"}".to_string();
+    for (status, body, needle) in [
+        (200, "[]".to_string(), "no compatible SSH public key"),
+        (
+            200,
+            "[{\"key\":\"unsupported-public-key\"}]".to_string(),
+            "no compatible SSH public key",
+        ),
+        (404, not_found, "Not Found"),
+    ] {
+        let mut routes = vec![(keys_path(), status, body)];
+        routes.extend(success_routes(204));
+        let (api_base, requests) = spawn_github_stub(routes);
+        let report = many_slot_report(4);
+        let mut shards = BTreeMap::new();
+        let mut shard_count = 1;
+        let failure = allocate_and_deliver_at(
+            &test_client(),
+            &api_base,
+            REPO,
+            ENVIRONMENT,
+            TOKEN,
+            Some(RECIPIENT),
+            &report,
+            &mut shards,
+            &mut shard_count,
+        )
+        .await
+        .expect_err("no recipient key means no allocation");
+        assert!(
+            failure.source.to_string().contains(needle),
+            "{}",
+            failure.source
+        );
+        assert!(failure.partial.allocated.is_empty());
+        assert!(shards.is_empty());
+        assert_eq!(shard_count, 1);
+        assert_eq!(count_requests(&requests, &keys_path()), 1);
+        assert_eq!(
+            requests.lock().expect("recorded").len(),
+            1,
+            "discovery is the only request of a refused batch"
+        );
+    }
+}
