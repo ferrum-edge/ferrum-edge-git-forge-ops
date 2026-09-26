@@ -614,16 +614,28 @@ class UrlUpstreamTests(unittest.TestCase):
             json.loads(self.fixture.read(".gitforgeops/baseline.json"))["ref"], "origin"
         )
 
-    def test_a_branch_really_named_origin_resolves_by_its_full_name(self):
+    def test_a_branch_or_tag_really_named_origin_resolves_by_its_full_name(self):
         named = self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
         git(self.fixture.upstream, "branch", "origin")
+        git(self.fixture.upstream, "tag", "origin")
         self.fixture.upstream_change({"src/main.rs": "// v3\n"}, "v3")
-        result = self.fixture.run("status", "--to", "refs/heads/origin", upstream=self.url)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"target:   {named}", result.stdout)
+        for ref in ("refs/heads/origin", "refs/tags/origin"):
+            with self.subTest(ref=ref):
+                result = self.fixture.run("status", "--to", ref, upstream=self.url)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"target:   {named}", result.stdout)
         for ref in ("origin/main", "origins", "release/origin"):
             with self.subTest(ref=ref):
                 self.assertEqual(template_update.validate_target_ref(ref, "target ref"), ref)
+
+    def test_the_bare_remote_hint_names_both_spellings(self):
+        result = self.fixture.run("plan", "--to", "origin", upstream=self.url)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            "a branch or tag that is really named origin is "
+            "refs/heads/origin or refs/tags/origin",
+            result.stderr,
+        )
 
     def test_branch_names_that_merely_end_in_head_are_accepted(self):
         for ref in ("ahead", "release/overhead", "HEADS", "v1-HEAD"):
@@ -823,6 +835,23 @@ class AbandonedTemporaryTests(unittest.TestCase):
         result = self.fixture.run("apply")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"removed .github/scripts/{self.NAME}", result.stderr)
+        self.assertFalse(os.path.lexists(temporary))
+
+    def test_a_temporary_a_concurrent_sweep_already_removed_is_skipped(self):
+        # Two writes can sweep the same stale temporary at once. The one that
+        # loses the race finds the entry already unlinked and must skip it
+        # rather than abort the run with a missing-file error.
+        temporary = self._leave(f".github/scripts/{self.NAME}")
+        real_unlink = os.unlink
+
+        def vanish(name, *, dir_fd=None):
+            real_unlink(name, dir_fd=dir_fd)
+            raise FileNotFoundError(2, "No such file or directory", str(name))
+
+        with mock.patch("os.unlink", side_effect=vanish):
+            template_update._remove_stale_temporaries(
+                self.fixture.customer, remove=True
+            )
         self.assertFalse(os.path.lexists(temporary))
 
     def test_detect_baseline_write_removes_an_old_one(self):
@@ -1130,6 +1159,24 @@ class ConfinementTests(unittest.TestCase):
         self.assert_refused(self.fixture.run("apply"), "src/apply is a symbolic link")
         self.assertEqual((real / "api_target.rs").read_text(encoding="utf-8"), original)
         self.assertEqual(sorted(path.name for path in real.iterdir()), ["api_target.rs"])
+
+    def test_a_linked_top_level_directory_holding_a_stale_temporary_is_refused(self):
+        # The sweep opens `.github` and `.gitforgeops` directly for the
+        # temporaries beside their managed files. A link there must be refused
+        # rather than followed, so nothing outside the repository is swept.
+        real = self.outside / "github"
+        real.mkdir()
+        (real / "dependabot.yml").write_text("version: 2\n", encoding="utf-8")
+        temporary = real / ".dependabot.yml.template-update-0123456789abcdef"
+        temporary.write_text("incomplete\n", encoding="utf-8")
+        then = temporary.stat().st_mtime - 3600
+        os.utime(temporary, (then, then))
+        shutil.rmtree(self.fixture.customer / ".github")
+        (self.fixture.customer / ".github").symlink_to(real, target_is_directory=True)
+        self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+
+        self.assert_refused(self.fixture.run("apply"), ".github is a symbolic link")
+        self.assertEqual(temporary.read_text(encoding="utf-8"), "incomplete\n")
 
     def test_a_dangling_link_at_an_added_path_is_refused(self):
         created = self.outside / "created-by-update.rs"
