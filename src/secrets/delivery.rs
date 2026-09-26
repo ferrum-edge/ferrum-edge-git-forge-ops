@@ -111,11 +111,7 @@ pub async fn discover_recipient_at(
     api_base: &str,
     login: &str,
 ) -> crate::error::Result<Option<DeliveryRecipient>> {
-    if !is_valid_github_login(login) {
-        return Err(crate::error::Error::Config(format!(
-            "Refusing SSH key discovery: recipient {login:?} is not a valid GitHub login"
-        )));
-    }
+    check_recipient_login(login)?;
     let url = format!("{}/users/{login}/keys", api_base.trim_end_matches('/'));
     let Some((recipient, fingerprint)) = fetch_ssh_recipient(client, &url).await? else {
         return Ok(None);
@@ -125,6 +121,20 @@ pub async fn discover_recipient_at(
         key_fingerprint: fingerprint,
         recipient,
     }))
+}
+
+/// Refuse a credential recipient that is not a GitHub login (see
+/// [`is_valid_github_login`]).
+///
+/// Key discovery checks this itself, but commands that take a recipient call
+/// it first, before any state lock, bundle read or request.
+pub fn check_recipient_login(login: &str) -> crate::error::Result<()> {
+    if is_valid_github_login(login) {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "Refusing credential recipient {login:?}: not a valid GitHub login"
+    )))
 }
 
 /// Whether `login` is a GitHub user or app bot login.

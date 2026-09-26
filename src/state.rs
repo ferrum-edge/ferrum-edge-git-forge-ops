@@ -35,6 +35,10 @@ pub struct CredentialMetadata {
 /// Set by the apply workflow to the commit that triggered the run.
 pub const ALLOCATION_REVISION_ENV: &str = "GITFORGEOPS_ALLOCATION_REVISION";
 
+/// Set by the apply workflow to the merged PR's author: the GitHub login that
+/// generated credentials are delivered to. Unset means no recipient.
+pub const RECIPIENT_ENV: &str = "GITFORGEOPS_ACTOR";
+
 /// The apply a recorded credential allocation belongs to.
 ///
 /// A recorded allocation newer than the last clean apply exempts its slot from
@@ -49,7 +53,11 @@ pub const ALLOCATION_REVISION_ENV: &str = "GITFORGEOPS_ALLOCATION_REVISION";
 /// refreshed protected branch, and a failed attempt pushes a state commit
 /// there before its retry starts. Without the variable (a local CLI run), it
 /// is the checked-out commit, so a retry from the same checkout matches and one
-/// after pulling new commits does not. Blank values count as unset.
+/// after pulling new commits does not. A blank revision counts as unset.
+///
+/// The recipient is [`RECIPIENT_ENV`]. Only an unset variable means "no
+/// recipient"; a set one must be a GitHub login (see
+/// [`AllocationBinding::resolve`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AllocationBinding {
     pub revision: Option<String>,
@@ -57,6 +65,9 @@ pub struct AllocationBinding {
 }
 
 impl AllocationBinding {
+    /// A binding from already-trusted values; blank values become `None`.
+    /// Environment input goes through [`AllocationBinding::resolve`], which
+    /// refuses a blank or malformed recipient instead.
     pub fn new(revision: Option<&str>, recipient: Option<&str>) -> Self {
         Self {
             revision: non_blank(revision),
@@ -65,11 +76,21 @@ impl AllocationBinding {
     }
 
     /// Resolve this process's binding from [`ALLOCATION_REVISION_ENV`] (or the
-    /// checked-out commit) and `GITFORGEOPS_ACTOR`. Call once per command and
-    /// pass the result to every consumer, so the ledger and the journal agree.
-    pub fn from_env() -> Self {
+    /// checked-out commit) and [`RECIPIENT_ENV`]. Call once per command, before
+    /// any request or write, and pass the result to every consumer, so the
+    /// ledger and the journal agree.
+    pub fn from_env() -> crate::error::Result<Self> {
         let configured = std::env::var(ALLOCATION_REVISION_ENV).ok();
-        let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
+        let recipient = match std::env::var(RECIPIENT_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(crate::error::Error::Config(format!(
+                    "{RECIPIENT_ENV} is not valid UTF-8; set it to the credential recipient's \
+                     GitHub login, or unset it to allocate without delivery"
+                )));
+            }
+        };
         Self::resolve(
             configured.as_deref(),
             recipient.as_deref(),
@@ -79,13 +100,30 @@ impl AllocationBinding {
 
     /// [`AllocationBinding::from_env`] with its inputs made explicit.
     /// `checkout_head` is consulted only when no revision is configured.
+    ///
+    /// A `recipient` of `None` is the only "no recipient". A set recipient is
+    /// trimmed and must then be a GitHub login. A blank one is refused, not
+    /// read as unset: it is what a mistyped workflow output expression
+    /// evaluates to, and reading it as unset would let `apply` allocate and
+    /// publish credentials that nobody receives.
     pub fn resolve(
         configured_revision: Option<&str>,
         recipient: Option<&str>,
         checkout_head: impl FnOnce() -> Option<String>,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
+        let recipient = recipient.map(str::trim);
+        match recipient {
+            Some("") => {
+                return Err(crate::error::Error::Config(format!(
+                    "{RECIPIENT_ENV} is set but blank; set it to the credential recipient's \
+                     GitHub login, or unset it to allocate without delivery"
+                )));
+            }
+            Some(login) => crate::secrets::check_recipient_login(login)?,
+            None => {}
+        }
         let revision = non_blank(configured_revision).or_else(checkout_head);
-        Self::new(revision.as_deref(), recipient)
+        Ok(Self::new(revision.as_deref(), recipient))
     }
 
     /// Whether `metadata` records an allocation made by this apply.
