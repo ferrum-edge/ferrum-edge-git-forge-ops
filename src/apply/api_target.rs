@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream};
+use crate::config::schema::{
+    Consumer, GatewayConfig, PassthroughFields, PluginConfig, PluginScope, Proxy, Upstream,
+};
 use crate::config::ApplyStrategy;
 use crate::diagnostics::{safe, safe_line};
 use crate::diff::resource_diff::{
@@ -338,6 +340,10 @@ struct PreparedFullReplace {
     spec_snapshot: BTreeMap<String, serde_json::Value>,
 }
 
+/// Namespaces an apply will refuse to write, keyed to the refusal it will
+/// report. See [`preflight_api_apply`].
+pub type BlockedNamespaces = BTreeMap<String, String>;
+
 /// Run every deterministic and remote write-capability preflight without
 /// mutating the gateway.
 ///
@@ -345,6 +351,12 @@ struct PreparedFullReplace {
 /// immediately before writes so a library caller cannot bypass the boundary
 /// and a plane that became read-only while credentials were delivered still
 /// fails before the first gateway mutation.
+///
+/// Returns the namespaces the apply will skip with a per-namespace error (a
+/// repository/API-spec conflict, or a write that would drop fields this build
+/// does not model). They are not a run-wide failure, so the caller gets them
+/// back instead of an `Err`, and must not allocate credentials, deliver them,
+/// or journal creates for those namespaces: nothing there would be written.
 pub async fn preflight_api_apply(
     desired: &GatewayConfig,
     client: &AdminClient,
@@ -353,8 +365,8 @@ pub async fn preflight_api_apply(
     actual_by_namespace: Option<&BTreeMap<String, GatewayConfig>>,
     extras_by_namespace: Option<&BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
-) -> crate::error::Result<()> {
-    let _prepared = prepare_apply(
+) -> crate::error::Result<BlockedNamespaces> {
+    let blocked = apply_blocked_namespaces(
         desired,
         client,
         namespaces,
@@ -364,7 +376,37 @@ pub async fn preflight_api_apply(
         options,
     )
     .await?;
-    preflight_writes(client).await
+    preflight_writes(client).await?;
+    Ok(blocked)
+}
+
+/// The per-namespace refusals an apply with these inputs would report, without
+/// the write-capability probe or any mutation.
+///
+/// This is the same preparation [`apply_api`] runs, so an interactive preview
+/// can show the refusal the apply would make. Deterministic run-wide errors
+/// (an unsupported restore section, an unprovable spec graph, a cached view)
+/// are returned as `Err`, exactly as the apply would return them.
+pub async fn apply_blocked_namespaces(
+    desired: &GatewayConfig,
+    client: &AdminClient,
+    namespaces: &[String],
+    ownership_scope: OwnershipScope<'_>,
+    actual_by_namespace: Option<&BTreeMap<String, GatewayConfig>>,
+    extras_by_namespace: Option<&BTreeMap<String, BackupExtras>>,
+    options: &ApplyOptions,
+) -> crate::error::Result<BlockedNamespaces> {
+    let prepared = prepare_apply(
+        desired,
+        client,
+        namespaces,
+        ownership_scope,
+        actual_by_namespace,
+        extras_by_namespace,
+        options,
+    )
+    .await?;
+    Ok(prepared.blocked)
 }
 
 pub async fn apply_api(
@@ -604,12 +646,16 @@ async fn prepare_apply<'a>(
             let full_replace =
                 prepare_full_replace(&desired_namespace, actual, live_extras, namespace, options)?;
             // The restore body re-creates every row it carries, including the
-            // live spec-owned rows `preserve_spec_owned_graph` copied in.
+            // live spec-owned rows `preserve_spec_owned_graph` copied in. Those
+            // are copied verbatim, `extra` included, so only the repository's
+            // rows can lose a live-only top-level field.
             let rewritten: BTreeSet<String> = row_identities(&full_replace.config)
                 .map(|(kind, namespace, id)| state_key(namespace, kind, id))
                 .collect();
-            if let Some(block) = unmodeled_nested_field_block(
+            let top_level = undeclared_live_top_level_fields(&desired_namespace, actual);
+            if let Some(block) = unmodeled_field_block(
                 &live_extras.unmodeled_nested_fields,
+                &top_level,
                 &rewritten,
                 namespace,
             ) {
@@ -627,10 +673,17 @@ async fn prepare_apply<'a>(
                     "backup extras (the unmodeled nested field inventory) for namespace `{namespace}` were not supplied alongside its live view; pass both from the same `/backup` snapshot"
                 ))
             })?;
-            let rewritten =
-                incremental_rewrite_keys(&desired_namespace, &diff, ownership_scope, options);
-            if let Some(block) = unmodeled_nested_field_block(
+            let rewritten = incremental_rewrite_keys(
+                &desired_namespace,
+                actual,
+                &diff,
+                ownership_scope,
+                options,
+            )?;
+            let top_level = undeclared_live_top_level_fields(&desired_namespace, actual);
+            if let Some(block) = unmodeled_field_block(
                 &live_extras.unmodeled_nested_fields,
+                &top_level,
                 &rewritten,
                 namespace,
             ) {
@@ -699,58 +752,141 @@ fn row_identities(config: &GatewayConfig) -> impl Iterator<Item = (&'static str,
 ///
 /// Mirrors the writes `apply_incremental` issues against rows that already
 /// exist: every Modify, every pending-create ownership assertion, and in
-/// shared mode every declared row not yet in the ledger (the adoption
-/// candidates, claimed with an idempotent PUT). A declared row that is
-/// unchanged and needs no claim — including every such row in exclusive mode,
-/// where adoption writes nothing — is left out, so a defaulted field a newer
-/// gateway starts serializing does not wedge every apply that merely declares
-/// it. Only declared keys are added, and only live rows carry unmodeled
-/// fields, so a key naming a row that is not live never matches one.
+/// shared mode every row [`adoption_candidates`] selects (claimed with an
+/// idempotent PUT). Adoption is computed by the same function the apply uses,
+/// so a declared row outside the ledger whose live copy differs from the
+/// declaration — which is never adopted and so never written — does not
+/// count. A declared row that is unchanged and needs no claim — including
+/// every such row in exclusive mode, where adoption writes nothing — is left
+/// out, so a defaulted field a newer gateway starts serializing does not wedge
+/// every apply that merely declares it. Only declared keys are added, and only
+/// live rows carry unmodeled fields, so a key naming a row that is not live
+/// never matches one.
 fn incremental_rewrite_keys(
     desired: &GatewayConfig,
+    actual: &GatewayConfig,
     diff: &DiffResult,
     ownership_scope: OwnershipScope<'_>,
     options: &ApplyOptions,
-) -> BTreeSet<String> {
-    let shared = matches!(ownership_scope, OwnershipScope::Shared { .. });
-    let modified = diff
+) -> crate::error::Result<BTreeSet<String>> {
+    let mut rewritten: BTreeSet<String> = diff
         .diffs
         .iter()
         .filter(|d| d.action == DiffAction::Modify)
-        .map(|d| state_key(&d.namespace, &d.kind, &d.id));
-    let claimed = row_identities(desired)
-        .map(|(kind, namespace, id)| state_key(namespace, kind, id))
-        .filter(|key| {
-            options.pending_create_assertions.contains(key)
-                || (shared && !options.managed_ledger.contains(key))
-        });
-    modified.chain(claimed).collect()
+        .map(|d| state_key(&d.namespace, &d.kind, &d.id))
+        .collect();
+    rewritten.extend(
+        row_identities(desired)
+            .map(|(kind, namespace, id)| state_key(namespace, kind, id))
+            .filter(|key| options.pending_create_assertions.contains(key)),
+    );
+    if matches!(ownership_scope, OwnershipScope::Shared { .. }) {
+        // `adopt_matching_rows` excludes every key the run already has an
+        // operation for; the same exclusions apply here.
+        let handled: BTreeSet<String> = diff
+            .diffs
+            .iter()
+            .map(|d| state_key(&d.namespace, &d.kind, &d.id))
+            .chain(options.pending_create_assertions.iter().cloned())
+            .collect();
+        let candidates = adoption_candidates(desired, actual, &options.managed_ledger, &handled)?;
+        rewritten.extend(
+            candidates
+                .iter()
+                .map(|row| state_key(&row.namespace, &row.kind, &row.id)),
+        );
+    }
+    Ok(rewritten)
 }
 
-/// Refuse to rewrite a live row whose backup carried nested fields this build
-/// does not model.
+/// Unknown top-level fields a declared row's live copy carries and its
+/// declaration does not, one entry per field, in the notation of the nested
+/// inventory (`.spec.<field>`).
 ///
-/// The typed decode dropped those values, so a PUT or `/restore` built from
-/// the repository declaration would omit them and the gateway would reset
-/// each one to its default — a silent change nobody declared. `rewritten`
-/// holds the state key of every row the namespace's writes will send: see
+/// The live decode keeps every unknown top-level field in the row's flattened
+/// `extra` map, whether or not `FERRUM_ALLOW_UNKNOWN_FIELDS` is set; the
+/// repository row carries only what the repository declared. A PUT or
+/// `/restore` built from the declaration therefore omits each such field and
+/// the gateway resets it. A field the declaration does name (possible only
+/// under `FERRUM_ALLOW_UNKNOWN_FIELDS=true`) is sent with the declared value
+/// and diffed like any other, so it is not listed.
+fn undeclared_live_top_level_fields(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+) -> Vec<http_client::UnmodeledNestedField> {
+    fn undeclared<T: PassthroughFields>(
+        kind: &str,
+        key: (&str, &str),
+        declared: &T,
+        live: Option<&&T>,
+        fields: &mut Vec<http_client::UnmodeledNestedField>,
+    ) {
+        let Some(live) = live else { return };
+        let (namespace, id) = key;
+        for field in live.passthrough().keys() {
+            if !declared.passthrough().contains_key(field) {
+                fields.push(http_client::UnmodeledNestedField {
+                    kind: kind.to_string(),
+                    namespace: namespace.to_string(),
+                    id: id.to_string(),
+                    path: format!(".spec.{field}"),
+                });
+            }
+        }
+    }
+
+    let live = LiveIndex::build(actual);
+    let mut fields = Vec::new();
+    for row in &desired.proxies {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        undeclared("Proxy", key, row, live.proxies.get(&key), &mut fields);
+    }
+    for row in &desired.consumers {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        undeclared("Consumer", key, row, live.consumers.get(&key), &mut fields);
+    }
+    for row in &desired.upstreams {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        undeclared("Upstream", key, row, live.upstreams.get(&key), &mut fields);
+    }
+    for row in &desired.plugin_configs {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        let live_row = live.plugin_configs.get(&key);
+        undeclared("PluginConfig", key, row, live_row, &mut fields);
+    }
+    fields
+}
+
+/// Refuse to rewrite a live row carrying fields this build does not model and
+/// the repository does not declare.
+///
+/// `nested` is the backup's nested inventory: the typed decode dropped those
+/// values. `top_level` comes from [`undeclared_live_top_level_fields`]: the
+/// decode kept them, but the repository row the write is built from does not
+/// carry them. Either way a PUT or `/restore` built from the repository
+/// declaration would omit them and the gateway would reset each one to its
+/// default — a silent change nobody declared. `rewritten` holds the state key
+/// of every row the namespace's writes will send: see
 /// [`incremental_rewrite_keys`] for incremental apply, and every row of the
 /// restore body for full replace. Other rows are left alone or deleted,
-/// neither of which truncates anything, so they do not block. An entry that
-/// could not be attributed to a resource blocks unconditionally.
+/// neither of which truncates anything, so they do not block. A nested entry
+/// that could not be attributed to a resource blocks unconditionally.
 ///
 /// Namespace-scoped like [`spec_owned_conflict_block`], and deliberately not
 /// narrowed to the affected rows: skipping one write would break the
-/// dependency order the rest of the namespace relies on. There is no
-/// override: the repository loader rejects the same nested fields, so no
-/// declaration could carry them.
-fn unmodeled_nested_field_block(
-    fields: &[http_client::UnmodeledNestedField],
+/// dependency order the rest of the namespace relies on. There is no override
+/// for nested fields: the repository loader rejects them, so no declaration
+/// could carry them. A top-level field can instead be declared on the row
+/// under `FERRUM_ALLOW_UNKNOWN_FIELDS=true`, which makes the write send it.
+fn unmodeled_field_block(
+    nested: &[http_client::UnmodeledNestedField],
+    top_level: &[http_client::UnmodeledNestedField],
     rewritten: &BTreeSet<String>,
     namespace: &str,
 ) -> Option<String> {
-    let offenders = fields
+    let offenders = nested
         .iter()
+        .chain(top_level)
         .filter(|field| match field.kind.as_str() {
             "Proxy" | "Consumer" | "Upstream" | "PluginConfig" => {
                 rewritten.contains(&state_key(&field.namespace, &field.kind, &field.id))
@@ -762,7 +898,7 @@ fn unmodeled_nested_field_block(
         return None;
     }
     Some(format!(
-        "refusing apply for namespace `{namespace}`: live row(s) this run would rewrite carry nested field(s) this build of gitforgeops does not model, and the write would reset them to their gateway defaults: {}. Upgrade gitforgeops to a version that models them (the intended fix), or remove them on the gateway. No resource in this namespace was written; other namespaces were reconciled normally",
+        "refusing apply for namespace `{namespace}`: live row(s) this run would rewrite carry field(s) this build of gitforgeops does not model and the repository does not declare, and the write would reset them to their gateway defaults: {}. Upgrade gitforgeops to a version that models them (the intended fix), or remove them on the gateway; a top-level field can also be declared on the resource with FERRUM_ALLOW_UNKNOWN_FIELDS=true. No resource in this namespace was written; other namespaces were reconciled normally",
         http_client::describe_unmodeled_nested_fields(offenders).join("; ")
     ))
 }
@@ -1565,9 +1701,9 @@ async fn apply_incremental(
         {
             // All rank-1 writes and the create batch have finished. Share one
             // authoritative snapshot across this namespace's proxy updates.
-            // Its `unmodeled_nested_fields` are deliberately not re-checked:
-            // `prepare_apply` already refused rows carrying them, and a field
-            // appearing in between is a narrow, inherent race.
+            // Its unmodeled fields (nested or top-level) are deliberately not
+            // re-checked: `prepare_apply` already refused rows carrying them,
+            // and a field appearing in between is a narrow, inherent race.
             post_plugin_snapshot = Some(
                 match client.get_backup_snapshot_for_mutation(namespace).await {
                     Ok(snapshot) => {

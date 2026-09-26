@@ -551,7 +551,8 @@ Three limits are deliberate:
   a field this client does not model and your repository does not declare,
   `diff` ignores it — reporting it would mean permanent drift that no `apply`
   could clear. Declaring a field in your YAML is how the repository takes
-  ownership of it.
+  ownership of it. `apply` still refuses to *rewrite* such a row, because the
+  write would drop the field (see below).
 
 `gitforgeops import` is the one place an unmodelled field would reach your tree
 without you typing it, so it is the one place the rule inverts: **import refuses
@@ -579,28 +580,45 @@ verbatim and are not affected.
 
 `apply` applies the same rule to live rows it would rewrite. Every write to
 an existing resource is a full-resource `PUT` (and full replace re-creates every
-row in its `/restore` body), so a nested field the build cannot represent would
-be omitted and the gateway would reset it to its default. The rows that count
-are the ones this run will actually write: an incremental update (the
-declaration differs from the live row), a pending-create ownership assertion,
-in `shared` mode a declared row not yet in the ledger (adoption claims it with
-an idempotent `PUT`), and in `full_replace` every row of the restore body,
-including preserved API-spec-owned rows. When one of them has such a field
-live, the namespace is refused before anything in it is written; other
-namespaces still reconcile and the run exits non-zero. A declared row that
+row in its `/restore` body), and both are built from the repository's
+declaration. Two kinds of live field would therefore be omitted and reset by
+the gateway to their defaults:
+
+* a nested field this build cannot represent, and
+* an unknown top-level field the live row carries but the declaration does not
+  name. The live decode keeps these, whether or not
+  `FERRUM_ALLOW_UNKNOWN_FIELDS` is set, but the declaration has no value to
+  send.
+
+The rows that count are the ones this run will actually write: an incremental
+update (the declaration differs from the live row), a pending-create ownership
+assertion, in `shared` mode a declared row that adoption will claim with an
+idempotent `PUT` (one not yet in the ledger whose live copy matches the
+declaration exactly), and in `full_replace` every row of the restore body.
+Preserved API-spec-owned rows count for nested fields; their top-level fields
+are copied from the live row verbatim and survive. When one of these rows has
+such a field live, the namespace is refused before anything in it is written;
+other namespaces still reconcile and the run exits non-zero. A declared row that
 already matches and needs no claim — including every such row in `exclusive`
-mode — is not written, so it does not block, nor does leaving an undeclared row
-alone or deleting it.
+mode — is not written, so it does not block. Neither does a declared row
+outside the ledger that differs from its live copy only by an undeclared
+top-level field, since adoption does not claim it. Leaving an undeclared row
+alone, or deleting it, does not block either.
+
+The refusal is evaluated before credentials are allocated. `apply` does not
+generate, store or deliver a credential for a refused namespace, and it does not
+journal that namespace's creates; the next apply that is not refused allocates
+them. The same holds for a namespace refused because a declaration collides
+with an API-spec-owned row. The interactive `apply` preview (without
+`--auto-approve`) lists each refused namespace with its reason and leaves its
+slots out of the allocation count.
 
 The remedy is to upgrade gitforgeops to a version that models the field, or to
-remove the field on the gateway. Do not work around the refusal by deleting the
-declaration: in `exclusive` mode an undeclared live row is **deleted** by the
-next apply.
-
-This refusal covers nested fields only. An unknown *top-level* field present
-only on the live row is not drift (see "A field only the gateway carries is not
-drift" above), and a `PUT` built from the declaration does not carry it, so a
-rewrite may reset it without a refusal; that asymmetry is tracked separately.
+remove the field on the gateway. For a top-level field there is a third option:
+declare it on the resource with `FERRUM_ALLOW_UNKNOWN_FIELDS=true`. The write
+then sends your declared value, and `diff` compares it like any other field.
+Do not work around the refusal by deleting the declaration: in `exclusive` mode
+an undeclared live row is **deleted** by the next apply.
 
 Upgrading gitforgeops is the real fix. When you cannot wait, read the source,
 confirm the field is not a credential, and re-run with one
@@ -1721,7 +1739,7 @@ Runtime variables supported by the binary include:
 |---|---|---|
 | `FERRUM_ENV` | — | Environment selected from `.gitforgeops/config.yaml`; overridden by global `--env`. |
 | `FERRUM_NAMESPACE` | — | Filter to one namespace. Omit to process all namespaces. `validate`, `plan`, `diff`, and `apply` refuse a filter that selects zero desired resources while the on-disk tree is non-empty (exit 1). `--allow-empty-namespace` (CLI-only) demotes that to a warning. File-mode documents are document-wide, so in file mode `plan` and `apply` refuse an ad-hoc filter that drops any loaded resource (`narrowed-file-publication`); declare `namespace_filter` on the environment instead. |
-| `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown **top-level** `spec` fields verbatim instead of rejecting them, for a gateway newer than this release. Nested unknown fields stay fatal either way. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones). |
+| `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown **top-level** `spec` fields verbatim instead of rejecting them, for a gateway newer than this release. Nested unknown fields stay fatal either way. A live-only top-level field the repository does not declare still makes `apply` refuse to rewrite its row, flag or not; declaring the field under this flag is one remedy. See [Supported fields](#supported-fields-and-what-happens-to-unsupported-ones). |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | Environment-variable strategy: `incremental` or `full_replace`. Repo config wins when an environment is selected. |
 | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same opt-in as `apply --allow-nontransactional-plugin-attach`: on batch 501/413, publish a new proxy before attaching its new scoped plugins. Accepts `true`, `false`, `1`, `0`; invalid values fail. |
 | `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same opt-in as `review --fail-on-blockers`: exit 1 when the same offline apply blockers that make `plan` exit 1 are present. Default `review` stays 0; the PR comment is identical either way. Accepts `true`, `false`, `1`, `0`; invalid values fail. |

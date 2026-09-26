@@ -706,6 +706,10 @@ pub enum PluginTriggerProtocol {
 /// authoritative over fields it does not model and the repo does not name. Only
 /// a key the desired resource declares is compared. See
 /// `diff::resource_diff::compare_fields`.
+///
+/// Not drift is not the same as safe to overwrite: a PUT or `/restore` row
+/// built from the declaration would drop such a key, so apply refuses to
+/// rewrite a row carrying one (`apply::api_target::unmodeled_field_block`).
 pub trait PassthroughFields {
     fn passthrough(&self) -> &BTreeMap<String, serde_json::Value>;
 }

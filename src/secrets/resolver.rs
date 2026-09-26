@@ -361,6 +361,22 @@ impl ResolveReport {
         self.slot_credential_types.get(slot).map(String::as_str)
     }
 
+    /// This report without the slots of `namespaces`.
+    ///
+    /// `apply` allocates from this for namespaces it is about to refuse: a
+    /// credential generated and delivered for a row the gateway never receives
+    /// would reach its recipient as a value that does not work. Only the
+    /// per-slot results are filtered; the slot-keyed lookup tables are
+    /// consulted for listed slots alone.
+    pub fn without_namespaces<'a>(&self, namespaces: impl IntoIterator<Item = &'a str>) -> Self {
+        let excluded: std::collections::BTreeSet<&str> = namespaces.into_iter().collect();
+        let mut report = self.clone();
+        report
+            .results
+            .retain(|result| !excluded.contains(result.namespace.as_str()));
+        report
+    }
+
     pub fn needs_allocation(&self) -> Vec<&ResolveResult> {
         self.results
             .iter()

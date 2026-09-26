@@ -2662,11 +2662,51 @@ async fn cmd_apply(
                 diffs.extend(pending);
                 let diffs = apply::order_incremental_diffs(diffs, &desired);
 
+                // The per-namespace refusals the apply would report, from the
+                // same preparation it runs. A run-wide preparation error is
+                // shown rather than returned, so the rest of the preview is
+                // still printed.
+                let mut preview_actuals = BTreeMap::new();
+                let mut preview_extras = BTreeMap::new();
+                for pair in namespace_pairs {
+                    preview_actuals.insert(pair.namespace.clone(), pair.actual);
+                    preview_extras.insert(pair.namespace, pair.extras);
+                }
+                let refusal = apply::apply_blocked_namespaces(
+                    &desired,
+                    &client,
+                    &namespaces,
+                    match managed.as_ref() {
+                        Some(previously_managed) => {
+                            diff::OwnershipScope::Shared { previously_managed }
+                        }
+                        None => diff::OwnershipScope::Exclusive,
+                    },
+                    Some(&preview_actuals),
+                    Some(&preview_extras),
+                    &apply::ApplyOptions {
+                        strategy: resolved.apply_strategy.clone(),
+                        pending_create_assertions: state.pending_creates.clone(),
+                        managed_ledger: ledger_keys(&state),
+                        confirm_api_spec_deletion,
+                        allow_nontransactional_plugin_attach,
+                    },
+                )
+                .await;
+                let (blocked, preparation_error) = match refusal {
+                    Ok(blocked) => (blocked, None),
+                    Err(error) => (apply::BlockedNamespaces::new(), Some(error)),
+                };
+                let refused = blocked.keys().map(String::as_str);
+                let allocatable = secret_report.without_namespaces(refused);
+
                 if diffs.is_empty()
                     && unmanaged.is_empty()
                     && adoptions.is_empty()
                     && !spec_owned_blocks_sync(&spec_owned)
-                    && secret_report.needs_allocation().is_empty()
+                    && blocked.is_empty()
+                    && preparation_error.is_none()
+                    && allocatable.needs_allocation().is_empty()
                 {
                     // Informational spec-owned rows are reported but do not
                     // manufacture a change to approve.
@@ -2715,7 +2755,23 @@ async fn cmd_apply(
                     println!();
                     print_spec_owned(&spec_owned);
                 }
-                let pending_creds = secret_report.needs_allocation();
+                if !blocked.is_empty() {
+                    println!(
+                        "\n{} namespace(s) would be refused; nothing in them would be written and \
+                         no credential would be allocated for them:",
+                        blocked.len()
+                    );
+                    for (namespace, reason) in &blocked {
+                        println!("  REFUSE [{}] {}", safe(namespace), safe_line(reason));
+                    }
+                }
+                if let Some(error) = &preparation_error {
+                    println!(
+                        "\nApply would stop before any write: {}",
+                        safe_line(error.to_string())
+                    );
+                }
+                let pending_creds = allocatable.needs_allocation();
                 if !pending_creds.is_empty() {
                     println!(
                         "\n{} credential slot(s) would be allocated on apply:",
@@ -2782,9 +2838,11 @@ async fn cmd_apply(
             // these: it blocks its own namespace only, and surfaces as a
             // per-namespace error during apply so the rest of the environment
             // still reconciles. So is a refusal to rewrite a row carrying
-            // unmodeled nested fields, for the same reason.
+            // fields this build does not model, for the same reason. Both come
+            // back as `blocked`, so the side effects below skip those
+            // namespaces: nothing in them will be written.
             let preflight_managed = previously_managed(&resolved, &state);
-            apply::preflight_api_apply(
+            let blocked = apply::preflight_api_apply(
                 &desired,
                 &client,
                 &namespaces,
@@ -2916,11 +2974,27 @@ async fn cmd_apply(
             // after a partial failure, so neither a later shard nor a gateway
             // or reporting failure can leave the ledger claiming the slot was
             // never allocated.
+            //
+            // Slots in a namespace the apply will refuse are left unallocated:
+            // generating and delivering a credential the gateway never
+            // receives only hands the recipient a value that does not work.
+            // The next unblocked apply allocates them.
+            let refused = blocked.keys().map(String::as_str);
+            let allocatable = secret_report.without_namespaces(refused);
+            let withheld =
+                secret_report.needs_allocation().len() - allocatable.needs_allocation().len();
+            if withheld > 0 {
+                eprintln!(
+                    "Not allocating {} credential slot(s) in namespace(s) this apply refuses: {}",
+                    withheld,
+                    safe(blocked.keys().cloned().collect::<Vec<_>>().join(", "))
+                );
+            }
             let allocation = allocate_if_needed(
                 &mut desired,
                 &env_config,
                 &resolved,
-                &secret_report,
+                &allocatable,
                 &mut per_shard,
                 &mut shard_count,
                 &mut state,
@@ -2969,11 +3043,16 @@ async fn cmd_apply(
             //
             // `full_replace` is exempt: `/restore` is atomic per namespace and
             // never consumes the journal, so writing keys there only creates
-            // entries a later run has to clean up.
+            // entries a later run has to clean up. So is every namespace the
+            // apply refuses, for the same reason.
+            let journaled: Vec<diff::ResourceDiff> = diffs
+                .into_iter()
+                .filter(|d| !blocked.contains_key(&d.namespace))
+                .collect();
             if !matches!(
                 resolved.apply_strategy,
                 gitforgeops::config::ApplyStrategy::FullReplace
-            ) && state.reserve_adds(&diffs, &desired)? > 0
+            ) && state.reserve_adds(&journaled, &desired)? > 0
             {
                 state.save()?;
             }

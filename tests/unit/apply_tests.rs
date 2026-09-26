@@ -4982,3 +4982,391 @@ async fn full_replace_refuses_a_preserved_spec_owned_row_carrying_unmodeled_nest
     assert!(mutation_lines(&requests).is_empty());
     assert!(result.fully_replaced_namespaces.is_empty());
 }
+
+/// [`live_upstream`] plus one unknown top-level field, which the live decode
+/// keeps in the row's flattened `extra` map.
+fn live_upstream_with_top_level_field(id: &str, namespace: &str) -> serde_json::Value {
+    let mut row = live_upstream(id, namespace, serde_json::json!({}));
+    row["future_upstream_option"] = serde_json::json!(7);
+    row
+}
+
+#[tokio::test]
+async fn incremental_apply_refuses_to_modify_a_row_carrying_an_undeclared_top_level_field() {
+    let (alpha_live, alpha_extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [
+                live_upstream_with_top_level_field("u1", "team-alpha"),
+                live_upstream("u2", "team-alpha", serde_json::json!({})),
+            ]
+        }),
+    );
+    assert!(alpha_extras.unmodeled_nested_fields.is_empty());
+    let (beta_live, beta_extras) = decoded_live(
+        "team-b",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream("v1", "team-b", serde_json::json!({}))]
+        }),
+    );
+    let mut desired = GatewayConfig {
+        upstreams: vec![
+            upstream("u1", "team-alpha"),
+            upstream("u2", "team-alpha"),
+            upstream("v1", "team-b"),
+        ],
+        ..Default::default()
+    };
+    for row in &mut desired.upstreams {
+        row.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+    }
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/v1".into(), 200, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([
+            ("team-alpha".to_string(), alpha_live),
+            ("team-b".to_string(), beta_live),
+        ])),
+        Some(&BTreeMap::from([
+            ("team-alpha".to_string(), alpha_extras),
+            ("team-b".to_string(), beta_extras),
+        ])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // The PUT would be built from the declaration, which lacks the field, and
+    // the gateway would reset it. The whole namespace is refused instead.
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(error.starts_with("[team-alpha] refusing apply"), "{error}");
+    assert!(
+        error.contains("Upstream 'u1' (namespace 'team-alpha'): .spec.future_upstream_option"),
+        "{error}"
+    );
+    assert!(error.contains("FERRUM_ALLOW_UNKNOWN_FIELDS"), "{error}");
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["PUT /upstreams/v1 HTTP/1.1"]
+    );
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn an_unchanged_row_carrying_an_undeclared_top_level_field_is_not_refused() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream_with_top_level_field("u1", "team-alpha")]
+        }),
+    );
+    // Not drift and not adoptable (adoption needs strict equality), so
+    // nothing writes the row and nothing can drop the field.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(mutation_lines(&requests).is_empty());
+}
+
+#[tokio::test]
+async fn a_top_level_field_the_repository_declares_is_written_not_refused() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream_with_top_level_field("u1", "team-alpha")]
+        }),
+    );
+    // What `FERRUM_ALLOW_UNKNOWN_FIELDS=true` lets a repository declare.
+    let mut declared = upstream("u1", "team-alpha");
+    declared.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+    declared
+        .extra
+        .insert("future_upstream_option".to_string(), serde_json::json!(7));
+    let desired = GatewayConfig {
+        upstreams: vec![declared],
+        ..Default::default()
+    };
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/u1".into(), 200, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.updated, 1);
+    let put = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.starts_with("PUT /upstreams/u1"))
+        .cloned()
+        .expect("PUT request");
+    assert!(put.contains("\"future_upstream_option\":7"), "{put}");
+}
+
+#[tokio::test]
+async fn full_replace_refuses_a_restore_body_that_would_drop_an_undeclared_top_level_field() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream_with_top_level_field("u1", "team-alpha")]
+        }),
+    );
+    // Identical apart from the field: `/restore` still re-creates the row.
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    assert!(
+        result.errors[0]
+            .contains("Upstream 'u1' (namespace 'team-alpha'): .spec.future_upstream_option"),
+        "{}",
+        result.errors[0]
+    );
+    assert!(mutation_lines(&requests).is_empty());
+    assert!(result.fully_replaced_namespaces.is_empty());
+}
+
+#[tokio::test]
+async fn full_replace_carries_a_preserved_spec_owned_row_top_level_field_verbatim() {
+    // The spec-owned rows in the restore body are copied from the live view,
+    // `extra` included, so their top-level fields survive and do not block.
+    let (desired, mut actual) = spec_owned_graph();
+    actual.upstreams[0]
+        .extra
+        .insert("future_upstream_option".to_string(), serde_json::json!(7));
+    let extras = spec_extras(&["spec-a"]);
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+        (
+            "GET /backup".into(),
+            200,
+            backup_body_with_extras(&actual, &extras),
+            vec![],
+        ),
+    ]);
+
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), actual)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.fully_replaced_namespaces, vec!["team-alpha"]);
+    let restore = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.contains("POST /restore?confirm=true"))
+        .cloned()
+        .expect("restore request");
+    assert!(
+        restore.contains("\"future_upstream_option\":7"),
+        "{restore}"
+    );
+}
+
+#[tokio::test]
+async fn shared_apply_does_not_refuse_a_declared_row_adoption_will_not_write() {
+    // Outside the ledger and carrying an unmodeled nested field, but its live
+    // copy also has an undeclared top-level field, so it differs from the
+    // declaration: `adoption_candidates` skips it and no Modify exists. The
+    // run writes nothing to it, so there is nothing to refuse.
+    let mut row = live_upstream(
+        "u1",
+        "team-alpha",
+        serde_json::json!({"future_target_option": 7}),
+    );
+    row["future_upstream_option"] = serde_json::json!(7);
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({"version": "1", "upstreams": [row]}),
+    );
+    assert_eq!(extras.unmodeled_nested_fields.len(), 1);
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+    let managed = HashSet::new();
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.adopted.is_empty());
+    assert!(mutation_lines(&requests).is_empty());
+}
+
+#[tokio::test]
+async fn preflight_returns_every_namespace_the_apply_will_refuse() {
+    let (alpha_live, alpha_extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream_with_top_level_field("u1", "team-alpha")]
+        }),
+    );
+    let mut u1 = upstream("u1", "team-alpha");
+    u1.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+    // `spec-ns` declares a row an API spec owns; `clean` has nothing to refuse.
+    let conflicting = proxy("shared", "spec-ns", None);
+    let mut spec_owned = conflicting.clone();
+    spec_owned.api_spec_id = Some("spec-a".to_string());
+    let desired = GatewayConfig {
+        proxies: vec![conflicting],
+        upstreams: vec![u1, upstream("fresh", "clean")],
+        ..Default::default()
+    };
+    let namespaces = [
+        "clean".to_string(),
+        "spec-ns".to_string(),
+        "team-alpha".to_string(),
+    ];
+    let actuals = BTreeMap::from([
+        ("clean".to_string(), GatewayConfig::default()),
+        (
+            "spec-ns".to_string(),
+            GatewayConfig {
+                proxies: vec![spec_owned],
+                ..Default::default()
+            },
+        ),
+        ("team-alpha".to_string(), alpha_live),
+    ]);
+    let mut extras = no_extras(&namespaces[..2]);
+    extras.insert("team-alpha".to_string(), alpha_extras);
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let client = stub_client(url);
+    let blocked = gitforgeops::apply::preflight_api_apply(
+        &desired,
+        &client,
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        blocked.keys().collect::<Vec<_>>(),
+        vec!["spec-ns", "team-alpha"]
+    );
+    assert!(blocked["spec-ns"].contains("API-spec-owned"), "{blocked:?}");
+    assert!(
+        blocked["team-alpha"].contains(".spec.future_upstream_option"),
+        "{blocked:?}"
+    );
+    assert!(mutation_lines(&requests).is_empty());
+
+    // The preview's variant reports the same set without probing `/health`.
+    let preview = gitforgeops::apply::apply_blocked_namespaces(
+        &desired,
+        &client,
+        &namespaces,
+        OwnershipScope::Exclusive,
+        Some(&actuals),
+        Some(&extras),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview, blocked);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "only the preflight's /health"
+    );
+}
