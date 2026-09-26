@@ -349,6 +349,7 @@ pub async fn preflight_api_apply(
     desired: &GatewayConfig,
     client: &AdminClient,
     namespaces: &[String],
+    ownership_scope: OwnershipScope<'_>,
     actual_by_namespace: Option<&BTreeMap<String, GatewayConfig>>,
     extras_by_namespace: Option<&BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
@@ -357,6 +358,7 @@ pub async fn preflight_api_apply(
         desired,
         client,
         namespaces,
+        ownership_scope,
         actual_by_namespace,
         extras_by_namespace,
         options,
@@ -378,6 +380,7 @@ pub async fn apply_api(
         desired,
         client,
         namespaces,
+        ownership_scope,
         actual_by_namespace,
         extras_by_namespace,
         options,
@@ -533,6 +536,7 @@ async fn prepare_apply<'a>(
     desired: &GatewayConfig,
     client: &AdminClient,
     namespaces: &[String],
+    ownership_scope: OwnershipScope<'_>,
     actual_by_namespace: Option<&'a BTreeMap<String, GatewayConfig>>,
     extras_by_namespace: Option<&'a BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
@@ -579,7 +583,13 @@ async fn prepare_apply<'a>(
                 "internal error: authoritative backup for namespace `{namespace}` was not prepared"
             ))
         })?;
-        if let Some(conflict) = spec_owned_conflict_block(&desired_namespace, actual, namespace)? {
+        let diff = compute_diff_with_options(
+            &desired_namespace,
+            actual,
+            OwnershipScope::Exclusive,
+            DiffOptions::default(),
+        )?;
+        if let Some(conflict) = spec_owned_conflict_block(&diff, namespace) {
             prepared.blocked.insert(namespace.clone(), conflict);
             continue;
         }
@@ -595,9 +605,12 @@ async fn prepare_apply<'a>(
                 prepare_full_replace(&desired_namespace, actual, live_extras, namespace, options)?;
             // The restore body re-creates every row it carries, including the
             // live spec-owned rows `preserve_spec_owned_graph` copied in.
+            let rewritten: BTreeSet<String> = row_identities(&full_replace.config)
+                .map(|(kind, namespace, id)| state_key(namespace, kind, id))
+                .collect();
             if let Some(block) = unmodeled_nested_field_block(
                 &live_extras.unmodeled_nested_fields,
-                &full_replace.config,
+                &rewritten,
                 namespace,
             ) {
                 prepared.blocked.insert(namespace.clone(), block);
@@ -606,13 +619,23 @@ async fn prepare_apply<'a>(
             prepared
                 .full_replaces
                 .insert(namespace.clone(), full_replace);
-        } else if let Some(live_extras) = extras.get(namespace) {
-            // Every incremental write to an existing row (update, pending-create
-            // assertion, adoption, ambiguous-create ownership assertion) is a
-            // full-resource PUT built from the repository declaration.
+        } else {
+            // A caller-supplied live view without its extras would skip this
+            // check silently, so a missing inventory is refused instead.
+            let live_extras = extras.get(namespace).ok_or_else(|| {
+                crate::error::Error::Config(format!(
+                    "backup extras (the unmodeled nested field inventory) for namespace `{namespace}` were not supplied alongside its live view; pass both from the same `/backup` snapshot"
+                ))
+            })?;
+            let rewritten = incremental_rewrite_keys(
+                &desired_namespace,
+                &diff,
+                ownership_scope,
+                options,
+            );
             if let Some(block) = unmodeled_nested_field_block(
                 &live_extras.unmodeled_nested_fields,
-                &desired_namespace,
+                &rewritten,
                 namespace,
             ) {
                 prepared.blocked.insert(namespace.clone(), block);
@@ -633,17 +656,7 @@ async fn prepare_apply<'a>(
 /// environment. `Some(reason)` means "reconcile nothing in this namespace and
 /// report this"; the caller records it as a per-namespace error, so the run
 /// still exits non-zero.
-fn spec_owned_conflict_block(
-    desired: &GatewayConfig,
-    actual: &GatewayConfig,
-    namespace: &str,
-) -> crate::error::Result<Option<String>> {
-    let result = compute_diff_with_options(
-        desired,
-        actual,
-        OwnershipScope::Exclusive,
-        DiffOptions::default(),
-    )?;
+fn spec_owned_conflict_block(result: &DiffResult, namespace: &str) -> Option<String> {
     let conflicts = result
         .spec_conflicts()
         .map(|resource| {
@@ -654,12 +667,68 @@ fn spec_owned_conflict_block(
         })
         .collect::<Vec<_>>();
     if conflicts.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(format!(
+    Some(format!(
         "refusing apply for namespace `{namespace}`: repository declarations conflict with live API-spec-owned resources: {}. Remove the repository declaration or manage the row through the API spec importer. No resource in this namespace was written; other namespaces were reconciled normally",
         conflicts.join(", ")
-    )))
+    ))
+}
+
+/// `(kind, namespace, id)` of every row in `config`.
+fn row_identities(config: &GatewayConfig) -> impl Iterator<Item = (&'static str, &str, &str)> {
+    let proxies = config
+        .proxies
+        .iter()
+        .map(|row| ("Proxy", row.namespace.as_str(), row.id.as_str()));
+    let consumers = config
+        .consumers
+        .iter()
+        .map(|row| ("Consumer", row.namespace.as_str(), row.id.as_str()));
+    let upstreams = config
+        .upstreams
+        .iter()
+        .map(|row| ("Upstream", row.namespace.as_str(), row.id.as_str()));
+    let plugin_configs = config
+        .plugin_configs
+        .iter()
+        .map(|row| ("PluginConfig", row.namespace.as_str(), row.id.as_str()));
+    proxies
+        .chain(consumers)
+        .chain(upstreams)
+        .chain(plugin_configs)
+}
+
+/// State keys of the live rows an incremental apply will PUT in one namespace.
+///
+/// Mirrors the writes `apply_incremental` issues against rows that already
+/// exist: every Modify, every pending-create ownership assertion, and in
+/// shared mode every declared row not yet in the ledger (the adoption
+/// candidates, claimed with an idempotent PUT). A declared row that is
+/// unchanged and needs no claim — including every such row in exclusive mode,
+/// where adoption writes nothing — is left out, so a defaulted field a newer
+/// gateway starts serializing does not wedge every apply that merely declares
+/// it. Only declared keys are added, and only live rows carry unmodeled
+/// fields, so a key naming a row that is not live never matches one.
+fn incremental_rewrite_keys(
+    desired: &GatewayConfig,
+    diff: &DiffResult,
+    ownership_scope: OwnershipScope<'_>,
+    options: &ApplyOptions,
+) -> BTreeSet<String> {
+    let shared = matches!(ownership_scope, OwnershipScope::Shared { .. });
+    let modified = diff
+        .diffs
+        .iter()
+        .filter(|d| d.action == DiffAction::Modify)
+        .map(|d| state_key(&d.namespace, &d.kind, &d.id));
+    let claimed = row_identities(desired)
+        .map(|(kind, namespace, id)| state_key(namespace, kind, id))
+        .filter(|key| {
+            options.pending_create_assertions.contains(key)
+                || (shared && !options.managed_ledger.contains(key))
+        });
+    modified.chain(claimed).collect()
 }
 
 /// Refuse to rewrite a live row whose backup carried nested fields this build
@@ -667,40 +736,37 @@ fn spec_owned_conflict_block(
 ///
 /// The typed decode dropped those values, so a PUT or `/restore` built from
 /// the repository declaration would omit them and the gateway would reset
-/// each one to its default — a silent change nobody declared. `written` is
-/// every row the namespace's writes may send: the desired declarations for
-/// incremental apply, the restore body for full replace. Rows the repository
-/// does not declare are either left alone or deleted, neither of which
-/// truncates anything, so they do not block. An entry that could not be
-/// attributed to a resource blocks unconditionally.
+/// each one to its default — a silent change nobody declared. `rewritten`
+/// holds the state key of every row the namespace's writes will send: see
+/// [`incremental_rewrite_keys`] for incremental apply, and every row of the
+/// restore body for full replace. Other rows are left alone or deleted,
+/// neither of which truncates anything, so they do not block. An entry that
+/// could not be attributed to a resource blocks unconditionally.
 ///
-/// Namespace-scoped like [`spec_owned_conflict_block`]. There is no override:
-/// the repository loader rejects the same nested fields, so no declaration
-/// could carry them.
+/// Namespace-scoped like [`spec_owned_conflict_block`], and deliberately not
+/// narrowed to the affected rows: skipping one write would break the
+/// dependency order the rest of the namespace relies on. There is no
+/// override: the repository loader rejects the same nested fields, so no
+/// declaration could carry them.
 fn unmodeled_nested_field_block(
     fields: &[http_client::UnmodeledNestedField],
-    written: &GatewayConfig,
+    rewritten: &BTreeSet<String>,
     namespace: &str,
 ) -> Option<String> {
-    let rows = ResourceIndex::build(written);
     let offenders = fields
         .iter()
-        .filter(|field| {
-            let key = (field.namespace.as_str(), field.id.as_str());
-            match field.kind.as_str() {
-                "Proxy" => rows.proxies.contains_key(&key),
-                "Consumer" => rows.consumers.contains_key(&key),
-                "Upstream" => rows.upstreams.contains_key(&key),
-                "PluginConfig" => rows.plugin_configs.contains_key(&key),
-                _ => true,
+        .filter(|field| match field.kind.as_str() {
+            "Proxy" | "Consumer" | "Upstream" | "PluginConfig" => {
+                rewritten.contains(&state_key(&field.namespace, &field.kind, &field.id))
             }
+            _ => true,
         })
         .collect::<Vec<_>>();
     if offenders.is_empty() {
         return None;
     }
     Some(format!(
-        "refusing apply for namespace `{namespace}`: live row(s) this run would rewrite carry nested field(s) this build of gitforgeops does not model, and the write would reset them to their gateway defaults: {}. Upgrade gitforgeops to a version that models them, remove them on the gateway, or stop declaring the row. No resource in this namespace was written; other namespaces were reconciled normally",
+        "refusing apply for namespace `{namespace}`: live row(s) this run would rewrite carry nested field(s) this build of gitforgeops does not model, and the write would reset them to their gateway defaults: {}. Upgrade gitforgeops to a version that models them (the intended fix), or remove them on the gateway. No resource in this namespace was written; other namespaces were reconciled normally",
         http_client::describe_unmodeled_nested_fields(offenders).join("; ")
     ))
 }
@@ -1503,6 +1569,9 @@ async fn apply_incremental(
         {
             // All rank-1 writes and the create batch have finished. Share one
             // authoritative snapshot across this namespace's proxy updates.
+            // Its `unmodeled_nested_fields` are deliberately not re-checked:
+            // `prepare_apply` already refused rows carrying them, and a field
+            // appearing in between is a narrow, inherent race.
             post_plugin_snapshot = Some(
                 match client.get_backup_snapshot_for_mutation(namespace).await {
                     Ok(snapshot) => {
@@ -2059,6 +2128,9 @@ async fn adopt_matching_rows(
     let confirmation = match ownership_scope {
         OwnershipScope::Exclusive => None,
         OwnershipScope::Shared { .. } => {
+            // The confirmation read's `unmodeled_nested_fields` are not
+            // re-checked; `prepare_apply` refused every candidate carrying
+            // them, and one appearing since is a narrow, inherent race.
             match client.get_backup_snapshot_for_mutation(namespace).await {
                 Ok(snapshot) if snapshot.cached => {
                     skip_all(
@@ -2433,6 +2505,9 @@ async fn create_with_reconciliation(
         Ok(()) => Ok(()),
         Err(error) if create_outcome_is_ambiguous(&error) => {
             let original = error.to_string();
+            // The row was absent at diff time, so this verification read's
+            // `unmodeled_nested_fields` are intentionally not checked: only a
+            // concurrent writer could have added one, a narrow, inherent race.
             let snapshot = client
                 .get_backup_snapshot_for_mutation(namespace)
                 .await
@@ -2844,6 +2919,8 @@ async fn try_batch_create(
                     || create_outcome_is_ambiguous(&e) =>
             {
                 let original = e.to_string();
+                // As in `create_with_reconciliation`, this verification read's
+                // `unmodeled_nested_fields` are intentionally not checked.
                 let snapshot = match client.get_backup_snapshot_for_mutation(namespace).await {
                     Ok(snapshot) if snapshot.cached => {
                         result.fatal_error = Some(

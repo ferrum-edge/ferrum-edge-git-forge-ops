@@ -700,6 +700,33 @@ spec:
         .all(|request| request.starts_with("GET /backup ")));
 }
 
+/// Issue #380: a live row whose backup carries a nested field this build does
+/// not model is refused when apply would rewrite it, and the refusal reaches
+/// the process exit status rather than only the per-namespace log.
+#[cfg(unix)]
+#[test]
+fn apply_exits_non_zero_when_a_rewritten_row_carries_unmodeled_nested_fields() {
+    // The repository moves the port, so apply would PUT the row, and that PUT
+    // would reset the live row's unmodeled retry option to its default.
+    let mut row = live_proxy("app", "ferrum", 9090, None);
+    row["retry"] = serde_json::json!({"future_retry_option": 1});
+    let repo = Repo::new(
+        &[("resources/ferrum/proxies/app.yaml", FERRUM_PROXY)],
+        vec![("ferrum".into(), backup(serde_json::json!([row])))],
+    );
+
+    let output = repo.run(&["apply", "--auto-approve"]);
+
+    let error = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(error.contains("refusing apply for namespace `ferrum`"), "{error}");
+    assert!(error.contains("Proxy 'app' (namespace 'ferrum')"), "{error}");
+    assert!(error.contains(".spec.retry.future_retry_option"), "{error}");
+    for request in repo.requests.lock().unwrap().iter() {
+        assert!(request.starts_with("GET "), "{request}");
+    }
+}
+
 /// The documented drift exit code.
 fn assert_drift_exit(output: &Output) {
     assert_eq!(
