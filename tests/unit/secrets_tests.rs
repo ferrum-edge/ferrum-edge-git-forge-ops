@@ -2059,11 +2059,7 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
         found,
         "rotate --credential keyauth/[1]/key must still find its slot"
     );
-    assert!(
-        report.slot_remaps.is_empty(),
-        "{} unexpected slot remap(s)",
-        report.slot_remaps.len()
-    );
+    assert!(report.slot_remaps.is_empty(), "unexpected slot remap(s)");
 }
 
 /// After a mutating resolve, the report, not the resolved bytes, says which

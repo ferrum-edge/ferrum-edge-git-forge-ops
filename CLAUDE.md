@@ -891,7 +891,9 @@ preflight, allocation or file publish, and refuses every finding
 `diff::security_blockers` returns. The escape hatch is the policy override (PR
 label + revision-bound review + current repo permission and input verification),
 resolved once and shared by both gates. `rotate` runs the same audit on the
-Consumer row it publishes and has no override.
+Consumer row it publishes, and `export --materialize` on the whole document
+before the bundle read; neither has an override, and an `apply` override does
+not carry over to them. A number or boolean at a secret leaf is a literal too.
 
 #### Secrets outside `Consumer.credentials`
 

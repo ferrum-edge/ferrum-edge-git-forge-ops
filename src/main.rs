@@ -1387,6 +1387,10 @@ async fn cmd_export(
         // Materializing writes resolved values out, so it refuses a retired
         // Consumer's slot (#332) exactly like `apply` does: the state ledger
         // is the evidence, under the operator's own remap policy.
+        //
+        // It also refuses everything `apply`'s security gate refuses, on the
+        // unresolved document and before the bundle or state is read.
+        refuse_materialize_security_blockers(&gateway_config, &resolved)?;
         let (bundle, _) = load_credential_bundles(&env_config)?;
         let state = StateFile::load(&resolved.name)?;
         let ledger = consumer_ledger(&resolved, &state);
@@ -4033,6 +4037,46 @@ async fn cmd_rotate(
     Ok(())
 }
 
+/// Refuse to materialize a document carrying a finding the `apply` security
+/// gate blocks, above all a literal credential.
+///
+/// Materialization writes the whole resolved document for a file-mode
+/// gateway, so a literal committed to `resources/` that `apply` refused would
+/// otherwise go live through the materialized file. Like `apply`, the audit
+/// sees the **unresolved** document, before the credential bundle or state is
+/// read. There is no override: `apply`'s override is bound to a reviewed
+/// revision, and an export has none.
+fn refuse_materialize_security_blockers(
+    desired: &GatewayConfig,
+    resolved: &ResolvedEnv,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let policy_cfg = policy::load_policies()?;
+    let no_ledger = HashSet::new();
+    let security_findings = diff::audit_security_with_scope(
+        desired,
+        policy_cfg.as_ref(),
+        match resolved.ownership.mode {
+            OwnershipMode::Shared => diff::OwnershipScope::Shared {
+                previously_managed: &no_ledger,
+            },
+            OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
+        },
+    );
+    let blockers = diff::security_blockers(&security_findings);
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    print_security_findings(&security_findings);
+    Err(format!(
+        "refusing to materialize: {} security blocker(s) that `apply` also refuses. An `apply` \
+         security override does not carry over to `export --materialize`: replace each literal \
+         with a `${{gh-env-secret:alloc=require}}` placeholder, seed its slot in the credential \
+         bundle and run `gitforgeops apply` before materializing.",
+        blockers.len()
+    )
+    .into())
+}
+
 /// Refuse a rotation whose Consumer row carries a finding the `apply`
 /// security gate blocks, above all a literal credential.
 ///
@@ -4054,8 +4098,9 @@ fn refuse_rotation_security_blockers(
     Err(format!(
         "Refusing to rotate: consumer '{}/{}' has {} security blocker(s) that `apply` also \
          refuses. Rotation publishes the whole Consumer, so every credential on it must be \
-         brokered: replace each literal with a `${{gh-env-secret:alloc=require}}` placeholder, \
-         seed its slot in the credential bundle and run `gitforgeops apply` before rotating.",
+         brokered, and an `apply` security override does not carry over to `rotate`: replace \
+         each literal with a `${{gh-env-secret:alloc=require}}` placeholder, seed its slot in \
+         the credential bundle and run `gitforgeops apply` before rotating.",
         safe(namespace),
         safe(consumer_id),
         blockers.len()

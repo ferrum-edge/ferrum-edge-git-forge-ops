@@ -1520,41 +1520,58 @@ fn rotate_checks_target_generation_before_any_network_or_state_publication() {
     // The Upstream and PluginConfig deliberately share the Consumer id.
     // An HTTPS proxy trap catches all GitHub traffic, including key discovery;
     // the gateway uses the same loopback listener. Nothing reaches production.
-    for (credential, credentials, expected) in [
+    // Each case names the marker its refusal must carry: the refused slot, or
+    // the Consumer row when the literal-credential gate refuses first.
+    for (credential, credentials, expected, marker) in [
         (
             "@service-discovery/consul/token",
             r#"{"keyauth":[{"key":"${gh-env-secret:alloc=require}"}]}"#,
             "Consul ACL token",
+            "'platform/app/@service-discovery/consul/token'",
         ),
         (
             "@plugin-config/config/api_key",
             r#"{"keyauth":[{"key":"${gh-env-secret:alloc=require}"}]}"#,
             "PluginConfig and Upstream slots cannot be published",
+            "'platform/app/@plugin-config/config/api_key'",
         ),
         (
             "basicauth/password_hash",
             r#"{"basicauth":[{"username":"app","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
             "cannot generate a basicauth password_hash",
+            "'platform/app/basicauth/password_hash'",
         ),
         (
             "basicauth/[1]/password_hash",
             r#"{"basicauth":[{"username":"one","password_hash":"${gh-env-secret:alloc=require}"},{"username":"two","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
             "cannot generate a basicauth password_hash",
+            "'platform/app/basicauth/[1]/password_hash'",
         ),
         (
             "jwt/secret",
             r#"{"jwt":[{"secret":"${gh-env-secret:alloc=require|len=16}"}]}"#,
             "at least 32 characters",
+            "'platform/app/jwt/secret'",
         ),
         (
             "keyauth/key",
             r#"{"keyauth":[{"key":"literal-value"}]}"#,
             "Literal credential in 'keyauth[0].key'",
+            "Refusing to rotate: consumer 'platform/app'",
+        ),
+        (
+            // The Consumer is fully brokered, so the literal gate passes and
+            // the target preflight refuses a slot that has no placeholder.
+            "keyauth/[1]/key",
+            r#"{"keyauth":[{"key":"${gh-env-secret:alloc=require}"}]}"#,
+            "no `${gh-env-secret:...}` placeholder",
+            "'platform/app/keyauth/[1]/key'",
         ),
         (
             "mtls_auth/identity",
             r#"{"mtls_auth":[{"identity":"${gh-env-secret:alloc=require}"}]}"#,
             "identity fields",
+            "'platform/app/mtls_auth/identity'",
         ),
     ] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1614,7 +1631,7 @@ fn rotate_checks_target_generation_before_any_network_or_state_publication() {
         let diagnostic = stderr(&output);
         assert!(!output.status.success(), "{credential}");
         assert!(diagnostic.contains(expected), "{credential}: {diagnostic}");
-        assert!(diagnostic.contains("platform/app"), "{diagnostic}");
+        assert!(diagnostic.contains(marker), "{credential}: {diagnostic}");
         assert!(!diagnostic.contains("existing-sensitive-value"));
         assert!(!diagnostic.contains("literal-value"));
         assert!(!stdout(&output).contains("existing-sensitive-value"));
@@ -1652,8 +1669,16 @@ fn rotate_reaches_provisioning(kind: &str, field: &str, seeded: &str) {
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let credential = format!("{kind}/[1]/{field}");
+    // Only `basicauth` pairs its secret with a public username. Under any
+    // other kind `username` is a literal secret leaf, which the rotation's
+    // literal-credential gate would refuse before provisioning.
+    let (first, second) = if kind == "basicauth" {
+        ("\n        username: first", "\n        username: second")
+    } else {
+        ("", "")
+    };
     let consumer = format!(
-        "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: '${{gh-env-secret:alloc=require}}'\n        username: first\n      - {field}: '${{gh-env-secret:alloc=require}}'\n        username: second\n"
+        "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: '${{gh-env-secret:alloc=require}}'{first}\n      - {field}: '${{gh-env-secret:alloc=require}}'{second}\n"
     );
     let bundle = serde_json::json!({
         "FERRUM_CREDS_BUNDLE": { format!("platform/app/{kind}/{field}"): seeded }
@@ -1697,6 +1722,7 @@ fn rotate_reaches_provisioning(kind: &str, field: &str, seeded: &str) {
         stderr(&output)
     );
     assert!(!stderr(&output).contains("unresolved placeholder"));
+    assert!(!stderr(&output).contains("Security Findings"));
     assert!(!repo.dir.path().join(".state/default.json").exists());
 }
 
@@ -1771,7 +1797,10 @@ fn rotate_refuses_a_literal_sibling_credential_before_any_side_effect() {
             diagnostic.contains("Refusing to rotate: consumer 'platform/app'"),
             "{diagnostic}"
         );
-        assert!(!diagnostic.contains("basicauth[0].username"), "{diagnostic}");
+        assert!(
+            !diagnostic.contains("basicauth[0].username"),
+            "{diagnostic}"
+        );
         let combined = format!("{}{diagnostic}", stdout(&output));
         assert!(!combined.contains(LITERAL));
         assert!(!combined.contains("seeded-target-value"));
@@ -1827,6 +1856,54 @@ fn materialize_classifies_slots_by_resolution_not_by_value_shape() {
         );
         assert!(!diagnostic.contains(SEEDED));
         assert!(!repo.dir.path().join("export.yaml").exists());
+    }
+}
+
+/// Materialization writes the whole resolved document for a file-mode
+/// gateway, so it refuses what `apply`'s security gate refuses: a literal
+/// credential committed to `resources/`, including an unquoted YAML number,
+/// must not go live through the materialized file. The audit runs on the
+/// unresolved document before the bundle is read, and has no override.
+#[test]
+fn materialize_refuses_a_literal_credential_before_reading_the_bundle() {
+    const NUMERIC_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    keyauth:
+      - key: 12345
+"#;
+    for consumer in [LITERAL_CONSUMER, NUMERIC_CONSUMER] {
+        for args in [
+            vec!["export", "--materialize", "--output", "export.yaml"],
+            vec!["export", "--materialize", "--encrypt-to", "fixture"],
+        ] {
+            let repo = Repo::with_consumer(consumer);
+            let output = repo.run(
+                &args,
+                &[("FERRUM_CREDS_JSON", "invalid bundle: must not be read")],
+            );
+            let diagnostic = stderr(&output);
+            assert!(!output.status.success(), "{args:?}");
+            assert!(
+                diagnostic.contains("Literal credential in 'keyauth[0].key'"),
+                "{args:?}: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("refusing to materialize: 1 security blocker(s)"),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("does not carry over to `export --materialize`"),
+                "{diagnostic}"
+            );
+            let combined = format!("{}{diagnostic}", stdout(&output));
+            assert!(!combined.contains("live-secret"));
+            assert!(!combined.contains("12345"));
+            assert!(!repo.dir.path().join("export.yaml").exists());
+            assert!(!repo.dir.path().join(".state/default.json").exists());
+        }
     }
 }
 

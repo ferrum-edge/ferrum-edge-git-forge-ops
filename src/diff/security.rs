@@ -672,14 +672,16 @@ fn check_literal_credentials(
             if is_identity_credential_leaf(credential_type, leaf) {
                 return;
             }
-            findings.push(SecurityFinding::error(
-                "Consumer",
-                consumer_id,
-                namespace,
-                format!(
-                    "Literal credential in '{path}' on consumer {consumer_id} in namespace {namespace} (use ${{gh-env-secret:...}} for secrets)"
-                ),
-            ));
+            findings.push(literal_credential_finding(consumer_id, namespace, path));
+        }
+        // YAML reads an unquoted `key: 12345` or `secret: true` as a number
+        // or boolean, yet the gateway still receives it as authentication
+        // material. A non-string scalar at a secret leaf is as literal as a
+        // string; identity leaves stay exempt, exactly as above.
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_)
+            if !is_identity_credential_leaf(credential_type, leaf) =>
+        {
+            findings.push(literal_credential_finding(consumer_id, namespace, path));
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map {
@@ -711,4 +713,15 @@ fn check_literal_credentials(
         }
         _ => {}
     }
+}
+
+fn literal_credential_finding(consumer_id: &str, namespace: &str, path: &str) -> SecurityFinding {
+    SecurityFinding::error(
+        "Consumer",
+        consumer_id,
+        namespace,
+        format!(
+            "Literal credential in '{path}' on consumer {consumer_id} in namespace {namespace} (use ${{gh-env-secret:...}} for secrets)"
+        ),
+    )
 }
