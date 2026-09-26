@@ -717,17 +717,16 @@ def _local_paths(root: Path) -> list[str]:
         cwd=str(root),
         check=False,
         capture_output=True,
-        text=True,
     )
     if inside.returncode != 0:
         error = inside.stderr.decode("utf-8", "replace").strip()
         if "not a git repository" in error.lower():
             return _walk_local(root)
         raise UpdateError(f"git rev-parse failed in {root}: {error or 'unknown error'}")
-    if inside.stdout.strip() != "true":
+    answer = inside.stdout.decode("utf-8", "replace").strip()
+    if answer != "true":
         raise UpdateError(
-            f"git rev-parse in {root} did not identify a Git work tree: "
-            f"{inside.stdout.strip()!r}"
+            f"git rev-parse in {root} did not identify a Git work tree: {answer!r}"
         )
     listing = subprocess.run(
         [

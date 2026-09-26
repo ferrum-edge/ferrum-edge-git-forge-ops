@@ -714,7 +714,10 @@ class ConfinementTests(unittest.TestCase):
         self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
         result = self.fixture.run("apply")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(customer_file.exists())
+        # The file is gone: its path is now the real directory upstream made it.
+        self.assertFalse(customer_file.is_symlink())
+        self.assertTrue(customer_file.is_dir())
+        self.assertEqual(sorted(path.name for path in customer_file.iterdir()), ["y"])
         self.assertEqual((self.fixture.customer / "docs/x/y").read_text(), "new\n")
         recorded = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
         self.assertEqual(recorded["commit"], target)
@@ -817,15 +820,26 @@ class ConfinementTests(unittest.TestCase):
         self.assertEqual(outside.read_text(encoding="utf-8"), original)
         self.assertNotEqual(self.fixture.read("src/main.rs"), "// v2\n")
 
-    def test_detect_baseline_refuses_a_link_instead_of_reading_through_it(self):
+    def test_detect_baseline_counts_a_link_instead_of_reading_through_it(self):
+        # The target holds upstream's exact bytes, so a comparison made through
+        # the link would report an exact match and record the baseline.
         outside = self.outside / "main.rs"
-        outside.write_text(self.fixture.read("src/main.rs"), encoding="utf-8")
+        original = self.fixture.read("src/main.rs")
+        outside.write_text(original, encoding="utf-8")
         destination = self.fixture.customer / "src/main.rs"
         destination.unlink()
         destination.symlink_to(outside)
+        recorded = self.fixture.customer / ".gitforgeops/baseline.json"
+        before = recorded.read_bytes()
 
         result = self.fixture.run("detect-baseline", "--write")
-        self.assert_refused(result, "src/main.rs is a symbolic link")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("1 upstream-managed path(s) differ", result.stdout)
+        self.assertNotIn("exact match", result.stdout)
+        self.assertEqual(recorded.read_bytes(), before)
+        self.assertEqual(outside.read_text(encoding="utf-8"), original)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), str(outside))
 
     def test_an_upstream_link_is_not_adopted_as_a_file(self):
         (self.fixture.upstream / "docs/link.md").symlink_to("github-launch-controls.md")
