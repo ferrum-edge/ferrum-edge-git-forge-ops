@@ -1090,6 +1090,7 @@ fn backup_extras() -> BackupExtras {
         })),
         gateway_trust_bundles: Some(serde_json::json!([{ "revision": 7 }])),
         unsupported_sections: Vec::new(),
+        unmodeled_nested_fields: Vec::new(),
     }
 }
 
@@ -1154,6 +1155,7 @@ fn restore_body_omits_an_authoritative_empty_api_spec_section() {
         })),
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
+        unmodeled_nested_fields: Vec::new(),
     };
     let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
     assert!(body.get("api_specs").is_none());

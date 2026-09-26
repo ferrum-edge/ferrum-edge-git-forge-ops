@@ -398,6 +398,7 @@ fn spec_extras_hashed(specs: &[(&str, &str)]) -> gitforgeops::http_client::Backu
         })),
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
+        unmodeled_nested_fields: Vec::new(),
     }
 }
 
@@ -1913,6 +1914,7 @@ async fn empty_spec_snapshot_omits_api_specs_and_trust_to_close_lost_update_race
         api_specs: Some(serde_json::json!({"section_version": "2", "items": []})),
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
+        unmodeled_nested_fields: Vec::new(),
     };
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
@@ -4599,4 +4601,223 @@ async fn uncommitted_cycle_batch_defers_deletes_after_invalid_acknowledgement() 
     assert_eq!(result.errors.len(), 1);
     assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"]);
     assert!(result.into_result().is_err());
+}
+
+/// Live view and extras for one namespace, decoded the way `cmd_apply`
+/// decodes a `/backup` body, so `unmodeled_nested_fields` is populated.
+fn decoded_live(
+    namespace: &str,
+    backup: serde_json::Value,
+) -> (GatewayConfig, gitforgeops::http_client::BackupExtras) {
+    let snapshot =
+        gitforgeops::http_client::BackupSnapshot::from_scoped_body(&backup.to_string(), namespace)
+            .unwrap();
+    (snapshot.config, snapshot.extras)
+}
+
+fn live_upstream(id: &str, namespace: &str, target_extra: serde_json::Value) -> serde_json::Value {
+    let mut target = serde_json::json!({"host": "10.0.0.1", "port": 8080});
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), target_extra.as_object()) {
+        target.extend(extra.clone());
+    }
+    serde_json::json!({"id": id, "namespace": namespace, "targets": [target]})
+}
+
+#[tokio::test]
+async fn incremental_apply_refuses_to_rewrite_a_row_carrying_unmodeled_nested_fields() {
+    let (alpha_live, alpha_extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [
+                live_upstream("u1", "team-alpha", serde_json::json!({"future_target_option": 7})),
+                live_upstream("u2", "team-alpha", serde_json::json!({})),
+            ]
+        }),
+    );
+    assert_eq!(alpha_extras.unmodeled_nested_fields.len(), 1);
+    let (beta_live, beta_extras) = decoded_live(
+        "team-b",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [live_upstream("v1", "team-b", serde_json::json!({}))]
+        }),
+    );
+
+    // An unrelated field changes on the affected row, on a clean sibling in
+    // the same namespace, and on a row in another namespace.
+    let mut desired = GatewayConfig {
+        upstreams: vec![
+            upstream("u1", "team-alpha"),
+            upstream("u2", "team-alpha"),
+            upstream("v1", "team-b"),
+        ],
+        ..Default::default()
+    };
+    for row in &mut desired.upstreams {
+        row.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+    }
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/v1".into(), 200, "{}".into(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string(), "team-b".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([
+            ("team-alpha".to_string(), alpha_live),
+            ("team-b".to_string(), beta_live),
+        ])),
+        Some(&BTreeMap::from([
+            ("team-alpha".to_string(), alpha_extras),
+            ("team-b".to_string(), beta_extras),
+        ])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(error.starts_with("[team-alpha] refusing apply"), "{error}");
+    assert!(
+        error.contains(
+            "Upstream 'u1' (namespace 'team-alpha'): .spec.targets[0].future_target_option"
+        ),
+        "{error}"
+    );
+    // Nothing in the blocked namespace is written, not even the clean sibling;
+    // the other namespace still reconciles.
+    assert_eq!(
+        mutation_lines(&requests),
+        vec!["PUT /upstreams/v1 HTTP/1.1"]
+    );
+    assert_eq!(result.updated, 1);
+    assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn incremental_apply_may_delete_an_undeclared_row_carrying_unmodeled_nested_fields() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [
+                live_upstream("u1", "team-alpha", serde_json::json!({"future_target_option": 7})),
+                live_upstream("u2", "team-alpha", serde_json::json!({})),
+            ]
+        }),
+    );
+    let mut desired = GatewayConfig {
+        upstreams: vec![upstream("u2", "team-alpha")],
+        ..Default::default()
+    };
+    desired.upstreams[0].algorithm =
+        gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
+
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /upstreams/u2".into(), 200, "{}".into(), vec![]),
+        ("DELETE /upstreams/u1".into(), 204, String::new(), vec![]),
+    ]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let mut lines = mutation_lines(&requests);
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec!["DELETE /upstreams/u1 HTTP/1.1", "PUT /upstreams/u2 HTTP/1.1"]
+    );
+}
+
+#[tokio::test]
+async fn full_replace_refuses_a_restore_body_that_would_truncate_a_live_row() {
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [serde_json::json!({
+                "id": "u1",
+                "namespace": "team-alpha",
+                "targets": [{"host": "10.0.0.1", "port": 8080}],
+                "health_checks": {"passive": {"future_passive_option": true}}
+            })]
+        }),
+    );
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "team-alpha")],
+        ..Default::default()
+    };
+
+    let (url, requests) =
+        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+    let error = &result.errors[0];
+    assert!(
+        error.contains("Upstream 'u1' (namespace 'team-alpha'): "),
+        "{error}"
+    );
+    assert!(
+        error.contains(".spec.health_checks.passive.future_passive_option"),
+        "{error}"
+    );
+    assert!(mutation_lines(&requests).is_empty());
+    assert!(result.fully_replaced_namespaces.is_empty());
+}
+
+#[test]
+fn unmodeled_nested_field_listing_is_deduplicated_and_bounded() {
+    use gitforgeops::http_client::{
+        describe_unmodeled_nested_fields, UnmodeledNestedField, MAX_LISTED_UNMODELED_NESTED_FIELDS,
+    };
+    let field = |id: String| UnmodeledNestedField {
+        kind: "Proxy".to_string(),
+        namespace: "ferrum".to_string(),
+        id,
+        path: ".spec.retry.future\noption".to_string(),
+    };
+    let mut fields = (0..MAX_LISTED_UNMODELED_NESTED_FIELDS + 3)
+        .map(|index| field(format!("p{index:03}")))
+        .collect::<Vec<_>>();
+    fields.push(field("p000".to_string()));
+
+    let entries = describe_unmodeled_nested_fields(&fields);
+
+    assert_eq!(entries.len(), MAX_LISTED_UNMODELED_NESTED_FIELDS + 1);
+    assert!(entries[0].starts_with("Proxy 'p000' "), "{entries:?}");
+    assert!(entries.iter().all(|entry| !entry.contains('\n')));
+    assert_eq!(entries.last().unwrap(), "…and 3 more");
+
+    let exact = describe_unmodeled_nested_fields(&fields[..MAX_LISTED_UNMODELED_NESTED_FIELDS]);
+    assert_eq!(exact.len(), MAX_LISTED_UNMODELED_NESTED_FIELDS);
+    assert!(!exact.iter().any(|entry| entry.contains("more")));
 }

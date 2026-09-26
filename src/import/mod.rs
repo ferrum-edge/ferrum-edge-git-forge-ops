@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::config::schema::{
     is_known_credential_type, unknown_credential_type_message, GatewayConfig, Resource,
 };
-use crate::http_client::{BackupSnapshot, UnmodeledNestedField};
+use crate::http_client::{describe_unmodeled_nested_fields, BackupSnapshot, UnmodeledNestedField};
 use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
@@ -751,31 +751,15 @@ fn reject_import_unmodeled_nested_fields(
     if fields.is_empty() {
         return Ok(());
     }
-    let offenders = fields
-        .iter()
-        .map(|field| {
-            (
-                field.kind.as_str(),
-                field.namespace.as_str(),
-                field.id.as_str(),
-                field.path.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
     let mut message = String::from(
         "refusing to import: the source carries nested field(s) this build of gitforgeops does \
          not model, and writing the resource tree would silently discard them. Upgrade \
          gitforgeops to a version that models them, or remove them on the gateway and \
          re-import. Nothing has been written.",
     );
-    for (kind, namespace, id, path) in offenders {
-        message.push_str(&format!(
-            "\n  {} '{}' (namespace '{}'): {}",
-            diagnostic_metadata(kind),
-            diagnostic_metadata(id),
-            diagnostic_metadata(namespace),
-            diagnostic_metadata(path)
-        ));
+    for entry in describe_unmodeled_nested_fields(fields) {
+        message.push_str("\n  ");
+        message.push_str(&entry);
     }
     Err(crate::error::Error::Config(message))
 }

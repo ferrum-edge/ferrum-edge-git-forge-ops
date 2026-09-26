@@ -2578,3 +2578,217 @@ async fn api_import_rejects_nested_unknown_fields_before_writing() {
     );
     assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
 }
+
+fn unmodeled_paths(backup: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    gitforgeops::http_client::BackupSnapshot::from_body(&backup.to_string())
+        .unwrap()
+        .unmodeled_nested_fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{} {}/{} {}",
+                field.kind, field.namespace, field.id, field.path
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn backup_decode_records_nested_unknowns_in_triggers_stream_arms_and_subsets() {
+    let backup = serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "tcp",
+            "namespace": "ferrum",
+            "backend_host": "example.invalid",
+            "backend_port": 443,
+            "stream_match": {"arms": [
+                {"gateways": ["mesh"]},
+                {"source_namespace": "payments", "future_arm_option": 1}
+            ]}
+        }],
+        "upstreams": [{
+            "id": "u",
+            "namespace": "ferrum",
+            "targets": [{"host": "a.example.invalid", "port": 80}],
+            "subsets": [
+                {"name": "stable", "labels": {"release": "stable"}},
+                {"name": "canary", "labels": {"release": "canary"}, "future_subset_option": true}
+            ]
+        }],
+        "plugin_configs": [{
+            "id": "limit",
+            "plugin_name": "rate_limiting",
+            "namespace": "ferrum",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"any": [
+                {"match": {"method": ["GET"]}},
+                {"match": {"path": {"prefix": ["/api"], "future_match_option": "x"}}}
+            ]}}
+        }]
+    });
+
+    assert_eq!(
+        unmodeled_paths(&backup),
+        [
+            "PluginConfig ferrum/limit .spec.trigger.when.any[1].match.path.future_match_option",
+            "Proxy ferrum/tcp .spec.stream_match.arms[1].future_arm_option",
+            "Upstream ferrum/u .spec.subsets[1].future_subset_option",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+    );
+}
+
+/// Consumer has no typed nested structure: `credentials` entries are opaque
+/// JSON, so nothing below them is ever reported or dropped.
+#[test]
+fn consumer_credential_entries_are_exempt_from_nested_unknown_detection() {
+    let backup = serde_json::json!({
+        "version": "1",
+        "consumers": [{
+            "id": "c",
+            "username": "c",
+            "namespace": "ferrum",
+            "acl_groups": ["readers"],
+            "credentials": {"keyauth": [{
+                "key": "live-value",
+                "future_credential_option": {"deep": {"deeper": true}}
+            }]}
+        }]
+    });
+
+    assert!(unmodeled_paths(&backup).is_empty());
+    let snapshot =
+        gitforgeops::http_client::BackupSnapshot::from_body(&backup.to_string()).unwrap();
+    let entry = &snapshot.config.consumers[0].credentials["keyauth"][0];
+    assert_eq!(
+        entry["future_credential_option"]["deep"]["deeper"],
+        serde_json::json!(true)
+    );
+}
+
+/// ferrum-edge v0.9.7 `PassiveHealthCheck.consecutive_error_mode`,
+/// `consecutive_5xx_ejection_disabled` and `SubsetDefinition.traffic_policy`
+/// (operator-settable members) are modeled, so a gateway that sets them
+/// imports cleanly and keeps the values.
+#[test]
+fn file_import_keeps_newer_passive_health_and_subset_traffic_policy_fields() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.json");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let backup = serde_json::json!({
+        "version": "1",
+        "upstreams": [{
+            "id": "u",
+            "namespace": "ferrum",
+            "targets": [
+                {"host": "a.example.invalid", "port": 80, "tags": {"release": "canary"}}
+            ],
+            "health_checks": {"passive": {
+                "consecutive_error_mode": true,
+                "consecutive_5xx_ejection_disabled": true
+            }},
+            "subsets": [{
+                "name": "canary",
+                "labels": {"release": "canary"},
+                "traffic_policy": {
+                    "load_balancer_algorithm": "consistent_hashing",
+                    "hash_on": "header:x-session-id"
+                }
+            }]
+        }]
+    });
+    assert!(unmodeled_paths(&backup).is_empty());
+    std::fs::write(&backup_path, backup.to_string()).unwrap();
+
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+
+    let yaml = std::fs::read_to_string(output.join("ferrum/upstreams/u.yaml")).unwrap();
+    for expected in [
+        "consecutive_error_mode: true",
+        "consecutive_5xx_ejection_disabled: true",
+        "load_balancer_algorithm: consistent_hashing",
+        "header:x-session-id",
+    ] {
+        assert!(yaml.contains(expected), "missing `{expected}`:\n{yaml}");
+    }
+}
+
+/// Only the operator-settable subset traffic-policy members are modeled. The
+/// mesh-projected ones are rejected by the gateway on operator writes, so a
+/// live row carrying them is refused rather than truncated.
+#[test]
+fn mesh_projected_subset_traffic_policy_members_stay_unmodeled() {
+    let backup = serde_json::json!({
+        "version": "1",
+        "upstreams": [{
+            "id": "u",
+            "namespace": "ferrum",
+            "targets": [{"host": "a.example.invalid", "port": 80}],
+            "subsets": [{
+                "name": "canary",
+                "labels": {},
+                "traffic_policy": {"hash_on": "ip", "connect_timeout_ms": 250}
+            }]
+        }]
+    });
+
+    assert_eq!(
+        unmodeled_paths(&backup),
+        ["Upstream ferrum/u .spec.subsets[0].traffic_policy.connect_timeout_ms".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn nested_unknown_import_refusal_lists_a_bounded_number_of_offenders() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.json");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let limit = gitforgeops::http_client::MAX_LISTED_UNMODELED_NESTED_FIELDS;
+    let upstreams = (0..limit + 5)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("u{index:03}"),
+                "namespace": "ferrum",
+                "targets": [{"host": "a.example.invalid", "port": 80, "future_target_option": 1}]
+            })
+        })
+        .collect::<Vec<_>>();
+    let backup = serde_json::json!({"version": "1", "upstreams": upstreams});
+    std::fs::write(&backup_path, backup.to_string()).unwrap();
+
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert_eq!(
+        error.matches(".spec.targets[0].future_target_option").count(),
+        limit,
+        "{error}"
+    );
+    assert!(error.contains("Upstream 'u000'"), "{error}");
+    let first_omitted = format!("Upstream 'u{limit:03}'");
+    assert!(!error.contains(&first_omitted), "{error}");
+    assert!(error.ends_with("\n  …and 5 more"), "{error}");
+    assert!(!output.exists());
+}

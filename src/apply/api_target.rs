@@ -591,10 +591,30 @@ async fn prepare_apply<'a>(
                 ))
             })?;
             ensure_restore_sections_supported(namespace, live_extras)?;
-            prepared.full_replaces.insert(
-                namespace.clone(),
-                prepare_full_replace(&desired_namespace, actual, live_extras, namespace, options)?,
-            );
+            let full_replace =
+                prepare_full_replace(&desired_namespace, actual, live_extras, namespace, options)?;
+            // The restore body re-creates every row it carries, including the
+            // live spec-owned rows `preserve_spec_owned_graph` copied in.
+            if let Some(block) = unmodeled_nested_field_block(
+                &live_extras.unmodeled_nested_fields,
+                &full_replace.config,
+                namespace,
+            ) {
+                prepared.blocked.insert(namespace.clone(), block);
+                continue;
+            }
+            prepared.full_replaces.insert(namespace.clone(), full_replace);
+        } else if let Some(live_extras) = extras.get(namespace) {
+            // Every incremental write to an existing row (update, pending-create
+            // assertion, adoption, ambiguous-create ownership assertion) is a
+            // full-resource PUT built from the repository declaration.
+            if let Some(block) = unmodeled_nested_field_block(
+                &live_extras.unmodeled_nested_fields,
+                &desired_namespace,
+                namespace,
+            ) {
+                prepared.blocked.insert(namespace.clone(), block);
+            }
         }
     }
 
@@ -638,6 +658,49 @@ fn spec_owned_conflict_block(
         "refusing apply for namespace `{namespace}`: repository declarations conflict with live API-spec-owned resources: {}. Remove the repository declaration or manage the row through the API spec importer. No resource in this namespace was written; other namespaces were reconciled normally",
         conflicts.join(", ")
     )))
+}
+
+/// Refuse to rewrite a live row whose backup carried nested fields this build
+/// does not model.
+///
+/// The typed decode dropped those values, so a PUT or `/restore` built from
+/// the repository declaration would omit them and the gateway would reset
+/// each one to its default — a silent change nobody declared. `written` is
+/// every row the namespace's writes may send: the desired declarations for
+/// incremental apply, the restore body for full replace. Rows the repository
+/// does not declare are either left alone or deleted, neither of which
+/// truncates anything, so they do not block. An entry that could not be
+/// attributed to a resource blocks unconditionally.
+///
+/// Namespace-scoped like [`spec_owned_conflict_block`]. There is no override:
+/// the repository loader rejects the same nested fields, so no declaration
+/// could carry them.
+fn unmodeled_nested_field_block(
+    fields: &[http_client::UnmodeledNestedField],
+    written: &GatewayConfig,
+    namespace: &str,
+) -> Option<String> {
+    let rows = ResourceIndex::build(written);
+    let offenders = fields
+        .iter()
+        .filter(|field| {
+            let key = (field.namespace.as_str(), field.id.as_str());
+            match field.kind.as_str() {
+                "Proxy" => rows.proxies.contains_key(&key),
+                "Consumer" => rows.consumers.contains_key(&key),
+                "Upstream" => rows.upstreams.contains_key(&key),
+                "PluginConfig" => rows.plugin_configs.contains_key(&key),
+                _ => true,
+            }
+        })
+        .collect::<Vec<_>>();
+    if offenders.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing apply for namespace `{namespace}`: live row(s) this run would rewrite carry nested field(s) this build of gitforgeops does not model, and the write would reset them to their gateway defaults: {}. Upgrade gitforgeops to a version that models them, remove them on the gateway, or stop declaring the row. No resource in this namespace was written; other namespaces were reconciled normally",
+        http_client::describe_unmodeled_nested_fields(offenders).join("; ")
+    ))
 }
 
 /// Errors that make continuing to the next namespace pointless or unsafe.

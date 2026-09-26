@@ -572,9 +572,19 @@ rejects them: there is nowhere in a resource file to keep them, so writing the
 tree would silently drop them. The refusal names each resource and the full
 field path (`.spec.targets[1].future_option`), and nothing — neither tree nor
 credential import bundle — is written. `--accept-unknown-field` does not cover
-nested fields; upgrade gitforgeops or remove the field on the gateway.
+nested fields; upgrade gitforgeops or remove the field on the gateway. The
+refusal lists the first 20 offenders and counts the rest.
 Deliberately opaque sections (plugin `config`, credential entries) are carried
 verbatim and are not affected.
+
+`apply` applies the same rule to live rows it would rewrite. Every update to
+an existing resource is a full-resource `PUT` (and full replace re-creates every
+row in its `/restore` body), so a nested field the build cannot represent would
+be omitted and the gateway would reset it to its default. When a row the
+repository declares — or a row a full-replace body carries — has such a field
+live, the namespace is refused before anything in it is written; other
+namespaces still reconcile and the run exits non-zero. Deleting or leaving an
+undeclared row alone never truncates it and is not affected.
 
 Upgrading gitforgeops is the real fix. When you cannot wait, read the source,
 confirm the field is not a credential, and re-run with one
