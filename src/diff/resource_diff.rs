@@ -38,8 +38,7 @@ pub fn mask_indeterminate_secret_values(
             .or_insert(consumer);
     }
     for live in &mut actual.consumers {
-        if let Some(expected) = desired_consumers
-            .get(&(live.namespace.as_str(), live.id.as_str()))
+        if let Some(expected) = desired_consumers.get(&(live.namespace.as_str(), live.id.as_str()))
         {
             for (credential_type, desired_value) in &expected.credentials {
                 if let Some(live_value) = live.credentials.get_mut(credential_type) {
@@ -65,8 +64,8 @@ pub fn mask_indeterminate_secret_values(
             .or_insert(plugin);
     }
     for live in &mut actual.plugin_configs {
-        if let Some(expected) = desired_plugin_configs
-            .get(&(live.namespace.as_str(), live.id.as_str()))
+        if let Some(expected) =
+            desired_plugin_configs.get(&(live.namespace.as_str(), live.id.as_str()))
         {
             mask_unresolved_leaves(
                 &expected.config,
@@ -95,8 +94,7 @@ pub fn mask_indeterminate_secret_values(
             .or_insert(upstream);
     }
     for live in &mut actual.upstreams {
-        let Some(expected) = desired_upstreams
-            .get(&(live.namespace.as_str(), live.id.as_str()))
+        let Some(expected) = desired_upstreams.get(&(live.namespace.as_str(), live.id.as_str()))
         else {
             continue;
         };

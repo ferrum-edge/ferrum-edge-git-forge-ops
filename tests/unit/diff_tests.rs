@@ -183,15 +183,13 @@ fn unresolved_secret_masking_matches_large_consumer_fixture() {
     for (index, consumer) in actual.consumers.iter().take(CONSUMER_COUNT).enumerate() {
         assert_eq!(consumer.id, format!("consumer-{index:05}"));
         assert_eq!(
-            consumer.credentials["keyauth"][0]["key"],
-            placeholder,
+            consumer.credentials["keyauth"][0]["key"], placeholder,
             "consumer {} was not masked",
             consumer.id
         );
     }
     assert_eq!(
-        actual.consumers[CONSUMER_COUNT].credentials["keyauth"][0]["key"],
-        "live-only-secret",
+        actual.consumers[CONSUMER_COUNT].credentials["keyauth"][0]["key"], "live-only-secret",
         "unmatched live resources must remain visible"
     );
 }
