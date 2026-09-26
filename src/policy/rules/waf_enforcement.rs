@@ -46,7 +46,7 @@ impl WafEnforcementRule {
                 if !waf_has_enforcing_rule(&plugin.config) {
                     push(
                         format!(
-                            "waf plugin {} in namespace {} has mode: enforce but every built-in rule is monitor-only — no rule_modes, rule_overrides, custom_rules or default_rule_action promotes one to enforcement",
+                            "waf plugin {} in namespace {} has mode: enforce but no rule enforces — the built-in rules are monitor-only and no rule_modes, rule_overrides, default_rule_action or enabled enforcing custom_rules entry promotes one to enforcement",
                             plugin.id, plugin.namespace
                         ),
                         "Set config.default_rule_action: enforce, or promote individual rules via config.rule_modes"
