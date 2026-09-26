@@ -3,11 +3,12 @@ pub mod file_target;
 
 pub use api_target::{
     adoption_candidates, adoption_summary_line, all_deletes_missing_warning, apply_api,
-    dedupe_pending_assertions, exclusive_prune_denominator, format_prune_percentage,
-    incremental_plugin_attach_notice, incremental_prune_notice, large_prune_exceeds_threshold,
-    operation_rank, order_diffs, order_incremental_diffs, pending_create_assertion_diffs,
-    preflight_api_apply, preserve_spec_owned_graph, spec_owned_skip_messages, stale_view_block,
-    validate_no_desired_spec_tags, AdoptionCandidate, AppliedOp, ApplyOptions, ApplyResult,
+    apply_blocked_namespaces, dedupe_pending_assertions, exclusive_prune_denominator,
+    format_prune_percentage, incremental_plugin_attach_notice, incremental_prune_notice,
+    large_prune_exceeds_threshold, operation_rank, order_diffs, order_incremental_diffs,
+    pending_create_assertion_diffs, preflight_api_apply, preserve_spec_owned_graph,
+    spec_owned_skip_messages, stale_view_block, validate_no_desired_spec_tags, AdoptionCandidate,
+    AppliedOp, ApplyOptions, ApplyResult, BlockedNamespaces,
 };
 pub use file_target::{
     apply_file, apply_mesh_file, ensure_distinct_publication_paths, plan_mesh_publication,

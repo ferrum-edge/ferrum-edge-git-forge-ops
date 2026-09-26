@@ -3950,3 +3950,35 @@ fn the_credential_handoff_is_never_written_through_a_symlink() {
         "untouched"
     );
 }
+
+#[test]
+fn a_report_without_refused_namespaces_allocates_nothing_for_them() {
+    use gitforgeops::secrets::{ResolveReport, ResolveResult};
+
+    let mut report = ResolveReport::default();
+    for namespace in ["refused", "kept"] {
+        report.results.push(ResolveResult {
+            consumer_id: "app".into(),
+            namespace: namespace.into(),
+            cred_key: "keyauth/key".into(),
+            slot: slot_path(namespace, "app", "keyauth/key"),
+            placeholder: parse_placeholder(GENERATE).unwrap().unwrap(),
+            status: SlotStatus::NeedsAllocation,
+        });
+    }
+
+    let allocatable = report.without_namespaces(["refused"]);
+
+    let slots = allocatable
+        .needs_allocation()
+        .into_iter()
+        .map(|result| result.namespace.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(slots, vec!["kept"]);
+    assert_eq!(
+        report.needs_allocation().len(),
+        2,
+        "the original is untouched"
+    );
+    assert_eq!(report.without_namespaces([]).results.len(), 2);
+}
