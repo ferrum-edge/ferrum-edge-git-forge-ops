@@ -327,11 +327,14 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         // short") instead of the clear "not configured" ones.
         gateway_url,
         verify_base_url,
-        admin_jwt_secret: non_empty_env("FERRUM_ADMIN_JWT_SECRET"),
-        admin_jwt_issuer: non_empty_env("FERRUM_ADMIN_JWT_ISSUER")
+        // The signing key and the opaque `iss` / `aud` strings keep their
+        // exact bytes: the gateway verifies against the raw value, so a trim
+        // here would mint tokens it rejects.
+        admin_jwt_secret: exact_non_blank_env("FERRUM_ADMIN_JWT_SECRET"),
+        admin_jwt_issuer: exact_non_blank_env("FERRUM_ADMIN_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),
         admin_jwt_role,
-        admin_jwt_audience: non_empty_env("FERRUM_ADMIN_JWT_AUDIENCE"),
+        admin_jwt_audience: exact_non_blank_env("FERRUM_ADMIN_JWT_AUDIENCE"),
         admin_jwt_ttl_secs: parse_positive_i64_env(
             "FERRUM_ADMIN_JWT_TTL_SECS",
             DEFAULT_JWT_TTL_SECS,
@@ -680,6 +683,13 @@ fn non_empty_env(var: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Read an env var verbatim, treating empty/whitespace as unset. For values
+/// the gateway compares byte-for-byte (the HS256 key, `iss`, `aud`): blank
+/// still means "not configured", but a non-blank value is never trimmed.
+fn exact_non_blank_env(var: &str) -> Option<String> {
+    env::var(var).ok().filter(|v| !v.trim().is_empty())
 }
 
 fn normalized_env(var: &str) -> Option<String> {

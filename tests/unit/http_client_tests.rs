@@ -71,6 +71,27 @@ fn admin_client_rejects_short_jwt_secret() {
     );
 }
 
+/// The gateway measures its minimum over the exact secret bytes, so padding
+/// counts toward the length and a short core padded out to 32 bytes is kept
+/// whole rather than being rejected after a trim.
+#[test]
+fn admin_client_measures_jwt_secret_length_over_exact_bytes() {
+    let mut env = base_env();
+    env.admin_jwt_secret = Some("  short-core-padded-to-32-bytes  ".to_string());
+    AdminClient::new_scoped(&env, TEST_NAMESPACES)
+        .expect("a 33-byte secret meets the minimum even with padding");
+
+    env.admin_jwt_secret = Some("  too-short  ".to_string());
+    let err = match AdminClient::new_scoped(&env, TEST_NAMESPACES) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
+    assert!(
+        err.contains("at least 32 characters"),
+        "expected short-secret error, got: {err}"
+    );
+}
+
 #[test]
 fn admin_client_builds_without_mtls() {
     let env = base_env();
