@@ -101,17 +101,44 @@ pub fn effective_auth_allowlist(policy: Option<&PolicyConfig>) -> AuthAllowlist 
         .auth_allowlist()
 }
 
-/// A protocol declaration must name a custom authenticator on the allowlist.
-/// A built-in's protocols are the gateway's, and a name missing from the
-/// allowlist declares nothing, so both are typos to fail on rather than
-/// silently ignore.
+/// Every allowlisted built-in must be an authenticator, and a protocol
+/// declaration must name a custom authenticator on the allowlist.
+///
+/// A built-in outside [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`] (`opa`,
+/// `access_control`, `spiffe_identity`, …) runs on no protocol as an
+/// authenticator and its protocols cannot be declared, so listing it could
+/// only ever report its instances as ignored. A built-in's protocols are the
+/// gateway's, a legacy alias is not a loadable `plugin_name`, and a name
+/// missing from the allowlist declares nothing. All of these are mistakes to
+/// fail on rather than silently ignore.
 fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::error::Result<()> {
+    for name in &cfg.auth_plugin_names {
+        let lowered = name.to_ascii_lowercase();
+        if crate::plugin_catalog::is_builtin(&lowered)
+            && !crate::plugin_catalog::is_auth_plugin(&lowered)
+        {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.auth_plugin_names lists built-in plugin '{name}', which \
+                 does not authenticate callers; the gateway never runs it as an authenticator, \
+                 so remove it (built-in authenticators: {})",
+                crate::plugin_catalog::AUTH_PLUGIN_NAMES.join(", ")
+            )));
+        }
+    }
     let allowlist = cfg.auth_allowlist();
     for name in cfg.custom_auth_plugin_protocols.keys() {
-        if crate::plugin_catalog::is_builtin(&name.to_ascii_lowercase()) {
+        let lowered = name.to_ascii_lowercase();
+        if crate::plugin_catalog::is_builtin(&lowered) {
             return Err(crate::error::Error::Config(format!(
                 "require_auth_plugin.custom_auth_plugin_protocols lists built-in plugin '{name}'; \
                  the gateway fixes a built-in's protocols, so remove the entry"
+            )));
+        }
+        if LEGACY_AUTH_PLUGIN_ALIASES.contains(&lowered.as_str()) {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.custom_auth_plugin_protocols lists '{name}', a legacy \
+                 spelling that is not a gateway plugin_name and can never match a live \
+                 plugin; remove the entry"
             )));
         }
         if !allowlist.contains(name) {
@@ -126,9 +153,11 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
 
 /// Spellings that are not real `plugin_name` values but appear in
 /// hand-written policy files and in this repo's own examples from before the
-/// catalog was pinned down. Tolerated so an upgrade does not suddenly report
-/// every proxy as unauthenticated, but they can never match a live plugin —
-/// `plugin_name_is_known` flags them separately as unknown names.
+/// catalog was pinned down. They stay in the default allowlist, but they are
+/// not built-ins, so like any custom name they count for plain HTTP only, and
+/// they can never match a live plugin — `plugin_name_is_known` flags them
+/// separately as unknown names. They cannot be given protocols under
+/// `custom_auth_plugin_protocols`.
 const LEGACY_AUTH_PLUGIN_ALIASES: &[&str] = &[
     "jwt",
     "oauth2",

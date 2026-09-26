@@ -2154,7 +2154,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         extra: Default::default(),
         id: "jwt-on".to_string(),
         namespace: "ferrum".to_string(),
-        plugin_name: "jwt".to_string(),
+        plugin_name: "jwt_auth".to_string(),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -2476,8 +2476,9 @@ fn require_auth_plugin_does_not_count_spiffe_identity() {
         assert!(!remediation.contains("spiffe_identity"), "{remediation}");
     }
 
-    // Allowlisting it explicitly does not make it an authenticator either: it
-    // is reported as ignored.
+    // Loading a policy file that allowlists it fails; an in-memory allowlist
+    // that names it still does not make it an authenticator: it is reported
+    // as ignored.
     let explicit = require_auth_policies(Some(&["spiffe_identity"]));
     let cfg = GatewayConfig {
         proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
@@ -2532,8 +2533,10 @@ fn require_auth_plugin_requires_an_authenticator_for_every_http_family_protocol(
 #[test]
 fn require_auth_plugin_honours_declared_custom_authenticator_protocols() {
     let mut policies = require_auth_policies(Some(&["company_sso"]));
-    policies.policies.require_auth_plugin.custom_auth_plugin_protocols =
-        custom_protocols(&[("company_sso", HTTP_FAMILY_PROTOCOLS)]);
+    policies
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols = custom_protocols(&[("company_sso", HTTP_FAMILY_PROTOCOLS)]);
 
     let http = GatewayConfig {
         proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
@@ -2552,7 +2555,10 @@ fn require_auth_plugin_honours_declared_custom_authenticator_protocols() {
 
     // A custom stream authenticator is declared persistently rather than
     // released per PR.
-    policies.policies.require_auth_plugin.custom_auth_plugin_protocols =
+    policies
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols =
         custom_protocols(&[("company_sso", &[PluginProtocol::Tcp][..])]);
     assert!(auth_findings(&stream, &policies).is_empty());
     let findings = auth_findings(&http, &policies);
@@ -2899,8 +2905,48 @@ policies:
     let err = load(&rule("company_ssso: [http]")).unwrap_err().to_string();
     assert!(err.contains("'company_ssso'"), "{err}");
 
+    // A legacy alias is not a gateway plugin_name, so it can never match a
+    // live plugin; declaring its protocols is an error.
+    let err = load(&rule("jwt: [http, grpc, websocket]"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'jwt', a legacy spelling"), "{err}");
+
     // Unknown protocols fail to parse.
     assert!(load(&rule("company_sso: [quic]")).is_err());
+}
+
+#[test]
+fn policy_config_rejects_non_auth_builtins_in_auth_plugin_names() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let load = |names: &str| {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "version: 1\npolicies:\n  require_auth_plugin:\n    auth_plugin_names: {names}\n"
+        )
+        .unwrap();
+        load_policies_from_path(file.path())
+    };
+
+    // A non-auth built-in could only ever be reported as ignored, and its
+    // protocols cannot be declared, so it is rejected at load.
+    for name in ["opa", "access_control", "spiffe_identity", "Access_Control"] {
+        let names = format!("[jwt_auth, {name}]");
+        let err = load(&names).unwrap_err().to_string();
+        assert!(err.contains(&format!("built-in plugin '{name}'")), "{err}");
+        assert!(err.contains("does not authenticate callers"), "{err}");
+    }
+
+    // Authenticators, in any case, custom names and legacy aliases still load.
+    let loaded = load("[Jwt_Auth, mtls_auth, company_sso, jwt]")
+        .unwrap()
+        .unwrap();
+    let names = &loaded.policies.require_auth_plugin.auth_plugin_names;
+    assert_eq!(names.len(), 4);
 }
 
 #[test]

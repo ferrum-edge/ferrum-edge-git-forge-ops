@@ -1090,7 +1090,10 @@ fn breaking_ignores_undeclared_unmanaged_authenticator_in_shared_mode() {
 fn shared_auth_coverage_reasons(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
-) -> (Vec<gitforgeops::diff::resource_diff::ResourceDiff>, Vec<String>) {
+) -> (
+    Vec<gitforgeops::diff::resource_diff::ResourceDiff>,
+    Vec<String>,
+) {
     let managed = std::collections::HashSet::new();
     let result = compute_diff_with_scope(
         desired,
@@ -1151,6 +1154,30 @@ fn breaking_skips_auth_coverage_for_deleted_proxies() {
     desired.proxies.retain(|p| p.id != "orders");
     let reasons = auth_coverage_reasons(&desired, &actual);
     assert_eq!(reasons, vec!["Proxy deleted".to_string()]);
+}
+
+/// A live proxy an OpenAPI spec import owns is never deleted or written by
+/// the repo, whether or not the repo declares it, so it survives the apply
+/// in its live shape. Narrowing the managed global authenticator away from it
+/// is still an authentication loss.
+#[test]
+fn breaking_detects_auth_loss_on_retained_spec_owned_proxy() {
+    let mut actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    actual.proxies[0].api_spec_id = Some("spec-orders".to_string());
+
+    // Undeclared: the diff retains the spec-owned row instead of deleting it.
+    let mut desired = auth_coverage_config("", KEY_AUTH_ON_PAYMENTS);
+    desired.proxies.retain(|p| p.id != "orders");
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    assert!(diffs.iter().all(|d| d.id != "orders"), "{diffs:?}");
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons, vec![ORDERS_LEFT_WITHOUT_KEY_AUTH.to_string()]);
+
+    // Declared: the spec-owned row is an ownership conflict, not a Modify, so
+    // it keeps its live shape and the loss is reported the same way.
+    let desired = auth_coverage_config("", KEY_AUTH_ON_PAYMENTS);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons, vec![ORDERS_LEFT_WITHOUT_KEY_AUTH.to_string()]);
 }
 
 /// `orders` (the first proxy) as a TCP stream proxy that terminates TLS.

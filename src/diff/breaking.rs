@@ -261,10 +261,7 @@ fn check_proxy_auth_coverage(
                 reason: format!(
                     "proxy {}/{} loses authenticator {} — consumer credentials for it no \
                      longer apply on this proxy{}",
-                    live_proxy.namespace,
-                    live_proxy.id,
-                    name,
-                    consequence
+                    live_proxy.namespace, live_proxy.id, name, consequence
                 ),
             });
         }

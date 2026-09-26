@@ -46,6 +46,9 @@ policies:
     # Omit the key entirely to use all ten built-in authenticators:
     # mtls_auth, jwks_auth, oauth2_introspection, oidc_relying_party,
     # jwt_auth, key_auth, ldap_auth, basic_auth, hmac_auth, soap_ws_security.
+    # Any other built-in (opa, access_control, spiffe_identity, ...) does not
+    # authenticate callers, so listing one fails the policy file load; list
+    # custom authenticators by their own plugin_name.
     auth_plugin_names:
       - jwt_auth
       - jwks_auth
@@ -56,7 +59,8 @@ policies:
     # Protocols each custom authenticator in auth_plugin_names implements
     # (its supported_protocols(): http, grpc, websocket, tcp, udp). An
     # undeclared custom authenticator counts for plain HTTP only, the
-    # gateway's default. Built-in names cannot be listed here.
+    # gateway's default. Built-in names and legacy spellings such as jwt or
+    # oauth2 (not real plugin names) cannot be listed here.
     # custom_auth_plugin_protocols:
     #   company_sso: [http, grpc, websocket]
 
