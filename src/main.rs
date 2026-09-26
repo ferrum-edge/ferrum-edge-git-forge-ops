@@ -796,8 +796,9 @@ async fn allocate_if_needed(
         .as_deref()
         .ok_or(verdict::BlockerKind::ProvisioningRepository.remedy())?;
 
-    let recipient = std::env::var("GITFORGEOPS_ACTOR").ok();
-
+    // Deliver to the same normalized recipient the allocation journal records,
+    // so delivery and the retry binding can never disagree about who holds
+    // the values.
     let client = build_github_api_client(env_config)?;
 
     let outcome = match secrets::allocate_and_deliver(
@@ -805,7 +806,7 @@ async fn allocate_if_needed(
         repo,
         &resolved.name,
         token,
-        recipient.as_deref(),
+        binding.recipient.as_deref(),
         report,
         per_shard,
         shard_count,
