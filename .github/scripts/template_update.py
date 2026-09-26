@@ -198,6 +198,9 @@ def validate_ref(value: object, field: str) -> str:
 # the last component (`origin/HEAD`).
 PSEUDO_REF = re.compile(r"(?:[A-Z]+_)*HEAD\Z", re.IGNORECASE)
 
+# The one remote the upstream copy configures (`prepare_mirror`).
+MIRROR_REMOTE = "origin"
+
 
 def validate_target_ref(value: object, field: str) -> str:
     """A valid ref that names a revision, not whatever a copy last pointed at."""
@@ -207,6 +210,17 @@ def validate_target_ref(value: object, field: str) -> str:
             f"{field} {ref} is ambiguous: HEAD and the other *HEAD pseudo-refs "
             "move with whichever copy resolves them; provide an explicit branch, "
             "tag, or SHA"
+        )
+    # Git resolves a bare remote name through `refs/remotes/<name>/HEAD`, which
+    # a fetch creates, so it is `origin/HEAD` by another spelling. Compared
+    # without case, since a case-insensitive filesystem finds the loose ref
+    # under any spelling.
+    if ref.lower() == MIRROR_REMOTE:
+        raise UpdateError(
+            f"{field} {ref} is ambiguous: it names the upstream remote, which "
+            "resolves to whichever branch upstream marks as its default; provide "
+            "an explicit branch, tag, or SHA (a branch that is really named "
+            f"{ref} is refs/heads/{ref})"
         )
     return ref
 
@@ -751,9 +765,14 @@ def build_plan(
         parent = blocking[0]
         if change.path in keep:
             change.action = KEPT
+            here = (
+                "--keep keeps as a file here"
+                if actions[parent] == KEPT
+                else "which is in conflict here"
+            )
             change.detail = (
-                f"upstream adds it under {parent}, which stays a file here; not "
-                "adopted, kept by --keep"
+                f"upstream adds it under {parent}, which upstream made a directory "
+                f"but {here}; not adopted, kept by --keep"
             )
         elif actions[parent] == KEPT:
             change.action = CONFLICT
@@ -969,14 +988,20 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
     _git(workdir, "init", "--quiet", "--bare", str(mirror))
     for key, value in MIRROR_CONFIG:
         _git(mirror, "config", key, value)
-    _git(mirror, "remote", "add", "origin", "--", location)
-    _git(mirror, "config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/heads/*")
-    _git(mirror, "fetch", "--quiet", "--tags", "origin")
+    _git(mirror, "remote", "add", MIRROR_REMOTE, "--", location)
+    _git(
+        mirror,
+        "config",
+        "--add",
+        f"remote.{MIRROR_REMOTE}.fetch",
+        "+refs/heads/*:refs/heads/*",
+    )
+    _git(mirror, "fetch", "--quiet", "--tags", MIRROR_REMOTE)
     for ref in refs:
         # Fail here, with the ref named, rather than deep inside a comparison.
         # A commit no branch or tag reaches can still be fetched by its ID.
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
-            _git(mirror, "fetch", "--quiet", "origin", "--", ref, check=False)
+            _git(mirror, "fetch", "--quiet", MIRROR_REMOTE, "--", ref, check=False)
         if not _git(mirror, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False):
             raise UpdateError(
                 f"upstream revision {ref!r} could not be resolved in {upstream}"
@@ -991,10 +1016,66 @@ def resolve(mirror: Path, ref: str) -> str:
     return resolved
 
 
-# The name `write_local` gives its temporary file, and how old one has to be
-# before no run can still be writing it.
-TEMPORARY_NAME = re.compile(r"\..+\.template-update-[0-9a-f]{16}")
+# The name `write_local` gives its temporary file (the group is the name of the
+# file it was writing), and how old one has to be before no run can still be
+# writing it.
+TEMPORARY_NAME = re.compile(r"\.(.+)\.template-update-[0-9a-f]{16}")
 STALE_TEMPORARY_SECONDS = 10 * 60
+
+
+def _sweep_temporaries(
+    descriptor: int,
+    directory: str,
+    owners: frozenset[str] | None,
+    *,
+    remove: bool,
+    now: float,
+) -> list[str]:
+    """Deal with the temporaries in one open directory; return its subdirectories.
+
+    `owners` limits the sweep to the temporaries of those file names; None
+    accepts the temporary of any file.
+    """
+    minutes = STALE_TEMPORARY_SECONDS // 60
+    subdirectories: list[str] = []
+    for child in os.listdir(descriptor):
+        # A nested clone's own `.git` is not part of this tree.
+        if child.lower() == ".git":
+            continue
+        child_info = _lstat_at(descriptor, child)
+        if child_info is None:
+            continue
+        if stat.S_ISDIR(child_info.st_mode):
+            subdirectories.append(child)
+            continue
+        if not stat.S_ISREG(child_info.st_mode):
+            continue
+        match = TEMPORARY_NAME.fullmatch(child)
+        if match is None or (owners is not None and match.group(1) not in owners):
+            continue
+        shown = f"{directory}/{child}" if directory else child
+        stale = now - child_info.st_mtime >= STALE_TEMPORARY_SECONDS
+        if remove and stale:
+            os.unlink(child, dir_fd=descriptor)
+            print(
+                f"removed {shown}, left by an interrupted template update",
+                file=sys.stderr,
+            )
+        elif remove:
+            print(
+                f"left {shown} in place: it is less than {minutes} "
+                "minutes old, so another template update may still be "
+                "writing it",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"found {shown}, apparently left by an interrupted "
+                "template update; `apply` or `detect-baseline --write` "
+                f"removes it once it is {minutes} minutes old",
+                file=sys.stderr,
+            )
+    return subdirectories
 
 
 def _remove_stale_temporaries(root: Path, *, remove: bool) -> None:
@@ -1006,7 +1087,6 @@ def _remove_stale_temporaries(root: Path, *, remove: bool) -> None:
     with exactly the name `write_local` gives is ever touched.
     """
     now = time.time()
-    minutes = STALE_TEMPORARY_SECONDS // 60
     pending = list(UPSTREAM_MANAGED)
     while pending:
         relative = pending.pop()
@@ -1016,44 +1096,29 @@ def _remove_stale_temporaries(root: Path, *, remove: bool) -> None:
                 continue
             descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent)
             try:
-                for child in os.listdir(descriptor):
-                    # A nested clone's own `.git` is not part of this tree.
-                    if child.lower() == ".git":
-                        continue
-                    child_info = _lstat_at(descriptor, child)
-                    if child_info is None:
-                        continue
-                    if stat.S_ISDIR(child_info.st_mode):
-                        pending.append(f"{relative}/{child}")
-                        continue
-                    if not stat.S_ISREG(child_info.st_mode):
-                        continue
-                    if TEMPORARY_NAME.fullmatch(child) is None:
-                        continue
-                    shown = f"{relative}/{child}"
-                    stale = now - child_info.st_mtime >= STALE_TEMPORARY_SECONDS
-                    if remove and stale:
-                        os.unlink(child, dir_fd=descriptor)
-                        print(
-                            f"removed {shown}, left by an interrupted template update",
-                            file=sys.stderr,
-                        )
-                    elif remove:
-                        print(
-                            f"left {shown} in place: it is less than {minutes} "
-                            "minutes old, so another template update may still be "
-                            "writing it",
-                            file=sys.stderr,
-                        )
-                    else:
-                        print(
-                            f"found {shown}, apparently left by an interrupted "
-                            "template update; `apply` or `detect-baseline --write` "
-                            f"removes it once it is {minutes} minutes old",
-                            file=sys.stderr,
-                        )
+                subdirectories = _sweep_temporaries(
+                    descriptor, relative, None, remove=remove, now=now
+                )
             finally:
                 os.close(descriptor)
+        pending.extend(f"{relative}/{child}" for child in subdirectories)
+
+    # A managed file that is not inside a managed directory — `Cargo.toml` at
+    # the root, `.github/dependabot.yml`, the `.gitforgeops/` examples and the
+    # baseline record — leaves its temporary in a directory the walk above
+    # never enters. That directory is looked at too, without descending, and
+    # only for the temporaries of those files' own names.
+    owners: dict[str, tuple[str, set[str]]] = {}
+    for relative in (*UPSTREAM_MANAGED, BASELINE_PATH.as_posix()):
+        directory, _, name = relative.rpartition("/")
+        owners.setdefault(directory, (relative, set()))[1].add(name)
+    for directory, (relative, names) in sorted(owners.items()):
+        with _parent_directory(root, relative) as (parent, _):
+            if parent is None:
+                continue
+            _sweep_temporaries(
+                parent, directory, frozenset(names), remove=remove, now=now
+            )
 
 
 def identify(root: Path) -> dict:
