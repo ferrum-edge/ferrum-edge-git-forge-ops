@@ -2,8 +2,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use gitforgeops::config::env::{
     load_env_config, validate_gateway_transport, validate_verify_transport, ApplyStrategy,
-    GatewayMode,
+    EnvConfig, GatewayMode,
 };
+use gitforgeops::jwt::{mint_jwt, JwtOptions};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
 // Env tests mutate process-global state and must run serially. Cargo's test
 // harness runs tests in parallel by default; this mutex gates every env test
@@ -155,6 +157,117 @@ fn env_config_treats_blank_jwt_vars_as_unset() {
     assert_eq!(config.admin_jwt_issuer, "ferrum-edge");
     // Blank is absent and retains the documented default.
     assert_eq!(config.admin_jwt_ttl_secs, 3600);
+
+    clear_env();
+}
+
+/// Verify `token` the way the gateway does: HS256 over the exact configured
+/// key bytes, with `iss` (and `aud` when configured) compared verbatim.
+fn gateway_verifies(
+    token: &str,
+    secret: &str,
+    issuer: &str,
+    audience: Option<&str>,
+) -> jsonwebtoken::errors::Result<()> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&[issuer]);
+    if let Some(audience) = audience {
+        validation.set_audience(&[audience]);
+    }
+    let key = DecodingKey::from_secret(secret.as_bytes());
+    decode::<serde_json::Value>(token, &key, &validation)?;
+    Ok(())
+}
+
+/// Load the environment and mint a token through the real client path.
+fn mint_from_loaded_env() -> (EnvConfig, String) {
+    let config = load_env_config().unwrap();
+    let secret = config.admin_jwt_secret.as_deref().unwrap();
+    let token = mint_jwt(secret, &JwtOptions::from_env(&config)).unwrap();
+    (config, token)
+}
+
+const DEFAULT_ISSUER: &str = "ferrum-edge";
+
+/// The gateway builds its verifier from the exact `FERRUM_ADMIN_JWT_SECRET`
+/// bytes. A padded key must reach the signer untouched, or every token fails
+/// signature verification despite both sides holding the same secret.
+#[test]
+fn padded_admin_jwt_secret_signs_with_its_exact_bytes() {
+    let _guard = env_guard();
+    clear_env();
+
+    let secret = "  synthetic-padded-signing-key-at-least-32-bytes\t\n";
+    std::env::set_var("FERRUM_ADMIN_JWT_SECRET", secret);
+
+    let (config, token) = mint_from_loaded_env();
+    assert_eq!(config.admin_jwt_secret.as_deref(), Some(secret));
+    gateway_verifies(&token, secret, DEFAULT_ISSUER, None)
+        .expect("a gateway holding the same padded secret must accept the token");
+    let trimmed = gateway_verifies(&token, secret.trim(), DEFAULT_ISSUER, None);
+    assert!(
+        trimmed.is_err(),
+        "the token must not be signed with a trimmed copy of the key"
+    );
+
+    clear_env();
+}
+
+#[test]
+fn ordinary_admin_jwt_secret_signs_with_its_exact_bytes() {
+    let _guard = env_guard();
+    clear_env();
+
+    let secret = "synthetic-ordinary-signing-key-at-least-32-bytes";
+    std::env::set_var("FERRUM_ADMIN_JWT_SECRET", secret);
+
+    let (config, token) = mint_from_loaded_env();
+    assert_eq!(config.admin_jwt_secret.as_deref(), Some(secret));
+    gateway_verifies(&token, secret, DEFAULT_ISSUER, None)
+        .expect("a gateway holding the same secret must accept the token");
+
+    clear_env();
+}
+
+#[test]
+fn whitespace_only_admin_jwt_secret_reads_as_unset() {
+    let _guard = env_guard();
+    clear_env();
+
+    for blank in ["", " ", "\t\n  "] {
+        std::env::set_var("FERRUM_ADMIN_JWT_SECRET", blank);
+        let config = load_env_config().unwrap();
+        assert!(
+            config.admin_jwt_secret.is_none(),
+            "blank secret {blank:?} must read as not configured"
+        );
+    }
+
+    clear_env();
+}
+
+/// The gateway compares `iss` and `aud` as opaque strings taken verbatim from
+/// its own environment, so a non-blank value keeps its surrounding whitespace.
+#[test]
+fn padded_admin_jwt_issuer_and_audience_are_kept_verbatim() {
+    const ISSUER: &str = " padded-issuer ";
+    const AUDIENCE: &str = "\tpadded-audience ";
+
+    let _guard = env_guard();
+    clear_env();
+
+    let secret = "synthetic-ordinary-signing-key-at-least-32-bytes";
+    std::env::set_var("FERRUM_ADMIN_JWT_SECRET", secret);
+    std::env::set_var("FERRUM_ADMIN_JWT_ISSUER", ISSUER);
+    std::env::set_var("FERRUM_ADMIN_JWT_AUDIENCE", AUDIENCE);
+
+    let (config, token) = mint_from_loaded_env();
+    assert_eq!(config.admin_jwt_issuer, ISSUER);
+    assert_eq!(config.admin_jwt_audience.as_deref(), Some(AUDIENCE));
+    gateway_verifies(&token, secret, ISSUER, Some(AUDIENCE))
+        .expect("a gateway configured with the same padded iss/aud must accept the token");
+    let trimmed = gateway_verifies(&token, secret, ISSUER.trim(), Some(AUDIENCE.trim()));
+    assert!(trimmed.is_err());
 
     clear_env();
 }
