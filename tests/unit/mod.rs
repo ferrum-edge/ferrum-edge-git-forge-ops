@@ -26,6 +26,7 @@ mod ownership_tests;
 mod passthrough_tests;
 mod policy_tests;
 mod promotion_tests;
+mod publication_preflight_tests;
 mod quickstart_tests;
 mod reconcile_tests;
 mod repo_config_tests;

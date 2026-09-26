@@ -62,6 +62,12 @@ pub enum BlockerKind {
     /// A file-mode apply narrowed by an ad-hoc `FERRUM_NAMESPACE` would
     /// replace the document-wide gateway (and mesh) file with a subset.
     NarrowedFilePublication,
+    /// A file-mode run whose gateway and mesh document destinations resolve
+    /// to one file; the second publication would overwrite the first.
+    PublicationPathCollision,
+    /// `.gitforgeops/smoke.yaml` exists but does not load: `verify` would
+    /// only discover it after `apply` changed the gateway.
+    InvalidSmokeChecks,
 }
 
 impl BlockerKind {
@@ -76,6 +82,8 @@ impl BlockerKind {
             BlockerKind::ProvisionerToken => "provisioner-token",
             BlockerKind::ProvisioningRepository => "provisioning-repository",
             BlockerKind::NarrowedFilePublication => "narrowed-file-publication",
+            BlockerKind::PublicationPathCollision => "publication-path-collision",
+            BlockerKind::InvalidSmokeChecks => "invalid-smoke-checks",
         }
     }
 
@@ -114,6 +122,14 @@ impl BlockerKind {
                 "FERRUM_NAMESPACE narrows a file-mode environment, whose published document \
                  replaces the whole gateway file; unset FERRUM_NAMESPACE, or declare \
                  namespace_filter on the environment in .gitforgeops/config.yaml"
+            }
+            BlockerKind::PublicationPathCollision => {
+                "FERRUM_FILE_OUTPUT_PATH and FERRUM_MESH_FILE_OUTPUT_PATH resolve to the same \
+                 file; point the gateway and mesh documents at distinct paths"
+            }
+            BlockerKind::InvalidSmokeChecks => {
+                ".gitforgeops/smoke.yaml does not load; fix the reported check, or remove the \
+                 file if the environment declares no traffic checks"
             }
         }
     }
@@ -173,6 +189,12 @@ pub struct ApplyGateInputs<'a> {
     /// environment's publication scope
     /// ([`crate::config::ResolvedEnv::covers_environment`]).
     pub file_publication_narrowed: bool,
+    /// File mode, and the gateway and mesh destinations name one file
+    /// ([`crate::apply::ensure_distinct_publication_paths`] refused them).
+    pub publication_paths_collide: bool,
+    /// `.gitforgeops/smoke.yaml` exists and
+    /// [`crate::verify::SmokeConfig::load`] refused it.
+    pub smoke_checks_invalid: bool,
 }
 
 /// A file-mode publication is document-wide: whatever the run selected
@@ -180,6 +202,16 @@ pub struct ApplyGateInputs<'a> {
 /// namespace, and a mistyped one would publish an empty document.
 pub fn narrowed_file_publication_blocker(narrowed: bool) -> Option<ApplyBlocker> {
     narrowed.then(|| ApplyBlocker::new(BlockerKind::NarrowedFilePublication, 1))
+}
+
+/// Two documents published to one file keep only the last write.
+pub fn publication_path_collision_blocker(collide: bool) -> Option<ApplyBlocker> {
+    collide.then(|| ApplyBlocker::new(BlockerKind::PublicationPathCollision, 1))
+}
+
+/// A smoke file `verify` would refuse only after the gateway changed.
+pub fn invalid_smoke_checks_blocker(invalid: bool) -> Option<ApplyBlocker> {
+    invalid.then(|| ApplyBlocker::new(BlockerKind::InvalidSmokeChecks, 1))
 }
 
 /// Validation is a single gate: it either passed or `apply` refuses.
@@ -253,6 +285,8 @@ pub fn slot_remap_blocker(report: &ResolveReport, allowed: bool) -> Option<Apply
 pub fn apply_blockers(inputs: ApplyGateInputs<'_>) -> Vec<ApplyBlocker> {
     [
         narrowed_file_publication_blocker(inputs.file_publication_narrowed),
+        publication_path_collision_blocker(inputs.publication_paths_collide),
+        invalid_smoke_checks_blocker(inputs.smoke_checks_invalid),
         security_blocker(inputs.security_findings, inputs.security_overridden),
         slot_remap_blocker(inputs.secret_report, inputs.allow_credential_slot_remap),
         required_credentials_blocker(inputs.secret_report),

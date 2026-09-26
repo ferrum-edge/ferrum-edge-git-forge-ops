@@ -707,9 +707,12 @@ Two pure computations, shared so a preview and the run it previews cannot
 disagree.
 
 **`apply_blockers`** — every fail-closed gate `apply` refuses on that is
-decidable *without* a gateway, as `Vec<ApplyBlocker>` over eight
-`BlockerKind`s: `NarrowedFilePublication`, `Validation`, `Security`, `Policy`, `RequiredCredentials`,
-`SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
+decidable *without* a gateway, as `Vec<ApplyBlocker>` over ten
+`BlockerKind`s: `NarrowedFilePublication`, `PublicationPathCollision`, `InvalidSmokeChecks`,
+`Validation`, `Security`, `Policy`, `RequiredCredentials`,
+`SlotRemap`, `ProvisionerToken`, `ProvisioningRepository`. `plan` and `apply` refuse
+`PublicationPathCollision` / `InvalidSmokeChecks` before assembly through
+`preflight_deployment_inputs`; `review` feeds the same two checks into `apply_blockers`. `plan` evaluates the whole set, prints an `=== Apply Blockers ===`
 section (class, count, remedy) plus a summary line, and exits 1 when it is
 non-empty. `review --fail-on-blockers` (or `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`)
 uses that same computation for its exit code; default `review` still renders
@@ -1038,8 +1041,8 @@ never restoring an obsolete ledger, which is a separate state-override repair.
 - `src/state.rs` — `.state/<env>.json` tracks managed resource keys with non-secret markers, credential delivery metadata, shard count, override history, the mesh-document destination this repository publishes to (`mesh_document_path`, the retraction attribution gate), and a non-authoritative write-ahead pending-create journal; `ResourceKeys` is the prebuilt `namespace:Kind:id` set `record_op` and the journal/ledger reconciliations check existence against
 - `src/reconcile.rs` — `resolved_namespaces` (which namespaces a run iterates; shared mode unions repo-declared with state-derived so orphans stay reconcilable) and `previously_managed` (the shared-mode delete fence)
 - `src/jwt.rs` — mints HS256 tokens for admin API auth
-- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `status` is passed/failed/skipped and whose `exit_code` is 0, `VERIFY_FAILED_EXIT_CODE` = 4 or `VERIFY_SKIPPED_EXIT_CODE` = 5 — an empty report is skipped, never a pass), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, an ambiguous attempt of a non-idempotent method is never replayed without `replay_safe`, the response body is never read)
-- `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
+- `src/verify/` — declarative traffic checks (`.gitforgeops/smoke.yaml`; `validate`, `plan` and `apply` load it through the same `SmokeConfig::load` before any mutation, so a malformed or unknown-field check fails the preview instead of surfacing after the change; an absent file is fine): `mod.rs` (closed `deny_unknown_fields` contract, `HeaderValue` literal-or-slot with exactly-one validation, `resolve_headers`, `VerifyReport` whose `status` is passed/failed/skipped and whose `exit_code` is 0, `VERIFY_FAILED_EXIT_CODE` = 4 or `VERIFY_SKIPPED_EXIT_CODE` = 5 — an empty report is skipped, never a pass), `runner.rs` (bounded per-check timeout and attempts; a wrong status is never retried, an ambiguous attempt of a non-idempotent method is never replayed without `replay_safe`, the response body is never read)
+- `src/verdict.rs` — `apply_blockers` (the offline fail-closed gates `plan` and `apply` share; `PublicationPathCollision` and `InvalidSmokeChecks` are raised early by `plan`/`apply` through `preflight_deployment_inputs` and surface as blockers only in `review`) and `DriftVerdict` / `DRIFT_EXIT_CODE` (what makes `diff --exit-on-drift` exit 2)
 - `src/diagnostics.rs` — the shared log sanitizer (`sanitize` / `sanitize_line` / `sanitize_block`
   and their `safe*` `Display` adapters) every diagnostic routes untrusted ids, namespaces,
   plugin names, YAML paths and gateway-sourced text through: control characters and line
@@ -1080,7 +1083,7 @@ See `.env.example` for the full list. Essentials:
 - `FERRUM_OVERLAY` (applies `overlays/<name>/` deep-merge; a configured missing directory is fatal — `resolved::validate_overlay_selection` reports it up front naming the environment, the overlay and the declaring file)
 - `FERRUM_EDGE_BINARY_PATH` (default `ferrum-edge` on `$PATH`)
 - `FERRUM_FILE_OUTPUT_PATH` (file mode; default `./assembled/resources.yaml`)
-- `FERRUM_MESH_FILE_OUTPUT_PATH` (default `./assembled/mesh.yaml`) — standalone `{version, mesh}` document; separate file from the gateway doc, written by `export` and file-mode `apply` whenever the repo declares any `MeshConfig`
+- `FERRUM_MESH_FILE_OUTPUT_PATH` (default `./assembled/mesh.yaml`) — standalone `{version, mesh}` document; separate file from the gateway doc, written by `export` and file-mode `apply` whenever the repo declares any `MeshConfig`. File-mode `validate` / `plan` / `apply` (and `export --output`) refuse, before any publication, state or broker write, when the gateway and mesh destinations resolve to one file (`apply::ensure_distinct_publication_paths`: `./` and `..` spellings, symlinked parent directories, and an existing file's identity all count)
 - `FERRUM_TLS_NO_VERIFY` (dev only; accepted values `true|false|1|0`) — TLS stays on but any certificate is accepted
 - `FERRUM_ALLOW_INSECURE_HTTP` (default `false`; dev only) — permits a cleartext `http://` gateway URL. Independent of `FERRUM_TLS_NO_VERIFY`; both print a loud stderr banner once per process and both are refused when `GITHUB_ACTIONS=true` unless the gateway host is loopback (`localhost`, `127.0.0.0/8`, `::1`). `config::env::validate_gateway_transport` owns the whole rule.
 - `FERRUM_GATEWAY_CA_CERT` / `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` — base64-encoded PEM. mTLS requires BOTH cert and key; setting only one is rejected.

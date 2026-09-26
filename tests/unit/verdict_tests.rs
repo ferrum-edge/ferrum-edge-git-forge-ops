@@ -75,6 +75,8 @@ fn clean_inputs<'a>(report: &'a ResolveReport) -> ApplyGateInputs<'a> {
         provisioner_token_present: true,
         github_repository_present: true,
         file_publication_narrowed: false,
+        publication_paths_collide: false,
+        smoke_checks_invalid: false,
     }
 }
 
@@ -224,6 +226,8 @@ fn every_blocker_class_is_reported_together_and_named_in_the_summary() {
         provisioner_token_present: true,
         github_repository_present: true,
         file_publication_narrowed: false,
+        publication_paths_collide: false,
+        smoke_checks_invalid: false,
     });
 
     let kinds: Vec<BlockerKind> = blockers.iter().map(|b| b.kind).collect();
@@ -249,6 +253,36 @@ fn every_blocker_class_is_reported_together_and_named_in_the_summary() {
         );
         // Every class carries an operator-actionable remedy.
         assert!(!kind.remedy().is_empty());
+    }
+}
+
+#[test]
+fn publication_preflight_refusals_are_blockers_in_apply_order() {
+    // `apply` refuses both right after the narrowed-publication check, before
+    // the security audit, so `plan` and `review --fail-on-blockers` must
+    // report them the same way.
+    let report = report(vec![], vec![]);
+    let blockers = apply_blockers(ApplyGateInputs {
+        validation_ok: false,
+        publication_paths_collide: true,
+        smoke_checks_invalid: true,
+        ..clean_inputs(&report)
+    });
+
+    let kinds: Vec<BlockerKind> = blockers.iter().map(|b| b.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            BlockerKind::PublicationPathCollision,
+            BlockerKind::InvalidSmokeChecks,
+            BlockerKind::Validation,
+        ]
+    );
+    let summary = blocker_summary(&blockers).expect("blocked");
+    assert!(summary.contains("publication-path-collision"), "{summary}");
+    assert!(summary.contains("invalid-smoke-checks"), "{summary}");
+    for blocker in &blockers {
+        assert_eq!(blocker.count, 1);
     }
 }
 
