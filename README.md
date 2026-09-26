@@ -2511,11 +2511,12 @@ and the runbook are asserted to stay in step.
 cargo build                                    # Debug
 cargo build --release
 cargo test --test unit_tests                   # aggregated unit/integration suite
+cargo test --lib                               # inline library tests under src/
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Rust CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --test unit_tests` on PRs/pushes that touch source, tests, Cargo metadata, the Dockerfile, or the Rust CI workflow. Resource-only PRs run `validate-pr.yml` instead.
+Rust CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --test unit_tests`, and `cargo test --lib` on PRs/pushes that touch source, tests, Cargo metadata, the Dockerfile, or the Rust CI workflow. Resource-only PRs run `validate-pr.yml` instead.
 
 The security workflow runs on every pull request, on pushes to `main` that
 touch build inputs, and weekly on a schedule. It rejects new vulnerabilities,
