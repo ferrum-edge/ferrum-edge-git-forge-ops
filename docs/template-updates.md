@@ -195,10 +195,22 @@ baseline: they name whatever a copy last pointed at, not a revision. A bare
 `origin` is refused for the same reason, since Git reads it as `origin/HEAD`.
 The check ignores case, and a branch or tag that really is named `origin` is
 `refs/heads/origin` or `refs/tags/origin`.
+A short name is resolved without Git's first-match lookup, which would let an
+upstream tag called `main` stand in for the `main` branch. The tool checks
+every place the name could live (`refs/<name>`, `refs/tags/<name>`,
+`refs/heads/<name>`, `refs/remotes/<name>`, and, for a hexadecimal name, an
+abbreviated commit ID) and refuses with `upstream revision '<name>' is
+ambiguous` when more than one exists, naming each match. This applies to the
+default and recorded ref as well as to `--to`, in `status`, `plan`, `apply` and
+`detect-baseline` alike; nothing is compared or written. Pass the full name
+you mean instead (`refs/heads/main`, `refs/tags/main`, or a complete commit
+SHA) — a full `refs/...` name or a 40- or 64-character SHA is used exactly as
+given.
 An `origin/<branch>` target is resolved explicitly under
 `refs/remotes/origin/`; an upstream branch whose literal name starts with
 `origin/` cannot shadow it. Select such a literal branch only by its full
-`refs/heads/origin/<branch>` name.
+`refs/heads/origin/<branch>` name; when an `origin/<branch>` target does not
+resolve but that literal branch exists, the error says so.
 Branch names resolve the same way whether `--upstream` (or the baseline's
 `upstream`) is a URL — the HTTPS default included — or a local clone, so the
 default `main` needs no `origin/` prefix. The tool fetches into a temporary

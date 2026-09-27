@@ -225,12 +225,70 @@ def validate_target_ref(value: object, field: str) -> str:
     return ref
 
 
-def _mirror_ref(ref: str) -> str:
-    """Resolve documented remote-tracking names without Git's DWIM rules."""
-    prefix = f"{MIRROR_REMOTE}/"
-    if ref.startswith(prefix):
-        return f"refs/remotes/{ref}"
-    return ref
+# The rules Git's short-name lookup tries, less `refs/remotes/<name>/HEAD`,
+# which only the bare remote name `validate_target_ref` refuses could reach.
+SHORT_REF_RULES = ("refs/{}", "refs/tags/{}", "refs/heads/{}", "refs/remotes/{}")
+ABBREVIATED_OBJECT_ID = re.compile(r"[0-9a-f]{4,64}\Z", re.IGNORECASE)
+
+
+def _ref_exists(mirror: Path, refname: str) -> bool:
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", refname],
+        cwd=str(mirror),
+        check=False,
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _mirror_refname(mirror: Path, ref: str) -> str | None:
+    """The one full refname or object ID `ref` names in the upstream copy.
+
+    Git's short-name lookup takes the first rule that matches, so an upstream
+    tag named `main` would silently stand in for the `main` branch, and a
+    branch named like an abbreviated commit ID for that commit. Every rule is
+    checked here instead and a name that more than one of them matches is
+    refused. `origin/<branch>` always names the remote-tracking ref, which an
+    upstream branch literally named `origin/<branch>` cannot shadow. None means
+    nothing in the copy matches (yet).
+    """
+    if FULL_OBJECT_ID.fullmatch(ref):
+        return ref
+    if ref.startswith("refs/"):
+        return ref if _ref_exists(mirror, ref) else None
+    if ref.startswith(f"{MIRROR_REMOTE}/"):
+        refname = f"refs/remotes/{ref}"
+        return refname if _ref_exists(mirror, refname) else None
+    matches = [
+        rule.format(ref)
+        for rule in SHORT_REF_RULES
+        if _ref_exists(mirror, rule.format(ref))
+    ]
+    if ABBREVIATED_OBJECT_ID.fullmatch(ref) and _git(
+        mirror, "rev-parse", f"--disambiguate={ref}", check=False
+    ).strip():
+        # With no ref matching, `rev-parse` of the bare prefix finds this
+        # object; with one, the name is refused below.
+        matches.append(ref)
+    if len(matches) > 1:
+        described = [
+            match if match.startswith("refs/") else f"an object ID starting {match}"
+            for match in matches
+        ]
+        exist = "both exist" if len(described) == 2 else "all exist"
+        raise UpdateError(
+            f"upstream revision {ref!r} is ambiguous: {' and '.join(described)} "
+            f"{exist} upstream; name the one you mean in full (for example "
+            f"refs/heads/{ref} or refs/tags/{ref}, or a complete commit ID)"
+        )
+    return matches[0] if matches else None
+
+
+def _resolves_to_commit(mirror: Path, ref: str) -> bool:
+    refname = _mirror_refname(mirror, ref)
+    return refname is not None and bool(
+        _git(mirror, "rev-parse", "--verify", f"{refname}^{{commit}}", check=False)
+    )
 
 
 # -- confined filesystem access ------------------------------------------------
@@ -946,8 +1004,11 @@ def detect_baseline(
     the newest commit, which is the one a copy was most likely taken from.
     """
     local = _local_managed_hashes(root)
+    refname = _mirror_refname(mirror, ref)
+    if refname is None:
+        raise UpdateError(f"upstream revision {ref!r} could not be resolved")
     revisions = _git(
-        mirror, "rev-list", "--first-parent", f"--max-count={limit}", _mirror_ref(ref)
+        mirror, "rev-list", "--first-parent", f"--max-count={limit}", refname
     ).split()
     if not revisions:
         raise UpdateError(f"upstream revision {ref!r} has no history to search")
@@ -986,7 +1047,8 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
     tested, entirely offline. Both take the same fetch, and it maps upstream's
     branches to `refs/heads/` and its tags to `refs/tags/`, so `main`, a tag
     and a full commit ID resolve the same way whichever form upstream was given
-    in (#361). `origin/<branch>` keeps resolving too.
+    in (#361). `origin/<branch>` keeps resolving too. Each name is resolved
+    through `_mirror_refname`, so one that is ambiguous upstream is refused.
     """
     mirror = workdir / "upstream"
     source = Path(upstream)
@@ -1006,32 +1068,30 @@ def prepare_mirror(upstream: str, refs: tuple[str, ...], workdir: Path) -> Path:
     )
     _git(mirror, "fetch", "--quiet", "--tags", MIRROR_REMOTE)
     for ref in refs:
-        mirror_ref = _mirror_ref(ref)
         # Fail here, with the ref named, rather than deep inside a comparison.
         # A commit no branch or tag reaches can still be fetched by its ID.
-        if not _git(
-            mirror,
-            "rev-parse",
-            "--verify",
-            f"{mirror_ref}^{{commit}}",
-            check=False,
-        ):
+        if not _resolves_to_commit(mirror, ref):
             _git(mirror, "fetch", "--quiet", MIRROR_REMOTE, "--", ref, check=False)
-        if not _git(
-            mirror,
-            "rev-parse",
-            "--verify",
-            f"{mirror_ref}^{{commit}}",
-            check=False,
-        ):
+        if not _resolves_to_commit(mirror, ref):
+            hint = ""
+            if ref.startswith(f"{MIRROR_REMOTE}/") and _ref_exists(
+                mirror, f"refs/heads/{ref}"
+            ):
+                hint = (
+                    f"; {ref} names the remote-tracking ref refs/remotes/{ref}, and "
+                    f"the upstream branch literally named {ref} is refs/heads/{ref}"
+                )
             raise UpdateError(
-                f"upstream revision {ref!r} could not be resolved in {upstream}"
+                f"upstream revision {ref!r} could not be resolved in {upstream}{hint}"
             )
     return mirror
 
 
 def resolve(mirror: Path, ref: str) -> str:
-    resolved = _git(mirror, "rev-parse", f"{_mirror_ref(ref)}^{{commit}}").strip()
+    refname = _mirror_refname(mirror, ref)
+    if refname is None:
+        raise UpdateError(f"upstream revision {ref!r} could not be resolved")
+    resolved = _git(mirror, "rev-parse", f"{refname}^{{commit}}").strip()
     if not resolved:
         raise UpdateError(f"upstream revision {ref!r} could not be resolved")
     return resolved
