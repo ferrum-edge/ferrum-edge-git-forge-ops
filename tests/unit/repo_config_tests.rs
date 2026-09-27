@@ -770,3 +770,34 @@ fn overlay_names_are_bounded_components_at_every_selection_boundary() {
         validate_overlay_selection(&resolved, None, root.path()).unwrap();
     }
 }
+
+#[test]
+fn repo_config_refuses_oversized_input() {
+    let file = write_repo_config(&" ".repeat(1024 * 1024 + 1));
+    let error = RepoConfig::load_from_path(file.path()).unwrap_err();
+    assert!(error.to_string().contains("1048576 byte limit"), "{error}");
+}
+
+#[test]
+fn repo_config_refuses_a_non_regular_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    std::fs::create_dir(&path).unwrap();
+
+    let error = RepoConfig::load_from_path(&path).unwrap_err();
+    assert!(error.to_string().contains("not a regular file"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_config_refuses_symbolic_links() {
+    use std::os::unix::fs::symlink;
+
+    let target = write_repo_config("version: 1\nenvironments: {}\n");
+    let directory = tempfile::tempdir().unwrap();
+    let link = directory.path().join("config.yaml");
+    symlink(target.path(), &link).unwrap();
+
+    let error = RepoConfig::load_from_path(&link).unwrap_err();
+    assert!(error.to_string().contains("symbolic links"), "{error}");
+}

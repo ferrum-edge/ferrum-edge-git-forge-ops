@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{read_bounded_repo_file, MAX_REPO_CONFIG_FILE_BYTES};
+
 pub mod runner;
 
 pub const SMOKE_CONFIG_PATH: &str = ".gitforgeops/smoke.yaml";
@@ -171,14 +173,9 @@ pub struct SmokeConfig {
 
 impl SmokeConfig {
     pub fn load_from_path(path: &Path) -> crate::error::Result<Option<Self>> {
-        if !path.exists() {
+        let Some(contents) = read_bounded_repo_file(path, MAX_REPO_CONFIG_FILE_BYTES)? else {
             return Ok(None);
-        }
-        let contents =
-            std::fs::read_to_string(path).map_err(|source| crate::error::Error::FileRead {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        };
         let config: SmokeConfig =
             serde_yaml::from_str(&contents).map_err(|source| crate::error::Error::YamlParse {
                 path: path.to_path_buf(),

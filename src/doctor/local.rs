@@ -236,17 +236,15 @@ fn resources(root: &Path, kind: RepositoryKind) -> Check {
 
 fn policies(root: &Path) -> Check {
     let path = root.join(crate::policy::config::POLICY_CONFIG_PATH);
-    if !path.is_file() {
-        return Check::new(
+    match crate::policy::config::load_policies_from_path(&path) {
+        Ok(None) => Check::new(
             "policies",
             "Policy configuration parses",
             Scope::Local,
             Status::Skipped,
             "no .gitforgeops/policies.yaml; every policy rule stays disabled",
-        );
-    }
-    match crate::policy::config::load_policies_from_path(&path) {
-        Ok(_) => Check::pass(
+        ),
+        Ok(Some(_)) => Check::pass(
             "policies",
             "Policy configuration parses",
             Scope::Local,

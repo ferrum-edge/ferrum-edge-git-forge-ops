@@ -667,6 +667,11 @@ This is the single file that declares environments. Each entry picks an
 overlay, apply strategy, and ownership mode. **No URLs, no secret names, no
 credentials ever live here.**
 
+The file is read before anything else runs, so it must be a plain file in the
+checkout: symlinks, non-regular files (directories, FIFOs, devices) and files
+over 1 MiB are refused before parsing. The same rule applies to
+`.gitforgeops/policies.yaml` and `.gitforgeops/smoke.yaml`.
+
 ```yaml
 version: 1
 
@@ -829,6 +834,8 @@ Two things are deliberately left out of the body:
 ## Policy framework: `.gitforgeops/policies.yaml`
 
 Enforce organization standards across every PR. All rules default off (opt-in).
+An absent file disables every rule; a present one must be a plain file —
+symlinks, non-regular files and files over 1 MiB are refused before parsing.
 
 ```yaml
 version: 1
@@ -2286,7 +2293,8 @@ apply instead of being discovered by `verify` after the gateway has changed.
 `review` reports it as the `invalid-smoke-checks` apply blocker, which fails
 `review --fail-on-blockers`.
 An absent `smoke.yaml` is still fine; only running the checks needs a data
-plane.
+plane. A present one must be a plain file: symlinks, non-regular files and
+files over 1 MiB are refused before parsing.
 
 Requests go to `FERRUM_VERIFY_BASE_URL`, the gateway's **data plane**, which is
 a different endpoint from the admin API in `FERRUM_GATEWAY_URL`, and is held to
