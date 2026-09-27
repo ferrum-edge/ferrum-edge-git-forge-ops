@@ -1,13 +1,14 @@
 //! Bounded reads of repository-controlled configuration files.
 //!
 //! `.gitforgeops/config.yaml`, `.gitforgeops/policies.yaml` and
-//! `.gitforgeops/smoke.yaml` arrive with a pull request, and the privileged
-//! workflows read them before anything else runs. A symbolic link would let
-//! that file name point anywhere on the runner, and a device, FIFO or
-//! arbitrarily large file would stall or exhaust the job before a single
-//! diagnostic is printed. Every such loader reads through
-//! [`read_bounded_repo_file`], which accepts only a regular file no larger
-//! than the stated cap.
+//! `.gitforgeops/smoke.yaml` arrive with a pull request. Only the unprivileged
+//! validate job (and a local run on a hostile checkout) reads those
+//! PR-authored copies; the privileged review substitutes the default branch's
+//! copies of `.gitforgeops`. A symbolic link would let that file name point
+//! anywhere on the runner, and a device, FIFO or arbitrarily large file would
+//! stall or exhaust the job before a single diagnostic is printed. Every such
+//! loader reads through [`read_bounded_repo_file`], which accepts only a
+//! regular file no larger than the stated cap.
 
 use std::fs::Metadata;
 use std::io::Read;
