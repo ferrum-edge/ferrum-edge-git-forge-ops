@@ -2239,9 +2239,10 @@ fn ordinary_consumer_secrets_and_placeholder_shaped_plugin_seeds_resolve() {
 
     let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::Api).unwrap();
     assert!(report.results.len() == 2);
-    for result in &report.results {
-        assert!(result.status == SlotStatus::Resolved, "{}", result.slot);
-    }
+    assert!(
+        report.results.iter().all(|r| r.status == SlotStatus::Resolved),
+        "every slot resolves"
+    );
     assert!(
         cfg.consumers[0].credentials["keyauth"][0]["key"] == SECRET,
         "an ordinary secret must be kept byte-for-byte"

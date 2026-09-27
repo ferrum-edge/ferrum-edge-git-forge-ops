@@ -1699,7 +1699,7 @@ fn rotate_refuses_a_placeholder_text_sibling_before_provisioning() {
         let (repo, output, listener) =
             run_rotate("keyauth", "key", serde_json::json!({ (SIBLING): seeded }));
         let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
-        assert!(!output.status.success(), "{seeded}: {diagnostic}");
+        assert!(!output.status.success(), "{reason}: {diagnostic}");
         let refusal = diagnostic
             .lines()
             .find(|line| line.contains("holds a bundle value that"))
