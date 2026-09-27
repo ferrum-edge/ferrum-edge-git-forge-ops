@@ -811,16 +811,91 @@ def state_guard_trigger_violations(text: str) -> list[str]:
         violations.append(
             "state-guard.yml: exactly one checkout is permitted, and it must name the default branch"
         )
-    # Branch protection reads the required check from the newest check suite
-    # on the head. Deliveries for one head (opened plus one `labeled` per
-    # label) start out of order, so any shared concurrency group — per PR or
-    # per head, cancelling in progress or not — can cancel that newest suite
-    # and leave the required check cancelled beside an older success.
-    if re.search(r"^\s*concurrency\s*:", text, re.MULTILINE):
+    # Deliveries for one head (opened plus one `labeled` per label) start out
+    # of order, so any shared concurrency group — per PR or per head,
+    # cancelling in progress or not — can cancel the newest check suite and
+    # leave the required check cancelled beside an older success (#407).
+    if declares_concurrency(text):
         violations.append(
             "state-guard.yml: the guard must not declare a concurrency group; "
             "a cancelled newest run leaves the required check cancelled"
         )
+    return violations
+
+
+_YAML_ESCAPED_LINE_BREAK = re.compile(r"\\\r?\n[ \t]*")
+_YAML_HEX_ESCAPE = re.compile(r"\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8}))")
+_CONCURRENCY_WORD = re.compile(r"concurrency", re.IGNORECASE)
+
+
+def _decode_yaml_escape(match: re.Match[str]) -> str:
+    code = int(next(group for group in match.groups() if group is not None), 16)
+    return chr(code) if code <= sys.maxunicode else ""
+
+
+def declares_concurrency(text: str) -> bool:
+    """Whether a workflow could declare `concurrency` at any mapping level.
+
+    A key-shaped regex misses too many YAML spellings of the same key: quoted
+    (`"concurrency":`), inside a flow mapping (`{runs-on: x, concurrency: g}`),
+    an explicit key (`? concurrency` with `: g` on the next line), behind a tag
+    or anchor, or spelled with double-quoted escapes (`"\\x63oncurrency"`).
+    Rather than parse YAML, this fails closed: after dropping full-line
+    comments and decoding double-quoted escapes, the word may not appear at
+    all, in any case. A run script or trailing comment that merely mentions it
+    is refused too; reword it.
+    """
+    content = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    content = _YAML_ESCAPED_LINE_BREAK.sub("", content)
+    content = _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, content)
+    return _CONCURRENCY_WORD.search(content) is not None
+
+
+# The last step before the guard reports an authorized override re-reads the
+# pull request, so an override label removed, a head pushed, or a base
+# retargeted while the run was in flight fails that run instead of leaving a
+# success behind it.
+STATE_GUARD_RECORD_STEP = "Record authorized override"
+STATE_GUARD_FINAL_RECHECK = (
+    'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
+    "final_head=$(jq -r '.head.sha' <<< \"$final\")",
+    "final_ref=$(jq -r '.base.ref' <<< \"$final\")",
+    "final_labels=$(jq -r '.labels[].name' <<< \"$final\")",
+    '[ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {',
+    '[ "$final_ref" = "$DEFAULT_BRANCH" ] || {',
+    'grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {',
+)
+
+
+def state_guard_override_recheck_violations(text: str) -> list[str]:
+    """An authorized override must be re-confirmed right before it reports."""
+    step = named_step(text, STATE_GUARD_RECORD_STEP)
+    if step is None:
+        return [f"state-guard.yml: the {STATE_GUARD_RECORD_STEP!r} step is missing"]
+    violations: list[str] = []
+    if "set -euo pipefail" not in step:
+        violations.append(
+            f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must run under set -euo pipefail"
+        )
+    positions = []
+    for required in STATE_GUARD_FINAL_RECHECK:
+        position = step.find(required)
+        if position < 0:
+            violations.append(
+                f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must re-read the pull "
+                f"request before reporting success; missing {required!r}"
+            )
+        positions.append(position)
+    for report in ("::warning::", '>> "$GITHUB_STEP_SUMMARY"'):
+        position = step.find(report)
+        if position >= 0 and any(position < check for check in positions):
+            violations.append(
+                f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must finish its final "
+                "pull-request recheck before reporting the override"
+            )
+            break
     return violations
 
 
@@ -1812,6 +1887,7 @@ def main(argv: list[str] | None = None) -> int:
         violations.append(
             "state-guard.yml: classifier execution must use the trusted helper variable"
         )
+    violations.extend(state_guard_override_recheck_violations(state_guard))
 
     for state_workflow, commit_step in (
         ("apply-on-merge.yml", "- name: Commit state + assembled (if changed)"),

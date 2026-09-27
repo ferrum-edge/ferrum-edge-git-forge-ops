@@ -531,11 +531,15 @@ the current head and its actor currently has `write`, `maintain`, or `admin`
 permission. It rejects every push or other PR transition until a qualified
 maintainer removes and reapplies the label, and records the actor, permission,
 head, run ID, and attempt. Label changes rerun the check, and the workflow
-declares no concurrency group (`check_supply_chain.py` refuses one): each
-delivery gets its own check suite, branch protection reads the newest, and a
+declares no concurrency group (`check_supply_chain.py` refuses the word
+outside full-line comments, in any case or quoting): each delivery gets its own
+check suite, branch protection was observed on #407 reading the newest, and a
 shared group can cancel that newest suite when same-head deliveries start out
 of order. Removing the label is itself a newer delivery that fails on its own,
-so removed authorization cannot leave a stale success. It triggers on
+and an authorizing run re-reads head, base and labels right before it records
+success (a checker-required recheck), so removed authorization cannot leave a
+stale success whether protection reads the newest suite or requires every
+suite's latest run to pass. It triggers on
 `pull_request_target`, never `pull_request`: the latter loads the guard from
 the PR's own head, so one commit could forge a ledger entry and delete the
 check that rejects it. That is safe only because the job never checks out the

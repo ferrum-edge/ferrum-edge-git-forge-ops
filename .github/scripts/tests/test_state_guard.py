@@ -139,6 +139,88 @@ class StateGuardTests(unittest.TestCase):
                             output.read_text(encoding="utf-8"),
                         )
 
+    def test_recorded_override_rechecks_head_base_and_label_last(self):
+        record = workflow_step("Record authorized override")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            gh = bin_dir / "gh"
+            gh.write_text(
+                f"#!{sys.executable}\n"
+                + textwrap.dedent(
+                    """\
+                    import json
+                    import os
+                    import sys
+
+                    if os.environ.get("TEST_API_FAILS") == "true":
+                        sys.exit(1)
+                    print(json.dumps({
+                        'head': {'sha': os.environ['TEST_HEAD']},
+                        'base': {'sha': 'b' * 40, 'ref': os.environ['TEST_BASE_REF']},
+                        'labels': [
+                            {'name': name}
+                            for name in json.loads(os.environ['TEST_LABELS'])
+                        ],
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            summary = root / "summary"
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "GH_TOKEN": "test-only",
+                "REPO": "example/repo",
+                "PR_NUMBER": "1",
+                "EXPECTED_HEAD_SHA": "a" * 40,
+                "DEFAULT_BRANCH": "main",
+                "OVERRIDE_LABEL": "gitforgeops/state-override",
+                "ACTOR": "maintainer",
+                "PERMISSION": "write",
+                "AUTHORIZED_HEAD": "a" * 40,
+                "RUN_ID": "1",
+                "RUN_ATTEMPT": "1",
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "TEST_HEAD": "a" * 40,
+                "TEST_BASE_REF": "main",
+                "TEST_LABELS": json.dumps(["bug", "gitforgeops/state-override"]),
+            }
+
+            def run(**overrides):
+                summary.write_text("", encoding="utf-8")
+                return subprocess.run(
+                    ["bash", "-c", record],
+                    cwd=root,
+                    env={**env, **overrides},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "Authorized protected-state override", summary.read_text(encoding="utf-8")
+            )
+
+            for overrides in (
+                {"TEST_HEAD": "c" * 40},
+                {"TEST_BASE_REF": "release"},
+                {"TEST_LABELS": json.dumps(["bug"])},
+                {"TEST_LABELS": json.dumps([])},
+                {"TEST_LABELS": json.dumps(["gitforgeops/state-override-lookalike"])},
+                {"TEST_API_FAILS": "true"},
+            ):
+                with self.subTest(overrides=overrides):
+                    result = run(**overrides)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertEqual(summary.read_text(encoding="utf-8"), "")
+                    self.assertNotIn("::warning::Protected state scope", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
