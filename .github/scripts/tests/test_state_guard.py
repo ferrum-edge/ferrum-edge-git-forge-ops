@@ -154,6 +154,11 @@ class StateGuardTests(unittest.TestCase):
                     import os
                     import sys
 
+                    expected = [
+                        "api",
+                        f"repos/{os.environ['REPO']}/pulls/{os.environ['PR_NUMBER']}",
+                    ]
+                    assert sys.argv[1:] == expected, sys.argv[1:]
                     if os.environ.get("TEST_API_FAILS") == "true":
                         sys.exit(1)
                     print(json.dumps({

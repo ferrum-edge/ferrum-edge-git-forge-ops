@@ -1265,6 +1265,55 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         violations = check_supply_chain.state_guard_override_recheck_violations(missing)
         self.assertTrue(any("step is missing" in item for item in violations), violations)
 
+    def test_state_guard_override_recheck_rejects_commented_out_checks(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        required = check_supply_chain.STATE_GUARD_FINAL_RECHECK[0]
+        weakened = text.replace(step, step.replace(required, "# " + required, 1), 1)
+        violations = check_supply_chain.state_guard_override_recheck_violations(weakened)
+        self.assertTrue(
+            any("must re-read the pull request" in item for item in violations),
+            violations,
+        )
+
+    def test_state_guard_override_recheck_rejects_continue_on_error(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        weakened = text.replace(
+            step, step.replace("        env:\n", "        continue-on-error: true\n        env:\n", 1), 1
+        )
+        violations = check_supply_chain.state_guard_override_recheck_violations(weakened)
+        self.assertTrue(
+            any("must not use continue-on-error" in item for item in violations),
+            violations,
+        )
+
+    def test_state_guard_override_recheck_pins_step_condition(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        weakened = text.replace(
+            step,
+            step.replace(
+                f"        if: {check_supply_chain.STATE_GUARD_RECORD_IF}\n",
+                "        if: always()\n",
+                1,
+            ),
+            1,
+        )
+        violations = check_supply_chain.state_guard_override_recheck_violations(weakened)
+        self.assertTrue(
+            any("if: condition pinned" in item for item in violations), violations
+        )
+
     def test_every_rust_toolchain_step_must_pin_the_version(self):
         secure = """      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000

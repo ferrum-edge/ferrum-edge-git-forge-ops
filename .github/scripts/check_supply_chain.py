@@ -858,6 +858,10 @@ def declares_concurrency(text: str) -> bool:
 # retargeted while the run was in flight fails that run instead of leaving a
 # success behind it.
 STATE_GUARD_RECORD_STEP = "Record authorized override"
+STATE_GUARD_RECORD_IF = (
+    "${{ steps.detect.outputs.requires_override == 'true' "
+    "&& steps.authorize.outcome == 'success' }}"
+)
 STATE_GUARD_FINAL_RECHECK = (
     'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
     "final_head=$(jq -r '.head.sha' <<< \"$final\")",
@@ -874,14 +878,26 @@ def state_guard_override_recheck_violations(text: str) -> list[str]:
     step = named_step(text, STATE_GUARD_RECORD_STEP)
     if step is None:
         return [f"state-guard.yml: the {STATE_GUARD_RECORD_STEP!r} step is missing"]
+    active_step = "\n".join(
+        "" if line.lstrip().startswith("#") else line for line in step.splitlines()
+    )
     violations: list[str] = []
-    if "set -euo pipefail" not in step:
+    if "set -euo pipefail" not in active_step:
         violations.append(
             f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must run under set -euo pipefail"
         )
+    if re.search(r"^\s*continue-on-error\s*:", active_step, re.MULTILINE):
+        violations.append(
+            f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must not use continue-on-error"
+        )
+    conditions = re.findall(r"^\s*if:\s*(.*?)\s*$", active_step, re.MULTILINE)
+    if conditions != [STATE_GUARD_RECORD_IF]:
+        violations.append(
+            f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must keep its if: condition pinned"
+        )
     positions = []
     for required in STATE_GUARD_FINAL_RECHECK:
-        position = step.find(required)
+        position = active_step.find(required)
         if position < 0:
             violations.append(
                 f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must re-read the pull "
@@ -889,7 +905,7 @@ def state_guard_override_recheck_violations(text: str) -> list[str]:
             )
         positions.append(position)
     for report in ("::warning::", '>> "$GITHUB_STEP_SUMMARY"'):
-        position = step.find(report)
+        position = active_step.find(report)
         if position >= 0 and any(position < check for check in positions):
             violations.append(
                 f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must finish its final "
