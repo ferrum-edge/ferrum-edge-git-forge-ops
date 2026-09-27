@@ -528,10 +528,12 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
         serde_json::json!({"kind": "Upstream", "spec": declared["upstreams"][0]}).to_string();
     for transport in ["inline", "file"] {
         for full in [false, true] {
-            // The final case resolves the first canonical leaf via its legacy
-            // explicit-zero lookup alias. The report still uses the canonical slot.
-            for target in 0..=leaves.len() {
-                let target_index = target % leaves.len();
+            // A Consumer secret may not be placeholder text (#379), so only
+            // plugin-config and discovery leaves are seeded with it.
+            for (target_index, &(target_kind, _, _)) in leaves.iter().enumerate() {
+                if target_kind == "consumers" {
+                    continue;
+                }
                 for different in [false, true] {
                     let mut live = declared.clone();
                     label_live_fixture(&mut live);
@@ -539,11 +541,6 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
                     for (index, &(kind, pointer, suffix)) in leaves.iter().enumerate() {
                         *live[kind][0].pointer_mut(pointer).unwrap() = LIVE.into();
                         if index == target_index || full {
-                            let suffix = if target == leaves.len() && index == 0 {
-                                "keyauth/[0]/key"
-                            } else {
-                                suffix
-                            };
                             let value = if index == target_index {
                                 PLACEHOLDER
                             } else {
@@ -578,7 +575,7 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
                         let out = stdout(&output);
                         let diagnostics = format!("{out}\n{}", stderr(&output));
                         let context = format!(
-                            "{transport}/full={full}/target={target}/different={different}/{args:?}: {diagnostics}"
+                            "{transport}/full={full}/target={target_index}/different={different}/{args:?}: {diagnostics}"
                         );
                         let expected_code = match args[0] {
                             "diff" => i32::from(different) * 2,

@@ -289,14 +289,18 @@ fn scrubber_provenance_preserves_canonical_indexed_escaped_slots_and_unresolved_
         "ferrum/plugin/@plugin-config/config/a~1b~0~21]/[1]",
         "ferrum/discovery/@service-discovery/consul/token",
     ];
+    // Consumer secrets may not be placeholder text (#379); plugin-config and
+    // discovery seeds that spell one are still values.
     let bundle: BTreeMap<String, String> = slots
         .iter()
         .enumerate()
         .map(|(index, slot)| {
-            (
-                slot.to_string(),
-                format!("${{gh-env-secret:alloc=require|len={}}}", 48 + index),
-            )
+            let value = if slot.starts_with("ferrum/app/") {
+                format!("synthetic-consumer-secret-{index}")
+            } else {
+                format!("${{gh-env-secret:alloc=require|len={}}}", 48 + index)
+            };
+            (slot.to_string(), value)
         })
         .collect();
     let report = resolve_secrets(&mut config, &bundle).unwrap();
@@ -1197,6 +1201,13 @@ exit 0
                 .map(|value| (slot.to_string(), value.to_string()))
                 .into_iter()
                 .collect();
+            if !plugin && seed == Some(placeholder) {
+                // A Consumer secret may not be placeholder text (#379).
+                let untouched = serde_yaml::to_string(&config).unwrap();
+                assert!(resolve_secrets(&mut config, &bundle).is_err());
+                assert_eq!(serde_yaml::to_string(&config).unwrap(), untouched);
+                continue;
+            }
             let report = resolve_secrets(&mut config, &bundle).unwrap();
             let before = serde_yaml::to_string(&config).unwrap();
             let dir = tempfile::tempdir().unwrap();
@@ -1272,12 +1283,21 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
         "n~1s~0~2/p~1l~0~2/@plugin-config/config/a~1b~0~21]/[0]",
         "ferrum/discovery/@service-discovery/consul/token",
     ];
+    // Consumer secrets may not be placeholder text (#379); plugin-config and
+    // discovery seeds that spell one are still values.
+    let seed_for = |slot: &str| {
+        if slot.starts_with("n~1s~0~2/a~1p~0~2/") {
+            "synthetic-consumer-seed".to_string()
+        } else {
+            placeholder.to_string()
+        }
+    };
     for seeded in [false, true] {
         let mut snapshot = config.clone();
         let bundle: BTreeMap<String, String> = resolved_slots
             .iter()
             .filter(|_| seeded)
-            .map(|slot| (slot.to_string(), placeholder.to_string()))
+            .map(|&slot| (slot.to_string(), seed_for(slot)))
             .collect();
         let report = resolve_secrets(&mut snapshot, &bundle).unwrap();
         assert_eq!(report.results.len(), 7);
@@ -1299,7 +1319,7 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
             (1, 1, resolved_slots[1]),
         ] {
             let expected = if seeded && resolved_slots.contains(&slot) {
-                placeholder.to_string()
+                seed_for(slot)
             } else {
                 validation_standin(slot, Some("a/b~[1]"))
             };

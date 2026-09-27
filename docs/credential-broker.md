@@ -90,6 +90,17 @@ A bundle value of `[REDACTED]` is refused: that is what `GET /consumers/...`
 returns, so the bundle was seeded from the wrong endpoint. Re-seed from
 `GET /backup` or rotate the slot.
 
+A Consumer credential secret whose bundle value is placeholder text is refused
+too: a value equal to the placeholder committed at that slot, or any value in
+the `${gh-env-secret:…}` grammar. Such text is known from the repository and
+has almost no entropy, so it can never be a live credential. Every command that
+reads Consumer slots from the bundle refuses it (`validate`, `plan`, `diff`,
+`review`, `apply`, `export --materialize` and `rotate`, which also checks the
+Consumer's other slots). The error names the slot and the reason, never the
+value. Re-seed the slot with the real secret or rotate it. This is the one
+exception to the rule that a supplied value counts as resolved whatever its
+bytes spell; plugin-config and service-discovery slots keep that rule.
+
 ## Slot names
 
 Slot names are derived from `(namespace, id, path)`; you never write them.

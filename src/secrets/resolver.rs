@@ -614,9 +614,16 @@ fn slot_lookup_candidates(components: &[SlotComponent<'_>]) -> Vec<String> {
     candidates
 }
 
+/// Look up the bundle value for a Consumer credential slot.
+///
+/// `committed` is the placeholder text the repository declares at this slot.
+/// Every Consumer lookup comes from that placeholder, and identity leaves
+/// reject broker syntax before any walk, so each value checked here is a
+/// Consumer secret.
 fn lookup_slot_value<'a>(
     components: &[SlotComponent<'_>],
     slot: &str,
+    committed: &str,
     bundle: &'a CredentialBundle,
 ) -> crate::error::Result<Option<&'a String>> {
     let found = slot_lookup_candidates(components)
@@ -637,9 +644,39 @@ fn lookup_slot_value<'a>(
                  bundle from 'GET /backup' or rotate the slot with 'gitforgeops rotate'."
             )));
         }
+        check_consumer_secret_not_placeholder_text(slot, committed, value)?;
         return Ok(Some(value));
     }
     Ok(None)
+}
+
+/// Refuse a Consumer secret whose bundle value is placeholder text.
+///
+/// A supplied value normally counts as resolved whatever its bytes spell
+/// (#364). Placeholder text is the exception: the committed placeholder is
+/// repository-known by definition, and any string in the placeholder grammar
+/// has almost no entropy. Publishing either would install a guessable live
+/// credential, and the validator-output scrubber keeps well-formed placeholder
+/// text readable, so it could also surface in diagnostics.
+///
+/// The refusal names the slot and the reason, never the value.
+fn check_consumer_secret_not_placeholder_text(
+    slot: &str,
+    committed: &str,
+    value: &str,
+) -> crate::error::Result<()> {
+    let reason = if value == committed {
+        "equals the placeholder text committed for this slot"
+    } else if parse_placeholder(value).is_some() {
+        "matches the gh-env-secret placeholder grammar"
+    } else {
+        return Ok(());
+    };
+    Err(crate::error::Error::Config(format!(
+        "credential slot '{slot}' holds a bundle value that {reason}, not a secret. \
+         Placeholder text is repository-known and cannot be a live Consumer credential; \
+         re-seed the slot with the real secret or rotate it with 'gitforgeops rotate'."
+    )))
 }
 
 fn lookup_exact_slot_value<'a>(
@@ -1166,8 +1203,9 @@ pub fn report_secrets_with_options(
 /// unrelated consumer holding, say, a `len=16` `jwt` generate placeholder
 /// would abort a rotation that has nothing to do with it. Structural errors
 /// (unknown credential types, identity placeholders, malformed placeholders,
-/// `[REDACTED]` bundle values, slot collisions) are still hard failures in
-/// both variants, because those make the report itself untrustworthy.
+/// `[REDACTED]` bundle values, placeholder-text Consumer secrets, slot
+/// collisions) are still hard failures in both variants, because those make
+/// the report itself untrustworthy.
 ///
 /// `plan`/`diff`/`apply` keep using strict [`report_secrets`]: there the
 /// constraint really is fatal, since apply would otherwise write a GitHub
@@ -2052,7 +2090,7 @@ fn walk_and_report(
             if let Some(res) = parse_placeholder(s) {
                 let placeholder = res?;
                 let slot = join_slot_components(components);
-                let existing = lookup_slot_value(components, &slot, bundle)?;
+                let existing = lookup_slot_value(components, &slot, s, bundle)?;
                 let status = classify_status(&placeholder, existing);
                 check_generation_constraints(components, &placeholder, &status, mode, constraints)?;
                 let (namespace, consumer_id, cred_key) = decompose_components(components);
@@ -2298,7 +2336,7 @@ fn walk_report_and_replace<'a>(
             if let Some(res) = parse_placeholder(s) {
                 let placeholder = res?;
                 let slot = join_slot_components(components);
-                let existing = lookup_slot_value(components, &slot, bundle)?;
+                let existing = lookup_slot_value(components, &slot, s, bundle)?;
                 let status = classify_status(&placeholder, existing);
                 check_generation_constraints(
                     components,

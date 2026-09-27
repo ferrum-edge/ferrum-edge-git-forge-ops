@@ -1438,8 +1438,10 @@ async fn cmd_export(
         // The resolution report is the authority on what is still
         // unresolved: it classifies every slot against the same bundle the
         // resolve consumed. Re-scanning the resolved document instead would
-        // read a seeded value that happens to spell a broker placeholder as
-        // an empty slot (#364).
+        // read a seeded plugin-config or discovery value that happens to
+        // spell a broker placeholder as an empty slot (#364). The resolve
+        // itself refuses a Consumer secret whose bundle value is placeholder
+        // text (#379).
         //
         // Materializing writes resolved values out, so it refuses a retired
         // Consumer's slot (#332) exactly like `apply` does: the state ledger
@@ -4128,8 +4130,8 @@ async fn cmd_rotate(
         let mut shim_bundle = current_bundle.clone();
         shim_bundle.insert(slot.clone(), "__rotate-preflight-shim__".to_string());
         single.consumers.push(c);
-        // The report says which slots found a value; a sibling whose seeded
-        // value resembles a placeholder is resolved, not pending (#364).
+        // The report says which slots found a value (#364). A sibling whose
+        // seeded value is placeholder text is refused by the resolve (#379).
         let sibling_report =
             secrets::resolve_secrets_with_options(&mut single, &shim_bundle, resolve_options)?;
         let unresolved_siblings = sibling_report.unresolved();
@@ -4373,8 +4375,8 @@ async fn push_rotated_consumer_to_gateway(
     // the consumer now would send a literal `${gh-env-secret:...}` string
     // to the gateway as a credential value — breaking auth for that
     // credential. Refuse and tell the operator to run apply first. The
-    // resolution report decides this, not the resolved bytes: a seeded value
-    // that resembles a placeholder is a value (#364).
+    // resolution report decides this, not the resolved bytes (#364); a
+    // seeded Consumer secret that is placeholder text never resolves (#379).
     let remaining = report.unresolved();
     if !remaining.is_empty() {
         return Err(format!(

@@ -1107,6 +1107,15 @@ generation agree:
   walks record these in `ResolveReport::endpoint_slots`; the allocator checks its
   batch with `ResolveReport::check_generation_allowed_for`.
 - A bundle value of `[REDACTED]` is refused.
+- A Consumer secret whose bundle value equals the placeholder committed at
+  that slot, or matches the `${gh-env-secret:…}` grammar at all, is refused
+  (`resolver::check_consumer_secret_not_placeholder_text`, same shape as the
+  `[REDACTED]` refusal: slot and reason, never the value). It is the one
+  exception to "supplied means resolved": placeholder text is
+  repository-known, low-entropy, and kept readable by the scrubber. Every
+  Consumer lookup goes through it: validate, plan, diff, review, apply,
+  `export --materialize`, and rotate's sibling resolve and publisher.
+  Plugin-config and service-discovery slots keep provenance semantics.
 - The allocator validates the whole candidate batch before GitHub key discovery,
   including direct callers and lenient reports. Structural types must match the
   slot. Non-generatable discovery secrets (`SD_SECRET_FIELDS`) and public
@@ -1131,8 +1140,9 @@ indexed entries. Both the CLI and `rotate_and_deliver` enforce it.
   preflight's Consumer snapshot.
 - Sibling resolution, the publisher and `export --materialize` decide what is
   unresolved from `ResolveReport::unresolved` of the resolve that consumed the
-  bundle, never by re-scanning bytes, so a seeded value that looks like a
-  placeholder is published byte-for-byte.
+  bundle, never by re-scanning bytes, so a seeded plugin-config or discovery
+  value that looks like a placeholder is published byte-for-byte (a Consumer
+  secret that is placeholder text is refused, see above).
 - Externally issued secrets must be reissued, reseeded and applied. A value
   destroyed by an older rotation cannot be recovered from GitHub's write-only
   secret API.
