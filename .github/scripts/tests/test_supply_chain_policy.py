@@ -1120,6 +1120,51 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("exactly one checkout" in item for item in violations), violations
         )
 
+    def test_state_guard_must_not_share_a_concurrency_group(self):
+        secure = """on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    branches: [main]
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+"""
+        workflow_level = secure.replace(
+            "      - uses:",
+            "concurrency:\n"
+            "  group: state-guard-${{ github.event.pull_request.number }}\n"
+            "  cancel-in-progress: true\n"
+            "      - uses:",
+            1,
+        )
+        per_head = secure.replace(
+            "      - uses:",
+            "concurrency:\n"
+            "  group: state-guard-${{ github.event.pull_request.number }}-"
+            "${{ github.event.pull_request.head.sha }}\n"
+            "  cancel-in-progress: false\n"
+            "      - uses:",
+            1,
+        )
+        job_level = secure.replace(
+            "      - uses:",
+            "    concurrency: state-guard-${{ github.event.pull_request.number }}\n"
+            "      - uses:",
+            1,
+        )
+        for text in (workflow_level, per_head, job_level):
+            with self.subTest(text=text):
+                violations = check_supply_chain.state_guard_trigger_violations(text)
+                self.assertTrue(
+                    any("must not declare a concurrency group" in item for item in violations),
+                    violations,
+                )
+
+    def test_shipped_state_guard_declares_no_concurrency_group(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        self.assertEqual(check_supply_chain.state_guard_trigger_violations(text), [])
+        self.assertNotRegex(text, re.compile(r"^\s*concurrency\s*:", re.MULTILINE))
+
     def test_every_rust_toolchain_step_must_pin_the_version(self):
         secure = """      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000

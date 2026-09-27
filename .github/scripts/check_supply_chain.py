@@ -811,6 +811,16 @@ def state_guard_trigger_violations(text: str) -> list[str]:
         violations.append(
             "state-guard.yml: exactly one checkout is permitted, and it must name the default branch"
         )
+    # Branch protection reads the required check from the newest check suite
+    # on the head. Deliveries for one head (opened plus one `labeled` per
+    # label) start out of order, so any shared concurrency group — per PR or
+    # per head, cancelling in progress or not — can cancel that newest suite
+    # and leave the required check cancelled beside an older success.
+    if re.search(r"^\s*concurrency\s*:", text, re.MULTILINE):
+        violations.append(
+            "state-guard.yml: the guard must not declare a concurrency group; "
+            "a cancelled newest run leaves the required check cancelled"
+        )
     return violations
 
 

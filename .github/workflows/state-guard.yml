@@ -52,9 +52,24 @@ on:
     # every PR to `main`, and passes in three seconds when `.state/` is untouched.
     branches: [main]
 
-concurrency:
-  group: state-guard-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+# Deliberately NO `concurrency:` group. Every delivery gets its own check suite
+# on the head commit, and branch protection reads the required
+# `state-guard-reject-state-edits` check from the newest suite, not from the one
+# that finished last. Opening a PR with labels already applied sends several
+# deliveries for one head about a second apart, and their runs do not start in
+# creation order, so any group they share can cancel the newest suite and leave
+# the required check cancelled beside an older success. `cancel-in-progress:
+# false` does not avoid this: GitHub keeps one pending run per group and cancels
+# the older pending one. Keying the group on the head SHA only moves the race to
+# same-head deliveries, which is exactly where it occurs; nothing in Actions can
+# cancel across heads without also cancelling within one.
+#
+# Nothing relies on cancellation for safety. Each run is bound to the head it
+# was delivered for and fails closed if the PR head moves while it runs, and a
+# run for a superseded head reports only on that commit. Removing the override
+# label sends a newer delivery whose run fails on its own, and the newest suite
+# is the authoritative one, so an older authorizing run that finishes later
+# cannot turn the check green.
 
 permissions:
   contents: read

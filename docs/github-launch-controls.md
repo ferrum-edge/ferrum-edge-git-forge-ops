@@ -84,6 +84,10 @@ paths regardless of file type. A repair requires a fresh
 current write, maintain, or admin permission. Incomplete file enumeration also
 requires that authorization. Keep both `/.state` and `/.state/` in CODEOWNERS;
 the trusted static-validation classifier must include both scopes as well.
+The guard workflow declares no concurrency group: every delivery reports its
+own check suite and the newest one is authoritative, so a PR opened with labels
+already applied cannot end up with a cancelled required check beside an older
+success.
 
 The runtime independently requires `.state` to be a real directory and state
 and lock entries to be regular files. Symlinks and intermediate environment
