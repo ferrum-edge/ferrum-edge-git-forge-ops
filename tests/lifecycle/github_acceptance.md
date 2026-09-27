@@ -1,42 +1,40 @@
 # GitHub acceptance path
 
-Five lifecycle scenarios are about GitHub's own controls rather than the
-gateway's: environment approvals, state-writer App permissions, protected-branch
-ledger writes, scheduling, and attribution. None of them can run inside this
-repository's CI, which has no authority to create a repository, an Environment
-or a GitHub App — and should not have it.
+Five lifecycle scenarios test GitHub's own controls rather than the gateway's:
+environment approvals, state-writer App permissions, protected-branch ledger
+writes, scheduling and attribution. This repository's CI cannot run them: it
+has no authority to create a repository, an Environment or a GitHub App, and
+should not have it.
 
-They run against a **disposable repository** instead, and their outcomes are
-recorded into the same acceptance result the release gate reads. Until they
-are, they stay `skipped`, and a skipped scenario never certifies anything.
+You run them against a **disposable repository** and record the outcomes in
+the same acceptance result the release gate reads. Until then they stay
+`skipped`, and a skipped scenario never certifies anything.
 
-Budget an hour. Most of it is waiting for approvals, which is the point.
+Budget about an hour, mostly spent waiting for approvals.
 
 ---
 
 ## 0. Prerequisites
 
-- an account (or org) where you can create a repository, a GitHub App, and
-  Environments with required reviewers — see
-  [GitHub plan requirements](../../README.md#github-plan-requirements); on a
-  private repository, required reviewers need Enterprise
-- **a second human**, who will be the environment's required reviewer. The
-  baseline sets `prevent_self_review: true`, so the account that merges cannot
-  approve the apply its merge triggered. This is not an obstacle to work
-  around; it is one of the things under test
+- an account or org where you can create a repository, a GitHub App and
+  Environments with required reviewers (on a private repository, required
+  reviewers need Enterprise; see
+  [GitHub plan requirements](../../README.md#github-plan-requirements))
+- **a second human** to be the environment's required reviewer. The baseline
+  sets `prevent_self_review: true`, so the account that merges cannot approve
+  the apply its merge triggered. That is one of the things under test
 - a disposable gateway the repository may mutate freely, reachable over
   `https://` from GitHub Actions
 - `gh` authenticated with admin on the new repository
 
-Nothing here may point at a real environment. Several steps deliberately
-delete managed resources and reject a ledger write mid-run.
+Never point any of this at a real environment. Several steps delete managed
+resources and break a ledger write mid-run on purpose.
 
 ---
 
 ## 1. Create and bootstrap
 
-Create the repository from the template — **Use this template**, not a fork —
-then:
+Create the repository with **Use this template** (not a fork), then:
 
 ```bash
 export GH_TOKEN=$(gh auth token)
@@ -56,16 +54,15 @@ python3 .github/scripts/audit_settings.py --repo "$REPO" \
   --state-writer-app-id <app-id>
 ```
 
-A clean audit is the precondition for everything below. If it is red, the
-scenarios would be testing your misconfiguration rather than the product.
+Everything below assumes a clean audit. If it is red, the scenarios would test
+your misconfiguration rather than the product.
 
 ---
 
 ## 2. `scheduling-and-attribution`
 
-The heart of it, and the one carrying
-[#261](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/261)'s
-regression.
+The core scenario. Step 1 guards against a past regression in which an
+unrelated merge cancelled a queued apply.
 
 1. **A queued apply survives an unrelated merge.** Open a PR adding a proxy;
    merge it. While its apply waits for approval, merge a README-only change.
@@ -187,22 +184,23 @@ python3 .github/scripts/lifecycle_result.py record \
   --status passed --detail "502 staging blocked production; mid-flight merge refused"
 ```
 
-## 7. `partial-failure-recovery` (optional here)
+## 7. `partial-failure-recovery`
 
-Runs locally against a fault-injecting proxy — see
-[README.md#injecting-failures](README.md#injecting-failures). Record it from
-whichever environment you actually exercised.
+This one needs a fault-injecting proxy, not a GitHub repository; see
+[Injecting failures](README.md#injecting-failures). The harness always records
+it as `skipped`, so it must be attested like the others. Record it from
+whichever environment you actually used.
 
 ---
 
 ## 8. Seal and publish
 
-Re-seal so the record certifies the revision you actually tested — the
-upstream commit (or release tag) whose template you exercised, not the
-disposable repository's own commit — and the gateway build you tested against.
-That must be the SHA-256 of the build `install-ferrum-edge.sh` installs for the
-release revision, because the acceptance run you hand this to records that
-build and refuses an attestation for any other:
+Re-seal the record for the revision you actually tested (the upstream commit
+or release tag whose template you exercised, not the disposable repository's
+own commit) and the gateway build you tested against. The gateway must be the
+SHA-256 of the build `install-ferrum-edge.sh` installs for the release
+revision; the acceptance run records that build and refuses an attestation for
+any other:
 
 ```bash
 python3 .github/scripts/lifecycle_result.py seal \
@@ -210,8 +208,8 @@ python3 .github/scripts/lifecycle_result.py seal \
   --revision <upstream commit being released> --gateway "<gateway binary sha256>"
 ```
 
-Then hand it to the release gate. The gate reads the result artifact of a
-**GitForgeOps Lifecycle Acceptance** run for the release revision, so dispatch
+Then hand it to the release gate, which reads the result artifact of a
+**GitForgeOps Lifecycle Acceptance** run for the release revision. Dispatch
 that workflow on the release ref with your sealed file as its
 `github_acceptance` input:
 
@@ -224,16 +222,16 @@ gh workflow run lifecycle.yml --repo ferrum-edge/ferrum-edge-git-forge-ops \
 That run executes the local scenarios itself, then merges your outcomes into
 **only** the scenarios it recorded as `skipped`, each marked `attested by
 @<you>`. It refuses an attestation that is unsealed, sealed for a different
-revision or a different gateway build than the one it installed, or sealed more
-than 72 hours (the `verify` freshness window) before it runs, and it can never
-overwrite a scenario it ran. When it is green,
-re-run the `Release` workflow for the same revision. It walks the successful
-acceptance runs for that commit newest first and accepts the first whose result
-`verify` certifies, so a later push-triggered run that skipped these scenarios
-does not hide your attested one.
+revision or gateway build than the one it installed, or sealed more than 72
+hours (the `verify` freshness window) before it runs. It never overwrites a
+scenario it ran.
 
-`verify` is the same computation the release runs, if you want to check the
-merged record yourself:
+When it is green, re-run the `Release` workflow for the same revision. Release
+checks the successful acceptance runs for that commit, newest first, and
+accepts the first whose result passes `verify`. A later push-triggered run
+that skipped these scenarios therefore does not hide your attested one.
+
+To check the merged record yourself, run the same `verify` the release uses:
 
 ```bash
 python3 .github/scripts/lifecycle_result.py verify \
@@ -255,6 +253,5 @@ the freshness window.
 - destroy the disposable gateway
 - rotate anything you typed by hand that was not generated for this run
 
-None of it is meant to outlive the run. A half-deleted acceptance repository
-with live environment secrets is a worse artifact than no acceptance run at
-all.
+A half-deleted acceptance repository with live environment secrets is worse
+than no acceptance run at all.

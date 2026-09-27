@@ -29,8 +29,9 @@ paths:
   errors, never silent successes, and `plan`, `apply`, `export` and PR review all report it.
 - Validate rendered mesh bytes through `ferrum-edge validate -m mesh` with the same scrubbed child
   environment and private temporary-file handling as gateway validation.
-- Preserve unknown mesh fields in the permissive mirror while omitting runtime-derived fields that
-  do not belong in GitOps input.
+- `MeshConfigSpec` types the top-level collections (merging needs them); the strict loader rejects
+  an unknown collection. Per-item values stay opaque `serde_json::Value` and round-trip verbatim.
+  Do not mirror Edge's runtime-derived `#[serde(skip)]` mesh fields.
 
 ## Verification
 

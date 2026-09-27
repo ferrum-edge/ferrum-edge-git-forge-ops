@@ -21,7 +21,8 @@ and reconciles the result with the companion `ferrum-edge` gateway.
   current schema and fixtures together. If a database is introduced, maintain one complete initial
   schema during buildout and fold subsequent changes into it.
 - Keep the Serde mirror fail-closed for unknown typed fields. Free-form plugin config, credential
-  maps, and mesh-item values round-trip unchanged. `FERRUM_ALLOW_UNKNOWN_FIELDS=true` permits
+  entry values, and mesh-item values round-trip unchanged; credential map keys are the closed
+  `KNOWN_CREDENTIAL_TYPES` set. `FERRUM_ALLOW_UNKNOWN_FIELDS=true` permits
   unknown top-level `spec` fields with a warning; nested unknowns stay fatal. The companion
   `ferrum-edge validate` command is authoritative for gateway schema validation.
 - Resource load order is `resources/<namespace>/<kind>/*.yaml`, followed by the selected

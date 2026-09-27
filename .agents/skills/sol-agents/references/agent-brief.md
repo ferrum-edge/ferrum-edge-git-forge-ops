@@ -44,8 +44,9 @@ explicitly assigns that operation.
 
 - Follow all repository invariants, especially no `.unwrap()` in production paths, no `.expect()`
   unless failure is a genuine bug, path-component traversal rejection, namespace-scoped
-  `(namespace, kind, id)` identity, deterministic state hashes, permissive schema mirroring, and
-  fail-closed ownership and secret handling.
+  `(namespace, kind, id)` identity, deterministic state hashes, a schema mirror that rejects unknown fields by default
+  and leaves value validation to `ferrum-edge validate`, and fail-closed ownership and secret
+  handling.
 - Add tests in the external test suites preferred by `AGENTS.md`; do not add inline source tests
   merely for convenience.
 - Register every new `tests/unit/<name>.rs` module in `tests/unit/mod.rs`.

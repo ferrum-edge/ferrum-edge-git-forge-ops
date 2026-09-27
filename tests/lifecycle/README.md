@@ -1,21 +1,26 @@
 # Lifecycle acceptance suite
 
-The unit suite proves the code does what the code says. This proves the
-*product* does what the README says: a real Ferrum Edge gateway, a real
-upstream, the real `gitforgeops` binary, real HTTP traffic through the routes
-it created.
+The unit suite checks that the code does what the code says. This suite checks
+that the *product* does what the README says, with a real Ferrum Edge gateway,
+a real upstream, the real `gitforgeops` binary and real HTTP traffic through
+the routes it creates.
 
-Its sealed result is what [`release.yml`](../../.github/workflows/release.yml)
-refuses to publish without.
+[`release.yml`](../../.github/workflows/release.yml) refuses to publish without
+its sealed result.
 
 ---
 
 ## What it certifies
 
 One scenario per acceptance promise. Every one must be `passed` before a
-revision may be published; the ids are the contract, declared once in
-[`.github/scripts/lifecycle_result.py`](../../.github/scripts/lifecycle_result.py)
-and asserted against this file by the test suite.
+revision can be published. The ids are declared once, in
+[`.github/scripts/lifecycle_result.py`](../../.github/scripts/lifecycle_result.py),
+and a test checks that this file lists each of them.
+
+The harness (`run.sh`) runs five scenarios itself: `create-and-route`,
+`reapply-is-a-no-op`, `modify-and-delete-in-order`, `drift-monitoring` and
+`file-and-mesh-boundary`. The other six always record `skipped` and are
+exercised by hand (see below).
 
 | Scenario | Question it answers |
 | --- | --- |
@@ -26,20 +31,20 @@ and asserted against this file by the test suite.
 | `partial-failure-recovery` | Do the recovery safeguards preserve successful work and ownership across an injected partial failure and an ambiguous response? |
 | `ledger-publication-failure` | When state publication is rejected after a gateway mutation and retries are exhausted, does a fresh runner recover ownership by the documented procedure — rather than treating a runner-local ledger as durable? |
 | `runner-interruption` | After an interruption mid-mutation, does the documented reconciliation path work, with state-override authorization only where it is genuinely required? |
-| `scheduling-and-attribution` | Queued and superseded applies, unrelated later merges, re-runs of an older workflow, PR-author credential delivery, policy-override attribution — including [#261](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/issues/261)'s regression. |
+| `scheduling-and-attribution` | Queued and superseded applies, unrelated later merges (a queued apply must survive one), re-runs of an older workflow, PR-author credential delivery, policy-override attribution. |
 | `staged-promotion` | Does an opted-in production environment stay blocked until staging applied *and* served traffic for the same revision — and does breaking staging's routing block it even though the gateway accepted the write? |
 | `drift-monitoring` | Is drift distinguishable from a failed check and from a skipped one? |
 | `file-and-mesh-boundary` | For the advertised file/mesh profile: assembly that preserves placeholders, a separate mesh document, and 0600 materialization that never touches the committed artifact — and that assembly is *not* reported as live fleet deployment. Encrypted delivery to a GitHub key is `credentials-generate-and-rotate`'s. |
 
 ### `skipped` is not `passed`
 
-Several scenarios need a disposable GitHub repository, which the suite cannot
-create for itself. Those record `skipped` with the reason, and **a skipped
-scenario never certifies anything** — the release gate refuses a result that
-contains one exactly as it refuses a failure. Run them through
-[the GitHub acceptance path](#the-github-repository-half) and submit their
-outcomes as an attestation to a dispatched acceptance run for the release
-revision.
+Five scenarios need a disposable GitHub repository, which the suite cannot
+create, and `partial-failure-recovery` needs a fault-injecting proxy. The
+harness records all six as `skipped` with the reason. **A skipped scenario
+never certifies anything**: the release gate refuses it exactly as it refuses a
+failure. Exercise them by hand ([GitHub half](#the-github-repository-half),
+[injecting failures](#injecting-failures)) and submit the outcomes as an
+attestation to a dispatched acceptance run for the release revision.
 
 ---
 
@@ -47,22 +52,22 @@ revision.
 
 ### Prerequisites
 
-- `python3` (standard library only — no packages to install)
-- nothing else: the config store is a SQLite file the run creates and deletes
+- `python3` (standard library only)
 - the `gitforgeops` binary on `PATH` (`cargo install --path . --locked`)
-- the `ferrum-edge` binary on `PATH`, installed through
+- the `ferrum-edge` binary on `PATH`, installed with
   [`install-ferrum-edge.sh`](../../.github/scripts/install-ferrum-edge.sh),
-  which verifies it against the allowlisted SHA-256 digests
+  which checks it against the allowlisted SHA-256 digests
 
-The suite deliberately reuses that same binary as the gateway rather than
-pinning a second artifact: it certifies the build this repository has already
-approved, and adds no new supply-chain surface.
+No database is needed: the config store is a SQLite file the run creates and
+deletes. The suite uses the approved validator binary as the gateway too, so it
+certifies the build this repository already trusts and adds no second
+artifact to pin.
 
 ### Commands
 
-Scenarios run in sequence and mutate shared state — one deletes the proxy —
-so each one deploys what it needs first. That is what makes `LIFECYCLE_ONLY`
-meaningful: any scenario can be run alone and still be reporting on itself.
+Scenarios run in sequence and change shared state (one deletes the proxy), so
+each deploys what it needs first. That is why any scenario can run alone with
+`LIFECYCLE_ONLY`.
 
 ```bash
 # Everything, sealed into ./lifecycle-result.json
@@ -92,39 +97,36 @@ python3 .github/scripts/lifecycle_result.py verify \
 | `LIFECYCLE_GATEWAY_EXTERNAL` | do not start a gateway; one is already listening |
 | `GITFORGEOPS_BINARY` | the binary under test (default `gitforgeops` on `PATH`) |
 
-If the gateway does not answer `GET /health` within 30 seconds the run **fails
-loudly** with the command it used *and the subcommands that build actually
-offers*. It does not fall back to skipping every
-scenario: a suite that silently certifies nothing is worse than one that is
-red.
+If the gateway does not answer `GET /health` within 30 seconds, the run **fails**
+and prints the command it used and the subcommands that build offers. It never
+falls back to skipping every scenario; a suite that silently certifies nothing
+is worse than a red one.
 
 ### Cleanup
 
-`run.sh` owns a single temporary directory and removes it on exit, including
-on failure and on `Ctrl-C`. It holds the repository tree, the gateway log, the
-credential bundle, and the upstream's port file. Both background processes are
-killed by the same trap.
+`run.sh` owns one temporary directory and removes it on exit, including on
+failure and `Ctrl-C`. It holds the repository tree, the gateway log, the
+credential bundle and the upstream's port file. The same trap stops both
+background processes (gateway and upstream).
 
-Nothing survives a run except the sealed result file, which contains no secret
-— only scenario ids, statuses, one-line details, the revision, and the gateway
-build's digest.
+Only the sealed result file survives a run. It holds no secret: scenario ids,
+statuses, one-line details, the revision and the gateway build's digest.
 
 ### Disposability is a requirement, not a convenience
 
-Every credential the suite uses is generated for the process and destroyed
-with it: the admin JWT signing secret, the consumer key, the broker bundle.
-The gateway is loopback-only. **Do not point this suite at a real gateway or
-supply a real environment's secrets** — several scenarios deliberately mutate
-resources out of band and delete managed ones.
+Every credential the suite uses (admin JWT signing secret, consumer key, broker
+bundle) is generated for the run and destroyed with it. The gateway listens on
+loopback only. **Do not point this suite at a real gateway or give it a real
+environment's secrets**: several scenarios change resources out of band and
+delete managed ones.
 
 ---
 
 ## Redacted failure evidence
 
-A failing lifecycle run is the single most likely place for a live credential
-to reach a log: the values are real, and the instinct on failure is to dump
-everything. So redaction happens at the point of capture, not at the point of
-printing.
+A failing lifecycle run is the most likely place for a live credential to reach
+a log: the values are real, and the instinct on failure is to dump everything.
+So redaction happens when output is captured, not when it is printed.
 
 - Every `gitforgeops` stdout/stderr the harness captures goes through
   `Harness.redact()`, keyed on the secrets *this run* created.
@@ -143,30 +145,27 @@ keep that log off CI.
 
 ## Injecting failures
 
-`partial-failure-recovery` needs the admin API to misbehave on demand — a 500
-after a commit, a connection dropped mid-response, a `X-Data-Source: cached`
-header on `/backup`. Put a fault-injecting reverse proxy between the harness
-and the gateway and point `LIFECYCLE_ADMIN_PORT` at it:
+`partial-failure-recovery` needs the admin API to misbehave on demand: a 500
+after a commit, a connection dropped mid-response, an `X-Data-Source: cached`
+header on `/backup`. No fault injector ships with this repository, and the
+harness does not drive this scenario; it always records `skipped`.
 
-```bash
-LIFECYCLE_GATEWAY_EXTERNAL=1 LIFECYCLE_ADMIN_PORT=18090 \
-  bash tests/lifecycle/run.sh
-```
-
-The scenario asserts the *safeguards*, not the fault: that successful work is
-preserved, that ownership is recorded for what actually committed, and that an
-ambiguous outcome stops the run rather than being retried blindly.
+To exercise it, put your own fault-injecting reverse proxy between
+`gitforgeops` and a disposable gateway, and run `gitforgeops apply` through it
+by hand. Check the *safeguards*, not the fault: successful work is preserved,
+ownership is recorded for what actually committed, and an ambiguous outcome
+stops the run instead of being retried blindly. Record the outcome with
+`lifecycle_result.py record`, as for the GitHub scenarios below.
 
 ---
 
 ## The GitHub-repository half
 
-Six scenarios are about GitHub's own controls — environment approvals,
-state-writer App permissions, protected-branch ledger writes, scheduling and
-attribution. They cannot run inside this repository's CI, which has no
-authority to create repositories, environments or Apps. They run against a
-**disposable repository** you create, and their outcomes are recorded into the
-same result file.
+Five scenarios test GitHub's own controls: environment approvals, state-writer
+App permissions, protected-branch ledger writes, scheduling and attribution.
+This repository's CI cannot run them, because it has no authority to create
+repositories, environments or Apps. You run them against a **disposable
+repository** and record the outcomes in the same result file.
 
 See [`github_acceptance.md`](github_acceptance.md) for the procedure. In
 short:
@@ -196,24 +195,24 @@ gh workflow run lifecycle.yml --ref <release tag or main> \
 ```
 
 The dispatched run merges your outcomes into **only** the scenarios it recorded
-as `skipped`, attributed to you, and refuses an attestation sealed for another
-revision, against another gateway build than the one it installs, or more than
-72 hours before it runs. It never overwrites a scenario it ran itself.
+as `skipped`, attributed to you. It refuses an attestation sealed for another
+revision, for a different gateway build than the one it installs, or more than
+72 hours before it runs, and it never overwrites a scenario it ran itself.
 
 Delete the repository, its environments and its App installation when you are
-done. Nothing in it is meant to outlive the run.
+done.
 
 ---
 
 ## Adding a scenario
 
-Adding a fail-closed gate to `apply` without adding a scenario here narrows
-what the suite certifies without narrowing what ships. So:
+A new fail-closed gate in `apply` without a matching scenario here is a
+behavior that ships uncertified. When adding one:
 
 1. Add the id and its description to `REQUIRED_SCENARIOS` in
    `.github/scripts/lifecycle_result.py`.
 2. Implement it in `scenarios.py` and register it in `SCENARIOS`.
 3. Add a row to the table at the top of this file.
 
-`test_lifecycle_result.py` asserts all three stay in step, so a half-added
-scenario fails the build rather than silently certifying nothing.
+`test_lifecycle_result.py` checks that all three agree, so a half-added
+scenario fails the build.

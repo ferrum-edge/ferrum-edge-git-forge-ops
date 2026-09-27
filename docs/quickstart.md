@@ -1,29 +1,26 @@
 # Quickstart: one gateway, one namespace, one environment
 
-Release baseline: [v0.1.0](../release/README.md). Follow this setup as a
+Release baseline: [v0.1.0](../release/README.md). Treat this setup as a
 supported pairing only when the [upstream record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json) `status` is
-`supported`; it then supplies the exact source revision and validator/gateway
-pairing. Use the [immutable adoption commands](../release/README.md#adopt-the-immutable-sourcetemplate-revision)
-to start a repository at that revision before continuing below. GitHub's
-**Use this template** button selects the current default branch, which may
-have moved beyond the supported baseline. The source archive itself carries
-the release-prep snapshot of the record; the upstream record is finalized
-after the image digest exists.
+`supported`. The record then gives the exact source revision and the
+validator/gateway pairing. Start your repository at that revision with the
+[immutable adoption commands](../release/README.md#adopt-the-immutable-sourcetemplate-revision).
+GitHub's **Use this template** button copies the current default branch, which
+may be ahead of the supported baseline.
 
-The smallest setup that actually deploys: a single API-mode gateway, a single
-namespace, shared ownership, one declared deployment environment, and the
-security controls the bundled workflows require. Follow it end to end and you
-finish with a proxy serving authenticated traffic, a broker-allocated consumer
-credential delivered to you encrypted, and an ownership ledger committed to
-`main` by the state-writer App.
+This is the smallest setup that actually deploys: one API-mode gateway, one
+namespace, shared ownership, one deployment environment, and the security
+controls the bundled workflows require. At the end you have a proxy serving
+authenticated traffic, a broker-allocated consumer credential delivered to you
+encrypted, and an ownership ledger committed to `main` by the state-writer App.
 
-Every file in this guide is the literal content of
-[`tests/fixtures/quickstart/`](../tests/fixtures/quickstart/), which
-`tests/unit/quickstart_tests.rs` loads, overlays and audits on every build. A
-change that would break this copy-paste breaks that test first.
+Every file in this guide is copied verbatim from
+[`tests/fixtures/quickstart/`](../tests/fixtures/quickstart/).
+`tests/unit/quickstart_tests.rs` loads, overlays and audits that fixture and
+checks it byte-for-byte against this page, so a change that breaks the
+copy-paste fails that test first.
 
-Detailed explanations live elsewhere and are linked where they matter; this
-page is the order of operations.
+This page is the order of operations. Details are linked where they matter.
 
 ---
 
@@ -39,30 +36,30 @@ page is the order of operations.
 [GitHub's environment documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#required-reviewers)
 is the authority. On a plan without required reviewers, the environment steps
 below fail with GitHub's own error, `bootstrap_repo_settings.py` exits
-non-zero, and the settings audit reports every reviewer-less environment. Pick
-the shape before you provision anything. See
+non-zero, and the settings audit reports every environment without a reviewer.
+Pick the shape before you provision anything. See
 [GitHub plan requirements](../README.md#github-plan-requirements).
 
 ### Decide who approves what
 
-Two different approvals, often confused:
+There are two different approvals:
 
 | Approval | Who | Required here? |
 | --- | --- | --- |
 | **Pull request review** | any collaborator | **No.** The `main` ruleset sets `required_approving_review_count: 0`. A pull request is required; an approving review is not. A solo maintainer merges their own PR once the required checks pass. |
 | **Environment approval** | a *required reviewer* on the deployment environment, who is not the person that triggered the run | **Yes**, and this one needs a second human. |
 
-That second row is the one to plan around. The baseline sets
-`prevent_self_review: true`, so the account that merged the pull request cannot
-approve the apply it triggered. **A single-person repository cannot satisfy
-both halves.** Name a second maintainer as the environment reviewer, or accept
-that every apply waits for someone who is not you.
+Plan around the second row. The baseline sets `prevent_self_review: true`, so
+the account that merged the pull request cannot approve the apply it
+triggered. **A single-person repository cannot satisfy both halves.** Name a
+second maintainer as the environment reviewer, or accept that every apply
+waits for someone who is not you.
 
-There is no supported "solo bypass" for that. The Repository Admin bypass actor
-you may have seen is a *different* control — it is the fallback the bootstrap
-uses on the `main` ruleset when no state-writer App exists yet, and the settings
-audit reports it as a violation until you replace it with the App. It has
-nothing to do with environment approvals and does not remove them.
+There is no supported solo bypass. The Repository Admin bypass actor you may
+see on the `main` ruleset is a different control: the bootstrap script uses it
+only when no state-writer App ID is given, and the settings audit reports it as
+a violation until you replace it with the App. It does not affect environment
+approvals.
 
 ### What this profile does and does not give you
 
@@ -74,22 +71,22 @@ nothing to do with environment approvals and does not remove them.
 | Drift detection | yes (`drift-check.yml`) | on demand (`gitforgeops diff`) | no live surface to compare |
 | Credential broker | yes | yes, with a local bundle | yes, plus a separate materialize step |
 
-One consequence worth stating plainly: **assembling a file is not deploying
-it.** In file mode `apply` writes `assembled/<env>.yaml` (and
-`assembled/<env>-mesh.yaml` when the repository declares mesh fragments) and
-commits it. Getting those documents onto a fleet is your own delivery step.
+**Assembling a file is not deploying it.** In file mode, `apply` writes and
+commits `assembled/<env>.yaml` (plus `assembled/<env>-mesh.yaml` when the
+repository declares mesh fragments). Getting those documents onto a fleet is
+your own delivery step.
 
-The sample configuration leaves `monitoring.unattended` unset, so scheduled
-drift monitoring is approval-gated: its nightly run waits for the deployment
-environment's required reviewer before it can read the gateway. To opt into
-unattended checks, set `monitoring.unattended: true`; bootstrap creates and
-binds a separate `<env>-monitor` environment. Set its secrets as described in
+The sample configuration leaves `monitoring.unattended` unset, so the nightly
+drift check waits for the environment's required reviewer before it can read
+the gateway. To run it unattended, set `monitoring.unattended: true`; the
+bootstrap script then creates a separate `<env>-monitor` environment for the
+check to bind. Set its secrets as described in
 [launch controls §3.1](github-launch-controls.md#31-unattended-drift-monitoring).
-The monitoring environment's admin JWT signing secret is write-equivalent at
-the gateway, even though the workflow runs read-only commands. See the
-[documented caveat](../README.md#unattended-monitoring-and-when-it-is-approval-gated)
-before enabling it. You can also dispatch `gitforgeops diff --exit-on-drift`
-yourself.
+Its admin JWT signing secret can write to the gateway even though the workflow
+only reads, so read the
+[caveat](../README.md#unattended-monitoring-and-when-it-is-approval-gated)
+first. You can also run `gitforgeops diff --exit-on-drift` yourself at any
+time.
 
 ### Prerequisites
 
@@ -102,37 +99,33 @@ yourself.
 
 ## 1. Create the repository from the template
 
-Before publication, a disposable setup may use **Use this template**. For the
-supported pairing, create the copy from the exact source SHA using the
+For the supported pairing, create the copy from the exact source SHA with the
 [release instructions](../release/README.md#adopt-the-immutable-sourcetemplate-revision).
-A fork inherits neither repository settings nor your own secrets cleanly.
+Before a release is supported, a throwaway setup may use **Use this
+template**. Do not fork: a fork carries neither repository settings nor
+secrets.
 
-Then, in **Actions → General**, enable workflows. A brand-new copy starts
-enabled; GitHub disables *schedules* after 60 days of repository inactivity, so
-check back if the repository goes quiet.
+Check that workflows are enabled under **Actions → General**. GitHub disables
+*scheduled* workflows after 60 days without repository activity, so check
+again if the repository goes quiet.
 
-At this point you have a **template**: no `.gitforgeops/config.yaml`, no
-deployment environment. Two workflows are supposed to be quiet about that, and
-two are supposed to be loud:
+At this point there is no `.gitforgeops/config.yaml` and no deployment
+environment. That is expected, and the workflows react like this:
 
 | Workflow | With no config |
 | --- | --- |
-| `GitForgeOps Apply` | **skips** — empty environment matrix, a `::notice::`, green |
-| `GitForgeOps Trusted PR Live Review` | **skips** — no live-review targets |
+| `GitForgeOps Apply` | **skips**: empty environment matrix, a `::notice::`, green |
+| `GitForgeOps Trusted PR Live Review` | **skips**: no live-review targets |
 | `GitForgeOps Drift Check` | **fails** its preflight |
-| `rotate`, `materialize-file` | **fail** — you started them, so absent configuration contradicts your intent |
-
-An unconfigured repository skipping is intentional. An unconfigured repository
-*failing* the workflows a human started is also intentional. Neither is a bug
-to work around.
+| `rotate`, `materialize-file` | **fail**: you started them, so missing configuration contradicts your intent |
 
 ---
 
 ## 2. Create the state-writer GitHub App
 
 `apply-on-merge.yml` and `rotate.yml` commit `.state/<env>.json` back to a
-protected `main`. A direct push by `github-actions[bot]` is correctly rejected,
-so they mint a short-lived installation token for a dedicated App instead.
+protected `main`, which rejects a direct push by `github-actions[bot]`. They
+use a short-lived installation token for a dedicated App instead.
 
 Create it under Settings → Developer settings → GitHub Apps → **New GitHub
 App**, with **Contents: read and write** as its only write permission, no
@@ -143,20 +136,19 @@ numeric **App ID**, and generate a private key.
 gh variable set GITFORGEOPS_STATE_APP_ID --repo OWNER/REPO --body 123456
 ```
 
-The App ID is a repository **variable** — public metadata, read identically by
-the workflows and by the settings audit. The private key is an environment
-**secret**, set in step 5.
-
-Full reasoning: [launch controls §1](github-launch-controls.md#1-create-the-state-writer-github-app).
+The App ID is a repository **variable** (public metadata, read by both the
+workflows and the settings audit). The private key is an environment
+**secret**, set in step 5. Details:
+[launch controls §1](github-launch-controls.md#1-create-the-state-writer-github-app).
 
 ---
 
 ## 3. Apply the settings baseline
 
-`bootstrap_repo_settings.py` writes the branch ruleset, Actions policy, labels,
-the `settings-audit` environment, and your deployment environment. It is
-idempotent, prints a plan without writing unless `--apply` is passed, and never
-accepts or prints a secret value.
+`bootstrap_repo_settings.py` writes the rulesets, Actions policy, security
+features, labels, the `settings-audit` environment and your deployment
+environment. It is idempotent, only prints a plan unless `--apply` is passed,
+and never accepts or prints a secret value.
 
 ```bash
 export GH_TOKEN=$(gh auth token)
@@ -172,28 +164,33 @@ python3 .github/scripts/bootstrap_repo_settings.py --repo OWNER/REPO \
   --reviewer SECOND-MAINTAINER --apply    # write
 ```
 
-It finishes by listing the exact `gh secret set` commands left for you. Run
-those in step 5. Before setting any secrets, confirm the applied plan contains
-`CREATE environment production` or `UPDATE environment production` (or
-`UNCHANGED environment production` on a later idempotent run). A successful
-bootstrap without that environment line is not a completed deployment setup.
+It ends by listing the `gh secret set` commands you run in step 5. Before
+setting any secrets, confirm the applied plan contains
+`CREATE environment production` or `UPDATE environment production`
+(`UNCHANGED environment production` on a later re-run). Without that line the
+deployment environment is not set up, even if the script succeeded.
 
-`--reviewer` is the environment's required reviewer from §0. Without it, the
-environment step reports `BLOCKED` rather than creating an environment nobody
-has to approve. `--environment production` is explicit because the repository
-configuration used for automatic environment discovery is not committed until
-step 4.
+`--reviewer` is the environment's required reviewer from §0. Without it the
+environment step reports `BLOCKED` instead of creating an environment nobody
+has to approve. `--environment production` is needed because the script
+normally discovers environments from `.gitforgeops/config.yaml`, which you
+commit in step 4.
+
+The release-tag ruleset's bypass defaults to the Repository Admin role, which
+the settings audit rejects. Once you have an App, user or team that publishes
+releases, re-run with `--release-tag-bypass app:<id>`, `user:<login>` or
+`team:<org/slug>`.
 
 ---
 
 ## 4. Commit the repository configuration
 
-**This file is what makes GitHub Actions deployment work at all.** Local CLI
-use does not need it — `gitforgeops validate`, `diff` and `plan` fall back to a
-synthetic local `default` environment driven purely by `FERRUM_*` variables.
-The workflows do not: with no `.gitforgeops/config.yaml`, `apply-on-merge.yml`
+**GitHub Actions deploys nothing without this file.** Local CLI use does not
+need it: `gitforgeops validate`, `diff` and `plan` fall back to a synthetic
+local `default` environment configured only by `FERRUM_*` variables. The
+workflows do need it. Without `.gitforgeops/config.yaml`, `apply-on-merge.yml`
 emits an empty matrix and deploys nothing, and `drift-check.yml` fails its
-enumeration preflight. The synthetic local default is never a trusted workflow
+enumeration preflight. The synthetic `default` is never a trusted workflow
 target.
 
 `.gitforgeops/config.yaml`:
@@ -215,22 +212,23 @@ environments:
 default_environment: production
 ```
 
-The environment name must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` — it becomes
-a GitHub Actions matrix value, an `environment:` binding, and a
-`.state/<name>.json` path — and it must equal the GitHub Environment name the
-bootstrap created.
+The environment name must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, because
+it becomes a GitHub Actions matrix value, an `environment:` binding and a
+`.state/<name>.json` path. It must also equal the GitHub Environment name the
+bootstrap script created.
 
-No URL, no secret name, no credential ever goes in this file.
+Never put a URL, secret name or credential in this file.
 
-Create the overlay directory even though this first example does not override
-anything yet:
+Make sure the overlay directory exists (the template ships it with a
+`.gitkeep`):
 
 ```bash
 mkdir -p overlays/production/ferrum/proxies
 ```
 
-A configured overlay that is not in the tree fails every command for that
-environment, up front, naming the environment and the file that selected it.
+If a configured overlay directory is missing, every command for that
+environment fails up front, naming the environment and the file that selected
+it.
 
 ---
 
@@ -247,29 +245,28 @@ gh secret set SETTINGS_AUDIT_TOKEN      --repo OWNER/REPO --env settings-audit
 
 | Secret | Environment | Why |
 | --- | --- | --- |
-| `FERRUM_GATEWAY_URL` | `production` | must be `https://`; `http://` is refused unless you opt in, and never on a non-loopback host in Actions |
-| `FERRUM_ADMIN_JWT_SECRET` | `production` | ≥ 32 characters, the gateway's own signing secret |
+| `FERRUM_GATEWAY_URL` | `production` | must be `https://`. `http://` needs an explicit opt-in and is always refused in Actions for a non-loopback host. |
+| `FERRUM_ADMIN_JWT_SECRET` | `production` | the gateway's own signing secret (at least 32 characters) |
 | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | `production` | PEM key of the App from step 2 |
-| `FERRUM_GH_PROVISIONER_TOKEN` | `production` | writes the credential-broker bundle secrets; needed the moment a consumer uses `alloc=generate` |
+| `FERRUM_GH_PROVISIONER_TOKEN` | `production` | writes the credential-broker bundle secrets; needed as soon as a consumer uses `alloc=generate` |
 | `SETTINGS_AUDIT_TOKEN` | `settings-audit` | fine-grained PAT or App token with **Administration: read** |
 
-Four more are optional to configure and mandatory to match if your gateway
-configures them: `FERRUM_ADMIN_JWT_ISSUER`, `FERRUM_ADMIN_JWT_ROLE`,
-`FERRUM_ADMIN_JWT_AUDIENCE`, `FERRUM_ADMIN_JWT_TTL_SECS`. An unset one means
-"use the documented default", not "send nothing" — and a gateway with no
-audience rejects a token that carries one. Mismatches here are the usual cause
-of a 401 halfway through an apply.
+Four more are optional, but must match the gateway if it sets them:
+`FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), `FERRUM_ADMIN_JWT_ROLE`
+(default `admin`), `FERRUM_ADMIN_JWT_AUDIENCE` (set only if the gateway
+configures an audience) and `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`). A
+mismatch here is the usual cause of a 401 partway through an apply.
 
-`FERRUM_CREDS_BUNDLE[_N]` is **not** on this list. The broker writes it on the
-first apply that resolves an `alloc=generate` placeholder; you only seed it by
-hand when adopting an existing gateway.
+Do **not** set `FERRUM_CREDS_BUNDLE[_N]`. The broker writes it on the first
+apply that resolves an `alloc=generate` placeholder. You only seed it by hand
+when adopting an existing gateway.
 
 ---
 
 ## 6. Write the resources
 
-One namespace, `ferrum`, inferred from the directory. Nothing declares a
-`namespace:` field.
+Everything lives in one namespace, `ferrum`, taken from the directory name. No
+file sets a `namespace:` field.
 
 `resources/ferrum/upstreams/orders.yaml`:
 
@@ -332,7 +329,7 @@ spec:
       - key: "${gh-env-secret:alloc=generate}"
 ```
 
-And an overlay that changes one key for production —
+An overlay that changes one key for production,
 `overlays/production/ferrum/proxies/orders.yaml`:
 
 ```yaml
@@ -349,11 +346,11 @@ your own resources are in place.
 
 ### Upload your SSH public key first
 
-Credential delivery age-encrypts the generated key to the SSH public key on
+Credential delivery age-encrypts the generated key to an SSH public key on
 your GitHub account, fetched from `GET /users/<you>/keys`. With no key on the
-account, delivery has nowhere to go. Add one before the first apply, and keep
-the matching private key handy — you decrypt with
-`age -d -i ~/.ssh/id_ed25519`.
+account there is nothing to encrypt to, and the slot is reported as
+`NOT DELIVERED`. Add a key before the first apply and keep the matching private
+key: you decrypt with `age -d -i ~/.ssh/id_ed25519`.
 
 ---
 
@@ -361,88 +358,88 @@ the matching private key handy — you decrypt with
 
 ### Set up the local tools
 
-Install Rust and build this checked-out repository with `cargo build`; run the
-CLI as `./target/debug/gitforgeops` (or install it with `cargo install
---path .`). `validate` invokes a separate Ferrum Edge validator. Use the
-repository-approved Ferrum Edge v0.9.7 binary (SHA-256
-`c26ba4c059be2d78f4044a3768ebfed5be4e7eb5640620fa93ea9199776b0902`),
-installed on `PATH` as `ferrum-edge` or selected with
-`FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The bundled workflows verify
+Install Rust and build this repository with `cargo build`, then run the CLI as
+`./target/debug/gitforgeops` (or install it with `cargo install --path .`).
+`validate` calls a separate Ferrum Edge validator. Use the approved Ferrum Edge
+v0.9.7 binary (SHA-256
+`c26ba4c059be2d78f4044a3768ebfed5be4e7eb5640620fa93ea9199776b0902`), either on
+`PATH` as `ferrum-edge` or selected with
+`FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The bundled workflows check
 this digest against `.github/ferrum-edge-checksums.txt` before use.
 
-Install `age` for decrypting the delivered credential in step 8, and install
-`python3` for the bootstrap commands in steps 3 and 5. If you prefer not to
-set up local validation, skip the commands below and wait for
-`gitforgeops-required-static-validation` and `rust-ci-check` on your pull
-request; the latter runs formatting, clippy and unit tests for Rust changes.
+Install `age` to decrypt the delivered credential in step 8, and install
+`python3` for the bootstrap script in step 3. To skip local validation, skip
+the commands below and wait for `gitforgeops-required-static-validation` and
+`rust-ci-check` on your pull request (`rust-ci-check` runs formatting, clippy
+and unit tests when Rust inputs change).
 
 ```bash
 ./target/debug/gitforgeops validate                      # assembles and shells out to ferrum-edge validate
 ./target/debug/gitforgeops --env production plan         # validation + diff + breaking/security/policy + blockers
 ```
 
-`plan` needs gateway credentials to compare against live state. Without them it
-still reports every *offline* blocker — literal credentials, required
-credential slots, schema, policy, security — and exits 1 if any exist.
+`plan` needs gateway credentials to compare against live state. Without them
+it still reports every *offline* blocker (literal credentials, required
+credential slots, schema, policy, security) and exits 1 if there are any.
 
 Run `gitforgeops doctor` for local checks and GitHub metadata, then
-`gitforgeops doctor --scope all --env production` when production gateway
-credentials are available for the read-only gateway checks. See
-[README: Setup doctor](../README.md#setup-doctor). Keep `validate` for the
-gateway schema check and `plan` for the live diff and apply-blocker report;
-doctor does not replace either command.
+`gitforgeops doctor --scope all --env production` once production gateway
+credentials are available, for the read-only gateway checks. See
+[README: Setup doctor](../README.md#setup-doctor). Doctor does not replace
+`validate` (the gateway schema check) or `plan` (the live diff and
+apply-blocker report).
 
 Open the pull request. You should see:
 
-- **`gitforgeops-required-static-validation`** — secretless assembly and schema
-  validation, no gateway contact.
-- **`rust-ci-check`**, **`security-*`**, **`state-guard-reject-state-edits`** —
-  the required checks.
-- A **GitForgeOps review comment** listing the resources that would be added,
-  the credential slots awaiting allocation, and the verdict.
+- **`gitforgeops-required-static-validation`**: secretless assembly and schema
+  validation, with no gateway contact.
+- **`rust-ci-check`**, **`security-*`** and **`state-guard-reject-state-edits`**:
+  the other required checks.
+- **`GitForgeOps Trusted PR Live Review`**, waiting for the environment
+  reviewer. Once approved, it posts a review comment listing the resources that
+  would be added, the credential slots awaiting allocation, and the verdict.
 
-Merge it. Zero approving reviews are required; the checks are.
+Merge it. The required checks must pass; no approving review is required.
 
 ---
 
 ## 8. Approve the apply, and watch what lands
 
 The merge triggers `GitForgeOps Apply`. It binds the `production` environment,
-so it stops at **waiting for approval** until your required reviewer — someone
-other than whoever merged — releases it.
+so it waits for approval until your required reviewer (someone other than
+whoever merged) releases it.
 
-Once approved, the successful run prints, in this order:
+Once approved, a successful run prints, among other lines:
 
 ```
 Triggering commit: 4f2c…
 Protected main HEAD: 4f2c…
 ...
-CREATE Upstream orders-upstream
-CREATE PluginConfig orders-key-auth
-CREATE Proxy orders-proxy
-CREATE Consumer orders-client
-Allocated credential slot ferrum/orders-client/keyauth/key
-convergence: mode=cp, 1 data plane connected, oldest last_sync_at ...
+Allocated 1 credential slot(s):
+  ferrum/orders-client/keyauth/key -> @you (ssh SHA256:…)
+Applied: 4 created, 0 updated, 0 deleted, 0 deletes deferred, 0 unmanaged skipped, 0 spec-owned skipped
+convergence: mode=cp, 1 data-plane node(s), 0 mesh node(s) connected; oldest last_sync_at …
+...
 Pushed state on attempt 1.
 ```
 
-Three things to verify afterwards:
+Then check three things:
 
-1. **A new commit on `main`** authored by `gitforgeops[bot]`:
-   `chore(gitforgeops): state update for production`, touching
-   `.state/production.json` only.
-2. **A comment on your merged pull request** carrying an age-encrypted blob.
-   Decrypt it:
+1. **A new commit on `main`** authored by `gitforgeops[bot]`,
+   `chore(gitforgeops): state update for production`, touching only
+   `.state/production.json`.
+2. **A comment on your merged pull request** with an age-encrypted blob.
+   Save it and decrypt it:
    ```bash
    age -d -i ~/.ssh/id_ed25519 < delivered.age
    ```
-3. **Real traffic**, using that key:
+3. **Real traffic** with that key:
    ```bash
    curl -i https://your-gateway/orders -H "X-API-Key: <decrypted value>"
    curl -i https://your-gateway/orders            # expect 401 without it
    ```
 
-If the second call succeeds, the scoped auth plugin is not attached — check
+If the second call succeeds, the scoped auth plugin is not attached. Check
 that the plugin's `proxy_id` matches the proxy's `id`.
 
 ### Confirm the loop is closed
@@ -451,8 +448,8 @@ that the plugin's `proxy_id` matches the proxy's `id`.
 gitforgeops --env production diff --exit-on-drift   # exit 0: in sync
 ```
 
-Re-running the apply must also be a no-op. If it is not, something in the
-document normalizes differently than the gateway stores it; open an issue
+Re-running the apply must also change nothing. If it does, part of the
+document normalizes differently from how the gateway stores it; open an issue
 rather than working around it.
 
 ---
@@ -481,17 +478,15 @@ environments:
 default_environment: staging
 ```
 
-Be clear about what that is and is not. Both jobs start from the same merge,
-`fail-fast: false`, and **production does not wait for staging**. Staging
-failing does not stop production, and production is not "promoted" from
-anything — it reconciles the same source revision with its own overlay.
+Both jobs start from the same merge with `fail-fast: false`, and **production
+does not wait for staging**. A staging failure does not stop production.
+Production is not promoted from staging; it reconciles the same source
+revision with its own overlay.
 
-If you want a real promotion path — staging applies, representative traffic is
-verified, and only then is production authorized for the same revision — opt
-production into it with `promotion.requires: staging` and declare staging's
-checks in `.gitforgeops/smoke.yaml`; see
-[Staged promotion](../README.md#staged-promotion). Do not read parallel matrix
-jobs as staged rollout.
+For a real promotion path (staging applies, representative traffic is
+verified, and only then is production authorized for the same revision), set
+`promotion.requires: staging` on production and declare staging's checks in
+`.gitforgeops/smoke.yaml`. See [Staged promotion](../README.md#staged-promotion).
 
 ---
 

@@ -34,22 +34,27 @@ In scope:
 - the bundled GitHub Actions workflows and helper scripts under `.github/`;
 - the published container image and its Dockerfile.
 
-Out of scope: the Ferrum Edge gateway itself (report those to
-<https://github.com/ferrum-edge/ferrum-edge>), and repository configuration
-that this project documents but cannot enforce from source (branch rulesets,
-environment reviewers, Actions permissions). The README section
-"Trust and security posture" describes the intended boundaries.
+Out of scope:
+
+- the Ferrum Edge gateway itself (report those to
+  <https://github.com/ferrum-edge/ferrum-edge>);
+- repository settings this project documents but cannot enforce from source
+  (branch rulesets, environment reviewers, Actions permissions).
+
+See [Trust and security posture](README.md#trust-and-security-posture) for the
+intended boundaries.
 
 ## Hardening expectations for operators
 
 Placeholders (`${gh-env-secret:...}`) are the only supported on-disk form for
-consumer credentials; never commit literal secrets or unencrypted
-materialized exports. Keep gateway and credential-broker secrets in GitHub
-Environment secrets scoped to the environment that uses them.
+consumer credentials. Never commit literal secrets or unencrypted materialized
+exports. Keep gateway and credential-broker secrets in GitHub Environment
+secrets, scoped to the environment that uses them. For the full settings
+baseline, see [GitHub launch controls](docs/github-launch-controls.md).
 
-Repository fixtures follow the same rule. `tests/fixtures/simple-config/`
-is the copy-paste sample and ships `${gh-env-secret:alloc=require}` (switch
-to `alloc=generate` for first-apply allocation — see
-`resources/ferrum/consumers/_example.yaml`). The only on-disk literal is
-`tests/fixtures/literal-credential/`, a negative case that `plan` / `apply`
-must refuse; it is not a sample.
+Repository fixtures follow the same rule. `tests/fixtures/simple-config/` is
+the copy-paste sample and uses `${gh-env-secret:alloc=require}` (switch to
+`alloc=generate` for first-apply allocation, as in
+`resources/ferrum/consumers/_example.yaml`). The only committed literal
+credential is in `tests/fixtures/literal-credential/`, a negative case that
+`plan` and `apply` must refuse; it is not a sample.

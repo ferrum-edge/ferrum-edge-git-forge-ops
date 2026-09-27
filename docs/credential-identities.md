@@ -1,25 +1,23 @@
 # Credential identities and broker boundaries
 
 `basicauth[].username` and `mtls_auth[].identity` are public identity fields.
-Author their values literally. The broker rejects its `${gh-env-secret:` marker
-in either leaf, including incomplete or embedded placeholders. The refusal is
-independent of allocation mode, gateway mode, bundle contents and
-`--allow-credential-slot-remap`. It names the canonical slot and explains the
-literal-identity remedy without printing the supplied value or placeholder.
+Write their values literally. The broker refuses its `${gh-env-secret:` marker
+in either field, including incomplete or embedded placeholders. The refusal
+does not depend on allocation mode, gateway mode, bundle contents or
+`--allow-credential-slot-remap`. The error names the canonical slot and tells
+you to author the identity literally, without printing the supplied value.
 
-Literal identities remain readable in resource files and validator diagnostics.
-Import keeps them literal; the security audit does not flag them as committed
-secrets. Unknown Consumer credential map keys are refused before leaf
-classification. Classification of recognized types uses the structural
-credential type and enclosing object key, with array indexes carrying the key
-unchanged.
+Literal identities stay readable in resource files and validator diagnostics.
+`import` keeps them literal, and the security audit does not flag them as
+committed secrets. Unknown Consumer credential types are refused before any
+field is classified. Classification uses the credential type and the enclosing
+object key; array indexes do not change which field a value belongs to.
 
 ## Correcting identity placeholders
 
-Identity fields require literal values, including during buildout. A seeded
-bundle value does not make a placeholder valid: generation, resolution, and
-inspect-only previews all reject an identity placeholder. Correct an invalid
-configuration as follows:
+Identity fields always need literal values. A seeded bundle value does not
+make a placeholder valid: generation, resolution and inspect-only previews all
+reject an identity placeholder. To fix one:
 
 1. Replace each identity placeholder in resources and overlays with the intended
    public login or certificate identity. Keep the credential array order stable.
@@ -34,12 +32,13 @@ configuration as follows:
 
 ## Static command-boundary audit
 
-All desired-resource CLI paths use `load_and_assemble_all`, directly or through
-`load_and_assemble_for`. Its identity check runs after overlays and namespace
-selection and before callers can read bundles or create state locks. The
-resolver also checks independently, so direct library callers get the same
-refusal. Its mutating entry point only commits a candidate document after the
-whole resolution succeeds; any error preserves the caller's complete input.
+Every CLI path that loads desired resources goes through
+`load_and_assemble_all` (directly or via `load_and_assemble_for`). Its identity
+check runs after overlays and namespace selection, and before a caller can read
+a bundle or take a state lock. The resolver checks again on its own, so direct
+library callers get the same refusal. Resolution works on a copy and only
+replaces the caller's document once the whole resolution succeeds; on any
+error the input is left unchanged.
 
 | Path | Identity refusal and output boundary |
 | --- | --- |
@@ -52,28 +51,28 @@ whole resolution succeeds; any error preserves the caller's complete input.
 | Plain `export` | Shared load check runs even though export preserves placeholders and does not resolve secrets. |
 | Materialized/encrypted `export` | Shared load check, then apply's security audit on the unresolved document (no override), precede the bundle read, resolution, output publication and recipient discovery. |
 
-The scrubber combines literal-secret classification with values at the report's
-successfully resolved slots. It uses the resolver's canonical path constructors,
-including index-zero elision, indexed entries and escaped object keys. It does
-not collect unused bundle entries or redact an unrelated literal identity just
-because of its field name. A value that itself resembles a placeholder is still
-protected when its slot resolved. The report stores metadata, not secret values.
+The validator-output scrubber combines literal-secret classification with the
+values at the report's successfully resolved slots. It builds slot paths with
+the resolver's own canonical path functions (index-zero elision, indexed
+entries, escaped object keys). It does not collect unused bundle entries, and
+it does not redact an unrelated literal identity just because of its field
+name. A resolved value that itself looks like a placeholder is still redacted.
+The report stores metadata, not secret values.
 
-The same report controls validator stand-ins: only explicitly unresolved
-canonical consumer and plugin slots may be substituted. A resolved value that
-looks like a placeholder reaches the validator byte-for-byte, so an invalid
-short JWT secret or endpoint still fails validation without leaking through
-diagnostics. Unreported slots also remain unchanged. The report-free API and
-file apply retain syntax-based stand-ins for the unresolved publication
-document; a read-only allocation report is not substitution provenance for
-that document. Modeled service-discovery values remain unchanged in validator
-input, as before.
+The same report controls validator stand-ins: only slots it marks as
+unresolved consumer or plugin slots may be replaced with a stand-in. A resolved
+value that looks like a placeholder reaches the validator byte-for-byte, so an
+invalid short JWT secret or endpoint still fails validation without leaking
+through diagnostics. Slots the report does not mention are left unchanged.
+Without a report (the public `with_validation_standins` function, and
+file-mode `apply`), the input is an unresolved publication document and
+placeholder syntax alone selects a stand-in; a read-only allocation report is
+not used as substitution provenance there. Modeled service-discovery values are
+passed to the validator unchanged.
 
-Regression coverage includes whole-input preservation in strict and lenient
-resolution, literal identity audit/import controls, canonical provenance slots,
-and CLI runs with synthetic bundles and a validator that quotes its input.
-CLI refusal tests trap gateway/GitHub traffic on loopback and check that input,
-bundle and existing output files survive and no validator, state lock or export
-is created. Validator-input captures additionally cover resolved placeholder
-values, unresolved stand-ins, escaped/indexed slots, incomplete reports,
-unchanged inputs and file publication. These tests run in GitHub-hosted Rust CI.
+Regression tests (run in GitHub-hosted Rust CI) cover whole-input preservation
+in strict and lenient resolution, identity handling in the audit and import,
+canonical slot provenance, and CLI runs with synthetic bundles and a validator
+that echoes its input. The CLI refusal tests trap gateway and GitHub traffic on
+loopback and check that input, bundle and existing output files survive and
+that no validator run, state lock or export happens.
