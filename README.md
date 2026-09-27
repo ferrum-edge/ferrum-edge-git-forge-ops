@@ -371,13 +371,22 @@ deletes only what it lists. A forged entry would make the next apply delete a
 live resource, so only CI writes the ledger:
 
 - `apply-on-merge.yml` and `rotate.yml` commit it with the state-writer App.
-- `state-guard.yml` fails any PR that touches `.state/`, unless a maintainer
-  with `write` or higher adds the `gitforgeops/state-override` label for the
-  current head. Make it a required status check.
+- `state-guard.yml` fails any PR that touches `.state/`, unless an actor with
+  current `write`, `maintain` or `admin` permission authorizes the current head
+  through a fresh `gitforgeops/state-override` label event. Make it a required
+  status check.
 - The binary rejects a `.state` that is not a real directory or holds
   symlinks, whatever the label says.
 - Keep `.state/*.json` tracked in Git. If it is ignored, the ledger never
   reaches `main` and shared mode stops deleting anything.
+
+The guard has no concurrency group, so each delivery runs to completion and
+cannot cancel another; manual cancellation and runner failure can still stop a
+run. This addresses the same-head cancellation observed on #407, where branch
+protection read the newest suite. Its final head, base and label recheck keeps
+authorization safe under that selection and under a rule requiring every
+suite's latest run to pass. The supply-chain checker enforces the no-group and
+recheck rules. See [GitHub launch controls](docs/github-launch-controls.md#protecting-the-ledger-path).
 
 Full rules: [State file trust model](docs/ownership.md#state-file-trust-model).
 

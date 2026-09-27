@@ -87,6 +87,17 @@ gateway mutation. A protected `main` rejects a direct push by
 `github-actions[bot]`, so the workflows mint a short-lived installation token
 for a dedicated App instead.
 
+The guard has no concurrency group, so every delivery runs to completion and
+cannot cancel another delivery. A manual cancellation or runner failure can
+still interrupt a run. This avoids the same-head cancellation seen on #407,
+where branch protection read the newest check suite. The guard is also safe if
+protection requires every suite's latest run to pass: each run is bound to its
+delivered head, and an authorized run re-reads the head, base and label just
+before reporting success. `check_supply_chain.py` enforces the
+`pull_request_target` trigger, a single default-branch checkout with no PR
+checkout, the absence of a concurrency declaration, and the final override
+revalidation.
+
 Create and install a GitHub App with:
 
 - repository access limited to this repository;

@@ -52,9 +52,29 @@ on:
     # every PR to `main`, and passes in three seconds when `.state/` is untouched.
     branches: [main]
 
-concurrency:
-  group: state-guard-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+# Deliberately NO `concurrency:` group, at workflow or job level; the
+# supply-chain policy refuses the word anywhere outside full-line comments, so
+# keep it out of run scripts and trailing comments too. Every delivery
+# gets its own check suite on the head commit. On #407, branch protection was
+# observed reading the required `state-guard-reject-state-edits` check from the
+# newest suite, not from the one that finished last. Opening a PR with labels
+# already applied sends several deliveries for one head about a second apart,
+# and their runs do not start in creation order, so any group they share can
+# cancel the newest suite and leave the required check cancelled beside an
+# older success. `cancel-in-progress: false` does not avoid this: GitHub keeps
+# one pending run per group and cancels the older pending one. Keying the group
+# on the head SHA only moves the race to same-head deliveries, which is exactly
+# where it occurs; nothing in Actions can cancel across heads without also
+# cancelling within one.
+#
+# Nothing relies on cancellation, or on which suite branch protection selects,
+# for safety. Each run is bound to the head it was delivered for and fails
+# closed if the PR head moves while it runs, and a run for a superseded head
+# reports only on that commit. Removing the override label sends a newer
+# delivery whose run fails on its own, and an authorizing run re-reads the head,
+# base and labels right before it records success. Whether branch protection
+# reads the newest suite or requires every suite's latest run to pass, an older
+# authorizing run that finishes later cannot turn the check green.
 
 permissions:
   contents: read
@@ -272,12 +292,42 @@ jobs:
       - name: Record authorized override
         if: ${{ steps.detect.outputs.requires_override == 'true' && steps.authorize.outcome == 'success' }}
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          OVERRIDE_LABEL: gitforgeops/state-override
           ACTOR: ${{ steps.authorize.outputs.actor }}
           PERMISSION: ${{ steps.authorize.outputs.permission }}
           AUTHORIZED_HEAD: ${{ steps.authorize.outputs.head_sha }}
           RUN_ID: ${{ steps.authorize.outputs.run_id }}
           RUN_ATTEMPT: ${{ steps.authorize.outputs.run_attempt }}
         run: |
+          set -euo pipefail
+
+          # Final recheck, immediately before this run reports success. The
+          # label, head and base may all have changed since authorization; a
+          # run that finishes after the override label was removed, a push, or
+          # a retarget must fail rather than leave a success on the head.
+          # `check_supply_chain.py` requires this block.
+          final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          final_head=$(jq -r '.head.sha' <<< "$final")
+          final_ref=$(jq -r '.base.ref' <<< "$final")
+          final_labels=$(jq -r '.labels[].name' <<< "$final")
+          [ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {
+            echo "::error::PR head changed before the state override was recorded; wait for the new run."
+            exit 1
+          }
+          [ "$final_ref" = "$DEFAULT_BRANCH" ] || {
+            echo "::error::PR no longer targets the protected default branch; state override is not recorded."
+            exit 1
+          }
+          grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {
+            echo "::error::State override label was removed before the override was recorded."
+            exit 1
+          }
+
           echo "::warning::Protected state scope authorized by @${ACTOR} (${PERMISSION}) for head ${AUTHORIZED_HEAD}."
           {
             echo "## Authorized protected-state override"

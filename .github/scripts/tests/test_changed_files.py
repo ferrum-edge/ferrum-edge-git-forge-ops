@@ -16,7 +16,7 @@ SPEC.loader.exec_module(changed_files)
 class ChangedFilesTests(unittest.TestCase):
     def test_pr_workflows_use_head_stable_api_snapshots(self):
         workflows = {
-            "state-guard.yml": (1, 2),
+            "state-guard.yml": (1, 3),
             "rust-ci.yml": (2, 2),
             "validate-pr.yml": (1, 1),
         }

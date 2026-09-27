@@ -1120,6 +1120,200 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("exactly one checkout" in item for item in violations), violations
         )
 
+    def test_state_guard_must_not_share_a_concurrency_group(self):
+        secure = """on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    branches: [main]
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+"""
+        workflow_level = secure.replace(
+            "      - uses:",
+            "concurrency:\n"
+            "  group: state-guard-${{ github.event.pull_request.number }}\n"
+            "  cancel-in-progress: true\n"
+            "      - uses:",
+            1,
+        )
+        per_head = secure.replace(
+            "      - uses:",
+            "concurrency:\n"
+            "  group: state-guard-${{ github.event.pull_request.number }}-"
+            "${{ github.event.pull_request.head.sha }}\n"
+            "  cancel-in-progress: false\n"
+            "      - uses:",
+            1,
+        )
+        job_level = secure.replace(
+            "      - uses:",
+            "    concurrency: state-guard-${{ github.event.pull_request.number }}\n"
+            "      - uses:",
+            1,
+        )
+        for text in (workflow_level, per_head, job_level):
+            with self.subTest(text=text):
+                violations = check_supply_chain.state_guard_trigger_violations(text)
+                self.assertTrue(
+                    any("must not declare a concurrency group" in item for item in violations),
+                    violations,
+                )
+
+    def test_state_guard_concurrency_detection_covers_every_yaml_key_spelling(self):
+        secure = """on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    branches: [main]
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+"""
+        spellings = {
+            "double_quoted": '"concurrency": state-guard\n',
+            "single_quoted": "'concurrency': state-guard\n",
+            "flow_mapping": "jobs: {guard: {runs-on: ubuntu-24.04, concurrency: g}}\n",
+            "flow_mapping_quoted": 'jobs: {guard: {"concurrency": g, runs-on: x}}\n',
+            "explicit_key": "? concurrency\n: state-guard\n",
+            "explicit_quoted_key": "? 'concurrency'\n: state-guard\n",
+            "capitalised": "Concurrency: state-guard\n",
+            "upper_case_job": "    CONCURRENCY:\n      group: g\n",
+            "tagged": "!!str concurrency: state-guard\n",
+            "anchored": "&key concurrency: state-guard\n",
+            "hex_escaped": '"\\x63oncurrency": state-guard\n',
+            "unicode_escaped": '"\\u0063oncurrency": state-guard\n',
+            "escaped_line_break": '"concur\\\n  rency": state-guard\n',
+            "trailing_comment_is_not_exempt": "permissions: {} # concurrency: g\n",
+        }
+        for label, declaration in spellings.items():
+            with self.subTest(label=label):
+                text = secure + declaration
+                violations = check_supply_chain.state_guard_trigger_violations(text)
+                self.assertTrue(
+                    any("must not declare a concurrency group" in item for item in violations),
+                    violations,
+                )
+
+        commented = secure + "# Deliberately NO `concurrency:` group.\n    # concurrency: g\n"
+        self.assertEqual(check_supply_chain.state_guard_trigger_violations(commented), [])
+
+    def test_shipped_state_guard_declares_no_concurrency_group(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        self.assertEqual(check_supply_chain.state_guard_trigger_violations(text), [])
+        self.assertFalse(check_supply_chain.declares_concurrency(text))
+        self.assertNotRegex(text, re.compile(r"^\s*concurrency\s*:", re.MULTILINE))
+
+    def test_shipped_state_guard_rechecks_before_recording_an_override(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        self.assertEqual(
+            check_supply_chain.state_guard_override_recheck_violations(text), []
+        )
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        for binding in (
+            "GH_TOKEN: ${{ github.token }}",
+            "EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+            "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+            "OVERRIDE_LABEL: gitforgeops/state-override",
+        ):
+            self.assertIn(binding, step)
+
+    def test_state_guard_override_recheck_cannot_be_removed_or_moved(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+
+        for required in check_supply_chain.STATE_GUARD_FINAL_RECHECK:
+            with self.subTest(removed=required):
+                weakened = text.replace(step, step.replace(required, "true", 1), 1)
+                violations = check_supply_chain.state_guard_override_recheck_violations(
+                    weakened
+                )
+                self.assertTrue(
+                    any("must re-read the pull request" in item for item in violations),
+                    violations,
+                )
+
+        unguarded = text.replace(step, step.replace("set -euo pipefail", "set -e", 1), 1)
+        violations = check_supply_chain.state_guard_override_recheck_violations(unguarded)
+        self.assertTrue(
+            any("set -euo pipefail" in item for item in violations), violations
+        )
+
+        recheck_start = step.index(check_supply_chain.STATE_GUARD_FINAL_RECHECK[0])
+        report = "          echo \"::warning::reported early\"\n"
+        reported_first = text.replace(
+            step, step[:recheck_start] + report.lstrip() + "          " + step[recheck_start:], 1
+        )
+        violations = check_supply_chain.state_guard_override_recheck_violations(
+            reported_first
+        )
+        self.assertTrue(
+            any("before reporting the override" in item for item in violations),
+            violations,
+        )
+
+        missing = text.replace(
+            "      - name: Record authorized override\n",
+            "      - name: Record override\n",
+            1,
+        )
+        violations = check_supply_chain.state_guard_override_recheck_violations(missing)
+        self.assertTrue(any("step is missing" in item for item in violations), violations)
+
+    def test_state_guard_override_recheck_rejects_commented_out_checks(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        required = check_supply_chain.STATE_GUARD_FINAL_RECHECK[0]
+        weakened = text.replace(step, step.replace(required, "# " + required, 1), 1)
+        violations = check_supply_chain.state_guard_override_recheck_violations(weakened)
+        self.assertTrue(
+            any("must re-read the pull request" in item for item in violations),
+            violations,
+        )
+
+    def test_state_guard_override_recheck_rejects_continue_on_error(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        weakened = text.replace(
+            step, step.replace("        env:\n", "        continue-on-error: true\n        env:\n", 1), 1
+        )
+        violations = check_supply_chain.state_guard_override_recheck_violations(weakened)
+        self.assertTrue(
+            any("must not use continue-on-error" in item for item in violations),
+            violations,
+        )
+
+    def test_state_guard_override_recheck_pins_step_condition(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        weakened = text.replace(
+            step,
+            step.replace(
+                f"        if: {check_supply_chain.STATE_GUARD_RECORD_IF}\n",
+                "        if: always()\n",
+                1,
+            ),
+            1,
+        )
+        violations = check_supply_chain.state_guard_override_recheck_violations(weakened)
+        self.assertTrue(
+            any("if: condition pinned" in item for item in violations), violations
+        )
+
     def test_every_rust_toolchain_step_must_pin_the_version(self):
         secure = """      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000

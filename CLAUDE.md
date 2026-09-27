@@ -711,8 +711,8 @@ unless:
 
 It rejects every later push or PR transition until a qualified maintainer
 removes and reapplies the label, and records actor, permission, head, run ID
-and attempt. Label changes rerun under per-PR concurrency so removed
-authorization cannot leave a stale success.
+and attempt. Label changes rerun the check so removed authorization cannot
+leave a stale success.
 
 - It uses `pull_request_target`, never `pull_request` (which would load the guard
   from the PR head, letting one commit forge a ledger entry and delete the
@@ -723,6 +723,17 @@ authorization cannot leave a stale success.
   path-filtered required check never reports on non-matching PRs and stalls
   them.
 
+The guard runs on every PR through `pull_request_target`, without checking out
+PR content; the changed-file list, labels and permission come from `gh api`,
+and the only checkout is the default branch. It requires a fresh
+`gitforgeops/state-override` `labeled` event for the current head by an actor
+with current `write`, `maintain` or `admin` permission, and re-reads the PR's
+head, base and label immediately before reporting success. The workflow has no
+concurrency group: every delivery runs to completion, though a manual cancel or
+runner failure can still interrupt one. On #407, branch protection read the
+newest check suite; the guard is safe under that selection and under a model
+that requires every suite's latest run to pass. `check_supply_chain.py` enforces
+the trigger, checkout, no-concurrency and final-recheck requirements.
 The launch baseline requires the check and gives only the dedicated App an
 always-on `main` ruleset bypass. Repository variable `GITFORGEOPS_STATE_APP_ID`
 (public; read the same way by workflows and the settings audit) and environment
