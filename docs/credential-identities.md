@@ -56,13 +56,16 @@ values at the report's successfully resolved slots. It builds slot paths with
 the resolver's own canonical path functions (index-zero elision, indexed
 entries, escaped object keys). It does not collect unused bundle entries, and
 it does not redact an unrelated literal identity just because of its field
-name. A resolved value that itself looks like a placeholder is still redacted.
+name. A resolved plugin-config or discovery value that itself looks like a
+placeholder is still redacted. (A Consumer secret whose bundle value is
+placeholder text never resolves; see
+[the credential broker](credential-broker.md#what-the-broker-will-not-generate).)
 The report stores metadata, not secret values.
 
 The same report controls validator stand-ins: only slots it marks as
 unresolved consumer or plugin slots may be replaced with a stand-in. A resolved
-value that looks like a placeholder reaches the validator byte-for-byte, so an
-invalid short JWT secret or endpoint still fails validation without leaking
+plugin-config value that looks like a placeholder reaches the validator
+byte-for-byte, so an invalid endpoint still fails validation without leaking
 through diagnostics. Slots the report does not mention are left unchanged.
 Without a report (the public `with_validation_standins` function, and
 file-mode `apply`), the input is an unresolved publication document and

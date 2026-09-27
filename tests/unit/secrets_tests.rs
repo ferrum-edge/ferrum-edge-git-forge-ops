@@ -2063,14 +2063,14 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
 }
 
 /// After a mutating resolve, the report, not the resolved bytes, says which
-/// slots are still unresolved. A seeded value that spells a broker placeholder
-/// is a supplied value; missing required values and pending allocations stay
-/// unresolved (#364).
+/// slots are still unresolved: a seeded value is supplied, while missing
+/// required values and pending allocations stay unresolved (#364).
 #[test]
 fn unresolved_slots_follow_resolution_provenance_not_value_shape() {
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::{report_secrets_with_mode, resolve_secrets_with_mode};
+    use gitforgeops::secrets::resolve_secrets_with_mode;
 
+    const SEEDED: &str = "seeded-provenance-value";
     let mut cfg = consumer_with(
         "keyauth",
         serde_json::Value::Array(vec![
@@ -2081,7 +2081,7 @@ fn unresolved_slots_follow_resolution_provenance_not_value_shape() {
     );
     let seeded_slot = slot_path("ferrum", "app", "keyauth/key");
     let mut bundle = BTreeMap::new();
-    bundle.insert(seeded_slot.clone(), GENERATE.to_string());
+    bundle.insert(seeded_slot, SEEDED.to_string());
 
     let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::Api).unwrap();
     let unresolved: Vec<String> = report
@@ -2099,14 +2099,158 @@ fn unresolved_slots_follow_resolution_provenance_not_value_shape() {
     );
     let entries = &cfg.consumers[0].credentials["keyauth"];
     assert!(
-        entries[0]["key"] == GENERATE,
+        entries[0]["key"] == SEEDED,
         "the seeded value must be kept byte-for-byte"
     );
+}
 
-    // Re-reading the resolved document, as materialize and rotate once did,
-    // mistakes that value for a pending allocation.
-    let rescan = report_secrets_with_mode(&cfg, &BTreeMap::new(), GatewayMode::Api).unwrap();
-    assert!(rescan.results.iter().any(|r| r.slot == seeded_slot));
+const PLACEHOLDER_TEXT_COMMITTED: &str = "equals the placeholder text committed for this slot";
+const PLACEHOLDER_TEXT_GRAMMAR: &str = "matches the gh-env-secret placeholder grammar";
+
+/// A Consumer secret whose bundle value is placeholder text is refused in
+/// every walk (#379): the placeholder committed at that slot, or any other
+/// string in the placeholder grammar, well-formed or not. That text is known
+/// from the repository, so it is never a live credential. The refusal names
+/// the slot and the reason, never the value, and a mutating resolve leaves
+/// its input unchanged.
+#[test]
+fn consumer_secret_bundle_values_that_are_placeholder_text_are_refused() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_lenient, report_secrets_with_mode_and_options,
+        resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    const SIBLING: &str = "q7Zr-synthetic-seeded-sibling-hmac-secret";
+    for (committed, seeded, reason) in [
+        (REQUIRE, REQUIRE, PLACEHOLDER_TEXT_COMMITTED),
+        (GENERATE, GENERATE, PLACEHOLDER_TEXT_COMMITTED),
+        (REQUIRE, GENERATE, PLACEHOLDER_TEXT_GRAMMAR),
+        (
+            REQUIRE,
+            "${gh-env-secret:alloc=generate|len=48}",
+            PLACEHOLDER_TEXT_GRAMMAR,
+        ),
+        (GENERATE, "${gh-env-secret:}", PLACEHOLDER_TEXT_GRAMMAR),
+        (
+            GENERATE,
+            "${gh-env-secret:alloc=synthetic-seeded-option}",
+            PLACEHOLDER_TEXT_GRAMMAR,
+        ),
+    ] {
+        // The canonical first entry, the same entry through its legacy
+        // explicit-zero lookup alias, and a second entry beside an ordinary
+        // seeded sibling.
+        for (credential_type, entries, slot, seeded_under, sibling) in [
+            (
+                "keyauth",
+                serde_json::json!([entry("key", committed)]),
+                "ferrum/app/keyauth/key",
+                "ferrum/app/keyauth/key",
+                None,
+            ),
+            (
+                "keyauth",
+                serde_json::json!([entry("key", committed)]),
+                "ferrum/app/keyauth/key",
+                "ferrum/app/keyauth/[0]/key",
+                None,
+            ),
+            (
+                "hmac_auth",
+                serde_json::json!([entry("secret", REQUIRE), entry("secret", committed)]),
+                "ferrum/app/hmac_auth/[1]/secret",
+                "ferrum/app/hmac_auth/[1]/secret",
+                Some("ferrum/app/hmac_auth/secret"),
+            ),
+        ] {
+            let cfg = consumer_with(credential_type, entries);
+            let mut bundle = BTreeMap::new();
+            bundle.insert(seeded_under.to_string(), seeded.to_string());
+            if let Some(sibling) = sibling {
+                bundle.insert(sibling.to_string(), SIBLING.to_string());
+            }
+
+            let mut resolved = cfg.clone();
+            let errors = [
+                report_secrets_with_mode_and_options(
+                    &cfg,
+                    &bundle,
+                    GatewayMode::Api,
+                    ResolveOptions::default(),
+                )
+                .err(),
+                report_secrets_lenient(&cfg, &bundle).err(),
+                resolve_secrets_with_mode_and_options(
+                    &mut resolved,
+                    &bundle,
+                    GatewayMode::Api,
+                    ResolveOptions::default(),
+                )
+                .err(),
+            ];
+            for err in errors {
+                let Some(err) = err else {
+                    panic!("{slot}: placeholder text must not resolve");
+                };
+                assert!(
+                    matches!(err, gitforgeops::error::Error::Config(_)),
+                    "{slot}: {err}"
+                );
+                let message = err.to_string();
+                assert!(message.contains(&format!("'{slot}'")), "{message}");
+                assert!(message.contains(reason), "{message}");
+                assert!(message.contains("re-seed the slot"), "{message}");
+                assert!(!message.contains(seeded), "{message}");
+                assert!(!message.contains("${"), "{message}");
+                assert!(!message.contains(SIBLING), "{message}");
+            }
+            assert!(
+                serde_json::to_value(&resolved).unwrap() == serde_json::to_value(&cfg).unwrap(),
+                "{slot}: a refused resolve must leave its input unchanged"
+            );
+        }
+    }
+}
+
+/// Ordinary Consumer secrets still resolve byte-for-byte, and the
+/// placeholder-text refusal is Consumer-only: a plugin-config seed that spells
+/// a placeholder remains a supplied value (#364, #379).
+#[test]
+fn ordinary_consumer_secrets_and_placeholder_shaped_plugin_seeds_resolve() {
+    use gitforgeops::config::schema::PluginConfig;
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::resolve_secrets_with_mode;
+
+    const SECRET: &str = "q7Zr-P2vX-synthetic-random-secret-9KtM";
+    let mut cfg = consumer_with("keyauth", serde_json::json!([entry("key", REQUIRE)]));
+    let plugin: PluginConfig = serde_json::from_value(serde_json::json!({
+        "id": "otel", "namespace": "ferrum", "plugin_name": "otel_tracing",
+        "scope": "global", "config": {"authorization": REQUIRE}
+    }))
+    .unwrap();
+    cfg.plugin_configs.push(plugin);
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/app/keyauth/key".to_string(), SECRET.to_string());
+    bundle.insert(
+        "ferrum/otel/@plugin-config/config/authorization".to_string(),
+        REQUIRE.to_string(),
+    );
+
+    let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::Api).unwrap();
+    assert!(report.results.len() == 2);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|r| r.status == SlotStatus::Resolved),
+        "every slot resolves"
+    );
+    assert!(
+        cfg.consumers[0].credentials["keyauth"][0]["key"] == SECRET,
+        "an ordinary secret must be kept byte-for-byte"
+    );
+    assert!(cfg.plugin_configs[0].config["authorization"] == REQUIRE);
 }
 
 // --- Omitted credential types (#332) ----------------------------------------

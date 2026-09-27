@@ -631,8 +631,11 @@ fn validate_plan_and_apply_refuse_unknown_credential_map_keys() {
 fn file_apply_standins_validate_the_publication_document_not_the_resolved_report() {
     let consumer = "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    jwt:\n      - secret: '${gh-env-secret:alloc=require}'\n";
     let plugin = "kind: PluginConfig\nspec:\n  id: ldap\n  plugin_name: ldap_auth\n  scope: global\n  config:\n    ldap_url: '${gh-env-secret:alloc=require}'\n";
+    // A Consumer secret may not be placeholder text, so the JWT is seeded
+    // with an ordinary too-short value; the plugin endpoint keeps a
+    // placeholder-shaped seed, which is a value (#364).
     let bundle = r#"{"FERRUM_CREDS_BUNDLE": {
-        "ferrum/app/jwt/secret": "${gh-env-secret:alloc=require}",
+        "ferrum/app/jwt/secret": "seeded-short-jwt",
         "ferrum/ldap/@plugin-config/config/ldap_url": "${gh-env-secret:alloc=require}"
     }}"#;
     let repo = Repo::with_files(&[
@@ -657,7 +660,7 @@ esac
     )
     .unwrap();
     // Validate uses the resolved snapshot even in file mode, so the actual
-    // placeholder-shaped bundle value must fail the validator's shape check.
+    // bundle values must fail the validator's shape check.
     let validation = repo.run(&["validate"], &[("FERRUM_CREDS_JSON", bundle)]);
     assert!(!validation.status.success());
     assert!(stdout(&validation).contains("jwt secret too short"));
@@ -1650,21 +1653,95 @@ fn rotate_checks_target_generation_before_any_network_or_state_publication() {
 fn rotate_supported_credentials_in_resolved_namespace_reach_provisioning() {
     // Positive controls end at the local proxy, before any secret write.
     // An unrelated invalid JWT must not block this Consumer's preflight.
-    // The sibling is brokered and seeded; a seeded value that happens to
-    // spell a broker placeholder is a value, not an unresolved slot (#364).
+    // The sibling is brokered and seeded.
     for (kind, field) in [
         ("keyauth", "key"),
         ("jwt", "secret"),
         ("hmac_auth", "secret"),
         ("basicauth", "password"),
     ] {
-        for seeded in ["seeded-sibling-value", "${gh-env-secret:alloc=require}"] {
-            rotate_reaches_provisioning(kind, field, seeded);
-        }
+        let sibling = format!("platform/app/{kind}/{field}");
+        let target = format!("platform/app/{kind}/[1]/{field}");
+        rotate_reaches_provisioning(
+            kind,
+            field,
+            serde_json::json!({ (sibling.clone()): "seeded-sibling-value" }),
+        );
+        // Placeholder text in the *target* slot is what rotation replaces, so
+        // it must not block the remedy the placeholder-text refusal names.
+        rotate_reaches_provisioning(
+            kind,
+            field,
+            serde_json::json!({
+                (sibling): "seeded-sibling-value",
+                (target): "${gh-env-secret:alloc=require}"
+            }),
+        );
     }
 }
 
-fn rotate_reaches_provisioning(kind: &str, field: &str, seeded: &str) {
+/// A sibling whose bundle value is placeholder text would be published with
+/// the rotated Consumer as live authentication material. Rotation refuses it
+/// by slot, never echoing the value, before any GitHub or gateway request.
+#[test]
+fn rotate_refuses_a_placeholder_text_sibling_before_provisioning() {
+    const SIBLING: &str = "platform/app/keyauth/key";
+    for (seeded, reason) in [
+        (
+            "${gh-env-secret:alloc=require}",
+            "equals the placeholder text committed for this slot",
+        ),
+        (
+            "${gh-env-secret:alloc=generate|len=97}",
+            "matches the gh-env-secret placeholder grammar",
+        ),
+    ] {
+        let (repo, output, listener) =
+            run_rotate("keyauth", "key", serde_json::json!({ (SIBLING): seeded }));
+        let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(!output.status.success(), "{reason}: {diagnostic}");
+        let refusal = diagnostic
+            .lines()
+            .find(|line| line.contains("holds a bundle value that"))
+            .unwrap_or_else(|| panic!("no placeholder-text refusal: {diagnostic}"));
+        assert!(refusal.contains(SIBLING), "{refusal}");
+        assert!(refusal.contains(reason), "{refusal}");
+        assert!(!refusal.contains(seeded), "{refusal}");
+        assert!(!diagnostic.contains("len=97"), "{diagnostic}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "refusal must precede every GitHub/gateway request"
+        );
+        assert!(!repo.dir.path().join(".state/default.json").exists());
+    }
+}
+
+fn rotate_reaches_provisioning(kind: &str, field: &str, slots: serde_json::Value) {
+    let credential = format!("{kind}/[1]/{field}");
+    let (repo, output, listener) = run_rotate(kind, field, slots);
+    assert!(
+        !output.status.success(),
+        "the proxy deliberately never responds"
+    );
+    assert!(
+        listener.accept().is_ok(),
+        "{credential} must reach provisioning in platform: {}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("unresolved placeholder"));
+    assert!(!stderr(&output).contains("Security Findings"));
+    assert!(!repo.dir.path().join(".state/default.json").exists());
+}
+
+/// Rotate `{kind}/[1]/{field}` on Consumer `platform/app` with `slots` as the
+/// bundle. Every GitHub and gateway request goes to the returned listener,
+/// which never answers.
+fn run_rotate(
+    kind: &str,
+    field: &str,
+    slots: serde_json::Value,
+) -> (Repo, Output, std::net::TcpListener) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1680,10 +1757,7 @@ fn rotate_reaches_provisioning(kind: &str, field: &str, seeded: &str) {
     let consumer = format!(
         "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: '${{gh-env-secret:alloc=require}}'{first}\n      - {field}: '${{gh-env-secret:alloc=require}}'{second}\n"
     );
-    let bundle = serde_json::json!({
-        "FERRUM_CREDS_BUNDLE": { format!("platform/app/{kind}/{field}"): seeded }
-    })
-    .to_string();
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": slots }).to_string();
     let repo = Repo::with_files(&[
         ("resources/platform/consumers/app.yaml", &consumer),
         (
@@ -1712,18 +1786,7 @@ fn rotate_reaches_provisioning(kind: &str, field: &str, seeded: &str) {
             ("NO_PROXY", ""),
         ],
     );
-    assert!(
-        !output.status.success(),
-        "the proxy deliberately never responds"
-    );
-    assert!(
-        listener.accept().is_ok(),
-        "{credential} must reach provisioning in platform: {}",
-        stderr(&output)
-    );
-    assert!(!stderr(&output).contains("unresolved placeholder"));
-    assert!(!stderr(&output).contains("Security Findings"));
-    assert!(!repo.dir.path().join(".state/default.json").exists());
+    (repo, output, listener)
 }
 
 /// Rotation `PUT`s the whole desired Consumer, so a literal credential beside
@@ -1814,13 +1877,12 @@ fn rotate_refuses_a_literal_sibling_credential_before_any_side_effect() {
     }
 }
 
-/// A seeded value is a value, whatever its bytes spell. Materialization
-/// classifies slots by the resolution report, so a bundle value that looks
-/// like a broker placeholder is published byte-for-byte, while a slot with no
-/// value (required or pending allocation) is still refused (#364).
+/// Materialization classifies slots by the resolution report, so a seeded
+/// value is published byte-for-byte, while a slot with no value (required or
+/// pending allocation) is still refused (#364).
 #[test]
 fn materialize_classifies_slots_by_resolution_not_by_value_shape() {
-    const SEEDED: &str = "${gh-env-secret:alloc=generate|len=48}";
+    const SEEDED: &str = "seeded-materialized-key";
     let bundle = serde_json::json!({
         "FERRUM_CREDS_BUNDLE": { "ferrum/app/keyauth/key": SEEDED }
     })
@@ -1857,6 +1919,66 @@ fn materialize_classifies_slots_by_resolution_not_by_value_shape() {
         assert!(!diagnostic.contains(SEEDED));
         assert!(!repo.dir.path().join("export.yaml").exists());
     }
+}
+
+/// A Consumer secret whose bundle value is placeholder text is refused by
+/// every command that reads the slot, before anything is published (#379):
+/// the committed placeholder itself, and any other string in the placeholder
+/// grammar. The refusal names the slot and the reason, never the value.
+#[test]
+fn placeholder_text_consumer_seeds_are_refused_by_every_bundle_reader() {
+    const SLOT: &str = "ferrum/app/keyauth/key";
+    const COMMITTED: &str = "equals the placeholder text committed for this slot";
+    const GRAMMAR: &str = "matches the gh-env-secret placeholder grammar";
+    for (seeded, reason) in [
+        ("${gh-env-secret:alloc=require}", COMMITTED),
+        ("${gh-env-secret:alloc=generate|len=97}", GRAMMAR),
+        ("${gh-env-secret:alloc=synthetic-seed-97}", GRAMMAR),
+        ("${gh-env-secret:alloc=require}\n", COMMITTED),
+        ("${gh-env-secret:alloc=require}\r\n", COMMITTED),
+        (" ${gh-env-secret:alloc=require}", COMMITTED),
+        ("${GH-ENV-SECRET:alloc=require}", GRAMMAR),
+        ("${gh-env-secret:alloc=require", GRAMMAR),
+    ] {
+        let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { (SLOT): seeded } }).to_string();
+        for args in [
+            vec!["validate"],
+            vec!["plan"],
+            vec!["diff"],
+            vec!["review"],
+            vec!["apply", "--auto-approve"],
+            vec!["export", "--materialize", "--output", "export.yaml"],
+        ] {
+            let repo = Repo::with_consumer(BROKERED_CONSUMER);
+            let output = repo.run(&args, &[("FERRUM_CREDS_JSON", &bundle)]);
+            let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(!output.status.success());
+            let refusal = diagnostic
+                .lines()
+                .find(|line| line.contains("holds a bundle value that"))
+                .expect("placeholder bundle value must be refused");
+            assert!(refusal.contains(SLOT));
+            assert!(refusal.contains(reason));
+            assert!(!refusal.contains(seeded));
+            assert!(!diagnostic.contains("len=97"));
+            assert!(!diagnostic.contains("synthetic-seed"));
+            assert!(!repo.published().exists());
+            assert!(!repo.dir.path().join("export.yaml").exists());
+            assert!(!repo.dir.path().join(".state/default.json").exists());
+        }
+    }
+
+    // An ordinary seed of the same slot materializes byte-for-byte.
+    const SEED: &str = "q7Zr-synthetic-seeded-key";
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { (SLOT): SEED } }).to_string();
+    let repo = Repo::with_consumer(BROKERED_CONSUMER);
+    let output = repo.run(
+        &["export", "--materialize", "--output", "export.yaml"],
+        &[("FERRUM_CREDS_JSON", &bundle)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let exported = std::fs::read_to_string(repo.dir.path().join("export.yaml")).unwrap();
+    assert!(exported.contains(SEED));
 }
 
 /// Materialization writes the whole resolved document for a file-mode
