@@ -1934,33 +1934,37 @@ fn placeholder_text_consumer_seeds_are_refused_by_every_bundle_reader() {
         ("${gh-env-secret:alloc=require}", COMMITTED),
         ("${gh-env-secret:alloc=generate|len=97}", GRAMMAR),
         ("${gh-env-secret:alloc=synthetic-seed-97}", GRAMMAR),
+        ("${gh-env-secret:alloc=require}\n", COMMITTED),
+        ("${gh-env-secret:alloc=require}\r\n", COMMITTED),
+        (" ${gh-env-secret:alloc=require}", COMMITTED),
+        ("${GH-ENV-SECRET:alloc=require}", GRAMMAR),
+        ("${gh-env-secret:alloc=require", GRAMMAR),
     ] {
         let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { (SLOT): seeded } }).to_string();
         for args in [
             vec!["validate"],
             vec!["plan"],
+            vec!["diff"],
+            vec!["review"],
             vec!["apply", "--auto-approve"],
             vec!["export", "--materialize", "--output", "export.yaml"],
         ] {
             let repo = Repo::with_consumer(BROKERED_CONSUMER);
             let output = repo.run(&args, &[("FERRUM_CREDS_JSON", &bundle)]);
             let diagnostic = format!("{}{}", stdout(&output), stderr(&output));
-            assert!(!output.status.success(), "{args:?}: {diagnostic}");
+            assert!(!output.status.success());
             let refusal = diagnostic
                 .lines()
                 .find(|line| line.contains("holds a bundle value that"))
-                .unwrap_or_else(|| panic!("{args:?}: {diagnostic}"));
-            assert!(refusal.contains(SLOT), "{args:?}: {refusal}");
-            assert!(refusal.contains(reason), "{args:?}: {refusal}");
-            assert!(!refusal.contains(seeded), "{args:?}: {refusal}");
-            assert!(!diagnostic.contains("len=97"), "{args:?}: {diagnostic}");
-            assert!(!diagnostic.contains("synthetic-seed"), "{diagnostic}");
-            assert!(!repo.published().exists(), "{args:?}");
-            assert!(!repo.dir.path().join("export.yaml").exists(), "{args:?}");
-            assert!(
-                !repo.dir.path().join(".state/default.json").exists(),
-                "{args:?}"
-            );
+                .expect("placeholder bundle value must be refused");
+            assert!(refusal.contains(SLOT));
+            assert!(refusal.contains(reason));
+            assert!(!refusal.contains(seeded));
+            assert!(!diagnostic.contains("len=97"));
+            assert!(!diagnostic.contains("synthetic-seed"));
+            assert!(!repo.published().exists());
+            assert!(!repo.dir.path().join("export.yaml").exists());
+            assert!(!repo.dir.path().join(".state/default.json").exists());
         }
     }
 

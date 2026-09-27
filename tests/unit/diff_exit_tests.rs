@@ -631,6 +631,43 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
             }
         }
     }
+
+    // The explicit-zero alias remains accepted when it carries an ordinary
+    // resolved Consumer secret.
+    for transport in ["inline", "file"] {
+        let mut live = declared.clone();
+        label_live_fixture(&mut live);
+        let mut slots = serde_json::Map::new();
+        for (index, &(kind, pointer, suffix)) in leaves.iter().enumerate() {
+            *live[kind][0].pointer_mut(pointer).unwrap() = LIVE.into();
+            let suffix = if index == 0 {
+                "keyauth/[0]/key"
+            } else {
+                suffix
+            };
+            slots.insert(format!("ferrum/app/{suffix}"), LIVE.into());
+        }
+        let repo = Repo::new(
+            &[
+                ("resources/ferrum/consumers/app.yaml", &consumer),
+                ("resources/ferrum/plugins/app.yaml", &plugin),
+                ("resources/ferrum/upstreams/app.yaml", &upstream),
+            ],
+            vec![("ferrum".into(), live.to_string())],
+        );
+        let bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": slots}).to_string();
+        let bundle_file = repo.dir.path().join("bundle.json");
+        std::fs::write(&bundle_file, &bundle).unwrap();
+        let env = if transport == "inline" {
+            vec![("FERRUM_CREDS_JSON", bundle.as_str())]
+        } else {
+            vec![("FERRUM_CREDS_JSON_FILE", bundle_file.to_str().unwrap())]
+        };
+        for args in [&["diff", "--exit-on-drift"][..], &["plan"], &["review"]] {
+            let output = repo.run_with_env(args, &env);
+            assert_eq!(output.status.code(), Some(0));
+        }
+    }
 }
 
 #[cfg(unix)]

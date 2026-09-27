@@ -665,9 +665,14 @@ fn check_consumer_secret_not_placeholder_text(
     committed: &str,
     value: &str,
 ) -> crate::error::Result<()> {
-    let reason = if value == committed {
+    const PLACEHOLDER_PREFIX: &str = "${gh-env-secret:";
+    let trimmed = value.trim();
+    let has_placeholder_prefix = trimmed
+        .get(..PLACEHOLDER_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PLACEHOLDER_PREFIX));
+    let reason = if trimmed == committed {
         "equals the placeholder text committed for this slot"
-    } else if parse_placeholder(value).is_some() {
+    } else if parse_placeholder(trimmed).is_some() || has_placeholder_prefix {
         "matches the gh-env-secret placeholder grammar"
     } else {
         return Ok(());

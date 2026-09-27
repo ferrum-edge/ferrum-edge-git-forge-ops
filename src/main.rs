@@ -4376,7 +4376,7 @@ async fn push_rotated_consumer_to_gateway(
     // to the gateway as a credential value — breaking auth for that
     // credential. Refuse and tell the operator to run apply first. The
     // resolution report decides this, not the resolved bytes (#364); a
-    // seeded Consumer secret that is placeholder text never resolves (#379).
+    // seeded Consumer secret that is placeholder text is refused by the resolve (#379).
     let remaining = report.unresolved();
     if !remaining.is_empty() {
         return Err(format!(
