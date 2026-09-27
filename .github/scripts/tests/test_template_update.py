@@ -665,6 +665,94 @@ class UrlUpstreamTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"target:   {expected}", result.stdout)
 
+    def test_remote_tracking_name_cannot_be_shadowed_by_an_upstream_branch(self):
+        attacker = self.fixture.upstream_change({"src/main.rs": "// attacker branch\n"}, "attacker")
+        git(self.fixture.upstream, "branch", "origin/main")
+        protected = self.fixture.upstream_change(
+            {"src/main.rs": "// protected main\n"}, "protected"
+        )
+
+        result = self.fixture.run("status", "--to", "origin/main", upstream=self.url)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"target:   {protected}", result.stdout)
+        self.assertNotIn(f"target:   {attacker}", result.stdout)
+
+    def test_detect_baseline_on_a_remote_tracking_name_ignores_a_shadowing_branch(self):
+        git(self.fixture.upstream, "switch", "--quiet", "-c", "origin/main")
+        other = self.fixture.upstream_change({"src/main.rs": "// other branch\n"}, "other")
+        git(self.fixture.upstream, "switch", "--quiet", "main")
+        protected = self.fixture.upstream_change(
+            {"src/main.rs": "// protected main\n"}, "protected"
+        )
+        self.fixture.customer_change({"src/main.rs": "// protected main\n"})
+
+        result = self.fixture.run("detect-baseline", "--to", "origin/main", upstream=self.url)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"exact match: this tree was copied from {protected}", result.stdout)
+        self.assertNotIn(other, result.stdout + result.stderr)
+
+    def test_an_unresolved_remote_tracking_name_points_at_the_literal_branch(self):
+        git(self.fixture.upstream, "branch", "origin/feature")
+        result = self.fixture.run("status", "--to", "origin/feature", upstream=self.url)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("could not be resolved", result.stderr)
+        self.assertIn(
+            "the upstream branch literally named origin/feature is refs/heads/origin/feature",
+            result.stderr,
+        )
+
+    def test_a_tag_named_like_the_default_branch_is_refused_as_ambiguous(self):
+        tagged = self.fixture.upstream_change({"src/main.rs": "// tagged\n"}, "tagged")
+        git(self.fixture.upstream, "tag", "main")
+        head = self.fixture.upstream_change({"src/main.rs": "// main\n"}, "main")
+        # No --to: the recorded (and default) `main` is what every command reads.
+        for command in ("status", "plan", "apply", "detect-baseline"):
+            with self.subTest(command=command):
+                result = self.fixture.run(command, upstream=self.url)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("upstream revision 'main' is ambiguous", result.stderr)
+                self.assertIn("refs/tags/main and refs/heads/main both exist", result.stderr)
+                self.assertNotIn(tagged, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.read("src/main.rs"), UPSTREAM_TREE["src/main.rs"])
+        self.assertEqual(
+            json.loads(self.fixture.read(".gitforgeops/baseline.json"))["commit"],
+            self.fixture.baseline,
+        )
+        for ref, expected in (("refs/heads/main", head), ("refs/tags/main", tagged)):
+            with self.subTest(ref=ref):
+                result = self.fixture.run("status", "--to", ref, upstream=self.url)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"target:   {expected}", result.stdout)
+
+    def test_a_branch_and_tag_sharing_any_name_are_refused_as_ambiguous(self):
+        git(self.fixture.upstream, "branch", "release")
+        tagged = self.fixture.upstream_change({"src/main.rs": "// tagged\n"}, "tagged")
+        git(self.fixture.upstream, "tag", "release")
+        result = self.fixture.run("status", "--to", "release", upstream=self.url)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("upstream revision 'release' is ambiguous", result.stderr)
+        self.assertIn("refs/heads/release or refs/tags/release", result.stderr)
+        self.assertNotIn(tagged, result.stdout + result.stderr)
+        self.assertNotIn(self.fixture.baseline, result.stdout)
+
+    def test_a_branch_named_like_an_abbreviated_commit_id_is_refused(self):
+        tagged = self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "v2")
+        self.fixture.upstream_change({"src/main.rs": "// v3\n"}, "v3")
+        abbreviated = tagged[:12]
+        result = self.fixture.run("status", "--to", abbreviated, upstream=self.url)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"target:   {tagged}", result.stdout)
+
+        git(self.fixture.upstream, "branch", abbreviated, self.fixture.baseline)
+        result = self.fixture.run("status", "--to", abbreviated, upstream=self.url)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            f"refs/heads/{abbreviated} and an object ID starting {abbreviated} both exist",
+            result.stderr,
+        )
+
     def test_the_upstream_copy_never_starts_background_maintenance(self):
         # A detached `git maintenance` or `gc --auto` started by the fetch can
         # still be writing objects/ when the temporary copy is removed.
