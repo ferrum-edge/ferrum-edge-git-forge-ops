@@ -2240,7 +2240,10 @@ fn ordinary_consumer_secrets_and_placeholder_shaped_plugin_seeds_resolve() {
     let report = resolve_secrets_with_mode(&mut cfg, &bundle, GatewayMode::Api).unwrap();
     assert!(report.results.len() == 2);
     assert!(
-        report.results.iter().all(|r| r.status == SlotStatus::Resolved),
+        report
+            .results
+            .iter()
+            .all(|r| r.status == SlotStatus::Resolved),
         "every slot resolves"
     );
     assert!(
