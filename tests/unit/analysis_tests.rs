@@ -502,7 +502,7 @@ fn security_audit_does_not_count_spiffe_identity_on_http_proxies() {
 
 #[test]
 fn security_audit_requires_an_authenticator_for_grpc_and_websocket_requests() {
-    // soap_ws_security declares HTTP_ONLY_PROTOCOLS in Ferrum Edge v0.9.7, so
+    // soap_ws_security declares HTTP_ONLY_PROTOCOLS in Ferrum Edge v0.9.8, so
     // gRPC and WebSocket requests to the proxy skip it.
     let soap_only = GatewayConfig {
         proxies: vec![proxy("api", Some(BackendScheme::Https))],

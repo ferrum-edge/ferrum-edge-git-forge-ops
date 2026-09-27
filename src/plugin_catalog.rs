@@ -207,7 +207,7 @@ pub const RESERVED_PLUGIN_NAMES: &[&str] = &["__mesh_bpf_metrics"];
 /// Built-in plugins that authenticate a caller, in priority order: each one
 /// rejects a request that does not present its credential.
 ///
-/// `spiffe_identity` is deliberately absent. In Ferrum Edge v0.9.7
+/// `spiffe_identity` is deliberately absent. In Ferrum Edge v0.9.8
 /// (`src/plugins/mesh/spiffe_identity.rs`) it does not override the trait's
 /// `is_auth_plugin()` (default `false`), and both `on_request_received` and
 /// `on_stream_connect` return `Continue` when the peer presents no client
@@ -456,7 +456,7 @@ pub fn scheme_is_http_family(scheme: BackendScheme) -> bool {
 // it for the request's protocol. Each gateway plugin declares
 // `supported_protocols()`, and the plugin cache builds one chain per protocol
 // from the plugins that declare it (`filter_for_protocol` in Ferrum Edge
-// v0.9.7 `src/plugin_cache.rs`). An HTTP-family proxy has no single protocol:
+// v0.9.8 `src/plugin_cache.rs`). An HTTP-family proxy has no single protocol:
 // the gateway classifies each request as plain HTTP, gRPC or a WebSocket
 // upgrade and runs that protocol's chain (`src/proxy/mod.rs`,
 // `request_protocol`). Only the authenticator half of that matrix is mirrored
@@ -561,7 +561,7 @@ pub fn proxy_transport(proxy: &Proxy) -> ProxyTransport {
 }
 
 /// The protocols a built-in authenticator declares in `supported_protocols()`
-/// on Ferrum Edge v0.9.7. Empty for every built-in outside
+/// on Ferrum Edge v0.9.8. Empty for every built-in outside
 /// [`AUTH_PLUGIN_NAMES`], which authenticates nothing on any protocol.
 ///
 /// * `mtls_auth` declares `HTTP_FAMILY_AND_STREAM_PROTOCOLS` and rejects a
@@ -581,7 +581,7 @@ pub fn builtin_auth_protocols(plugin_name: &str) -> &'static [PluginProtocol] {
 }
 
 /// Built-in authenticators that authenticate stream connections on the paired
-/// gateway (v0.9.7): the members of [`AUTH_PLUGIN_NAMES`] whose
+/// gateway (v0.9.8): the members of [`AUTH_PLUGIN_NAMES`] whose
 /// [`builtin_auth_protocols`] include `Tcp` and `Udp`.
 pub const STREAM_AUTH_PLUGIN_NAMES: &[&str] = &["mtls_auth"];
 
@@ -816,7 +816,7 @@ pub fn waf_has_enforcing_rule(config: &serde_json::Value) -> bool {
 /// Does the gateway compile the custom rule `rule` of the WAF `config` with an
 /// enforcing action?
 ///
-/// Mirrors the paired gateway (v0.9.7, `src/plugins/waf/mod.rs` and
+/// Mirrors the paired gateway (v0.9.8, `src/plugins/waf/mod.rs` and
 /// `src/plugins/waf/rules.rs`): an omitted `custom_rules[].action` defaults to
 /// `enforce` when the global `mode` is `enforce` and to `monitor` otherwise.
 /// `rule_overrides.<id>.action` then replaces it, and `rule_modes.<id>` wins
