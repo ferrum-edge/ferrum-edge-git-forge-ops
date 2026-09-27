@@ -45,6 +45,27 @@ fn load_smoke(contents: &str) -> Result<SmokeConfig, String> {
         .map_err(|error| error.to_string())
 }
 
+#[test]
+fn smoke_config_refuses_oversized_input() {
+    let file = write_yaml(&" ".repeat(1024 * 1024 + 1));
+    let error = SmokeConfig::load_from_path(file.path()).expect_err("must refuse oversized input");
+    assert!(error.to_string().contains("1048576 byte limit"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn smoke_config_refuses_symbolic_links() {
+    use std::os::unix::fs::symlink;
+
+    let target = write_yaml("version: 1\nenvironments: {}\n");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let link = directory.path().join("smoke.yaml");
+    symlink(target.path(), &link).expect("symlink");
+
+    let error = SmokeConfig::load_from_path(&link).expect_err("must refuse symlink");
+    assert!(error.to_string().contains("symbolic links"), "{error}");
+}
+
 // -- the chain --------------------------------------------------------------
 
 #[test]

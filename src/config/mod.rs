@@ -3,6 +3,7 @@ pub mod env;
 pub mod loader;
 pub mod namespace_guard;
 pub mod repo_config;
+mod repo_file;
 pub mod resolved;
 pub mod schema;
 mod strict;
@@ -20,6 +21,7 @@ pub use namespace_guard::{
 pub use repo_config::{
     EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
 };
+pub use repo_file::{read_bounded_repo_file, MAX_REPO_CONFIG_FILE_BYTES};
 pub use resolved::{
     resolve_env, validate_env_name_is_safe_path_component, validate_overlay_selection, ResolvedEnv,
     OVERLAYS_ROOT,

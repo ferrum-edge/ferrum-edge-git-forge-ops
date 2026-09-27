@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::Severity;
+use crate::config::{read_bounded_repo_file, MAX_REPO_CONFIG_FILE_BYTES};
 use crate::plugin_catalog::{AuthAllowlist, PluginProtocol};
 
 pub const POLICY_CONFIG_PATH: &str = ".gitforgeops/policies.yaml";
@@ -464,10 +465,9 @@ pub fn load_policies() -> crate::error::Result<Option<PolicyConfig>> {
 }
 
 pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<PolicyConfig>> {
-    if !path.exists() {
+    let Some(loaded) = load_raw(path)? else {
         return Ok(None);
-    }
-    let loaded = load_raw(path)?;
+    };
     if loaded.version != POLICY_CONFIG_VERSION {
         return Err(crate::error::Error::Config(format!(
             "unsupported policy config version {} in {}; expected version {}",
@@ -481,16 +481,14 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
     Ok(Some(loaded))
 }
 
-fn load_raw(path: &Path) -> crate::error::Result<PolicyConfig> {
-    let contents =
-        std::fs::read_to_string(path).map_err(|source| crate::error::Error::FileRead {
-            path: path.to_path_buf(),
-            source,
-        })?;
+fn load_raw(path: &Path) -> crate::error::Result<Option<PolicyConfig>> {
+    let Some(contents) = read_bounded_repo_file(path, MAX_REPO_CONFIG_FILE_BYTES)? else {
+        return Ok(None);
+    };
     let config: PolicyConfig =
         serde_yaml::from_str(&contents).map_err(|source| crate::error::Error::YamlParse {
             path: path.to_path_buf(),
             source,
         })?;
-    Ok(config)
+    Ok(Some(config))
 }
