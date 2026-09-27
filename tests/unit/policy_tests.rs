@@ -4141,3 +4141,43 @@ fn enabled_allowlists_reject_empty_configuration_even_at_warning_severity() {
         }
     }
 }
+
+#[test]
+fn policy_config_load_refuses_oversized_input() {
+    use gitforgeops::policy::config::load_policies_from_path;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("policies.yaml");
+    std::fs::write(&path, " ".repeat(1024 * 1024 + 1)).unwrap();
+
+    let error = load_policies_from_path(&path).unwrap_err();
+    assert!(error.to_string().contains("1048576 byte limit"), "{error}");
+}
+
+#[test]
+fn policy_config_load_refuses_a_non_regular_file() {
+    use gitforgeops::policy::config::load_policies_from_path;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("policies.yaml");
+    std::fs::create_dir(&path).unwrap();
+
+    let error = load_policies_from_path(&path).unwrap_err();
+    assert!(error.to_string().contains("not a regular file"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_config_load_refuses_symbolic_links() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target.yaml");
+    std::fs::write(&target, "version: 1\n").unwrap();
+    let link = directory.path().join("policies.yaml");
+    symlink(&target, &link).unwrap();
+
+    let error = load_policies_from_path(&link).unwrap_err();
+    assert!(error.to_string().contains("symbolic links"), "{error}");
+}

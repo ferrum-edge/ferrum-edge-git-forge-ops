@@ -30,6 +30,7 @@ mod publication_preflight_tests;
 mod quickstart_tests;
 mod reconcile_tests;
 mod repo_config_tests;
+mod repo_file_tests;
 mod review_tests;
 mod schema_tests;
 mod scoped_plugin_tests;

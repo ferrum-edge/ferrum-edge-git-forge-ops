@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::env::ApplyStrategy;
+use super::repo_file::{read_bounded_repo_file, MAX_REPO_CONFIG_FILE_BYTES};
 
 pub const REPO_CONFIG_PATH: &str = ".gitforgeops/config.yaml";
 pub const DEFAULT_LARGE_PRUNE_THRESHOLD_PERCENT: u8 = 25;
@@ -211,14 +212,9 @@ pub struct EnvironmentScope {
 
 impl RepoConfig {
     pub fn load_from_path(path: &Path) -> crate::error::Result<Option<Self>> {
-        if !path.exists() {
+        let Some(contents) = read_bounded_repo_file(path, MAX_REPO_CONFIG_FILE_BYTES)? else {
             return Ok(None);
-        }
-        let contents =
-            std::fs::read_to_string(path).map_err(|source| crate::error::Error::FileRead {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        };
         let config: RepoConfig =
             serde_yaml::from_str(&contents).map_err(|source| crate::error::Error::YamlParse {
                 path: path.to_path_buf(),

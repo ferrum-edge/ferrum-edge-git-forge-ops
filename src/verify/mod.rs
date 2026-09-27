@@ -20,17 +20,16 @@
 //! which route is wrong, not what a valid key looks like.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{read_bounded_repo_file, MAX_REPO_CONFIG_FILE_BYTES};
+
 pub mod runner;
 
 pub const SMOKE_CONFIG_PATH: &str = ".gitforgeops/smoke.yaml";
-/// Upper bound for repository-controlled smoke-check input.
-const MAX_SMOKE_CONFIG_BYTES: u64 = 1024 * 1024;
 /// The only smoke contract this release reads.
 pub const SMOKE_CONFIG_VERSION: u32 = 1;
 
@@ -174,48 +173,9 @@ pub struct SmokeConfig {
 
 impl SmokeConfig {
     pub fn load_from_path(path: &Path) -> crate::error::Result<Option<Self>> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(crate::error::Error::FileRead {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
+        let Some(contents) = read_bounded_repo_file(path, MAX_REPO_CONFIG_FILE_BYTES)? else {
+            return Ok(None);
         };
-        if metadata.file_type().is_symlink() {
-            return Err(crate::error::Error::Config(format!(
-                "symbolic links are not allowed for smoke-check configuration: {}",
-                path.display()
-            )));
-        }
-        if metadata.len() > MAX_SMOKE_CONFIG_BYTES {
-            return Err(crate::error::Error::Config(format!(
-                "smoke-check configuration {} exceeds the {} byte limit",
-                path.display(),
-                MAX_SMOKE_CONFIG_BYTES
-            )));
-        }
-
-        let file = std::fs::File::open(path).map_err(|source| crate::error::Error::FileRead {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mut contents = String::new();
-        file.take(MAX_SMOKE_CONFIG_BYTES + 1)
-            .read_to_string(&mut contents)
-            .map_err(|source| crate::error::Error::FileRead {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if contents.len() as u64 > MAX_SMOKE_CONFIG_BYTES {
-            return Err(crate::error::Error::Config(format!(
-                "smoke-check configuration {} exceeds the {} byte limit",
-                path.display(),
-                MAX_SMOKE_CONFIG_BYTES
-            )));
-        }
         let config: SmokeConfig =
             serde_yaml::from_str(&contents).map_err(|source| crate::error::Error::YamlParse {
                 path: path.to_path_buf(),
