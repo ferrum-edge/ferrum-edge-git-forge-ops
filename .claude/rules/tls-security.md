@@ -24,12 +24,13 @@ paths:
   slots, stay below GitHub's size limit, and keep shard assignment deterministic. Provisioning
   tokens must never enter normal gateway requests or output.
 - Delivery encrypts to a verified GitHub user's SSH public key with age. The reviewed RSA exception
-  permits public-key encryption only; do not add identity/private-key/decryption APIs or expand age
-  features without a new security review.
+  (`.github/cargo-audit-policy.json`) permits public-key encryption only; do not add
+  identity/private-key/decryption APIs or expand age features without a new security review.
 - Gateway CA, client certificate, and client key inputs are base64-encoded PEM. mTLS requires both
-  client cert and key; reject partial configuration. `FERRUM_TLS_NO_VERIFY` is development-only and
-  must remain explicit.
-- Admin JWT secrets must meet the gateway minimum. Preserve issuer, audience, role, TTL, and
+  client cert and key; reject partial configuration. `FERRUM_TLS_NO_VERIFY` and
+  `FERRUM_ALLOW_INSECURE_HTTP` are development-only, explicit, and refused under `GITHUB_ACTIONS`
+  unless the gateway host is loopback (`config::env::validate_gateway_transport`).
+- Admin JWT secrets must meet the gateway minimum (32 characters). Preserve issuer, audience, role, TTL, and
   namespace-claim compatibility; do not emit `aud` unless configured.
 - Scrub all `FERRUM_*` variables from the external validator child, pass a private settings file,
   and keep temporary specs mode 0600. Validator diagnostics are sensitive and remain suppressed or

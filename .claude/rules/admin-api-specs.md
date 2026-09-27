@@ -29,8 +29,8 @@ paths:
   `--allow-large-prune`.
 - Keep preview and execution semantics aligned. `diff`, `plan`, PR review, confirmation prompts,
   large-prune accounting, and apply must classify the same operation set.
-- Resource IDs interpolated into URL paths must pass the shared path-segment validation; do not
-  rely on percent encoding to make traversal-like IDs safe.
+- Resource IDs interpolated into URL paths must pass `validate_resource_id_for_path` in
+  `src/http_client.rs`; do not rely on percent encoding to make traversal-like IDs safe.
 
 ## Verification
 
