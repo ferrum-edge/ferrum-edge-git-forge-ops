@@ -96,7 +96,7 @@ ALLOCATION_REVISION_BINDING = "GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }
 APPLY_COMMAND = "run: gitforgeops apply"
 STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
-CARGO_AUDIT_ACTION = "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af"
+CARGO_AUDIT_ACTION = "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172"
 SECURITY_PUSH_POLICY_PATHS = (
     ".github/cargo-audit-policy.json",
     ".github/ferrum-edge-checksums.txt",
