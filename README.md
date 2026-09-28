@@ -1,4 +1,23 @@
-# Ferrum Edge GitForgeOps
+<p align="center">
+  <img src="docs/ferrum_git_forge_ops.png" alt="Ferrum Edge Git Forge Ops" width="300" />
+</p>
+
+<h1 align="center">Ferrum Edge GitForgeOps</h1>
+
+<p align="center">GitOps for <a href="https://github.com/ferrum-edge/ferrum-edge">Ferrum Edge</a> — review, apply, and monitor gateway configuration through pull requests</p>
+
+<p align="center">
+  <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/rust-ci.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/rust-ci.yml/badge.svg?branch=main" alt="Rust CI" /></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/security.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/security.yml/badge.svg?branch=main" alt="Security" /></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/release.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/release.yml/badge.svg?branch=main" alt="Release" /></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License" /></a>
+  <img src="https://img.shields.io/badge/rust-1.98.0-orange?logo=rust" alt="Rust 1.98.0" />
+  <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge-git-forge-ops"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge-git-forge-ops" alt="Docker Pulls" /></a>
+</p>
+
+> **Active build-out:** breaking changes to the CLI, configuration, and state
+> formats are expected until the first supported baseline. See
+> [Development status](#development-status).
 
 GitOps for [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge) gateway
 configuration. Gateway resources live in this repository as YAML; pull requests
@@ -11,6 +30,18 @@ This repository is a template. Copy it, configure it, and follow
 path in the [Quickstart](docs/quickstart.md). Check
 [GitHub plan requirements](#github-plan-requirements) before choosing a
 repository shape.
+
+## Contents
+
+| Get started | Operate | Reference |
+|---|---|---|
+| [How it works](#how-it-works) | [Ownership modes](#ownership-modes) | [CLI](#cli) |
+| [GitHub plan requirements](#github-plan-requirements) | [Policy framework](#policy-framework-gitforgeopspoliciesyaml) | [Repo configuration](#repo-configuration-gitforgeopsconfigyaml) |
+| [Set up your own repository](#set-up-your-own-repository) | [Credential broker](#credential-broker-gh-env-secret-placeholders) | [Mesh configuration](#mesh-configuration) |
+| [Quickstart guide](docs/quickstart.md) | [Apply and recovery](#apply-and-recovery) | [Trust and security posture](#trust-and-security-posture) |
+| [Repository layout](#repository-layout) | [Staged promotion](#staged-promotion) | [Docker](#docker) |
+| [Adopting an existing gateway](#adopting-an-existing-gateway) | [Drift detection](#drift-detection) | [Development](#development) |
+| [Setup doctor](#setup-doctor) | [Upgrading](#upgrading) | [License](#license) |
 
 ## Development status
 
