@@ -249,10 +249,7 @@ fn conditional_auth_exemptions_downgrade_supported_stream_and_http_gaps() {
         .conditional_auth_exemptions = vec!["ferrum/stream".to_string()];
 
     let mut custom_policy = PolicyConfig::default();
-    custom_policy
-        .policies
-        .require_auth_plugin
-        .auth_plugin_names = vec!["company_sso".to_string()];
+    custom_policy.policies.require_auth_plugin.auth_plugin_names = vec!["company_sso".to_string()];
     custom_policy
         .policies
         .require_auth_plugin
@@ -273,10 +270,8 @@ fn conditional_auth_exemptions_downgrade_supported_stream_and_http_gaps() {
     };
 
     let mut mixed_policy = PolicyConfig::default();
-    mixed_policy
-        .policies
-        .require_auth_plugin
-        .auth_plugin_names = vec!["soap_ws_security".to_string(), "company_sso".to_string()];
+    mixed_policy.policies.require_auth_plugin.auth_plugin_names =
+        vec!["soap_ws_security".to_string(), "company_sso".to_string()];
     mixed_policy
         .policies
         .require_auth_plugin
@@ -317,9 +312,7 @@ fn conditional_auth_exemptions_downgrade_supported_stream_and_http_gaps() {
         assert!(
             auth_findings.iter().all(|finding| {
                 finding.severity == "info"
-                    && finding
-                        .message
-                        .contains(&format!("exemption '{identity}'"))
+                    && finding.message.contains(&format!("exemption '{identity}'"))
             }),
             "{findings:?}"
         );

@@ -2948,8 +2948,10 @@ fn conditional_auth_exemption_accepts_mixed_unconditional_and_conditional_protoc
     policies
         .policies
         .require_auth_plugin
-        .custom_auth_plugin_protocols =
-        custom_protocols(&[("company_sso", &[PluginProtocol::Grpc, PluginProtocol::WebSocket])]);
+        .custom_auth_plugin_protocols = custom_protocols(&[(
+        "company_sso",
+        &[PluginProtocol::Grpc, PluginProtocol::WebSocket],
+    )]);
     policies
         .policies
         .require_auth_plugin
