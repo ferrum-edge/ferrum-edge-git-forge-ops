@@ -23,6 +23,47 @@ use gitforgeops::state::{AllocationBinding, StateFile};
 use gitforgeops::validate;
 use gitforgeops::verdict::{self, ApplyGateInputs};
 
+fn refuse_policy_violations(
+    findings: &[policy::PolicyFinding],
+    phase: &str,
+    override_decision: Option<&policy::github_override::OverrideDecision>,
+    scrubber: Option<&secrets::SecretScrubber>,
+) -> bool {
+    let Some(gate) = verdict::policy_blocker(findings) else {
+        return false;
+    };
+
+    eprintln!(
+        "Refusing to apply: {} policy violation(s) not covered by an override{}:",
+        gate.count, phase
+    );
+
+    let mut details = String::new();
+    for finding in findings.iter().filter(|finding| finding.is_blocking()) {
+        details.push_str(&format!(
+            "  [{}] {}: {}\n",
+            finding.severity.as_str(),
+            safe(&finding.rule_id),
+            safe_line(&finding.message)
+        ));
+    }
+    if let Some(decision) = override_decision {
+        if !decision.active {
+            details.push_str(&format!("(override inactive: {})\n", safe_block(&decision.reason)));
+        }
+    } else {
+        details.push_str(&format!("({})\n", policy::github_override::NO_PR_OVERRIDE_NOTE));
+    }
+
+    if let Some(scrubber) = scrubber {
+        let output = scrubber.scrub_streams("", &details);
+        eprint!("{}", output.stderr);
+    } else {
+        eprint!("{details}");
+    }
+    true
+}
+
 // Keep human-readable reports on stderr when stdout carries a JSON document.
 macro_rules! reportln {
     ($json_mode:expr) => {
@@ -2478,27 +2519,7 @@ async fn cmd_apply(
 
         // Post-override findings, which is exactly what
         // `verdict::policy_blocker` expects and what `plan` feeds it.
-        if let Some(gate) = verdict::policy_blocker(&findings) {
-            let blockers = findings.iter().filter(|f| f.is_blocking());
-            eprintln!(
-                "Refusing to apply: {} unresolved policy violation(s):",
-                gate.count
-            );
-            for b in blockers {
-                eprintln!(
-                    "  [{}] {}: {}",
-                    b.severity.as_str(),
-                    safe(&b.rule_id),
-                    safe_line(&b.message)
-                );
-            }
-            if let Some(d) = &override_decision {
-                if !d.active {
-                    eprintln!("(override inactive: {})", safe_block(&d.reason));
-                }
-            } else {
-                eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE);
-            }
+        if refuse_policy_violations(&findings, "", override_decision.as_ref(), None) {
             return Err("unresolved policy violations".into());
         }
     }
@@ -2555,19 +2576,14 @@ async fn cmd_apply(
                     }
                 }
             }
-            if let Some(gate) = verdict::policy_blocker(&findings) {
-                eprintln!(
-                    "Refusing to apply: {} unresolved policy violation(s) after credential resolution:",
-                    gate.count
-                );
-                for finding in findings.iter().filter(|finding| finding.is_blocking()) {
-                    eprintln!(
-                        "  [{}] {}: {}",
-                        finding.severity.as_str(),
-                        safe(&finding.rule_id),
-                        safe_line(&finding.message)
-                    );
-                }
+            let scrubber =
+                secrets::SecretScrubber::from_gateway_config_with_report(&desired, &secret_report);
+            if refuse_policy_violations(
+                &findings,
+                " (after credential resolution)",
+                override_decision.as_ref(),
+                Some(&scrubber),
+            ) {
                 return Err("unresolved policy violations".into());
             }
         }

@@ -205,7 +205,7 @@ fn conditional_auth_plugin_beside_an_unconditional_one_is_not_missing_auth() {
     };
     assert!(auth_messages(&cfg).is_empty());
     // The conditional instance is still surfaced for review.
-    assert!(any_message(&cfg, "authenticated by jwt_auth plugin jwt-1"));
+    assert!(any_message(&cfg, "has a conditional jwt_auth plugin jwt-1"));
 }
 
 // ---------------------------------------------------------------------------
@@ -596,10 +596,10 @@ fn skipped_stream_authenticator_triggers_are_not_reported_as_conditional_auth() 
         ..Default::default()
     };
     // The plugin-level trigger warning still surfaces the instance; only the
-    // proxy-level "authenticated by" claim must not appear.
+    // proxy-level conditional-auth claim must not appear.
     let msgs = messages(&cfg);
     assert!(
-        !msgs.iter().any(|m| m.contains("is authenticated by")),
+        !msgs.iter().any(|m| m.contains("has a conditional")),
         "{msgs:?}"
     );
     assert_eq!(auth_messages(&cfg).len(), 1);

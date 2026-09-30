@@ -3,11 +3,13 @@
 //! `apply` refusing to publish, and `plan` exiting non-zero, are properties of
 //! the *command*, not of any library function: the point is that nothing is
 //! written and the process reports failure. Both are exercised in file mode so
-//! the whole run is hermetic — no gateway, no GitHub, no network — with a stub
-//! validator standing in for `ferrum-edge` (absent in Rust CI).
+//! runs are hermetic, with loopback stubs for the validator and API gateway
+//! standing in for `ferrum-edge` and the gateway (absent in Rust CI).
 
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Arc, Mutex};
 
 use gitforgeops::policy::github_override::NO_PR_OVERRIDE_NOTE;
 use tempfile::TempDir;
@@ -86,6 +88,13 @@ policies:
     enabled: true
     severity: warning
     allowed_protocols: [https]
+"#;
+
+const AI_GUARDRAILS_POLICY: &str = r#"version: 1
+policies:
+  require_ai_guardrails:
+    enabled: true
+    severity: error
 "#;
 
 /// A throwaway repository checkout plus a stub validator.
@@ -275,6 +284,73 @@ fn identity_broker_cli_refuses_before_validator_network_or_file_side_effects() {
             }
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value() {
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
+        (
+            "resources/ferrum/plugins/mcp.yaml",
+            "kind: PluginConfig\nspec:\n  id: mcp\n  plugin_name: mcp_gateway\n  scope: global\n  config: {}\n",
+        ),
+        (
+            "resources/ferrum/plugins/shield.yaml",
+            "kind: PluginConfig\nspec:\n  id: shield\n  plugin_name: ai_prompt_shield\n  scope: global\n  config:\n    mode: '${gh-env-secret:alloc=require}'\n",
+        ),
+        (".gitforgeops/policies.yaml", AI_GUARDRAILS_POLICY),
+    ]);
+    std::fs::write(
+        &repo.validator,
+        "#!/bin/sh\ntouch validator-ran\nexit 0\n",
+    )
+    .unwrap();
+    set_executable(&repo.validator);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let gateway_requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&gateway_requests);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0; 4096];
+            let length = stream.read(&mut request).unwrap_or(0);
+            recorded_requests
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request[..length]).to_string());
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            );
+        }
+    });
+    let bundle = r#"{"FERRUM_CREDS_BUNDLE":{"ferrum/shield/@plugin-config/config/mode":"dry_run"}}"#;
+    let output = repo.run(
+        &["apply", "--auto-approve"],
+        &[
+            ("FERRUM_GATEWAY_MODE", "api"),
+            ("FERRUM_GATEWAY_URL", &endpoint),
+            ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-at-least-32-bytes",
+            ),
+            ("FERRUM_CREDS_JSON", bundle),
+        ],
+    );
+
+    let stderr = stderr(&output);
+    assert!(!output.status.success(), "{}\n{stderr}", stdout(&output));
+    assert!(stderr.contains("after credential resolution"), "{stderr}");
+    assert!(stderr.contains("policy violation(s)"), "{stderr}");
+    assert!(!stderr.contains("dry_run"), "{stderr}");
+    assert!(!repo.dir.path().join("validator-ran").exists());
+    assert!(!repo.dir.path().join(".state/default.json").exists());
+    assert!(
+        gateway_requests.lock().unwrap().is_empty(),
+        "policy refusal must precede every gateway request"
+    );
 }
 
 #[cfg(unix)]

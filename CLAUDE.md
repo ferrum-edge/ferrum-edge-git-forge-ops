@@ -1031,9 +1031,11 @@ gateway, as `Vec<ApplyBlocker>` over ten `BlockerKind`s:
   `credential_provisioning_blockers`) at its own gate points, because order
   matters: the security audit and the policy gate must refuse before the state
   lock and bundle read (the policy gate evaluates the unresolved document, as
-  the security audit sees it),
-  the required-slot check before the first gateway call. Share predicates, not
-  control flow.
+  the security audit sees it); API mode evaluates policy again after credential
+  resolution and before validation, using the resolved-slot report to scrub
+  diagnostics. Both policy refusals include the same override guidance. The
+  required-slot check runs before the first gateway call. Share predicates,
+  not control flow.
 
 Rules that must not drift:
 

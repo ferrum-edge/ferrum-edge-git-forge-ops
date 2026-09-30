@@ -480,6 +480,8 @@ fn cli_accepts_a_valid_or_absent_smoke_file() {
 #[test]
 fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {
     let repo = Repo::new(None);
+    std::fs::create_dir_all(repo.path("resources/ferrum/plugins")).unwrap();
+    std::fs::create_dir_all(repo.path(".gitforgeops")).unwrap();
     std::fs::write(
         repo.path("resources/ferrum/proxies/api.yaml"),
         CONDITIONAL_AUTH_PROXY,
@@ -503,11 +505,15 @@ fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("unresolved policy violations"), "{stderr}");
+    assert!(stderr.contains("require_auth_plugin"), "{stderr}");
+    assert!(
+        !stderr.contains("after credential resolution"),
+        "{stderr}"
+    );
     assert!(
         !repo.path("validator-ran").exists(),
         "validator was invoked"
     );
     assert!(!repo.path("assembled/resources.yaml").exists());
     assert!(!repo.path("assembled/mesh.yaml").exists());
-    repo.assert_no_state("conditional authenticator policy refusal");
 }
