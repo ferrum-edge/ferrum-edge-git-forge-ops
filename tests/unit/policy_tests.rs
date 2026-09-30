@@ -2252,6 +2252,7 @@ fn require_auth_plugin_uses_explicit_allowlist() {
                 severity: Severity::Error,
                 auth_plugin_names: vec!["company_sso".to_string()],
                 custom_auth_plugin_protocols: declared,
+                conditional_auth_exemptions: Vec::new(),
             },
             ..Default::default()
         },
