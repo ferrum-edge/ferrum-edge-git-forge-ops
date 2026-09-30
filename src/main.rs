@@ -39,7 +39,11 @@ fn refuse_policy_violations(
     );
 
     let mut details = String::new();
-    for finding in findings.iter().filter(|finding| finding.is_blocking()) {
+    let blocking_findings = findings
+        .iter()
+        .filter(|finding| finding.is_blocking())
+        .collect::<Vec<_>>();
+    for finding in &blocking_findings {
         details.push_str(&format!(
             "  [{}] {}: {}\n",
             finding.severity.as_str(),
@@ -47,25 +51,34 @@ fn refuse_policy_violations(
             safe_line(&finding.message)
         ));
     }
-    if let Some(decision) = override_decision {
-        if !decision.active {
-            details.push_str(&format!(
-                "(override inactive: {})\n",
-                safe_block(&decision.reason)
-            ));
-        }
-    } else {
-        details.push_str(&format!(
-            "({})\n",
-            policy::github_override::NO_PR_OVERRIDE_NOTE
-        ));
-    }
 
     if let Some(scrubber) = scrubber {
         let output = scrubber.scrub_streams("", &details);
-        eprint!("{}", output.stderr);
+        if output.suppressed.is_some() {
+            eprintln!(
+                "Policy finding details were withheld because they may contain resolved secrets:"
+            );
+            for finding in &blocking_findings {
+                eprintln!(
+                    "  [{}] {}/{} {}",
+                    safe(&finding.rule_id),
+                    safe(&finding.kind),
+                    safe(&finding.namespace),
+                    safe(&finding.id)
+                );
+            }
+        } else {
+            eprint!("{}", output.stderr);
+        }
     } else {
         eprint!("{details}");
+    }
+    if let Some(decision) = override_decision {
+        if !decision.active {
+            eprintln!("(override inactive: {})", safe_block(&decision.reason));
+        }
+    } else {
+        eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE);
     }
     true
 }

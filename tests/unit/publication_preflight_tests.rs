@@ -513,4 +513,5 @@ fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {
     );
     assert!(!repo.path("assembled/resources.yaml").exists());
     assert!(!repo.path("assembled/mesh.yaml").exists());
+    assert!(!repo.path(".state/default.json").exists());
 }
