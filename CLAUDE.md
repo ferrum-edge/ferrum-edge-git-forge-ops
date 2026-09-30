@@ -898,7 +898,9 @@ TCP or UDP for stream listeners).
 - Custom authenticators default to plain HTTP (Edge's trait default) unless
   `require_auth_plugin.custom_auth_plugin_protocols` declares them.
 - A stream proxy is authenticated only if its listener terminates TLS/DTLS
-  (`frontend_tls` without `passthrough`).
+  (`frontend_tls` without `passthrough`). An HTTP proxy with `passthrough:
+  true` (which Edge rejects) fails closed: its authenticators are inert and
+  cover no protocol.
 - An authenticator carrying a `trigger` (`PluginConfig::is_conditional`) is
   `AuthCoverage::conditional` and covers no protocol, whatever its predicate:
   repository data cannot prove a trigger matches every request. An intentionally

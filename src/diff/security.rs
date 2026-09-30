@@ -356,13 +356,13 @@ fn missing_auth_message(
 
     if !coverage.transport.is_stream() {
         if proxy.passthrough {
-            let inert = if coverage.inapplicable.is_empty() {
-                "HTTP authenticators".to_string()
+            let (inert, attach) = if coverage.inapplicable.is_empty() {
+                ("none attached".to_string(), ", then attach an authenticator")
             } else {
-                plugin_instance_list(&coverage.inapplicable)
+                (plugin_instance_list(&coverage.inapplicable), "")
             };
             return format!(
-                "No auth plugin counts on HTTP proxy {id} in namespace {ns}: passthrough: true is rejected by Ferrum Edge on non-stream proxies, so GitForgeOps fails closed; inert authenticators: {inert}. Set passthrough: false and terminate TLS at the gateway"
+                "No auth plugin counts on HTTP proxy {id} in namespace {ns}: passthrough: true is rejected by Ferrum Edge on non-stream proxies, so GitForgeOps fails closed; inert authenticators: {inert}. Set passthrough: false and terminate TLS at the gateway{attach}"
             );
         }
         if coverage.applicable.is_empty() && coverage.conditional.is_empty() {
