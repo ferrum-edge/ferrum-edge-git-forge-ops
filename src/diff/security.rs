@@ -220,14 +220,31 @@ fn check_proxy(
     // never counts, because it only runs on the requests its predicate
     // matches.
     let coverage = auth_coverage(config, proxy, auth);
-    let exempt = has_exemption && !coverage.is_authenticated() && !coverage.conditional.is_empty();
+    let exemption_gap = coverage.conditional_exemption_gap(auth);
+    let exempt = has_exemption
+        && !coverage.is_authenticated()
+        && !coverage.conditional.is_empty()
+        && exemption_gap.is_none();
     let exemption_note = format!(
         "; permitted by conditional-auth exemption '{}/{}'",
         proxy.namespace, proxy.id
     );
+    let uncovered_exemption_note = format!(
+        concat!(
+            "; conditional-auth exemption '{}/{}' does not cover this gap: {}"
+        ),
+        proxy.namespace,
+        proxy.id,
+        exemption_gap
+            .as_deref()
+            .unwrap_or("no conditional authenticator applies")
+    );
 
     if !coverage.is_authenticated() {
-        let message = missing_auth_message(proxy, &coverage, auth);
+        let mut message = missing_auth_message(proxy, &coverage, auth);
+        if has_exemption && !exempt {
+            message.push_str(&uncovered_exemption_note);
+        }
         findings.push(if exempt {
             SecurityFinding::info(
                 "Proxy",
@@ -251,7 +268,13 @@ fn check_proxy(
             proxy.namespace,
             plugin.plugin_name,
             plugin.id,
-            if exempt { exemption_note.as_str() } else { "" }
+            if exempt {
+                exemption_note.as_str()
+            } else if has_exemption {
+                uncovered_exemption_note.as_str()
+            } else {
+                ""
+            }
         );
         findings.push(if exempt {
             SecurityFinding::info("Proxy", &proxy.id, &proxy.namespace, message)

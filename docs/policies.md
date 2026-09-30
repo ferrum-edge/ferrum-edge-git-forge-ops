@@ -97,9 +97,17 @@ global ones with the same `plugin_name`, disabled instances dropped.
   public route, list the exact `<namespace>/<proxy_id>` in
   `conditional_auth_exemptions`. The finding remains visible at `info`, naming
   the exemption, and the security audit reports the same exception at `info`.
-  Non-listed proxies still block according to the configured severity. Missing
-  or no-longer-needed entries produce a stale-exemption warning. Entries cannot
-  contain wildcards and must be unique.
+  The exemption is bound to proxy identity only, so later changes to that
+  proxy's configuration retain the `info` rating. Code owners approving an
+  entry also approve future edits to that proxy; delete the entry and add a new
+  one when the service changes. The trusted review workflow reads
+  `policies.yaml` from the base branch, so land the exemption first (it produces
+  a harmless stale-exemption note), then submit the route. Non-listed proxies
+  still block according to the configured severity. Missing, no-longer-needed,
+  or insufficiently scoped entries produce an informational stale-exemption
+  finding. Entries cannot contain wildcards and must be unique. Components use
+  only ASCII letters, digits, `.`, `_` and `-`; `.` and `..` are not valid
+  components.
 - **Custom authenticators** are assumed to cover plain HTTP only. Declare what
   they implement under `custom_auth_plugin_protocols`, for example
   `company_sso: [http, grpc, websocket]` (values: `http`, `grpc`, `websocket`,

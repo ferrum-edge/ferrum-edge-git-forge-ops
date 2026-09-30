@@ -2719,12 +2719,14 @@ fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
     );
     let mut other_namespace = proxy("api", BackendScheme::Https, 30_000, true);
     other_namespace.namespace = "other".to_string();
+    let mut other_conditional = conditional.clone();
+    other_conditional.namespace = "other".to_string();
     let cfg = GatewayConfig {
         proxies: vec![
             proxy("api", BackendScheme::Https, 30_000, true),
             other_namespace,
         ],
-        plugin_configs: vec![conditional],
+        plugin_configs: vec![conditional, other_conditional],
         ..Default::default()
     };
     let mut policies = require_auth_policies(None);
@@ -2738,10 +2740,15 @@ fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
         .iter()
         .filter(|finding| finding.rule_id == "require_auth_plugin")
         .collect::<Vec<_>>();
-    assert_eq!(auth_findings.len(), 1, "{findings:?}");
-    assert_eq!(auth_findings[0].namespace, "other");
-    assert!(auth_findings[0].is_blocking(), "{auth_findings:?}");
-    assert!(auth_findings[0].message.contains("conditional"));
+    assert_eq!(auth_findings.len(), 2, "{findings:?}");
+    let blocking = auth_findings
+        .iter()
+        .filter(|finding| finding.is_blocking())
+        .collect::<Vec<_>>();
+    assert_eq!(blocking.len(), 1, "{findings:?}");
+    assert_eq!(blocking[0].namespace, "other");
+    assert_eq!(blocking[0].id, "api");
+    assert!(blocking[0].message.contains("conditional"));
 
     let exempt = gitforgeops::plugin_catalog::auth_coverage(
         &cfg,
@@ -2749,6 +2756,18 @@ fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
         &policies.policies.require_auth_plugin.auth_allowlist(),
     );
     assert!(!exempt.is_authenticated());
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| {
+                finding.severity == Severity::Info
+                    && finding.namespace == "ferrum"
+                    && finding.message.contains("exemption 'ferrum/api'")
+            })
+            .count(),
+        1,
+        "{findings:?}"
+    );
     assert!(findings.iter().any(|finding| {
         finding.severity == Severity::Info
             && finding.namespace == "ferrum"
@@ -2765,12 +2784,199 @@ fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
     let stale = evaluate_policies(&cfg, &policies);
     assert!(stale.iter().any(|finding| {
         finding.kind == "PolicyConfig"
-            && finding.severity == Severity::Warning
+            && finding.severity == Severity::Info
             && finding.message.contains("ferrum/missing")
     }));
     assert!(stale
         .iter()
         .any(|finding| finding.namespace == "ferrum" && finding.is_blocking()));
+
+    let mut other_only = proxy("api", BackendScheme::Https, 30_000, true);
+    other_only.namespace = "other".to_string();
+    let filtered_document = GatewayConfig {
+        proxies: vec![other_only],
+        ..Default::default()
+    };
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/missing".to_string()];
+    assert!(!evaluate_policies(&filtered_document, &policies)
+        .iter()
+        .any(|finding| finding.kind == "PolicyConfig"));
+}
+
+#[test]
+fn conditional_auth_exemptions_only_cover_complete_identity_and_protocol_gaps() {
+    let trigger = serde_json::json!({"match": {"path": {"prefix": ["/private"]}}});
+
+    let mut http_only = global_plugin("custom-1", "company_sso");
+    http_only = with_trigger(http_only, trigger.clone());
+    let http_policies = PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: gitforgeops::policy::config::RequireAuthPluginRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                auth_plugin_names: vec!["company_sso".to_string()],
+                conditional_auth_exemptions: vec!["ferrum/api".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let http_cfg = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![http_only],
+        ..Default::default()
+    };
+    let http_findings = evaluate_policies(&http_cfg, &http_policies)
+        .into_iter()
+        .filter(|finding| finding.kind == "Proxy")
+        .collect::<Vec<_>>();
+    assert_eq!(http_findings.len(), 1, "{http_findings:?}");
+    assert!(http_findings[0].is_blocking(), "{http_findings:?}");
+    assert!(
+        http_findings[0].message.contains("gRPC, WebSocket")
+            && http_findings[0].message.contains("does not cover this gap"),
+        "{http_findings:?}"
+    );
+    let security_findings =
+        gitforgeops::diff::security::audit_security_with_policy(&http_cfg, Some(&http_policies));
+    assert!(security_findings.iter().any(|finding| {
+        finding.kind == "Proxy"
+            && finding.severity == "warning"
+            && finding.message.contains("does not cover this gap")
+    }));
+
+    let mut mtls = with_trigger(global_plugin("mtls-1", "mtls_auth"), trigger);
+    mtls.namespace = "ferrum".to_string();
+    let stream_cfg = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcps, false)],
+        plugin_configs: vec![mtls],
+        ..Default::default()
+    };
+    let mut stream_policies = require_auth_policies(None);
+    stream_policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/stream".to_string()];
+    let stream_findings = evaluate_policies(&stream_cfg, &stream_policies)
+        .into_iter()
+        .filter(|finding| finding.kind == "Proxy")
+        .collect::<Vec<_>>();
+    assert_eq!(stream_findings.len(), 1, "{stream_findings:?}");
+    assert!(stream_findings[0].is_blocking(), "{stream_findings:?}");
+    assert!(
+        stream_findings[0].message.contains("does not terminate TLS/DTLS"),
+        "{stream_findings:?}"
+    );
+    let security_findings = gitforgeops::diff::security::audit_security_with_policy(
+        &stream_cfg,
+        Some(&stream_policies),
+    );
+    assert!(security_findings.iter().any(|finding| {
+        finding.kind == "Proxy"
+            && finding.severity == "warning"
+            && finding.message.contains("does not cover this gap")
+    }));
+}
+
+#[test]
+fn conditional_auth_exemptions_are_stale_when_auth_is_missing_or_unconditional() {
+    let mut policies = require_auth_policies(None);
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+
+    let no_auth = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&no_auth, &policies);
+    assert!(findings.iter().any(|finding| {
+        finding.kind == "Proxy" && finding.id == "api" && finding.is_blocking()
+    }));
+    assert!(findings.iter().any(|finding| {
+        finding.kind == "PolicyConfig"
+            && finding.severity == Severity::Info
+            && finding.message.contains("stale conditional-auth exemption 'ferrum/api'")
+    }));
+
+    let fully_authenticated = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("jwt-1", "jwt_auth")],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&fully_authenticated, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].kind, "PolicyConfig");
+    assert_eq!(findings[0].severity, Severity::Info);
+
+    let mut proxy_named_api = proxy("actual-id", BackendScheme::Https, 30_000, true);
+    proxy_named_api.name = Some("api".to_string());
+    let mismatched_identity = GatewayConfig {
+        proxies: vec![proxy_named_api],
+        plugin_configs: vec![with_trigger(
+            global_plugin("key-1", "key_auth"),
+            serde_json::json!({"match": {"path": {"prefix": ["/private"]}}}),
+        )],
+        ..Default::default()
+    };
+    let mut identity_policies = require_auth_policies(None);
+    identity_policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+    let findings = evaluate_policies(&mismatched_identity, &identity_policies);
+    let proxy_finding = findings
+        .iter()
+        .find(|finding| finding.kind == "Proxy")
+        .expect("mismatched proxy identity remains blocking");
+    assert_eq!(proxy_finding.id, "actual-id");
+    assert!(proxy_finding.is_blocking(), "{findings:?}");
+}
+
+#[test]
+fn conditional_auth_exemption_matching_is_case_sensitive_and_disabled_rule_is_quiet() {
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![with_trigger(
+            global_plugin("key-1", "key_auth"),
+            serde_json::json!({"match": {"path": {"prefix": ["/private"]}}}),
+        )],
+        ..Default::default()
+    };
+    let mut policies = require_auth_policies(None);
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/API".to_string()];
+    let findings = evaluate_policies(&cfg, &policies);
+    let proxy_finding = findings
+        .iter()
+        .find(|finding| finding.kind == "Proxy")
+        .expect("case-mismatched exemption does not apply");
+    assert_eq!(proxy_finding.severity, Severity::Error);
+    assert_eq!(proxy_finding.id, "api");
+
+    policies.policies.require_auth_plugin.enabled = false;
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+    let findings = evaluate_policies(&cfg, &policies);
+    assert!(findings.is_empty(), "{findings:?}");
+
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/missing".to_string()];
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].kind, "PolicyConfig");
+    assert_eq!(findings[0].severity, Severity::Info);
 }
 
 #[test]
@@ -3165,6 +3371,13 @@ fn policy_config_validates_conditional_auth_exemptions_strictly() {
         ("[ferrum/*]", "wildcards"),
         ("[ferrum/api, ferrum/api]", "duplicate entry"),
         ("['/api']", "exactly <namespace>/<proxy_id>"),
+        ("['ferrum/ api']", "ASCII letters"),
+        ("['ferrum/api ']", "ASCII letters"),
+        ("['férum/api']", "ASCII letters"),
+        ("['./api']", "cannot be '.' or '..'"),
+        ("['../api']", "cannot be '.' or '..'"),
+        ("['ferrum/.']", "cannot be '.' or '..'"),
+        ("['ferrum/..']", "cannot be '.' or '..'"),
     ] {
         let error = load(entries).unwrap_err().to_string();
         assert!(error.contains(expected), "{entries}: {error}");

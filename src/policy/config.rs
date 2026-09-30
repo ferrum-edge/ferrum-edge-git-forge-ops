@@ -134,13 +134,19 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
         let parts = exemption.split('/').collect::<Vec<_>>();
         let valid_component = |part: &str| {
             !part.is_empty()
+                && part != "."
+                && part != ".."
                 && part
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
         };
         if parts.len() != 2 || !valid_component(parts[0]) || !valid_component(parts[1]) {
             return Err(crate::error::Error::Config(format!(
-                "require_auth_plugin.conditional_auth_exemptions entry '{exemption}' must be exactly <namespace>/<proxy_id> using letters, digits, '.', '_' or '-'"
+                concat!(
+                    "require_auth_plugin.conditional_auth_exemptions entry '{exemption}' must be ",
+                    "exactly <namespace>/<proxy_id>; each component must use only ASCII ",
+                    "letters, digits, '_', '-', or '.' and cannot be '.' or '..'"
+                )
             )));
         }
         if !exemptions.insert(exemption) {
