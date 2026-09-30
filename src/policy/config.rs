@@ -146,7 +146,8 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
                     "require_auth_plugin.conditional_auth_exemptions entry '{exemption}' must be ",
                     "exactly <namespace>/<proxy_id>; each component must use only ASCII ",
                     "letters, digits, '_', '-', or '.' and cannot be '.' or '..'"
-                )
+                ),
+                exemption = exemption
             )));
         }
         if !exemptions.insert(exemption) {

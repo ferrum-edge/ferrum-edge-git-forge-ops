@@ -219,7 +219,8 @@ impl PolicyCheck for RequireAuthPluginRule {
                         proxy.id,
                         exemption_gap
                             .as_deref()
-                            .unwrap_or("no conditional authenticator applies")
+                            .unwrap_or("no conditional authenticator applies"),
+                        message = message
                     )
                 } else {
                     message
