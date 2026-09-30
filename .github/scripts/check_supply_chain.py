@@ -96,7 +96,13 @@ ALLOCATION_REVISION_BINDING = "GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }
 APPLY_COMMAND = "run: gitforgeops apply"
 STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
-CARGO_AUDIT_ACTION = "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af"
+# The older pin is retired by the follow-up PR that switches the workflow.
+CARGO_AUDIT_ACTIONS = frozenset(
+    {
+        "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af",
+        "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",
+    }
+)
 SECURITY_PUSH_POLICY_PATHS = (
     ".github/cargo-audit-policy.json",
     ".github/ferrum-edge-checksums.txt",
@@ -1221,14 +1227,19 @@ def cargo_audit_install_violations(text: str) -> list[str]:
     """Pin the installer and manifest-backed tool; never restore an executable."""
     job = workflow_job(text, "security-cargo-audit")
     violations: list[str] = []
-    if policy_step(job, "Install cargo-audit") != [
-        "name: Install cargo-audit",
-        f"        uses: {CARGO_AUDIT_ACTION}",
-        "        with:",
-        "          tool: cargo-audit@0.22.1",
-        "          checksum: true",
-        "          fallback: none",
-    ]:
+    install_step = policy_step(job, "Install cargo-audit")
+    allowed_action_lines = {f"        uses: {action}" for action in CARGO_AUDIT_ACTIONS}
+    if (
+        len(install_step) != 6
+        or install_step[0] != "name: Install cargo-audit"
+        or install_step[1] not in allowed_action_lines
+        or install_step[2:] != [
+            "        with:",
+            "          tool: cargo-audit@0.22.1",
+            "          checksum: true",
+            "          fallback: none",
+        ]
+    ):
         violations.append(
             "security.yml: cargo-audit 0.22.1 must use the reviewed install-action "
             "with checksums, no fallback, and no conditional or failure bypass"
