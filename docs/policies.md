@@ -23,6 +23,8 @@ policies:
   require_auth_plugin:
     enabled: true
     severity: error
+    conditional_auth_exemptions:
+      - public/status
 
 overrides:
   require_label: gitforgeops/policy-override
@@ -85,14 +87,19 @@ global ones with the same `plugin_name`, disabled instances dropped.
   - On stream listeners only `mtls_auth` counts, and the listener must
     terminate TLS/DTLS (`frontend_tls: true` without `passthrough`) so the
     client certificate reaches it.
-- **Conditional authenticators never count.** An authenticator with a
+- **Conditional authenticators never count by default.** An authenticator with a
   `trigger` runs only on the requests its predicate matches (protocol, path,
   method, header, or any other match), and every other request reaches the
   backend unauthenticated. It covers no protocol, whatever the predicate, so a
   proxy needs an authenticator without a trigger on every protocol its listener
   serves. A scoped instance with a trigger replaces a global instance of the
-  same `plugin_name` without one, so it can remove coverage. A route that is
-  intentionally public needs the policy override, not a trigger.
+  same `plugin_name` without one, so it can remove coverage. For an intentionally
+  public route, list the exact `<namespace>/<proxy_id>` in
+  `conditional_auth_exemptions`. The finding remains visible at `info`, naming
+  the exemption, and the security audit reports the same exception at `info`.
+  Non-listed proxies still block according to the configured severity. Missing
+  or no-longer-needed entries produce a stale-exemption warning. Entries cannot
+  contain wildcards and must be unique.
 - **Custom authenticators** are assumed to cover plain HTTP only. Declare what
   they implement under `custom_auth_plugin_protocols`, for example
   `company_sso: [http, grpc, websocket]` (values: `http`, `grpc`, `websocket`,

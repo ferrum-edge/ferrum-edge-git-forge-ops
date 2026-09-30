@@ -192,6 +192,39 @@ fn auth_plugin_with_a_trigger_is_reported_as_conditional() {
 }
 
 #[test]
+fn conditional_auth_exemption_downgrades_security_findings_with_exact_identity() {
+    let mut conditional = plugin("jwt-1", "jwt_auth", serde_json::json!({}));
+    conditional.trigger = Some(from_json::<PluginTrigger>(serde_json::json!({
+        "when": {"match": {"path": {"prefix": ["/private"]}}},
+    })));
+    let mut other_namespace = proxy("p1", Some(BackendScheme::Https));
+    other_namespace.namespace = "other".to_string();
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("p1", Some(BackendScheme::Https)), other_namespace],
+        plugin_configs: vec![conditional],
+        ..Default::default()
+    };
+    let mut policy = PolicyConfig::default();
+    policy.policies.require_auth_plugin.conditional_auth_exemptions =
+        vec!["ferrum/p1".to_string()];
+
+    let findings = audit_security_with_policy(&cfg, Some(&policy));
+    let exempt = findings
+        .iter()
+        .filter(|finding| finding.namespace == "ferrum" && finding.kind == "Proxy")
+        .collect::<Vec<_>>();
+    assert_eq!(exempt.len(), 2, "{findings:?}");
+    assert!(exempt.iter().all(|finding| finding.severity == "info"));
+    assert!(exempt
+        .iter()
+        .all(|finding| finding.message.contains("exemption 'ferrum/p1'")));
+    assert!(findings
+        .iter()
+        .filter(|finding| finding.namespace == "other" && finding.kind == "Proxy")
+        .all(|finding| finding.severity == "warning"));
+}
+
+#[test]
 fn conditional_auth_plugin_beside_an_unconditional_one_is_not_missing_auth() {
     let mut conditional = plugin("jwt-1", "jwt_auth", serde_json::json!({}));
     conditional.trigger = Some(from_json::<PluginTrigger>(serde_json::json!({

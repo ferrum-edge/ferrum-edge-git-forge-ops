@@ -27,7 +27,7 @@ impl RequireAuthPluginRule {
     /// gateway runs it on) are delegated to the shared `auth_coverage`
     /// classification. So is the trigger guard: an authenticator carrying a
     /// `trigger` only runs on the requests it matches, so it never counts,
-    /// and an intentionally public route needs the policy override.
+    /// and an intentionally public route needs a code-owned exemption.
     fn coverage<'a>(&self, cfg: &'a GatewayConfig, proxy: &Proxy) -> AuthCoverage<'a> {
         auth_coverage(cfg, proxy, &self.config.auth_allowlist())
     }
@@ -61,8 +61,8 @@ fn conditional_remedy(coverage: &AuthCoverage<'_>) -> &'static str {
     if coverage.conditional.is_empty() {
         return "";
     }
-    ". Remove the trigger from the authenticator; a route that is intentionally public needs the \
-     policy override, not a trigger"
+    ". Remove the trigger from the authenticator; an intentionally public route needs an exact \
+     code-owned conditional-auth exemption"
 }
 
 /// Finding text and remediation for a proxy that is not authenticated.
@@ -141,6 +141,37 @@ impl PolicyCheck for RequireAuthPluginRule {
 
     fn evaluate(&self, cfg: &GatewayConfig) -> Vec<PolicyFinding> {
         let mut findings = Vec::new();
+        for exemption in &self.config.conditional_auth_exemptions {
+            let (namespace, proxy_id) = exemption.split_once('/').unwrap_or(("", ""));
+            let proxy = cfg
+                .proxies
+                .iter()
+                .find(|proxy| proxy.namespace == namespace && proxy.id == proxy_id);
+            let stale = match proxy {
+                Some(proxy) => {
+                    let coverage = self.coverage(cfg, proxy);
+                    coverage.is_authenticated() || coverage.conditional.is_empty()
+                }
+                None => true,
+            };
+            if stale {
+                findings.push(PolicyFinding {
+                    rule_id: self.rule_id().to_string(),
+                    severity: crate::policy::Severity::Warning,
+                    kind: "PolicyConfig".to_string(),
+                    id: exemption.clone(),
+                    namespace: namespace.to_string(),
+                    message: format!(
+                        "stale conditional-auth exemption '{exemption}': the proxy is missing or does not need this exemption"
+                    ),
+                    remediation: Some(format!(
+                        "Remove '{exemption}' from require_auth_plugin.conditional_auth_exemptions"
+                    )),
+                    overridden_by: None,
+                });
+            }
+        }
+
         if !self.config.enabled {
             return findings;
         }
@@ -151,14 +182,35 @@ impl PolicyCheck for RequireAuthPluginRule {
                 continue;
             }
             let (message, remediation) = describe(proxy, &coverage);
+            let exempt = !coverage.conditional.is_empty()
+                && self
+                    .config
+                    .has_conditional_auth_exemption(&proxy.namespace, &proxy.id);
             findings.push(PolicyFinding {
                 rule_id: self.rule_id().to_string(),
-                severity: self.config.severity,
+                severity: if exempt {
+                    crate::policy::Severity::Info
+                } else {
+                    self.config.severity
+                },
                 kind: "Proxy".to_string(),
                 id: proxy.id.clone(),
                 namespace: proxy.namespace.clone(),
-                message,
-                remediation: Some(remediation),
+                message: if exempt {
+                    format!(
+                        "{message}; permitted by conditional-auth exemption '{}/{}'",
+                        proxy.namespace, proxy.id
+                    )
+                } else {
+                    message
+                },
+                remediation: if exempt {
+                    Some(
+                        "Keep this exact proxy identity in the code-owned conditional-auth exemption list; requests outside its trigger remain unauthenticated".to_string(),
+                    )
+                } else {
+                    Some(remediation)
+                },
                 overridden_by: None,
             });
         }

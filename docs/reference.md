@@ -311,6 +311,13 @@ differences, is compared.
 policy file's `auth_plugin_names` when present, otherwise the built-ins. Other
 plugin edits are not breaking.
 
+Intentionally public proxies that rely on conditional authenticators can be
+listed under `policies.require_auth_plugin.conditional_auth_exemptions` in the
+code-owned `.gitforgeops/policies.yaml`, using exact `<namespace>/<proxy_id>`
+identities. Their auth findings remain visible at `info`; missing or
+unnecessary entries are reported as stale warnings. Wildcards, malformed
+identities and duplicates fail policy loading.
+
 ## Import details
 
 - `--output-dir` is required and must be empty. The tree is staged and

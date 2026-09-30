@@ -49,6 +49,10 @@ impl SecurityFinding {
     fn warning(kind: &str, id: &str, namespace: &str, message: String) -> Self {
         Self::new("warning", kind, id, namespace, message)
     }
+
+    fn info(kind: &str, id: &str, namespace: &str, message: String) -> Self {
+        Self::new("info", kind, id, namespace, message)
+    }
 }
 
 /// Severity string that blocks `apply`. Matches
@@ -168,7 +172,10 @@ pub fn audit_security_with_scope(
     }
 
     for proxy in &config.proxies {
-        check_proxy(config, proxy, &auth, &mut findings);
+        let exemption = policy
+            .map(|cfg| &cfg.policies.require_auth_plugin)
+            .filter(|cfg| cfg.has_conditional_auth_exemption(&proxy.namespace, &proxy.id));
+        check_proxy(config, proxy, &auth, exemption.is_some(), &mut findings);
         check_proxy_plugin_associations(config, proxy, ownership_scope, &mut findings);
     }
 
@@ -203,6 +210,7 @@ fn check_proxy(
     config: &GatewayConfig,
     proxy: &Proxy,
     auth: &AuthAllowlist,
+    has_exemption: bool,
     findings: &mut Vec<SecurityFinding>,
 ) {
     // Only authenticators the gateway runs on each of this proxy's request
@@ -212,14 +220,29 @@ fn check_proxy(
     // never counts, because it only runs on the requests its predicate
     // matches.
     let coverage = auth_coverage(config, proxy, auth);
+    let exempt = has_exemption && !coverage.is_authenticated() && !coverage.conditional.is_empty();
+    let exemption_note = format!(
+        "; permitted by conditional-auth exemption '{}/{}'",
+        proxy.namespace, proxy.id
+    );
 
     if !coverage.is_authenticated() {
-        findings.push(SecurityFinding::warning(
-            "Proxy",
-            &proxy.id,
-            &proxy.namespace,
-            missing_auth_message(proxy, &coverage, auth),
-        ));
+        let message = missing_auth_message(proxy, &coverage, auth);
+        findings.push(if exempt {
+            SecurityFinding::info(
+                "Proxy",
+                &proxy.id,
+                &proxy.namespace,
+                format!("{message}{exemption_note}"),
+            )
+        } else {
+            SecurityFinding::warning(
+                "Proxy",
+                &proxy.id,
+                &proxy.namespace,
+                message,
+            )
+        });
     }
 
     // A conditional auth plugin only runs when its trigger matches, so every
@@ -227,15 +250,24 @@ fn check_proxy(
     // never counted as authentication above; this names each instance so the
     // exemption it creates is reviewed.
     for plugin in &coverage.conditional {
-        findings.push(SecurityFinding::warning(
-            "Proxy",
-            &proxy.id,
-            &proxy.namespace,
-            format!(
-                "proxy {} in namespace {} has a conditional {} plugin {}, which carries a trigger — requests the trigger does not match are served unauthenticated; drop the trigger to authenticate every request",
-                proxy.id, proxy.namespace, plugin.plugin_name, plugin.id
-            ),
-        ));
+        let message = format!(
+            "proxy {} in namespace {} has a conditional {} plugin {}, which carries a trigger — requests the trigger does not match are served unauthenticated{}",
+            proxy.id,
+            proxy.namespace,
+            plugin.plugin_name,
+            plugin.id,
+            if exempt { exemption_note.as_str() } else { "" }
+        );
+        findings.push(if exempt {
+            SecurityFinding::info("Proxy", &proxy.id, &proxy.namespace, message)
+        } else {
+            SecurityFinding::warning(
+                "Proxy",
+                &proxy.id,
+                &proxy.namespace,
+                format!("{message}; drop the trigger to authenticate every request"),
+            )
+        });
     }
 
     let scheme = effective_scheme(proxy);

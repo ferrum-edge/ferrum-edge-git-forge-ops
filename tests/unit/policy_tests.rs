@@ -2697,7 +2697,10 @@ fn require_auth_plugin_does_not_count_conditional_authenticators() {
             "{when}: {finding:?}"
         );
         let remediation = finding.remediation.as_deref().unwrap_or_default();
-        assert!(remediation.contains("policy override"), "{remediation}");
+        assert!(
+            remediation.contains("code-owned conditional-auth exemption"),
+            "{remediation}"
+        );
 
         // `plan` and `apply` refuse on this same predicate.
         assert!(
@@ -2705,6 +2708,66 @@ fn require_auth_plugin_does_not_count_conditional_authenticators() {
             "{when}"
         );
     }
+}
+
+#[test]
+fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
+    let conditional = with_trigger(
+        global_plugin("key-1", "key_auth"),
+        serde_json::json!({"match": {"path": {"prefix": ["/private"]}}}),
+    );
+    let mut other_namespace = proxy("api", BackendScheme::Https, 30_000, true);
+    other_namespace.namespace = "other".to_string();
+    let cfg = GatewayConfig {
+        proxies: vec![
+            proxy("api", BackendScheme::Https, 30_000, true),
+            other_namespace,
+        ],
+        plugin_configs: vec![conditional],
+        ..Default::default()
+    };
+    let mut policies = require_auth_policies(None);
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+
+    let findings = evaluate_policies(&cfg, &policies);
+    let auth_findings = findings
+        .iter()
+        .filter(|finding| finding.rule_id == "require_auth_plugin")
+        .collect::<Vec<_>>();
+    assert_eq!(auth_findings.len(), 1, "{findings:?}");
+    assert_eq!(auth_findings[0].namespace, "other");
+    assert!(auth_findings[0].is_blocking(), "{auth_findings:?}");
+    assert!(auth_findings[0].message.contains("conditional"));
+
+    let exempt = gitforgeops::plugin_catalog::auth_coverage(
+        &cfg,
+        &cfg.proxies[0],
+        &policies.policies.require_auth_plugin.auth_allowlist(),
+    );
+    assert!(!exempt.is_authenticated());
+    assert!(findings.iter().any(|finding| {
+        finding.severity == Severity::Info
+            && finding.namespace == "ferrum"
+            && finding.message.contains("exemption 'ferrum/api'")
+    }));
+    assert!(!findings.iter().any(|finding| {
+        finding.kind == "PolicyConfig" && finding.message.contains("stale")
+    }));
+
+    policies.policies.require_auth_plugin.conditional_auth_exemptions =
+        vec!["ferrum/missing".to_string()];
+    let stale = evaluate_policies(&cfg, &policies);
+    assert!(stale.iter().any(|finding| {
+        finding.kind == "PolicyConfig"
+            && finding.severity == Severity::Warning
+            && finding.message.contains("ferrum/missing")
+    }));
+    assert!(stale
+        .iter()
+        .any(|finding| finding.namespace == "ferrum" && finding.is_blocking()));
 }
 
 #[test]
@@ -3074,6 +3137,35 @@ policies:
 
     // Unknown protocols fail to parse.
     assert!(load(&rule("company_sso: [quic]")).is_err());
+}
+
+#[test]
+fn policy_config_validates_conditional_auth_exemptions_strictly() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let load = |entries: &str| {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "version: 1\npolicies:\n  require_auth_plugin:\n    conditional_auth_exemptions: {entries}\n"
+        )
+        .unwrap();
+        load_policies_from_path(file.path())
+    };
+
+    assert!(load("[ferrum/api]").unwrap().is_some());
+    for (entries, expected) in [
+        ("[api]", "exactly <namespace>/<proxy_id>"),
+        ("[ferrum/api/extra]", "exactly <namespace>/<proxy_id>"),
+        ("[ferrum/*]", "wildcards"),
+        ("[ferrum/api, ferrum/api]", "duplicate entry"),
+        ("['/api']", "exactly <namespace>/<proxy_id>"),
+    ] {
+        let error = load(entries).unwrap_err().to_string();
+        assert!(error.contains(expected), "{entries}: {error}");
+    }
 }
 
 #[test]

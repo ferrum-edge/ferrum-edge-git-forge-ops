@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Add exact, code-owned `require_auth_plugin.conditional_auth_exemptions` entries
+  for intentionally public proxies. Exempted auth findings stay visible at
+  `info`; stale entries warn, while malformed, wildcard and duplicate entries
+  are rejected.
+
 ### Changed
 
 - Pin the plugin catalog, `provisioned-by` vocabulary, and GitForgeOps resource-envelope fixtures
@@ -20,8 +27,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   request. A proxy now needs an authenticator without a trigger on every
   protocol its listener serves, including when a scoped instance with a trigger
   replaces an unconditional global one. An intentionally public route needs
-  the policy override. Breaking-change detection still treats a conditional
-  authenticator as running. `require_ai_guardrails` also refuses conditional
+  the code-owned conditional-auth exemption. Breaking-change detection still
+  treats a conditional authenticator as running. `require_ai_guardrails` also refuses conditional
   guardrails unless an unconditional enforcing guardrail is effective.
   `apply` evaluates policy before the state lock on the unresolved document,
   as the security audit sees it, and checks again after API credential

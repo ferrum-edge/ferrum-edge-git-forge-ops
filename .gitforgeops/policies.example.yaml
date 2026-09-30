@@ -63,6 +63,9 @@ policies:
     # oauth2 (not real plugin names) cannot be listed here.
     # custom_auth_plugin_protocols:
     #   company_sso: [http, grpc, websocket]
+    # Exact proxies deliberately allowed to rely on conditional authenticators.
+    # Findings remain visible at info; missing or unnecessary entries warn.
+    # conditional_auth_exemptions: [public/status]
 
   # Refuse `backend_tls_verify_server_cert: false` on proxies and upstreams.
   forbid_tls_verify_disabled:
