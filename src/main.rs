@@ -11,77 +11,18 @@ use gitforgeops::config::{
     self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
     ResolvedEnv,
 };
-use gitforgeops::diagnostics::{safe, safe_block, safe_line};
+use gitforgeops::diagnostics::{safe, safe_block};
 use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
 use gitforgeops::policy;
+use gitforgeops::policy::refusal::refuse_policy_violations;
 use gitforgeops::reconcile::{previously_managed, resolved_namespaces};
 use gitforgeops::review;
 use gitforgeops::secrets;
 use gitforgeops::state::{AllocationBinding, StateFile};
 use gitforgeops::validate;
 use gitforgeops::verdict::{self, ApplyGateInputs};
-
-fn refuse_policy_violations(
-    findings: &[policy::PolicyFinding],
-    phase: &str,
-    override_decision: Option<&policy::github_override::OverrideDecision>,
-    scrubber: Option<&secrets::SecretScrubber>,
-) -> bool {
-    let Some(gate) = verdict::policy_blocker(findings) else {
-        return false;
-    };
-
-    eprintln!(
-        "Refusing to apply: {} policy violation(s) not covered by an override{}:",
-        gate.count, phase
-    );
-
-    let mut details = String::new();
-    let blocking_findings = findings
-        .iter()
-        .filter(|finding| finding.is_blocking())
-        .collect::<Vec<_>>();
-    for finding in &blocking_findings {
-        details.push_str(&format!(
-            "  [{}] {}: {}\n",
-            finding.severity.as_str(),
-            safe(&finding.rule_id),
-            safe_line(&finding.message)
-        ));
-    }
-
-    if let Some(scrubber) = scrubber {
-        let output = scrubber.scrub_streams("", &details);
-        if output.suppressed.is_some() {
-            eprintln!(
-                "Policy finding details were withheld because they may contain resolved secrets:"
-            );
-            for finding in &blocking_findings {
-                eprintln!(
-                    "  [{}] {}/{} {}",
-                    safe(&finding.rule_id),
-                    safe(&finding.kind),
-                    safe(&finding.namespace),
-                    safe(&finding.id)
-                );
-            }
-        } else {
-            eprint!("{}", output.stderr);
-        }
-    } else {
-        eprint!("{details}");
-    }
-    if let Some(decision) = override_decision {
-        if !decision.active {
-            eprintln!("(override inactive: {})", safe_block(&decision.reason));
-        }
-    } else {
-        eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE);
-    }
-    true
-}
 
 // Keep human-readable reports on stderr when stdout carries a JSON document.
 macro_rules! reportln {
@@ -2538,7 +2479,10 @@ async fn cmd_apply(
 
         // Post-override findings, which is exactly what
         // `verdict::policy_blocker` expects and what `plan` feeds it.
-        if refuse_policy_violations(&findings, "", override_decision.as_ref(), None) {
+        if let Some(message) =
+            refuse_policy_violations(&findings, "", override_decision.as_ref(), None)
+        {
+            eprint!("{message}");
             return Err("unresolved policy violations".into());
         }
     }
@@ -2597,12 +2541,13 @@ async fn cmd_apply(
             }
             let scrubber =
                 secrets::SecretScrubber::from_gateway_config_with_report(&desired, &secret_report);
-            if refuse_policy_violations(
+            if let Some(message) = refuse_policy_violations(
                 &findings,
                 " (after credential resolution)",
                 override_decision.as_ref(),
                 Some(&scrubber),
             ) {
+                eprint!("{message}");
                 return Err("unresolved policy violations".into());
             }
         }

@@ -343,13 +343,13 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
     assert!(stderr.contains("policy violation(s)"), "{stderr}");
     assert!(stderr.contains("require_ai_guardrails"), "{stderr}");
     assert!(stderr.contains(NO_PR_OVERRIDE_NOTE), "{stderr}");
-    assert!(stderr.contains("[REDACTED]"), "{stderr}");
+    assert!(
+        stderr.contains("Policy finding details were withheld"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("[REDACTED]"), "{stderr}");
     assert!(!stderr.contains("dry_run"), "{stderr}");
     assert!(!stderr.contains("Validator diagnostics"), "{stderr}");
-    assert!(
-        !stderr.contains("Policy finding details were withheld"),
-        "an eight-byte value should be redacted rather than withheld: {stderr}"
-    );
     assert!(!repo.dir.path().join("validator-ran").exists());
     assert!(!repo.dir.path().join(".state/default.json").exists());
     assert!(
