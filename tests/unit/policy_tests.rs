@@ -2428,7 +2428,9 @@ fn require_auth_plugin_does_not_count_authenticators_on_http_passthrough() {
     assert!(security_findings.iter().any(|finding| {
         finding.kind == "Proxy"
             && finding.message.contains("sets passthrough: true")
-            && finding.message.contains("every attached plugin (auth included) is inert")
+            && finding
+                .message
+                .contains("every attached plugin (auth included) is inert")
     }));
 }
 
@@ -2940,7 +2942,10 @@ fn conditional_auth_exemptions_only_cover_complete_identity_and_protocol_gaps() 
         .filter(|finding| finding.kind == "Proxy")
         .collect::<Vec<_>>();
     assert_eq!(passthrough_findings.len(), 1, "{passthrough_findings:?}");
-    assert!(passthrough_findings[0].is_blocking(), "{passthrough_findings:?}");
+    assert!(
+        passthrough_findings[0].is_blocking(),
+        "{passthrough_findings:?}"
+    );
     assert!(
         passthrough_findings[0]
             .message
