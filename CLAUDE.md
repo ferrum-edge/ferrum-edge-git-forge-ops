@@ -901,9 +901,11 @@ TCP or UDP for stream listeners).
   (`frontend_tls` without `passthrough`).
 - An authenticator carrying a `trigger` (`PluginConfig::is_conditional`) is
   `AuthCoverage::conditional` and covers no protocol, whatever its predicate:
-  repository data cannot prove a trigger matches every request. Only the
-  policy override exempts an intentionally public route. Breaking-change
-  detection still counts it as running (`AuthCoverage::running`), because
+  repository data cannot prove a trigger matches every request. An intentionally
+  public route can use the exact code-owned
+  `require_auth_plugin.conditional_auth_exemptions` identity; its finding stays
+  visible at info, and missing or unnecessary entries are informational.
+  Breaking-change detection still counts it as running (`AuthCoverage::running`), because
   consumer credentials apply on the requests it matches.
 
 #### Security audit of plugin associations

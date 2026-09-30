@@ -23,7 +23,13 @@ pub fn build_registry(policy_cfg: &PolicyConfig) -> Vec<Box<dyn PolicyCheck>> {
             policy_cfg.policies.backend_scheme.clone(),
         )));
     }
-    if policy_cfg.policies.require_auth_plugin.enabled {
+    if policy_cfg.policies.require_auth_plugin.enabled
+        || !policy_cfg
+            .policies
+            .require_auth_plugin
+            .conditional_auth_exemptions
+            .is_empty()
+    {
         rules.push(Box::new(RequireAuthPluginRule::new(
             policy_cfg.policies.require_auth_plugin.clone(),
         )));

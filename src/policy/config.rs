@@ -68,6 +68,9 @@ pub struct RequireAuthPluginRuleConfig {
     /// the gateway.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_auth_plugin_protocols: BTreeMap<String, Vec<PluginProtocol>>,
+    /// Exact namespace/proxy identities allowed to rely on conditional auth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_auth_exemptions: Vec<String>,
 }
 
 impl Default for RequireAuthPluginRuleConfig {
@@ -77,6 +80,7 @@ impl Default for RequireAuthPluginRuleConfig {
             severity: Severity::default(),
             auth_plugin_names: default_auth_plugin_names(),
             custom_auth_plugin_protocols: BTreeMap::new(),
+            conditional_auth_exemptions: Vec::new(),
         }
     }
 }
@@ -85,6 +89,13 @@ impl RequireAuthPluginRuleConfig {
     /// The configured allowlist with each authenticator's protocols.
     pub fn auth_allowlist(&self) -> AuthAllowlist {
         AuthAllowlist::new(&self.auth_plugin_names, &self.custom_auth_plugin_protocols)
+    }
+
+    pub fn has_conditional_auth_exemption(&self, namespace: &str, proxy_id: &str) -> bool {
+        let identity = format!("{namespace}/{proxy_id}");
+        self.conditional_auth_exemptions
+            .iter()
+            .any(|exemption| exemption == &identity)
     }
 }
 
@@ -113,6 +124,38 @@ pub fn effective_auth_allowlist(policy: Option<&PolicyConfig>) -> AuthAllowlist 
 /// missing from the allowlist declares nothing. All of these are mistakes to
 /// fail on rather than silently ignore.
 fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::error::Result<()> {
+    let mut exemptions = std::collections::BTreeSet::new();
+    for exemption in &cfg.conditional_auth_exemptions {
+        if exemption.contains('*') {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.conditional_auth_exemptions entry '{exemption}' cannot use wildcards"
+            )));
+        }
+        let parts = exemption.split('/').collect::<Vec<_>>();
+        let valid_component = |part: &str| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        };
+        if parts.len() != 2 || !valid_component(parts[0]) || !valid_component(parts[1]) {
+            return Err(crate::error::Error::Config(format!(
+                concat!(
+                    "require_auth_plugin.conditional_auth_exemptions entry '{exemption}' must be ",
+                    "exactly <namespace>/<proxy_id>; each component must use only ASCII ",
+                    "letters, digits, '_', '-', or '.' and cannot be '.' or '..'"
+                ),
+                exemption = exemption
+            )));
+        }
+        if !exemptions.insert(exemption) {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.conditional_auth_exemptions contains duplicate entry '{exemption}'"
+            )));
+        }
+    }
     for name in &cfg.auth_plugin_names {
         let lowered = name.to_ascii_lowercase();
         if crate::plugin_catalog::is_builtin(&lowered)

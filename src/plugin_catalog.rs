@@ -684,8 +684,9 @@ pub fn listener_can_establish_identity(proxy: &Proxy) -> bool {
 /// request on the same protocol reaches the backend unauthenticated. Whether a
 /// predicate matches every request cannot be proven from repository data (the
 /// gateway classifies the request), so a conditional authenticator never
-/// satisfies mandatory authentication. A route that is meant to be public is
-/// an exemption for the protected policy override, not for resource data.
+/// satisfies mandatory authentication. A public route needs an exact entry in
+/// `require_auth_plugin.conditional_auth_exemptions`; the exemption applies to
+/// policy findings, not resource data.
 #[derive(Debug, Clone)]
 pub struct AuthCoverage<'a> {
     pub transport: ProxyTransport,
@@ -724,6 +725,38 @@ impl<'a> AuthCoverage<'a> {
         running.extend_from_slice(&self.conditional);
         running.sort_by_key(|plugin| effective_priority(plugin));
         running
+    }
+
+    /// Explain why a conditional-auth exemption cannot cover this proxy's gap.
+    /// Every uncovered protocol must run a conditional authenticator, and
+    /// stream listeners must establish identity.
+    pub fn conditional_exemption_gap(&self, auth: &AuthAllowlist) -> Option<String> {
+        if !self.listener_establishes_identity {
+            return Some(
+                "the listener cannot establish identity because it does not terminate TLS/DTLS"
+                    .to_string(),
+            );
+        }
+
+        let uncovered = self
+            .uncovered
+            .iter()
+            .copied()
+            .filter(|protocol| {
+                !self
+                    .conditional
+                    .iter()
+                    .any(|plugin| auth.runs_on(&plugin.plugin_name, *protocol))
+            })
+            .collect::<Vec<_>>();
+        if uncovered.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "conditional authenticators do not run on {}",
+                protocol_list(&uncovered)
+            ))
+        }
     }
 }
 
