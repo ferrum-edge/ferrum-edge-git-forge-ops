@@ -11,7 +11,7 @@ use gitforgeops::config::{
     self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
     ResolvedEnv,
 };
-use gitforgeops::diagnostics::{safe, safe_block};
+use gitforgeops::diagnostics::{safe, safe_block, safe_line};
 use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
