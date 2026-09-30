@@ -58,8 +58,8 @@ fn contract_files(root: &Path, directory: &Path, found: &mut BTreeSet<String>) {
 }
 
 fn json(path: &str) -> Value {
-    let bytes = fs::read(contract_dir().join(path))
-        .unwrap_or_else(|error| panic!("{path}: {error}"));
+    let bytes =
+        fs::read(contract_dir().join(path)).unwrap_or_else(|error| panic!("{path}: {error}"));
     serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("parse {path}: {error}"))
 }
 
@@ -98,7 +98,9 @@ fn vendored_contract_files_match_the_pin_hashes() {
 #[test]
 fn local_plugin_catalog_matches_the_pinned_contract() {
     let contract = json("vocabularies/plugin-catalog.json");
-    let plugins = contract["plugins"].as_array().expect("contract plugins array");
+    let plugins = contract["plugins"]
+        .as_array()
+        .expect("contract plugins array");
     let mut contract_plugins = BTreeMap::new();
     let mut contract_reserved = BTreeSet::new();
     for plugin in plugins {
@@ -139,7 +141,12 @@ fn local_plugin_catalog_matches_the_pinned_contract() {
         .as_array()
         .expect("removed_plugins array")
         .iter()
-        .map(|plugin| plugin["name"].as_str().expect("removed plugin name").to_string())
+        .map(|plugin| {
+            plugin["name"]
+                .as_str()
+                .expect("removed plugin name")
+                .to_string()
+        })
         .collect();
     assert_eq!(
         contract_retired,
@@ -196,10 +203,9 @@ fn gitforgeops_resource_contract_fixtures_match_the_local_serde_envelope() {
         let path = entry.expect("valid fixture entry").path();
         let bytes = fs::read(&path).expect("read valid fixture");
         let name = path.file_name().unwrap().to_string_lossy();
-        serde_json::from_slice::<Resource>(&bytes)
-            .unwrap_or_else(|error| {
-                panic!("valid contract fixture {name} rejected by Resource: {error}")
-            });
+        serde_json::from_slice::<Resource>(&bytes).unwrap_or_else(|error| {
+            panic!("valid contract fixture {name} rejected by Resource: {error}")
+        });
     }
     for entry in fs::read_dir(root.join("invalid")).expect("read invalid fixtures") {
         let path = entry.expect("invalid fixture entry").path();
