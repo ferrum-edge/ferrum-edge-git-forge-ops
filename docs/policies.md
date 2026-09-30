@@ -93,6 +93,12 @@ global ones with the same `plugin_name`, disabled instances dropped.
   - On stream listeners only `mtls_auth` counts, and the listener must
     terminate TLS/DTLS (`frontend_tls: true` without `passthrough`) so the
     client certificate reaches it.
+- Breaking-change analysis compares authenticators that run before and after
+  the change. A listener that stops terminating TLS/DTLS loses `mtls_auth`,
+  including when a stream proxy changes to passthrough. If enabled authenticators
+  remain attached but cannot run on the resulting listener, the finding says
+  there is no running authenticator; if none remain enabled, it says there is
+  no enabled authenticator.
 - **Conditional authenticators never count by default.** An authenticator with a
   `trigger` runs only on the requests its predicate matches (protocol, path,
   method, header, or any other match), and every other request reaches the

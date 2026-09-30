@@ -161,14 +161,18 @@ fn projected_plugin_configs(
 
 /// Enabled authenticators the gateway runs on a proxy, by `plugin_name`, with
 /// the ids of the instances providing each one. Only an authenticator that
-/// runs on one of the listener's request protocols counts ([`auth_coverage`],
-/// the classification `require_auth_plugin` and the security audit use), so
-/// dropping a `key_auth` that a TCP listener never runs is not an
-/// authentication loss. Conditional authenticators count here
+/// runs on one of the listener's request protocols and can establish identity
+/// counts, so dropping a `key_auth` that a TCP listener never runs or an
+/// `mtls_auth` whose listener does not terminate TLS is not counted as
+/// continued authentication. Conditional authenticators count here
 /// ([`AuthCoverage::running`]): consumer credentials still apply on the
 /// requests their trigger matches, even though they never satisfy
 /// `require_auth_plugin`.
 fn running_authenticators(coverage: &AuthCoverage<'_>) -> Vec<(String, Vec<String>)> {
+    if !coverage.listener_establishes_identity {
+        return Vec::new();
+    }
+
     let mut by_name: Vec<(String, Vec<String>)> = Vec::new();
     for plugin in coverage.running() {
         match by_name
@@ -229,8 +233,15 @@ fn check_proxy_auth_coverage(
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        let consequence = if after_coverage.running().is_empty() {
-            ", which is left with no enabled authenticator".to_string()
+        let consequence = if running_authenticators(&after_coverage).is_empty() {
+            let has_enabled_authenticator = !after_coverage.applicable.is_empty()
+                || !after_coverage.conditional.is_empty()
+                || !after_coverage.inapplicable.is_empty();
+            if has_enabled_authenticator {
+                ", which is left with no running authenticator".to_string()
+            } else {
+                ", which is left with no enabled authenticator".to_string()
+            }
         } else {
             let newly_uncovered: Vec<_> = after_coverage
                 .uncovered

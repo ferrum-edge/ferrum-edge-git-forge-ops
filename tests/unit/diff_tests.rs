@@ -750,7 +750,7 @@ fn breaking_reports_authenticator_loss_when_http_proxy_becomes_passthrough() {
     assert!(
         reasons.iter().any(|r| {
             r.starts_with("proxy ferrum/orders loses authenticator key_auth")
-                && r.contains("no enabled authenticator")
+                && r.contains("no running authenticator")
         }),
         "{reasons:?}"
     );
@@ -1326,6 +1326,28 @@ fn breaking_ignores_losing_an_authenticator_the_listener_never_ran() {
     assert!(
         reasons[0].starts_with("proxy ferrum/orders loses authenticator mtls_auth"),
         "{reasons:?}"
+    );
+}
+
+#[test]
+fn breaking_reports_mtls_loss_when_stream_proxy_becomes_passthrough() {
+    let actual = stream_orders_config(
+        "  - id: sso
+    plugin_name: mtls_auth
+    scope: global
+",
+    );
+    let mut desired = actual.clone();
+    desired.proxies[0].frontend_tls = false;
+    desired.proxies[0].passthrough = true;
+
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert!(
+        reasons.iter().any(|reason| {
+            reason.starts_with("proxy ferrum/orders loses authenticator mtls_auth")
+                && reason.contains("no running authenticator")
+        }),
+        "expected the passthrough stream listener to lose mtls_auth: {reasons:?}"
     );
 }
 

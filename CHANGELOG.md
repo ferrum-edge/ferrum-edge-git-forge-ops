@@ -16,6 +16,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Report an authenticator-loss breaking change when an HTTP proxy is changed to
   passthrough, which Ferrum Edge rejects on non-stream proxies.
+- Report `mtls_auth` loss when a stream proxy stops terminating TLS and becomes
+  passthrough. Auth-loss reasons distinguish enabled authenticators that no
+  longer run from proxies with no enabled authenticator.
 - Include `CHANGELOG.md` and `.env.example` in downstream template updates so adopters receive
   release notes and current environment-variable examples.
 - Pin the plugin catalog, `provisioned-by` vocabulary, and GitForgeOps resource-envelope fixtures
