@@ -1,0 +1,45 @@
+{
+  "kind": "MeshConfig",
+  "id": "minimal",
+  "spec": {
+    "workloads": [
+      {
+        "spiffe_id": "spiffe://cluster.local/ns/ferrum/sa/api",
+        "selector": {
+          "labels": {
+            "app": "api"
+          }
+        },
+        "service_name": "api",
+        "addresses": [
+          "10.0.0.5"
+        ],
+        "ports": [
+          {
+            "port": 8080,
+            "protocol": "http"
+          }
+        ],
+        "trust_domain": "cluster.local",
+        "namespace": "ferrum"
+      }
+    ],
+    "services": [
+      {
+        "name": "api",
+        "namespace": "ferrum",
+        "ports": [
+          {
+            "port": 80,
+            "protocol": "http"
+          }
+        ],
+        "workloads": [
+          {
+            "spiffe_id": "spiffe://cluster.local/ns/ferrum/sa/api"
+          }
+        ]
+      }
+    ]
+  }
+}

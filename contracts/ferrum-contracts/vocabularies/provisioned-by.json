@@ -1,0 +1,108 @@
+{
+  "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-provisioned-by/v1.schema.json",
+  "vocabulary": "provisioned-by",
+  "version": 1,
+  "edge_release": "v0.9.8",
+  "description": "Application attribution for Ferrum Edge configuration resources: the provisioned-by resource label and the X-Ferrum-Provisioned-By admin request header, with the companion products' values. Informational only: not authorization, ownership, audit identity, or a routing selector.",
+  "provenance": [
+    {
+      "repo": "ferrum-edge/ferrum-edge",
+      "ref": "v0.9.8",
+      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "path": "docs/admin_api.md",
+      "sections": [
+        "Resource labels and application attribution"
+      ]
+    },
+    {
+      "repo": "ferrum-edge/ferrum-edge",
+      "ref": "v0.9.8",
+      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "path": "src/admin/provisioning.rs",
+      "symbols": [
+        "PROVISIONED_BY_LABEL",
+        "PROVISIONED_BY_HEADER",
+        "provisioner",
+        "stamp"
+      ]
+    },
+    {
+      "repo": "ferrum-edge/ferrum-edge",
+      "ref": "v0.9.8",
+      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "path": "openapi.yaml",
+      "symbols": [
+        "components.parameters.ProvisionedBy"
+      ]
+    },
+    {
+      "repo": "ferrum-edge/ferrum-edge",
+      "ref": "v0.9.8",
+      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "path": "docs/hardening.md",
+      "note": "Minimum companion versions that inject labels.provisioned-by."
+    }
+  ],
+  "label": {
+    "key": "provisioned-by",
+    "resources": [
+      "Proxy",
+      "Consumer",
+      "Upstream",
+      "PluginConfig"
+    ],
+    "available_since": "v0.9.5"
+  },
+  "header": {
+    "name": "X-Ferrum-Provisioned-By",
+    "occurrences": 1,
+    "min_length": 1,
+    "max_length_bytes": 512,
+    "control_characters": false,
+    "trimmed": true,
+    "behavior": "CRUD creates, batch creates, non-spec-owned restore rows and API-spec-generated resources fill an absent provisioned-by label from the header. Existing labels are kept; spec-owned restore graphs stay verbatim."
+  },
+  "values": [
+    {
+      "value": "ferrum-edge-git-forge-ops",
+      "product": "GitForgeOps",
+      "repo": "ferrum-edge/ferrum-edge-git-forge-ops",
+      "sets": "label",
+      "introduced_in": "ferrum-edge-git-forge-ops#218",
+      "observed_in": {
+        "repo": "ferrum-edge/ferrum-edge-git-forge-ops",
+        "ref": "main",
+        "commit": "36206d8de8929884f62c65a040f3a08d35bd5863",
+        "path": "src/config/assembler.rs"
+      }
+    },
+    {
+      "value": "ferrum-nexus",
+      "product": "Nexus",
+      "repo": "ferrum-edge/ferrum-nexus",
+      "sets": "header",
+      "introduced_in": "ferrum-nexus#245",
+      "observed_in": {
+        "repo": "ferrum-edge/ferrum-nexus",
+        "ref": "main",
+        "commit": "06254cfd124ce679bf7b93108c0edb1778160d00",
+        "path": "server/src/ferrum-admin/client.ts"
+      }
+    },
+    {
+      "value": "ferrum-foundry",
+      "product": "Foundry",
+      "repo": "ferrum-edge/ferrum-foundry",
+      "sets": "header",
+      "introduced_in": "ferrum-foundry#340",
+      "observed_in": {
+        "repo": "ferrum-edge/ferrum-foundry",
+        "ref": "main",
+        "commit": "8d075206e2fabf05283e0fb3c998d2fccf655293",
+        "path": "server/proxy.ts"
+      }
+    }
+  ],
+  "open_set": true,
+  "open_set_note": "Edge accepts any value that meets the header rules. The three values above are the companion products' values documented by Edge; an unlabeled resource has no known creator."
+}

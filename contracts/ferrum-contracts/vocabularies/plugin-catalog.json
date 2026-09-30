@@ -1,0 +1,1965 @@
+{
+  "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-plugin-catalog/v1.schema.json",
+  "vocabulary": "plugin-catalog",
+  "version": 1,
+  "edge_release": "v0.9.8",
+  "description": "Index of every built-in Ferrum Edge plugin at v0.9.8: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
+  "provenance": [
+    {
+      "repo": "ferrum-edge/ferrum-edge",
+      "ref": "v0.9.8",
+      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "path": "src/plugins/mod.rs",
+      "symbols": [
+        "BUILTIN_PLUGIN_REGISTRATIONS",
+        "REMOVED_PLUGIN_REGISTRATIONS",
+        "ProxyProtocol"
+      ],
+      "fields": [
+        "name",
+        "failure_policy",
+        "removed_plugins"
+      ]
+    },
+    {
+      "repo": "ferrum-edge/ferrum-edge",
+      "ref": "v0.9.8",
+      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "path": "src/plugins/builtin_parity.rs",
+      "symbols": [
+        "BUILTIN_PLUGIN_PARITY_META",
+        "BUILTIN_RESPONSE_BODY_PRODUCERS"
+      ],
+      "fields": [
+        "classification",
+        "priority",
+        "active_phases",
+        "protocols",
+        "protocol_rationale",
+        "response_body_producer"
+      ]
+    },
+    {
+      "repo": "ferrum-edge/ferrum-edge",
+      "ref": "v0.9.8",
+      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "path": "openapi.yaml",
+      "symbols": [
+        "components.schemas.PluginConfigBase"
+      ],
+      "fields": [
+        "config_schema"
+      ]
+    }
+  ],
+  "config_schema_document": {
+    "repo": "ferrum-edge/ferrum-edge",
+    "ref": "v0.9.8",
+    "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+    "path": "openapi.yaml",
+    "sha256": "158979cc76a1f756ff1b9e0f7cd6c9299cf8db2ba845e3e204604f2608f123cf",
+    "openapi": "3.1.0",
+    "note": "Each config_schema.pointer is a JSON Pointer into this exact file. The schemas are OpenAPI 3.1 (JSON Schema 2020-12 dialect) and may $ref other components in the same document. They apply to `config` only when the plugin config is enabled. They are referenced, not copied, in this release; see docs/adoption.md (follow-ups)."
+  },
+  "protocol_values": {
+    "http": "HTTP/1.1, HTTP/2 and HTTP/3, including HTTPS",
+    "grpc": "gRPC over HTTP/2",
+    "websocket": "WebSocket and WSS",
+    "tcp": "Raw TCP stream proxy, including TLS termination and origination",
+    "udp": "Raw UDP datagram proxy, including DTLS termination and origination"
+  },
+  "plugins": [
+    {
+      "name": "transaction_log_schema",
+      "classification": "config_only",
+      "priority": 9999,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [],
+      "active_phases_note": "config-only; no lifecycle hooks — priority retained for schema-registration inventory/order",
+      "protocols": [],
+      "protocol_rationale": "Config-only: registers named log schemas during cache rebuild; no protocol hooks (ordering priority 9999)",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/TransactionLogSchemaConfig",
+        "config_required_when_enabled": true,
+        "scope_constraint": "global"
+      }
+    },
+    {
+      "name": "stdout_logging",
+      "classification": "public",
+      "priority": 9000,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/StdoutLoggingConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "http_logging",
+      "classification": "public",
+      "priority": 9100,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/HttpLoggingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "tcp_logging",
+      "classification": "public",
+      "priority": 9125,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/TcpLoggingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "kafka_logging",
+      "classification": "public",
+      "priority": 9150,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/KafkaLoggingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ws_logging",
+      "classification": "public",
+      "priority": 9175,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/WsLoggingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "transaction_debugger",
+      "classification": "public",
+      "priority": 9200,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "on_request_received",
+        "before_proxy",
+        "on_final_request_body",
+        "after_proxy",
+        "on_final_response_body",
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/TransactionDebuggerConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "jwks_auth",
+      "classification": "public",
+      "priority": 1000,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Requires HTTP headers",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/JwksAuthConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "oauth2_introspection",
+      "classification": "public",
+      "priority": 1050,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate",
+        "before_proxy"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Requires HTTP bearer token headers or query params",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/Oauth2IntrospectionConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "oidc_relying_party",
+      "classification": "public",
+      "priority": 1075,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received",
+        "authenticate",
+        "before_proxy",
+        "after_proxy"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Browser-oriented HTTP authentication flow",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/OidcRelyingPartyConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "jwt_auth",
+      "classification": "public",
+      "priority": 1100,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Requires HTTP headers",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/JwtAuthConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "key_auth",
+      "classification": "public",
+      "priority": 1200,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate",
+        "before_proxy"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Requires HTTP headers or query parameters",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/KeyAuthConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "basic_auth",
+      "classification": "public",
+      "priority": 1300,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate",
+        "before_proxy"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Requires HTTP headers",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/BasicAuthConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ldap_auth",
+      "classification": "public",
+      "priority": 1250,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate",
+        "before_proxy"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Requires HTTP Basic auth header; authenticates against LDAP directory",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/LdapAuthConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "hmac_auth",
+      "classification": "public",
+      "priority": 1400,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Requires HTTP headers and a buffered request body; a WebSocket handshake is signed over the empty body and tunnel DATA is never drained; HBONE CONNECT fails closed as incompatible",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/HmacAuthConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "mtls_auth",
+      "classification": "public",
+      "priority": 950,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Requires TLS/DTLS client certificate",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/MtlsAuthConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "spiffe_identity",
+      "classification": "public",
+      "priority": 940,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Extracts SPIFFE IDs from TLS/DTLS client certificates",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/SpiffeIdentityConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "mesh_authz",
+      "classification": "public",
+      "priority": 2075,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authorize",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Applies Layer 2 mesh policy using SPIFFE or HBONE identities",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/MeshAuthzConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "opa",
+      "classification": "public",
+      "priority": 2080,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authorize"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Delegates HTTP-family request authorization to an OPA Data API policy",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/OpaPluginConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "mesh_outbound_registry",
+      "classification": "public",
+      "priority": 130,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Host-header outbound registry gating is HTTP-family only; raw streams use mesh connect/datagram enforcement",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/MeshOutboundRegistryConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "compression",
+      "classification": "public",
+      "priority": 4050,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "normalize_buffered_request_body_before_before_proxy",
+        "before_proxy",
+        "after_proxy",
+        "transform_request_body_with_context",
+        "transform_response_body_with_context"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP response compression and request decompression (gzip, brotli)",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/CompressionConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "cors",
+      "classification": "public",
+      "priority": 100,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received",
+        "after_proxy"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Origin/ACAO enforcement includes browser gRPC-Web requests",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/CorsConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "security_headers",
+      "classification": "public",
+      "priority": 4080,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "after_proxy",
+        "initial response-header boundary"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "HTTP-family response security headers and fingerprint stripping",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/SecurityHeadersConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "access_control",
+      "classification": "public",
+      "priority": 2000,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authorize",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AccessControlConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "tcp_connection_throttle",
+      "classification": "public",
+      "priority": 2050,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_stream_connect (opaque connection permit releases on rejection/teardown)"
+      ],
+      "protocols": [
+        "tcp"
+      ],
+      "protocol_rationale": "Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/TcpConnectionThrottleConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "adaptive_concurrency",
+      "classification": "public",
+      "priority": 2090,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "backend_admission"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Target-aware backend admission for HTTP-family upstream survival",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AdaptiveConcurrencyConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ip_restriction",
+      "classification": "public",
+      "priority": 150,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "IP filtering is protocol-agnostic",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/IpRestrictionConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "bot_detection",
+      "classification": "public",
+      "priority": 200,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Needs User-Agent header",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/BotDetectionConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "correlation_id",
+      "classification": "public",
+      "priority": 50,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "on_request_received",
+        "before_proxy",
+        "after_proxy",
+        "apply_websocket_handshake_response_headers",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "ID assignment is protocol-agnostic",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/CorrelationIdConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "request_transformer",
+      "classification": "public",
+      "priority": 3000,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy",
+        "transform_request_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Modifies HTTP headers/query/body",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/RequestTransformerConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "response_transformer",
+      "classification": "public",
+      "priority": 4000,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "after_proxy",
+        "transform_response_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Modifies HTTP response headers/body",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ResponseTransformerConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "mesh_route_dispatch",
+      "classification": "public",
+      "priority": 2995,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/MeshRouteDispatchConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "graphql",
+      "classification": "public",
+      "priority": 2850,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "on_final_request_body"
+      ],
+      "protocols": [
+        "http",
+        "websocket"
+      ],
+      "protocol_rationale": "GraphQL JSON over HTTP; WebSocket upgrade handshakes are refused fail-closed and post-upgrade frames are never inspected",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/GraphqlConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "grpc_method_router",
+      "classification": "public",
+      "priority": 275,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received",
+        "on_backend_path_resolved"
+      ],
+      "protocols": [
+        "grpc"
+      ],
+      "protocol_rationale": "gRPC method-level access control and rate limiting",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/GrpcMethodRouterConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "grpc_deadline",
+      "classification": "public",
+      "priority": 3050,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "receipt-time deadline preflight",
+        "before_proxy"
+      ],
+      "protocols": [
+        "grpc"
+      ],
+      "protocol_rationale": "gRPC timeout enforcement and propagation",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/GrpcDeadlineConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "grpc_web",
+      "classification": "public",
+      "priority": 260,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "on_request_received",
+        "before_proxy",
+        "transform_request_body",
+        "on_final_request_body",
+        "after_proxy",
+        "transform_response_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Translates gRPC-Web (browser) ↔ native gRPC (HTTP/2)",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/GrpcWebConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "rate_limiting",
+      "classification": "public",
+      "priority": 2900,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received (IP mode)",
+        "authorize (consumer mode)",
+        "before_proxy",
+        "after_proxy",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Connection/session rate applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/RateLimitingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "request_size_limiting",
+      "classification": "public",
+      "priority": 2800,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received",
+        "before_proxy",
+        "on_final_request_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Enforces per-proxy request body size limits",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/RequestSizeLimitingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "waf",
+      "classification": "public",
+      "priority": 2930,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authorize",
+        "on_final_request_body",
+        "after_proxy",
+        "finalize_client_visible_response_body",
+        "finalize_client_visible_response_headers",
+        "on_ws_frame",
+        "on_stream_connect",
+        "on_udp_datagram"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "HTTP-family always, including complete WebSocket text/binary application messages in both directions; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/WafPluginConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "response_size_limiting",
+      "classification": "public",
+      "priority": 3490,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "after_proxy",
+        "on_final_response_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Enforces per-proxy response body size limits",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ResponseSizeLimitingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "body_validator",
+      "classification": "public",
+      "priority": 2950,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "on_final_request_body",
+        "after_proxy",
+        "finalize_client_visible_response_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Validates request and response bodies",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/BodyValidatorConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "openapi_validator",
+      "classification": "public",
+      "priority": 2960,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "validate_client_request_body_contract",
+        "before_proxy",
+        "on_final_request_body",
+        "after_proxy",
+        "on_final_response_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "Validates bodies against generated OpenAPI operation schemas",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/OpenapiValidatorConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "request_termination",
+      "classification": "public",
+      "priority": 125,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket"
+      ],
+      "protocol_rationale": "Returns HTTP error response",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/RequestTerminationConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "response_caching",
+      "classification": "public",
+      "priority": 3500,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy",
+        "after_proxy",
+        "on_final_response_headers",
+        "on_final_response_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only response cache lookup and store",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ResponseCachingConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "response_mock",
+      "classification": "public",
+      "priority": 3030,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy"
+      ],
+      "protocols": [
+        "http",
+        "websocket"
+      ],
+      "protocol_rationale": "Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported by design — only the validated serverless_function terminate contract carries provenance-authorized framed unary Reject semantics",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ResponseMockConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "serverless_function",
+      "classification": "public",
+      "priority": 3025,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "finalized request egress"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ServerlessFunctionConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "prometheus_metrics",
+      "classification": "public",
+      "priority": 9300,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "on_request_received",
+        "on_stream_connect",
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Metrics for all protocols",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/PrometheusMetricsConfig",
+        "config_required_when_enabled": false,
+        "scope_constraint": "global"
+      }
+    },
+    {
+      "name": "proxy_alerts",
+      "classification": "public",
+      "priority": 9250,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Anomaly notifications across all protocols",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ProxyAlertsConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "otel_tracing",
+      "classification": "public",
+      "priority": 25,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "on_request_received",
+        "on_stream_connect",
+        "before_proxy",
+        "after_proxy",
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Tracing for all protocols",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/OtelTracingConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ai_token_metrics",
+      "classification": "public",
+      "priority": 4100,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "on_response_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiTokenMetricsConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ai_request_guard",
+      "classification": "public",
+      "priority": 2975,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "transform_request_body",
+        "on_final_request_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Validates JSON request bodies",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiRequestGuardConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_rate_limiter",
+      "classification": "public",
+      "priority": 4200,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "after_proxy",
+        "on_response_body",
+        "response_stream_inspector",
+        "on_response_stream_terminated"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiRateLimiterConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_prompt_shield",
+      "classification": "public",
+      "priority": 2925,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "transform_request_body",
+        "on_final_request_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped)",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiPromptShieldConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ai_prompt_compressor",
+      "classification": "public",
+      "priority": 4055,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy",
+        "transform_request_body_with_context",
+        "on_final_request_body_with_context"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiPromptCompressorConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_semantic_firewall",
+      "classification": "public",
+      "priority": 2968,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "on_final_request_body",
+        "on_response_body",
+        "on_final_response_body",
+        "response_stream_inspector",
+        "on_response_stream_terminated"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only semantic inspection for LLM JSON request and response bodies",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiSemanticFirewallConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_response_guard",
+      "classification": "public",
+      "priority": 4075,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "after_proxy",
+        "on_response_body",
+        "transform_response_body",
+        "finalize_client_visible_response_body"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "HTTP JSON/SSE/text response inspection; native gRPC only for methods enrolled in the descriptor-based `grpc` block",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiResponseGuardConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_tool_governor",
+      "classification": "public",
+      "priority": 2978,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "on_final_request_body",
+        "on_response_body",
+        "transform_response_body",
+        "on_final_response_body",
+        "response_stream_inspector",
+        "on_response_stream_terminated"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only deterministic tool/function-call policy on JSON and SSE bodies",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiToolGovernorConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_semantic_cache",
+      "classification": "public",
+      "priority": 4057,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "on_final_request_body_with_context",
+        "after_proxy",
+        "on_final_response_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only exact/semantic cache for LLM JSON request and response bodies",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiSemanticCacheConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ai_stream_router",
+      "classification": "public",
+      "priority": 2984,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "transform_request_body",
+        "enforce_final_backend_header_policy",
+        "on_final_request_body",
+        "normalize_response_body",
+        "response_stream_inspector"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiStreamRouterConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_federation",
+      "classification": "public",
+      "priority": 4060,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy",
+        "transform_request_body_with_context",
+        "finalized request egress",
+        "enforce_final_backend_header_policy",
+        "on_final_request_body_with_context",
+        "origin response-header boundary",
+        "after_proxy",
+        "response_stream_inspector",
+        "on_response_stream_terminated (HTTP only)"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only; routes final OpenAI JSON bodies to providers, normalizes bounded responses, and relays committed provider SSE incrementally",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiFederationConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ai_transcript_audit",
+      "classification": "public",
+      "priority": 2740,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy",
+        "on_final_request_body",
+        "after_proxy",
+        "on_final_response_body",
+        "on_response_committed",
+        "response_stream_inspector",
+        "on_response_stream_terminated",
+        "log"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "HTTP AI transcript capture to a configured sink; native gRPC only for methods enrolled in the descriptor-based `grpc` block",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/AiTranscriptAuditConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "mcp_gateway",
+      "classification": "public",
+      "priority": 2992,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "transform_request_body",
+        "transform_response_body",
+        "after_proxy",
+        "on_final_response_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only MCP JSON-RPC parsing, metadata, and namespaced tool/resource/prompt routing",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/McpGatewayConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "a2a_gateway",
+      "classification": "public",
+      "priority": 2993,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "on_final_request_body",
+        "after_proxy",
+        "normalize_response_body",
+        "on_response_body",
+        "transform_response_body",
+        "on_final_response_body",
+        "response_stream_inspector"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Detects A2A HTTP/REST/gRPC methods, rewrites HTTP and gRPC Agent Cards, applies method policy, and emits `a2a.*` metadata",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/A2aGatewayConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ws_message_size_limiting",
+      "classification": "public",
+      "priority": 2810,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "parser-level frame/message limits"
+      ],
+      "protocols": [
+        "websocket"
+      ],
+      "protocol_rationale": "Enforces actual-frame and bounded-reassembly limits on WebSocket connections",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/WsMessageSizeLimitingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "ws_frame_logging",
+      "classification": "public",
+      "priority": 9050,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "on_ws_frame",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "websocket"
+      ],
+      "protocol_rationale": "Logs WebSocket frame metadata",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/WsFrameLoggingConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "ws_rate_limiting",
+      "classification": "public",
+      "priority": 2910,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_ws_frame",
+        "on_ws_reassembly_frames"
+      ],
+      "protocols": [
+        "websocket"
+      ],
+      "protocol_rationale": "Per-connection frame rate limiting for WebSocket",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/WsRateLimitingConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "udp_rate_limiting",
+      "classification": "public",
+      "priority": 2915,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_udp_datagram"
+      ],
+      "protocols": [
+        "udp"
+      ],
+      "protocol_rationale": "Per-client-IP datagram and byte rate limiting for UDP proxies",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/UdpRateLimitingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "udp_logging",
+      "classification": "public",
+      "priority": 9160,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/UdpLoggingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "statsd_logging",
+      "classification": "public",
+      "priority": 9075,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/StatsdLoggingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "loki_logging",
+      "classification": "public",
+      "priority": 9155,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Observability applies everywhere",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/LokiLoggingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "sse",
+      "classification": "public",
+      "priority": 250,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "on_request_received",
+        "before_proxy",
+        "after_proxy",
+        "transform_response_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "SSE is HTTP-only (text/event-stream over chunked transfer)",
+      "response_body_producer": true,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/SseConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "request_mirror",
+      "classification": "public",
+      "priority": 3075,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "authorize (pre-buffer mirror admission; never rejects)",
+        "finalized request egress"
+      ],
+      "protocols": [
+        "http",
+        "grpc"
+      ],
+      "protocol_rationale": "Duplicates traffic to a shadow destination for validation",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/RequestMirrorConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "load_testing",
+      "classification": "public",
+      "priority": 3070,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "On-demand load testing via header trigger with multi-node fan-out",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/LoadTestingConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "geo_restriction",
+      "classification": "public",
+      "priority": 175,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "on_request_received",
+        "on_stream_connect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "GeoIP country allow/deny is protocol-agnostic",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/GeoRestrictionConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "request_deduplication",
+      "classification": "public",
+      "priority": 3010,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "before_proxy",
+        "on_final_response_body",
+        "on_response_stream_terminated",
+        "on_response_committed"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only request deduplication and response replay",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/RequestDeduplicationConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "soap_ws_security",
+      "classification": "public",
+      "priority": 1500,
+      "failure_policy": "fail_closed",
+      "active_phases": [
+        "authenticate",
+        "before_proxy",
+        "transform_request_body",
+        "on_final_request_body"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "SOAP XML body parsing (text/xml, application/soap+xml, application/xml, application/xop+xml, MTOM multipart/related)",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/SoapWsSecurityConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "spec_expose",
+      "classification": "public",
+      "priority": 210,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "on_request_received",
+        "after_proxy"
+      ],
+      "protocols": [
+        "http"
+      ],
+      "protocol_rationale": "HTTP-only; requires prefix listen_path",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/SpecExposeConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "api_chargeback",
+      "classification": "public",
+      "priority": 9350,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "In-memory charge accumulator for HTTP-family, WebSocket bandwidth, and stream sessions",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ApiChargebackConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "api_chargeback_sink",
+      "classification": "public",
+      "priority": 9351,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "log",
+        "on_stream_disconnect",
+        "on_ws_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Durable ClickHouse charge event/snapshot exporter",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/ApiChargebackSinkConfig",
+        "config_required_when_enabled": true
+      }
+    },
+    {
+      "name": "workload_metrics",
+      "classification": "public",
+      "priority": 9360,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [
+        "on_request_received",
+        "before_proxy",
+        "after_proxy",
+        "log",
+        "on_stream_connect",
+        "on_stream_disconnect"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Adds Istio/GAMMA mesh identity labels to metadata",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/WorkloadMetricsConfig",
+        "config_required_when_enabled": false
+      }
+    },
+    {
+      "name": "__mesh_bpf_metrics",
+      "classification": "reserved",
+      "priority": 9365,
+      "failure_policy": "optional_fail_open",
+      "active_phases": [],
+      "active_phases_note": "no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer",
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface (counters + fixed latency histograms); no request hooks",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/MeshBpfMetricsConfig",
+        "config_required_when_enabled": false,
+        "scope_constraint": "global"
+      }
+    },
+    {
+      "name": "fault_injection",
+      "classification": "public",
+      "priority": 2940,
+      "failure_policy": "keep_last_known_good",
+      "active_phases": [
+        "before_proxy",
+        "on_stream_connect",
+        "on_udp_datagram"
+      ],
+      "protocols": [
+        "http",
+        "grpc",
+        "websocket",
+        "tcp",
+        "udp"
+      ],
+      "protocol_rationale": "Probabilistic aborts and delays across HTTP-family, TCP stream connect, and UDP/DTLS session + datagram hooks",
+      "response_body_producer": false,
+      "config_schema": {
+        "document": "openapi.yaml",
+        "pointer": "#/components/schemas/FaultInjectionConfig",
+        "config_required_when_enabled": true
+      }
+    }
+  ],
+  "removed_plugins": [
+    {
+      "name": "oauth2_auth",
+      "failure_policy": "fail_closed",
+      "note": "Removed built-in. Edge refuses a config that names it, so an upgrade cannot silently drop the protection it provided."
+    },
+    {
+      "name": "semantic_ai_firewall",
+      "failure_policy": "fail_closed",
+      "note": "Removed built-in. Edge refuses a config that names it, so an upgrade cannot silently drop the protection it provided."
+    }
+  ],
+  "main_branch_delta": {
+    "repo": "ferrum-edge/ferrum-edge",
+    "ref": "main",
+    "commit": "f638465034734e335bde7e76c56e8c8244afba8a",
+    "summary": "Same 82 built-in plugin names and failure policies, and the same two removed names. Main adds BUILTIN_WEBSOCKET_FRAMING_PLUGINS (waf, ws_frame_logging, ws_message_size_limiting, ws_rate_limiting) for websocket_permessage_deflate passthrough admission; that list is not part of this v0.9.8 index."
+  }
+}
