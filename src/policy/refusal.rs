@@ -70,11 +70,14 @@ mod tests {
     use super::*;
     use crate::config::GatewayConfig;
     use crate::policy::Severity;
-    use crate::secrets::SecretScrubber;
+    use crate::secrets::{
+        PlaceholderAlloc, ResolveReport, ResolveResult, SecretPlaceholder, SecretScrubber,
+        SlotStatus,
+    };
 
     #[test]
     fn refusal_redacts_a_synthetic_resolved_value() {
-        let secret = "synthetic-secret-value";
+        let secret = "Q7m2Vx9c2L";
         let config: GatewayConfig = serde_json::from_value(serde_json::json!({
             "consumers": [{
                 "id": "app",
@@ -84,7 +87,21 @@ mod tests {
             }]
         }))
         .unwrap();
-        let scrubber = SecretScrubber::from_gateway_config(&config);
+        let report = ResolveReport {
+            results: vec![ResolveResult {
+                consumer_id: "app".to_string(),
+                namespace: "ferrum".to_string(),
+                cred_key: "keyauth/key".to_string(),
+                slot: crate::secrets::slot_path("ferrum", "app", "keyauth/key"),
+                placeholder: SecretPlaceholder {
+                    alloc: PlaceholderAlloc::Require,
+                    length_bytes: 32,
+                },
+                status: SlotStatus::Resolved,
+            }],
+            ..ResolveReport::default()
+        };
+        let scrubber = SecretScrubber::from_gateway_config_with_report(&config, &report);
         let finding = PolicyFinding {
             rule_id: "synthetic_rule".to_string(),
             severity: Severity::Error,
@@ -102,6 +119,7 @@ mod tests {
         assert!(output.contains("[REDACTED]"), "{output}");
         assert!(!output.contains(secret), "{output}");
         assert!(!output.contains("details were withheld"), "{output}");
+        assert!(output.contains("synthetic_rule"), "{output}");
         assert!(output.contains(github_override::NO_PR_OVERRIDE_NOTE));
     }
 }
