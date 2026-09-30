@@ -4,6 +4,7 @@ mod apply_tests;
 mod assembler_tests;
 mod cli_tests;
 mod companion_schema_tests;
+mod contracts_tests;
 mod diff_exit_tests;
 mod diff_tests;
 mod doctor_tests;

@@ -1,0 +1,13 @@
+{
+  "kind": "PluginConfig",
+  "spec": {
+    "id": "orders-key-auth",
+    "plugin_name": "key_auth",
+    "scope": "proxy",
+    "proxy_id": "orders-proxy",
+    "enabled": true,
+    "config": {
+      "key_location": "header:X-API-Key"
+    }
+  }
+}

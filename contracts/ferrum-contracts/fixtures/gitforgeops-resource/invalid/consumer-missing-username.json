@@ -1,0 +1,13 @@
+{
+  "kind": "Consumer",
+  "spec": {
+    "id": "orders-client",
+    "credentials": {
+      "keyauth": [
+        {
+          "key": "${gh-env-secret:alloc=generate}"
+        }
+      ]
+    }
+  }
+}

@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Pin the plugin catalog, `provisioned-by` vocabulary, and GitForgeOps resource-envelope fixtures
+  to ferrum-contracts `contracts-edge-0.9.8`; unit tests now check vendored hashes and local
+  conformance. No catalog or label drift was found against the pinned release.
+
 ### Security
 
 - `require_auth_plugin`, the security audit and the shared auth-coverage
