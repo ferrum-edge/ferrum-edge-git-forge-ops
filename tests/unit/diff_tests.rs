@@ -740,10 +740,18 @@ fn breaking_reports_authenticator_loss_when_http_proxy_becomes_passthrough() {
     desired.proxies[0].passthrough = true;
 
     let reasons = auth_coverage_reasons(&desired, &actual);
-    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
     assert!(
-        reasons[0].starts_with("proxy ferrum/orders loses authenticator key_auth")
-            && reasons[0].contains("no enabled authenticator"),
+        reasons
+            .iter()
+            .any(|r| r.starts_with("passthrough changed (false -> true)")),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| {
+            r.starts_with("proxy ferrum/orders loses authenticator key_auth")
+                && r.contains("no enabled authenticator")
+        }),
         "{reasons:?}"
     );
 }
