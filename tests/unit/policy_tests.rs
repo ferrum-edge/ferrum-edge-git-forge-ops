@@ -2397,6 +2397,42 @@ fn require_auth_plugin_ignores_http_only_authenticators_on_stream_listeners() {
 }
 
 #[test]
+fn require_auth_plugin_does_not_count_authenticators_on_http_passthrough() {
+    let policies = require_auth_policies(None);
+    let mut passthrough = proxy("api", BackendScheme::Https, 30_000, true);
+    passthrough.frontend_tls = true;
+    passthrough.passthrough = true;
+    let cfg = GatewayConfig {
+        proxies: vec![passthrough],
+        plugin_configs: vec![global_plugin("key-1", "key_auth")],
+        ..Default::default()
+    };
+
+    let findings = auth_findings(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].contains("no enabled authentication plugin"),
+        "{findings:?}"
+    );
+    assert!(findings[0].contains("key_auth (key-1)"), "{findings:?}");
+
+    let ordinary = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("key-1", "key_auth")],
+        ..Default::default()
+    };
+    assert!(auth_findings(&ordinary, &policies).is_empty());
+
+    let security_findings =
+        gitforgeops::diff::security::audit_security_with_policy(&cfg, Some(&policies));
+    assert!(security_findings.iter().any(|finding| {
+        finding.kind == "Proxy"
+            && finding.message.contains("sets passthrough: true")
+            && finding.message.contains("every attached plugin (auth included) is inert")
+    }));
+}
+
+#[test]
 fn require_auth_plugin_assesses_stream_identity_separately() {
     let policies = require_auth_policies(None);
 
@@ -2882,6 +2918,41 @@ fn conditional_auth_exemptions_only_cover_complete_identity_and_protocol_gaps() 
             && finding.severity == "warning"
             && finding.message.contains("does not cover this gap")
     }));
+
+    let mut passthrough = proxy("api", BackendScheme::Https, 30_000, true);
+    passthrough.frontend_tls = true;
+    passthrough.passthrough = true;
+    let passthrough_config = GatewayConfig {
+        proxies: vec![passthrough],
+        plugin_configs: vec![with_trigger(
+            global_plugin("jwt-1", "jwt_auth"),
+            serde_json::json!({"match": {"path": {"prefix": ["/private"]}}}),
+        )],
+        ..Default::default()
+    };
+    let mut passthrough_policy = require_auth_policies(None);
+    passthrough_policy
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+    let passthrough_findings = evaluate_policies(&passthrough_config, &passthrough_policy)
+        .into_iter()
+        .filter(|finding| finding.kind == "Proxy")
+        .collect::<Vec<_>>();
+    assert_eq!(passthrough_findings.len(), 1, "{passthrough_findings:?}");
+    assert!(passthrough_findings[0].is_blocking(), "{passthrough_findings:?}");
+    assert!(
+        passthrough_findings[0]
+            .message
+            .contains("does not terminate TLS/DTLS"),
+        "{passthrough_findings:?}"
+    );
+    assert!(
+        !passthrough_findings[0]
+            .message
+            .contains("permitted by conditional-auth exemption"),
+        "{passthrough_findings:?}"
+    );
 }
 
 #[test]

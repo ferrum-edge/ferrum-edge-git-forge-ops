@@ -22,6 +22,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Do not count HTTP authenticators on passthrough proxies: forwarded TLS is not
+  terminated by the gateway, so the authenticator cannot inspect requests.
+  Conditional-auth exemptions also refuse passthrough proxies.
 - `require_auth_plugin`, the security audit and the shared auth-coverage
   classification no longer count an authenticator that carries a `trigger` as
   authentication for any protocol. A trigger limits the requests the gateway

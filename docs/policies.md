@@ -84,6 +84,10 @@ global ones with the same `plugin_name`, disabled instances dropped.
   an authenticator runs on every protocol its listener serves.
   - On HTTP-family proxies every built-in authenticator covers all three
     protocols except `soap_ws_security`, which covers plain HTTP only.
+  - A passthrough proxy forwards TLS without terminating it, so the gateway
+    cannot inspect HTTP requests and attached HTTP authenticators do not run.
+    It cannot satisfy `require_auth_plugin` or qualify for a conditional-auth
+    exemption, even when configured with `frontend_tls: true`.
   - On stream listeners only `mtls_auth` counts, and the listener must
     terminate TLS/DTLS (`frontend_tls: true` without `passthrough`) so the
     client certificate reaches it.
