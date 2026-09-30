@@ -79,7 +79,10 @@ fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
     if !coverage.transport.is_stream() {
         if proxy.passthrough {
             let (inert, attach) = if coverage.inapplicable.is_empty() {
-                ("none attached".to_string(), ", then attach an authenticator")
+                (
+                    "none attached".to_string(),
+                    ", then attach an authenticator",
+                )
             } else {
                 (plugin_instance_list(&coverage.inapplicable), "")
             };
