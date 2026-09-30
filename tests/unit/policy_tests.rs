@@ -2400,7 +2400,6 @@ fn require_auth_plugin_ignores_http_only_authenticators_on_stream_listeners() {
 fn require_auth_plugin_does_not_count_authenticators_on_http_passthrough() {
     let policies = require_auth_policies(None);
     let mut passthrough = proxy("api", BackendScheme::Https, 30_000, true);
-    passthrough.frontend_tls = true;
     passthrough.passthrough = true;
     let cfg = GatewayConfig {
         proxies: vec![passthrough],
@@ -2411,7 +2410,8 @@ fn require_auth_plugin_does_not_count_authenticators_on_http_passthrough() {
     let findings = auth_findings(&cfg, &policies);
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(
-        findings[0].contains("no enabled authentication plugin"),
+        findings[0].contains("fails closed")
+            && findings[0].contains("rejects on non-stream proxies"),
         "{findings:?}"
     );
     assert!(findings[0].contains("key_auth (key-1)"), "{findings:?}");
@@ -2427,10 +2427,20 @@ fn require_auth_plugin_does_not_count_authenticators_on_http_passthrough() {
         gitforgeops::diff::security::audit_security_with_policy(&cfg, Some(&policies));
     assert!(security_findings.iter().any(|finding| {
         finding.kind == "Proxy"
+            && finding.severity == "warning"
+            && finding.message.contains("No auth plugin counts on HTTP proxy api")
+            && finding.message.contains("key_auth (key-1)")
+    }));
+    assert!(security_findings.iter().any(|finding| {
+        finding.kind == "Proxy"
             && finding.message.contains("sets passthrough: true")
-            && finding
-                .message
-                .contains("every attached plugin (auth included) is inert")
+            && finding.message.contains("fails closed")
+            && finding.message.contains("passthrough: false")
+    }));
+    let ordinary_security_findings =
+        gitforgeops::diff::security::audit_security_with_policy(&ordinary, Some(&policies));
+    assert!(!ordinary_security_findings.iter().any(|finding| {
+        finding.kind == "Proxy" && finding.message.contains("No auth plugin counts on HTTP proxy")
     }));
 }
 
@@ -2922,7 +2932,6 @@ fn conditional_auth_exemptions_only_cover_complete_identity_and_protocol_gaps() 
     }));
 
     let mut passthrough = proxy("api", BackendScheme::Https, 30_000, true);
-    passthrough.frontend_tls = true;
     passthrough.passthrough = true;
     let passthrough_config = GatewayConfig {
         proxies: vec![passthrough],

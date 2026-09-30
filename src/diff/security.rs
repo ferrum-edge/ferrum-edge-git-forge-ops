@@ -5,9 +5,10 @@ use crate::diff::resource_diff::OwnershipScope;
 use crate::plugin_catalog::{
     allows_uninspectable_body, auth_coverage, cfg_array, cfg_bool, cfg_str, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
-    plugin_instance_list, retired_replacement, scheme_is_tls, waf_has_enforcing_rule, waf_mode,
-    waf_mode_is_passive, waf_skips_oversized_body, AuthAllowlist, AuthCoverage, RetiredRemediation,
-    RETIRED_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
+    plugin_instance_list, proxy_transport, retired_replacement, scheme_is_tls,
+    waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body,
+    AuthAllowlist, AuthCoverage, RetiredRemediation, RETIRED_PLUGIN_NAMES,
+    STREAM_AUTH_PLUGIN_NAMES,
 };
 use crate::policy::config::effective_auth_allowlist;
 use crate::policy::PolicyConfig;
@@ -314,14 +315,22 @@ fn check_proxy(
     }
 
     if proxy.passthrough {
+        let message = if proxy_transport(proxy).is_stream() {
+            format!(
+                "proxy {} in namespace {} sets passthrough: true — TLS is forwarded untouched, so no request is inspected and every attached plugin (auth included) is inert; unset passthrough to terminate TLS at the gateway",
+                proxy.id, proxy.namespace
+            )
+        } else {
+            format!(
+                "proxy {} in namespace {} sets passthrough: true, which Ferrum Edge rejects on non-stream proxies; GitForgeOps fails closed and does not count HTTP authenticators; set passthrough: false and terminate TLS at the gateway",
+                proxy.id, proxy.namespace
+            )
+        };
         findings.push(SecurityFinding::warning(
             "Proxy",
             &proxy.id,
             &proxy.namespace,
-            format!(
-                "proxy {} in namespace {} sets passthrough: true — TLS is forwarded untouched, so no request is inspected and every attached plugin (auth included) is inert; unset passthrough to terminate TLS at the gateway",
-                proxy.id, proxy.namespace
-            ),
+            message,
         ));
     }
 }
@@ -347,6 +356,16 @@ fn missing_auth_message(
     };
 
     if !coverage.transport.is_stream() {
+        if proxy.passthrough {
+            let inert = if coverage.inapplicable.is_empty() {
+                "HTTP authenticators".to_string()
+            } else {
+                plugin_instance_list(&coverage.inapplicable)
+            };
+            return format!(
+                "No auth plugin counts on HTTP proxy {id} in namespace {ns}: passthrough: true is rejected by Ferrum Edge on non-stream proxies, so GitForgeOps fails closed; inert authenticators: {inert}. Set passthrough: false and terminate TLS at the gateway"
+            );
+        }
         if coverage.applicable.is_empty() && coverage.conditional.is_empty() {
             return format!(
                 "No auth plugin attached to proxy {id} in namespace {ns} — its effective plugin list contains no enabled authenticator; attach one of: {}",

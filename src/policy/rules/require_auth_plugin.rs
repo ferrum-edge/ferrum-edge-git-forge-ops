@@ -77,6 +77,21 @@ fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
     let remedy = conditional_remedy(coverage);
 
     if !coverage.transport.is_stream() {
+        if proxy.passthrough {
+            let inert = if coverage.inapplicable.is_empty() {
+                "HTTP authenticators".to_string()
+            } else {
+                plugin_instance_list(&coverage.inapplicable)
+            };
+            return (
+                format!(
+                    "proxy {id} in namespace {ns} sets passthrough: true, which Ferrum Edge rejects on non-stream proxies; GitForgeOps fails closed and does not count its HTTP authenticators ({inert})"
+                ),
+                format!(
+                    "Set passthrough: false on proxy {id} and terminate TLS at the gateway"
+                ),
+            );
+        }
         if coverage.applicable.is_empty() && coverage.conditional.is_empty() {
             let skipped = ignored_suffix(coverage, "its requests");
             return (

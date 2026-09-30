@@ -665,7 +665,7 @@ impl AuthAllowlist {
     }
 }
 
-/// Can a stream authenticator establish an identity on `proxy`'s listener?
+/// Can an authenticator establish an identity on `proxy`'s listener?
 ///
 /// Stream authenticators read the client certificate from the TLS or DTLS
 /// handshake, which only exists when the gateway terminates it:
