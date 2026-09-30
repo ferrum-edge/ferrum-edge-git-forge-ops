@@ -2868,7 +2868,9 @@ fn conditional_auth_exemptions_only_cover_complete_identity_and_protocol_gaps() 
     assert_eq!(stream_findings.len(), 1, "{stream_findings:?}");
     assert!(stream_findings[0].is_blocking(), "{stream_findings:?}");
     assert!(
-        stream_findings[0].message.contains("does not terminate TLS/DTLS"),
+        stream_findings[0]
+            .message
+            .contains("does not terminate TLS/DTLS"),
         "{stream_findings:?}"
     );
     let security_findings = gitforgeops::diff::security::audit_security_with_policy(
@@ -2901,7 +2903,9 @@ fn conditional_auth_exemptions_are_stale_when_auth_is_missing_or_unconditional()
     assert!(findings.iter().any(|finding| {
         finding.kind == "PolicyConfig"
             && finding.severity == Severity::Info
-            && finding.message.contains("stale conditional-auth exemption 'ferrum/api'")
+            && finding
+                .message
+                .contains("stale conditional-auth exemption 'ferrum/api'")
     }));
 
     let fully_authenticated = GatewayConfig {
