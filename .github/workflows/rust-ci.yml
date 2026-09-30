@@ -244,7 +244,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-llvm-cov@0.9.0
 

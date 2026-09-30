@@ -146,20 +146,28 @@ class SupplyChainPolicyTests(unittest.TestCase):
 
     def test_cargo_audit_install_is_pinned_unconditional_and_uncached(self):
         workflow = (ROOT / ".github/workflows/security.yml").read_text()
-        self.assertEqual(check_supply_chain.cargo_audit_install_violations(workflow), [])
-        old_pin = "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af"
         new_pin = "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172"
-        for pin in (old_pin, new_pin):
-            with self.subTest(pin=pin):
-                changed = workflow.replace(f"uses: {old_pin}", f"uses: {pin}", 1)
-                self.assertEqual(check_supply_chain.cargo_audit_install_violations(changed), [])
+        self.assertEqual(check_supply_chain.CARGO_AUDIT_ACTIONS, frozenset({new_pin}))
+        with self.subTest(pin=new_pin):
+            self.assertIn(f"uses: {new_pin}", workflow)
+            self.assertEqual(check_supply_chain.cargo_audit_install_violations(workflow), [])
 
-        for replacement in (
-            "taiki-e/install-action@" + "0" * 40,
-            "taiki-e/install-action@v2",
+        for pin, replacement in (
+            (
+                new_pin,
+                "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af",
+            ),
+            (
+                new_pin,
+                "taiki-e/install-action@" + "0" * 40,
+            ),
+            (
+                new_pin,
+                "taiki-e/install-action@v2",
+            ),
         ):
             with self.subTest(replacement=replacement):
-                changed = workflow.replace(f"uses: {old_pin}", f"uses: {replacement}", 1)
+                changed = workflow.replace(f"uses: {pin}", f"uses: {replacement}", 1)
                 self.assertNotEqual(changed, workflow)
                 self.assertTrue(check_supply_chain.cargo_audit_install_violations(changed))
 

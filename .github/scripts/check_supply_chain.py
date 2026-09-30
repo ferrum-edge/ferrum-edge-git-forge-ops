@@ -96,10 +96,10 @@ ALLOCATION_REVISION_BINDING = "GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }
 APPLY_COMMAND = "run: gitforgeops apply"
 STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
-# The older pin is retired by the follow-up PR that switches the workflow.
+# Keep this as a set so each reviewed Dependabot bump can allow both pins before
+# switching the workflow, then retire the previous pin in a follow-up PR.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
-        "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af",
         "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",
     }
 )
