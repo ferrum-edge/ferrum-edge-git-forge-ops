@@ -96,12 +96,7 @@ mod tests {
             overridden_by: None,
         };
 
-        let output = refuse_policy_violations(
-            &[finding],
-            "",
-            None,
-            Some(&scrubber),
-        );
+        let output = refuse_policy_violations(&[finding], "", None, Some(&scrubber));
         let output = output.expect("blocking finding refuses apply");
 
         assert!(output.contains("[REDACTED]"), "{output}");
