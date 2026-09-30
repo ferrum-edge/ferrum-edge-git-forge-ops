@@ -15,8 +15,8 @@ fields GitForgeOps does carry: built-in names, priorities, retired names, and re
 ## Bumping the pin
 
 1. Choose the new immutable `contracts-edge-*` tag. Read its commit SHA from
-   `gh api repos/ferrum-edge/ferrum-contracts/git/ref/tags/<tag>` and dereference the object when
-if the tag points to an annotated tag.
+   `gh api repos/ferrum-edge/ferrum-contracts/git/ref/tags/<tag>` and dereference the object
+   if the tag points to an annotated tag.
 2. Download the adopted vocabulary and GitForgeOps resource fixture files from that tag into the
    matching paths under `contracts/ferrum-contracts/`.
 3. Update `PIN` with the tag, commit SHA, and `shasum -a 256` for every vendored file.
