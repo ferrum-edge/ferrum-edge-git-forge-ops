@@ -301,11 +301,7 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
         ),
         (".gitforgeops/policies.yaml", AI_GUARDRAILS_POLICY),
     ]);
-    std::fs::write(
-        &repo.validator,
-        "#!/bin/sh\ntouch validator-ran\nexit 0\n",
-    )
-    .unwrap();
+    std::fs::write(&repo.validator, "#!/bin/sh\ntouch validator-ran\nexit 0\n").unwrap();
     set_executable(&repo.validator);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -325,7 +321,8 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
             );
         }
     });
-    let bundle = r#"{"FERRUM_CREDS_BUNDLE":{"ferrum/shield/@plugin-config/config/mode":"dry_run"}}"#;
+    let bundle =
+        r#"{"FERRUM_CREDS_BUNDLE":{"ferrum/shield/@plugin-config/config/mode":"dry_run"}}"#;
     let output = repo.run(
         &["apply", "--auto-approve"],
         &[

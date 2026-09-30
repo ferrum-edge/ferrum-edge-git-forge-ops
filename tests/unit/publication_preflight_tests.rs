@@ -506,10 +506,7 @@ fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("unresolved policy violations"), "{stderr}");
     assert!(stderr.contains("require_auth_plugin"), "{stderr}");
-    assert!(
-        !stderr.contains("after credential resolution"),
-        "{stderr}"
-    );
+    assert!(!stderr.contains("after credential resolution"), "{stderr}");
     assert!(
         !repo.path("validator-ran").exists(),
         "validator was invoked"

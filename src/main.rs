@@ -49,10 +49,16 @@ fn refuse_policy_violations(
     }
     if let Some(decision) = override_decision {
         if !decision.active {
-            details.push_str(&format!("(override inactive: {})\n", safe_block(&decision.reason)));
+            details.push_str(&format!(
+                "(override inactive: {})\n",
+                safe_block(&decision.reason)
+            ));
         }
     } else {
-        details.push_str(&format!("({})\n", policy::github_override::NO_PR_OVERRIDE_NOTE));
+        details.push_str(&format!(
+            "({})\n",
+            policy::github_override::NO_PR_OVERRIDE_NOTE
+        ));
     }
 
     if let Some(scrubber) = scrubber {
