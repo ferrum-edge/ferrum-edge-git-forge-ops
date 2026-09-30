@@ -230,7 +230,7 @@ fn check_proxy(
         proxy.namespace, proxy.id
     );
     let uncovered_exemption_note = format!(
-        concat!("; conditional-auth exemption '{}/{}' does not cover this gap: {}"),
+        "; conditional-auth exemption '{}/{}' does not cover this gap: {}",
         proxy.namespace,
         proxy.id,
         exemption_gap

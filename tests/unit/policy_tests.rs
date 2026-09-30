@@ -2885,6 +2885,96 @@ fn conditional_auth_exemptions_only_cover_complete_identity_and_protocol_gaps() 
 }
 
 #[test]
+fn conditional_auth_exemption_accepts_tls_terminated_stream_mtls() {
+    let mut policies = require_auth_policies(None);
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/stream".to_string()];
+    let conditional = with_trigger(
+        global_plugin("mtls-1", "mtls_auth"),
+        serde_json::json!({"match": {"sni": {"exact": ["internal.example"]}}}),
+    );
+    let cfg = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
+        plugin_configs: vec![conditional],
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].severity, Severity::Info, "{findings:?}");
+    assert!(!findings[0].is_blocking(), "{findings:?}");
+    assert!(
+        findings[0].message.contains("exemption 'ferrum/stream'"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn conditional_auth_exemption_accepts_declared_http_family_custom_auth() {
+    let mut policies = require_auth_policies(Some(&["company_sso"]));
+    policies
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols = custom_protocols(&[("company_sso", HTTP_FAMILY_PROTOCOLS)]);
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+    let conditional = with_trigger(
+        global_plugin("sso-1", "company_sso"),
+        serde_json::json!({"match": {"path": {"prefix": ["/private"]}}}),
+    );
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![conditional],
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].severity, Severity::Info, "{findings:?}");
+    assert!(!findings[0].is_blocking(), "{findings:?}");
+    assert!(
+        findings[0].message.contains("exemption 'ferrum/api'"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn conditional_auth_exemption_accepts_mixed_unconditional_and_conditional_protocols() {
+    let mut policies = require_auth_policies(Some(&["soap_ws_security", "company_sso"]));
+    policies
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols =
+        custom_protocols(&[("company_sso", &[PluginProtocol::Grpc, PluginProtocol::WebSocket])]);
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+    let conditional = with_trigger(
+        global_plugin("sso-1", "company_sso"),
+        serde_json::json!({"match": {"path": {"prefix": ["/private"]}}}),
+    );
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("soap-1", "soap_ws_security"), conditional],
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].severity, Severity::Info, "{findings:?}");
+    assert!(!findings[0].is_blocking(), "{findings:?}");
+    assert!(
+        findings[0].message.contains("exemption 'ferrum/api'"),
+        "{findings:?}"
+    );
+}
+
+#[test]
 fn conditional_auth_exemptions_are_stale_when_auth_is_missing_or_unconditional() {
     let mut policies = require_auth_policies(None);
     policies

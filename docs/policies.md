@@ -97,6 +97,9 @@ global ones with the same `plugin_name`, disabled instances dropped.
   public route, list the exact `<namespace>/<proxy_id>` in
   `conditional_auth_exemptions`. The finding remains visible at `info`, naming
   the exemption, and the security audit reports the same exception at `info`.
+  The exemption predicate checks which protocols a conditional authenticator
+  can run on, not which requests its trigger matches, so exempted requests
+  outside that trigger remain unauthenticated.
   The exemption is bound to proxy identity only, so later changes to that
   proxy's configuration retain the `info` rating. Code owners approving an
   entry also approve future edits to that proxy; delete the entry and add a new

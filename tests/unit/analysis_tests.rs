@@ -8,8 +8,8 @@ use gitforgeops::config::schema::{
     PluginConfig, PluginScope, PluginTrigger, Proxy, ServiceDiscoveryConfig, Upstream,
 };
 use gitforgeops::diff::best_practice::check_best_practices;
-use gitforgeops::diff::security::{audit_security, audit_security_with_policy};
-use gitforgeops::plugin_catalog::HTTP_FAMILY_PROTOCOLS;
+use gitforgeops::diff::security::{audit_security, audit_security_with_policy, security_blockers};
+use gitforgeops::plugin_catalog::{PluginProtocol, HTTP_FAMILY_PROTOCOLS};
 use gitforgeops::policy::config::{PolicyConfig, PolicyRules, RequireAuthPluginRuleConfig};
 
 /// Fixtures go through serde rather than struct literals: every field these
@@ -224,6 +224,107 @@ fn conditional_auth_exemption_downgrades_security_findings_with_exact_identity()
         .iter()
         .filter(|finding| finding.namespace == "other" && finding.kind == "Proxy")
         .all(|finding| finding.severity == "warning"));
+}
+
+#[test]
+fn conditional_auth_exemptions_downgrade_supported_stream_and_http_gaps() {
+    let trigger = from_json::<PluginTrigger>(serde_json::json!({
+        "when": {"match": {"path": {"prefix": ["/private"]}}},
+    }));
+    let mut stream = proxy("stream", Some(BackendScheme::Tcp));
+    stream.listen_path = None;
+    stream.listen_port = Some(19001);
+    stream.frontend_tls = true;
+    let mut mtls = plugin("mtls-1", "mtls_auth", serde_json::json!({}));
+    mtls.trigger = Some(trigger.clone());
+    let stream_config = GatewayConfig {
+        proxies: vec![stream],
+        plugin_configs: vec![mtls],
+        ..Default::default()
+    };
+    let mut stream_policy = PolicyConfig::default();
+    stream_policy
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/stream".to_string()];
+
+    let mut custom_policy = PolicyConfig::default();
+    custom_policy
+        .policies
+        .require_auth_plugin
+        .auth_plugin_names = vec!["company_sso".to_string()];
+    custom_policy
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols = std::collections::BTreeMap::from([(
+        "company_sso".to_string(),
+        HTTP_FAMILY_PROTOCOLS.to_vec(),
+    )]);
+    custom_policy
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+    let mut custom = plugin("sso-1", "company_sso", serde_json::json!({}));
+    custom.trigger = Some(trigger.clone());
+    let custom_config = GatewayConfig {
+        proxies: vec![proxy("api", Some(BackendScheme::Https))],
+        plugin_configs: vec![custom],
+        ..Default::default()
+    };
+
+    let mut mixed_policy = PolicyConfig::default();
+    mixed_policy
+        .policies
+        .require_auth_plugin
+        .auth_plugin_names = vec!["soap_ws_security".to_string(), "company_sso".to_string()];
+    mixed_policy
+        .policies
+        .require_auth_plugin
+        .custom_auth_plugin_protocols = std::collections::BTreeMap::from([(
+        "company_sso".to_string(),
+        vec![PluginProtocol::Grpc, PluginProtocol::WebSocket],
+    )]);
+    mixed_policy
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/api".to_string()];
+    let mut conditional_custom = plugin("sso-1", "company_sso", serde_json::json!({}));
+    conditional_custom.trigger = Some(trigger);
+    let mixed_config = GatewayConfig {
+        proxies: vec![proxy("api", Some(BackendScheme::Https))],
+        plugin_configs: vec![
+            plugin("soap-1", "soap_ws_security", serde_json::json!({})),
+            conditional_custom,
+        ],
+        ..Default::default()
+    };
+
+    for (config, policy, identity) in [
+        (&stream_config, &stream_policy, "ferrum/stream"),
+        (&custom_config, &custom_policy, "ferrum/api"),
+        (&mixed_config, &mixed_policy, "ferrum/api"),
+    ] {
+        let findings = audit_security_with_policy(config, Some(policy));
+        let auth_findings = findings
+            .iter()
+            .filter(|finding| {
+                finding.kind == "Proxy"
+                    && finding.namespace == "ferrum"
+                    && finding.message.contains("conditional")
+            })
+            .collect::<Vec<_>>();
+        assert!(!auth_findings.is_empty(), "{findings:?}");
+        assert!(
+            auth_findings.iter().all(|finding| {
+                finding.severity == "info"
+                    && finding
+                        .message
+                        .contains(&format!("exemption '{identity}'"))
+            }),
+            "{findings:?}"
+        );
+        assert!(security_blockers(&findings).is_empty(), "{findings:?}");
+    }
 }
 
 #[test]

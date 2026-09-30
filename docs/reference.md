@@ -315,8 +315,8 @@ Intentionally public proxies that rely on conditional authenticators can be
 listed under `policies.require_auth_plugin.conditional_auth_exemptions` in the
 code-owned `.gitforgeops/policies.yaml`, using exact `<namespace>/<proxy_id>`
 identities. Their auth findings remain visible at `info`; missing or
-unnecessary entries are reported as stale warnings. Wildcards, malformed
-identities and duplicates fail policy loading.
+unnecessary entries are reported as informational stale findings. Wildcards,
+malformed identities and duplicates fail policy loading.
 
 ## Import details
 

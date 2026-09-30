@@ -64,7 +64,9 @@ policies:
     # custom_auth_plugin_protocols:
     #   company_sso: [http, grpc, websocket]
     # Exact proxies deliberately allowed to rely on conditional authenticators.
-    # Findings remain visible at info; missing or unnecessary entries warn.
+    # Findings remain visible at info; missing or unnecessary entries are
+    # informational.
+    # Entries that do not cover the proxy's protocol gap keep the configured severity.
     # conditional_auth_exemptions: [public/status]
 
   # Refuse `backend_tls_verify_server_cert: false` on proxies and upstreams.

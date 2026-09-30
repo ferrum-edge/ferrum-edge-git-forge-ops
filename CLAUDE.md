@@ -904,8 +904,8 @@ TCP or UDP for stream listeners).
   repository data cannot prove a trigger matches every request. An intentionally
   public route can use the exact code-owned
   `require_auth_plugin.conditional_auth_exemptions` identity; its finding stays
-  visible at info, and missing or unnecessary entries warn. Breaking-change
-  detection still counts it as running (`AuthCoverage::running`), because
+  visible at info, and missing or unnecessary entries are informational.
+  Breaking-change detection still counts it as running (`AuthCoverage::running`), because
   consumer credentials apply on the requests it matches.
 
 #### Security audit of plugin associations
