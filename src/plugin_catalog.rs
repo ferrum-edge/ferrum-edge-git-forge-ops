@@ -665,15 +665,16 @@ impl AuthAllowlist {
     }
 }
 
-/// Can a stream authenticator establish an identity on `proxy`'s listener?
+/// Can an authenticator establish an identity on `proxy`'s listener?
 ///
 /// Stream authenticators read the client certificate from the TLS or DTLS
 /// handshake, which only exists when the gateway terminates it:
 /// `frontend_tls: true` without `passthrough`. The gateway rejects a stream
-/// `mtls_auth` otherwise. Always `true` for an HTTP-family proxy, where the
-/// authenticators read the request.
+/// `mtls_auth` otherwise. HTTP authenticators also need the gateway to
+/// terminate TLS; a passthrough proxy forwards the encrypted stream without
+/// exposing HTTP requests to its plugins.
 pub fn listener_can_establish_identity(proxy: &Proxy) -> bool {
-    !proxy_transport(proxy).is_stream() || (proxy.frontend_tls && !proxy.passthrough)
+    !proxy.passthrough && (!proxy_transport(proxy).is_stream() || proxy.frontend_tls)
 }
 
 /// How a proxy's effective authenticators relate to the listener they guard.
@@ -774,13 +775,15 @@ pub fn auth_coverage<'a>(
     let mut applicable = Vec::new();
     let mut conditional = Vec::new();
     let mut inapplicable = Vec::new();
+    let http_plugins_are_inert = !transport.is_stream() && proxy.passthrough;
     for plugin in effective_plugins(config, proxy) {
         if !auth.contains(&plugin.plugin_name) {
             continue;
         }
-        let runs_on_listener = protocols
-            .iter()
-            .any(|protocol| auth.runs_on(&plugin.plugin_name, *protocol));
+        let runs_on_listener = !http_plugins_are_inert
+            && protocols
+                .iter()
+                .any(|protocol| auth.runs_on(&plugin.plugin_name, *protocol));
         if !runs_on_listener {
             inapplicable.push(plugin);
         } else if plugin.is_conditional() {

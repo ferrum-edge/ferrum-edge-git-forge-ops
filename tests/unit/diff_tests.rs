@@ -734,6 +734,29 @@ fn breaking_detects_passthrough_flip() {
 }
 
 #[test]
+fn breaking_reports_authenticator_loss_when_http_proxy_becomes_passthrough() {
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let mut desired = actual.clone();
+    desired.proxies[0].passthrough = true;
+
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.starts_with("passthrough changed (false -> true)")),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| {
+            r.starts_with("proxy ferrum/orders loses authenticator key_auth")
+                && r.contains("no enabled authenticator")
+        }),
+        "{reasons:?}"
+    );
+}
+
+#[test]
 fn breaking_ignores_non_breaking_proxy_edit() {
     // A pure timeout bump is a modify, but nothing about it is breaking.
     let reasons = breaking_reasons_for_proxy_change(|p| p.backend_read_timeout_ms = 45_000);

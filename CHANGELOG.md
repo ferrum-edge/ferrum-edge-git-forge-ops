@@ -14,6 +14,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Report an authenticator-loss breaking change when an HTTP proxy is changed to
+  passthrough, which Ferrum Edge rejects on non-stream proxies.
 - Include `CHANGELOG.md` and `.env.example` in downstream template updates so adopters receive
   release notes and current environment-variable examples.
 - Pin the plugin catalog, `provisioned-by` vocabulary, and GitForgeOps resource-envelope fixtures
@@ -22,6 +24,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on
+  non-stream proxies and rejects it with `frontend_tls: true`, so GitForgeOps
+  does not count their HTTP authenticators. Set `passthrough: false` and
+  terminate TLS at the gateway. Conditional-auth exemptions also refuse
+  passthrough proxies.
 - `require_auth_plugin`, the security audit and the shared auth-coverage
   classification no longer count an authenticator that carries a `trigger` as
   authentication for any protocol. A trigger limits the requests the gateway
