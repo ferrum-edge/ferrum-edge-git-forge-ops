@@ -179,9 +179,33 @@ fn auth_plugin_with_a_trigger_is_reported_as_conditional() {
         msgs.iter().any(|m| m.contains("carries a trigger")),
         "expected a conditional-auth finding, got {msgs:?}"
     );
-    // ... and the proxy is not reported as unauthenticated, because the
-    // plugin is attached — just conditionally.
-    assert!(!msgs.iter().any(|m| m.contains("No auth plugin")));
+    // ... and the proxy is reported as unauthenticated: the trigger leaves
+    // every request it does not match without authentication, so the
+    // conditional plugin is named but not counted.
+    let msgs = auth_messages(&cfg);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(
+        msgs[0].contains("runs on every request to proxy p1")
+            && msgs[0].contains("not counted: jwt_auth (jwt-1)"),
+        "{msgs:?}"
+    );
+}
+
+#[test]
+fn conditional_auth_plugin_beside_an_unconditional_one_is_not_missing_auth() {
+    let mut conditional = plugin("jwt-1", "jwt_auth", serde_json::json!({}));
+    conditional.trigger = Some(from_json::<PluginTrigger>(serde_json::json!({
+        "when": {"match": {"protocol": ["http1"]}},
+    })));
+    let key = plugin("key-1", "key_auth", serde_json::json!({}));
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("p1", Some(BackendScheme::Https))],
+        plugin_configs: vec![conditional, key],
+        ..Default::default()
+    };
+    assert!(auth_messages(&cfg).is_empty());
+    // The conditional instance is still surfaced for review.
+    assert!(any_message(&cfg, "has a conditional jwt_auth plugin jwt-1"));
 }
 
 // ---------------------------------------------------------------------------
@@ -572,10 +596,10 @@ fn skipped_stream_authenticator_triggers_are_not_reported_as_conditional_auth() 
         ..Default::default()
     };
     // The plugin-level trigger warning still surfaces the instance; only the
-    // proxy-level "authenticated by" claim must not appear.
+    // proxy-level conditional-auth claim must not appear.
     let msgs = messages(&cfg);
     assert!(
-        !msgs.iter().any(|m| m.contains("is authenticated by")),
+        !msgs.iter().any(|m| m.contains("has a conditional")),
         "{msgs:?}"
     );
     assert_eq!(auth_messages(&cfg).len(), 1);

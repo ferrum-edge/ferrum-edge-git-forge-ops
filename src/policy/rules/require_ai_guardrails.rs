@@ -19,6 +19,9 @@ impl RequireAiGuardrailsRule {
     /// refuse does not satisfy the requirement. Each escape hatch below flips
     /// a gateway default that fails closed.
     fn neutered_reason(plugin: &PluginConfig) -> Option<String> {
+        if plugin.is_conditional() {
+            return Some("a trigger".into());
+        }
         let cfg = &plugin.config;
         if cfg_str(cfg, &["mode"]).as_deref() == Some("dry_run") {
             return Some("mode: dry_run".to_string());

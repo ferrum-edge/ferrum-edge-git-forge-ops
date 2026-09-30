@@ -164,10 +164,13 @@ fn projected_plugin_configs(
 /// runs on one of the listener's request protocols counts ([`auth_coverage`],
 /// the classification `require_auth_plugin` and the security audit use), so
 /// dropping a `key_auth` that a TCP listener never runs is not an
-/// authentication loss.
+/// authentication loss. Conditional authenticators count here
+/// ([`AuthCoverage::running`]): consumer credentials still apply on the
+/// requests their trigger matches, even though they never satisfy
+/// `require_auth_plugin`.
 fn running_authenticators(coverage: &AuthCoverage<'_>) -> Vec<(String, Vec<String>)> {
     let mut by_name: Vec<(String, Vec<String>)> = Vec::new();
-    for plugin in &coverage.applicable {
+    for plugin in coverage.running() {
         match by_name
             .iter_mut()
             .find(|(name, _)| *name == plugin.plugin_name)
@@ -226,7 +229,7 @@ fn check_proxy_auth_coverage(
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        let consequence = if after_coverage.applicable.is_empty() {
+        let consequence = if after_coverage.running().is_empty() {
             ", which is left with no enabled authenticator".to_string()
         } else {
             let newly_uncovered: Vec<_> = after_coverage

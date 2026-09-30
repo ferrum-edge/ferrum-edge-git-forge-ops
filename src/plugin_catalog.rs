@@ -677,32 +677,60 @@ pub fn listener_can_establish_identity(proxy: &Proxy) -> bool {
 }
 
 /// How a proxy's effective authenticators relate to the listener they guard.
+///
+/// The three plugin lists are disjoint. Only [`AuthCoverage::applicable`]
+/// counts towards [`AuthCoverage::uncovered`]: an authenticator carrying a
+/// `trigger` runs only on the requests its predicate matches, and every other
+/// request on the same protocol reaches the backend unauthenticated. Whether a
+/// predicate matches every request cannot be proven from repository data (the
+/// gateway classifies the request), so a conditional authenticator never
+/// satisfies mandatory authentication. A route that is meant to be public is
+/// an exemption for the protected policy override, not for resource data.
 #[derive(Debug, Clone)]
 pub struct AuthCoverage<'a> {
     pub transport: ProxyTransport,
-    /// Allowlisted authenticators the gateway runs on at least one of the
-    /// listener's request protocols.
+    /// Allowlisted authenticators without a trigger that the gateway runs on
+    /// at least one of the listener's request protocols.
     pub applicable: Vec<&'a PluginConfig>,
+    /// Allowlisted authenticators the gateway runs on at least one of the
+    /// listener's request protocols, but only on requests their trigger
+    /// matches ([`PluginConfig::is_conditional`]). They cover no protocol.
+    pub conditional: Vec<&'a PluginConfig>,
     /// Allowlisted authenticators effective by scope that the gateway runs on
-    /// none of the listener's request protocols.
+    /// none of the listener's request protocols, conditional or not.
     pub inapplicable: Vec<&'a PluginConfig>,
     /// Request protocols the listener serves on which no applicable
-    /// authenticator runs. Those requests reach the backend unauthenticated.
+    /// authenticator runs. Those requests (or, with only a conditional
+    /// authenticator, those its trigger does not match) reach the backend
+    /// unauthenticated.
     pub uncovered: Vec<PluginProtocol>,
     /// See [`listener_can_establish_identity`].
     pub listener_establishes_identity: bool,
 }
 
-impl AuthCoverage<'_> {
-    /// Does an authenticator run on every request protocol the listener
-    /// serves, on a listener where it can establish an identity?
+impl<'a> AuthCoverage<'a> {
+    /// Does an unconditional authenticator run on every request protocol the
+    /// listener serves, on a listener where it can establish an identity?
     pub fn is_authenticated(&self) -> bool {
         self.uncovered.is_empty() && self.listener_establishes_identity
+    }
+
+    /// Every authenticator the gateway runs on the listener for at least some
+    /// requests: [`AuthCoverage::applicable`] and
+    /// [`AuthCoverage::conditional`], in effective priority order. Consumer
+    /// credentials for any of them still apply on this proxy.
+    pub fn running(&self) -> Vec<&'a PluginConfig> {
+        let mut running = self.applicable.clone();
+        running.extend_from_slice(&self.conditional);
+        running.sort_by_key(|plugin| effective_priority(plugin));
+        running
     }
 }
 
 /// Classify the effective plugins of `proxy` against the authentication
-/// allowlist `auth`, per request protocol.
+/// allowlist `auth`, per request protocol. Authenticators carrying a trigger
+/// are classified as conditional and never cover a protocol; see
+/// [`AuthCoverage`].
 pub fn auth_coverage<'a>(
     config: &'a GatewayConfig,
     proxy: &Proxy,
@@ -710,14 +738,24 @@ pub fn auth_coverage<'a>(
 ) -> AuthCoverage<'a> {
     let transport = proxy_transport(proxy);
     let protocols = transport.request_protocols();
-    let (applicable, inapplicable): (Vec<_>, Vec<_>) = effective_plugins(config, proxy)
-        .into_iter()
-        .filter(|plugin| auth.contains(&plugin.plugin_name))
-        .partition(|plugin| {
-            protocols
-                .iter()
-                .any(|protocol| auth.runs_on(&plugin.plugin_name, *protocol))
-        });
+    let mut applicable = Vec::new();
+    let mut conditional = Vec::new();
+    let mut inapplicable = Vec::new();
+    for plugin in effective_plugins(config, proxy) {
+        if !auth.contains(&plugin.plugin_name) {
+            continue;
+        }
+        let runs_on_listener = protocols
+            .iter()
+            .any(|protocol| auth.runs_on(&plugin.plugin_name, *protocol));
+        if !runs_on_listener {
+            inapplicable.push(plugin);
+        } else if plugin.is_conditional() {
+            conditional.push(plugin);
+        } else {
+            applicable.push(plugin);
+        }
+    }
     let uncovered = protocols
         .iter()
         .copied()
@@ -730,6 +768,7 @@ pub fn auth_coverage<'a>(
     AuthCoverage {
         transport,
         applicable,
+        conditional,
         inapplicable,
         uncovered,
         listener_establishes_identity: listener_can_establish_identity(proxy),

@@ -1169,6 +1169,34 @@ const ORDERS_LEFT_WITHOUT_KEY_AUTH: &str = "proxy ferrum/orders loses authentica
      — consumer credentials for it no longer apply on this proxy, which is left with no \
      enabled authenticator";
 
+/// Appended to a plugin fixture: run it only on `/private` requests.
+const PRIVATE_PATH_TRIGGER: &str = "    trigger:
+      when:
+        match:
+          path:
+            prefix: [/private]
+";
+
+#[test]
+fn breaking_counts_conditional_authenticators_as_running() {
+    // A trigger narrows which requests key_auth runs on, but consumer
+    // credentials still apply on the requests it matches, so adding one is
+    // not an authenticator loss. `require_auth_plugin` reports the gap.
+    let actual = auth_coverage_config("", GLOBAL_KEY_AUTH);
+    let conditional = format!("{GLOBAL_KEY_AUTH}{PRIVATE_PATH_TRIGGER}");
+    let desired = auth_coverage_config("", &conditional);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert!(reasons.is_empty(), "{reasons:?}");
+
+    // Narrowing a conditional authenticator away from a proxy still strands
+    // the credentials it accepts there.
+    let actual = desired;
+    let narrowed = format!("{KEY_AUTH_ON_PAYMENTS}{PRIVATE_PATH_TRIGGER}");
+    let desired = auth_coverage_config("", &narrowed);
+    let reasons = auth_coverage_reasons(&desired, &actual);
+    assert_eq!(reasons, vec![ORDERS_LEFT_WITHOUT_KEY_AUTH.to_string()]);
+}
+
 /// In shared mode a live proxy the repo does not declare is unmanaged and
 /// survives the apply, yet a managed global authenticator still decides its
 /// effective plugin list. Narrowing that global strands the proxy exactly as

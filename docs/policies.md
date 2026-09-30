@@ -85,6 +85,14 @@ global ones with the same `plugin_name`, disabled instances dropped.
   - On stream listeners only `mtls_auth` counts, and the listener must
     terminate TLS/DTLS (`frontend_tls: true` without `passthrough`) so the
     client certificate reaches it.
+- **Conditional authenticators never count.** An authenticator with a
+  `trigger` runs only on the requests its predicate matches (protocol, path,
+  method, header, or any other match), and every other request reaches the
+  backend unauthenticated. It covers no protocol, whatever the predicate, so a
+  proxy needs an authenticator without a trigger on every protocol its listener
+  serves. A scoped instance with a trigger replaces a global instance of the
+  same `plugin_name` without one, so it can remove coverage. A route that is
+  intentionally public needs the policy override, not a trigger.
 - **Custom authenticators** are assumed to cover plain HTTP only. Declare what
   they implement under `custom_auth_plugin_protocols`, for example
   `company_sso: [http, grpc, websocket]` (values: `http`, `grpc`, `websocket`,
@@ -151,7 +159,10 @@ default 1). The security audit runs the same check.
 
 A proxy carrying AI traffic (any `ai_*` plugin, `mcp_gateway` or
 `a2a_gateway`) must also carry an enforcing content guardrail from
-`guardrail_plugin_names`, not a dry-run or warn-only one.
+`guardrail_plugin_names`. A guardrail with a `trigger` only runs for matching
+requests, so it does not satisfy the requirement unless an unconditional
+enforcing guardrail is also effective on that proxy. Dry-run and warn-only
+guardrails likewise do not satisfy the requirement.
 
 ### `rate_limit_completeness`
 

@@ -31,6 +31,36 @@ spec:
   backend_port: 443
 "#;
 
+const CONDITIONAL_AUTH_PROXY: &str = r#"kind: Proxy
+spec:
+  id: "api"
+  listen_path: "/api"
+  backend_scheme: https
+  backend_host: "api.internal"
+  backend_port: 443
+  plugins:
+    - plugin_config_id: conditional-key-auth
+"#;
+
+const CONDITIONAL_AUTH_PLUGIN: &str = r#"kind: PluginConfig
+spec:
+  id: conditional-key-auth
+  plugin_name: key_auth
+  scope: proxy
+  proxy_id: api
+  trigger:
+    when:
+      match:
+        method: [POST]
+"#;
+
+const REQUIRE_AUTH_POLICY: &str = r#"version: 1
+policies:
+  require_auth_plugin:
+    enabled: true
+    severity: error
+"#;
+
 const MESH_FRAGMENT: &str = r#"kind: MeshConfig
 spec:
   istio_root_namespace: istio-system
@@ -444,4 +474,44 @@ fn cli_accepts_a_valid_or_absent_smoke_file() {
         assert!(repo.path("assembled/resources.yaml").exists());
         assert!(repo.path(".state/default.json").exists());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {
+    let repo = Repo::new(None);
+    std::fs::create_dir_all(repo.path("resources/ferrum/plugins")).unwrap();
+    std::fs::create_dir_all(repo.path(".gitforgeops")).unwrap();
+    std::fs::write(
+        repo.path("resources/ferrum/proxies/api.yaml"),
+        CONDITIONAL_AUTH_PROXY,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path("resources/ferrum/plugins/auth.yaml"),
+        CONDITIONAL_AUTH_PLUGIN,
+    )
+    .unwrap();
+    std::fs::write(repo.path(".gitforgeops/policies.yaml"), REQUIRE_AUTH_POLICY).unwrap();
+    std::fs::write(&repo.validator, "#!/bin/sh\ntouch validator-ran\nexit 0\n").unwrap();
+    set_executable(&repo.validator);
+
+    let output = repo.run(
+        &["apply", "--auto-approve"],
+        "assembled/resources.yaml",
+        "assembled/mesh.yaml",
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("unresolved policy violations"), "{stderr}");
+    assert!(stderr.contains("require_auth_plugin"), "{stderr}");
+    assert!(!stderr.contains("after credential resolution"), "{stderr}");
+    assert!(
+        !repo.path("validator-ran").exists(),
+        "validator was invoked"
+    );
+    assert!(!repo.path("assembled/resources.yaml").exists());
+    assert!(!repo.path("assembled/mesh.yaml").exists());
+    assert!(!repo.path(".state/default.json").exists());
 }

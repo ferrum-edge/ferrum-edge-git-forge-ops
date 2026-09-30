@@ -16,6 +16,7 @@ use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
 use gitforgeops::policy;
+use gitforgeops::policy::refusal::refuse_policy_violations;
 use gitforgeops::reconcile::{previously_managed, resolved_namespaces};
 use gitforgeops::review;
 use gitforgeops::secrets;
@@ -2455,6 +2456,37 @@ async fn cmd_apply(
         }
     }
 
+    // Policy enforcement, sharing the override decision resolved before the
+    // security gate. Evaluated on the unresolved document, as the security
+    // audit sees it, and refused here, before the state lock, the credential
+    // bundle read, secret resolution, validation, credential allocation or
+    // any gateway write or file publish. Overridden rule_ids are captured here
+    // and written into state after a successful apply so audits can see which
+    // blocking findings were bypassed by whom.
+    if let Some(policy_cfg) = &policy_cfg {
+        let mut findings = policy::evaluate_policies(&desired, policy_cfg);
+        if let Some(d) = &override_decision {
+            policy::github_override::apply_override(&mut findings, d);
+        }
+
+        if let Some(approver) = &override_approver {
+            for f in &findings {
+                if f.overridden_by.is_some() {
+                    overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
+                }
+            }
+        }
+
+        // Post-override findings, which is exactly what
+        // `verdict::policy_blocker` expects and what `plan` feeds it.
+        if let Some(message) =
+            refuse_policy_violations(&findings, "", override_decision.as_ref(), None)
+        {
+            eprint!("{message}");
+            return Err("unresolved policy violations".into());
+        }
+    }
+
     let _state_lock = StateFile::lock(&resolved.name)?;
     let mut state = StateFile::load(&resolved.name)?;
 
@@ -2487,6 +2519,39 @@ async fn cmd_apply(
             secrets::resolve_secrets_with_options(&mut desired, &initial_bundle, initial_options)?
         }
     };
+
+    // Config-string policy checks also need to see resolved values. Keep the
+    // early unresolved-document gate above, then recheck API mode after secret
+    // resolution so substitution cannot make a blocking finding disappear.
+    if env_config.gateway_mode == GatewayMode::Api {
+        if let Some(policy_cfg) = &policy_cfg {
+            let mut findings = policy::evaluate_policies(&desired, policy_cfg);
+            if let Some(d) = &override_decision {
+                policy::github_override::apply_override(&mut findings, d);
+            }
+            if let Some(approver) = &override_approver {
+                for finding in &findings {
+                    if finding.overridden_by.is_some() {
+                        let audit_entry = (finding.rule_id.clone(), approver.clone());
+                        if !overridden_for_audit.contains(&audit_entry) {
+                            overridden_for_audit.push(audit_entry);
+                        }
+                    }
+                }
+            }
+            let scrubber =
+                secrets::SecretScrubber::from_gateway_config_with_report(&desired, &secret_report);
+            if let Some(message) = refuse_policy_violations(
+                &findings,
+                " (after credential resolution)",
+                override_decision.as_ref(),
+                Some(&scrubber),
+            ) {
+                eprint!("{message}");
+                return Err("unresolved policy violations".into());
+            }
+        }
+    }
 
     // Missing required credentials → fail fast before we touch the gateway.
     // `plan` reports this class through the same predicate, so a repository
@@ -2539,51 +2604,6 @@ async fn cmd_apply(
                 safe_line(mesh_summary_line(mesh)),
                 env_config.mesh_file_output_path
             );
-        }
-    }
-
-    // Policy enforcement, sharing the override decision resolved before the
-    // security gate. Overridden rule_ids are captured here and written into
-    // state after a successful apply so audits can see which blocking findings
-    // were bypassed by whom.
-    if let Some(policy_cfg) = &policy_cfg {
-        let mut findings = policy::evaluate_policies(&desired, policy_cfg);
-        if let Some(d) = &override_decision {
-            policy::github_override::apply_override(&mut findings, d);
-        }
-
-        if let Some(approver) = &override_approver {
-            for f in &findings {
-                if f.overridden_by.is_some() {
-                    overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
-                }
-            }
-        }
-
-        // Post-override findings, which is exactly what
-        // `verdict::policy_blocker` expects and what `plan` feeds it.
-        if let Some(gate) = verdict::policy_blocker(&findings) {
-            let blockers = findings.iter().filter(|f| f.is_blocking());
-            eprintln!(
-                "Refusing to apply: {} unresolved policy violation(s):",
-                gate.count
-            );
-            for b in blockers {
-                eprintln!(
-                    "  [{}] {}: {}",
-                    b.severity.as_str(),
-                    safe(&b.rule_id),
-                    safe_line(&b.message)
-                );
-            }
-            if let Some(d) = &override_decision {
-                if !d.active {
-                    eprintln!("(override inactive: {})", safe_block(&d.reason));
-                }
-            } else {
-                eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE);
-            }
-            return Err("unresolved policy violations".into());
         }
     }
 

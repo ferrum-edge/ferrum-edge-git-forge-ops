@@ -899,6 +899,12 @@ TCP or UDP for stream listeners).
   `require_auth_plugin.custom_auth_plugin_protocols` declares them.
 - A stream proxy is authenticated only if its listener terminates TLS/DTLS
   (`frontend_tls` without `passthrough`).
+- An authenticator carrying a `trigger` (`PluginConfig::is_conditional`) is
+  `AuthCoverage::conditional` and covers no protocol, whatever its predicate:
+  repository data cannot prove a trigger matches every request. Only the
+  policy override exempts an intentionally public route. Breaking-change
+  detection still counts it as running (`AuthCoverage::running`), because
+  consumer credentials apply on the requests it matches.
 
 #### Security audit of plugin associations
 
@@ -1023,9 +1029,13 @@ gateway, as `Vec<ApplyBlocker>` over ten `BlockerKind`s:
 - `cmd_apply` calls the *same per-class predicates* (`security_blocker`,
   `policy_blocker`, `required_credentials_blocker`, `validation_blocker`,
   `credential_provisioning_blockers`) at its own gate points, because order
-  matters: the security audit must refuse before the bundle is read, the
-  required-slot check before the first gateway call. Share predicates, not
-  control flow.
+  matters: the security audit and the policy gate must refuse before the state
+  lock and bundle read (the policy gate evaluates the unresolved document, as
+  the security audit sees it); API mode evaluates policy again after credential
+  resolution and before validation, using the resolved-slot report to scrub
+  diagnostics. Both policy refusals include the same override guidance. The
+  required-slot check runs before the first gateway call. Share predicates,
+  not control flow.
 
 Rules that must not drift:
 
