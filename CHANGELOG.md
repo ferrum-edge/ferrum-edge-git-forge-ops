@@ -14,6 +14,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Include `CHANGELOG.md` and `.env.example` in downstream template updates so adopters receive
+  release notes and current environment-variable examples.
 - Pin the plugin catalog, `provisioned-by` vocabulary, and GitForgeOps resource-envelope fixtures
   to ferrum-contracts `contracts-edge-0.9.8`; unit tests now check vendored hashes and local
   conformance. No catalog or label drift was found against the pinned release.

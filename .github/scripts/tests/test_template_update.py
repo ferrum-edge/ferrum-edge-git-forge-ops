@@ -78,6 +78,8 @@ UPSTREAM_TREE = {
     ".github/workflows/apply-on-merge.yml": "name: GitForgeOps Apply\n# v1\n",
     ".github/scripts/credential_bundles.py": "# v1\n",
     ".github/ferrum-edge-checksums.txt": "aaa111  ferrum-edge\n",
+    ".env.example": "FERRUM_GATEWAY_MODE=api\n",
+    "CHANGELOG.md": "# Changelog\n\n## [Unreleased]\n",
     "docs/github-launch-controls.md": "# controls v1\n",
     "Cargo.toml": '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n',
     ".github/CODEOWNERS": "* @upstream-maintainer\n",
@@ -176,6 +178,15 @@ class TemplateUpdateTests(unittest.TestCase):
         )
         baseline = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
         self.assertEqual(baseline["commit"], target)
+
+    def test_an_upstream_changelog_update_is_adopted(self):
+        changelog = "# Changelog\n\n## [Unreleased]\n\n- New upstream behavior.\n"
+        self.fixture.upstream_change(
+            {"CHANGELOG.md": changelog}, "document upstream changes"
+        )
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.read("CHANGELOG.md"), changelog)
 
     def test_apply_prints_the_checks_to_re_run_before_deploying(self):
         self.fixture.upstream_change({"src/main.rs": "// v2\n"}, "upstream v2")
@@ -1400,6 +1411,14 @@ class RepositoryContractTests(unittest.TestCase):
         for path in template_update.UPSTREAM_MANAGED:
             with self.subTest(path=path):
                 self.assertTrue((ROOT / path).exists(), path)
+
+    def test_changelog_and_env_example_are_upstream_managed_but_agent_alias_is_not(self):
+        self.assertIn("CHANGELOG.md", template_update.UPSTREAM_MANAGED)
+        self.assertIn(".env.example", template_update.UPSTREAM_MANAGED)
+        # AGENTS.md is a symlink to CLAUDE.md; managed paths must be regular
+        # files because the updater refuses to read or write through links.
+        self.assertTrue((ROOT / "AGENTS.md").is_symlink())
+        self.assertNotIn("AGENTS.md", template_update.UPSTREAM_MANAGED)
 
     def test_every_shipped_example_is_upstream_managed(self):
         # The examples are upstream's documentation of its own contract, and
