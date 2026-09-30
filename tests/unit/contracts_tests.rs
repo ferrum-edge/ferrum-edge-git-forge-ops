@@ -90,7 +90,10 @@ fn vendored_contract_files_match_the_pin_hashes() {
     for (path, expected) in hashes {
         let bytes = fs::read(contract_dir().join(&path))
             .unwrap_or_else(|error| panic!("read pinned {path}: {error}"));
-        let actual: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+        let actual: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(actual, expected, "pinned contract file changed: {path}");
     }
 }
