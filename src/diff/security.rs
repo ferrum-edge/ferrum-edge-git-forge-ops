@@ -208,7 +208,9 @@ fn check_proxy(
     // Only authenticators the gateway runs on each of this proxy's request
     // protocols count: a TCP or UDP listener skips every HTTP-family plugin,
     // `key_auth` included, and gRPC and WebSocket requests skip an HTTP-only
-    // one such as `soap_ws_security`.
+    // one such as `soap_ws_security`. An authenticator carrying a trigger
+    // never counts, because it only runs on the requests its predicate
+    // matches.
     let coverage = auth_coverage(config, proxy, auth);
 
     if !coverage.is_authenticated() {
@@ -221,21 +223,19 @@ fn check_proxy(
     }
 
     // A conditional auth plugin only runs when its trigger matches, so every
-    // request the predicate misses reaches the backend unauthenticated. That is
-    // a legitimate pattern (public health endpoints) but never an accident
-    // worth leaving unreviewed.
-    for plugin in &coverage.applicable {
-        if plugin.trigger.is_some() {
-            findings.push(SecurityFinding::warning(
-                "Proxy",
-                &proxy.id,
-                &proxy.namespace,
-                format!(
-                    "proxy {} in namespace {} is authenticated by {} plugin {}, which carries a trigger — requests the trigger does not match are served unauthenticated; drop the trigger to authenticate every request",
-                    proxy.id, proxy.namespace, plugin.plugin_name, plugin.id
-                ),
-            ));
-        }
+    // request the predicate misses reaches the backend unauthenticated. It is
+    // never counted as authentication above; this names each instance so the
+    // exemption it creates is reviewed.
+    for plugin in &coverage.conditional {
+        findings.push(SecurityFinding::warning(
+            "Proxy",
+            &proxy.id,
+            &proxy.namespace,
+            format!(
+                "proxy {} in namespace {} is authenticated by {} plugin {}, which carries a trigger — requests the trigger does not match are served unauthenticated; drop the trigger to authenticate every request",
+                proxy.id, proxy.namespace, plugin.plugin_name, plugin.id
+            ),
+        ));
     }
 
     let scheme = effective_scheme(proxy);
@@ -287,15 +287,32 @@ fn missing_auth_message(
     let ns = proxy.namespace.as_str();
     let transport = coverage.transport.as_str();
 
+    // Conditional authenticators are named rather than silently dropped, so a
+    // proxy guarded only by one does not read as having no authenticator.
+    let conditional = if coverage.conditional.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; conditional authenticators carrying a trigger were not counted: {}",
+            plugin_instance_list(&coverage.conditional)
+        )
+    };
+
     if !coverage.transport.is_stream() {
-        if coverage.applicable.is_empty() {
+        if coverage.applicable.is_empty() && coverage.conditional.is_empty() {
             return format!(
                 "No auth plugin attached to proxy {id} in namespace {ns} — its effective plugin list contains no enabled authenticator; attach one of: {}",
                 auth.names().join(", ")
             );
         }
+        if coverage.applicable.is_empty() {
+            return format!(
+                "No auth plugin runs on every request to proxy {id} in namespace {ns}{conditional} — requests a trigger does not match reach the backend unauthenticated; attach an authenticator without a trigger, one of: {}",
+                auth.names().join(", ")
+            );
+        }
         return format!(
-            "No auth plugin runs on {} requests to proxy {id} in namespace {ns} — the gateway skips its authenticators ({}) for them, so they reach the backend unauthenticated; attach an authenticator that runs on HTTP, gRPC and WebSocket requests, or declare a custom authenticator's protocols under require_auth_plugin.custom_auth_plugin_protocols",
+            "No auth plugin runs on {} requests to proxy {id} in namespace {ns} — the gateway skips its authenticators ({}) for them, so they reach the backend unauthenticated{conditional}; attach an authenticator that runs on HTTP, gRPC and WebSocket requests, or declare a custom authenticator's protocols under require_auth_plugin.custom_auth_plugin_protocols",
             crate::plugin_catalog::protocol_list(&coverage.uncovered),
             plugin_instance_list(&coverage.applicable)
         );
@@ -311,7 +328,7 @@ fn missing_auth_message(
             )
         };
         return format!(
-            "No auth plugin runs on {transport} stream proxy {id} in namespace {ns}{ignored} — attach one of: {} and terminate TLS/DTLS on the listener (frontend_tls: true)",
+            "No auth plugin runs on {transport} stream proxy {id} in namespace {ns}{conditional}{ignored} — attach one of: {} without a trigger and terminate TLS/DTLS on the listener (frontend_tls: true)",
             STREAM_AUTH_PLUGIN_NAMES.join(", ")
         );
     }
@@ -600,7 +617,7 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
     // A trigger on an auth plugin decides whether a route is authenticated at
     // all. Flagged here as well as per-proxy so an unattached-but-committed
     // instance is still surfaced.
-    if is_auth_plugin(name) && plugin.trigger.is_some() {
+    if is_auth_plugin(name) && plugin.is_conditional() {
         findings.push(SecurityFinding::warning(
             "PluginConfig",
             id,

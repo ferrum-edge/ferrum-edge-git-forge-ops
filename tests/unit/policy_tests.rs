@@ -2651,6 +2651,166 @@ fn require_auth_plugin_fails_closed_for_unverified_stream_authenticators() {
     assert!(auth_findings(&canonical, &policies).is_empty());
 }
 
+/// `plugin` with a `trigger` whose predicate tree is `when`.
+fn with_trigger(mut plugin: PluginConfig, when: serde_json::Value) -> PluginConfig {
+    let trigger = serde_json::json!({ "when": when });
+    plugin.trigger = Some(serde_json::from_value(trigger).expect("trigger fixture"));
+    plugin
+}
+
+#[test]
+fn require_auth_plugin_does_not_count_conditional_authenticators() {
+    // A trigger restricts which requests the gateway runs an authenticator on;
+    // every request it does not match reaches the backend unauthenticated. No
+    // predicate is taken as proof that it matches every request, not even a
+    // protocol list naming every HTTP-family protocol.
+    let policies = require_auth_policies(None);
+    let triggers = [
+        serde_json::json!({"match": {"protocol": ["http1"]}}),
+        serde_json::json!({"match": {"protocol": [
+            "http1", "http2", "http3", "grpc", "grpc_web", "websocket"
+        ]}}),
+        serde_json::json!({"match": {"path": {"prefix": ["/private"]}}}),
+        serde_json::json!({"match": {"method": ["POST", "PUT", "DELETE"]}}),
+        serde_json::json!({"not": {"match": {"path": {"exact": ["/health"]}}}}),
+        serde_json::json!({"any": [
+            {"match": {"protocol": ["http1"]}},
+            {"match": {"method": ["GET"]}}
+        ]}),
+    ];
+    for when in triggers {
+        let auth = with_trigger(global_plugin("key-1", "key_auth"), when.clone());
+        let cfg = GatewayConfig {
+            proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+            plugin_configs: vec![auth],
+            ..Default::default()
+        };
+        let findings = evaluate_policies(&cfg, &policies);
+        assert_eq!(findings.len(), 1, "{when}: {findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding.rule_id, "require_auth_plugin");
+        assert!(finding.is_blocking(), "{when}: {finding:?}");
+        assert!(
+            finding.message.contains("runs on every request")
+                && finding.message.contains("not counted")
+                && finding.message.contains("key_auth (key-1)"),
+            "{when}: {finding:?}"
+        );
+        let remediation = finding.remediation.as_deref().unwrap_or_default();
+        assert!(remediation.contains("policy override"), "{remediation}");
+
+        // `plan` and `apply` refuse on this same predicate.
+        assert!(
+            gitforgeops::verdict::policy_blocker(&findings).is_some(),
+            "{when}"
+        );
+    }
+}
+
+#[test]
+fn require_auth_plugin_accepts_conditional_authenticators_beside_an_unconditional_one() {
+    let policies = require_auth_policies(None);
+    let path_only = serde_json::json!({"match": {"path": {"prefix": ["/admin"]}}});
+    let conditional = with_trigger(global_plugin("key-1", "key_auth"), path_only);
+
+    // An unconditional authenticator on every protocol satisfies the rule; a
+    // conditional one beside it adds a check and is not reported.
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![conditional.clone(), global_plugin("jwt-1", "jwt_auth")],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &policies);
+    assert!(findings.is_empty(), "{findings:?}");
+    assert!(gitforgeops::verdict::policy_blocker(&findings).is_none());
+
+    // A conditional authenticator does not fill the protocol gap an
+    // unconditional HTTP-only one leaves.
+    let soap = GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![conditional, global_plugin("soap-1", "soap_ws_security")],
+        ..Default::default()
+    };
+    let findings = auth_findings(&soap, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].contains("gRPC, WebSocket requests")
+            && findings[0].contains("soap_ws_security (soap-1)")
+            && findings[0].contains("not counted")
+            && findings[0].contains("key_auth (key-1)"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn require_auth_plugin_rejects_a_conditional_scoped_replacement() {
+    // A proxy-scoped instance replaces the global instance of the same
+    // `plugin_name` on that proxy. When the scoped one carries a trigger, the
+    // unconditional global no longer runs there.
+    let policies = require_auth_policies(None);
+    let scoped = catalog_plugin(
+        "key-api",
+        "key_auth",
+        PluginScope::Proxy,
+        Some("api"),
+        serde_json::json!({}),
+    );
+    let http1_only = serde_json::json!({"match": {"protocol": ["http1"]}});
+    let scoped = with_trigger(scoped, http1_only);
+    let api = proxy("api", BackendScheme::Https, 30_000, true);
+    let cfg = GatewayConfig {
+        proxies: vec![
+            attach(api, &["key-api"]),
+            proxy("other", BackendScheme::Https, 30_000, true),
+        ],
+        plugin_configs: vec![global_plugin("key-global", "key_auth"), scoped],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].id, "api");
+    assert!(findings[0].is_blocking());
+    assert!(
+        findings[0].message.contains("key_auth (key-api)")
+            && !findings[0].message.contains("key-global"),
+        "{:?}",
+        findings[0]
+    );
+    assert!(gitforgeops::verdict::policy_blocker(&findings).is_some());
+
+    // The same scoped replacement without a trigger authenticates every
+    // request, and the global instance still covers `other` throughout.
+    let mut unconditional = cfg.clone();
+    unconditional.plugin_configs[1].trigger = None;
+    assert!(auth_findings(&unconditional, &policies).is_empty());
+}
+
+#[test]
+fn require_auth_plugin_does_not_count_conditional_stream_authenticators() {
+    let policies = require_auth_policies(None);
+    let sni_only = serde_json::json!({"match": {"sni": {"exact": ["internal.example"]}}});
+    let mtls = with_trigger(global_plugin("mtls-1", "mtls_auth"), sni_only);
+    let cfg = GatewayConfig {
+        proxies: vec![stream_proxy("stream", BackendScheme::Tcps, true)],
+        plugin_configs: vec![mtls],
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].is_blocking());
+    assert!(
+        findings[0].message.contains("every connection")
+            && findings[0].message.contains("mtls_auth (mtls-1)"),
+        "{:?}",
+        findings[0]
+    );
+
+    // The unconditional authenticator on the same listener qualifies.
+    let mut unconditional = cfg.clone();
+    unconditional.plugin_configs[0].trigger = None;
+    assert!(auth_findings(&unconditional, &policies).is_empty());
+}
+
 #[test]
 fn stream_auth_catalog_matches_the_gateway_protocol_contract() {
     use gitforgeops::plugin_catalog::{

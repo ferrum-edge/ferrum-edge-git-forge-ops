@@ -25,7 +25,9 @@ impl RequireAuthPluginRule {
     /// policy while the proxy accepts unauthenticated traffic) and protocol
     /// applicability (an authenticator only guards the request protocols the
     /// gateway runs it on) are delegated to the shared `auth_coverage`
-    /// classification.
+    /// classification. So is the trigger guard: an authenticator carrying a
+    /// `trigger` only runs on the requests it matches, so it never counts,
+    /// and an intentionally public route needs the policy override.
     fn coverage<'a>(&self, cfg: &'a GatewayConfig, proxy: &Proxy) -> AuthCoverage<'a> {
         auth_coverage(cfg, proxy, &self.config.auth_allowlist())
     }
@@ -42,6 +44,27 @@ fn ignored_suffix(coverage: &AuthCoverage<'_>, traffic: &str) -> String {
     )
 }
 
+/// `; conditional authenticators … were not counted …`, or nothing.
+fn conditional_suffix(coverage: &AuthCoverage<'_>) -> String {
+    if coverage.conditional.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; conditional authenticators carrying a trigger were not counted, because requests their trigger does not match reach the backend unauthenticated: {}",
+        plugin_instance_list(&coverage.conditional)
+    )
+}
+
+/// Remediation clause for a proxy whose authenticators carry a trigger, or
+/// nothing.
+fn conditional_remedy(coverage: &AuthCoverage<'_>) -> &'static str {
+    if coverage.conditional.is_empty() {
+        return "";
+    }
+    ". Remove the trigger from the authenticator; a route that is intentionally public needs the \
+     policy override, not a trigger"
+}
+
 /// Finding text and remediation for a proxy that is not authenticated.
 fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
     let id = proxy.id.as_str();
@@ -50,9 +73,11 @@ fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
     let http_family = http_family_auth_plugin_names().join(", ");
     let custom = "or declare a custom authenticator's protocols under \
                   require_auth_plugin.custom_auth_plugin_protocols";
+    let conditional = conditional_suffix(coverage);
+    let remedy = conditional_remedy(coverage);
 
     if !coverage.transport.is_stream() {
-        if coverage.applicable.is_empty() {
+        if coverage.applicable.is_empty() && coverage.conditional.is_empty() {
             let skipped = ignored_suffix(coverage, "its requests");
             return (
                 format!(
@@ -63,14 +88,25 @@ fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
                 ),
             );
         }
+        if coverage.applicable.is_empty() {
+            let skipped = ignored_suffix(coverage, "its requests");
+            return (
+                format!(
+                    "proxy {id} in namespace {ns} has no enabled authentication plugin that runs on every request{conditional}{skipped}"
+                ),
+                format!(
+                    "Attach an authenticator without a trigger ({http_family}) to proxy {id}{remedy}"
+                ),
+            );
+        }
         let uncovered = crate::plugin_catalog::protocol_list(&coverage.uncovered);
         return (
             format!(
-                "proxy {id} in namespace {ns} has no enabled authentication plugin that runs on its {uncovered} requests; the gateway skips its authenticators ({}) for them, so they reach the backend unauthenticated",
+                "proxy {id} in namespace {ns} has no enabled authentication plugin that runs on its {uncovered} requests; the gateway skips its authenticators ({}) for them, so they reach the backend unauthenticated{conditional}",
                 plugin_instance_list(&coverage.applicable)
             ),
             format!(
-                "Attach an authenticator that runs on HTTP, gRPC and WebSocket requests ({http_family}) to proxy {id}, {custom}"
+                "Attach an authenticator that runs on HTTP, gRPC and WebSocket requests ({http_family}) to proxy {id}, {custom}{remedy}"
             ),
         );
     }
@@ -80,10 +116,10 @@ fn describe(proxy: &Proxy, coverage: &AuthCoverage<'_>) -> (String, String) {
         let skipped = ignored_suffix(coverage, &format!("{transport} connections"));
         return (
             format!(
-                "{transport} stream proxy {id} in namespace {ns} has no enabled authentication plugin that runs on its listener{skipped}"
+                "{transport} stream proxy {id} in namespace {ns} has no enabled authentication plugin that runs on every connection to its listener{conditional}{skipped}"
             ),
             format!(
-                "Attach a stream authenticator ({}) to proxy {id} and {terminate}, {custom}",
+                "Attach a stream authenticator ({}) to proxy {id} and {terminate}, {custom}{remedy}",
                 STREAM_AUTH_PLUGIN_NAMES.join(", ")
             ),
         );

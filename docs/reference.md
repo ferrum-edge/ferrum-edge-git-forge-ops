@@ -303,7 +303,9 @@ differences, is compared.
   different `plugin_name`;
 - a surviving proxy (declared or not) that stops running an authenticator it
   runs live (`proxy <ns>/<id> loses authenticator <plugin_name>`), counting
-  only authenticators its listener runs.
+  only authenticators its listener runs. An authenticator with a `trigger`
+  still counts as running here, although it never satisfies
+  `require_auth_plugin`.
 
 "Authentication plugin" means the `require_auth_plugin` definition: the
 policy file's `auth_plugin_names` when present, otherwise the built-ins. Other

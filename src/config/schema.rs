@@ -1063,6 +1063,19 @@ pub struct PluginConfig {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+impl PluginConfig {
+    /// Does a `trigger` restrict which requests this instance runs on?
+    ///
+    /// Any trigger counts, whatever its predicate: the gateway evaluates it
+    /// against each request, and repository data cannot prove that it matches
+    /// every request a listener serves. Enforcement that requires a plugin to
+    /// run on every request must therefore not be satisfied by a conditional
+    /// instance.
+    pub fn is_conditional(&self) -> bool {
+        self.trigger.is_some()
+    }
+}
+
 // --- Root config ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
