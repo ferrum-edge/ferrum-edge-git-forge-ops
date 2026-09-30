@@ -15,6 +15,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   protocol its listener serves, including when a scoped instance with a trigger
   replaces an unconditional global one. An intentionally public route needs
   the policy override. Breaking-change detection still treats a conditional
-  authenticator as running. `apply` now evaluates policy before the state lock,
-  credential bundle read, secret resolution and validation, on the same
-  unresolved document `plan` previews (GHSA-92v7-rq7m-pxfq).
+  authenticator as running. `require_ai_guardrails` also refuses conditional
+  guardrails unless an unconditional enforcing guardrail is effective.
+  `apply` evaluates policy before the state lock on the unresolved document,
+  as the security audit sees it, and checks again after API credential
+  resolution (GHSA-92v7-rq7m-pxfq).

@@ -3777,6 +3777,120 @@ fn require_ai_guardrails_rejects_a_dry_run_guardrail() {
 }
 
 #[test]
+fn require_ai_guardrails_rejects_a_triggered_guardrail() {
+    let guardrail = with_trigger(
+        catalog_plugin(
+            "shield-1",
+            "ai_prompt_shield",
+            PluginScope::Global,
+            None,
+            serde_json::json!({}),
+        ),
+        serde_json::json!({"match": {"method": ["POST"]}}),
+    );
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("llm", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![
+            catalog_plugin(
+                "mcp-1",
+                "mcp_gateway",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            guardrail,
+        ],
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &ai_policies());
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].is_blocking());
+    assert!(findings[0].message.contains("a trigger"));
+}
+
+#[test]
+fn require_ai_guardrails_accepts_a_triggered_guardrail_beside_an_unconditional_one() {
+    let conditional = with_trigger(
+        catalog_plugin(
+            "shield-conditional",
+            "ai_prompt_shield",
+            PluginScope::Global,
+            None,
+            serde_json::json!({}),
+        ),
+        serde_json::json!({"match": {"method": ["POST"]}}),
+    );
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("llm", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![
+            catalog_plugin(
+                "mcp-1",
+                "mcp_gateway",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            conditional,
+            catalog_plugin(
+                "shield-enforcing",
+                "ai_semantic_firewall",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+        ],
+        ..Default::default()
+    };
+
+    assert!(evaluate_policies(&cfg, &ai_policies()).is_empty());
+}
+
+#[test]
+fn require_ai_guardrails_rejects_a_triggered_scoped_replacement() {
+    let scoped = with_trigger(
+        catalog_plugin(
+            "shield-scoped",
+            "ai_prompt_shield",
+            PluginScope::Proxy,
+            Some("llm"),
+            serde_json::json!({}),
+        ),
+        serde_json::json!({"match": {"method": ["POST"]}}),
+    );
+    let cfg = GatewayConfig {
+        proxies: vec![attach(
+            proxy("llm", BackendScheme::Https, 30_000, true),
+            &["shield-scoped"],
+        )],
+        plugin_configs: vec![
+            catalog_plugin(
+                "mcp-1",
+                "mcp_gateway",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            catalog_plugin(
+                "shield-global",
+                "ai_prompt_shield",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            scoped,
+        ],
+        ..Default::default()
+    };
+
+    let findings = evaluate_policies(&cfg, &ai_policies());
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].is_blocking());
+    assert!(findings[0].message.contains("shield-scoped"));
+    assert!(!findings[0].message.contains("shield-global"));
+}
+
+#[test]
 fn require_ai_guardrails_accepts_an_enforcing_companion_to_a_dry_run_guardrail() {
     let cfg = GatewayConfig {
         proxies: vec![proxy("llm", BackendScheme::Https, 30_000, true)],

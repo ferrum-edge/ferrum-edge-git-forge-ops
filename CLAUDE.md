@@ -1030,7 +1030,8 @@ gateway, as `Vec<ApplyBlocker>` over ten `BlockerKind`s:
   `policy_blocker`, `required_credentials_blocker`, `validation_blocker`,
   `credential_provisioning_blockers`) at its own gate points, because order
   matters: the security audit and the policy gate must refuse before the state
-  lock and bundle read (both evaluate the unresolved document `plan` previews),
+  lock and bundle read (the policy gate evaluates the unresolved document, as
+  the security audit sees it),
   the required-slot check before the first gateway call. Share predicates, not
   control flow.
 

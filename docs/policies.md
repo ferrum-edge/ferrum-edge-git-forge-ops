@@ -159,7 +159,10 @@ default 1). The security audit runs the same check.
 
 A proxy carrying AI traffic (any `ai_*` plugin, `mcp_gateway` or
 `a2a_gateway`) must also carry an enforcing content guardrail from
-`guardrail_plugin_names`, not a dry-run or warn-only one.
+`guardrail_plugin_names`. A guardrail with a `trigger` only runs for matching
+requests, so it does not satisfy the requirement unless an unconditional
+enforcing guardrail is also effective on that proxy. Dry-run and warn-only
+guardrails likewise do not satisfy the requirement.
 
 ### `rate_limit_completeness`
 

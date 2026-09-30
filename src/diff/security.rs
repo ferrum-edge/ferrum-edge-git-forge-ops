@@ -232,7 +232,7 @@ fn check_proxy(
             &proxy.id,
             &proxy.namespace,
             format!(
-                "proxy {} in namespace {} is authenticated by {} plugin {}, which carries a trigger — requests the trigger does not match are served unauthenticated; drop the trigger to authenticate every request",
+                "proxy {} in namespace {} has a conditional {} plugin {}, which carries a trigger — requests the trigger does not match are served unauthenticated; drop the trigger to authenticate every request",
                 proxy.id, proxy.namespace, plugin.plugin_name, plugin.id
             ),
         ));
