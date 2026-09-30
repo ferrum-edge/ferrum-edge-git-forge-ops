@@ -491,11 +491,7 @@ fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {
     )
     .unwrap();
     std::fs::write(repo.path(".gitforgeops/policies.yaml"), REQUIRE_AUTH_POLICY).unwrap();
-    std::fs::write(
-        &repo.validator,
-        "#!/bin/sh\ntouch validator-ran\nexit 0\n",
-    )
-    .unwrap();
+    std::fs::write(&repo.validator, "#!/bin/sh\ntouch validator-ran\nexit 0\n").unwrap();
     set_executable(&repo.validator);
 
     let output = repo.run(
@@ -507,7 +503,10 @@ fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("unresolved policy violations"), "{stderr}");
-    assert!(!repo.path("validator-ran").exists(), "validator was invoked");
+    assert!(
+        !repo.path("validator-ran").exists(),
+        "validator was invoked"
+    );
     assert!(!repo.path("assembled/resources.yaml").exists());
     assert!(!repo.path("assembled/mesh.yaml").exists());
     repo.assert_no_state("conditional authenticator policy refusal");
