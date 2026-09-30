@@ -6,9 +6,8 @@ use crate::plugin_catalog::{
     allows_uninspectable_body, auth_coverage, cfg_array, cfg_bool, cfg_str, effective_scheme,
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
     plugin_instance_list, proxy_transport, retired_replacement, scheme_is_tls,
-    waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body,
-    AuthAllowlist, AuthCoverage, RetiredRemediation, RETIRED_PLUGIN_NAMES,
-    STREAM_AUTH_PLUGIN_NAMES,
+    waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body, AuthAllowlist,
+    AuthCoverage, RetiredRemediation, RETIRED_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
 };
 use crate::policy::config::effective_auth_allowlist;
 use crate::policy::PolicyConfig;

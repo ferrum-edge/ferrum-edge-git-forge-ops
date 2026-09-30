@@ -2428,7 +2428,9 @@ fn require_auth_plugin_does_not_count_authenticators_on_http_passthrough() {
     assert!(security_findings.iter().any(|finding| {
         finding.kind == "Proxy"
             && finding.severity == "warning"
-            && finding.message.contains("No auth plugin counts on HTTP proxy api")
+            && finding
+                .message
+                .contains("No auth plugin counts on HTTP proxy api")
             && finding.message.contains("key_auth (key-1)")
     }));
     assert!(security_findings.iter().any(|finding| {
@@ -2440,7 +2442,10 @@ fn require_auth_plugin_does_not_count_authenticators_on_http_passthrough() {
     let ordinary_security_findings =
         gitforgeops::diff::security::audit_security_with_policy(&ordinary, Some(&policies));
     assert!(!ordinary_security_findings.iter().any(|finding| {
-        finding.kind == "Proxy" && finding.message.contains("No auth plugin counts on HTTP proxy")
+        finding.kind == "Proxy"
+            && finding
+                .message
+                .contains("No auth plugin counts on HTTP proxy")
     }));
 }
 
