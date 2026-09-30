@@ -236,12 +236,7 @@ fn check_proxy(
                 format!("{message}{exemption_note}"),
             )
         } else {
-            SecurityFinding::warning(
-                "Proxy",
-                &proxy.id,
-                &proxy.namespace,
-                message,
-            )
+            SecurityFinding::warning("Proxy", &proxy.id, &proxy.namespace, message)
         });
     }
 

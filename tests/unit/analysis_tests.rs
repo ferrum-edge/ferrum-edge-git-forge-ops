@@ -205,8 +205,10 @@ fn conditional_auth_exemption_downgrades_security_findings_with_exact_identity()
         ..Default::default()
     };
     let mut policy = PolicyConfig::default();
-    policy.policies.require_auth_plugin.conditional_auth_exemptions =
-        vec!["ferrum/p1".to_string()];
+    policy
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/p1".to_string()];
 
     let findings = audit_security_with_policy(&cfg, Some(&policy));
     let exempt = findings

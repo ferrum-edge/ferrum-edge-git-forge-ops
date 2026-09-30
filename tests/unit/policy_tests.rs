@@ -2754,12 +2754,14 @@ fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
             && finding.namespace == "ferrum"
             && finding.message.contains("exemption 'ferrum/api'")
     }));
-    assert!(!findings.iter().any(|finding| {
-        finding.kind == "PolicyConfig" && finding.message.contains("stale")
-    }));
+    assert!(!findings
+        .iter()
+        .any(|finding| { finding.kind == "PolicyConfig" && finding.message.contains("stale") }));
 
-    policies.policies.require_auth_plugin.conditional_auth_exemptions =
-        vec!["ferrum/missing".to_string()];
+    policies
+        .policies
+        .require_auth_plugin
+        .conditional_auth_exemptions = vec!["ferrum/missing".to_string()];
     let stale = evaluate_policies(&cfg, &policies);
     assert!(stale.iter().any(|finding| {
         finding.kind == "PolicyConfig"
