@@ -112,7 +112,9 @@ fn stream_path_parameter_opt_in_reaches_edge_validator_rejection() {
         result.stdout
     );
     assert!(
-        result.stderr.contains("allow_path_parameters must be false"),
+        result
+            .stderr
+            .contains("allow_path_parameters must be false"),
         "{}",
         result.stderr
     );

@@ -1029,12 +1029,8 @@ async fn api_apply_batch_payload_carries_proxy_path_parameter_opt_in() {
         proxies: vec![matrix_proxy],
         ..GatewayConfig::default()
     };
-    let (url, requests) = spawn_recording_gateway(vec![(
-        "POST /batch".into(),
-        200,
-        "{}".into(),
-        vec![],
-    )]);
+    let (url, requests) =
+        spawn_recording_gateway(vec![("POST /batch".into(), 200, "{}".into(), vec![])]);
 
     let result = apply_api(
         &desired,

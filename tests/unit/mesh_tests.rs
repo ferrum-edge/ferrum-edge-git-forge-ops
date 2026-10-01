@@ -171,11 +171,12 @@ spec:
     );
 
     let mesh = mesh_from(tmp.path()).expect("mesh document");
-    assert!(mesh.services[0]["allow_path_parameters"]
-        .as_bool()
-        .unwrap());
+    assert!(mesh.services[0]["allow_path_parameters"].as_bool().unwrap());
     let published = render_mesh_yaml(&mesh).unwrap();
-    assert!(published.contains("allow_path_parameters: true"), "{published}");
+    assert!(
+        published.contains("allow_path_parameters: true"),
+        "{published}"
+    );
 }
 
 #[test]
