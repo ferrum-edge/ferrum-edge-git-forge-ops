@@ -88,6 +88,35 @@ ADMIN_API_WORKFLOWS = (
     "rotate.yml",
     "trusted-pr-review.yml",
 )
+# Ferrum Edge's second signing key. The gateway authorizes every token signed
+# with it as `viewer` whatever the token claims, and `gitforgeops diff` reads
+# `GET /config/export` with it when it is set (never touching the admin key).
+# Least privilege runs both ways: only scheduled monitoring compares without
+# writing, so only `drift-check.yml` may bind it. `plan`, `review` and `apply`
+# need `/backup` and cannot use it, and a reconciling job has no reason to hold
+# a second gateway key.
+VIEWER_JWT_SECRET = "FERRUM_ADMIN_JWT_VIEWER_SECRET"
+VIEWER_JWT_SECRET_BINDING = (
+    "FERRUM_ADMIN_JWT_VIEWER_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}"
+)
+VIEWER_JWT_SECRET_REFERENCE = re.compile(r"\bsecrets\.FERRUM_ADMIN_JWT_VIEWER_SECRET\b")
+ADMIN_JWT_SECRET_REFERENCE = re.compile(r"\bsecrets\.FERRUM_ADMIN_JWT_SECRET\b")
+VIEWER_JWT_WORKFLOW_PATHS = (f".github/workflows/{MONITORING_WORKFLOW}",)
+# The viewer key's tokens carry the configured issuer, audience and TTL; the
+# role claim is always `viewer`, so `FERRUM_ADMIN_JWT_ROLE` does not apply.
+VIEWER_JWT_OPTIONAL_SETTINGS = (
+    "FERRUM_ADMIN_JWT_ISSUER",
+    "FERRUM_ADMIN_JWT_AUDIENCE",
+    "FERRUM_ADMIN_JWT_TTL_SECS",
+)
+# TRANSITIONAL (#440, step 1 of 2). The monitoring workflow may bind the viewer
+# key, and may still bind the admin key while the workflow change lands in its
+# own PR (this checker judges every PR from the default branch, so a PR that
+# changed both the rule and the workflow would be judged by the old rule).
+# Binding both is reported as a warning, not a violation. Step 2 binds the
+# viewer key in `drift-check.yml`, drops the admin key from this tuple, and
+# makes "admin secret in drift-check" a violation.
+MONITORING_JWT_SECRET_BINDINGS = (VIEWER_JWT_SECRET_BINDING, ADMIN_JWT_SECRET_BINDING)
 # The revision a recorded credential allocation is bound to, which lets the
 # retry of a failed apply keep the slots it already wrote. It must be the
 # triggering merge: the applied head moves when the failed attempt pushes its
@@ -385,22 +414,52 @@ def admin_jwt_binding_violations(workflow: str, text: str) -> list[str]:
     """
     violations: list[str] = []
     for step in STEP_SPLIT.split(text):
-        if ADMIN_JWT_SECRET_BINDING not in step:
-            continue
         name_match = STEP_NAME.search(step)
         name = name_match.group(1) if name_match else "<unnamed step>"
-        missing = [
-            setting
-            for setting in ADMIN_JWT_OPTIONAL_SETTINGS
-            if f"{setting}: ${{{{ secrets.{setting} }}}}" not in step
-        ]
-        if missing:
-            violations.append(
-                f"{workflow}: step {name!r} binds FERRUM_ADMIN_JWT_SECRET but not "
-                f"{', '.join(missing)}; a documented per-environment secret that "
-                "never reaches the process is a 401 the operator cannot explain"
-            )
+        for binding, secret, settings in (
+            (ADMIN_JWT_SECRET_BINDING, "FERRUM_ADMIN_JWT_SECRET", ADMIN_JWT_OPTIONAL_SETTINGS),
+            (VIEWER_JWT_SECRET_BINDING, VIEWER_JWT_SECRET, VIEWER_JWT_OPTIONAL_SETTINGS),
+        ):
+            if binding not in step:
+                continue
+            missing = [
+                setting
+                for setting in settings
+                if f"{setting}: ${{{{ secrets.{setting} }}}}" not in step
+            ]
+            if missing:
+                violations.append(
+                    f"{workflow}: step {name!r} binds {secret} but not "
+                    f"{', '.join(missing)}; a documented per-environment secret that "
+                    "never reaches the process is a 401 the operator cannot explain"
+                )
     return violations
+
+
+def admin_api_jwt_bindings(workflow: str) -> tuple[str, ...]:
+    """The signing-key bindings that satisfy one admin-API workflow.
+
+    Monitoring may authenticate with the viewer key (or, until step 2 of #440,
+    the admin key); every other admin-API workflow needs the admin key.
+    """
+    if workflow == MONITORING_WORKFLOW:
+        return MONITORING_JWT_SECRET_BINDINGS
+    return (ADMIN_JWT_SECRET_BINDING,)
+
+
+def viewer_jwt_scope_violations(workflow: str, text: str) -> list[str]:
+    """Only scheduled monitoring may hold the viewer-capped signing key.
+
+    `workflow` is the path relative to the repository root, so a composite
+    action or a second file named like the monitoring workflow is refused too.
+    """
+    if workflow in VIEWER_JWT_WORKFLOW_PATHS or not VIEWER_JWT_SECRET_REFERENCE.search(text):
+        return []
+    return [
+        f"{workflow}: only {MONITORING_WORKFLOW} may bind {VIEWER_JWT_SECRET}; "
+        "plan, review and apply read GET /backup and cannot use it, and a job "
+        "that does not compare must not hold a second gateway key"
+    ]
 
 
 def allocation_revision_binding_violations(workflow: str, text: str) -> list[str]:
@@ -730,6 +789,25 @@ def monitoring_workflow_violations(text: str) -> list[str]:
             "cannot be reported as in sync"
         )
     return violations
+
+
+def monitoring_jwt_warnings(text: str) -> list[str]:
+    """TRANSITIONAL (#440): binding both gateway keys in monitoring is a warning.
+
+    With the viewer key set, `diff` reads `GET /config/export` with it and never
+    uses the admin key, so a monitoring job holding both carries write-equivalent
+    gateway authority it does not use. Step 2 of #440 binds only the viewer key
+    in `drift-check.yml` and turns any admin-key binding there into a violation.
+    """
+    if VIEWER_JWT_SECRET_REFERENCE.search(text) and ADMIN_JWT_SECRET_REFERENCE.search(text):
+        return [
+            f"{MONITORING_WORKFLOW}: binds both {VIEWER_JWT_SECRET} and "
+            "FERRUM_ADMIN_JWT_SECRET; diff reads with the viewer key whenever it "
+            "is set, so the admin key is unused write-equivalent authority. Drop "
+            "FERRUM_ADMIN_JWT_SECRET: step 2 of #440 makes binding it in "
+            f"{MONITORING_WORKFLOW} a violation"
+        ]
+    return []
 
 
 def trusted_classifier_violations(
@@ -1608,6 +1686,9 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(
             admin_jwt_binding_violations(str(workflow.relative_to(root)), text)
         )
+        violations.extend(
+            viewer_jwt_scope_violations(workflow.relative_to(root).as_posix(), text)
+        )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
                 f"{workflow.relative_to(root)}: download must go through install-ferrum-edge.sh"
@@ -1779,11 +1860,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"{privileged_workflow}: state commits must not suppress required checks with [skip ci]"
             )
 
-    violations.extend(
-        monitoring_workflow_violations(
-            (workflows / MONITORING_WORKFLOW).read_text(encoding="utf-8")
-        )
-    )
+    monitoring_text = (workflows / MONITORING_WORKFLOW).read_text(encoding="utf-8")
+    violations.extend(monitoring_workflow_violations(monitoring_text))
+    warnings = monitoring_jwt_warnings(monitoring_text)
 
     for state_writer_workflow in ("apply-on-merge.yml", "rotate.yml"):
         violations.extend(
@@ -1799,10 +1878,12 @@ def main(argv: list[str] | None = None) -> int:
     # default — is caught here rather than at 2am against a live gateway.
     for admin_api_workflow in ADMIN_API_WORKFLOWS:
         text = (workflows / admin_api_workflow).read_text(encoding="utf-8")
-        if ADMIN_JWT_SECRET_BINDING not in text:
+        accepted = admin_api_jwt_bindings(admin_api_workflow)
+        if not any(binding in text for binding in accepted):
             violations.append(
                 f"{admin_api_workflow}: an admin-API workflow must bind "
-                f"{ADMIN_JWT_SECRET_BINDING!r} from the selected GitHub Environment"
+                f"{' or '.join(repr(binding) for binding in accepted)} from the "
+                "selected GitHub Environment"
             )
 
     for fresh_head_workflow, contract in FRESH_HEAD_WORKFLOWS.items():
@@ -2124,6 +2205,10 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(digest_allowlist_violations(allowlist_text))
     approved_digests = allowlisted_validator_digests(allowlist_text)
 
+    # Warnings name a transitional state the policy still accepts. They are
+    # GitHub annotations on stdout, so they never read as a violation line.
+    for warning in warnings:
+        print(f"::warning::{warning}")
     if violations:
         print("Supply-chain policy violations:", file=sys.stderr)
         for violation in violations:

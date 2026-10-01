@@ -601,6 +601,61 @@ class MonitoringEnvironmentTests(unittest.TestCase):
                     audit.violations,
                 )
 
+    def _with_monitoring_secrets(self, *names):
+        responses = monitoring_responses()
+        responses[
+            "repos/acme/repo/environments/production-monitor/secrets?per_page=100"
+        ] = [
+            {
+                "total_count": len(names),
+                "secrets": [{"name": name} for name in names],
+            }
+        ]
+        return responses
+
+    def test_monitoring_may_hold_the_viewer_capped_key(self):
+        self.assertNotIn(
+            audit_settings.MONITORING_VIEWER_JWT_SECRET,
+            audit_settings.MONITORING_FORBIDDEN_SECRETS,
+        )
+        self.assertFalse(
+            audit_settings.MONITORING_VIEWER_JWT_SECRET.startswith(
+                audit_settings.MONITORING_FORBIDDEN_SECRET_PREFIXES
+            )
+        )
+        audit = self.run_audit(
+            self._with_monitoring_secrets(
+                "FERRUM_GATEWAY_URL", "FERRUM_ADMIN_JWT_VIEWER_SECRET"
+            )
+        )
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(audit.warnings, [])
+        self.assertIn(
+            "environment production-monitor: holds the viewer-capped "
+            "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+            audit.evidence,
+        )
+
+    def test_monitoring_on_the_admin_key_alone_is_still_accepted(self):
+        # TRANSITIONAL (#440): the shipped drift-check.yml still binds the
+        # admin key until step 2 moves it to the viewer key.
+        audit = self.run_audit(monitoring_responses())
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(audit.warnings, [])
+
+    def test_monitoring_holding_both_keys_is_a_warning_not_a_violation(self):
+        audit = self.run_audit(
+            self._with_monitoring_secrets(
+                "FERRUM_GATEWAY_URL",
+                "FERRUM_ADMIN_JWT_SECRET",
+                "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+            )
+        )
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(len(audit.warnings), 1, audit.warnings)
+        self.assertIn("'production-monitor' holds both", audit.warnings[0])
+        self.assertIn("remove FERRUM_ADMIN_JWT_SECRET", audit.warnings[0])
+
     def test_monitoring_still_needs_its_branch_policy(self):
         responses = monitoring_responses()
         responses["repos/acme/repo/environments/production-monitor"] = {

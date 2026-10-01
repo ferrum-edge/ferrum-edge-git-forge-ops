@@ -320,11 +320,26 @@ and `GET /config/export` serves a fingerprinted snapshot to that role.
 `gitforgeops diff` already reads that way when `FERRUM_ADMIN_JWT_VIEWER_SECRET`
 is set (see
 [Reading with a viewer-capped credential](../README.md#reading-with-a-viewer-capped-credential)).
-Moving the monitoring environment to it means binding that secret in
-`drift-check.yml` instead of the admin one, and updating the trusted
-supply-chain checker and settings audit to require it; that is a separate,
-policy-reviewed change. Unless the gateway also sets
-`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer key reads every namespace.
+Unless the gateway also sets `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer
+key reads every namespace.
+
+**Moving monitoring to the viewer key (#440).** The trusted checker judges
+every PR with the default branch's copy, so the move lands in two PRs:
+
+1. *Policy (done).* `check_supply_chain.py` accepts
+   `FERRUM_ADMIN_JWT_VIEWER_SECRET` as the signing-key binding of
+   `drift-check.yml`, and refuses it in every other workflow or composite
+   action: `plan`, `review` and `apply` read `GET /backup` and cannot use it.
+   A step that binds it must also bind `FERRUM_ADMIN_JWT_ISSUER`, `_AUDIENCE`
+   and `_TTL_SECS` (the role claim is always `viewer`). For now
+   `drift-check.yml` may still bind `FERRUM_ADMIN_JWT_SECRET`; binding both
+   keys is a warning, not a violation. `audit_settings.py` accepts either key
+   in a `<env>-monitor` environment and warns when it holds both.
+2. *Workflow (next).* `drift-check.yml` binds the viewer key and drops the
+   admin key, and the checker then makes the admin key in `drift-check.yml` a
+   violation. Add `FERRUM_ADMIN_JWT_VIEWER_SECRET` to each `<env>-monitor`
+   environment before step 2 merges, and remove its `FERRUM_ADMIN_JWT_SECRET`
+   after.
 
 ### 3.2 Monitoring outcomes
 
