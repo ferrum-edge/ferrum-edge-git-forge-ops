@@ -78,6 +78,33 @@ pub enum Commands {
         exit_on_drift: bool,
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
         format: ReportFormat,
+        /// Compare the secret fingerprints of `GET /config/export` with this
+        /// baseline file and report every declared resource's secret that
+        /// changed since. Needs `FERRUM_ADMIN_JWT_VIEWER_SECRET`. A missing
+        /// file means no baseline yet. Keep the file outside the repository.
+        #[arg(long, value_name = "PATH")]
+        fingerprint_baseline: Option<String>,
+        /// Record this run's export fingerprints in this file (other
+        /// namespaces already in it are kept). Needs
+        /// `FERRUM_ADMIN_JWT_VIEWER_SECRET`; refused when the export was
+        /// served from cache. May name the same file as
+        /// `--fingerprint-baseline`, which is read first.
+        #[arg(long, value_name = "PATH")]
+        write_fingerprint_baseline: Option<String>,
+        /// With `--write-fingerprint-baseline`, record the baseline even when
+        /// this run found differences or secret changes. Without it, such a
+        /// run refuses to record, because the baseline would carry the drift
+        /// forward.
+        #[arg(long)]
+        force_baseline: bool,
+        /// With `--exit-on-drift`, return the in-sync result (0) even though
+        /// fingerprinted secrets could not be verified (no complete
+        /// fingerprint baseline, or the gateway's fingerprint key changed).
+        /// Without it, such a run exits 1 as non-authoritative. Drift found
+        /// on a fresh read exits 2 either way; a cached read always exits 1,
+        /// and so does a whole value fingerprinted around a secret.
+        #[arg(long)]
+        accept_unverified_secrets: bool,
     },
     Plan {
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]

@@ -465,3 +465,21 @@ fn provisioning_blockers_require_pending_allocations_and_missing_capability() {
         }
     }
 }
+
+#[test]
+fn secret_fingerprint_changes_are_managed_modifications() {
+    let alert = defaults();
+    let none = DriftVerdict::evaluate(&alert, &[], &[], &[]).with_secret_changes(&alert, 0);
+    assert!(!none.has_drift());
+
+    let changed = DriftVerdict::evaluate(&alert, &[], &[], &[]).with_secret_changes(&alert, 2);
+    assert!(changed.secrets_changed);
+    assert_eq!(changed.exit_code(), DRIFT_EXIT_CODE);
+    let reasons = changed.reasons();
+    assert!(reasons.iter().any(|r| r.contains("fingerprint baseline")));
+
+    // The managed_modified flag mutes secret changes too.
+    let alert = all_muted();
+    let muted = DriftVerdict::evaluate(&alert, &[], &[], &[]).with_secret_changes(&alert, 2);
+    assert!(!muted.has_drift());
+}

@@ -334,6 +334,10 @@ pub struct DriftVerdict {
     pub unmanaged_added: bool,
     /// A live `api_spec_id`-tagged resource is also declared in this repo.
     pub spec_conflicts: bool,
+    /// A declared resource's fingerprinted secret changed since the
+    /// `GET /config/export` fingerprint baseline. A managed modification, so
+    /// it honors the same `drift_alert_on` flag.
+    pub secrets_changed: bool,
 }
 
 impl DriftVerdict {
@@ -355,11 +359,24 @@ impl DriftVerdict {
             // Informational spec-owned rows — ones the repo does not declare —
             // are a stable steady state and stay non-blocking.
             spec_conflicts: spec_owned.iter().any(|s| s.is_conflict()),
+            secrets_changed: false,
         }
     }
 
+    /// Fold in the secret fingerprint changes found against a baseline
+    /// (`diff --fingerprint-baseline`). They count when
+    /// `drift_alert_on.managed_modified` is on.
+    pub fn with_secret_changes(mut self, alert: &DriftAlertOn, changes: usize) -> Self {
+        self.secrets_changed = alert.managed_modified && changes > 0;
+        self
+    }
+
     pub fn has_drift(&self) -> bool {
-        self.managed_modified || self.managed_deleted || self.unmanaged_added || self.spec_conflicts
+        self.managed_modified
+            || self.managed_deleted
+            || self.unmanaged_added
+            || self.spec_conflicts
+            || self.secrets_changed
     }
 
     /// `0` when in sync, [`DRIFT_EXIT_CODE`] otherwise. The only mapping;
@@ -387,6 +404,9 @@ impl DriftVerdict {
         }
         if self.spec_conflicts {
             reasons.push("API-spec ownership conflicts");
+        }
+        if self.secrets_changed {
+            reasons.push("managed secrets changed since the fingerprint baseline");
         }
         reasons
     }

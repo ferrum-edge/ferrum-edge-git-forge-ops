@@ -1273,3 +1273,413 @@ fn label_live_fixture(live: &mut serde_json::Value) {
         }
     }
 }
+
+// --- Viewer credential: GET /config/export ------------------------------------
+
+/// Signing key for viewer-credential runs. The stub ignores the token.
+const VIEWER_SECRET: &str = "diff-exit-test-viewer-secret-32-chars";
+
+const EXPORT_KEY_ID: &str = "0123456789abcdef";
+
+/// Repository consumer with a brokered keyauth key. No bundle is loaded, so
+/// the key stays an unresolved placeholder, as in the drift check.
+const KEYAUTH_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app"
+  credentials:
+    keyauth: [{key: "${gh-env-secret:alloc=require}"}]
+"#;
+
+fn fingerprint(digit: char) -> String {
+    format!("hmac-sha256:{}", digit.to_string().repeat(64))
+}
+
+/// One `GET /config/export` document for namespace `ferrum`: Consumer `app`
+/// with one fingerprinted keyauth key per digit.
+fn config_export(key_id: &str, keys: &[char]) -> String {
+    let keyauth: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|digit| serde_json::json!({ "key": fingerprint(*digit) }))
+        .collect();
+    serde_json::json!({
+        "version": "1",
+        "ferrum_version": "0.9.9",
+        "source": "database",
+        "namespace": "ferrum",
+        "redaction": {
+            "fingerprint_algorithm": "hmac-sha256",
+            "fingerprint_prefix": "hmac-sha256:",
+            "fingerprint_key_id": key_id,
+        },
+        "counts": { "proxies": 0, "consumers": 1, "plugin_configs": 0, "upstreams": 0 },
+        "proxies": [],
+        "consumers": [{
+            "id": "app",
+            "namespace": "ferrum",
+            "username": "app",
+            "labels": { "provisioned-by": "ferrum-edge-git-forge-ops" },
+            "credentials": { "keyauth": keyauth },
+            "hidden_credentials_fingerprint": fingerprint('f'),
+        }],
+        "plugin_configs": [],
+        "upstreams": [],
+    })
+    .to_string()
+}
+
+/// A repository whose `ferrum` namespace is served as `export`.
+fn export_repo(export: String, cached: bool) -> Repo {
+    Repo::with_cache(
+        &[("resources/ferrum/consumers/app.yaml", KEYAUTH_CONSUMER)],
+        vec![("ferrum".to_string(), export)],
+        cached,
+    )
+}
+
+/// The viewer secret set and the admin secret blanked (blank reads as unset),
+/// so a request that needed the admin credential could not be made.
+const VIEWER_ONLY: [(&str, &str); 2] = [
+    ("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET),
+    ("FERRUM_ADMIN_JWT_SECRET", ""),
+];
+
+#[test]
+fn a_viewer_diff_reads_the_export_and_does_not_call_unverified_secrets_in_sync() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+
+    // Unverified secrets make --exit-on-drift non-authoritative, like a cache.
+    let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("Fingerprinted secret fields were not verified"));
+    assert!(stderr(&output).contains("cannot compute the fingerprint"));
+    assert!(stderr(&output).contains("requires every declared secret to be verified"));
+    assert!(!stdout(&output).contains("Configuration is in sync."));
+
+    let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&accepted, &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let output = repo.run_with_env(&["diff", "--format", "json"], &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["in_sync"], false);
+    assert_eq!(report["live_source"], "config_export");
+    assert_eq!(report["secret_fingerprints"]["verified"], false);
+
+    let requests = repo.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    for request in requests.iter() {
+        assert!(request.starts_with("GET /config/export "), "{request}");
+    }
+}
+
+#[test]
+fn a_viewer_diff_still_reports_a_credential_the_repository_does_not_declare() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a', 'b']), false);
+
+    // Drift found on a fresh read is real: it keeps the drift exit code even
+    // though the declared key itself stays unverified.
+    let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+
+    assert_drift_exit(&output);
+    let out = stdout(&output);
+    assert!(out.contains("MODIFY Consumer app (ferrum)"), "{out}");
+    assert!(out.contains("credentials: [REDACTED] -> [REDACTED]"));
+    assert!(!out.contains("hmac-sha256:"), "{out}");
+    assert!(!stderr(&output).contains("requires every declared secret"));
+
+    let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
+    assert_drift_exit(&repo.run_with_env(&accepted, &VIEWER_ONLY));
+}
+
+#[test]
+fn drift_in_a_cached_export_is_still_not_authoritative() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a', 'b']), true);
+
+    let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("requires an authoritative configuration export"));
+}
+
+#[test]
+fn a_fingerprint_baseline_detects_a_secret_changed_between_exports() {
+    let baseline_dir = TempDir::new().unwrap();
+    let baseline = baseline_dir.path().join("fingerprints.json");
+    let path = baseline.to_str().unwrap();
+
+    let recorded = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+    let write = ["diff", "--write-fingerprint-baseline", path];
+    let first = recorded.run_with_env(&write, &VIEWER_ONLY);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    assert!(baseline.exists());
+    assert!(stderr(&first).contains("Recorded secret fingerprints for 1 namespace(s)"));
+
+    let compare = ["diff", "--exit-on-drift", "--fingerprint-baseline", path];
+    let unchanged = recorded.run_with_env(&compare, &VIEWER_ONLY);
+    assert_eq!(unchanged.status.code(), Some(0), "{}", stderr(&unchanged));
+    assert!(stdout(&unchanged).contains("Configuration is in sync."));
+
+    let rotated = export_repo(config_export(EXPORT_KEY_ID, &['c']), false);
+    let changed = rotated.run_with_env(&compare, &VIEWER_ONLY);
+    assert_drift_exit(&changed);
+    let out = stdout(&changed);
+    assert!(
+        out.contains("CHANGED Consumer app (ferrum) /credentials/keyauth/0/key"),
+        "{out}"
+    );
+    assert!(out.contains("managed secrets changed since the fingerprint baseline"));
+
+    let rekeyed = export_repo(config_export("fedcba9876543210", &['c']), false);
+    let not_comparable = rekeyed.run_with_env(&compare, &VIEWER_ONLY);
+    assert_eq!(not_comparable.status.code(), Some(1));
+    assert!(stderr(&not_comparable).contains("fingerprint key changed"));
+    assert!(stderr(&not_comparable).contains("requires every declared secret to be verified"));
+    assert!(stdout(&not_comparable).contains("were not verified"));
+}
+
+#[test]
+fn a_baseline_is_not_recorded_from_a_drifted_run_without_force() {
+    let baseline_dir = TempDir::new().unwrap();
+    let baseline = baseline_dir.path().join("fingerprints.json");
+    let next = baseline_dir.path().join("next.json");
+    let path = baseline.to_str().unwrap();
+    let next_path = next.to_str().unwrap();
+
+    let recorded = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+    let write = ["diff", "--write-fingerprint-baseline", path];
+    let first = recorded.run_with_env(&write, &VIEWER_ONLY);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+
+    let rotated = export_repo(config_export(EXPORT_KEY_ID, &['c']), false);
+    let rewrite = [
+        "diff",
+        "--fingerprint-baseline",
+        path,
+        "--write-fingerprint-baseline",
+        next_path,
+    ];
+    let refused = rotated.run_with_env(&rewrite, &VIEWER_ONLY);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("refusing to write a fingerprint baseline"));
+    assert!(stdout(&refused).contains("CHANGED Consumer app (ferrum)"));
+    assert!(!next.exists());
+
+    let mut forced = rewrite.to_vec();
+    forced.push("--force-baseline");
+    let output = rotated.run_with_env(&forced, &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(next.exists());
+}
+
+#[test]
+fn a_baseline_inside_the_worktree_is_warned_about() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+    std::fs::create_dir(repo.dir.path().join(".git")).unwrap();
+
+    let args = ["diff", "--fingerprint-baseline", "fingerprints.json"];
+    let output = repo.run_with_env(&args, &VIEWER_ONLY);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("is inside the git worktree"));
+}
+
+#[test]
+fn a_credential_less_consumer_is_not_in_sync_without_a_baseline() {
+    // Edge hides basicauth and custom credentials behind one fingerprint per
+    // consumer, so a credential added out of band to a consumer the
+    // repository declares without credentials is invisible to a comparison.
+    let consumer = "kind: Consumer\nspec:\n  id: \"app\"\n  username: \"app\"\n";
+    let export = serde_json::json!({
+        "version": "1",
+        "ferrum_version": "0.9.9",
+        "source": "database",
+        "namespace": "ferrum",
+        "redaction": {
+            "fingerprint_algorithm": "hmac-sha256",
+            "fingerprint_prefix": "hmac-sha256:",
+            "fingerprint_key_id": EXPORT_KEY_ID,
+        },
+        "counts": { "proxies": 0, "consumers": 1, "plugin_configs": 0, "upstreams": 0 },
+        "proxies": [],
+        "consumers": [{
+            "id": "app",
+            "namespace": "ferrum",
+            "username": "app",
+            "labels": { "provisioned-by": "ferrum-edge-git-forge-ops" },
+            "credentials": {},
+            "hidden_credentials_fingerprint": fingerprint('9'),
+        }],
+        "plugin_configs": [],
+        "upstreams": [],
+    })
+    .to_string();
+    let repo = Repo::new(
+        &[("resources/ferrum/consumers/app.yaml", consumer)],
+        vec![("ferrum".to_string(), export)],
+    );
+
+    let output = repo.run_with_env(&["diff", "--format", "json"], &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["in_sync"], false);
+    assert_eq!(report["diff_count"], 0);
+    assert_eq!(report["secret_fingerprints"]["verified"], false);
+    assert_eq!(report["secret_fingerprints"]["uncompared_fields"], 1);
+
+    let text = repo.run_with_env(&["diff"], &VIEWER_ONLY);
+    assert!(!stdout(&text).contains("Configuration is in sync."));
+    let strict = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+    assert_eq!(strict.status.code(), Some(1));
+}
+
+#[test]
+fn a_cached_export_is_never_reported_as_in_sync_or_recorded() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), true);
+    let baseline_dir = TempDir::new().unwrap();
+    let baseline = baseline_dir.path().join("fingerprints.json");
+    let path = baseline.to_str().unwrap();
+
+    let strict = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+    assert_eq!(strict.status.code(), Some(1));
+    assert!(stderr(&strict).contains("requires an authoritative configuration export"));
+
+    let write = ["diff", "--write-fingerprint-baseline", path];
+    let refused = repo.run_with_env(&write, &VIEWER_ONLY);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("refusing to write a fingerprint baseline"));
+    assert!(!baseline.exists());
+
+    let report = repo.run_with_env(&["diff"], &VIEWER_ONLY);
+    assert_eq!(report.status.code(), Some(0));
+    assert!(stderr(&report).contains("approximate"));
+    assert!(stdout(&report).contains("Authoritative sync status is unavailable"));
+}
+
+#[test]
+fn without_a_viewer_secret_diff_falls_back_to_the_admin_backup() {
+    let repo = Repo::new(
+        &[("resources/ferrum/consumers/app.yaml", KEYAUTH_CONSUMER)],
+        vec![("ferrum".to_string(), backup(serde_json::json!([])))],
+    );
+
+    let refused = repo.run(&["diff", "--fingerprint-baseline", "fingerprints.json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("need FERRUM_ADMIN_JWT_VIEWER_SECRET"));
+    for flag in ["--force-baseline", "--accept-unverified-secrets"] {
+        let refused = repo.run(&["diff", "--exit-on-drift", flag]);
+        assert_eq!(refused.status.code(), Some(1), "{flag}");
+        assert!(stderr(&refused).contains("need FERRUM_ADMIN_JWT_VIEWER_SECRET"));
+    }
+    assert!(repo.requests.lock().unwrap().is_empty());
+
+    let report = repo.run(&["diff"]);
+    assert_eq!(report.status.code(), Some(0), "{}", stderr(&report));
+    let requests = repo.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    for request in requests.iter() {
+        assert!(request.starts_with("GET /backup "), "{request}");
+    }
+}
+
+/// One `GET /config/export` document for namespace `ferrum` holding plugin
+/// `otel` with `config`.
+fn plugin_export(config: serde_json::Value) -> String {
+    serde_json::json!({
+        "version": "1",
+        "ferrum_version": "0.9.9",
+        "source": "database",
+        "namespace": "ferrum",
+        "redaction": {
+            "fingerprint_algorithm": "hmac-sha256",
+            "fingerprint_prefix": "hmac-sha256:",
+            "fingerprint_key_id": EXPORT_KEY_ID,
+        },
+        "counts": { "proxies": 0, "consumers": 0, "plugin_configs": 1, "upstreams": 0 },
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "otel",
+            "namespace": "ferrum",
+            "plugin_name": "otel_tracing",
+            "scope": "global",
+            "labels": { "provisioned-by": "ferrum-edge-git-forge-ops" },
+            "config": config,
+        }],
+        "upstreams": [],
+    })
+    .to_string()
+}
+
+/// Repository plugin `otel` with `config`, as YAML.
+fn plugin_yaml(config: serde_json::Value) -> String {
+    serde_json::json!({
+        "kind": "PluginConfig",
+        "spec": {
+            "id": "otel",
+            "plugin_name": "otel_tracing",
+            "scope": "global",
+            "config": config,
+        },
+    })
+    .to_string()
+}
+
+#[test]
+fn a_bundle_resolved_placeholder_stays_uncompared() {
+    // `service_label` is secret-bearing only because the repository brokers
+    // it. With the bundle loaded the desired value is the resolved string, so
+    // the location must come from the configuration before resolution.
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+    let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+    let repo = Repo::new(
+        &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+        vec![("ferrum".to_string(), plugin_export(live))],
+    );
+    let slot = "ferrum/otel/@plugin-config/config/service_label";
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: "resolved-label-0001" } });
+    let bundle = bundle.to_string();
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("FERRUM_CREDS_JSON", &bundle));
+
+    let args = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&args, &env);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("MODIFY"));
+    assert!(!stdout(&output).contains("resolved-label-0001"));
+}
+
+#[test]
+fn a_whole_value_fingerprinted_around_a_secret_is_never_accepted() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let headers = serde_json::json!({ "x-api-key": placeholder, "x-trace": "on" });
+    let config = serde_json::json!({ "headers": headers });
+    let live = serde_json::json!({ "headers": fingerprint('c') });
+    let repo = Repo::new(
+        &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+        vec![("ferrum".to_string(), plugin_export(live))],
+    );
+
+    let args = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&args, &VIEWER_ONLY);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--accept-unverified-secrets does not cover this"));
+    assert!(stderr(&output).contains("fingerprinted 1 whole value(s)"));
+
+    let json = repo.run_with_env(&["diff", "--format", "json"], &VIEWER_ONLY);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(report["in_sync"], false);
+    assert_eq!(report["secret_fingerprints"]["masked_ancestor_fields"], 1);
+    assert_eq!(report["secret_fingerprints"]["authoritative"], false);
+}

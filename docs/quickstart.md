@@ -257,6 +257,14 @@ Four more are optional, but must match the gateway if it sets them:
 configures an audience) and `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`). A
 mismatch here is the usual cause of a 401 partway through an apply.
 
+If the gateway sets `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+), you
+can give a manual `gitforgeops diff` that key instead of the admin secret: it
+then reads `GET /config/export`, which the gateway caps at `viewer`. Secrets
+come back as fingerprints the viewer key cannot reproduce, so `diff` reports
+them as unverified rather than in sync. The bundled workflows do not bind this
+secret yet. See
+[Reading with a viewer-capped credential](../README.md#reading-with-a-viewer-capped-credential).
+
 Do **not** set `FERRUM_CREDS_BUNDLE[_N]`. The broker writes it on the first
 apply that resolves an `alloc=generate` placeholder. You only seed it by hand
 when adopting an existing gateway.

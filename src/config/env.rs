@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,9 @@ pub enum ApplyStrategy {
 }
 
 /// Environment-driven configuration for the gitforgeops tool.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written and redacts every secret field.
+#[derive(Clone)]
 pub struct EnvConfig {
     /// URL of the Ferrum Edge admin API (e.g. `https://gateway.internal:9000`).
     ///
@@ -48,6 +51,13 @@ pub struct EnvConfig {
     pub gateway_url: Option<String>,
     /// JWT secret for authenticating with the admin API.
     pub admin_jwt_secret: Option<String>,
+    /// The gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET`: a second signing key
+    /// the gateway caps at `viewer` whatever a token claims. When set, `diff`
+    /// reads live state from `GET /config/export` with it instead of
+    /// `GET /backup` with the admin secret. Same handling as
+    /// [`EnvConfig::admin_jwt_secret`]: an environment secret, exact bytes,
+    /// blank reads as unset, never printed.
+    pub admin_jwt_viewer_secret: Option<String>,
     /// `iss` claim minted into admin API tokens. Must equal the gateway's
     /// `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`) or every request is
     /// rejected with 401 `InvalidIssuer`.
@@ -178,6 +188,83 @@ pub struct EnvConfig {
     pub gateway_max_retries: u32,
 }
 
+/// `Debug` that never prints a secret: the admin and viewer JWT signing keys,
+/// both GitHub tokens, the inline credential bundle and the mTLS client key
+/// render as `<redacted>` when set, so a stray `{:?}` cannot leak them.
+impl fmt::Debug for EnvConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let admin_jwt_secret = redacted(self.admin_jwt_secret.as_deref());
+        let admin_jwt_viewer_secret = redacted(self.admin_jwt_viewer_secret.as_deref());
+        let github_token = redacted(self.github_token.as_deref());
+        let github_provisioner_token = redacted(self.github_provisioner_token.as_deref());
+        let creds_bundle_json = redacted(self.creds_bundle_json.as_deref());
+        let client_key = redacted(self.client_key.as_deref());
+        f.debug_struct("EnvConfig")
+            .field("gateway_url", &self.gateway_url)
+            .field("admin_jwt_secret", &admin_jwt_secret)
+            .field("admin_jwt_viewer_secret", &admin_jwt_viewer_secret)
+            .field("admin_jwt_issuer", &self.admin_jwt_issuer)
+            .field("admin_jwt_role", &self.admin_jwt_role)
+            .field("admin_jwt_audience", &self.admin_jwt_audience)
+            .field("admin_jwt_ttl_secs", &self.admin_jwt_ttl_secs)
+            .field("namespace_filter", &self.namespace_filter)
+            .field("allow_unknown_fields", &self.allow_unknown_fields)
+            .field("gateway_mode", &self.gateway_mode)
+            .field("apply_strategy", &self.apply_strategy)
+            .field(
+                "allow_nontransactional_plugin_attach",
+                &self.allow_nontransactional_plugin_attach,
+            )
+            .field("review_fail_on_blockers", &self.review_fail_on_blockers)
+            .field("overlay", &self.overlay)
+            .field("env_name", &self.env_name)
+            .field("github_repository", &self.github_repository)
+            .field("github_token", &github_token)
+            .field("github_provisioner_token", &github_provisioner_token)
+            .field("creds_bundle_json", &creds_bundle_json)
+            .field("creds_bundle_json_file", &self.creds_bundle_json_file)
+            .field(
+                "creds_bundle_json_output_file",
+                &self.creds_bundle_json_output_file,
+            )
+            .field("file_output_path", &self.file_output_path)
+            .field("mesh_file_output_path", &self.mesh_file_output_path)
+            .field("edge_binary_path", &self.edge_binary_path)
+            .field("tls_no_verify", &self.tls_no_verify)
+            .field("verify_base_url", &self.verify_base_url)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("ca_cert", &self.ca_cert)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &client_key)
+            .field(
+                "gateway_connect_timeout_secs",
+                &self.gateway_connect_timeout_secs,
+            )
+            .field(
+                "gateway_request_timeout_secs",
+                &self.gateway_request_timeout_secs,
+            )
+            .field(
+                "github_connect_timeout_secs",
+                &self.github_connect_timeout_secs,
+            )
+            .field(
+                "github_request_timeout_secs",
+                &self.github_request_timeout_secs,
+            )
+            .field("gateway_max_retries", &self.gateway_max_retries)
+            .finish()
+    }
+}
+
+/// `Some("<redacted>")` for a configured secret, `None` otherwise.
+fn redacted(value: Option<&str>) -> Option<&'static str> {
+    value.map(|_| REDACTED)
+}
+
+/// What [`EnvConfig`]'s `Debug` prints in place of a secret.
+const REDACTED: &str = "<redacted>";
+
 impl Default for EnvConfig {
     /// The configuration `load_env_config()` produces with no `FERRUM_*` /
     /// `GITHUB_*` variables set. Keeps struct-literal construction (tests,
@@ -187,6 +274,7 @@ impl Default for EnvConfig {
         Self {
             gateway_url: None,
             admin_jwt_secret: None,
+            admin_jwt_viewer_secret: None,
             admin_jwt_issuer: DEFAULT_JWT_ISSUER.to_string(),
             admin_jwt_role: DEFAULT_JWT_ROLE.to_string(),
             admin_jwt_audience: None,
@@ -234,6 +322,7 @@ impl Default for EnvConfig {
 /// |------------------------------|--------------------|----------------------------------|
 /// | `FERRUM_GATEWAY_URL`         | `gateway_url`      | `None`                           |
 /// | `FERRUM_ADMIN_JWT_SECRET`    | `admin_jwt_secret` | `None`                           |
+/// | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | `admin_jwt_viewer_secret` | `None` (`diff` reads `/backup`) |
 /// | `FERRUM_ADMIN_JWT_ISSUER`    | `admin_jwt_issuer` | `ferrum-edge`                    |
 /// | `FERRUM_ADMIN_JWT_ROLE`      | `admin_jwt_role`   | `admin`                          |
 /// | `FERRUM_ADMIN_JWT_AUDIENCE`  | `admin_jwt_audience` | `None` (claim omitted)         |
@@ -331,6 +420,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         // exact bytes: the gateway verifies against the raw value, so a trim
         // here would mint tokens it rejects.
         admin_jwt_secret: exact_non_blank_env("FERRUM_ADMIN_JWT_SECRET"),
+        admin_jwt_viewer_secret: exact_non_blank_env("FERRUM_ADMIN_JWT_VIEWER_SECRET"),
         admin_jwt_issuer: exact_non_blank_env("FERRUM_ADMIN_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),
         admin_jwt_role,

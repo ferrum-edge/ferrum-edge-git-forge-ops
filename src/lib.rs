@@ -1,6 +1,7 @@
 pub mod apply;
 pub mod cli;
 pub mod config;
+pub mod config_export;
 pub mod diagnostics;
 pub mod diff;
 pub mod doctor;
