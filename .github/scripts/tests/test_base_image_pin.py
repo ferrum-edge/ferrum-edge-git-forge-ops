@@ -187,31 +187,37 @@ class RealDockerfileTests(unittest.TestCase):
         )
         self.assertIn("dpkg --purge", instructions)
 
-    def test_the_live_dockerfile_has_retired_the_package_stage(self):
-        self.assertEqual(self.pin.packages, [])
-        self.assertEqual(self.pin.pools, {})
-        self.assertEqual(self.pin.mirror, "")
-        self.assertEqual(self.pin.versions_by_name(), {})
+    def test_the_live_dockerfile_pins_the_current_libpcre2_security_update(self):
+        self.assertEqual(
+            self.pin.versions_by_name(),
+            {"libpcre2-8-0": {"amd64": "10.46-1~deb13u3", "arm64": "10.46-1~deb13u3"}},
+        )
+        self.assertEqual(
+            {package.arch: package.digest for package in self.pin.packages},
+            {
+                "amd64": "e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040",
+                "arm64": "1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7",
+            },
+        )
+        self.assertEqual(
+            self.pin.pools,
+            {"libpcre2-8-0": "pool/updates/main/p/pcre2"},
+        )
+        self.assertEqual(self.pin.mirror, "https://deb.debian.org/debian-security/")
         instructions = "\n".join(
             line
             for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
             if not line.lstrip().startswith("#")
         )
-        self.assertNotIn("runtime-security-updates", instructions)
-        self.assertNotIn("dpkg --install", instructions)
-        self.assertNotEqual(
-            self.pin.digest,
-            "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
-        )
+        self.assertIn("runtime-security-updates", instructions)
+        self.assertIn("dpkg --install", instructions)
         self.assertEqual(
             self.pin.digest,
             "sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a",
         )
 
     def test_every_pinned_package_carries_both_architectures_and_a_pool(self):
-        # Completeness guard if the temporary stage is reintroduced: both
-        # architectures and a pool directory must stay in step. The live
-        # Dockerfile currently has no pins (issue #257).
+        # Both architectures and their pool directory must stay in step.
         versions = self.pin.versions_by_name()
         for name, by_arch in versions.items():
             self.assertEqual(
