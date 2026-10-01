@@ -1304,7 +1304,7 @@ fn config_export(key_id: &str, keys: &[char]) -> String {
         .collect();
     serde_json::json!({
         "version": "1",
-        "ferrum_version": "0.9.9",
+        "ferrum_version": "0.9.10",
         "source": "database",
         "namespace": "ferrum",
         "redaction": {
@@ -1500,7 +1500,7 @@ fn a_credential_less_consumer_is_not_in_sync_without_a_baseline() {
     let consumer = "kind: Consumer\nspec:\n  id: \"app\"\n  username: \"app\"\n";
     let export = serde_json::json!({
         "version": "1",
-        "ferrum_version": "0.9.9",
+        "ferrum_version": "0.9.10",
         "source": "database",
         "namespace": "ferrum",
         "redaction": {
@@ -1595,7 +1595,7 @@ fn without_a_viewer_secret_diff_falls_back_to_the_admin_backup() {
 fn plugin_export(config: serde_json::Value) -> String {
     serde_json::json!({
         "version": "1",
-        "ferrum_version": "0.9.9",
+        "ferrum_version": "0.9.10",
         "source": "database",
         "namespace": "ferrum",
         "redaction": {

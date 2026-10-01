@@ -76,7 +76,7 @@ fn vendored_contract_files_match_the_pin_hashes() {
     let (tag, commit, edge_version, hashes) = parse_pin();
     assert_eq!(tag, "contracts-edge-0.9.9");
     assert_eq!(commit, "25c4e9e00033d7941a1dd0ab733fa74e735546ae");
-    assert_eq!(edge_version, "v0.9.9");
+    assert_eq!(edge_version, "v0.9.10");
 
     let mut vendored = BTreeSet::new();
     contract_files(&contract_dir(), &contract_dir(), &mut vendored);

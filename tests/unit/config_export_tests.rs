@@ -39,7 +39,7 @@ fn document(namespace: &str, key_id: &str, consumers: Value, plugins: Value) -> 
     let plugin_count = plugins.as_array().map_or(0, Vec::len);
     json!({
         "version": "1",
-        "ferrum_version": "0.9.9",
+        "ferrum_version": "0.9.10",
         "source": "database",
         "namespace": namespace,
         "redaction": {

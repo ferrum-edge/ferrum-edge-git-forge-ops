@@ -1325,7 +1325,7 @@ fn stream_orders_config(plugin_configs: &str) -> GatewayConfig {
     config
 }
 
-/// A TCP listener never runs `key_auth` (Ferrum Edge v0.9.9 declares it for
+/// A TCP listener never runs `key_auth` (Ferrum Edge v0.9.10 declares it for
 /// HTTP-family protocols only), so narrowing it away from the stream proxy
 /// removes nothing that authenticated its connections.
 #[test]
