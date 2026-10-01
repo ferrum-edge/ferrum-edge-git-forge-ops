@@ -304,16 +304,27 @@ The credential bundle is deliberately left out. `diff` excludes unresolved
 broker leaves from the live comparison one leaf at a time, so the rest of the
 document is still compared in full.
 
-**Limitation: there is no read-only gateway credential.** Ferrum Edge signs
-admin tokens with a *symmetric* secret, and `GET /backup` requires the `admin`
-role. No token this workflow can hold reads configuration without also being
-able to write it. Leave the monitoring environment's `FERRUM_ADMIN_JWT_ROLE`
-unset (it defaults to `admin`) and treat its signing secret as
-gateway-write-equivalent: fenced to the default branch and holding no
-GitHub-side authority, but not read-limited at the gateway. Closing this gap
-needs a Ferrum Edge feature (a read-only admin role, or separately issued read
-tokens). If that trade-off is not acceptable, leave `monitoring.unattended`
-off and read the approval-gated `Not completed` result for what it is.
+**Limitation: the bundled check still holds a write-capable key.**
+`drift-check.yml` runs `diff` against `GET /backup`, which requires the `admin`
+role, with the environment's `FERRUM_ADMIN_JWT_SECRET`. Ferrum Edge signs admin
+tokens with a *symmetric* secret, so that key can mint any role. Leave the
+monitoring environment's `FERRUM_ADMIN_JWT_ROLE` unset (it defaults to `admin`)
+and treat its signing secret as gateway-write-equivalent: fenced to the default
+branch and holding no GitHub-side authority, but not read-limited at the
+gateway. If that trade-off is not acceptable, leave `monitoring.unattended` off
+and read the approval-gated `Not completed` result for what it is.
+
+Ferrum Edge v0.9.9 closes the gateway side: a token signed with its
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` is authorized as `viewer` whatever it claims,
+and `GET /config/export` serves a fingerprinted snapshot to that role.
+`gitforgeops diff` already reads that way when `FERRUM_ADMIN_JWT_VIEWER_SECRET`
+is set (see
+[Reading with a viewer-capped credential](../README.md#reading-with-a-viewer-capped-credential)).
+Moving the monitoring environment to it means binding that secret in
+`drift-check.yml` instead of the admin one, and updating the trusted
+supply-chain checker and settings audit to require it; that is a separate,
+policy-reviewed change. Unless the gateway also sets
+`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer key reads every namespace.
 
 ### 3.2 Monitoring outcomes
 

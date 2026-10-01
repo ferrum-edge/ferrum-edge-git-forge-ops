@@ -48,6 +48,13 @@ pub struct EnvConfig {
     pub gateway_url: Option<String>,
     /// JWT secret for authenticating with the admin API.
     pub admin_jwt_secret: Option<String>,
+    /// The gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET`: a second signing key
+    /// the gateway caps at `viewer` whatever a token claims. When set, `diff`
+    /// reads live state from `GET /config/export` with it instead of
+    /// `GET /backup` with the admin secret. Same handling as
+    /// [`EnvConfig::admin_jwt_secret`]: an environment secret, exact bytes,
+    /// blank reads as unset, never printed.
+    pub admin_jwt_viewer_secret: Option<String>,
     /// `iss` claim minted into admin API tokens. Must equal the gateway's
     /// `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`) or every request is
     /// rejected with 401 `InvalidIssuer`.
@@ -187,6 +194,7 @@ impl Default for EnvConfig {
         Self {
             gateway_url: None,
             admin_jwt_secret: None,
+            admin_jwt_viewer_secret: None,
             admin_jwt_issuer: DEFAULT_JWT_ISSUER.to_string(),
             admin_jwt_role: DEFAULT_JWT_ROLE.to_string(),
             admin_jwt_audience: None,
@@ -234,6 +242,7 @@ impl Default for EnvConfig {
 /// |------------------------------|--------------------|----------------------------------|
 /// | `FERRUM_GATEWAY_URL`         | `gateway_url`      | `None`                           |
 /// | `FERRUM_ADMIN_JWT_SECRET`    | `admin_jwt_secret` | `None`                           |
+/// | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | `admin_jwt_viewer_secret` | `None` (`diff` reads `/backup`) |
 /// | `FERRUM_ADMIN_JWT_ISSUER`    | `admin_jwt_issuer` | `ferrum-edge`                    |
 /// | `FERRUM_ADMIN_JWT_ROLE`      | `admin_jwt_role`   | `admin`                          |
 /// | `FERRUM_ADMIN_JWT_AUDIENCE`  | `admin_jwt_audience` | `None` (claim omitted)         |
@@ -331,6 +340,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         // exact bytes: the gateway verifies against the raw value, so a trim
         // here would mint tokens it rejects.
         admin_jwt_secret: exact_non_blank_env("FERRUM_ADMIN_JWT_SECRET"),
+        admin_jwt_viewer_secret: exact_non_blank_env("FERRUM_ADMIN_JWT_VIEWER_SECRET"),
         admin_jwt_issuer: exact_non_blank_env("FERRUM_ADMIN_JWT_ISSUER")
             .unwrap_or_else(|| DEFAULT_JWT_ISSUER.to_string()),
         admin_jwt_role,

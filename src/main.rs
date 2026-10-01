@@ -11,7 +11,8 @@ use gitforgeops::config::{
     self, resolve_env, EnvConfig, GatewayConfig, GatewayMode, OwnershipMode, RepoConfig,
     ResolvedEnv,
 };
-use gitforgeops::diagnostics::{safe, safe_block, safe_line};
+use gitforgeops::config_export;
+use gitforgeops::diagnostics::{safe, safe_block, safe_line, safe_path};
 use gitforgeops::diff;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
@@ -73,12 +74,18 @@ async fn main() {
         cli::Commands::Diff {
             exit_on_drift,
             format,
+            fingerprint_baseline,
+            write_fingerprint_baseline,
         } => {
             cmd_diff(
                 exit_on_drift,
                 format,
                 explicit_env.as_deref(),
                 cli.allow_empty_namespace,
+                FingerprintBaselinePaths {
+                    read: fingerprint_baseline.map(PathBuf::from),
+                    write: write_fingerprint_baseline.map(PathBuf::from),
+                },
             )
             .await
         }
@@ -1559,14 +1566,112 @@ async fn cmd_export(
     Ok(())
 }
 
+/// `diff --fingerprint-baseline` and `--write-fingerprint-baseline`.
+struct FingerprintBaselinePaths {
+    read: Option<PathBuf>,
+    write: Option<PathBuf>,
+}
+
+/// The exports a viewer-credential `diff` read, and the fingerprinted fields
+/// it could not compare with the repository.
+struct ExportComparison {
+    exports: Vec<config_export::ConfigExport>,
+    uncompared: usize,
+}
+
+/// [`load_namespace_pairs_for`] over `GET /config/export` with the viewer
+/// credential. Each pair's live side is [`config_export::ConfigExport::live_view`]
+/// and its desired side is projected the way the export projects Consumers.
+async fn load_export_pairs_for(
+    client: &AdminClient,
+    desired: &GatewayConfig,
+    namespaces: &[String],
+) -> gitforgeops::error::Result<(Vec<NamespaceSnapshot>, ExportComparison)> {
+    let mut pairs = Vec::new();
+    let mut comparison = ExportComparison {
+        exports: Vec::new(),
+        uncompared: 0,
+    };
+    for namespace in namespaces {
+        let desired_namespace = config::filter_config_by_namespace(desired, namespace);
+        let export = client.get_config_export(namespace).await?;
+        if let Some(notice) = &export.count_seal_notice {
+            eprintln!(
+                "Warning: GET /config/export for namespace '{}' returned counts that do not match the document ({}). Resource data is used as received.",
+                safe(namespace),
+                safe_line(notice)
+            );
+        }
+        let view = export.live_view(&desired_namespace)?;
+        pairs.push(NamespaceSnapshot {
+            namespace: namespace.clone(),
+            desired: config_export::project_desired_for_export(&desired_namespace),
+            actual: view.actual,
+            extras: gitforgeops::http_client::BackupExtras::default(),
+            cached: export.cached,
+        });
+        comparison.uncompared += view.uncompared.len();
+        comparison.exports.push(export);
+    }
+    Ok((pairs, comparison))
+}
+
+/// Explain, on stderr, what a viewer-credential `diff` could not compare.
+fn print_secret_fingerprint_notes(
+    summary: &config_export::SecretFingerprintSummary,
+    baseline_requested: bool,
+    baseline_found: bool,
+) {
+    if baseline_requested && !baseline_found {
+        eprintln!(
+            "Note: the fingerprint baseline file does not exist yet; no secret could be checked for changes."
+        );
+    }
+    for note in &summary.notes {
+        eprintln!("Note: {}.", safe_line(note));
+    }
+    if summary.uncompared == 0 {
+        return;
+    }
+    if summary.baseline_complete {
+        eprintln!(
+            "Note: {} fingerprinted secret field(s) on declared resources were compared with the fingerprint baseline, not with the repository: the result says whether each changed since the baseline was recorded, not whether it matches the repository.",
+            summary.uncompared
+        );
+    } else {
+        eprintln!(
+            "Note: {} fingerprinted secret field(s) on declared resources were not verified. GET /config/export fingerprints secrets with a key derived from the gateway's admin secret, so the viewer credential cannot compute the fingerprint of the repository's value. Pass --fingerprint-baseline with a baseline recorded by --write-fingerprint-baseline to detect changes between exports.",
+            summary.uncompared
+        );
+    }
+}
+
 async fn cmd_diff(
     exit_on_drift: bool,
     format: cli::ReportFormat,
     explicit_env: Option<&str>,
     allow_empty_namespace: bool,
+    baseline_paths: FingerprintBaselinePaths,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json_mode = matches!(format, cli::ReportFormat::Json);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
+    // With a viewer secret configured, diff reads GET /config/export with it
+    // and never touches the admin secret. Without one, it falls back to
+    // GET /backup with the admin credential.
+    let read_export = env_config.admin_jwt_viewer_secret.is_some();
+    if !read_export && (baseline_paths.read.is_some() || baseline_paths.write.is_some()) {
+        return Err(gitforgeops::error::Error::Config(
+            "--fingerprint-baseline and --write-fingerprint-baseline need \
+             FERRUM_ADMIN_JWT_VIEWER_SECRET: fingerprints come from GET /config/export, which \
+             diff reads only with the viewer credential"
+                .to_string(),
+        )
+        .into());
+    }
+    let baseline = match &baseline_paths.read {
+        Some(path) => config_export::FingerprintBaseline::load(path)?,
+        None => None,
+    };
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     let mut desired = assembled.gateway;
     let mut namespace_scope = assembled.namespace_scope;
@@ -1579,7 +1684,12 @@ async fn cmd_diff(
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
     let namespaces = resolved_namespaces(&resolved, &desired, &state);
-    let client = match AdminClient::new_scoped(&env_config, &namespaces) {
+    let client = if read_export {
+        AdminClient::new_viewer_scoped(&env_config, &namespaces)
+    } else {
+        AdminClient::new_scoped(&env_config, &namespaces)
+    };
+    let client = match client {
         Ok(client) => client,
         Err(error) => {
             print_or_collect_scope_json(
@@ -1597,25 +1707,33 @@ async fn cmd_diff(
             return Err(error.into());
         }
     };
-    let mut namespace_pairs =
-        match load_namespace_pairs_for(&client, &desired, &namespaces, false).await {
-            Ok(pairs) => pairs,
-            Err(error) => {
-                print_or_collect_scope_json(
-                    json_mode,
-                    &namespace_scope,
-                    desired_finding.as_ref(),
-                    serde_json::json!({ "in_sync": false, "diff_count": 0 }),
-                );
-                if desired_finding
-                    .as_ref()
-                    .is_some_and(|finding| finding.is_error())
-                {
-                    process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
-                }
-                return Err(error.into());
+    let loaded = if read_export {
+        load_export_pairs_for(&client, &desired, &namespaces)
+            .await
+            .map(|(pairs, comparison)| (pairs, Some(comparison)))
+    } else {
+        load_namespace_pairs_for(&client, &desired, &namespaces, false)
+            .await
+            .map(|pairs| (pairs, None))
+    };
+    let (mut namespace_pairs, export_comparison) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            print_or_collect_scope_json(
+                json_mode,
+                &namespace_scope,
+                desired_finding.as_ref(),
+                serde_json::json!({ "in_sync": false, "diff_count": 0 }),
+            );
+            if desired_finding
+                .as_ref()
+                .is_some_and(|finding| finding.is_error())
+            {
+                process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
             }
-        };
+            return Err(error.into());
+        }
+    };
     let live_count: usize = namespace_pairs
         .iter()
         .map(|pair| config::gateway_resource_count(&pair.actual))
@@ -1630,15 +1748,25 @@ async fn cmd_diff(
     if let Some(warning) = &live_warning {
         print_live_filter_warning(warning);
     }
+    let live_source = if read_export {
+        "configuration export (GET /config/export)"
+    } else {
+        "backup (GET /backup)"
+    };
+    if read_export {
+        eprintln!(
+            "Note: live state was read from GET /config/export with the viewer credential (FERRUM_ADMIN_JWT_VIEWER_SECRET). The export strips api_spec_id, so API-spec-owned rows are compared like any other live row and spec ownership conflicts are not detected; plan and review read GET /backup and do detect them."
+        );
+    }
     let cached_namespaces = cached_namespace_names(&namespace_pairs);
     if !cached_namespaces.is_empty() {
         eprintln!(
-            "Warning: diff is approximate because cached backup data was served for namespace(s) {}. API-spec ownership metadata is unavailable, so spec-owned/conflict classification is incomplete; no authoritative sync or drift decision is possible until the configuration database returns.",
+            "Warning: diff is approximate because cached {live_source} data was served for namespace(s) {}. The cached snapshot may be older than the configuration database, and API-spec ownership metadata is unavailable, so no authoritative sync or drift decision is possible until the gateway serves a database read again.",
             safe(cached_namespaces.join(", "))
         );
         if exit_on_drift {
             return Err(gitforgeops::error::Error::StaleGatewayView(format!(
-                "--exit-on-drift requires an authoritative backup, but namespace(s) {} were served from cache; refusing to return either the in-sync (0) or drift (2) result",
+                "--exit-on-drift requires an authoritative {live_source}, but namespace(s) {} were served from cache; refusing to return either the in-sync (0) or drift (2) result",
                 cached_namespaces.join(", ")
             ))
             .into());
@@ -1664,7 +1792,64 @@ async fn cmd_diff(
     let plugin_attach_notice =
         apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
 
-    let in_sync = diffs.is_empty() && unmanaged.is_empty() && !spec_owned_blocks_sync(&spec_owned);
+    let secrets = export_comparison.as_ref().map(|comparison| {
+        config_export::SecretFingerprintSummary::evaluate(
+            &comparison.exports,
+            comparison.uncompared,
+            baseline.as_ref(),
+            &desired,
+        )
+    });
+    if let Some(summary) = &secrets {
+        print_secret_fingerprint_notes(summary, baseline_paths.read.is_some(), baseline.is_some());
+    }
+    let secret_changes: &[config_export::SecretChange] = secrets
+        .as_ref()
+        .map(|summary| summary.changes.as_slice())
+        .unwrap_or_default();
+    let secrets_verified = secrets
+        .as_ref()
+        .is_none_or(config_export::SecretFingerprintSummary::verified);
+
+    if let (Some(path), Some(comparison)) = (&baseline_paths.write, &export_comparison) {
+        if !cached_namespaces.is_empty() {
+            return Err(gitforgeops::error::Error::StaleGatewayView(format!(
+                "refusing to write a fingerprint baseline: namespace(s) {} were served from cache",
+                cached_namespaces.join(", ")
+            ))
+            .into());
+        }
+        let existing = config_export::FingerprintBaseline::load(path)?;
+        let mut recorded = existing.unwrap_or_default();
+        for export in &comparison.exports {
+            recorded.record(export);
+        }
+        recorded.write(path)?;
+        eprintln!(
+            "Recorded secret fingerprints for {} namespace(s) in {}.",
+            comparison.exports.len(),
+            safe_path(path)
+        );
+    }
+
+    let in_sync = diffs.is_empty()
+        && unmanaged.is_empty()
+        && !spec_owned_blocks_sync(&spec_owned)
+        && secret_changes.is_empty();
+    let live_source_key = if read_export {
+        "config_export"
+    } else {
+        "backup"
+    };
+    let secret_json = secrets.as_ref().map(|summary| {
+        serde_json::json!({
+            "uncompared_fields": summary.uncompared,
+            "baseline_complete": summary.baseline_complete,
+            "verified": summary.verified(),
+            "changes": summary.changes,
+            "notes": summary.notes,
+        })
+    });
     print_or_collect_scope_json(
         json_mode,
         &namespace_scope,
@@ -1674,6 +1859,8 @@ async fn cmd_diff(
             "diff_count": diffs.len(),
             "live_filter_warning": live_warning,
             "plugin_attach_notice": plugin_attach_notice,
+            "live_source": live_source_key,
+            "secret_fingerprints": secret_json,
         }),
     );
     if let Some(finding) = &desired_finding {
@@ -1682,17 +1869,19 @@ async fn cmd_diff(
         }
     }
 
+    // Honor drift_alert_on flags so operators can selectively suppress
+    // categories (e.g. a noisy staging env where only destructive changes
+    // should alert). Only categories with their flag set contribute to the
+    // drift decision — except an API-spec ownership conflict, which has no
+    // flag because `apply` blocks the namespace over it. See
+    // `gitforgeops::verdict::DriftVerdict`.
+    let alert = &resolved.ownership.drift_alert_on;
+    let drift = verdict::DriftVerdict::evaluate(alert, &diffs, &unmanaged, &spec_owned)
+        .with_secret_changes(alert, secret_changes.len());
+
     if json_mode {
-        if exit_on_drift && cached_namespaces.is_empty() {
-            let drift = verdict::DriftVerdict::evaluate(
-                &resolved.ownership.drift_alert_on,
-                &diffs,
-                &unmanaged,
-                &spec_owned,
-            );
-            if drift.has_drift() {
-                process::exit(drift.exit_code());
-            }
+        if exit_on_drift && cached_namespaces.is_empty() && drift.has_drift() {
+            process::exit(drift.exit_code());
         }
         return Ok(());
     }
@@ -1702,12 +1891,16 @@ async fn cmd_diff(
         // owner is in play — but they do not make the configuration
         // out-of-sync on their own.
         print_spec_owned(&spec_owned);
-        if cached_namespaces.is_empty() {
-            println!("No differences found. Configuration is in sync.");
-        } else {
+        if !cached_namespaces.is_empty() {
             println!(
                 "No differences found in the cached snapshot. Authoritative sync status is unavailable."
             );
+        } else if !secrets_verified {
+            println!(
+                "No differences found in the compared fields. Fingerprinted secret fields were not verified (see the note above)."
+            );
+        } else {
+            println!("No differences found. Configuration is in sync.");
         }
         return Ok(());
     }
@@ -1745,6 +1938,24 @@ async fn cmd_diff(
         }
     }
 
+    if !secret_changes.is_empty() {
+        println!(
+            "\nSecret fields changed since the fingerprint baseline ({}):",
+            secret_changes.len()
+        );
+        for change in secret_changes {
+            println!(
+                "  {} {} {} ({}) {}",
+                change.change.label(),
+                safe(&change.kind),
+                safe(&change.id),
+                safe(&change.namespace),
+                safe(&change.pointer)
+            );
+        }
+        println!();
+    }
+
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
         println!("{}\n", safe_block(note));
     }
@@ -1771,19 +1982,6 @@ async fn cmd_diff(
         println!();
         print_spec_owned(&spec_owned);
     }
-
-    // Honor drift_alert_on flags so operators can selectively suppress
-    // categories (e.g. a noisy staging env where only destructive changes
-    // should alert). Only categories with their flag set contribute to the
-    // drift decision — except an API-spec ownership conflict, which has no
-    // flag because `apply` blocks the namespace over it. See
-    // `gitforgeops::verdict::DriftVerdict`.
-    let drift = verdict::DriftVerdict::evaluate(
-        &resolved.ownership.drift_alert_on,
-        &diffs,
-        &unmanaged,
-        &spec_owned,
-    );
 
     if exit_on_drift && drift.has_drift() {
         println!(

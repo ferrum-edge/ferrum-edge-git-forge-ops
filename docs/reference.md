@@ -19,6 +19,7 @@ Global flags: `--env <name>`, `--allow-credential-slot-remap`,
 ```
 gitforgeops validate [--format text|json|github|github-annotations]
 gitforgeops diff     [--exit-on-drift] [--format text|json]
+                     [--fingerprint-baseline PATH] [--write-fingerprint-baseline PATH]
 gitforgeops plan     [--format text|json]
 gitforgeops apply    [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
                      [--allow-nontransactional-plugin-attach]
@@ -39,7 +40,7 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 | Command | Does |
 |---|---|
 | `validate` | Loads and assembles the tree, runs the security audit and `ferrum-edge validate`. `--format github` is an alias for `github-annotations`. |
-| `diff` | Compares desired state with the live gateway. |
+| `diff` | Compares desired state with the live gateway: `GET /config/export` with `FERRUM_ADMIN_JWT_VIEWER_SECRET` when it is set, otherwise `GET /backup` with the admin credential. See [Viewer-credential drift reads](#viewer-credential-drift-reads). |
 | `plan` | Shows what `apply` would do, and exits non-zero for every offline reason `apply` would refuse. |
 | `apply` | Reconciles the gateway (api mode) or writes the assembled files (file mode). |
 | `export` | Writes the assembled document; `--materialize` resolves placeholders, `--encrypt-to` age-encrypts the result. |
@@ -63,7 +64,9 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 `diff --exit-on-drift` counts as drift: managed resources added, modified or
 deleted, and unmanaged resources, each as enabled by
 `ownership.drift_alert_on`, plus any API-spec ownership conflict, which cannot
-be muted.
+be muted. With `--fingerprint-baseline`, a declared resource's secret that
+changed since the baseline counts as a managed modification. A cached gateway
+read (`X-Data-Source: cached`) is never a result: `--exit-on-drift` exits `1`.
 
 ### `plan` blockers
 
@@ -127,6 +130,7 @@ Set these per deployment environment (Settings → Environments, or
 |---|---|---|
 | `FERRUM_GATEWAY_URL` | api mode | Admin API base URL; must be `https://`. |
 | `FERRUM_ADMIN_JWT_SECRET` | api mode | HS256 signing secret, at least 32 characters. |
+| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | optional | The gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+), at least 32 characters and different from the admin secret. `diff` then reads with it and never uses the admin secret. Not bound by the bundled workflows yet. |
 | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | yes | State-writer App private key. |
 | `FERRUM_GH_PROVISIONER_TOKEN` | to allocate or rotate | App installation token (preferred) or fine-grained PAT with `Secrets: write` + `Environments: write`. |
 | `FERRUM_ADMIN_JWT_ISSUER` | optional | `iss` claim; default `ferrum-edge`. |
@@ -178,6 +182,7 @@ case-insensitive), malformed or zero numbers, and bad URLs are errors. See
 | `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` or `full_replace`; repository config wins when an environment is selected. |
 | `FERRUM_GATEWAY_URL` | — | Admin API URL. See [Transport security](#transport-security). |
 | `FERRUM_ADMIN_JWT_SECRET`, `_ISSUER`, `_ROLE`, `_AUDIENCE`, `_TTL_SECS` | see [secrets](#github-environment-secrets) | Admin JWT settings. |
+| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | — | Viewer-capped signing key for `diff`. Issuer, audience and TTL settings apply to its tokens too; the role claim is always `viewer`. |
 | `FERRUM_GATEWAY_CA_CERT`, `FERRUM_GATEWAY_CLIENT_CERT`, `FERRUM_GATEWAY_CLIENT_KEY` | — | Base64 PEM TLS material. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Accept any gateway certificate. Local use only. |
 | `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Allow an `http://` gateway or data-plane URL. Local use only. |
@@ -292,7 +297,56 @@ the verdict counts are kept and the footer names what was cut.
 In live comparisons, `review`, `diff` and `plan` leave out only broker leaves
 that are still unresolved after loading the bundle, so unseeded slots do not
 show as permanent drift. Everything else, including resolved secret
-differences, is compared.
+differences, is compared. A viewer-credential `diff` also cannot compare
+secrets the gateway fingerprints; see below.
+
+### Viewer-credential drift reads
+
+With `FERRUM_ADMIN_JWT_VIEWER_SECRET` set, `diff` reads each namespace from
+`GET /config/export` (Ferrum Edge v0.9.9+) with a token signed by that key. The
+gateway caps such a token at `viewer`, so it cannot write, read `GET /backup`
+or see a raw secret. `plan`, `review` and `apply` keep reading `GET /backup`
+with the admin credential.
+
+- **Fingerprinted fields.** Values the gateway's viewer projection withholds
+  (keyauth keys, `jwt`/`hmac_auth` secrets, plugin-config secrets and
+  credential-bearing URLs, URL userinfo in a Proxy or Upstream, the Consul
+  token) arrive as `hmac-sha256:<64 hex>`. The MAC key derives from the
+  gateway's *admin* secret, and Edge deliberately does not let a viewer
+  compute it, so `diff` cannot fingerprint the repository's value. Where the
+  repository declares a value at a fingerprinted location, the field is left
+  out of the comparison and counted as unverified; where it declares none, the
+  difference is reported. While any declared secret is unverified, `diff`
+  prints `No differences found in the compared fields` instead of `in sync`.
+- **Fingerprint baseline.** `--write-fingerprint-baseline PATH` records the
+  fingerprints of every exported resource (other namespaces already in the
+  file are kept; refused for cached data). `--fingerprint-baseline PATH`
+  compares each declared resource with it and reports secrets `CHANGED`,
+  `ADDED` or `REMOVED` since, as managed drift. A missing file means no
+  baseline yet. Both flags need the viewer secret. A baseline shows change
+  between two exports, never agreement with the repository. Fingerprints are
+  comparable only under one `redaction.fingerprint_key_id`; after the
+  gateway's `FERRUM_ADMIN_JWT_SECRET` rotates (or a gateway without one
+  restarts), `diff` says the baseline is not comparable and reports no secret
+  drift. Record the baseline from a trusted state, such as right after a
+  successful apply; a baseline rewritten by every drift check alerts on a
+  change once. It holds keyed fingerprints only; keep it out of the repository.
+- **Hidden credentials.** `basicauth` and custom credential types are omitted
+  from the export. Each consumer carries one `hidden_credentials_fingerprint`
+  over them, which only a baseline can compare.
+- **Consumer projection.** The export keeps only `keyauth[].key`,
+  `jwt[].secret`, `hmac_auth[].secret` and `mtls_auth[].identity`; the
+  repository's Consumers are projected the same way before comparison.
+- **No spec ownership.** `api_spec_id` is stripped, so spec-owned rows are
+  compared like other live rows and spec ownership conflicts are not detected.
+- **Cached data.** `X-Data-Source: cached` (or `source: cached`) marks the
+  export as possibly stale. The gateway also serves its cached snapshot when
+  another export holds the database load, so a retry may get a database read.
+  `diff` warns, reports no authoritative result and refuses `--exit-on-drift`.
+- **Refusals.** `404` means the gateway predates the export, `401` a viewer key
+  or claim mismatch, `403` a namespace outside
+  `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` or the token's `ns` claim. Each message
+  says what to check.
 
 **Breaking changes** (also in `plan`):
 

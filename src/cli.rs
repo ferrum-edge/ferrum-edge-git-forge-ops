@@ -78,6 +78,19 @@ pub enum Commands {
         exit_on_drift: bool,
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
         format: ReportFormat,
+        /// Compare the secret fingerprints of `GET /config/export` with this
+        /// baseline file and report every declared resource's secret that
+        /// changed since. Needs `FERRUM_ADMIN_JWT_VIEWER_SECRET`. A missing
+        /// file means no baseline yet. Keep the file outside the repository.
+        #[arg(long, value_name = "PATH")]
+        fingerprint_baseline: Option<String>,
+        /// Record this run's export fingerprints in this file (other
+        /// namespaces already in it are kept). Needs
+        /// `FERRUM_ADMIN_JWT_VIEWER_SECRET`; refused when the export was
+        /// served from cache. May name the same file as
+        /// `--fingerprint-baseline`, which is read first.
+        #[arg(long, value_name = "PATH")]
+        write_fingerprint_baseline: Option<String>,
     },
     Plan {
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]

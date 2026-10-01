@@ -52,6 +52,16 @@ exports. Keep gateway and credential-broker secrets in GitHub Environment
 secrets, scoped to the environment that uses them. For the full settings
 baseline, see [GitHub launch controls](docs/github-launch-controls.md).
 
+A process that only compares configuration needs no write authority. Give it
+the gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+) instead of
+`FERRUM_ADMIN_JWT_SECRET`: `gitforgeops diff` then reads `GET /config/export`,
+which the gateway caps at `viewer` and which carries keyed fingerprints instead
+of secret values. Handle the viewer secret like the admin one: an environment
+secret, never logged, never committed. Unless the gateway sets
+`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, it reads every namespace. A fingerprint
+baseline file holds only keyed fingerprints, but keep it outside the
+repository.
+
 Repository fixtures follow the same rule. `tests/fixtures/simple-config/` is
 the copy-paste sample and uses `${gh-env-secret:alloc=require}` (switch to
 `alloc=generate` for first-apply allocation, as in

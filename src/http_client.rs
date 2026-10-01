@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::config::EnvConfig;
+use crate::config_export::ConfigExport;
 use crate::diagnostics::{safe, safe_line};
 use crate::jwt::{self, JwtOptions};
 
@@ -86,7 +87,45 @@ impl AdminClient {
                 jwt_secret.len()
             )));
         }
+        Self::with_signing_secret(env, gateway_url, jwt_secret)
+    }
 
+    /// Build a read-only client whose tokens are signed with
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` and scoped to `namespaces`.
+    ///
+    /// The gateway authorizes a token that verifies under its viewer secret as
+    /// `viewer` whatever the token claims, so this client can read
+    /// [`AdminClient::get_config_export`] and `GET /namespaces` but every
+    /// write, and `GET /backup`, answers `403`. The admin secret is neither
+    /// needed nor used. The token claims `role: viewer` so the gateway's logs
+    /// do not show a role the key cannot grant.
+    ///
+    /// Refused, naming the settings and never the values: a missing viewer
+    /// secret, one shorter than the gateway's 32-character minimum, and one
+    /// equal to `FERRUM_ADMIN_JWT_SECRET` (the gateway refuses that pairing at
+    /// startup, and such a "viewer" key would really be the admin key).
+    pub fn new_viewer_scoped<I, S>(env: &EnvConfig, namespaces: I) -> crate::error::Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let gateway_url = env
+            .gateway_url
+            .clone()
+            .ok_or(crate::error::Error::NoGatewayUrl)?;
+        let viewer_secret = check_viewer_secret(env)?.to_string();
+        let mut client = Self::with_signing_secret(env, gateway_url, viewer_secret)?;
+        client.jwt_options.role = crate::config_export::VIEWER_ROLE.to_string();
+        client.set_namespace_scope(namespaces);
+        Ok(client)
+    }
+
+    /// Shared transport construction for both credential tiers.
+    fn with_signing_secret(
+        env: &EnvConfig,
+        gateway_url: String,
+        jwt_secret: String,
+    ) -> crate::error::Result<Self> {
         // Timeouts prevent CI from hanging indefinitely when the gateway is
         // unreachable or slow. Defaults: connect 10s, total request 60s.
         // `/backup` on large configs or `/restore` on slow commits may need
@@ -418,6 +457,38 @@ impl AdminClient {
             );
         }
         Ok(snapshot)
+    }
+
+    /// `GET /config/export` for one namespace: the read-only, fingerprinted
+    /// snapshot drift detection reads with a viewer credential.
+    ///
+    /// A cached export (`X-Data-Source: cached`, or `source: cached` in the
+    /// body) sets the same sticky flag as a cached `/backup`. Refusals are
+    /// explained in terms an operator can act on (see
+    /// [`explain_config_export_refusal`]).
+    pub async fn get_config_export(&self, namespace: &str) -> crate::error::Result<ConfigExport> {
+        let token = self.token()?;
+        let path = crate::config_export::CONFIG_EXPORT_PATH;
+        let resp = self
+            .send_with_retry(RequestKind::Read, || {
+                self.client
+                    .get(self.url(path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
+        if let Err(error) = self.check(&resp, RequestKind::Read) {
+            return Err(explain_config_export_refusal(resp.status, namespace, error));
+        }
+        let header_cached = resp
+            .data_source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("cached"));
+        let export = ConfigExport::from_response(&resp.body, namespace, header_cached)?;
+        if export.cached {
+            self.saw_cached_backup.store(true, Ordering::Relaxed);
+        }
+        Ok(export)
     }
 
     /// Fetch a backup that will be used to authorize gateway or ownership
@@ -930,6 +1001,75 @@ pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> Re
 
 fn rollback_needs_manual_recovery(rollback: Option<&str>) -> bool {
     matches!(rollback, Some("incomplete") | Some("unknown_outcome"))
+}
+
+/// Minimum length Ferrum Edge enforces for both admin JWT secrets.
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// The configured `FERRUM_ADMIN_JWT_VIEWER_SECRET`, or a refusal that names
+/// the settings involved and never either value.
+///
+/// Mirrors the gateway's own startup checks: at least 32 characters, and not
+/// equal to `FERRUM_ADMIN_JWT_SECRET`.
+pub fn check_viewer_secret(env: &EnvConfig) -> crate::error::Result<&str> {
+    let Some(secret) = env.admin_jwt_viewer_secret.as_deref() else {
+        return Err(crate::error::Error::Config(
+            "FERRUM_ADMIN_JWT_VIEWER_SECRET is not set (in CI, add it to the GitHub \
+             Environment's secrets for this environment)"
+                .to_string(),
+        ));
+    };
+    if secret.len() < MIN_JWT_SECRET_LEN {
+        return Err(crate::error::Error::Config(format!(
+            "FERRUM_ADMIN_JWT_VIEWER_SECRET must be at least {MIN_JWT_SECRET_LEN} characters to \
+             match ferrum-edge's minimum (got {})",
+            secret.len()
+        )));
+    }
+    if env.admin_jwt_secret.as_deref() == Some(secret) {
+        return Err(crate::error::Error::Config(
+            "FERRUM_ADMIN_JWT_VIEWER_SECRET must differ from FERRUM_ADMIN_JWT_SECRET: the gateway \
+             refuses that pairing, and a viewer key equal to the admin key grants admin"
+                .to_string(),
+        ));
+    }
+    Ok(secret)
+}
+
+/// Turn a failed `GET /config/export` into an error that says what to check.
+///
+/// - `404`: the gateway predates the export (Ferrum Edge v0.9.9).
+/// - `401`: the viewer token was rejected (wrong secret or claim settings).
+/// - `403`: the namespace is outside what the credential may read
+///   (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` or the token's `ns` claim).
+///
+/// Every other failure is returned unchanged.
+pub fn explain_config_export_refusal(
+    status: u16,
+    namespace: &str,
+    error: crate::error::Error,
+) -> crate::error::Error {
+    let remedy = match status {
+        404 => {
+            "the gateway does not serve GET /config/export, which needs Ferrum Edge v0.9.9 or \
+             later. Upgrade the gateway, or unset FERRUM_ADMIN_JWT_VIEWER_SECRET so diff reads \
+             GET /backup with the admin credential"
+        }
+        401 => {
+            "the gateway rejected the viewer token. FERRUM_ADMIN_JWT_VIEWER_SECRET must equal the \
+             gateway's FERRUM_ADMIN_JWT_VIEWER_SECRET, and FERRUM_ADMIN_JWT_ISSUER, \
+             FERRUM_ADMIN_JWT_AUDIENCE and FERRUM_ADMIN_JWT_TTL_SECS must match its settings"
+        }
+        403 => {
+            "the viewer credential may not read this namespace. Check the gateway's \
+             FERRUM_ADMIN_JWT_VIEWER_NAMESPACES and namespace-claim settings"
+        }
+        _ => return error,
+    };
+    crate::error::Error::Config(format!(
+        "GET /config/export for namespace '{}' failed: {remedy} ({error})",
+        safe(namespace)
+    ))
 }
 
 /// A DELETE that answers 404 already achieved its goal. The gateway cascades

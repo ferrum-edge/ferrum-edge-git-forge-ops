@@ -7,6 +7,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `diff` reads Ferrum Edge's `GET /config/export` with a viewer-capped
+  credential when `FERRUM_ADMIN_JWT_VIEWER_SECRET` is set, and never uses the
+  admin secret on that path; without it, `diff` keeps reading `GET /backup`
+  with the admin credential. Secrets arrive as gateway-keyed fingerprints a
+  viewer cannot reproduce, so declared secret fields are reported as
+  unverified instead of in sync, while fingerprinted credentials the
+  repository does not declare are still drift. New
+  `--write-fingerprint-baseline` / `--fingerprint-baseline` record an export's
+  fingerprints and report declared secrets that changed between two exports as
+  managed drift; a rotated gateway key makes the baseline "not comparable"
+  rather than drift. A cached export (`X-Data-Source: cached`) never yields an
+  in-sync or drift verdict and is never recorded as a baseline. `plan`,
+  `review` and `apply` still read `GET /backup`, and the bundled drift-check
+  workflow does not bind the viewer secret yet (#432).
 - Add exact, code-owned `require_auth_plugin.conditional_auth_exemptions` entries
   for intentionally public proxies. Exempted auth findings stay visible at
   `info`; stale entries are informational, while malformed, wildcard and
