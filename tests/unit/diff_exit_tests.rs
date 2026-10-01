@@ -1348,18 +1348,32 @@ const VIEWER_ONLY: [(&str, &str); 2] = [
 fn a_viewer_diff_reads_the_export_and_does_not_call_unverified_secrets_in_sync() {
     let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
 
+    // Unverified secrets make --exit-on-drift non-authoritative, like a cache.
     let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
 
     assert_eq!(
         output.status.code(),
-        Some(0),
+        Some(1),
         "stdout={} stderr={}",
         stdout(&output),
         stderr(&output)
     );
     assert!(stdout(&output).contains("Fingerprinted secret fields were not verified"));
     assert!(stderr(&output).contains("cannot compute the fingerprint"));
+    assert!(stderr(&output).contains("requires every declared secret to be verified"));
     assert!(!stdout(&output).contains("Configuration is in sync."));
+
+    let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&accepted, &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let output = repo.run_with_env(&["diff", "--format", "json"], &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["in_sync"], false);
+    assert_eq!(report["live_source"], "config_export");
+    assert_eq!(report["secret_fingerprints"]["verified"], false);
+
     let requests = repo.requests.lock().unwrap();
     assert!(!requests.is_empty());
     for request in requests.iter() {
@@ -1371,7 +1385,8 @@ fn a_viewer_diff_reads_the_export_and_does_not_call_unverified_secrets_in_sync()
 fn a_viewer_diff_still_reports_a_credential_the_repository_does_not_declare() {
     let repo = export_repo(config_export(EXPORT_KEY_ID, &['a', 'b']), false);
 
-    let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+    let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&accepted, &VIEWER_ONLY);
 
     assert_drift_exit(&output);
     let out = stdout(&output);
@@ -1410,9 +1425,105 @@ fn a_fingerprint_baseline_detects_a_secret_changed_between_exports() {
 
     let rekeyed = export_repo(config_export("fedcba9876543210", &['c']), false);
     let not_comparable = rekeyed.run_with_env(&compare, &VIEWER_ONLY);
-    assert_eq!(not_comparable.status.code(), Some(0));
+    assert_eq!(not_comparable.status.code(), Some(1));
     assert!(stderr(&not_comparable).contains("fingerprint key changed"));
+    assert!(stderr(&not_comparable).contains("requires every declared secret to be verified"));
     assert!(stdout(&not_comparable).contains("were not verified"));
+}
+
+#[test]
+fn a_baseline_is_not_recorded_from_a_drifted_run_without_force() {
+    let baseline_dir = TempDir::new().unwrap();
+    let baseline = baseline_dir.path().join("fingerprints.json");
+    let next = baseline_dir.path().join("next.json");
+    let path = baseline.to_str().unwrap();
+    let next_path = next.to_str().unwrap();
+
+    let recorded = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+    let write = ["diff", "--write-fingerprint-baseline", path];
+    let first = recorded.run_with_env(&write, &VIEWER_ONLY);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+
+    let rotated = export_repo(config_export(EXPORT_KEY_ID, &['c']), false);
+    let rewrite = [
+        "diff",
+        "--fingerprint-baseline",
+        path,
+        "--write-fingerprint-baseline",
+        next_path,
+    ];
+    let refused = rotated.run_with_env(&rewrite, &VIEWER_ONLY);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("refusing to write a fingerprint baseline"));
+    assert!(stdout(&refused).contains("CHANGED Consumer app (ferrum)"));
+    assert!(!next.exists());
+
+    let mut forced = rewrite.to_vec();
+    forced.push("--force-baseline");
+    let output = rotated.run_with_env(&forced, &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(next.exists());
+}
+
+#[test]
+fn a_baseline_inside_the_worktree_is_warned_about() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+    std::fs::create_dir(repo.dir.path().join(".git")).unwrap();
+
+    let args = ["diff", "--fingerprint-baseline", "fingerprints.json"];
+    let output = repo.run_with_env(&args, &VIEWER_ONLY);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("is inside the git worktree"));
+}
+
+#[test]
+fn a_credential_less_consumer_is_not_in_sync_without_a_baseline() {
+    // Edge hides basicauth and custom credentials behind one fingerprint per
+    // consumer, so a credential added out of band to a consumer the
+    // repository declares without credentials is invisible to a comparison.
+    let consumer = "kind: Consumer\nspec:\n  id: \"app\"\n  username: \"app\"\n";
+    let export = serde_json::json!({
+        "version": "1",
+        "ferrum_version": "0.9.9",
+        "source": "database",
+        "namespace": "ferrum",
+        "redaction": {
+            "fingerprint_algorithm": "hmac-sha256",
+            "fingerprint_prefix": "hmac-sha256:",
+            "fingerprint_key_id": EXPORT_KEY_ID,
+        },
+        "counts": { "proxies": 0, "consumers": 1, "plugin_configs": 0, "upstreams": 0 },
+        "proxies": [],
+        "consumers": [{
+            "id": "app",
+            "namespace": "ferrum",
+            "username": "app",
+            "labels": { "provisioned-by": "ferrum-edge-git-forge-ops" },
+            "credentials": {},
+            "hidden_credentials_fingerprint": fingerprint('9'),
+        }],
+        "plugin_configs": [],
+        "upstreams": [],
+    })
+    .to_string();
+    let repo = Repo::new(
+        &[("resources/ferrum/consumers/app.yaml", consumer)],
+        vec![("ferrum".to_string(), export)],
+    );
+
+    let output = repo.run_with_env(&["diff", "--format", "json"], &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["in_sync"], false);
+    assert_eq!(report["diff_count"], 0);
+    assert_eq!(report["secret_fingerprints"]["verified"], false);
+    assert_eq!(report["secret_fingerprints"]["uncompared_fields"], 1);
+
+    let text = repo.run_with_env(&["diff"], &VIEWER_ONLY);
+    assert!(!stdout(&text).contains("Configuration is in sync."));
+    let strict = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+    assert_eq!(strict.status.code(), Some(1));
 }
 
 #[test]

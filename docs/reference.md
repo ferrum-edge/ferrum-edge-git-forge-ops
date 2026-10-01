@@ -20,6 +20,7 @@ Global flags: `--env <name>`, `--allow-credential-slot-remap`,
 gitforgeops validate [--format text|json|github|github-annotations]
 gitforgeops diff     [--exit-on-drift] [--format text|json]
                      [--fingerprint-baseline PATH] [--write-fingerprint-baseline PATH]
+                     [--force-baseline] [--accept-unverified-secrets]
 gitforgeops plan     [--format text|json]
 gitforgeops apply    [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion]
                      [--allow-nontransactional-plugin-attach]
@@ -65,8 +66,23 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 deleted, and unmanaged resources, each as enabled by
 `ownership.drift_alert_on`, plus any API-spec ownership conflict, which cannot
 be muted. With `--fingerprint-baseline`, a declared resource's secret that
-changed since the baseline counts as a managed modification. A cached gateway
-read (`X-Data-Source: cached`) is never a result: `--exit-on-drift` exits `1`.
+changed since the baseline counts as a managed modification.
+
+`--exit-on-drift` exits `1` instead of `0` or `2` whenever the read is not
+authoritative:
+
+- a cached gateway read (`X-Data-Source: cached`);
+- on the viewer-credential path, any declared secret left unverified: no
+  `--fingerprint-baseline`, a baseline missing a namespace or a declared
+  resource, or a gateway fingerprint key that changed since the baseline.
+  Every declared Consumer counts here, because its hidden-credentials
+  fingerprint can only be checked against a baseline.
+
+`--accept-unverified-secrets` accepts unverified secrets and returns `0` or
+`2` from the compared fields; nothing accepts a cached read. In JSON output,
+`in_sync` is `true` only when nothing differs, every declared secret is
+verified and the read was not cached. The `/backup` path never has
+unverified secrets.
 
 ### `plan` blockers
 
@@ -314,16 +330,27 @@ with the admin credential.
   token) arrive as `hmac-sha256:<64 hex>`. The MAC key derives from the
   gateway's *admin* secret, and Edge deliberately does not let a viewer
   compute it, so `diff` cannot fingerprint the repository's value. Where the
-  repository declares a value at a fingerprinted location, the field is left
-  out of the comparison and counted as unverified; where it declares none, the
-  difference is reported. While any declared secret is unverified, `diff`
-  prints `No differences found in the compared fields` instead of `in sync`.
+  repository declares a secret-bearing value at a fingerprinted location (a
+  `${gh-env-secret:…}` placeholder, a URL with userinfo, a Consumer key or
+  secret, a plugin-config path the secret classifier flags, the Consul token,
+  or an ancestor of one), the field is left out of the comparison and counted
+  as unverified. Edge v0.9.9 does not publish which pointers it redacted, so a
+  fingerprint-shaped string anywhere else is compared like any value and shows
+  as drift; a field Edge fingerprints but GitForgeOps does not classify, with
+  a literal repository value, also shows as drift (noisy, never silent). Where
+  the repository declares nothing, the difference is reported. While any
+  declared secret is unverified, `diff` prints `No differences found in the
+  compared fields` instead of `in sync`.
 - **Fingerprint baseline.** `--write-fingerprint-baseline PATH` records the
   fingerprints of every exported resource (other namespaces already in the
   file are kept; refused for cached data). `--fingerprint-baseline PATH`
   compares each declared resource with it and reports secrets `CHANGED`,
   `ADDED` or `REMOVED` since, as managed drift. A missing file means no
-  baseline yet. Both flags need the viewer secret. A baseline shows change
+  baseline yet. Both flags need the viewer secret. Recording is refused (exit
+  `1`) when the same run found differences or secret changes, since the
+  baseline would carry the drift forward; `--force-baseline` overrides that.
+  `diff` warns when either baseline path lies inside a git worktree. A baseline
+  shows change
   between two exports, never agreement with the repository. Fingerprints are
   comparable only under one `redaction.fingerprint_key_id`; after the
   gateway's `FERRUM_ADMIN_JWT_SECRET` rotates (or a gateway without one
@@ -331,12 +358,19 @@ with the admin credential.
   drift. Record the baseline from a trusted state, such as right after a
   successful apply; a baseline rewritten by every drift check alerts on a
   change once. It holds keyed fingerprints only; keep it out of the repository.
-- **Hidden credentials.** `basicauth` and custom credential types are omitted
-  from the export. Each consumer carries one `hidden_credentials_fingerprint`
-  over them, which only a baseline can compare.
+- **Hidden credentials.** `basicauth`, custom credential types and
+  `mtls_auth` entries whose identity Edge considers invalid are omitted from
+  the export. Each consumer carries one `hidden_credentials_fingerprint` over
+  them, which only a baseline can compare, so it is unverified on every
+  declared Consumer, including one that declares no credentials.
 - **Consumer projection.** The export keeps only `keyauth[].key`,
   `jwt[].secret`, `hmac_auth[].secret` and `mtls_auth[].identity`; the
-  repository's Consumers are projected the same way before comparison.
+  repository's Consumers are projected the same way before comparison. Any
+  other non-secret field inside a credential entry (a legacy or extra key) is
+  therefore not compared on this path. `diff` drops only blank `mtls_auth`
+  identities and does not reproduce the rest of Edge's identity filter, so a
+  repository identity Edge rejects shows as drift: a false positive, never a
+  hidden change.
 - **No spec ownership.** `api_spec_id` is stripped, so spec-owned rows are
   compared like other live rows and spec ownership conflicts are not detected.
 - **Cached data.** `X-Data-Source: cached` (or `source: cached`) marks the

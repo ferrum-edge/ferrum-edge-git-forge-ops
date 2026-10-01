@@ -42,6 +42,7 @@ gitforgeops export --materialize [--encrypt-to LOGIN] # resolve creds, age-encry
 gitforgeops diff [--exit-on-drift] [--format text|json]  # desired vs live: /backup, or
   [--fingerprint-baseline PATH]                      # /config/export when
   [--write-fingerprint-baseline PATH]                # FERRUM_ADMIN_JWT_VIEWER_SECRET is set
+  [--force-baseline] [--accept-unverified-secrets]
 gitforgeops plan [--format text|json]                # validate + diff + breaking + security + best-practice
                                                      # + policy + adoption + apply blockers
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion] \
@@ -487,15 +488,23 @@ which the export lacks.
 - Fingerprints (`hmac-sha256:<64 hex>`) are keyed from the gateway's primary
   admin secret; a viewer cannot compute the repository value's fingerprint, and
   this build does not try. `ConfigExport::live_view` substitutes the declared
-  value at each fingerprinted pointer that the repository also declares and
-  lists it as uncompared; undeclared fingerprints stay and show as drift.
+  value only at a fingerprinted pointer that is secret-bearing in the repo
+  (placeholder, URL userinfo, Consumer key/secret, classified plugin path,
+  Consul token, or an ancestor of one; Edge publishes no redacted-pointer
+  list) and lists it as uncompared; every other fingerprint-shaped value is
+  compared as written. Every declared Consumer's
+  `hidden_credentials_fingerprint` is uncompared until a baseline covers it.
   Desired Consumers go through `project_consumer_for_export` (keyauth key,
   jwt/hmac secret, mtls identity only; `basicauth` dropped).
 - `FingerprintBaseline` (`--fingerprint-baseline`, `--write-fingerprint-baseline`)
   compares two exports per `(kind, id, pointer)` on declared resources only.
   A different `fingerprint_key_id` is "not comparable", never drift. Changes
   count as managed modifications (`DriftVerdict::with_secret_changes`).
-  `diff` never prints "in sync" while a declared secret is unverified.
+  Recording refuses a run with diffs or secret changes unless
+  `--force-baseline`; a baseline path inside a git worktree is warned about.
+- Unverified secrets (or a key change) are non-authoritative: no "in sync"
+  text, JSON `in_sync: false`, and `--exit-on-drift` exits 1 like a cached
+  read unless `--accept-unverified-secrets`.
 - Cached export (`X-Data-Source: cached` or `source: cached`): same as a cached
   `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
   no baseline is written.

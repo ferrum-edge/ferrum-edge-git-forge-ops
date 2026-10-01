@@ -20,11 +20,15 @@
 //! does not try to reproduce the computation. Consequences:
 //!
 //! - A fingerprinted field cannot be compared with the repository. Where the
-//!   repository declares a value at the same location, [`ConfigExport::live_view`]
-//!   substitutes the declared value into the live view (so the field is not
-//!   reported as drift it cannot be) and records the site in
-//!   [`ExportLiveView::uncompared`]. Where the repository declares nothing
-//!   there, the fingerprint stays and the structural difference is reported.
+//!   repository declares a **secret-bearing** value at the same location (a
+//!   brokered placeholder, a modeled secret leaf, or a URL with userinfo),
+//!   [`ConfigExport::live_view`] substitutes the declared value into the live
+//!   view (so the field is not reported as drift it cannot be) and records the
+//!   site in [`ExportLiveView::uncompared`]. Edge v0.9.9 publishes no list of
+//!   the pointers it redacted, so a fingerprint-shaped string anywhere else is
+//!   compared as an ordinary value and reported when it differs. Where the
+//!   repository declares nothing there, the fingerprint stays and the
+//!   structural difference is reported.
 //! - Fingerprint equality only shows that a stored value is **unchanged
 //!   between two exports** under one gateway key. [`FingerprintBaseline`]
 //!   records an export's fingerprints; a later run compares against it and
@@ -37,9 +41,10 @@
 //!   without one). Fingerprints under different key ids are not comparable;
 //!   [`FingerprintBaseline::compare`] says so instead of reporting drift.
 //! - Consumer `basicauth` (and any custom credential type) is omitted from the
-//!   export. Each consumer instead carries one
+//!   export, and so are `mtls_auth` entries whose identity Edge considers
+//!   invalid. Each consumer instead carries one
 //!   `hidden_credentials_fingerprint` over all of them, which only a baseline
-//!   can use.
+//!   can use; it is therefore uncompared on every declared consumer.
 //! - The export strips `api_spec_id`, so spec-owned rows cannot be told apart
 //!   from other live rows on this path.
 //!
@@ -48,7 +53,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,6 +62,7 @@ use crate::config::schema::Consumer;
 use crate::config::GatewayConfig;
 use crate::error::Error;
 use crate::http_client::{BackupSnapshot, SealStrictness};
+use crate::secrets::plugin_config::{sensitive_string_paths, ConfigPathComponent};
 
 /// Admin API path of the read-only export.
 pub const CONFIG_EXPORT_PATH: &str = "/config/export";
@@ -289,41 +295,36 @@ impl ConfigExport {
     /// The live configuration for comparison with `desired`.
     ///
     /// Each fingerprint at a location where the repository (after
-    /// [`project_consumer_for_export`]) declares a value is replaced by that
-    /// value and listed in [`ExportLiveView::uncompared`]: the field cannot be
-    /// compared, and reporting it as drift would be false. Fingerprints the
-    /// repository has no value for stay, so the difference is reported. The
-    /// consumers' [`HIDDEN_CREDENTIALS_FIELD`] is removed; it is listed as
-    /// uncompared when the repository declares `basicauth` for that consumer.
+    /// [`project_consumer_for_export`]) declares a secret-bearing value is
+    /// replaced by that value and listed in [`ExportLiveView::uncompared`]:
+    /// the field cannot be compared, and reporting it as drift would be
+    /// false. A location is secret-bearing when the declared value is a
+    /// brokered placeholder or a URL with userinfo, or the location is (or
+    /// contains) a modeled secret leaf: a Consumer key or secret, a plugin
+    /// config path the secret classifier flags, or the Consul token. Every
+    /// other fingerprint-shaped value stays and is compared as written.
+    ///
+    /// The consumers' [`HIDDEN_CREDENTIALS_FIELD`] is removed and, for every
+    /// declared consumer, listed as uncompared: it covers credentials the
+    /// export never shows (`basicauth`, custom types, invalid `mtls_auth`
+    /// identities), so only a baseline can say they did not change.
     pub fn live_view(&self, desired: &GatewayConfig) -> crate::error::Result<ExportLiveView> {
         let desired_rows = desired_comparison_rows(desired, &self.namespace)?;
-        let declares_hidden: BTreeSet<&str> = desired
-            .consumers
-            .iter()
-            .filter(|consumer| consumer.namespace == self.namespace)
-            .filter(|consumer| {
-                consumer
-                    .credentials
-                    .keys()
-                    .any(|credential_type| !exports_credential_type(credential_type))
-            })
-            .map(|consumer| consumer.id.as_str())
-            .collect();
-
         let mut sections: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
         let mut uncompared = Vec::new();
         for row in &self.rows {
             let mut body = row.body.clone();
+            let expected = desired_rows.get(&(row.kind, row.id.clone()));
             if row.kind == "Consumer" {
                 let removed = body
                     .as_object_mut()
                     .and_then(|object| object.remove(HIDDEN_CREDENTIALS_FIELD))
                     .is_some();
-                if removed && declares_hidden.contains(row.id.as_str()) {
+                if removed && expected.is_some() {
                     uncompared.push(self.site(row, &format!("/{HIDDEN_CREDENTIALS_FIELD}")));
                 }
             }
-            if let Some(expected) = desired_rows.get(&(row.kind, row.id.clone())) {
+            if let Some(expected) = expected {
                 let mut substituted = Vec::new();
                 substitute_fingerprints(&mut body, expected, &mut String::new(), &mut substituted);
                 uncompared.extend(substituted.iter().map(|pointer| self.site(row, pointer)));
@@ -433,11 +434,6 @@ pub fn project_desired_for_export(desired: &GatewayConfig) -> GatewayConfig {
     projected
 }
 
-fn exports_credential_type(credential_type: &str) -> bool {
-    let fingerprinted = FINGERPRINTED_CREDENTIAL_FIELDS.map(|(exported, _)| exported);
-    credential_type == "mtls_auth" || fingerprinted.contains(&credential_type)
-}
-
 /// Object entries of one credential value: an array's objects, or a legacy
 /// single object (Edge emits it at index 0).
 fn credential_entries(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
@@ -448,36 +444,147 @@ fn credential_entries(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
     }
 }
 
-/// Desired resources of one namespace, serialized for pointer lookups.
+/// One declared resource, serialized for pointer lookups, with the JSON
+/// pointers of its secret-bearing values.
+struct DesiredRow {
+    value: Value,
+    secret_pointers: BTreeSet<String>,
+}
+
+impl DesiredRow {
+    fn new(value: Value, mut secret_pointers: BTreeSet<String>) -> Self {
+        collect_secret_values(&value, &mut String::new(), &mut secret_pointers);
+        Self {
+            value,
+            secret_pointers,
+        }
+    }
+
+    /// True when `pointer` is a secret-bearing location, or an ancestor of
+    /// one (Edge may fingerprint a whole value that fails closed).
+    fn is_secret_bearing(&self, pointer: &str) -> bool {
+        let below = format!("{pointer}/");
+        self.secret_pointers
+            .iter()
+            .any(|secret| secret == pointer || secret.starts_with(&below))
+    }
+}
+
+/// Declared resources of one namespace, keyed by `(kind, id)`.
 fn desired_comparison_rows(
     desired: &GatewayConfig,
     namespace: &str,
-) -> crate::error::Result<HashMap<(&'static str, String), Value>> {
+) -> crate::error::Result<HashMap<(&'static str, String), DesiredRow>> {
     let desired = crate::config::filter_config_by_namespace(desired, namespace);
     let mut rows = HashMap::new();
     for proxy in &desired.proxies {
-        rows.insert(("Proxy", proxy.id.clone()), serde_json::to_value(proxy)?);
+        let value = serde_json::to_value(proxy)?;
+        rows.insert(
+            ("Proxy", proxy.id.clone()),
+            DesiredRow::new(value, BTreeSet::new()),
+        );
     }
     for consumer in &desired.consumers {
         let projected = project_consumer_for_export(consumer);
+        let value = serde_json::to_value(&projected)?;
+        let secrets = consumer_secret_pointers(&projected);
         rows.insert(
             ("Consumer", consumer.id.clone()),
-            serde_json::to_value(&projected)?,
+            DesiredRow::new(value, secrets),
         );
     }
     for plugin in &desired.plugin_configs {
+        let value = serde_json::to_value(plugin)?;
+        let mut secrets = BTreeSet::new();
+        for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
+            let mut pointer = String::from("/config");
+            for component in &path {
+                let segment = match component {
+                    ConfigPathComponent::Key(key) => key.clone(),
+                    ConfigPathComponent::Index(index) => index.to_string(),
+                };
+                push_pointer_segment(&mut pointer, &segment);
+            }
+            secrets.insert(pointer);
+        }
         rows.insert(
             ("PluginConfig", plugin.id.clone()),
-            serde_json::to_value(plugin)?,
+            DesiredRow::new(value, secrets),
         );
     }
     for upstream in &desired.upstreams {
+        let value = serde_json::to_value(upstream)?;
+        let mut secrets = BTreeSet::new();
+        for field in crate::secrets::service_discovery::SD_SECRET_FIELDS {
+            let mut pointer = String::from("/service_discovery");
+            for segment in field.path {
+                push_pointer_segment(&mut pointer, segment);
+            }
+            secrets.insert(pointer);
+        }
         rows.insert(
             ("Upstream", upstream.id.clone()),
-            serde_json::to_value(upstream)?,
+            DesiredRow::new(value, secrets),
         );
     }
     Ok(rows)
+}
+
+/// Pointers of the secret leaves the export fingerprints on a projected
+/// Consumer: each `keyauth[].key`, `jwt[].secret` and `hmac_auth[].secret`.
+fn consumer_secret_pointers(projected: &Consumer) -> BTreeSet<String> {
+    let mut pointers = BTreeSet::new();
+    for (credential_type, field) in FINGERPRINTED_CREDENTIAL_FIELDS {
+        let Some(Value::Array(entries)) = projected.credentials.get(credential_type) else {
+            continue;
+        };
+        for index in 0..entries.len() {
+            let mut pointer = String::from("/credentials");
+            push_pointer_segment(&mut pointer, credential_type);
+            push_pointer_segment(&mut pointer, &index.to_string());
+            push_pointer_segment(&mut pointer, field);
+            pointers.insert(pointer);
+        }
+    }
+    pointers
+}
+
+/// Add the pointer of every string that is a brokered placeholder or a URL
+/// carrying userinfo.
+fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => {
+            if crate::secrets::parse_placeholder(text).is_some() || has_url_userinfo(text) {
+                out.insert(pointer.clone());
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                let len = pointer.len();
+                push_pointer_segment(pointer, key);
+                collect_secret_values(child, pointer, out);
+                pointer.truncate(len);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let len = pointer.len();
+                push_pointer_segment(pointer, &index.to_string());
+                collect_secret_values(child, pointer, out);
+                pointer.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True for `scheme://user[:password]@host…`.
+fn has_url_userinfo(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.contains('@')
 }
 
 /// Append one RFC 6901 reference token.
@@ -517,18 +624,20 @@ fn collect_fingerprints(value: &Value, pointer: &mut String, out: &mut ResourceF
     }
 }
 
-/// Replace each fingerprint in `live` that has a counterpart in `desired` with
-/// that counterpart, recording the pointer.
+/// Replace each fingerprint in `live` at a secret-bearing location the
+/// repository declares with the declared value, recording the pointer.
 fn substitute_fingerprints(
     live: &mut Value,
-    desired: &Value,
+    desired: &DesiredRow,
     pointer: &mut String,
     substituted: &mut Vec<String>,
 ) {
     if live.as_str().is_some_and(is_fingerprint) {
-        if let Some(expected) = desired.pointer(pointer) {
-            *live = expected.clone();
-            substituted.push(pointer.clone());
+        if let Some(expected) = desired.value.pointer(pointer) {
+            if desired.is_secret_bearing(pointer) {
+                *live = expected.clone();
+                substituted.push(pointer.clone());
+            }
         }
         return;
     }
@@ -742,6 +851,18 @@ fn declared_resources(
     declared
 }
 
+/// The git worktree containing `path`, if any: the nearest ancestor of its
+/// absolute form that holds a `.git` entry. A fingerprint baseline belongs
+/// outside the repository, so callers warn when this is `Some`.
+pub fn enclosing_git_worktree(path: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    absolute
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 /// Result of comparing one namespace's export with a baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceSecretComparison {
@@ -802,6 +923,9 @@ pub struct SecretFingerprintSummary {
     /// Every namespace was compared with a baseline under the same key, and
     /// every declared live resource was in it.
     pub baseline_complete: bool,
+    /// A namespace's baseline was recorded under a different gateway key, so
+    /// none of its fingerprints could be compared.
+    pub key_changed: bool,
     /// Why parts of the comparison were not possible. Unsanitized: gateway
     /// and baseline text; print through `diagnostics`.
     pub notes: Vec<String>,
@@ -822,6 +946,7 @@ impl SecretFingerprintSummary {
             uncompared,
             changes: Vec::new(),
             baseline_complete: baseline.is_some(),
+            key_changed: false,
             notes: Vec::new(),
         };
         let Some(baseline) = baseline else {
@@ -842,6 +967,7 @@ impl SecretFingerprintSummary {
                 }
                 NamespaceSecretComparison::KeyChanged => {
                     summary.baseline_complete = false;
+                    summary.key_changed = true;
                     summary.notes.push(format!(
                         "namespace '{namespace}': the gateway's fingerprint key changed since the \
                          baseline (its FERRUM_ADMIN_JWT_SECRET rotated, or a gateway without one \
@@ -869,8 +995,9 @@ impl SecretFingerprintSummary {
 
     /// True when no declared secret is left unverified: either nothing was
     /// fingerprinted, or a complete baseline shows each one unchanged (or
-    /// lists it in [`Self::changes`]).
+    /// lists it in [`Self::changes`]). A gateway key change is never
+    /// verified: the baseline it invalidated proves nothing.
     pub fn verified(&self) -> bool {
-        self.uncompared == 0 || self.baseline_complete
+        !self.key_changed && (self.uncompared == 0 || self.baseline_complete)
     }
 }

@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use gitforgeops::config::env::EnvConfig;
 use gitforgeops::config::GatewayConfig;
 use gitforgeops::config_export::{
-    is_fingerprint, project_consumer_for_export, project_desired_for_export, ConfigExport,
-    FingerprintBaseline, NamespaceSecretComparison, SecretChange, SecretChangeKind,
-    SecretFingerprintSummary, BASELINE_FORMAT, VIEWER_ROLE,
+    enclosing_git_worktree, is_fingerprint, project_consumer_for_export,
+    project_desired_for_export, ConfigExport, FingerprintBaseline, NamespaceSecretComparison,
+    SecretChange, SecretChangeKind, SecretFingerprintSummary, BASELINE_FORMAT, VIEWER_ROLE,
 };
 use gitforgeops::diff::{compute_diff, DiffAction};
 use gitforgeops::error::Error;
@@ -242,6 +242,81 @@ fn a_fingerprint_the_repository_does_not_declare_is_still_drift() {
 }
 
 #[test]
+fn a_fingerprint_shaped_value_in_a_non_secret_field_is_compared() {
+    // Edge publishes no list of the pointers it redacted, so a fingerprint
+    // shape alone must not hide drift in an ordinary field.
+    let desired = desired();
+    let consumers = json!([live_consumer(&[fp('a')], &fp('b'))]);
+    let plugins = json!([live_plugin(&fp('e'), &fp('9'))]);
+    let body = document("ferrum", KEY_ID, consumers, plugins).to_string();
+    let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+    let view = export.live_view(&desired).unwrap();
+
+    let plugin = &view.actual.plugin_configs[0];
+    assert_eq!(plugin.config["protocol"], json!(fp('9')));
+    assert_eq!(plugin.config["authorization"], PLACEHOLDER);
+    // The key, the hidden credentials and the bearer token; not the protocol.
+    assert_eq!(view.uncompared.len(), 3);
+
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    assert_eq!(diffs[0].kind, "PluginConfig");
+    assert_eq!(diffs[0].action, DiffAction::Modify);
+}
+
+#[test]
+fn a_resolved_secret_at_a_modeled_path_is_still_uncompared() {
+    // With a bundle loaded the repository value is the real secret, not a
+    // placeholder; the Consumer key path alone marks it secret-bearing.
+    let mut desired = desired();
+    let consumer = &mut desired.consumers[0];
+    let key = json!([{ "key": "resolved-key-value-0001" }]);
+    consumer.credentials.insert("keyauth".to_string(), key);
+    let view = export_with('a', 'b', KEY_ID).live_view(&desired).unwrap();
+    let keyauth = &view.actual.consumers[0].credentials["keyauth"];
+    assert_eq!(keyauth, &json!([{ "key": "resolved-key-value-0001" }]));
+}
+
+#[test]
+fn every_declared_consumer_leaves_its_hidden_credentials_uncompared() {
+    // A credential-less consumer can still gain a basicauth credential out of
+    // band; only the hidden-credentials fingerprint would show it.
+    let desired: GatewayConfig = serde_json::from_value(json!({
+        "consumers": [{ "id": "app", "namespace": "ferrum", "username": "app" }],
+    }))
+    .unwrap();
+    let mut consumer = live_consumer(&[], &fp('b'));
+    consumer["credentials"] = json!({});
+    let body = document("ferrum", KEY_ID, json!([consumer]), json!([])).to_string();
+    let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+    let view = export.live_view(&desired).unwrap();
+
+    assert_eq!(view.uncompared.len(), 1);
+    let site = &view.uncompared[0];
+    assert_eq!(site.pointer, "/hidden_credentials_fingerprint");
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    let exports = [export];
+    let unverified = SecretFingerprintSummary::evaluate(&exports, 1, None, &desired);
+    assert!(!unverified.verified());
+
+    let mut baseline = FingerprintBaseline::default();
+    baseline.record(&exports[0]);
+    let proven = SecretFingerprintSummary::evaluate(&exports, 1, Some(&baseline), &desired);
+    assert!(proven.verified());
+}
+
+#[test]
+fn a_baseline_inside_a_git_worktree_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let nested = dir.path().join("state").join("fingerprints.json");
+    let found = enclosing_git_worktree(&nested);
+    assert_eq!(found.as_deref(), Some(dir.path()));
+}
+
+#[test]
 fn the_desired_consumer_is_projected_like_the_export() {
     let desired = desired();
     let consumer: gitforgeops::config::schema::Consumer = serde_json::from_value(json!({
@@ -401,7 +476,13 @@ fn the_summary_is_unverified_without_a_complete_baseline() {
     let key_changed =
         SecretFingerprintSummary::evaluate(&rotated, uncompared, Some(&baseline), &desired);
     assert!(!key_changed.verified());
+    assert!(key_changed.key_changed);
     assert!(key_changed.notes[0].contains("fingerprint key changed"));
+
+    // A key change is never verified, even with nothing to compare.
+    let empty = GatewayConfig::default();
+    let rekeyed = SecretFingerprintSummary::evaluate(&rotated, 0, Some(&baseline), &empty);
+    assert!(!rekeyed.verified());
 
     let nothing_fingerprinted = SecretFingerprintSummary::evaluate(&exports, 0, None, &desired);
     assert!(nothing_fingerprinted.verified());

@@ -91,6 +91,18 @@ pub enum Commands {
         /// `--fingerprint-baseline`, which is read first.
         #[arg(long, value_name = "PATH")]
         write_fingerprint_baseline: Option<String>,
+        /// With `--write-fingerprint-baseline`, record the baseline even when
+        /// this run found differences or secret changes. Without it, such a
+        /// run refuses to record, because the baseline would carry the drift
+        /// forward.
+        #[arg(long)]
+        force_baseline: bool,
+        /// With `--exit-on-drift`, return the in-sync or drift result even
+        /// though fingerprinted secrets could not be verified (no complete
+        /// fingerprint baseline, or the gateway's fingerprint key changed).
+        /// Without it, such a run exits 1 as non-authoritative.
+        #[arg(long)]
+        accept_unverified_secrets: bool,
     },
     Plan {
         #[arg(long, value_enum, default_value_t = ReportFormat::Text)]

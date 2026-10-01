@@ -666,21 +666,28 @@ What the export cannot tell you:
   credential cannot compute the fingerprint of the repository's value, so
   those fields are not compared with the repository. `diff` says how many it
   left unverified and does not print `Configuration is in sync.` while any
-  are. A fingerprinted credential the repository does not declare is still
-  reported.
+  are; JSON `in_sync` is `false`, and `--exit-on-drift` exits `1` (not
+  authoritative) unless `--accept-unverified-secrets` is passed. A
+  fingerprinted credential the repository does not declare, and a
+  fingerprint-shaped value in a non-secret field, are still reported.
 - **Fingerprints only show change between two exports.**
   `--write-fingerprint-baseline PATH` records an export's fingerprints;
   `--fingerprint-baseline PATH` reports every declared resource's secret that
   changed, appeared or disappeared since, and counts them as managed drift. The
   baseline cannot say whether a value matches the repository: record it from a
-  gateway you trust, ideally right after a successful apply. If the drift check
-  rewrites the baseline on every run, a change alerts once. Rotating the
-  gateway's `FERRUM_ADMIN_JWT_SECRET`, or restarting a gateway that has none,
-  changes every fingerprint; `diff` then reports the baseline as not comparable
-  instead of reporting drift. The baseline holds keyed fingerprints only; keep
-  it outside the repository.
-- **`basicauth` is hidden.** The export omits it and gives each consumer one
-  fingerprint over all hidden credentials, which only a baseline can use.
+  gateway you trust, ideally right after a successful apply. Recording is
+  refused when the same run found differences or secret changes, unless
+  `--force-baseline` is passed. If the drift check rewrites the baseline on
+  every run, a change alerts once. Rotating the gateway's
+  `FERRUM_ADMIN_JWT_SECRET`, or restarting a gateway that has none, changes
+  every fingerprint; `diff` then reports the baseline as not comparable, which
+  is not authoritative either. The baseline holds keyed fingerprints only; keep
+  it outside the repository (`diff` warns when it is inside a git worktree).
+- **`basicauth` is hidden.** The export omits it (and custom types, and
+  `mtls_auth` identities Edge rejects) and gives each consumer one fingerprint
+  over all hidden credentials. Only a baseline can use it, so every declared
+  consumer, even one with no credentials, leaves that fingerprint unverified
+  until a baseline covers it.
 - **No API-spec ownership.** The export strips `api_spec_id`, so spec-owned
   rows look like any other live row and spec ownership conflicts are not
   detected on this path.

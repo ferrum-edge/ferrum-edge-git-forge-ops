@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
@@ -76,15 +76,19 @@ async fn main() {
             format,
             fingerprint_baseline,
             write_fingerprint_baseline,
+            force_baseline,
+            accept_unverified_secrets,
         } => {
             cmd_diff(
                 exit_on_drift,
                 format,
                 explicit_env.as_deref(),
                 cli.allow_empty_namespace,
-                FingerprintBaselinePaths {
+                ExportDiffFlags {
                     read: fingerprint_baseline.map(PathBuf::from),
                     write: write_fingerprint_baseline.map(PathBuf::from),
+                    force_baseline,
+                    accept_unverified_secrets,
                 },
             )
             .await
@@ -1566,10 +1570,28 @@ async fn cmd_export(
     Ok(())
 }
 
-/// `diff --fingerprint-baseline` and `--write-fingerprint-baseline`.
-struct FingerprintBaselinePaths {
+/// `diff` flags for the viewer-credential (`GET /config/export`) path.
+struct ExportDiffFlags {
+    /// `--fingerprint-baseline`
     read: Option<PathBuf>,
+    /// `--write-fingerprint-baseline`
     write: Option<PathBuf>,
+    /// `--force-baseline`
+    force_baseline: bool,
+    /// `--accept-unverified-secrets`
+    accept_unverified_secrets: bool,
+}
+
+/// The refusal `diff --exit-on-drift` returns when fingerprinted secrets
+/// were not verified: like a cached read, the run cannot say "in sync".
+fn unverified_secrets_refusal() -> gitforgeops::error::Error {
+    gitforgeops::error::Error::StaleGatewayView(
+        "--exit-on-drift requires every declared secret to be verified, but fingerprinted \
+         secret fields were not (see the notes above); refusing to return either the in-sync \
+         (0) or drift (2) result. Compare against a complete fingerprint baseline under the \
+         gateway's current key, or pass --accept-unverified-secrets"
+            .to_string(),
+    )
 }
 
 /// The exports a viewer-credential `diff` read, and the fingerprinted fields
@@ -1651,7 +1673,7 @@ async fn cmd_diff(
     format: cli::ReportFormat,
     explicit_env: Option<&str>,
     allow_empty_namespace: bool,
-    baseline_paths: FingerprintBaselinePaths,
+    flags: ExportDiffFlags,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json_mode = matches!(format, cli::ReportFormat::Json);
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
@@ -1659,7 +1681,7 @@ async fn cmd_diff(
     // and never touches the admin secret. Without one, it falls back to
     // GET /backup with the admin credential.
     let read_export = env_config.admin_jwt_viewer_secret.is_some();
-    if !read_export && (baseline_paths.read.is_some() || baseline_paths.write.is_some()) {
+    if !read_export && (flags.read.is_some() || flags.write.is_some()) {
         return Err(gitforgeops::error::Error::Config(
             "--fingerprint-baseline and --write-fingerprint-baseline need \
              FERRUM_ADMIN_JWT_VIEWER_SECRET: fingerprints come from GET /config/export, which \
@@ -1668,7 +1690,18 @@ async fn cmd_diff(
         )
         .into());
     }
-    let baseline = match &baseline_paths.read {
+    let mut baseline_files = BTreeSet::new();
+    baseline_files.extend(flags.read.iter().chain(&flags.write));
+    for path in baseline_files {
+        if let Some(root) = config_export::enclosing_git_worktree(path) {
+            eprintln!(
+                "Warning: fingerprint baseline {} is inside the git worktree at {}. It holds keyed fingerprints only, but keep it outside the repository so it is never committed.",
+                safe_path(path),
+                safe_path(&root)
+            );
+        }
+    }
+    let baseline = match &flags.read {
         Some(path) => config_export::FingerprintBaseline::load(path)?,
         None => None,
     };
@@ -1801,7 +1834,7 @@ async fn cmd_diff(
         )
     });
     if let Some(summary) = &secrets {
-        print_secret_fingerprint_notes(summary, baseline_paths.read.is_some(), baseline.is_some());
+        print_secret_fingerprint_notes(summary, flags.read.is_some(), baseline.is_some());
     }
     let secret_changes: &[config_export::SecretChange] = secrets
         .as_ref()
@@ -1811,7 +1844,8 @@ async fn cmd_diff(
         .as_ref()
         .is_none_or(config_export::SecretFingerprintSummary::verified);
 
-    if let (Some(path), Some(comparison)) = (&baseline_paths.write, &export_comparison) {
+    let mut baseline_refusal = None;
+    if flags.write.is_some() && export_comparison.is_some() {
         if !cached_namespaces.is_empty() {
             return Err(gitforgeops::error::Error::StaleGatewayView(format!(
                 "refusing to write a fingerprint baseline: namespace(s) {} were served from cache",
@@ -1819,6 +1853,19 @@ async fn cmd_diff(
             ))
             .into());
         }
+        let drifted = !diffs.is_empty() || !secret_changes.is_empty();
+        if drifted && !flags.force_baseline {
+            let reason = format!(
+                "refusing to write a fingerprint baseline: this run found {} difference(s) and {} secret change(s), and a baseline recorded from a drifted gateway carries the drift forward. Reconcile first, or pass --force-baseline",
+                diffs.len(),
+                secret_changes.len()
+            );
+            eprintln!("Warning: {reason}.");
+            baseline_refusal = Some(gitforgeops::error::Error::Config(reason));
+        }
+    }
+    let record_to = flags.write.as_ref().filter(|_| baseline_refusal.is_none());
+    if let (Some(path), Some(comparison)) = (record_to, &export_comparison) {
         let existing = config_export::FingerprintBaseline::load(path)?;
         let mut recorded = existing.unwrap_or_default();
         for export in &comparison.exports {
@@ -1855,7 +1902,7 @@ async fn cmd_diff(
         &namespace_scope,
         desired_finding.as_ref(),
         serde_json::json!({
-            "in_sync": in_sync && cached_namespaces.is_empty(),
+            "in_sync": in_sync && secrets_verified && cached_namespaces.is_empty(),
             "diff_count": diffs.len(),
             "live_filter_warning": live_warning,
             "plugin_attach_notice": plugin_attach_notice,
@@ -1878,8 +1925,18 @@ async fn cmd_diff(
     let alert = &resolved.ownership.drift_alert_on;
     let drift = verdict::DriftVerdict::evaluate(alert, &diffs, &unmanaged, &spec_owned)
         .with_secret_changes(alert, secret_changes.len());
+    // Unverified secrets make `--exit-on-drift` non-authoritative, exactly as
+    // a cached read does; a refused baseline write is an error either way.
+    let refusal = if exit_on_drift && !secrets_verified && !flags.accept_unverified_secrets {
+        Some(unverified_secrets_refusal())
+    } else {
+        baseline_refusal
+    };
 
     if json_mode {
+        if let Some(error) = refusal {
+            return Err(error.into());
+        }
         if exit_on_drift && cached_namespaces.is_empty() && drift.has_drift() {
             process::exit(drift.exit_code());
         }
@@ -1901,6 +1958,9 @@ async fn cmd_diff(
             );
         } else {
             println!("No differences found. Configuration is in sync.");
+        }
+        if let Some(error) = refusal {
+            return Err(error.into());
         }
         return Ok(());
     }
@@ -1983,6 +2043,9 @@ async fn cmd_diff(
         print_spec_owned(&spec_owned);
     }
 
+    if let Some(error) = refusal {
+        return Err(error.into());
+    }
     if exit_on_drift && drift.has_drift() {
         println!(
             "Drift detected ({}); exiting {}.",

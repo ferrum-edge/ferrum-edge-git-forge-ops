@@ -752,3 +752,25 @@ fn the_viewer_secret_keeps_its_exact_bytes() {
 
     clear_env();
 }
+
+#[test]
+fn env_config_debug_redacts_both_jwt_secrets() {
+    let admin = "synthetic-admin-signing-key-at-least-32-bytes";
+    let viewer = "synthetic-viewer-signing-key-at-least-32-bytes";
+    let config = EnvConfig {
+        admin_jwt_secret: Some(admin.to_string()),
+        admin_jwt_viewer_secret: Some(viewer.to_string()),
+        github_token: Some("synthetic-github-token".to_string()),
+        client_key: Some("synthetic-client-key".to_string()),
+        ..EnvConfig::default()
+    };
+
+    let rendered = format!("{config:?}");
+
+    assert!(!rendered.contains(admin), "{rendered}");
+    assert!(!rendered.contains(viewer), "{rendered}");
+    assert!(!rendered.contains("synthetic-github-token"), "{rendered}");
+    assert!(!rendered.contains("synthetic-client-key"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(rendered.contains("admin_jwt_issuer"), "{rendered}");
+}
