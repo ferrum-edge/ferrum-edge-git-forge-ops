@@ -9,6 +9,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Support the per-proxy `allow_path_parameters` option for HTTP-family routes
   and preserve the mesh service opt-in through mesh configuration output.
+- The supply-chain policy accepts `FERRUM_ADMIN_JWT_VIEWER_SECRET` as the
+  signing key of the scheduled drift check (`drift-check.yml`) and refuses it
+  in every other workflow or composite action. A step that binds it must also
+  bind the issuer, audience and TTL settings. During the move,
+  `drift-check.yml` may still bind `FERRUM_ADMIN_JWT_SECRET`, and binding both
+  keys is reported as a warning. The settings audit accepts either key in a
+  `<env>-monitor` environment and warns when it holds both, and `doctor`
+  reports the auditor's warnings as `WARN` findings. Secret names are matched
+  case-insensitively, as GitHub resolves them, and a `secrets.<name>`
+  reference not spelled in upper case is a violation. The next change binds
+  the viewer key in `drift-check.yml` and removes the admin key from
+  monitoring (#440).
 - `diff` reads Ferrum Edge's `GET /config/export` with a viewer-capped
   credential when `FERRUM_ADMIN_JWT_VIEWER_SECRET` is set, and never uses the
   admin secret on that path; without it, `diff` keeps reading `GET /backup`
