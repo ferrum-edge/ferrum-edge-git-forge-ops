@@ -39,7 +39,10 @@ gateway's API contract, secret handling and ownership rules still apply.
 gitforgeops validate [--format text|json|github|github-annotations]  # assemble + `ferrum-edge validate`
 gitforgeops export [--output PATH]                   # flat YAML (placeholders kept) + mesh doc
 gitforgeops export --materialize [--encrypt-to LOGIN] # resolve creds, age-encrypt (materialize-file.yml)
-gitforgeops diff [--exit-on-drift] [--format text|json]  # desired vs live (/backup)
+gitforgeops diff [--exit-on-drift] [--format text|json]  # desired vs live: /backup, or
+  [--fingerprint-baseline PATH]                      # /config/export when
+  [--write-fingerprint-baseline PATH]                # FERRUM_ADMIN_JWT_VIEWER_SECRET is set
+  [--force-baseline] [--accept-unverified-secrets]
 gitforgeops plan [--format text|json]                # validate + diff + breaking + security + best-practice
                                                      # + policy + adoption + apply blockers
 gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion] \
@@ -473,6 +476,50 @@ config and service-discovery secrets in `diff`, `plan` and `review`. Missing
 required values still block apply. Review markdown is bounded below GitHub's
 API limit.
 
+### Viewer-credential drift reads
+
+`config_export.rs`. With `FERRUM_ADMIN_JWT_VIEWER_SECRET` set, `diff` (only
+`diff`) builds `AdminClient::new_viewer_scoped` (role claim `viewer`; the admin
+secret is neither needed nor used) and reads `GET /config/export` per
+namespace. `plan`, `review` and `apply` stay on `/backup`: adoption,
+pending-create matching and spec ownership need raw values and `api_spec_id`,
+which the export lacks.
+
+- Fingerprints (`hmac-sha256:<64 hex>`) are keyed from the gateway's primary
+  admin secret; a viewer cannot compute the repository value's fingerprint, and
+  this build does not try. `ConfigExport::live_view` substitutes the declared
+  value only at a fingerprinted pointer that is secret-bearing in the repo
+  (placeholder, URL userinfo, Consumer key/secret, classified plugin path,
+  Consul token, or an ancestor of one; Edge publishes no redacted-pointer
+  list) and lists it as uncompared; every other fingerprint-shaped value is
+  compared as written. Secret-bearing locations come from the desired config
+  both before and after bundle resolution (`live_view_with`). Every declared
+  Consumer's `hidden_credentials_fingerprint` is uncompared (even if the export
+  omits it) until a baseline covers it; an omitted one is never verified.
+  Ancestor replacements are `masked_ancestors`: never authoritative, not
+  covered by a baseline or `--accept-unverified-secrets`.
+  Desired Consumers go through `project_consumer_for_export` (keyauth key,
+  jwt/hmac secret, mtls identity only; `basicauth` dropped).
+- `FingerprintBaseline` (`--fingerprint-baseline`, `--write-fingerprint-baseline`)
+  compares two exports per `(kind, id, pointer)` on declared resources only.
+  A different `fingerprint_key_id` is "not comparable", never drift. Changes
+  count as managed modifications (`DriftVerdict::with_secret_changes`).
+  Recording refuses a run with diffs or secret changes unless
+  `--force-baseline`; a baseline path inside a git worktree is warned about.
+- Unverified secrets (or a key change) are non-authoritative: no "in sync"
+  text, JSON `in_sync: false`; `--exit-on-drift` exits 2 when drift was
+  found, otherwise 1 unless `--accept-unverified-secrets` (which does not
+  cover masked ancestors). A cached read exits 1 either way. The four
+  export-only flags are refused on the `/backup` path.
+- Cached export (`X-Data-Source: cached` or `source: cached`): same as a cached
+  `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
+  no baseline is written.
+- The export strips `api_spec_id`; spec ownership is not detected on this path.
+- `ExportEndpoint` builds the export URL from `FERRUM_GATEWAY_URL`, not from the
+  client: `https://`, or `http://` only to a literal loopback IP. Keeping the
+  URL out of the secret-holding client also keeps CodeQL's cleartext rules
+  clean; avoid secret-named locals (`secrets`, …) for values that are printed.
+
 ### Multi-environment (repo config)
 
 `.gitforgeops/config.yaml` (closed version-1 contract) declares logical
@@ -516,8 +563,11 @@ comparison; `drift`/`failed`/`not_completed` block; `skipped` does not. A matrix
 entry with no record becomes `not_completed`. The settings audit also fails when
 the newest successful `drift-check.yml` run is older than
 `--monitoring-max-age-hours` (48), so a `cron:` entry alone proves nothing.
-Ferrum Edge has no read-only admin role, so the monitoring JWT secret is
-gateway-write-equivalent.
+`drift-check.yml` still binds the admin secret and `diff` then reads `/backup`,
+so the monitoring JWT secret is gateway-write-equivalent. Binding
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` there instead (see
+[Viewer-credential drift reads](#viewer-credential-drift-reads)) is a separate
+supply-chain-policy change.
 
 #### Freshness guard
 
@@ -1386,6 +1436,8 @@ Only what the sections above do not already say.
 - `src/reconcile.rs` — `resolved_namespaces`, `previously_managed`.
 - `src/jwt.rs` — HS256 admin tokens. `src/verdict.rs` — `apply_blockers`,
   `DriftVerdict`.
+- `src/config_export.rs` — `GET /config/export` parsing, fingerprint
+  substitution, Consumer projection, `FingerprintBaseline`.
 - `src/diagnostics.rs` — shared log sanitizer (`sanitize*` and `safe*`
   adapters). Every diagnostic routes untrusted ids, namespaces, plugin names,
   YAML paths and gateway text through it: control characters and line
@@ -1421,6 +1473,7 @@ credentials. Booleans accept `true|false|1|0`.
 |---|---|---|
 | `FERRUM_GATEWAY_URL` | — (api mode: required) | `https://` only; `http://` needs `FERRUM_ALLOW_INSECURE_HTTP=true`; other schemes and embedded `user:password@` are refused, in `load_env_config` before any client exists. |
 | `FERRUM_ADMIN_JWT_SECRET` | — (api mode: required) | ≥32 chars, matching Edge. |
+| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | unset | Edge's viewer-capped key (≥32, ≠ admin secret). Set → `diff` reads `/config/export` with it. |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Must equal the gateway's issuer or every call is 401. |
 | `FERRUM_ADMIN_JWT_ROLE` | `admin` | `viewer`/`operator`/`admin`. `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only. |
 | `FERRUM_ADMIN_JWT_AUDIENCE` | unset | `aud` emitted only when set; a gateway with no audience rejects tokens carrying it. |

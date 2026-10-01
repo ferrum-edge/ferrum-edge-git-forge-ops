@@ -245,6 +245,7 @@ environment through to a first apply and authenticated traffic.
    |---|---|---|
    | `FERRUM_GATEWAY_URL` | api mode | Must be `https://`. |
    | `FERRUM_ADMIN_JWT_SECRET` | api mode | HS256 key, at least 32 characters. |
+   | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | optional | The gateway's viewer-capped key (Ferrum Edge v0.9.9+). When set, `diff` reads `GET /config/export` with it instead of `GET /backup` with the admin key. The bundled workflows do not bind it yet. See [Reading with a viewer-capped credential](#reading-with-a-viewer-capped-credential). |
    | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | yes | From step 5. |
    | `FERRUM_GH_PROVISIONER_TOKEN` | credential broker | App installation token, or fine-grained PAT with `Secrets: write` + `Environments: write`. |
    | `FERRUM_ADMIN_JWT_ISSUER` / `_ROLE` / `_AUDIENCE` / `_TTL_SECS` | optional | Defaults `ferrum-edge`, `admin`, none, `3600`. If set, must match the gateway or every call is `401`. |
@@ -646,6 +647,67 @@ Only `In sync` means the gateway was read and matched; `Drift detected`,
 gitforgeops --env production diff --exit-on-drift   # exit 0 in sync, 2 drift, 1 error
 ```
 
+### Reading with a viewer-capped credential
+
+Ferrum Edge v0.9.9 can verify admin tokens with a second key,
+`FERRUM_ADMIN_JWT_VIEWER_SECRET`, and authorizes every token signed with it as
+`viewer` whatever the token claims. When the same setting is present for
+GitForgeOps, `diff` reads live state from `GET /config/export` with that key
+and never uses the admin key. Without it, `diff` reads `GET /backup` with the
+admin credential as before. `plan`, `review` and `apply` always use
+`GET /backup`: they preview or perform writes and need raw values and API-spec
+ownership tags, which the export does not carry.
+
+What the export cannot tell you:
+
+- **Secrets are fingerprints.** Credential keys and secrets, plugin-config
+  secrets, credential-bearing URLs and the Consul token arrive as
+  `hmac-sha256:<64 hex>`, keyed from the gateway's *admin* secret. A viewer
+  credential cannot compute the fingerprint of the repository's value, so
+  those fields are not compared with the repository. `diff` says how many it
+  left unverified and does not print `Configuration is in sync.` while any
+  are; JSON `in_sync` is `false`. With `--exit-on-drift`, drift that was found
+  still exits `2`, but "no drift" exits `1` (not authoritative) unless
+  `--accept-unverified-secrets` is passed. A
+  fingerprinted credential the repository does not declare, and a
+  fingerprint-shaped value in a non-secret field, are still reported.
+- **Fingerprints only show change between two exports.**
+  `--write-fingerprint-baseline PATH` records an export's fingerprints;
+  `--fingerprint-baseline PATH` reports every declared resource's secret that
+  changed, appeared or disappeared since, and counts them as managed drift. The
+  baseline cannot say whether a value matches the repository: record it from a
+  gateway you trust, ideally right after a successful apply. Recording is
+  refused when the same run found differences or secret changes, unless
+  `--force-baseline` is passed. If the drift check rewrites the baseline on
+  every run, a change alerts once. Rotating the gateway's
+  `FERRUM_ADMIN_JWT_SECRET`, or restarting a gateway that has none, changes
+  every fingerprint; `diff` then reports the baseline as not comparable, which
+  is not authoritative either. The baseline holds keyed fingerprints only; keep
+  it outside the repository (`diff` warns when it is inside a git worktree).
+- **`basicauth` is hidden.** The export omits it (and custom types, and an
+  `mtls_auth` type with no identity Edge accepts) and gives each consumer one
+  fingerprint over all hidden credentials. Only a baseline can use it, so every
+  declared consumer, even one with no credentials, leaves that fingerprint
+  unverified until a baseline covers it. Invalid `mtls_auth` identities next
+  to a valid one are neither shown nor fingerprinted.
+- **Whole values around a secret.** When Edge fingerprints a whole value that
+  only contains a secret (a `headers` map holding an API key, say), its
+  non-secret contents cannot be compared either. Such a run is never
+  authoritative: without drift elsewhere, `--exit-on-drift` exits `1` even
+  with a baseline or `--accept-unverified-secrets`.
+- **No API-spec ownership.** The export strips `api_spec_id`, so spec-owned
+  rows look like any other live row and spec ownership conflicts are not
+  detected on this path.
+- **HTTPS only.** The viewer token goes only to an `https://` gateway, or over
+  `http://` to a literal loopback IP such as `127.0.0.1` (not `localhost`).
+- **Cached data is stale.** An export served with `X-Data-Source: cached`
+  (including when another export holds the gateway's database load) makes
+  `diff` warn, report no authoritative result, refuse `--exit-on-drift`
+  (exit 1) and refuse to write a baseline.
+
+The bundled `drift-check.yml` does not bind the viewer secret yet, so
+scheduled checks still use the admin credential.
+
 ### Unattended monitoring, and when it is approval-gated
 
 A drift check bound to a deployment environment inherits its required
@@ -667,11 +729,12 @@ provisioner token or credential bundles). The settings audit,
 environment opts in, the audit also requires a successful drift run in the
 last 48 hours.
 
-**Caveat:** Ferrum Edge signs admin tokens with a symmetric secret, and
-`GET /backup` needs the `admin` role, so no token can read configuration
-without also being able to write it. Treat the monitoring environment's
-signing secret as gateway-write-equivalent. If that is unacceptable, leave
-`monitoring.unattended` off. See
+**Caveat:** the bundled drift check still reads `GET /backup`, which needs
+the `admin` role, so the monitoring environment's signing secret is
+gateway-write-equivalent. Treat it that way. If that is unacceptable, leave
+`monitoring.unattended` off. `diff` itself can already read with a
+viewer-capped key ([above](#reading-with-a-viewer-capped-credential)); binding
+it in the workflow is a separate change. See
 [GitHub launch controls §3.1](docs/github-launch-controls.md#31-unattended-drift-monitoring).
 
 ## Setup doctor

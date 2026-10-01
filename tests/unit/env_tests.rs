@@ -22,6 +22,7 @@ fn clear_env() {
     for var in &[
         "FERRUM_GATEWAY_URL",
         "FERRUM_ADMIN_JWT_SECRET",
+        "FERRUM_ADMIN_JWT_VIEWER_SECRET",
         "FERRUM_NAMESPACE",
         "FERRUM_GATEWAY_MODE",
         "FERRUM_APPLY_STRATEGY",
@@ -284,6 +285,7 @@ fn env_config_treats_blank_secret_backed_vars_as_unset() {
 
     std::env::set_var("FERRUM_GATEWAY_URL", "");
     std::env::set_var("FERRUM_ADMIN_JWT_SECRET", "");
+    std::env::set_var("FERRUM_ADMIN_JWT_VIEWER_SECRET", "");
     std::env::set_var("FERRUM_NAMESPACE", "  ");
     std::env::set_var("FERRUM_GATEWAY_CA_CERT", "");
     std::env::set_var("FERRUM_GATEWAY_CLIENT_CERT", "");
@@ -292,6 +294,7 @@ fn env_config_treats_blank_secret_backed_vars_as_unset() {
     let config = load_env_config().unwrap();
     assert!(config.gateway_url.is_none());
     assert!(config.admin_jwt_secret.is_none());
+    assert!(config.admin_jwt_viewer_secret.is_none());
     assert!(config.namespace_filter.is_none());
     assert!(config.ca_cert.is_none());
     assert!(config.client_cert.is_none());
@@ -732,4 +735,46 @@ fn allow_insecure_http_parses_like_the_other_booleans() {
     assert!(error.contains("yes"), "{error}");
 
     clear_env();
+}
+
+/// The viewer secret is an environment secret like the admin one: its exact
+/// bytes are the signing key, so it is never trimmed.
+#[test]
+fn the_viewer_secret_keeps_its_exact_bytes() {
+    let _guard = env_guard();
+    clear_env();
+
+    let secret = " synthetic-viewer-signing-key-at-least-32-bytes ";
+    std::env::set_var("FERRUM_ADMIN_JWT_VIEWER_SECRET", secret);
+    let config = load_env_config().unwrap();
+    assert_eq!(config.admin_jwt_viewer_secret.as_deref(), Some(secret));
+    assert!(config.admin_jwt_secret.is_none());
+
+    clear_env();
+}
+
+#[test]
+fn env_config_debug_redacts_both_jwt_secrets() {
+    let admin = "synthetic-admin-signing-key-at-least-32-bytes";
+    let viewer = "synthetic-viewer-signing-key-at-least-32-bytes";
+    let config = EnvConfig {
+        admin_jwt_secret: Some(admin.to_string()),
+        admin_jwt_viewer_secret: Some(viewer.to_string()),
+        github_token: Some("synthetic-github-token".to_string()),
+        github_provisioner_token: Some("synthetic-provisioner-token".to_string()),
+        creds_bundle_json: Some("synthetic-inline-bundle".to_string()),
+        client_key: Some("synthetic-client-key".to_string()),
+        ..EnvConfig::default()
+    };
+
+    let rendered = format!("{config:?}");
+
+    assert!(!rendered.contains(admin), "{rendered}");
+    assert!(!rendered.contains(viewer), "{rendered}");
+    assert!(!rendered.contains("synthetic-github-token"), "{rendered}");
+    assert!(!rendered.contains("synthetic-client-key"), "{rendered}");
+    assert!(!rendered.contains("synthetic-provisioner-token"));
+    assert!(!rendered.contains("synthetic-inline-bundle"));
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(rendered.contains("admin_jwt_issuer"), "{rendered}");
 }
