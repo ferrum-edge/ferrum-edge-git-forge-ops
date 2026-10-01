@@ -27,6 +27,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
+  CVE-2026-103111 finding while the pinned Debian base remains behind.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on
   non-stream proxies and rejects it with `frontend_tls: true`, so GitForgeOps
   does not count their HTTP authenticators. Set `passthrough: false` and
