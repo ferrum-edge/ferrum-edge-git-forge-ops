@@ -101,7 +101,8 @@ pub enum Commands {
         /// fingerprinted secrets could not be verified (no complete
         /// fingerprint baseline, or the gateway's fingerprint key changed).
         /// Without it, such a run exits 1 as non-authoritative. Drift found
-        /// on a fresh read exits 2 either way; a cached read always exits 1.
+        /// on a fresh read exits 2 either way; a cached read always exits 1,
+        /// and so does a whole value fingerprinted around a secret.
         #[arg(long)]
         accept_unverified_secrets: bool,
     },

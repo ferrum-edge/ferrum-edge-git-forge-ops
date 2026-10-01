@@ -308,6 +308,97 @@ fn every_declared_consumer_leaves_its_hidden_credentials_uncompared() {
 }
 
 #[test]
+fn a_consumer_exported_without_its_hidden_fingerprint_is_never_verified() {
+    // A non-conforming gateway that omits the field must not let a baseline
+    // vouch for credentials nobody could see.
+    let desired = desired();
+    let mut consumer = live_consumer(&[fp('a')], &fp('b'));
+    let object = consumer.as_object_mut().unwrap();
+    object.remove("hidden_credentials_fingerprint");
+    let plugins = json!([live_plugin(&fp('e'), "grpc")]);
+    let body = document("ferrum", KEY_ID, json!([consumer]), plugins).to_string();
+    let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+    let view = export.live_view(&desired).unwrap();
+    // The key, the hidden credentials (recorded although absent) and the token.
+    assert_eq!(view.uncompared.len(), 3);
+    let site = &view.uncompared[1];
+    assert_eq!(site.pointer, "/hidden_credentials_fingerprint");
+
+    let uncompared = view.uncompared.len();
+    let exports = [export];
+    let mut baseline = FingerprintBaseline::default();
+    baseline.record(&exports[0]);
+    let summary =
+        SecretFingerprintSummary::evaluate(&exports, uncompared, Some(&baseline), &desired);
+    assert!(!summary.verified());
+    assert!(summary.notes[0].contains("hidden_credentials_fingerprint"));
+}
+
+#[test]
+fn a_placeholder_stays_secret_bearing_after_the_bundle_resolves_it() {
+    // An unclassified plugin field is secret-bearing only because the
+    // repository brokers it; resolution must not erase that.
+    let unresolved: GatewayConfig = serde_json::from_value(json!({
+        "plugin_configs": [{
+            "id": "otel",
+            "namespace": "ferrum",
+            "plugin_name": "otel_tracing",
+            "scope": "global",
+            "config": { "service_label": PLACEHOLDER, "protocol": "grpc" },
+        }],
+    }))
+    .unwrap();
+    let mut resolved = unresolved.clone();
+    resolved.plugin_configs[0].config["service_label"] = json!("resolved-label-0001");
+    let mut plugin = live_plugin(&fp('e'), "grpc");
+    plugin["config"] = json!({ "service_label": fp('e'), "protocol": "grpc" });
+    let body = document("ferrum", KEY_ID, json!([]), json!([plugin])).to_string();
+    let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+
+    let without_source = export.live_view(&resolved).unwrap();
+    assert!(without_source.uncompared.is_empty());
+
+    let view = export.live_view_with(&resolved, &unresolved).unwrap();
+    assert_eq!(view.uncompared.len(), 1);
+    let label = &view.actual.plugin_configs[0].config["service_label"];
+    assert_eq!(label, &json!("resolved-label-0001"));
+    let diffs = compute_diff(&resolved, &view.actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+}
+
+#[test]
+fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
+    let desired: GatewayConfig = serde_json::from_value(json!({
+        "plugin_configs": [{
+            "id": "otel",
+            "namespace": "ferrum",
+            "plugin_name": "otel_tracing",
+            "scope": "global",
+            "config": { "headers": { "x-api-key": PLACEHOLDER, "x-trace": "on" } },
+        }],
+    }))
+    .unwrap();
+    let mut plugin = live_plugin(&fp('e'), "grpc");
+    plugin["config"] = json!({ "headers": fp('c') });
+    let body = document("ferrum", KEY_ID, json!([]), json!([plugin])).to_string();
+    let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+    let view = export.live_view(&desired).unwrap();
+
+    assert_eq!(view.masked_ancestors.len(), 1);
+    assert_eq!(view.masked_ancestors[0].pointer, "/config/headers");
+    assert_eq!(view.uncompared.len(), 1);
+
+    let exports = [export];
+    let mut baseline = FingerprintBaseline::default();
+    baseline.record(&exports[0]);
+    let summary = SecretFingerprintSummary::evaluate(&exports, 1, Some(&baseline), &desired)
+        .with_masked_ancestors(view.masked_ancestors.len());
+    // The baseline proves the fingerprint unchanged, not its hidden contents.
+    assert!(summary.verified());
+    assert!(!summary.authoritative());
+}
+
+#[test]
 fn a_baseline_inside_a_git_worktree_is_detected() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".git")).unwrap();

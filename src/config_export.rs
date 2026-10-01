@@ -41,10 +41,18 @@
 //!   without one). Fingerprints under different key ids are not comparable;
 //!   [`FingerprintBaseline::compare`] says so instead of reporting drift.
 //! - Consumer `basicauth` (and any custom credential type) is omitted from the
-//!   export, and so are `mtls_auth` entries whose identity Edge considers
-//!   invalid. Each consumer instead carries one
-//!   `hidden_credentials_fingerprint` over all of them, which only a baseline
-//!   can use; it is therefore uncompared on every declared consumer.
+//!   export. Each consumer instead carries one `hidden_credentials_fingerprint`
+//!   over the omitted types, which only a baseline can use; it is therefore
+//!   uncompared on every declared consumer, and a declared consumer whose
+//!   export lacks the field can never be verified. `mtls_auth` falls under the
+//!   hidden fingerprint only when none of its identities is valid to Edge;
+//!   when at least one is valid, the export shows the valid ones and its
+//!   invalid entries are neither shown nor fingerprinted.
+//! - Edge may fingerprint a whole value (an ancestor of a secret leaf) when
+//!   the value fails closed. Replacing it with the declared value also hides
+//!   the value's non-secret contents, so such replacements are counted
+//!   separately ([`ExportLiveView::masked_ancestors`]) and keep a run
+//!   non-authoritative whatever else is accepted.
 //! - The export strips `api_spec_id`, so spec-owned rows cannot be told apart
 //!   from other live rows on this path.
 //!
@@ -305,29 +313,58 @@ impl ConfigExport {
     /// other fingerprint-shaped value stays and is compared as written.
     ///
     /// The consumers' [`HIDDEN_CREDENTIALS_FIELD`] is removed and, for every
-    /// declared consumer, listed as uncompared: it covers credentials the
-    /// export never shows (`basicauth`, custom types, invalid `mtls_auth`
-    /// identities), so only a baseline can say they did not change.
+    /// declared consumer, listed as uncompared whether or not the export
+    /// carries it: it covers credentials the export never shows (`basicauth`,
+    /// custom types, an `mtls_auth` type with no valid identity), so only a
+    /// baseline can say they did not change.
+    ///
+    /// Equivalent to [`Self::live_view_with`] with `desired` as its own
+    /// secret source.
     pub fn live_view(&self, desired: &GatewayConfig) -> crate::error::Result<ExportLiveView> {
-        let desired_rows = desired_comparison_rows(desired, &self.namespace)?;
+        self.live_view_with(desired, desired)
+    }
+
+    /// [`Self::live_view`] for a `desired` whose placeholders were already
+    /// resolved from a credential bundle. Secret-bearing locations are taken
+    /// from both `desired` and `unresolved` (the same configuration before
+    /// resolution), so a brokered value stays secret-bearing once the bundle
+    /// has replaced its placeholder.
+    pub fn live_view_with(
+        &self,
+        desired: &GatewayConfig,
+        unresolved: &GatewayConfig,
+    ) -> crate::error::Result<ExportLiveView> {
+        let mut desired_rows = desired_comparison_rows(desired, &self.namespace)?;
+        let unresolved_rows = desired_comparison_rows(unresolved, &self.namespace)?;
+        for (key, row) in &mut desired_rows {
+            if let Some(source) = unresolved_rows.get(key) {
+                let extra = source.secret_pointers.iter().cloned();
+                row.secret_pointers.extend(extra);
+            }
+        }
         let mut sections: BTreeMap<&'static str, Vec<Value>> = BTreeMap::new();
         let mut uncompared = Vec::new();
+        let mut masked_ancestors = Vec::new();
         for row in &self.rows {
             let mut body = row.body.clone();
             let expected = desired_rows.get(&(row.kind, row.id.clone()));
             if row.kind == "Consumer" {
-                let removed = body
-                    .as_object_mut()
-                    .and_then(|object| object.remove(HIDDEN_CREDENTIALS_FIELD))
-                    .is_some();
-                if removed && expected.is_some() {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove(HIDDEN_CREDENTIALS_FIELD);
+                }
+                if expected.is_some() {
                     uncompared.push(self.site(row, &format!("/{HIDDEN_CREDENTIALS_FIELD}")));
                 }
             }
             if let Some(expected) = expected {
                 let mut substituted = Vec::new();
                 substitute_fingerprints(&mut body, expected, &mut String::new(), &mut substituted);
-                uncompared.extend(substituted.iter().map(|pointer| self.site(row, pointer)));
+                for (pointer, ancestor) in &substituted {
+                    uncompared.push(self.site(row, pointer));
+                    if *ancestor {
+                        masked_ancestors.push(self.site(row, pointer));
+                    }
+                }
             }
             sections.entry(row.section).or_default().push(body);
         }
@@ -343,10 +380,24 @@ impl ConfigExport {
             SealStrictness::Advisory,
         )?;
         uncompared.sort();
+        masked_ancestors.sort();
         Ok(ExportLiveView {
             actual: snapshot.config,
             uncompared,
+            masked_ancestors,
         })
+    }
+
+    /// Ids of exported consumers that lack [`HIDDEN_CREDENTIALS_FIELD`]. Edge
+    /// always sends it, so its absence means a non-conforming gateway, and no
+    /// baseline can then vouch for the hidden credentials.
+    pub fn consumers_missing_hidden_fingerprint(&self) -> BTreeSet<&str> {
+        self.rows
+            .iter()
+            .filter(|row| row.kind == "Consumer")
+            .filter(|row| row.body.get(HIDDEN_CREDENTIALS_FIELD).is_none())
+            .map(|row| row.id.as_str())
+            .collect()
     }
 
     fn site(&self, row: &ExportRow, pointer: &str) -> FingerprintSite {
@@ -366,6 +417,10 @@ pub struct ExportLiveView {
     /// Fingerprinted fields on declared resources whose live value could not
     /// be compared with the repository's value.
     pub uncompared: Vec<FingerprintSite>,
+    /// The subset of [`Self::uncompared`] where Edge fingerprinted a whole
+    /// value that only *contains* a secret. Its non-secret contents were not
+    /// compared either, so a run with any of these is never authoritative.
+    pub masked_ancestors: Vec<FingerprintSite>,
 }
 
 /// One fingerprinted field. Every member comes from the gateway; sanitize
@@ -460,13 +515,19 @@ impl DesiredRow {
         }
     }
 
-    /// True when `pointer` is a secret-bearing location, or an ancestor of
-    /// one (Edge may fingerprint a whole value that fails closed).
-    fn is_secret_bearing(&self, pointer: &str) -> bool {
+    /// How `pointer` relates to the secret-bearing locations: `Some(false)`
+    /// for one of them, `Some(true)` for an ancestor of one (Edge may
+    /// fingerprint a whole value that fails closed), `None` otherwise.
+    fn secret_bearing(&self, pointer: &str) -> Option<bool> {
+        if self.secret_pointers.contains(pointer) {
+            return Some(false);
+        }
         let below = format!("{pointer}/");
-        self.secret_pointers
+        let ancestor = self
+            .secret_pointers
             .iter()
-            .any(|secret| secret == pointer || secret.starts_with(&below))
+            .any(|secret| secret.starts_with(&below));
+        ancestor.then_some(true)
     }
 }
 
@@ -625,19 +686,19 @@ fn collect_fingerprints(value: &Value, pointer: &mut String, out: &mut ResourceF
 }
 
 /// Replace each fingerprint in `live` at a secret-bearing location the
-/// repository declares with the declared value, recording the pointer.
+/// repository declares with the declared value, recording the pointer and
+/// whether it was an ancestor of the secret rather than the secret itself.
 fn substitute_fingerprints(
     live: &mut Value,
     desired: &DesiredRow,
     pointer: &mut String,
-    substituted: &mut Vec<String>,
+    substituted: &mut Vec<(String, bool)>,
 ) {
     if live.as_str().is_some_and(is_fingerprint) {
-        if let Some(expected) = desired.value.pointer(pointer) {
-            if desired.is_secret_bearing(pointer) {
-                *live = expected.clone();
-                substituted.push(pointer.clone());
-            }
+        let expected = desired.value.pointer(pointer);
+        if let (Some(expected), Some(ancestor)) = (expected, desired.secret_bearing(pointer)) {
+            *live = expected.clone();
+            substituted.push((pointer.clone(), ancestor));
         }
         return;
     }
@@ -926,6 +987,11 @@ pub struct SecretFingerprintSummary {
     /// A namespace's baseline was recorded under a different gateway key, so
     /// none of its fingerprints could be compared.
     pub key_changed: bool,
+    /// Whole values Edge fingerprinted around a secret (see
+    /// [`ExportLiveView::masked_ancestors`]). Never authoritative: neither a
+    /// baseline nor `--accept-unverified-secrets` covers their non-secret
+    /// contents.
+    pub masked_ancestors: usize,
     /// Why parts of the comparison were not possible. Unsanitized: gateway
     /// and baseline text; print through `diagnostics`.
     pub notes: Vec<String>,
@@ -947,6 +1013,7 @@ impl SecretFingerprintSummary {
             changes: Vec::new(),
             baseline_complete: baseline.is_some(),
             key_changed: false,
+            masked_ancestors: 0,
             notes: Vec::new(),
         };
         let Some(baseline) = baseline else {
@@ -958,6 +1025,19 @@ impl SecretFingerprintSummary {
                 continue;
             }
             let namespace = &export.namespace;
+            let declared = declared_resources(desired, namespace);
+            let missing = export
+                .consumers_missing_hidden_fingerprint()
+                .into_iter()
+                .filter(|id| declared.contains(&("Consumer", (*id).to_string())))
+                .count();
+            if missing > 0 {
+                summary.baseline_complete = false;
+                summary.notes.push(format!(
+                    "namespace '{namespace}': {missing} declared consumer(s) came without \
+                     {HIDDEN_CREDENTIALS_FIELD}, so their hidden credentials cannot be verified"
+                ));
+            }
             match baseline.compare(export, desired) {
                 NamespaceSecretComparison::NoBaseline => {
                     summary.baseline_complete = false;
@@ -999,5 +1079,17 @@ impl SecretFingerprintSummary {
     /// verified: the baseline it invalidated proves nothing.
     pub fn verified(&self) -> bool {
         !self.key_changed && (self.uncompared == 0 || self.baseline_complete)
+    }
+
+    /// Record how many whole values were fingerprinted around a secret.
+    pub fn with_masked_ancestors(mut self, masked_ancestors: usize) -> Self {
+        self.masked_ancestors = masked_ancestors;
+        self
+    }
+
+    /// False when any whole value was fingerprinted around a secret: no flag
+    /// or baseline makes such a run authoritative.
+    pub fn authoritative(&self) -> bool {
+        self.masked_ancestors == 0
     }
 }

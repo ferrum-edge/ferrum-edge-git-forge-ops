@@ -21,6 +21,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `--fingerprint-baseline` record an export's fingerprints and report declared
   secrets that changed between two exports as managed drift; a rotated gateway
   key makes the baseline "not comparable", which is not authoritative either.
+  Whole values Edge fingerprints around a secret keep a run non-authoritative
+  even with that flag or a baseline, and a declared consumer whose export lacks
+  its hidden-credentials fingerprint is never verified. Brokered locations stay
+  secret-bearing when a credential bundle resolves them. The export-only flags
+  are refused when no viewer secret is configured.
   Recording a baseline is refused when the run found drift unless
   `--force-baseline` is passed, and `diff` warns when a baseline path is inside
   a git worktree. A cached export (`X-Data-Source: cached`) never yields an

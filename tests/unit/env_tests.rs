@@ -761,6 +761,8 @@ fn env_config_debug_redacts_both_jwt_secrets() {
         admin_jwt_secret: Some(admin.to_string()),
         admin_jwt_viewer_secret: Some(viewer.to_string()),
         github_token: Some("synthetic-github-token".to_string()),
+        github_provisioner_token: Some("synthetic-provisioner-token".to_string()),
+        creds_bundle_json: Some("synthetic-inline-bundle".to_string()),
         client_key: Some("synthetic-client-key".to_string()),
         ..EnvConfig::default()
     };
@@ -771,6 +773,8 @@ fn env_config_debug_redacts_both_jwt_secrets() {
     assert!(!rendered.contains(viewer), "{rendered}");
     assert!(!rendered.contains("synthetic-github-token"), "{rendered}");
     assert!(!rendered.contains("synthetic-client-key"), "{rendered}");
+    assert!(!rendered.contains("synthetic-provisioner-token"));
+    assert!(!rendered.contains("synthetic-inline-bundle"));
     assert!(rendered.contains("<redacted>"), "{rendered}");
     assert!(rendered.contains("admin_jwt_issuer"), "{rendered}");
 }

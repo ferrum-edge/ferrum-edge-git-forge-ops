@@ -492,8 +492,12 @@ which the export lacks.
   (placeholder, URL userinfo, Consumer key/secret, classified plugin path,
   Consul token, or an ancestor of one; Edge publishes no redacted-pointer
   list) and lists it as uncompared; every other fingerprint-shaped value is
-  compared as written. Every declared Consumer's
-  `hidden_credentials_fingerprint` is uncompared until a baseline covers it.
+  compared as written. Secret-bearing locations come from the desired config
+  both before and after bundle resolution (`live_view_with`). Every declared
+  Consumer's `hidden_credentials_fingerprint` is uncompared (even if the export
+  omits it) until a baseline covers it; an omitted one is never verified.
+  Ancestor replacements are `masked_ancestors`: never authoritative, not
+  covered by a baseline or `--accept-unverified-secrets`.
   Desired Consumers go through `project_consumer_for_export` (keyauth key,
   jwt/hmac secret, mtls identity only; `basicauth` dropped).
 - `FingerprintBaseline` (`--fingerprint-baseline`, `--write-fingerprint-baseline`)
@@ -504,8 +508,9 @@ which the export lacks.
   `--force-baseline`; a baseline path inside a git worktree is warned about.
 - Unverified secrets (or a key change) are non-authoritative: no "in sync"
   text, JSON `in_sync: false`; `--exit-on-drift` exits 2 when drift was
-  found, otherwise 1 unless `--accept-unverified-secrets`. A cached read exits
-  1 either way.
+  found, otherwise 1 unless `--accept-unverified-secrets` (which does not
+  cover masked ancestors). A cached read exits 1 either way. The four
+  export-only flags are refused on the `/backup` path.
 - Cached export (`X-Data-Source: cached` or `source: cached`): same as a cached
   `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
   no baseline is written.

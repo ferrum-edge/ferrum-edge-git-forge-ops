@@ -1582,6 +1582,19 @@ struct ExportDiffFlags {
     accept_unverified_secrets: bool,
 }
 
+/// The refusal `diff --exit-on-drift` returns when it found no drift but the
+/// gateway fingerprinted a whole value around a secret, hiding its non-secret
+/// contents. No flag accepts it.
+fn masked_ancestor_refusal() -> gitforgeops::error::Error {
+    gitforgeops::error::Error::StaleGatewayView(
+        "--exit-on-drift cannot report no drift: the gateway fingerprinted whole value(s) that \
+         contain a secret, so their non-secret contents were not compared (see the notes \
+         above); refusing to return the in-sync (0) result. --accept-unverified-secrets does \
+         not cover this"
+            .to_string(),
+    )
+}
+
 /// The refusal `diff --exit-on-drift` returns when it found no drift but
 /// fingerprinted secrets were not verified: the run cannot say "in sync".
 /// Drift found on the same read is real and keeps the drift exit code.
@@ -1600,23 +1613,31 @@ fn unverified_secrets_refusal() -> gitforgeops::error::Error {
 struct ExportComparison {
     exports: Vec<config_export::ConfigExport>,
     uncompared: usize,
+    /// Whole values fingerprinted around a secret; never authoritative.
+    masked_ancestors: usize,
 }
 
 /// [`load_namespace_pairs_for`] over `GET /config/export` with the viewer
 /// credential. Each pair's live side is [`config_export::ConfigExport::live_view`]
 /// and its desired side is projected the way the export projects Consumers.
+///
+/// `unresolved` is the desired configuration before credential resolution, so
+/// a brokered value stays secret-bearing once a bundle has replaced it.
 async fn load_export_pairs_for(
     client: &AdminClient,
     desired: &GatewayConfig,
+    unresolved: &GatewayConfig,
     namespaces: &[String],
 ) -> gitforgeops::error::Result<(Vec<NamespaceSnapshot>, ExportComparison)> {
     let mut pairs = Vec::new();
     let mut comparison = ExportComparison {
         exports: Vec::new(),
         uncompared: 0,
+        masked_ancestors: 0,
     };
     for namespace in namespaces {
-        let desired_namespace = config::filter_config_by_namespace(desired, namespace);
+        let desired_ns = config::filter_config_by_namespace(desired, namespace);
+        let unresolved_ns = config::filter_config_by_namespace(unresolved, namespace);
         let export = client.get_config_export(namespace).await?;
         if let Some(notice) = &export.count_seal_notice {
             eprintln!(
@@ -1625,15 +1646,16 @@ async fn load_export_pairs_for(
                 safe_line(notice)
             );
         }
-        let view = export.live_view(&desired_namespace)?;
+        let view = export.live_view_with(&desired_ns, &unresolved_ns)?;
         pairs.push(NamespaceSnapshot {
             namespace: namespace.clone(),
-            desired: config_export::project_desired_for_export(&desired_namespace),
+            desired: config_export::project_desired_for_export(&desired_ns),
             actual: view.actual,
             extras: gitforgeops::http_client::BackupExtras::default(),
             cached: export.cached,
         });
         comparison.uncompared += view.uncompared.len();
+        comparison.masked_ancestors += view.masked_ancestors.len();
         comparison.exports.push(export);
     }
     Ok((pairs, comparison))
@@ -1652,6 +1674,12 @@ fn print_secret_fingerprint_notes(
     }
     for note in &summary.notes {
         eprintln!("Note: {}.", safe_line(note));
+    }
+    if summary.masked_ancestors > 0 {
+        eprintln!(
+            "Note: the gateway fingerprinted {} whole value(s) that contain a secret, so their non-secret contents were not compared either. No baseline or flag makes such a run authoritative.",
+            summary.masked_ancestors
+        );
     }
     if summary.uncompared == 0 {
         return;
@@ -1682,11 +1710,15 @@ async fn cmd_diff(
     // and never touches the admin secret. Without one, it falls back to
     // GET /backup with the admin credential.
     let read_export = env_config.admin_jwt_viewer_secret.is_some();
-    if !read_export && (flags.read.is_some() || flags.write.is_some()) {
+    let export_only_flag = flags.read.is_some()
+        || flags.write.is_some()
+        || flags.force_baseline
+        || flags.accept_unverified_secrets;
+    if !read_export && export_only_flag {
         return Err(gitforgeops::error::Error::Config(
-            "--fingerprint-baseline and --write-fingerprint-baseline need \
-             FERRUM_ADMIN_JWT_VIEWER_SECRET: fingerprints come from GET /config/export, which \
-             diff reads only with the viewer credential"
+            "--fingerprint-baseline, --write-fingerprint-baseline, --force-baseline and \
+             --accept-unverified-secrets need FERRUM_ADMIN_JWT_VIEWER_SECRET: they apply to \
+             GET /config/export, which diff reads only with the viewer credential"
                 .to_string(),
         )
         .into());
@@ -1714,6 +1746,9 @@ async fn cmd_diff(
     if let Some(finding) = &desired_finding {
         print_namespace_finding(finding);
     }
+    // Kept for the export path: secret-bearing locations are read from the
+    // configuration as committed, before a bundle replaces placeholders.
+    let unresolved_desired = desired.clone();
     let secret_report = resolve_credentials(&mut desired, &env_config, None)?;
     let state = StateFile::load(&resolved.name)?;
     let managed = previously_managed(&resolved, &state);
@@ -1742,7 +1777,7 @@ async fn cmd_diff(
         }
     };
     let loaded = if read_export {
-        load_export_pairs_for(&client, &desired, &namespaces)
+        load_export_pairs_for(&client, &desired, &unresolved_desired, &namespaces)
             .await
             .map(|(pairs, comparison)| (pairs, Some(comparison)))
     } else {
@@ -1833,6 +1868,7 @@ async fn cmd_diff(
             baseline.as_ref(),
             &desired,
         )
+        .with_masked_ancestors(comparison.masked_ancestors)
     });
     if let Some(summary) = &secrets {
         print_secret_fingerprint_notes(summary, flags.read.is_some(), baseline.is_some());
@@ -1844,6 +1880,9 @@ async fn cmd_diff(
     let secrets_verified = secrets
         .as_ref()
         .is_none_or(config_export::SecretFingerprintSummary::verified);
+    let fields_authoritative = secrets
+        .as_ref()
+        .is_none_or(config_export::SecretFingerprintSummary::authoritative);
 
     let mut baseline_refusal = None;
     if flags.write.is_some() && export_comparison.is_some() {
@@ -1892,6 +1931,8 @@ async fn cmd_diff(
     let secret_json = secrets.as_ref().map(|summary| {
         serde_json::json!({
             "uncompared_fields": summary.uncompared,
+            "masked_ancestor_fields": summary.masked_ancestors,
+            "authoritative": summary.authoritative(),
             "baseline_complete": summary.baseline_complete,
             "verified": summary.verified(),
             "changes": summary.changes,
@@ -1903,7 +1944,10 @@ async fn cmd_diff(
         &namespace_scope,
         desired_finding.as_ref(),
         serde_json::json!({
-            "in_sync": in_sync && secrets_verified && cached_namespaces.is_empty(),
+            "in_sync": in_sync
+                && secrets_verified
+                && fields_authoritative
+                && cached_namespaces.is_empty(),
             "diff_count": diffs.len(),
             "live_filter_warning": live_warning,
             "plugin_attach_notice": plugin_attach_notice,
@@ -1931,9 +1975,13 @@ async fn cmd_diff(
     // warning is already printed). Without drift, unverified secrets make
     // `--exit-on-drift` non-authoritative. A cached read never gets here
     // with `--exit-on-drift`; it was refused above.
+    // Whole values fingerprinted around a secret also hid non-secret
+    // contents; neither a baseline nor --accept-unverified-secrets covers that.
     let drift_exit = exit_on_drift && drift.has_drift();
     let refusal = if drift_exit {
         None
+    } else if exit_on_drift && !fields_authoritative {
+        Some(masked_ancestor_refusal())
     } else if exit_on_drift && !secrets_verified && !flags.accept_unverified_secrets {
         Some(unverified_secrets_refusal())
     } else {
@@ -1959,7 +2007,7 @@ async fn cmd_diff(
             println!(
                 "No differences found in the cached snapshot. Authoritative sync status is unavailable."
             );
-        } else if !secrets_verified {
+        } else if !secrets_verified || !fields_authoritative {
             println!(
                 "No differences found in the compared fields. Fingerprinted secret fields were not verified (see the note above)."
             );

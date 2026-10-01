@@ -684,11 +684,17 @@ What the export cannot tell you:
   every fingerprint; `diff` then reports the baseline as not comparable, which
   is not authoritative either. The baseline holds keyed fingerprints only; keep
   it outside the repository (`diff` warns when it is inside a git worktree).
-- **`basicauth` is hidden.** The export omits it (and custom types, and
-  `mtls_auth` identities Edge rejects) and gives each consumer one fingerprint
-  over all hidden credentials. Only a baseline can use it, so every declared
-  consumer, even one with no credentials, leaves that fingerprint unverified
-  until a baseline covers it.
+- **`basicauth` is hidden.** The export omits it (and custom types, and an
+  `mtls_auth` type with no identity Edge accepts) and gives each consumer one
+  fingerprint over all hidden credentials. Only a baseline can use it, so every
+  declared consumer, even one with no credentials, leaves that fingerprint
+  unverified until a baseline covers it. Invalid `mtls_auth` identities next
+  to a valid one are neither shown nor fingerprinted.
+- **Whole values around a secret.** When Edge fingerprints a whole value that
+  only contains a secret (a `headers` map holding an API key, say), its
+  non-secret contents cannot be compared either. Such a run is never
+  authoritative: without drift elsewhere, `--exit-on-drift` exits `1` even
+  with a baseline or `--accept-unverified-secrets`.
 - **No API-spec ownership.** The export strips `api_spec_id`, so spec-owned
   rows look like any other live row and spec ownership conflicts are not
   detected on this path.

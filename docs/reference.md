@@ -81,11 +81,19 @@ changed since the baseline counts as a managed modification.
     undermine a "no drift" claim.
   - No drift found: `1`, because "in sync" cannot be claimed.
     `--accept-unverified-secrets` returns `0` instead.
+- **Whole values fingerprinted around a secret** (viewer-credential path):
+  Edge fingerprinted a value that only *contains* a secret (for example a
+  plugin `headers` map holding an API key), and its non-secret contents were
+  not compared. Drift found elsewhere: `2`. No drift found: `1`, and neither
+  a baseline nor `--accept-unverified-secrets` changes that. JSON reports them
+  as `secret_fingerprints.masked_ancestor_fields` with `authoritative: false`.
 
-In JSON output,
-`in_sync` is `true` only when nothing differs, every declared secret is
-verified and the read was not cached. The `/backup` path never has
-unverified secrets.
+In JSON output, `in_sync` is `true` only when nothing differs, every declared
+secret is verified, no whole value was fingerprinted around a secret, and the
+read was not cached. The `/backup` path has none of these.
+`--fingerprint-baseline`, `--write-fingerprint-baseline`, `--force-baseline`
+and `--accept-unverified-secrets` are refused there (exit `1`), since they only
+apply to the export.
 
 ### `plan` blockers
 
@@ -337,7 +345,12 @@ with the admin credential.
   `${gh-env-secret:…}` placeholder, a URL with userinfo, a Consumer key or
   secret, a plugin-config path the secret classifier flags, the Consul token,
   or an ancestor of one), the field is left out of the comparison and counted
-  as unverified. Edge v0.9.9 does not publish which pointers it redacted, so a
+  as unverified. Placeholder locations are read from the repository before a
+  credential bundle resolves them, so loading a bundle does not change which
+  fields are secret-bearing. Replacing an ancestor also hides that value's
+  non-secret contents, so those are counted separately and keep the run
+  non-authoritative (see exit codes above). Edge v0.9.9 does not publish which
+  pointers it redacted, so a
   fingerprint-shaped string anywhere else is compared like any value and shows
   as drift; a field Edge fingerprints but GitForgeOps does not classify, with
   a literal repository value, also shows as drift (noisy, never silent). Where
@@ -361,11 +374,15 @@ with the admin credential.
   drift. Record the baseline from a trusted state, such as right after a
   successful apply; a baseline rewritten by every drift check alerts on a
   change once. It holds keyed fingerprints only; keep it out of the repository.
-- **Hidden credentials.** `basicauth`, custom credential types and
-  `mtls_auth` entries whose identity Edge considers invalid are omitted from
-  the export. Each consumer carries one `hidden_credentials_fingerprint` over
-  them, which only a baseline can compare, so it is unverified on every
-  declared Consumer, including one that declares no credentials.
+- **Hidden credentials.** `basicauth` and custom credential types are omitted
+  from the export. Each consumer carries one `hidden_credentials_fingerprint`
+  over them, which only a baseline can compare, so it is unverified on every
+  declared Consumer, including one that declares no credentials. A declared
+  Consumer whose export lacks the field (a non-conforming gateway) stays
+  unverified even with a baseline. `mtls_auth` falls under the hidden
+  fingerprint only when none of its identities is valid to Edge; when at least
+  one is valid, the export lists the valid identities and the invalid entries
+  are neither shown nor fingerprinted, so no baseline can see them change.
 - **Consumer projection.** The export keeps only `keyauth[].key`,
   `jwt[].secret`, `hmac_auth[].secret` and `mtls_auth[].identity`; the
   repository's Consumers are projected the same way before comparison. Any
