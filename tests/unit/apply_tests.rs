@@ -1034,8 +1034,7 @@ async fn api_apply_batch_payload_carries_proxy_path_parameter_opt_in() {
         (
             "POST /batch".into(),
             200,
-            r#"{"created":{"proxies":1,"consumers":0,"plugin_configs":0,"upstreams":0}}"#
-                .into(),
+            r#"{"created":{"proxies":1,"consumers":0,"plugin_configs":0,"upstreams":0}}"#.into(),
             vec![],
         ),
     ]);
