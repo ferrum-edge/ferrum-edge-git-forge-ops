@@ -214,6 +214,21 @@ pub fn audit_checks(success: bool, stdout: &str, stderr: &str) -> Vec<Check> {
             .remedy("See docs/github-launch-controls.md for this control."),
         );
     }
+    // States the auditor accepts but flags for attention (for example a
+    // monitoring environment holding both gateway signing keys). They do not
+    // fail the audit, so they are warnings here too.
+    for warning in warning_lines(stdout) {
+        checks.push(
+            Check::new(
+                "settings-warning",
+                "Launch control",
+                Scope::Github,
+                Status::Warn,
+                warning.to_string(),
+            )
+            .remedy("See docs/github-launch-controls.md for this control."),
+        );
+    }
     checks
 }
 
@@ -221,6 +236,12 @@ fn evidence_lines(stdout: &str) -> impl Iterator<Item = &str> {
     stdout
         .lines()
         .filter_map(|line| line.trim().strip_prefix("PASS: "))
+}
+
+fn warning_lines(stdout: &str) -> impl Iterator<Item = &str> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("WARN: "))
 }
 
 fn violation_lines(stderr: &str) -> impl Iterator<Item = &str> {

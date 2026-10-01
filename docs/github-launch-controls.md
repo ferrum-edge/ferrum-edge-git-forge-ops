@@ -334,12 +334,20 @@ every PR with the default branch's copy, so the move lands in two PRs:
    and `_TTL_SECS` (the role claim is always `viewer`). For now
    `drift-check.yml` may still bind `FERRUM_ADMIN_JWT_SECRET`; binding both
    keys is a warning, not a violation. `audit_settings.py` accepts either key
-   in a `<env>-monitor` environment and warns when it holds both.
+   in a `<env>-monitor` environment and warns when it holds both. GitHub
+   resolves secret names without regard to case, so the checker matches them
+   case-insensitively and refuses any `secrets.<name>` reference that is not
+   spelled in upper case.
 2. *Workflow (next).* `drift-check.yml` binds the viewer key and drops the
    admin key, and the checker then makes the admin key in `drift-check.yml` a
-   violation. Add `FERRUM_ADMIN_JWT_VIEWER_SECRET` to each `<env>-monitor`
-   environment before step 2 merges, and remove its `FERRUM_ADMIN_JWT_SECRET`
-   after.
+   violation. Before step 2 merges, add `FERRUM_ADMIN_JWT_VIEWER_SECRET` to
+   every environment `drift-check.yml` binds
+   (`matrix.scope.monitoring_environment`): `<env>-monitor` when
+   `monitoring.unattended` is true, otherwise the deployment environment
+   itself. After it merges, remove
+   `FERRUM_ADMIN_JWT_SECRET` from each `<env>-monitor`. Deployment
+   environments keep `FERRUM_ADMIN_JWT_SECRET`, because `apply`, `review` and
+   `rotate` need it.
 
 ### 3.2 Monitoring outcomes
 

@@ -58,17 +58,21 @@ the gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+) instead of
 which the gateway caps at `viewer` and which carries keyed fingerprints instead
 of secret values. Handle the viewer secret like the admin one: an environment
 secret, never logged, never committed. Unless the gateway sets
-`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, it reads every namespace.
+`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, it reads every namespace. A fingerprint
+baseline file holds only keyed fingerprints, but keep it outside the
+repository.
 
 The trusted supply-chain checker allows the viewer secret only in the
 scheduled drift-check workflow (`drift-check.yml`) and refuses it in every
 other workflow. For now, that workflow may still bind the admin secret, and
 binding both is a warning. The follow-up change (#440, step 2) binds the
 viewer secret there, removes the admin secret from monitoring, and makes
-binding it a policy violation. See
-[GitHub launch controls §3.1](docs/github-launch-controls.md#31-unattended-drift-monitoring). A fingerprint
-baseline file holds only keyed fingerprints, but keep it outside the
-repository.
+binding it a policy violation. Before it merges, add
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` to every environment the drift check binds:
+`<env>-monitor` when `monitoring.unattended` is true, otherwise the deployment
+environment itself. Deployment environments keep `FERRUM_ADMIN_JWT_SECRET`,
+because apply, review and rotate need it. See
+[GitHub launch controls §3.1](docs/github-launch-controls.md#31-unattended-drift-monitoring).
 
 Repository fixtures follow the same rule. `tests/fixtures/simple-config/` is
 the copy-paste sample and uses `${gh-env-secret:alloc=require}` (switch to

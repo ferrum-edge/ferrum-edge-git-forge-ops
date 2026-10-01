@@ -18,8 +18,15 @@ FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
-NAMED_SECRET = re.compile(r"\bsecrets\.[A-Za-z_][A-Za-z0-9_]*")
-WHOLE_SECRETS = re.compile(r"\bsecrets\b")
+# GitHub resolves contexts and secret names without regard to case:
+# `${{ secrets.ferrum_admin_jwt_secret }}` and `${{ SECRETS.FERRUM_ADMIN_JWT_SECRET }}`
+# both read FERRUM_ADMIN_JWT_SECRET. Every secret-name match below is therefore
+# case-insensitive, and `secret_name_case_violations` requires the canonical
+# spelling so a reviewer reading the workflow sees the name the policy sees.
+NAMED_SECRET = re.compile(r"\bsecrets\.[A-Za-z_][A-Za-z0-9_]*", re.IGNORECASE)
+WHOLE_SECRETS = re.compile(r"\bsecrets\b", re.IGNORECASE)
+SECRET_REFERENCE = re.compile(r"\bsecrets\.[A-Za-z_][A-Za-z0-9_]*\b", re.IGNORECASE)
+CANONICAL_SECRET_REFERENCE = re.compile(r"secrets\.[A-Z_][A-Z0-9_]*")
 BUNDLE_SECRET_PREFIX = "FERRUM_CREDS_BUNDLE"
 BUNDLE_BINDING = re.compile(
     r"^\s+(" + BUNDLE_SECRET_PREFIX + r"(?:_\d+)?)\s*:\s*\$\{\{\s*secrets\.("
@@ -99,8 +106,10 @@ VIEWER_JWT_SECRET = "FERRUM_ADMIN_JWT_VIEWER_SECRET"
 VIEWER_JWT_SECRET_BINDING = (
     "FERRUM_ADMIN_JWT_VIEWER_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}"
 )
-VIEWER_JWT_SECRET_REFERENCE = re.compile(r"\bsecrets\.FERRUM_ADMIN_JWT_VIEWER_SECRET\b")
-ADMIN_JWT_SECRET_REFERENCE = re.compile(r"\bsecrets\.FERRUM_ADMIN_JWT_SECRET\b")
+VIEWER_JWT_SECRET_REFERENCE = re.compile(
+    r"\bsecrets\.FERRUM_ADMIN_JWT_VIEWER_SECRET\b", re.IGNORECASE
+)
+ADMIN_JWT_SECRET_REFERENCE = re.compile(r"\bsecrets\.FERRUM_ADMIN_JWT_SECRET\b", re.IGNORECASE)
 VIEWER_JWT_WORKFLOW_PATHS = (f".github/workflows/{MONITORING_WORKFLOW}",)
 # The viewer key's tokens carry the configured issuer, audience and TTL; the
 # role claim is always `viewer`, so `FERRUM_ADMIN_JWT_ROLE` does not apply.
@@ -259,6 +268,36 @@ def action_files(root: Path) -> list[Path]:
             *(root / ".github" / "actions").glob("**/action.yaml"),
         }
     )
+
+
+def mentions_secret(text: str, reference: str) -> bool:
+    """Case-insensitive substring test for a `secrets.<NAME>` reference.
+
+    A substring, not a whole word, so `secrets.FERRUM_CREDS_BUNDLE` still
+    matches every `_N` shard.
+    """
+    return reference.lower() in text.lower()
+
+
+def secret_name_case_violations(workflow: str, text: str) -> list[str]:
+    """Every `secrets.<NAME>` reference must use the canonical upper-case name.
+
+    GitHub would resolve a lower- or mixed-case spelling to the same secret, so
+    the spelling is not a different secret; it is a way to read past a
+    case-sensitive search. The policy's own matches are case-insensitive too.
+    """
+    violations: list[str] = []
+    seen: set[str] = set()
+    for match in SECRET_REFERENCE.finditer(text):
+        reference = match.group(0)
+        if CANONICAL_SECRET_REFERENCE.fullmatch(reference) or reference in seen:
+            continue
+        seen.add(reference)
+        violations.append(
+            f"{workflow}: secret references must be spelled `secrets.<UPPER_CASE_NAME>`; "
+            f"found {reference!r}"
+        )
+    return violations
 
 
 def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
@@ -420,7 +459,7 @@ def admin_jwt_binding_violations(workflow: str, text: str) -> list[str]:
             (ADMIN_JWT_SECRET_BINDING, "FERRUM_ADMIN_JWT_SECRET", ADMIN_JWT_OPTIONAL_SETTINGS),
             (VIEWER_JWT_SECRET_BINDING, VIEWER_JWT_SECRET, VIEWER_JWT_OPTIONAL_SETTINGS),
         ):
-            if binding not in step:
+            if not mentions_secret(step, binding):
                 continue
             missing = [
                 setting
@@ -749,7 +788,7 @@ def monitoring_workflow_violations(text: str) -> list[str]:
     """
     violations: list[str] = []
     for secret in MONITORING_FORBIDDEN_SECRETS:
-        if f"secrets.{secret}" in text:
+        if mentions_secret(text, f"secrets.{secret}"):
             violations.append(
                 f"{MONITORING_WORKFLOW}: unattended monitoring may not reach "
                 f"{secret!r}; it runs in an environment with no required "
@@ -1114,7 +1153,7 @@ def state_writer_preflight_violations(workflow: str, text: str) -> list[str]:
     # the workflows drifted apart: the audit proves the ruleset bypass is THIS
     # App by comparing against `vars.GITFORGEOPS_STATE_APP_ID`, and a secret it
     # cannot read is a comparison it cannot make.
-    if "secrets.GITFORGEOPS_STATE_APP_ID" in text:
+    if mentions_secret(text, "secrets.GITFORGEOPS_STATE_APP_ID"):
         violations.append(
             f"{workflow}: the state-writer App ID must be read from vars, matching the settings audit"
         )
@@ -1684,6 +1723,9 @@ def main(argv: list[str] | None = None) -> int:
             whole_secrets_context_violations(str(workflow.relative_to(root)), text)
         )
         violations.extend(
+            secret_name_case_violations(str(workflow.relative_to(root)), text)
+        )
+        violations.extend(
             admin_jwt_binding_violations(str(workflow.relative_to(root)), text)
         )
         violations.extend(
@@ -1831,7 +1873,7 @@ def main(argv: list[str] | None = None) -> int:
         # workflows become covered if they start binding credential bundles.
         if (
             privileged_workflow in CREDENTIAL_BUNDLE_WORKFLOWS
-            or BUNDLE_SECRET_BINDING in text
+            or mentions_secret(text, BUNDLE_SECRET_BINDING)
         ):
             if ".github/scripts/credential_bundles.py" not in text:
                 violations.append(
@@ -1918,7 +1960,7 @@ def main(argv: list[str] | None = None) -> int:
     for workflow in checked_action_files:
         if workflow.name == "settings-audit.yml":
             continue
-        if SETTINGS_AUDIT_TOKEN_REFERENCE in workflow.read_text(encoding="utf-8"):
+        if mentions_secret(workflow.read_text(encoding="utf-8"), SETTINGS_AUDIT_TOKEN_REFERENCE):
             violations.append(
                 f"{workflow.relative_to(root)}: the administration-read audit token "
                 "may be read only by the environment-bound settings audit"
@@ -2019,7 +2061,7 @@ def main(argv: list[str] | None = None) -> int:
     # every environment secret at once and are exactly what the privileged
     # workflows use to load credential bundles — the form most worth catching
     # in the workflow that must never receive one.
-    if re.search(r"\$\{\{[^}]*\bsecrets\b", static_review):
+    if re.search(r"\$\{\{[^}]*\bsecrets\b", static_review, re.IGNORECASE):
         violations.append("validate-pr.yml: PR-built code must not receive any secrets")
     if re.search(r"^\s+paths\s*:", static_review, re.MULTILINE):
         violations.append(
