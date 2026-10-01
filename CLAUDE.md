@@ -14,6 +14,9 @@ live operations.
 
 ## Buildout and schema policy
 
+Shared contracts live in [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts); see
+[README.md's Contracts section](README.md#contracts) for the vendored pin and update rule.
+
 GitForgeOps is in pre-launch buildout with no users. Breaking changes are
 acceptable. Update implementation, examples, fixtures, tests and docs together;
 do not add compatibility layers or upgrade guides for earlier buildout

@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ferrum-edge/ferrum-contracts/schemas/gitforgeops-resource/v1.schema.json",
+  "title": "GitForgeOps resource file envelope v1",
+  "description": "One GitForgeOps resource file (YAML in a resources/<namespace>/ tree, described here as its JSON data model): a kind tag and a spec. The spec shapes are Ferrum Edge's own resource types; this schema checks only the envelope and the spec keys GitForgeOps requires to deserialize.",
+  "x-contract": {
+    "name": "gitforgeops-resource",
+    "version": 1,
+    "status": "implemented",
+    "owner": "ferrum-edge/ferrum-edge-git-forge-ops",
+    "source_version": "gitforgeops 0.1.0 (Cargo.toml) at main 36206d8de8929884f62c65a040f3a08d35bd5863; src/config/schema.rs last changed in 12dcdf6abb9927079f625891ba79494fad6b3cd8 (#403). GitForgeOps has no release tags yet.",
+    "provenance": [
+      {
+        "repo": "ferrum-edge/ferrum-edge-git-forge-ops",
+        "ref": "main",
+        "commit": "36206d8de8929884f62c65a040f3a08d35bd5863",
+        "path": "src/config/schema.rs",
+        "symbols": [
+          "Resource",
+          "Proxy",
+          "Consumer",
+          "Upstream",
+          "PluginConfig",
+          "PluginScope",
+          "MeshConfigSpec"
+        ],
+        "note": "Resource is a serde internally tagged enum (tag = \"kind\") without deny_unknown_fields, so unknown top-level keys are ignored by GitForgeOps. Required spec keys are the struct fields with no serde default. Option<T> fields accept null (serde maps it to None); Vec fields do not."
+      }
+    ]
+  },
+  "type": "object",
+  "required": [
+    "kind",
+    "spec"
+  ],
+  "properties": {
+    "kind": {
+      "enum": [
+        "Proxy",
+        "Consumer",
+        "Upstream",
+        "PluginConfig",
+        "MeshConfig"
+      ]
+    },
+    "spec": {
+      "type": "object"
+    },
+    "id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "MeshConfig only: GitForgeOps-side fragment name (Option<String>; null means absent). The loader defaults it to the file stem; it is never emitted into the mesh document."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "Consumer"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "required": [
+              "username"
+            ],
+            "properties": {
+              "username": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "Upstream"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "required": [
+              "targets"
+            ],
+            "properties": {
+              "targets": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "host",
+                    "port"
+                  ],
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 65535
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "PluginConfig"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "required": [
+              "plugin_name",
+              "scope"
+            ],
+            "properties": {
+              "plugin_name": {
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "global",
+                  "proxy",
+                  "proxy_group"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "MeshConfig"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "properties": {
+              "workloads": {
+                "type": "array"
+              },
+              "services": {
+                "type": "array"
+              },
+              "mesh_policies": {
+                "type": "array"
+              },
+              "ext_authz_providers": {
+                "type": "array"
+              },
+              "peer_authentications": {
+                "type": "array"
+              },
+              "service_entries": {
+                "type": "array"
+              },
+              "request_authentications": {
+                "type": "array"
+              },
+              "telemetry_resources": {
+                "type": "array"
+              },
+              "destination_rules": {
+                "type": "array"
+              },
+              "virtual_service_cors_policies": {
+                "type": "array"
+              },
+              "proxy_configs": {
+                "type": "array"
+              },
+              "sidecars": {
+                "type": "array"
+              },
+              "waypoint_bindings": {
+                "type": "array"
+              },
+              "extension_configs": {
+                "type": "array"
+              },
+              "istio_root_namespace": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Option<String>; null means absent (Edge's istio-system default applies)."
+              },
+              "trust_bundles": {
+                "description": "Option<serde_json::Value>: any JSON value; null means absent. The shape is Edge's mesh config."
+              },
+              "multi_cluster": {
+                "description": "Option<serde_json::Value>: any JSON value; null means absent. The shape is Edge's mesh config."
+              },
+              "outbound_traffic_policy": {
+                "description": "Option<serde_json::Value>: any JSON value; null means absent. The shape is Edge's mesh config."
+              }
+            },
+            "description": "MeshConfigSpec. Every field is optional. List fields are Vec<serde_json::Value>, which serde rejects when null, so they must be arrays when present."
+          }
+        }
+      }
+    }
+  ]
+}
