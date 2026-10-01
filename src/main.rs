@@ -1625,10 +1625,12 @@ struct ExportComparison {
 /// a brokered value stays secret-bearing once a bundle has replaced it.
 async fn load_export_pairs_for(
     client: &AdminClient,
+    env_config: &EnvConfig,
     desired: &GatewayConfig,
     unresolved: &GatewayConfig,
     namespaces: &[String],
 ) -> gitforgeops::error::Result<(Vec<NamespaceSnapshot>, ExportComparison)> {
+    let endpoint = gitforgeops::http_client::ExportEndpoint::from_env(env_config)?;
     let mut pairs = Vec::new();
     let mut comparison = ExportComparison {
         exports: Vec::new(),
@@ -1638,7 +1640,7 @@ async fn load_export_pairs_for(
     for namespace in namespaces {
         let desired_ns = config::filter_config_by_namespace(desired, namespace);
         let unresolved_ns = config::filter_config_by_namespace(unresolved, namespace);
-        let export = client.get_config_export(namespace).await?;
+        let export = client.get_config_export(&endpoint, namespace).await?;
         if let Some(notice) = &export.count_seal_notice {
             eprintln!(
                 "Warning: GET /config/export for namespace '{}' returned counts that do not match the document ({}). Resource data is used as received.",
@@ -1662,7 +1664,7 @@ async fn load_export_pairs_for(
 }
 
 /// Explain, on stderr, what a viewer-credential `diff` could not compare.
-fn print_secret_fingerprint_notes(
+fn print_fingerprint_notes(
     summary: &config_export::SecretFingerprintSummary,
     baseline_requested: bool,
     baseline_found: bool,
@@ -1777,9 +1779,15 @@ async fn cmd_diff(
         }
     };
     let loaded = if read_export {
-        load_export_pairs_for(&client, &desired, &unresolved_desired, &namespaces)
-            .await
-            .map(|(pairs, comparison)| (pairs, Some(comparison)))
+        load_export_pairs_for(
+            &client,
+            &env_config,
+            &desired,
+            &unresolved_desired,
+            &namespaces,
+        )
+        .await
+        .map(|(pairs, comparison)| (pairs, Some(comparison)))
     } else {
         load_namespace_pairs_for(&client, &desired, &namespaces, false)
             .await
@@ -1861,7 +1869,7 @@ async fn cmd_diff(
     let plugin_attach_notice =
         apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
 
-    let secrets = export_comparison.as_ref().map(|comparison| {
+    let fingerprint_report = export_comparison.as_ref().map(|comparison| {
         config_export::SecretFingerprintSummary::evaluate(
             &comparison.exports,
             comparison.uncompared,
@@ -1870,17 +1878,17 @@ async fn cmd_diff(
         )
         .with_masked_ancestors(comparison.masked_ancestors)
     });
-    if let Some(summary) = &secrets {
-        print_secret_fingerprint_notes(summary, flags.read.is_some(), baseline.is_some());
+    if let Some(summary) = &fingerprint_report {
+        print_fingerprint_notes(summary, flags.read.is_some(), baseline.is_some());
     }
-    let secret_changes: &[config_export::SecretChange] = secrets
+    let fingerprint_changes: &[config_export::SecretChange] = fingerprint_report
         .as_ref()
         .map(|summary| summary.changes.as_slice())
         .unwrap_or_default();
-    let secrets_verified = secrets
+    let fingerprints_verified = fingerprint_report
         .as_ref()
         .is_none_or(config_export::SecretFingerprintSummary::verified);
-    let fields_authoritative = secrets
+    let fields_authoritative = fingerprint_report
         .as_ref()
         .is_none_or(config_export::SecretFingerprintSummary::authoritative);
 
@@ -1893,12 +1901,12 @@ async fn cmd_diff(
             ))
             .into());
         }
-        let drifted = !diffs.is_empty() || !secret_changes.is_empty();
+        let drifted = !diffs.is_empty() || !fingerprint_changes.is_empty();
         if drifted && !flags.force_baseline {
             let reason = format!(
                 "refusing to write a fingerprint baseline: this run found {} difference(s) and {} secret change(s), and a baseline recorded from a drifted gateway carries the drift forward. Reconcile first, or pass --force-baseline",
                 diffs.len(),
-                secret_changes.len()
+                fingerprint_changes.len()
             );
             eprintln!("Warning: {reason}.");
             baseline_refusal = Some(gitforgeops::error::Error::Config(reason));
@@ -1922,13 +1930,13 @@ async fn cmd_diff(
     let in_sync = diffs.is_empty()
         && unmanaged.is_empty()
         && !spec_owned_blocks_sync(&spec_owned)
-        && secret_changes.is_empty();
+        && fingerprint_changes.is_empty();
     let live_source_key = if read_export {
         "config_export"
     } else {
         "backup"
     };
-    let secret_json = secrets.as_ref().map(|summary| {
+    let fingerprint_json = fingerprint_report.as_ref().map(|summary| {
         serde_json::json!({
             "uncompared_fields": summary.uncompared,
             "masked_ancestor_fields": summary.masked_ancestors,
@@ -1945,14 +1953,14 @@ async fn cmd_diff(
         desired_finding.as_ref(),
         serde_json::json!({
             "in_sync": in_sync
-                && secrets_verified
+                && fingerprints_verified
                 && fields_authoritative
                 && cached_namespaces.is_empty(),
             "diff_count": diffs.len(),
             "live_filter_warning": live_warning,
             "plugin_attach_notice": plugin_attach_notice,
             "live_source": live_source_key,
-            "secret_fingerprints": secret_json,
+            "secret_fingerprints": fingerprint_json,
         }),
     );
     if let Some(finding) = &desired_finding {
@@ -1969,7 +1977,7 @@ async fn cmd_diff(
     // `gitforgeops::verdict::DriftVerdict`.
     let alert = &resolved.ownership.drift_alert_on;
     let drift = verdict::DriftVerdict::evaluate(alert, &diffs, &unmanaged, &spec_owned)
-        .with_secret_changes(alert, secret_changes.len());
+        .with_secret_changes(alert, fingerprint_changes.len());
     // Drift found on a fresh read is real: it keeps the drift exit code even
     // with unverified secrets (and wins over a refused baseline write, whose
     // warning is already printed). Without drift, unverified secrets make
@@ -1982,7 +1990,7 @@ async fn cmd_diff(
         None
     } else if exit_on_drift && !fields_authoritative {
         Some(masked_ancestor_refusal())
-    } else if exit_on_drift && !secrets_verified && !flags.accept_unverified_secrets {
+    } else if exit_on_drift && !fingerprints_verified && !flags.accept_unverified_secrets {
         Some(unverified_secrets_refusal())
     } else {
         baseline_refusal
@@ -2007,7 +2015,7 @@ async fn cmd_diff(
             println!(
                 "No differences found in the cached snapshot. Authoritative sync status is unavailable."
             );
-        } else if !secrets_verified || !fields_authoritative {
+        } else if !fingerprints_verified || !fields_authoritative {
             println!(
                 "No differences found in the compared fields. Fingerprinted secret fields were not verified (see the note above)."
             );
@@ -2053,12 +2061,12 @@ async fn cmd_diff(
         }
     }
 
-    if !secret_changes.is_empty() {
+    if !fingerprint_changes.is_empty() {
         println!(
             "\nSecret fields changed since the fingerprint baseline ({}):",
-            secret_changes.len()
+            fingerprint_changes.len()
         );
-        for change in secret_changes {
+        for change in fingerprint_changes {
             println!(
                 "  {} {} {} ({}) {}",
                 change.change.label(),

@@ -462,17 +462,27 @@ impl AdminClient {
     /// `GET /config/export` for one namespace: the read-only, fingerprinted
     /// snapshot drift detection reads with a viewer credential.
     ///
+    /// The request goes to `endpoint`, whose transport was checked when it was
+    /// built ([`ExportEndpoint::from_env`]): the bearer token never travels
+    /// over plain `http://` except to a literal loopback address. The URL is
+    /// taken from the endpoint, not from this client, so the check is the one
+    /// the request actually used.
+    ///
     /// A cached export (`X-Data-Source: cached`, or `source: cached` in the
     /// body) sets the same sticky flag as a cached `/backup`. Refusals are
     /// explained in terms an operator can act on (see
     /// [`explain_config_export_refusal`]).
-    pub async fn get_config_export(&self, namespace: &str) -> crate::error::Result<ConfigExport> {
+    pub async fn get_config_export(
+        &self,
+        endpoint: &ExportEndpoint,
+        namespace: &str,
+    ) -> crate::error::Result<ConfigExport> {
         let token = self.token()?;
-        let path = crate::config_export::CONFIG_EXPORT_PATH;
+        let url = endpoint.as_str();
         let resp = self
             .send_with_retry(RequestKind::Read, || {
                 self.client
-                    .get(self.url(path))
+                    .get(url)
                     .bearer_auth(&token)
                     .header("X-Ferrum-Namespace", namespace)
             })
@@ -1001,6 +1011,68 @@ pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> Re
 
 fn rollback_needs_manual_recovery(rollback: Option<&str>) -> bool {
     matches!(rollback, Some("incomplete") | Some("unknown_outcome"))
+}
+
+/// The `GET /config/export` URL, checked for the transport a viewer bearer
+/// token may use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportEndpoint {
+    url: String,
+}
+
+impl ExportEndpoint {
+    /// Build from `FERRUM_GATEWAY_URL`. See [`ExportEndpoint::from_gateway_url`].
+    pub fn from_env(env: &EnvConfig) -> crate::error::Result<Self> {
+        let gateway_url = env
+            .gateway_url
+            .as_deref()
+            .ok_or(crate::error::Error::NoGatewayUrl)?;
+        Self::from_gateway_url(gateway_url)
+    }
+
+    /// Accept `https://`, or plain `http://` only to a literal loopback IP
+    /// address (`127.0.0.0/8` or `::1`; not a name such as `localhost`, which
+    /// a resolver could point elsewhere). Embedded `user:password@` and every
+    /// other scheme are refused. This is stricter than the admin client,
+    /// whose opted-in `http://` may name any host outside GitHub Actions: a
+    /// viewer token is meant for unattended runs, so it gets no such opt-in.
+    pub fn from_gateway_url(gateway_url: &str) -> crate::error::Result<Self> {
+        let parsed = url::Url::parse(gateway_url).map_err(invalid_gateway_url)?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(crate::error::Error::Config(
+                "FERRUM_GATEWAY_URL must not embed credentials".to_string(),
+            ));
+        }
+        let loopback = match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        match parsed.scheme() {
+            "https" => {}
+            "http" if loopback => {}
+            scheme => {
+                return Err(crate::error::Error::Config(format!(
+                    "refusing to send the viewer token to a {scheme}:// gateway URL: \
+                     GET /config/export needs https://, or http:// to a literal loopback IP \
+                     address (127.0.0.1 or [::1])"
+                )))
+            }
+        }
+        let base = gateway_url.trim_end_matches('/');
+        let path = crate::config_export::CONFIG_EXPORT_PATH;
+        Ok(Self {
+            url: format!("{base}{path}"),
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.url
+    }
+}
+
+fn invalid_gateway_url(error: url::ParseError) -> crate::error::Error {
+    crate::error::Error::Config(format!("FERRUM_GATEWAY_URL is not a valid URL: {error}"))
 }
 
 /// Minimum length Ferrum Edge enforces for both admin JWT secrets.

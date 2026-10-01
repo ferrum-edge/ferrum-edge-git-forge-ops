@@ -25,7 +25,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   even with that flag or a baseline, and a declared consumer whose export lacks
   its hidden-credentials fingerprint is never verified. Brokered locations stay
   secret-bearing when a credential bundle resolves them. The export-only flags
-  are refused when no viewer secret is configured.
+  are refused when no viewer secret is configured. The viewer token is sent
+  only over `https://`, or `http://` to a literal loopback IP address.
   Recording a baseline is refused when the run found drift unless
   `--force-baseline` is passed, and `diff` warns when a baseline path is inside
   a git worktree. A cached export (`X-Data-Source: cached`) never yields an

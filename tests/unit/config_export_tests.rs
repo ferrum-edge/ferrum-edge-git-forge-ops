@@ -17,7 +17,9 @@ use gitforgeops::config_export::{
 };
 use gitforgeops::diff::{compute_diff, DiffAction};
 use gitforgeops::error::Error;
-use gitforgeops::http_client::{check_viewer_secret, explain_config_export_refusal, AdminClient};
+use gitforgeops::http_client::{
+    check_viewer_secret, explain_config_export_refusal, AdminClient, ExportEndpoint,
+};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde_json::{json, Value};
 
@@ -716,7 +718,9 @@ async fn the_export_is_read_with_a_viewer_token_and_cached_data_is_flagged() {
     env.admin_jwt_secret = Some(ADMIN_SECRET.to_string());
     let client = AdminClient::new_viewer_scoped(&env, ["ferrum"]).unwrap();
 
-    let export = client.get_config_export("ferrum").await.unwrap();
+    let endpoint = ExportEndpoint::from_env(&env).unwrap();
+    assert_eq!(endpoint.as_str(), format!("{url}/config/export"));
+    let export = client.get_config_export(&endpoint, "ferrum").await.unwrap();
     assert!(export.cached);
     assert!(client.served_from_cache());
     assert_eq!(export.fingerprints().resources["Consumer"]["app"].len(), 2);
@@ -730,4 +734,32 @@ async fn the_export_is_read_with_a_viewer_token_and_cached_data_is_flagged() {
     assert_eq!(claims["role"], VIEWER_ROLE);
     assert_eq!(claims["ns"], json!(["ferrum"]));
     assert!(verifies_under(&token, ADMIN_SECRET).is_none());
+}
+
+#[test]
+fn the_viewer_token_is_sent_only_over_https_or_to_a_loopback_ip() {
+    for accepted in [
+        "https://gateway.example:9000",
+        "https://gateway.example:9000/admin/",
+        "http://127.0.0.1:9000",
+        "http://127.8.9.10:9000",
+        "http://[::1]:9000",
+    ] {
+        let endpoint = ExportEndpoint::from_gateway_url(accepted).unwrap();
+        assert!(endpoint.as_str().ends_with("/config/export"), "{accepted}");
+        assert!(!endpoint.as_str().contains("//config"), "{accepted}");
+    }
+    for refused in [
+        "http://gateway.example:9000",
+        "http://localhost:9000",
+        "http://10.0.0.1:9000",
+        "ftp://127.0.0.1:9000",
+        "https://user:pass@gateway.example:9000",
+        "not a url",
+    ] {
+        let result = ExportEndpoint::from_gateway_url(refused);
+        assert!(result.is_err(), "{refused}");
+    }
+    let error = ExportEndpoint::from_gateway_url("http://localhost:9000").unwrap_err();
+    assert!(error.to_string().contains("literal loopback IP"), "{error}");
 }

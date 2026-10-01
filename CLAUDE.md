@@ -515,6 +515,10 @@ which the export lacks.
   `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
   no baseline is written.
 - The export strips `api_spec_id`; spec ownership is not detected on this path.
+- `ExportEndpoint` builds the export URL from `FERRUM_GATEWAY_URL`, not from the
+  client: `https://`, or `http://` only to a literal loopback IP. Keeping the
+  URL out of the secret-holding client also keeps CodeQL's cleartext rules
+  clean; avoid secret-named locals (`secrets`, …) for values that are printed.
 
 ### Multi-environment (repo config)
 

@@ -397,6 +397,11 @@ with the admin credential.
   export as possibly stale. The gateway also serves its cached snapshot when
   another export holds the database load, so a retry may get a database read.
   `diff` warns, reports no authoritative result and refuses `--exit-on-drift`.
+- **Transport.** The viewer token is sent only to an `https://` gateway URL,
+  or over `http://` to a literal loopback IP address (`127.0.0.0/8`, `[::1]`;
+  not `localhost`). This is stricter than the admin client, whose opted-in
+  `http://` (`FERRUM_ALLOW_INSECURE_HTTP=true`) may name any host outside
+  GitHub Actions. Any other URL is refused before a request is made.
 - **Refusals.** `404` means the gateway predates the export, `401` a viewer key
   or claim mismatch, `403` a namespace outside
   `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` or the token's `ns` claim. Each message

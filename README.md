@@ -698,6 +698,8 @@ What the export cannot tell you:
 - **No API-spec ownership.** The export strips `api_spec_id`, so spec-owned
   rows look like any other live row and spec ownership conflicts are not
   detected on this path.
+- **HTTPS only.** The viewer token goes only to an `https://` gateway, or over
+  `http://` to a literal loopback IP such as `127.0.0.1` (not `localhost`).
 - **Cached data is stale.** An export served with `X-Data-Source: cached`
   (including when another export holds the gateway's database load) makes
   `diff` warn, report no authoritative result, refuse `--exit-on-drift`
