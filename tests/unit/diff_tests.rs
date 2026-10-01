@@ -33,6 +33,7 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
         backend_path: None,
         strip_listen_path: true,
         preserve_host_header: false,
+        allow_path_parameters: false,
         backend_connect_timeout_ms: 5000,
         backend_read_timeout_ms: 30000,
         backend_write_timeout_ms: 30000,
@@ -78,6 +79,33 @@ fn make_proxy(id: &str, listen_path: &str, host: &str) -> Proxy {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     }
+}
+
+#[test]
+fn proxy_path_parameter_opt_in_is_owned_and_idempotent_across_diffs() {
+    let mut desired_proxy = make_proxy("matrix", "/items", "backend.example");
+    desired_proxy.allow_path_parameters = true;
+    let desired = GatewayConfig {
+        proxies: vec![desired_proxy.clone()],
+        ..GatewayConfig::default()
+    };
+    let live = GatewayConfig {
+        proxies: vec![desired_proxy],
+        ..GatewayConfig::default()
+    };
+
+    assert!(compute_diff(&desired, &live).unwrap().is_empty());
+
+    let mut old_proxy = live.proxies[0].clone();
+    old_proxy.allow_path_parameters = false;
+    let drifted = GatewayConfig {
+        proxies: vec![old_proxy],
+        ..GatewayConfig::default()
+    };
+    let differences = compute_diff(&desired, &drifted).unwrap();
+    assert_eq!(differences.len(), 1);
+    assert_eq!(differences[0].kind, "Proxy");
+    assert_eq!(differences[0].id, "matrix");
 }
 
 fn make_consumer(id: &str, username: &str) -> Consumer {

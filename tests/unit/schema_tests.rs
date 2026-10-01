@@ -718,6 +718,27 @@ spec:
     }
 }
 
+#[test]
+fn proxy_path_parameter_opt_in_is_typed_and_round_trips() {
+    let spec = proxy_from_yaml(
+        r#"
+kind: Proxy
+spec:
+  id: "proxy-matrix"
+  backend_scheme: https
+  backend_host: "localhost"
+  backend_port: 8443
+  allow_path_parameters: true
+"#,
+    );
+
+    assert!(spec.allow_path_parameters);
+    let emitted = serde_yaml::to_string(&spec).unwrap();
+    assert!(emitted.contains("allow_path_parameters: true"), "{emitted}");
+    let reparsed: Proxy = serde_yaml::from_str(&emitted).unwrap();
+    assert!(reparsed.allow_path_parameters);
+}
+
 // --- MeshConfig mirror ------------------------------------------------------
 
 #[test]

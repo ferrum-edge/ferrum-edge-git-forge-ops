@@ -26,6 +26,7 @@ fn proxy(id: &str, protocol: BackendScheme, read_timeout: u64, tls_verify: bool)
         backend_path: None,
         strip_listen_path: true,
         preserve_host_header: false,
+        allow_path_parameters: false,
         backend_connect_timeout_ms: 5000,
         backend_read_timeout_ms: read_timeout,
         backend_write_timeout_ms: 30000,

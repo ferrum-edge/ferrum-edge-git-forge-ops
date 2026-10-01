@@ -82,6 +82,7 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
             backend_path: None,
             strip_listen_path: true,
             preserve_host_header: false,
+            allow_path_parameters: true,
             backend_connect_timeout_ms: 5000,
             backend_read_timeout_ms: 30000,
             backend_write_timeout_ms: 30000,
@@ -135,6 +136,7 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
     let written = std::fs::read_to_string(path).unwrap();
     assert!(written.contains("p1"));
     assert!(written.contains("proxies:"));
+    assert!(written.contains("allow_path_parameters: true"));
 }
 
 // --- Apply ordering ----------------------------------------------------------
@@ -1015,6 +1017,53 @@ async fn a_rejected_batch_chunk_falls_back_to_named_per_resource_creates() {
     created.sort_unstable();
     assert_eq!(created, vec!["u1", "u3"]);
     assert!(result.fatal_error.is_none());
+}
+
+#[tokio::test]
+async fn api_apply_batch_payload_carries_proxy_path_parameter_opt_in() {
+    let mut matrix_proxy = proxy("matrix", "team-alpha", None);
+    matrix_proxy.listen_path = Some("/items".into());
+    matrix_proxy.backend_scheme = Some(gitforgeops::config::schema::BackendScheme::Https);
+    matrix_proxy.allow_path_parameters = true;
+    let desired = GatewayConfig {
+        proxies: vec![matrix_proxy],
+        ..GatewayConfig::default()
+    };
+    let (url, requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /batch".into(),
+            200,
+            r#"{"created":{"proxies":1,"consumers":0,"plugin_configs":0,"upstreams":0}}"#.into(),
+            vec![],
+        ),
+    ]);
+
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&empty_actuals(&["team-alpha"])),
+        Some(&no_extras(&["team-alpha".into()])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.created, 1);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    let requests = requests.lock().unwrap();
+    let batch = requests
+        .iter()
+        .find(|request| request.starts_with("POST /batch "))
+        .expect("batch create request");
+    let body: serde_json::Value =
+        serde_json::from_str(batch.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(body["proxies"][0]["allow_path_parameters"]
+        .as_bool()
+        .unwrap());
 }
 
 #[tokio::test]

@@ -216,6 +216,14 @@ matching how the gateway stores it; otherwise it would show as modified on
 every diff. Stream proxies (`listen_port` set) are not defaulted: the gateway
 rejects a stream proxy with no scheme, and guessing would hide that error.
 
+HTTP-family proxies may set `allow_path_parameters: true` to accept RFC 3986
+`;` path parameters (matrix parameters) in request paths. The default is
+`false`; stream proxies (`tcp`, `tcps`, `udp` or `dtls`) must keep it false.
+Enable it only when the backend uses path parameters. A literal `listen_path`
+containing `;` also requires this opt-in. Ferrum Edge strips parameters for
+its re-route check, which still refuses a request if the stripped path belongs
+to a different route.
+
 ## Mesh configuration
 
 Mesh nodes read a standalone `{version, mesh}` document that is separate from
@@ -251,9 +259,15 @@ spec:
       ports:
         - port: 80
           protocol: http
+      allow_path_parameters: true
       workloads:
         - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api
 ```
+
+A mesh service may set `allow_path_parameters: true` to opt routes derived
+from that service into matrix parameters. It defaults to false. Ferrum Edge
+still rejects a request when stripping the parameters would route it to a
+different service.
 
 All fragments merge into **one** document:
 

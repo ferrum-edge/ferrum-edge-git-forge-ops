@@ -7,6 +7,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Support the per-proxy `allow_path_parameters` option for HTTP-family routes
+  and preserve the mesh service opt-in through mesh configuration output.
 - The supply-chain policy accepts `FERRUM_ADMIN_JWT_VIEWER_SECRET` as the
   signing key of the scheduled drift check (`drift-check.yml`) and refuses it
   in every other workflow or composite action. A step that binds it must also
