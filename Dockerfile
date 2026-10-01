@@ -28,7 +28,9 @@ RUN cargo build --release --locked
 # Debian point-release security update for CVE-2026-103111 (HIGH): the pinned
 # runtime base still carries libpcre2-8-0 10.46-1~deb13u2, while 10.46-1~deb13u3
 # fixes the out-of-bounds write. Pin the .deb by version and SHA-256 from its
-# immutable security pool path; never consult a mutable package index here.
+# content-immutable security pool path; never consult a mutable package index
+# here. The security pool drops a version once a newer update supersedes it;
+# the build then fails closed (404) and the base-image pin canary reports it.
 ARG TARGETARCH
 RUN set -eu; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
