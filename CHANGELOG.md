@@ -14,6 +14,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Pin the Ferrum Edge validator and bundled gateway to v0.9.9, keeping earlier
+  approved validator digests in the allowlist for in-flight pull requests.
 - Report an authenticator-loss breaking change when an HTTP proxy is changed to
   passthrough, which Ferrum Edge rejects on non-stream proxies.
 - Report `mtls_auth` loss when a stream proxy stops terminating TLS and becomes
