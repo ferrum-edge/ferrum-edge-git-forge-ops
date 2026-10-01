@@ -1031,7 +1031,13 @@ async fn api_apply_batch_payload_carries_proxy_path_parameter_opt_in() {
     };
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
-        ("POST /batch".into(), 200, "{}".into(), vec![]),
+        (
+            "POST /batch".into(),
+            200,
+            r#"{"created":{"proxies":1,"consumers":0,"plugin_configs":0,"upstreams":0}}"#
+                .into(),
+            vec![],
+        ),
     ]);
 
     let result = apply_api(
@@ -1047,6 +1053,8 @@ async fn api_apply_batch_payload_carries_proxy_path_parameter_opt_in() {
     .unwrap();
 
     assert_eq!(result.created, 1);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
     let requests = requests.lock().unwrap();
     let batch = requests
         .iter()
