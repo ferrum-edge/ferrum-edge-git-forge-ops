@@ -77,6 +77,15 @@ MONITORING_FORBIDDEN_SECRETS = (
 )
 MONITORING_FORBIDDEN_SECRET_PREFIXES = ("FERRUM_CREDS_BUNDLE",)
 
+# The gateway signing keys a monitoring environment may hold. The viewer key
+# (Ferrum Edge's `FERRUM_ADMIN_JWT_VIEWER_SECRET`) is capped at `viewer` by the
+# gateway and is what `diff` reads with whenever it is set; the admin key is
+# write-equivalent. TRANSITIONAL (#440, step 1 of 2): both are allowed, like
+# any other gateway read material, and holding both is a warning because the
+# admin key then goes unused. Step 2 moves `drift-check.yml` to the viewer key.
+MONITORING_VIEWER_JWT_SECRET = "FERRUM_ADMIN_JWT_VIEWER_SECRET"
+MONITORING_ADMIN_JWT_SECRET = "FERRUM_ADMIN_JWT_SECRET"
+
 # The drift workflow whose last successful run is the monitoring evidence.
 MONITORING_WORKFLOW_FILE = "drift-check.yml"
 # The cron is daily; two periods of slack absorbs one missed or queued run
@@ -101,6 +110,10 @@ TEMPLATE_SKIPPED_CONTROLS = (
 class Audit:
     violations: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
+    # Accepted states worth an operator's attention. Printed as `WARN:` lines
+    # on stdout, so neither the exit code nor `doctor`'s PASS/FAIL parsing
+    # changes.
+    warnings: list[str] = field(default_factory=list)
 
     def require(self, condition: bool, violation: str, evidence: str | None = None) -> None:
         if condition:
@@ -353,6 +366,29 @@ def audit_monitoring_secrets(audit: Audit, repo: str, name: str) -> None:
         "required reviewer, so its authority must stop at reading the gateway",
         f"environment {name}: holds no deployment/broker/state secret",
     )
+    audit_monitoring_jwt_keys(audit, name, secret_names)
+
+
+def audit_monitoring_jwt_keys(audit: Audit, name: str, secret_names: set[str]) -> None:
+    """Report which gateway signing key a monitoring environment holds.
+
+    Neither key is forbidden here: both are gateway read material for `diff`.
+    TRANSITIONAL (#440): holding both is a warning, never a violation, because
+    `diff` reads with the viewer key whenever it is set and the admin key then
+    sits unused in an unattended job.
+    """
+    has_viewer = MONITORING_VIEWER_JWT_SECRET in secret_names
+    has_admin = MONITORING_ADMIN_JWT_SECRET in secret_names
+    if has_viewer:
+        audit.evidence.append(
+            f"environment {name}: holds the viewer-capped {MONITORING_VIEWER_JWT_SECRET}"
+        )
+    if has_viewer and has_admin:
+        audit.warnings.append(
+            f"monitoring environment {name!r} holds both {MONITORING_VIEWER_JWT_SECRET} "
+            f"and {MONITORING_ADMIN_JWT_SECRET}; once drift-check.yml binds the viewer "
+            f"key (#440), remove {MONITORING_ADMIN_JWT_SECRET} from this environment"
+        )
 
 
 def audit_monitoring_coverage(
@@ -664,6 +700,10 @@ def main() -> int:
     print("Repository protection evidence:")
     for item in audit.evidence:
         print(f"  PASS: {item}")
+    if audit.warnings:
+        print("Repository protection warnings:")
+        for item in audit.warnings:
+            print(f"  WARN: {item}")
     if audit.violations:
         print("Repository protection violations:", file=sys.stderr)
         for item in audit.violations:

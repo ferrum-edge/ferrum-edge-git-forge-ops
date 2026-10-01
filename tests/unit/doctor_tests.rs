@@ -306,6 +306,28 @@ fn github_checks_surface_each_auditor_violation_as_its_own_finding() {
 }
 
 #[test]
+fn github_checks_surface_each_auditor_warning_as_a_warn_finding() {
+    // A state the auditor accepts but flags (a monitoring environment holding
+    // both gateway signing keys) passes the audit and is still reported.
+    let checks = doctor::github::audit_checks(
+        true,
+        "Repository protection evidence:\n  PASS: something is fine\n\
+         Repository protection warnings:\n  \
+         WARN: monitoring environment 'production-monitor' holds both keys\n\
+         All launch protection controls are active.\n",
+        "",
+    );
+    assert_eq!(find(&checks, "settings-audit").status, Status::Pass);
+    let warning = find(&checks, "settings-warning");
+    assert_eq!(warning.status, Status::Warn, "{warning:?}");
+    assert!(warning.detail.contains("holds both keys"), "{warning:?}");
+    assert!(
+        checks.iter().all(|check| check.id != "settings-control"),
+        "{checks:?}"
+    );
+}
+
+#[test]
 fn an_auditor_that_could_not_run_is_unknown_not_a_failed_control() {
     // Violations are a finding about the repository; an API error or a token
     // without Administration: read means the audit did not happen.

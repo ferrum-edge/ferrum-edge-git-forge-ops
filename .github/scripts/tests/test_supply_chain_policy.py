@@ -1518,8 +1518,14 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 text = (ROOT / ".github/workflows" / workflow).read_text(
                     encoding="utf-8"
                 )
-                self.assertIn(check_supply_chain.ADMIN_JWT_SECRET_BINDING, text)
-                for setting in check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS:
+                accepted = check_supply_chain.admin_api_jwt_bindings(workflow)
+                self.assertTrue(any(binding in text for binding in accepted), accepted)
+                settings = set()
+                if check_supply_chain.ADMIN_JWT_SECRET_BINDING in text:
+                    settings.update(check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS)
+                if check_supply_chain.VIEWER_JWT_SECRET_BINDING in text:
+                    settings.update(check_supply_chain.VIEWER_JWT_OPTIONAL_SETTINGS)
+                for setting in sorted(settings):
                     self.assertIn(f"{setting}: ${{{{ secrets.{setting} }}}}", text)
                 self.assertEqual(
                     check_supply_chain.admin_jwt_binding_violations(workflow, text), []
@@ -1563,6 +1569,314 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations = self._violations(root)
         self.assertTrue(
             any("must bind" in item and "FERRUM_ADMIN_JWT_SECRET" in item for item in violations),
+            violations,
+        )
+        # Monitoring is satisfied by either key, and the violation names both.
+        self.assertTrue(
+            any(
+                item.startswith("drift-check.yml: an admin-API workflow must bind")
+                and repr(check_supply_chain.VIEWER_JWT_SECRET_BINDING) in item
+                and repr(check_supply_chain.ADMIN_JWT_SECRET_BINDING) in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    # -- viewer-capped monitoring credential (#440, step 1 of 2) -------------
+
+    ADMIN_LINE = (
+        "          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}\n"
+    )
+    VIEWER_LINE = (
+        "          FERRUM_ADMIN_JWT_VIEWER_SECRET: "
+        "${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}\n"
+    )
+
+    def _drift_check(self) -> str:
+        return (ROOT / ".github/workflows/drift-check.yml").read_text(encoding="utf-8")
+
+    def test_viewer_secret_is_allowed_in_the_monitoring_workflow(self):
+        workflow = self._drift_check()
+        self.assertIn(self.ADMIN_LINE, workflow)
+        viewer_only = workflow.replace(self.ADMIN_LINE, self.VIEWER_LINE, 1)
+        self.assertEqual(
+            check_supply_chain.viewer_jwt_scope_violations(
+                ".github/workflows/drift-check.yml", viewer_only
+            ),
+            [],
+        )
+        self.assertEqual(
+            check_supply_chain.monitoring_workflow_violations(viewer_only), []
+        )
+        self.assertEqual(check_supply_chain.monitoring_jwt_warnings(viewer_only), [])
+        self.assertEqual(
+            check_supply_chain.admin_jwt_binding_violations("drift-check.yml", viewer_only),
+            [],
+        )
+
+        # The step-2 shape (viewer key only) passes the whole trusted checker.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(viewer_only, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("::warning::", result.stdout)
+
+    def test_viewer_secret_is_refused_outside_the_monitoring_workflow(self):
+        step = (
+            "      - name: Apply\n"
+            "        env:\n" + self.VIEWER_LINE + "        run: gitforgeops apply\n"
+        )
+        for path in (
+            ".github/workflows/apply-on-merge.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/trusted-pr-review.yml",
+            ".github/workflows/materialize-file.yml",
+            ".github/workflows/validate-pr.yml",
+            ".github/workflows/nested/drift-check.yml",
+            ".github/actions/gateway/action.yml",
+        ):
+            with self.subTest(path=path):
+                violations = check_supply_chain.viewer_jwt_scope_violations(path, step)
+                self.assertTrue(
+                    any("only drift-check.yml may bind" in item for item in violations),
+                    violations,
+                )
+        # A file that never names the key is not held to the rule.
+        self.assertEqual(
+            check_supply_chain.viewer_jwt_scope_violations(
+                ".github/workflows/rotate.yml", "run: gitforgeops plan\n"
+            ),
+            [],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(self.ADMIN_LINE, text)
+            path.write_text(
+                text.replace(self.ADMIN_LINE, self.ADMIN_LINE + self.VIEWER_LINE, 1),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith(".github/workflows/apply-on-merge.yml:")
+                and "only drift-check.yml may bind" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_monitoring_binding_both_keys_is_a_transitional_warning(self):
+        # TRANSITIONAL: step 2 of #440 turns the admin key in drift-check.yml
+        # into a violation. Until then both keys pass, with a warning.
+        workflow = self._drift_check()
+        self.assertEqual(check_supply_chain.monitoring_jwt_warnings(workflow), [])
+        both = workflow.replace(self.ADMIN_LINE, self.ADMIN_LINE + self.VIEWER_LINE, 1)
+        warnings = check_supply_chain.monitoring_jwt_warnings(both)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("step 2 of #440", warnings[0])
+        self.assertEqual(check_supply_chain.monitoring_workflow_violations(both), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(both, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"::warning::{warnings[0]}", result.stdout)
+        self.assertNotIn("Supply-chain policy violations", result.stderr)
+
+    def test_viewer_step_must_bind_issuer_audience_and_ttl(self):
+        secure = "\n".join(
+            [
+                "      - name: Check drift",
+                "        env:",
+                self.VIEWER_LINE.rstrip("\n"),
+                "          FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}",
+                "          FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}",
+                "          FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}",
+                "        run: gitforgeops diff --exit-on-drift",
+            ]
+        )
+        # The viewer key's role claim is fixed, so the role setting is not required.
+        self.assertEqual(
+            check_supply_chain.admin_jwt_binding_violations("drift-check.yml", secure), []
+        )
+        for setting in check_supply_chain.VIEWER_JWT_OPTIONAL_SETTINGS:
+            with self.subTest(setting=setting):
+                dropped = secure.replace(
+                    f"          {setting}: ${{{{ secrets.{setting} }}}}\n", "", 1
+                )
+                self.assertNotEqual(dropped, secure)
+                violations = check_supply_chain.admin_jwt_binding_violations(
+                    "drift-check.yml", dropped
+                )
+                self.assertTrue(
+                    any(
+                        "binds FERRUM_ADMIN_JWT_VIEWER_SECRET" in item and setting in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_monitoring_with_neither_key_names_both_accepted_bindings(self):
+        self.assertEqual(
+            check_supply_chain.admin_api_jwt_bindings("drift-check.yml"),
+            (
+                check_supply_chain.VIEWER_JWT_SECRET_BINDING,
+                check_supply_chain.ADMIN_JWT_SECRET_BINDING,
+            ),
+        )
+        for workflow in ("apply-on-merge.yml", "rotate.yml", "trusted-pr-review.yml"):
+            with self.subTest(workflow=workflow):
+                self.assertEqual(
+                    check_supply_chain.admin_api_jwt_bindings(workflow),
+                    (check_supply_chain.ADMIN_JWT_SECRET_BINDING,),
+                )
+
+    # -- secret names are case-insensitive at GitHub ------------------------
+
+    def test_secret_references_must_use_the_canonical_upper_case_name(self):
+        for reference in (
+            "${{ secrets.ferrum_admin_jwt_viewer_secret }}",
+            "${{ secrets.Ferrum_Gateway_Url }}",
+            "${{ SECRETS.FERRUM_GATEWAY_URL }}",
+            "${{ Secrets.FERRUM_GATEWAY_URL }}",
+        ):
+            with self.subTest(reference=reference):
+                violations = check_supply_chain.secret_name_case_violations(
+                    "sample.yml", f"          KEY: {reference}\n"
+                )
+                self.assertEqual(len(violations), 1, violations)
+                self.assertIn("sample.yml:", violations[0])
+                self.assertIn("secrets.<UPPER_CASE_NAME>", violations[0])
+        self.assertEqual(
+            check_supply_chain.secret_name_case_violations(
+                "sample.yml",
+                "          URL: ${{ secrets.FERRUM_GATEWAY_URL }}\n"
+                "          SHARD: ${{ secrets.FERRUM_CREDS_BUNDLE_2 }}\n"
+                "# GitHub Environment Secrets are not process environment variables.\n",
+            ),
+            [],
+        )
+        # A whole-context read cannot hide behind upper case either.
+        self.assertTrue(
+            check_supply_chain.whole_secrets_context_violations(
+                "sample.yml", "        run: echo '${{ toJSON(SECRETS) }}'"
+            )
+        )
+
+    def test_lower_case_viewer_key_outside_monitoring_is_refused(self):
+        lower = (
+            "          FERRUM_ADMIN_JWT_VIEWER_SECRET: "
+            "${{ secrets.ferrum_admin_jwt_viewer_secret }}\n"
+        )
+        self.assertTrue(
+            check_supply_chain.viewer_jwt_scope_violations(
+                ".github/workflows/apply-on-merge.yml", lower
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    self.ADMIN_LINE, self.ADMIN_LINE + lower, 1
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        for expected in (
+            "only drift-check.yml may bind",
+            "found 'secrets.ferrum_admin_jwt_viewer_secret'",
+        ):
+            with self.subTest(expected=expected):
+                self.assertTrue(
+                    any(
+                        item.startswith(".github/workflows/apply-on-merge.yml:")
+                        and expected in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_lower_case_forbidden_secrets_are_refused_in_monitoring(self):
+        workflow = self._drift_check()
+        for secret in check_supply_chain.MONITORING_FORBIDDEN_SECRETS:
+            with self.subTest(secret=secret):
+                mutated = workflow.replace(
+                    "FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}",
+                    f"{secret}: ${{{{ secrets.{secret.lower()} }}}}",
+                    1,
+                )
+                self.assertNotEqual(mutated, workflow)
+                violations = check_supply_chain.monitoring_workflow_violations(mutated)
+                self.assertTrue(
+                    any(f"may not reach {secret!r}" in item for item in violations),
+                    violations,
+                )
+        # A lower-case shard name still reaches the credential bundle.
+        shard = workflow.replace(
+            "FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}",
+            "FERRUM_CREDS_BUNDLE_2: ${{ secrets.ferrum_creds_bundle_2 }}",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "may not reach 'FERRUM_CREDS_BUNDLE'" in item
+                for item in check_supply_chain.monitoring_workflow_violations(shard)
+            )
+        )
+
+    def test_lower_case_admin_key_is_still_held_to_the_admin_rules(self):
+        lower_admin = (
+            "          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.ferrum_admin_jwt_secret }}\n"
+        )
+        # The claim-settings rule still fires for the lower-case binding.
+        step = "      - name: Apply\n        env:\n" + lower_admin + "        run: x\n"
+        violations = check_supply_chain.admin_jwt_binding_violations("apply.yml", step)
+        self.assertTrue(
+            any("binds FERRUM_ADMIN_JWT_SECRET but not" in item for item in violations),
+            violations,
+        )
+        # Both keys in monitoring, one spelled in lower case, still warns.
+        both = self._drift_check().replace(
+            self.ADMIN_LINE, lower_admin + self.VIEWER_LINE, 1
+        )
+        self.assertEqual(len(check_supply_chain.monitoring_jwt_warnings(both)), 1)
+        # And the audit token stays fenced to the settings audit.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/rust-ci.yml"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "    steps:",
+                    "    steps:\n      - run: echo '${{ secrets.settings_audit_token }}'",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith(".github/workflows/rust-ci.yml:")
+                and "administration-read audit token" in item
+                for item in violations
+            ),
             violations,
         )
 
