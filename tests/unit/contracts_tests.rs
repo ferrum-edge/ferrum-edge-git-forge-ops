@@ -269,7 +269,10 @@ fn gitforgeops_resource_schema_matches_the_local_resource_envelope() {
         .iter()
         .map(|property| property.as_str().expect("required property").to_string())
         .collect();
-    assert_eq!(required, ["kind", "spec"].into_iter().map(String::from).collect());
+    assert_eq!(
+        required,
+        ["kind", "spec"].into_iter().map(String::from).collect()
+    );
 
     let properties: BTreeSet<String> = schema["properties"]
         .as_object()
@@ -281,6 +284,9 @@ fn gitforgeops_resource_schema_matches_the_local_resource_envelope() {
     // MeshConfig has the optional GitForgeOps-side `id` field.
     assert_eq!(
         properties,
-        ["id", "kind", "spec"].into_iter().map(String::from).collect()
+        ["id", "kind", "spec"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     );
 }
