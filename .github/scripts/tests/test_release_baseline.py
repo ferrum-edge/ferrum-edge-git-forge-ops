@@ -93,6 +93,15 @@ class ReleaseBaselineTests(unittest.TestCase):
         issues = check_release_baseline.check(self.root)
         self.assertTrue(any("Dockerfile gateway base" in issue for issue in issues), issues)
 
+        record = self.record()
+        record["validator"]["version"] = "v0.9.9"
+        self.write_record(record)
+        issues = check_release_baseline.check(self.root)
+        self.assertIn(
+            "the first baseline must name the verified v0.9.10 validator",
+            issues,
+        )
+
     def test_docs_and_cargo_version_drift_are_rejected(self):
         cargo = self.root / "Cargo.toml"
         cargo.write_text(cargo.read_text().replace('version = "0.1.0"', 'version = "0.2.0"', 1))

@@ -62,8 +62,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "requires an authoritative configuration export (GET /config/export)".
 - `EnvConfig`'s `Debug` output redacts the admin and viewer JWT secrets, the
   GitHub tokens, the inline credential bundle and the mTLS client key.
-- Pin the Ferrum Edge validator and bundled gateway to v0.9.9, keeping earlier
+- Pin the Ferrum Edge validator and bundled gateway to v0.9.10, keeping earlier
   approved validator digests in the allowlist for in-flight pull requests.
+  The gateway refuses MCP requests with non-UTF-8 charsets and fails closed on
+  uninspectable or over-nested JSON-RPC batches (GHSA-4f9m-cfqg-fhx9,
+  GHSA-f2jp-59r9-fp64).
 - Report an authenticator-loss breaking change when an HTTP proxy is changed to
   passthrough, which Ferrum Edge rejects on non-stream proxies.
 - Report `mtls_auth` loss when a stream proxy stops terminating TLS and becomes

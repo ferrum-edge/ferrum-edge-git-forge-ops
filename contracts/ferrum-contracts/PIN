@@ -1,6 +1,6 @@
 tag=contracts-edge-0.9.9
 commit=25c4e9e00033d7941a1dd0ab733fa74e735546ae
-edge_version=v0.9.9
+edge_version=v0.9.10
 sha256 fixtures/gitforgeops-resource/invalid/consumer-missing-username.json 76ab80b5556083d451e213f6764619d28b4ff5c4e43bfa91ca312d81d41f91a1
 sha256 fixtures/gitforgeops-resource/invalid/lowercase-kind.json 54e01060c01ef659794667e4c53a207269bb7ba46e20142576ef9e2b2b94652d
 sha256 fixtures/gitforgeops-resource/invalid/missing-spec.json e5eb220d18cc0a90f605fe77f4168ae5c0e9666267092df6b6be0929a8009edf

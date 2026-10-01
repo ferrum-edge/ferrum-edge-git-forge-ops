@@ -2550,7 +2550,7 @@ fn require_auth_plugin_does_not_count_spiffe_identity() {
 
 #[test]
 fn require_auth_plugin_requires_an_authenticator_for_every_http_family_protocol() {
-    // Ferrum Edge v0.9.9 filters each request's plugin chain by its protocol.
+    // Ferrum Edge v0.9.10 filters each request's plugin chain by its protocol.
     // soap_ws_security declares HTTP only, so gRPC and WebSocket requests to
     // a proxy it alone protects reach the backend unauthenticated.
     let policies = require_auth_policies(None);
@@ -3288,7 +3288,7 @@ fn stream_auth_catalog_matches_the_gateway_protocol_contract() {
         HTTP_FAMILY_PROTOCOLS
     );
 
-    // Pinned to Ferrum Edge v0.9.9: mtls_auth is the only built-in that both
+    // Pinned to Ferrum Edge v0.9.10: mtls_auth is the only built-in that both
     // runs on stream listeners and rejects an unauthenticated peer there.
     assert_eq!(STREAM_AUTH_PLUGIN_NAMES, &["mtls_auth"]);
     for name in AUTH_PLUGIN_NAMES {
