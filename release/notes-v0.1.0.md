@@ -8,8 +8,8 @@ after workflow artifacts expire.
 
 ## Supported pairing
 
-GitForgeOps v0.1.0 pairs with Ferrum Edge v0.9.8, using the checked-in
-v0.9.8 validator asset pin. See the [support table](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/README.md#support-and-compatibility)
+GitForgeOps v0.1.0 pairs with Ferrum Edge v0.9.9, using the checked-in
+v0.9.9 validator asset pin. See the [support table](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/README.md#support-and-compatibility)
 for the precise profile and file/mesh and monitoring boundaries.
 
 ## Adoption and verification
@@ -24,19 +24,14 @@ for later fixes.
 
 - First supported source/template and container pairing, conditional on the
   record's `supported` status and passing exact-revision release gate.
-- The paired gateway is Ferrum Edge v0.9.8. It keeps v0.9.7's configuration
-  schema and admin API, so GitForgeOps needs no configuration change; its
-  data-plane changes are in the
-  [Edge upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.8/docs/upgrade_guide.md#upgrading-to-098).
-  Coming from v0.9.5 (upstream v0.9.6 was never published), v0.9.7's
-  `ferrum-edge validate` refuses configuration earlier gateways accepted,
-  including an upstream health-check `active.http_path` that does not start
-  with `/` and an `active.udp_probe_payload` that is not an even-length hex
-  string. Run validation on a pull request before adopting this pairing; see
-  [Upgrading to 0.9.7](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.8/docs/upgrade_guide.md#upgrading-to-097).
-  The admin API's new optional `ETag`/`If-Match` preconditions do not change
-  apply: GitForgeOps sends no `If-Match`, so writes keep their earlier
-  behavior.
+- The paired gateway is Ferrum Edge v0.9.9. Its request-path hardening refuses
+  non-final empty path segments and requires `allow_path_parameters: true` on
+  a proxy to accept semicolon path parameters; review the
+  [Edge upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.9/docs/upgrade_guide.md#upgrading-to-099)
+  when upgrading a gateway. GitForgeOps does not currently expose the new
+  `allow_path_parameters` proxy option, so semicolon path parameters remain
+  refused on proxies declared through this repository. Run validation on a
+  pull request before adopting this pairing.
 - API-mode shared ownership is the first deployment profile. File/mesh output
   is assembled and validated, with external fleet delivery required.
 - Scheduled monitoring needs approval unless `monitoring.unattended` binds its

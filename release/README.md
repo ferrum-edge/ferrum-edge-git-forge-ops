@@ -14,16 +14,16 @@ finalized record on upstream `main` when adopting the tag. The
 [release notes](notes-v0.1.0.md) are committed here so the pairing stays
 discoverable after Actions artifacts expire.
 
-The intended first pairing is GitForgeOps v0.1.0 with Ferrum Edge v0.9.8:
+The intended first pairing is GitForgeOps v0.1.0 with Ferrum Edge v0.9.9:
 
 | Artifact | Digest |
 | --- | --- |
-| v0.9.8 Linux x86_64 binary: the approved validator and the lifecycle suite's gateway | `00beb6b8c6cce424fb9d9be290285a9b1c4968e13d9cf78ea671ab37ef32269d` (SHA-256) |
-| Docker Hub v0.9.8 multi-platform index, used by the Dockerfile's gateway stage | `sha256:e5b204f9448d4ec210a57dbd2badece5f4359d5d544522fa48dcdfeef033b385` |
+| v0.9.9 Linux x86_64 binary: the approved validator and the lifecycle suite's gateway | `e628f60a7d12ad526781cedbd0b15ab3447d99f37222c46a2cda4c3bc3e955c5` (SHA-256) |
+| Docker Hub v0.9.9 multi-platform index, used by the Dockerfile's gateway stage | `sha256:83bb4de2ea264d5bed18d8f01f94e0e17a29b43aa1458b8984a0e9e1e784ede6` |
 
 They differ because a binary and an OCI index are different artifacts. See the
-[upstream release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.8)
-and the [Docker Hub version tag](https://hub.docker.com/r/ferrumedge/ferrum-edge/tags?name=v0.9.8).
+[upstream release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.9)
+and the [Docker Hub version tag](https://hub.docker.com/r/ferrumedge/ferrum-edge/tags?name=v0.9.9).
 Because the Dockerfile pins the index digest, the GitForgeOps image bundles
 this tested gateway.
 
@@ -31,9 +31,9 @@ this tested gateway.
 
 | Combination or profile | Initial support boundary |
 | --- | --- |
-| GitForgeOps v0.1.0 source/template with Ferrum Edge v0.9.8 | Intended first pairing; supported only after the record is finalized against passing exact-revision lifecycle evidence. The validator is the checked-in v0.9.8 x86_64 asset. |
-| GitForgeOps container | Linux AMD64 and ARM64 image at the recorded immutable GitForgeOps digest. The bundled gateway comes from the v0.9.8 OCI index above. The x86_64 standalone validator pin describes GitHub's Linux x86_64 runners, not an ARM64 binary checksum. |
-| Earlier or later Ferrum Edge versions | Not a supported pair. v0.9.4 and earlier cannot accept the resource labels GitForgeOps emits. A newer validator added to the checksum allowlist is not automatically a new supported pairing. Upstream v0.9.6 was tagged but never published. Older allowlist entries, including v0.9.5 and v0.9.7, are kept only so in-flight pull requests keep validating; they are not part of this pairing. |
+| GitForgeOps v0.1.0 source/template with Ferrum Edge v0.9.9 | Intended first pairing; supported only after the record is finalized against passing exact-revision lifecycle evidence. The validator is the checked-in v0.9.9 x86_64 asset. |
+| GitForgeOps container | Linux AMD64 and ARM64 image at the recorded immutable GitForgeOps digest. The bundled gateway comes from the v0.9.9 OCI index above. The x86_64 standalone validator pin describes GitHub's Linux x86_64 runners, not an ARM64 binary checksum. |
+| Earlier or later Ferrum Edge versions | Not a supported pair. v0.9.4 and earlier cannot accept the resource labels GitForgeOps emits. A newer validator added to the checksum allowlist is not automatically a new supported pairing. Upstream v0.9.6 was tagged but never published. Older allowlist entries, including v0.9.5, v0.9.7 and v0.9.8, are kept only so in-flight pull requests keep validating; they are not part of this pairing. |
 | API mode, one namespace, shared ownership, incremental apply | The first customer deployment profile. It includes PR validation/review, human-approved apply, credential delivery, traffic verification, and ownership ledger publication. See the [quickstart](../docs/quickstart.md). |
 | File mode and mesh | Supported as assembly, validation, placeholder-preserving publication, and separate encrypted materialization. File output and mesh documents are **not** delivered to nodes by the bundled workflows; mesh has no admin API. Live fleet rollout and file-mode drift monitoring need an external delivery/observation system. Set `live_review: false` for file-only environments. |
 | Multiple environments | Independent matrix jobs can run in parallel, each with its own GitHub Environment approval, concurrency group, and ledger. For ordering, set `promotion.requires: staging` and declare traffic checks in `.gitforgeops/smoke.yaml`; promotion waits for successful staging apply and verify for the same eligible revision. Parallel jobs alone provide no promotion gate. |
