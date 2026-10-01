@@ -2,13 +2,13 @@
   "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-plugin-catalog/v1.schema.json",
   "vocabulary": "plugin-catalog",
   "version": 1,
-  "edge_release": "v0.9.8",
-  "description": "Index of every built-in Ferrum Edge plugin at v0.9.8: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
+  "edge_release": "v0.9.9",
+  "description": "Index of every built-in Ferrum Edge plugin at v0.9.9: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
   "provenance": [
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.8",
-      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "ref": "v0.9.9",
+      "commit": "234717ce41965cd1e2b5c6c761a25475c5d7628c",
       "path": "src/plugins/mod.rs",
       "symbols": [
         "BUILTIN_PLUGIN_REGISTRATIONS",
@@ -23,12 +23,13 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.8",
-      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "ref": "v0.9.9",
+      "commit": "234717ce41965cd1e2b5c6c761a25475c5d7628c",
       "path": "src/plugins/builtin_parity.rs",
       "symbols": [
         "BUILTIN_PLUGIN_PARITY_META",
-        "BUILTIN_RESPONSE_BODY_PRODUCERS"
+        "BUILTIN_RESPONSE_BODY_PRODUCERS",
+        "BUILTIN_WEBSOCKET_FRAMING_PLUGINS"
       ],
       "fields": [
         "classification",
@@ -36,13 +37,14 @@
         "active_phases",
         "protocols",
         "protocol_rationale",
-        "response_body_producer"
+        "response_body_producer",
+        "websocket_framing_plugins"
       ]
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.8",
-      "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+      "ref": "v0.9.9",
+      "commit": "234717ce41965cd1e2b5c6c761a25475c5d7628c",
       "path": "openapi.yaml",
       "symbols": [
         "components.schemas.PluginConfigBase"
@@ -54,10 +56,10 @@
   ],
   "config_schema_document": {
     "repo": "ferrum-edge/ferrum-edge",
-    "ref": "v0.9.8",
-    "commit": "e27f2109216352c3fe9e67a7014611f3f66daa91",
+    "ref": "v0.9.9",
+    "commit": "234717ce41965cd1e2b5c6c761a25475c5d7628c",
     "path": "openapi.yaml",
-    "sha256": "158979cc76a1f756ff1b9e0f7cd6c9299cf8db2ba845e3e204604f2608f123cf",
+    "sha256": "2d28bbefa87d09bba7e484ac616d739c818bd04aeabc6e2c5ae163f8a0820db2",
     "openapi": "3.1.0",
     "note": "Each config_schema.pointer is a JSON Pointer into this exact file. The schemas are OpenAPI 3.1 (JSON Schema 2020-12 dialect) and may $ref other components in the same document. They apply to `config` only when the plugin config is enabled. They are referenced, not copied, in this release; see docs/adoption.md (follow-ups)."
   },
@@ -68,6 +70,12 @@
     "tcp": "Raw TCP stream proxy, including TLS termination and origination",
     "udp": "Raw UDP datagram proxy, including DTLS termination and origination"
   },
+  "websocket_framing_plugins": [
+    "waf",
+    "ws_frame_logging",
+    "ws_message_size_limiting",
+    "ws_rate_limiting"
+  ],
   "plugins": [
     {
       "name": "transaction_log_schema",
@@ -1474,6 +1482,9 @@
       "active_phases": [
         "before_proxy",
         "transform_request_body",
+        "enforce_final_backend_header_policy",
+        "on_final_request_body",
+        "normalize_response_body",
         "transform_response_body",
         "after_proxy",
         "on_final_response_body"
@@ -1955,11 +1966,5 @@
       "failure_policy": "fail_closed",
       "note": "Removed built-in. Edge refuses a config that names it, so an upgrade cannot silently drop the protection it provided."
     }
-  ],
-  "main_branch_delta": {
-    "repo": "ferrum-edge/ferrum-edge",
-    "ref": "main",
-    "commit": "f638465034734e335bde7e76c56e8c8244afba8a",
-    "summary": "Same 82 built-in plugin names and failure policies, and the same two removed names. Main adds BUILTIN_WEBSOCKET_FRAMING_PLUGINS (waf, ws_frame_logging, ws_message_size_limiting, ws_rate_limiting) for websocket_permessage_deflate passthrough admission; that list is not part of this v0.9.8 index."
-  }
+  ]
 }

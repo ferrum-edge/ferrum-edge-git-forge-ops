@@ -13,10 +13,11 @@ fn contract_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("contracts/ferrum-contracts")
 }
 
-fn parse_pin() -> (String, String, BTreeMap<String, String>) {
+fn parse_pin() -> (String, String, String, BTreeMap<String, String>) {
     let pin = fs::read_to_string(contract_dir().join("PIN")).expect("read contracts PIN");
     let mut tag = None;
     let mut commit = None;
+    let mut edge_version = None;
     let mut hashes = BTreeMap::new();
 
     for line in pin.lines().filter(|line| !line.is_empty()) {
@@ -24,6 +25,8 @@ fn parse_pin() -> (String, String, BTreeMap<String, String>) {
             tag = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("commit=") {
             commit = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("edge_version=") {
+            edge_version = Some(value.to_string());
         } else if let Some(value) = line.strip_prefix("sha256 ") {
             let (path, hash) = value
                 .split_once(' ')
@@ -37,6 +40,7 @@ fn parse_pin() -> (String, String, BTreeMap<String, String>) {
     (
         tag.expect("PIN has a tag"),
         commit.expect("PIN has a commit"),
+        edge_version.expect("PIN has an Edge version"),
         hashes,
     )
 }
@@ -69,9 +73,10 @@ fn string_set<'a>(values: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
 
 #[test]
 fn vendored_contract_files_match_the_pin_hashes() {
-    let (tag, commit, hashes) = parse_pin();
-    assert_eq!(tag, "contracts-edge-0.9.8");
-    assert_eq!(commit, "89ef3917ce6bba142dce50b84f2033d81eb429dd");
+    let (tag, commit, edge_version, hashes) = parse_pin();
+    assert_eq!(tag, "contracts-edge-0.9.9");
+    assert_eq!(commit, "25c4e9e00033d7941a1dd0ab733fa74e735546ae");
+    assert_eq!(edge_version, "v0.9.9");
 
     let mut vendored = BTreeSet::new();
     contract_files(&contract_dir(), &contract_dir(), &mut vendored);
@@ -96,6 +101,40 @@ fn vendored_contract_files_match_the_pin_hashes() {
             .collect();
         assert_eq!(actual, expected, "pinned contract file changed: {path}");
     }
+}
+
+#[test]
+fn pinned_contract_tag_matches_the_qualified_edge_version() {
+    let (tag, _, edge_version, _) = parse_pin();
+    let edge_contract_tags = [
+        ("v0.9.9", "contracts-edge-0.9.9"),
+        ("v0.9.10", "contracts-edge-0.9.9"),
+    ];
+    let expected_tag = edge_contract_tags
+        .iter()
+        .find_map(|(edge, contracts)| (*edge == edge_version).then_some(*contracts))
+        .unwrap_or_else(|| panic!("no contracts tag mapping for Edge {edge_version}"));
+    assert_eq!(tag, expected_tag);
+
+    let checksums = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/ferrum-edge-checksums.txt"),
+    )
+    .expect("read Edge checksum allowlist");
+    let allowlisted_edge_versions: BTreeSet<&str> = checksums
+        .lines()
+        .filter_map(|line| line.split_once('#').map(|(_, note)| note))
+        .flat_map(str::split_whitespace)
+        .filter(|value| {
+            value.starts_with('v')
+                && value[1..]
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.')
+        })
+        .collect();
+    assert!(
+        allowlisted_edge_versions.contains(edge_version.as_str()),
+        "PIN Edge version {edge_version} is absent from the checksum allowlist"
+    );
 }
 
 #[test]
@@ -219,4 +258,35 @@ fn gitforgeops_resource_contract_fixtures_match_the_local_serde_envelope() {
             "invalid contract fixture {name} unexpectedly parsed as Resource"
         );
     }
+}
+
+#[test]
+fn gitforgeops_resource_schema_matches_the_local_resource_envelope() {
+    let schema = json("schemas/gitforgeops-resource/v1.schema.json");
+    let required: BTreeSet<String> = schema["required"]
+        .as_array()
+        .expect("schema required array")
+        .iter()
+        .map(|property| property.as_str().expect("required property").to_string())
+        .collect();
+    assert_eq!(
+        required,
+        ["kind", "spec"].into_iter().map(String::from).collect()
+    );
+
+    let properties: BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("schema properties object")
+        .keys()
+        .cloned()
+        .collect();
+    // Resource is tagged with `kind`, every variant carries `spec`, and only
+    // MeshConfig has the optional GitForgeOps-side `id` field.
+    assert_eq!(
+        properties,
+        ["id", "kind", "spec"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
 }

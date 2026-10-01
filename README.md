@@ -315,6 +315,17 @@ assembled/             # file-mode output, written by CI
 Resource files, overlays, schema strictness, plugin associations and mesh
 fragments are covered in [Writing resources](docs/resources.md).
 
+## Contracts
+
+[ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts) is Ferrum's central store for
+shared vocabularies, JSON schemas and fixtures. GitForgeOps consumes its plugin catalog,
+`provisioned-by` vocabulary and resource fixtures, and publishes its `gitforgeops-resource` schema.
+These files are pinned to `contracts-edge-0.9.9` in
+[`contracts/ferrum-contracts/PIN`](contracts/ferrum-contracts/PIN) and vendored under
+`contracts/ferrum-contracts/`.
+See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
+Change shared contracts in ferrum-contracts first, then re-vendor them here; never edit shared copies locally.
+
 ## Repo configuration: `.gitforgeops/config.yaml`
 
 This file declares environments. It holds no URLs, secret names or

@@ -71,9 +71,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer run from proxies with no enabled authenticator.
 - Include `CHANGELOG.md` and `.env.example` in downstream template updates so adopters receive
   release notes and current environment-variable examples.
-- Pin the plugin catalog, `provisioned-by` vocabulary, and GitForgeOps resource-envelope fixtures
-  to ferrum-contracts `contracts-edge-0.9.8`; unit tests now check vendored hashes and local
-  conformance. No catalog or label drift was found against the pinned release.
+- Pin the plugin catalog, `provisioned-by` vocabulary, GitForgeOps resource-envelope fixtures,
+  and the GitForgeOps-owned resource schema to ferrum-contracts `contracts-edge-0.9.9`; unit tests
+  check vendored hashes, fixture deserialization, schema envelope fields, and compatibility with
+  the qualified Ferrum Edge version.
 
 ### Security
 
