@@ -772,6 +772,10 @@ pub struct Proxy {
     pub strip_listen_path: bool,
     #[serde(default)]
     pub preserve_host_header: bool,
+    /// Accept RFC 3986 `;` path parameters on HTTP-family requests. Ferrum
+    /// Edge rejects this option on stream proxies, which have no request path.
+    #[serde(default)]
+    pub allow_path_parameters: bool,
     #[serde(default = "default_connect_timeout")]
     pub backend_connect_timeout_ms: u64,
     #[serde(default = "default_read_timeout")]

@@ -18,6 +18,7 @@ spec:
   backend_path: /v1
   strip_listen_path: false
   preserve_host_header: true
+  allow_path_parameters: false
   backend_connect_timeout_ms: 4000
   backend_read_timeout_ms: 25000
   backend_write_timeout_ms: 26000

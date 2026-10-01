@@ -76,6 +76,48 @@ fn consumer_config(credentials: serde_json::Value) -> gitforgeops::config::schem
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn stream_path_parameter_opt_in_reaches_edge_validator_rejection() {
+    use gitforgeops::config::schema::{BackendScheme, GatewayConfig, Proxy};
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "stream-matrix",
+        "namespace": "ferrum",
+        "backend_scheme": "tcp",
+        "backend_host": "db.internal",
+        "backend_port": 5432,
+        "listen_port": 15432,
+        "allow_path_parameters": true,
+    }))
+    .unwrap();
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(
+        dir.path(),
+        "stream-path-parameters-validator",
+        "#!/bin/sh\ncat \"$7\"\necho 'Stream proxies (TCP/UDP) have no request path; allow_path_parameters must be false' >&2\nexit 1\n",
+    );
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(!result.success);
+    assert!(
+        result.stdout.contains("allow_path_parameters: true"),
+        "{}",
+        result.stdout
+    );
+    assert!(
+        result.stderr.contains("allow_path_parameters must be false"),
+        "{}",
+        result.stderr
+    );
+}
+
 /// F1: a resolved (or literal) consumer credential is redacted from the
 /// validator's diagnostics, and everything else the validator said survives.
 #[cfg(unix)]

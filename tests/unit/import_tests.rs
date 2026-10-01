@@ -26,6 +26,7 @@ fn make_test_config() -> GatewayConfig {
             backend_path: None,
             strip_listen_path: true,
             preserve_host_header: false,
+            allow_path_parameters: false,
             backend_connect_timeout_ms: 5000,
             backend_read_timeout_ms: 30000,
             backend_write_timeout_ms: 30000,

@@ -153,6 +153,32 @@ fn fragments_concatenate_collection_fields() {
 }
 
 #[test]
+fn mesh_service_path_parameter_opt_in_survives_mesh_publication() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[(
+            "ferrum/mesh/core.yaml",
+            r#"
+kind: MeshConfig
+spec:
+  services:
+    - name: api
+      namespace: ferrum
+      allow_path_parameters: true
+"#,
+        )],
+    );
+
+    let mesh = mesh_from(tmp.path()).expect("mesh document");
+    assert!(mesh.services[0]["allow_path_parameters"]
+        .as_bool()
+        .unwrap());
+    let published = render_mesh_yaml(&mesh).unwrap();
+    assert!(published.contains("allow_path_parameters: true"), "{published}");
+}
+
+#[test]
 fn fragments_merge_across_namespaces_into_one_document() {
     // Every mesh node loads the SAME document; namespace directories are an
     // authoring convenience, not a partition of the mesh.

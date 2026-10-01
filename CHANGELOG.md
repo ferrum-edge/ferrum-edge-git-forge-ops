@@ -7,6 +7,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Support the per-proxy `allow_path_parameters` option for HTTP-family routes
+  and preserve the mesh service opt-in through mesh configuration output.
 - Add exact, code-owned `require_auth_plugin.conditional_auth_exemptions` entries
   for intentionally public proxies. Exempted auth findings stay visible at
   `info`; stale entries are informational, while malformed, wildcard and
