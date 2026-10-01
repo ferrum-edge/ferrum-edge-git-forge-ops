@@ -666,8 +666,9 @@ What the export cannot tell you:
   credential cannot compute the fingerprint of the repository's value, so
   those fields are not compared with the repository. `diff` says how many it
   left unverified and does not print `Configuration is in sync.` while any
-  are; JSON `in_sync` is `false`, and `--exit-on-drift` exits `1` (not
-  authoritative) unless `--accept-unverified-secrets` is passed. A
+  are; JSON `in_sync` is `false`. With `--exit-on-drift`, drift that was found
+  still exits `2`, but "no drift" exits `1` (not authoritative) unless
+  `--accept-unverified-secrets` is passed. A
   fingerprinted credential the repository does not declare, and a
   fingerprint-shaped value in a non-secret field, are still reported.
 - **Fingerprints only show change between two exports.**

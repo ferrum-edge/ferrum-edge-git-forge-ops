@@ -1385,14 +1385,29 @@ fn a_viewer_diff_reads_the_export_and_does_not_call_unverified_secrets_in_sync()
 fn a_viewer_diff_still_reports_a_credential_the_repository_does_not_declare() {
     let repo = export_repo(config_export(EXPORT_KEY_ID, &['a', 'b']), false);
 
-    let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
-    let output = repo.run_with_env(&accepted, &VIEWER_ONLY);
+    // Drift found on a fresh read is real: it keeps the drift exit code even
+    // though the declared key itself stays unverified.
+    let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
 
     assert_drift_exit(&output);
     let out = stdout(&output);
     assert!(out.contains("MODIFY Consumer app (ferrum)"), "{out}");
     assert!(out.contains("credentials: [REDACTED] -> [REDACTED]"));
     assert!(!out.contains("hmac-sha256:"), "{out}");
+    assert!(!stderr(&output).contains("requires every declared secret"));
+
+    let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
+    assert_drift_exit(&repo.run_with_env(&accepted, &VIEWER_ONLY));
+}
+
+#[test]
+fn drift_in_a_cached_export_is_still_not_authoritative() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a', 'b']), true);
+
+    let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("requires an authoritative configuration export"));
 }
 
 #[test]

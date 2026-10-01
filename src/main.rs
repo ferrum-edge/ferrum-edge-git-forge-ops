@@ -1582,14 +1582,15 @@ struct ExportDiffFlags {
     accept_unverified_secrets: bool,
 }
 
-/// The refusal `diff --exit-on-drift` returns when fingerprinted secrets
-/// were not verified: like a cached read, the run cannot say "in sync".
+/// The refusal `diff --exit-on-drift` returns when it found no drift but
+/// fingerprinted secrets were not verified: the run cannot say "in sync".
+/// Drift found on the same read is real and keeps the drift exit code.
 fn unverified_secrets_refusal() -> gitforgeops::error::Error {
     gitforgeops::error::Error::StaleGatewayView(
-        "--exit-on-drift requires every declared secret to be verified, but fingerprinted \
-         secret fields were not (see the notes above); refusing to return either the in-sync \
-         (0) or drift (2) result. Compare against a complete fingerprint baseline under the \
-         gateway's current key, or pass --accept-unverified-secrets"
+        "--exit-on-drift requires every declared secret to be verified before it reports no \
+         drift, but fingerprinted secret fields were not (see the notes above); refusing to \
+         return the in-sync (0) result. Compare against a complete fingerprint baseline under \
+         the gateway's current key, or pass --accept-unverified-secrets"
             .to_string(),
     )
 }
@@ -1925,9 +1926,15 @@ async fn cmd_diff(
     let alert = &resolved.ownership.drift_alert_on;
     let drift = verdict::DriftVerdict::evaluate(alert, &diffs, &unmanaged, &spec_owned)
         .with_secret_changes(alert, secret_changes.len());
-    // Unverified secrets make `--exit-on-drift` non-authoritative, exactly as
-    // a cached read does; a refused baseline write is an error either way.
-    let refusal = if exit_on_drift && !secrets_verified && !flags.accept_unverified_secrets {
+    // Drift found on a fresh read is real: it keeps the drift exit code even
+    // with unverified secrets (and wins over a refused baseline write, whose
+    // warning is already printed). Without drift, unverified secrets make
+    // `--exit-on-drift` non-authoritative. A cached read never gets here
+    // with `--exit-on-drift`; it was refused above.
+    let drift_exit = exit_on_drift && drift.has_drift();
+    let refusal = if drift_exit {
+        None
+    } else if exit_on_drift && !secrets_verified && !flags.accept_unverified_secrets {
         Some(unverified_secrets_refusal())
     } else {
         baseline_refusal

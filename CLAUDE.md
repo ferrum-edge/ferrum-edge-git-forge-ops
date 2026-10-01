@@ -503,8 +503,9 @@ which the export lacks.
   Recording refuses a run with diffs or secret changes unless
   `--force-baseline`; a baseline path inside a git worktree is warned about.
 - Unverified secrets (or a key change) are non-authoritative: no "in sync"
-  text, JSON `in_sync: false`, and `--exit-on-drift` exits 1 like a cached
-  read unless `--accept-unverified-secrets`.
+  text, JSON `in_sync: false`; `--exit-on-drift` exits 2 when drift was
+  found, otherwise 1 unless `--accept-unverified-secrets`. A cached read exits
+  1 either way.
 - Cached export (`X-Data-Source: cached` or `source: cached`): same as a cached
   `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
   no baseline is written.

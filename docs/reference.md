@@ -68,18 +68,21 @@ deleted, and unmanaged resources, each as enabled by
 be muted. With `--fingerprint-baseline`, a declared resource's secret that
 changed since the baseline counts as a managed modification.
 
-`--exit-on-drift` exits `1` instead of `0` or `2` whenever the read is not
-authoritative:
+`--exit-on-drift` exits `1` when the read cannot support the result:
 
-- a cached gateway read (`X-Data-Source: cached`);
-- on the viewer-credential path, any declared secret left unverified: no
+- **Cached read** (`X-Data-Source: cached`): always `1`, whether or not drift
+  was seen, because the snapshot may be stale. Nothing overrides this.
+- **Unverified secrets on a fresh read** (viewer-credential path): no
   `--fingerprint-baseline`, a baseline missing a namespace or a declared
   resource, or a gateway fingerprint key that changed since the baseline.
   Every declared Consumer counts here, because its hidden-credentials
   fingerprint can only be checked against a baseline.
+  - Drift found: `2`, as usual. The drift is real; unverified secrets only
+    undermine a "no drift" claim.
+  - No drift found: `1`, because "in sync" cannot be claimed.
+    `--accept-unverified-secrets` returns `0` instead.
 
-`--accept-unverified-secrets` accepts unverified secrets and returns `0` or
-`2` from the compared fields; nothing accepts a cached read. In JSON output,
+In JSON output,
 `in_sync` is `true` only when nothing differs, every declared secret is
 verified and the read was not cached. The `/backup` path never has
 unverified secrets.

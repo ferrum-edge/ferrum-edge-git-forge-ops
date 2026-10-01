@@ -13,8 +13,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with the admin credential. Secrets arrive as gateway-keyed fingerprints a
   viewer cannot reproduce. Declared secret-bearing fields (and every declared
   consumer's hidden-credentials fingerprint) are reported as unverified, never
-  as in sync: JSON `in_sync` is `false` and `--exit-on-drift` exits 1 unless
-  `--accept-unverified-secrets` is passed. Fingerprinted credentials the
+  as in sync: JSON `in_sync` is `false`, and `--exit-on-drift` exits 1 instead
+  of 0 unless `--accept-unverified-secrets` is passed (drift found on a fresh
+  read still exits 2; a cached read always exits 1). Fingerprinted credentials the
   repository does not declare, and fingerprint-shaped values in non-secret
   fields, are still drift. New `--write-fingerprint-baseline` /
   `--fingerprint-baseline` record an export's fingerprints and report declared
