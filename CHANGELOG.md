@@ -112,6 +112,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rotation-specific notice: the freshness guard's refusal text is written for
   apply, but no apply reschedules a rotation, so dispatch it again from the
   current head.
+- `FERRUM_GATEWAY_URL` and `FERRUM_VERIFY_BASE_URL` are GitHub Environment
+  secrets, so no diagnostic echoes them any more (GHSA-pp23-79rj-gp54).
+  Transport-validation errors report only the variable name — never the
+  scheme, host, port or path — and the `GITHUB_ACTIONS` refusals no longer
+  name the remote host. The admin HTTP client strips the request URL from
+  `reqwest` failures (`without_url`) before formatting them, so a connection
+  or timeout error no longer carries `for url (…)`, and a refused 3xx
+  redirect is described only by how its `Location` relates to the configured
+  base (same origin and a different path, a changed scheme, or another
+  origin) rather than echoed — a normalized Location would evade GitHub's
+  exact-value masking. `EnvConfig`'s and `ExportEndpoint`'s `Debug` output
+  redact both URLs.
 - Plugin-config credential slots now include the plugin type:
   `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>` replaces
   `<ns>/<plugin-id>/@plugin-config/config/<path>`. A plugin that keeps its id
@@ -165,3 +177,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `apply` evaluates policy before the state lock on the unresolved document,
   as the security audit sees it, and checks again after API credential
   resolution (GHSA-92v7-rq7m-pxfq).
+- Neutralize both GitHub Actions workflow-command syntaxes in terminal output.
+  Fenced validator diagnostics and resource IDs could reach stdout with `::`
+  at the start of a line or the legacy `##[command]` form anywhere in a line,
+  letting resource data forge annotations, add masks, fold logs, or suppress
+  later output with `stop-commands`. Shared diagnostic sanitization now breaks
+  both forms for validate, plan, apply and review terminal output, while the
+  Markdown sent to the GitHub comment and step summary keeps readable text
+  (GHSA-955f-64c5-hvfx).

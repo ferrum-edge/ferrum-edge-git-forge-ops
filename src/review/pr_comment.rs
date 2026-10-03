@@ -563,29 +563,45 @@ fn bounded_inline_code(value: &str) -> String {
 /// exact inverse, and an input that literally contained `&#46;` still prints
 /// as `&#46;`.
 ///
-/// Fenced blocks are left alone. Validator output is placed in them verbatim,
-/// never escaped, so decoding there would rewrite the tool's own text — and a
-/// literal ``&#96;&#96;&#96;`` inside one would decode into a fence that
-/// terminates the block early.
+/// Fenced blocks are left undecoded. Validator output is placed in them
+/// verbatim, never escaped, so decoding there would rewrite the tool's own text
+/// — and a literal ``&#96;&#96;&#96;`` inside one would decode into a fence
+/// that terminates the block early.
+///
+/// Every physical line then goes through `crate::diagnostics::sanitize_line`,
+/// fenced or not. The terminal sink is a GitHub Actions job log, where the
+/// runner parses a line that begins with `::` (after leading whitespace) or
+/// contains `##[command]` anywhere as a workflow command. Markdown fencing is
+/// invisible to that parser, so the validator bytes this function deliberately
+/// preserves for the rendered comment must be neutralized before they reach
+/// stdout — otherwise a diagnostic can forge log evidence, add masks, fold
+/// output or silence the real annotations a later step emits. Per-line
+/// sanitization avoids truncating the whole comment at the 64 KiB budget used
+/// by `crate::diagnostics::sanitize_block`; the published Markdown stays
+/// unsanitized.
 pub fn markdown_comment_for_terminal(value: &str) -> String {
     let mut rendered = String::with_capacity(value.len());
     let mut open_fence: Option<usize> = None;
     for line in value.split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
         let fence_run = markdown_fence_run(content);
-        match (open_fence, fence_run) {
+        let decoded = match (open_fence, fence_run) {
             (None, Some(run)) if !content.trim_start()[run..].contains('`') => {
                 open_fence = Some(run);
-                rendered.push_str(line);
+                content.to_string()
             }
             (Some(open), Some(run))
                 if run >= open && content.trim_start()[run..].trim().is_empty() =>
             {
                 open_fence = None;
-                rendered.push_str(line);
+                content.to_string()
             }
-            (Some(_), _) => rendered.push_str(line),
-            (None, _) => rendered.push_str(&decode_markdown_escapes(line)),
+            (Some(_), _) => content.to_string(),
+            (None, _) => decode_markdown_escapes(content),
+        };
+        rendered.push_str(&crate::diagnostics::sanitize_line(&decoded));
+        if line.ends_with('\n') {
+            rendered.push('\n');
         }
     }
     rendered
