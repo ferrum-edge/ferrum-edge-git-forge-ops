@@ -16,8 +16,48 @@
 # in FERRUM_GATEWAY_CA_CERT, and FERRUM_TLS_NO_VERIFY deliberately does not
 # reach this path, because a check that accepts any certificate has not
 # verified TLS.
+#
+# A check may send ONLY a verification probe credential. The job holds the
+# environment's whole credential bundle, so a `slot:` header is honoured only
+# when it names a brokered (`${gh-env-secret:...}`) secret of a Consumer that
+#
+#   1. a repository administrator lists in the FERRUM_VERIFY_PROBE_CONSUMERS
+#      variable of the environment's GitHub Environment (comma-separated
+#      <namespace>/<consumer-id>, e.g. `ferrum/orders-probe`), AND
+#   2. this environment's resources label `gitforgeops/verify-probe: "true"`,
+#
+# and only on a GET or HEAD check. The variable is the authorization: no
+# change to resources/ or .gitforgeops/ can change it (the workflow lines that
+# bind it are guarded by review of .github/workflows/), while the label lives
+# in resources/, which the same pull request could edit. With the variable
+# unset, every check that sends a slot fails. Plugin-config and
+# service-discovery slots are never sent. Anything else fails `gitforgeops
+# verify` before any request, and validate, plan and review report it before
+# the merge. Use a dedicated, low-privilege Consumer that exists to be probed,
+# never a customer:
+#
+#   kind: Consumer
+#   spec:
+#     id: "orders-probe"
+#     username: "orders-probe"
+#     labels:
+#       gitforgeops/verify-probe: "true"
+#     credentials:
+#       keyauth:
+#         - key: "${gh-env-secret:alloc=generate}"
+#
+# Every check is bounded, because verification runs after the gateway changed
+# and before the ownership ledger is committed: `attempts` at most 10,
+# `timeout_secs` at most 60, `retry_backoff_ms` at most 30000, at most 50
+# checks per environment, and at most 15 minutes for an environment's checks
+# together when every attempt times out (attempts x timeout_secs, plus the
+# backoff pauses). A file over any bound is refused by validate, plan and
+# apply before anything changes.
 
-version: 1
+# Version 2: a `slot:` names only an allowlisted, labelled probe Consumer's
+# credential. A version 1 file (or one with no `version`) that names a slot is
+# refused, so a slot written under the old meaning is reviewed again.
+version: 2
 
 environments:
   staging:
@@ -27,15 +67,16 @@ environments:
         method: GET
         path: /orders/healthz
         headers:
-          # A credential-bundle slot. Resolved at run time and never printed;
-          # a slot that is not in the bundle FAILS the check rather than
-          # sending an empty header.
+          # The probe Consumer's credential slot. Resolved at run time and
+          # never printed; a slot that is not in the bundle FAILS the check
+          # rather than sending an empty header.
           X-API-Key:
-            slot: ferrum/orders-client/keyauth/key
+            slot: ferrum/orders-probe/keyauth/key
         expect_status: 200
         # A freshly applied route can take a moment to become live, so retry —
         # but boundedly. An unbounded wait is a promotion that hangs rather
-        # than one that is blocked.
+        # than one that is blocked. This check's worst case is
+        # 5 x 10s + (1+2+3+4) x 0.5s = 55s.
         attempts: 5
         timeout_secs: 10
         retry_backoff_ms: 500
@@ -49,12 +90,12 @@ environments:
         expect_status: 401
         attempts: 3
 
-      # Prefer GET/HEAD probes. A POST, PATCH or other non-idempotent check is
-      # retried only when its connection was never established: after a
-      # timeout the endpoint may already have applied it, and a replay would
-      # repeat the side effect. Add `replay_safe: true` only if the endpoint
-      # genuinely tolerates a replay (an Idempotency-Key header proves nothing
-      # by itself).
+      # Prefer GET/HEAD probes; a check that sends a slot must use one. A
+      # POST, PATCH or other non-idempotent check is retried only when its
+      # connection was never established: after a timeout the endpoint may
+      # already have applied it, and a replay would repeat the side effect.
+      # Add `replay_safe: true` only if the endpoint genuinely tolerates a
+      # replay (an Idempotency-Key header proves nothing by itself).
 
   # `production` deliberately has no entry here. An environment with no
   # declared check has verified nothing and failed nothing: `gitforgeops
