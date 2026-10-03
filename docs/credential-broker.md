@@ -125,13 +125,27 @@ path: `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `basicauth/password`, or
 Secrets outside `Consumer.credentials` get a reserved `@` segment:
 
 ```text
-PluginConfig.config leaf     ->  <ns>/<plugin-id>/@plugin-config/config/<path>
-                                 ferrum/ldap/@plugin-config/config/ldap_url
+PluginConfig.config leaf     ->  <ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>
+                                 ferrum/ldap/@plugin/ldap_auth/config/ldap_url
 Upstream.service_discovery   ->  <ns>/<upstream-id>/@service-discovery/<path>
                                  ferrum/orders/@service-discovery/consul/token
 ```
 
 Plugin-config array paths keep every index, including `[0]`.
+
+A plugin-config slot names the plugin type as well as its id, because what a
+config path means, and where the plugin sends it, depends on the type (the
+same `headers.*` path is a secret for more than one plugin, and some of them
+send it to an endpoint their own config names). Changing a plugin's
+`plugin_name` while keeping its id therefore gives it new slots: the previous
+type's stored values are never resolved into it. See
+[Entry position is the slot identity](#entry-position-is-the-slot-identity)
+for what happens to the old values.
+
+Bundle keys in the earlier type-less form (`<ns>/<plugin-id>/@plugin-config/config/<path>`)
+are never read. A declared plugin with the same id refuses on them. If a value
+was issued for the plugin's current type, copy it to the typed slot. In every
+case, remove the old key.
 
 Service discovery is brokered leaf by leaf. The only modeled secret is the
 Consul ACL token. `consul.address`, `service_name`, `datacenter` and `tag`
@@ -164,6 +178,7 @@ What GitForgeOps does about it:
 | A brokered array has more than one entry | Warning (a reorder cannot be detected from the document). |
 | The bundle holds a slot at an index the array no longer has (a shrink, including deleting the last entry) | **Refused.** |
 | A credential type was dropped from a Consumer while its slot is still in the bundle | **Refused.** |
+| The bundle holds a slot of a different plugin type (or the type-less form) under a declared plugin's id | **Refused.** The value is never resolved into the plugin, even when the refusal is accepted. |
 | The ledger records a Consumer as applied, it is no longer declared, and its slots are still in the bundle | **Refused** (only in runs that load that whole namespace). |
 | A Consumer the ledger does not record resolves an `alloc=generate`/`alloc=rotate` value already in the bundle | **Refused** (the value may belong to a retired Consumer with a reused id). |
 
@@ -182,9 +197,12 @@ Until that retry completes, `plan` and `review` runs without
 `GITFORGEOPS_ACTOR` report those slots as refusals.
 
 Plugin-config arrays get the same shrink refusal and multi-entry warning
-(`ferrum/oidc/@plugin-config/config/providers/[1]/client_auth/client_secret`).
+(`ferrum/oidc/@plugin/oidc_relying_party/config/providers/[1]/client_auth/client_secret`).
 `rotate` does not publish plugin configs, so the remedy there is to reseed and
-retire slots in the bundle.
+retire slots in the bundle. The same applies to a plugin type change: seed the
+values the new type needs under its own slots and remove the old type's keys,
+keeping every other slot. Changing the type back later would otherwise
+resurrect a value nobody reviewed for that plugin.
 
 ### Retiring or shifting entries safely
 
@@ -211,7 +229,8 @@ bundle keys or revoke anything at an external issuer.
 CLI run (`plan`, `apply`, `export --materialize`, `rotate`), for a deliberate
 reassignment. There is no environment variable for it, and the bundled apply
 workflow never passes it. After accepting a deletion with the flag, retire the
-slot before re-adding the type. An environment whose ledger is missing, or does
+slot before re-adding the type. Accepting a plugin type change never resolves
+the old type's value into the plugin; it only lets the run proceed. An environment whose ledger is missing, or does
 not record Consumers the bundle already serves through `alloc=generate`, is
 refused until the slots are retired or accepted once with the flag.
 
@@ -297,7 +316,7 @@ Rules:
 
 - Only Consumer `keyauth/key`, `jwt/secret`, `hmac_auth/secret` and api-mode
   `basicauth/password` (including indexed entries) can be rotated. Hashes,
-  identities, unknown fields and `@plugin-config` / `@service-discovery` slots
+  identities, unknown fields and `@plugin` / `@service-discovery` slots
   are refused before anything is written.
 - Rotation is refused in file mode; use materialization instead.
 - The target must be a placeholder on a declared Consumer in the namespace,
