@@ -974,7 +974,11 @@ async fn redirect_on_the_gateway_origin_is_classified_not_echoed() {
     let client =
         AdminClient::new_scoped(&stub_env(format!("http://{source_addr}")), TEST_NAMESPACES)
             .unwrap();
-    let message = client.get_backup("team-alpha").await.unwrap_err().to_string();
+    let message = client
+        .get_backup("team-alpha")
+        .await
+        .unwrap_err()
+        .to_string();
 
     assert!(
         !message.contains(&source_addr.to_string()),
@@ -1146,7 +1150,10 @@ fn redirect_message_reads_with_single_spaces() {
 fn redirect_location_is_classified_against_the_configured_base() {
     let base = "https://gateway.example:9000";
     for (location, expected) in [
-        ("https://gateway.example:9000/other", "same origin under a different path"),
+        (
+            "https://gateway.example:9000/other",
+            "same origin under a different path",
+        ),
         ("https://gateway.example:9443/other", "a different origin"),
         ("http://gateway.example:9000/other", "changed scheme"),
         ("https://elsewhere.example/x", "a different origin"),
