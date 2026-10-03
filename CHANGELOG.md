@@ -81,6 +81,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- `FERRUM_GATEWAY_URL` and `FERRUM_VERIFY_BASE_URL` are GitHub Environment
+  secrets, so no diagnostic echoes them any more (GHSA-pp23-79rj-gp54).
+  Transport-validation errors report only the variable name and a
+  `<value withheld: … is an environment secret>` placeholder — never the
+  scheme, host, port or path — and the `GITHUB_ACTIONS` refusals no longer
+  name the remote host. The admin HTTP client strips the request URL from
+  `reqwest` failures (`without_url`) before formatting them, so a connection
+  or timeout error no longer carries `for url (…)`.
 - Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
   CVE-2026-103111 finding while the pinned Debian base remains behind.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on

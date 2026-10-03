@@ -826,6 +826,29 @@ async fn the_health_recheck_is_best_effort() {
     );
 }
 
+/// `reqwest::Error`'s `Display` appends `for url (…)`, and `FERRUM_GATEWAY_URL`
+/// is a GitHub Environment secret. A connection failure must not echo the
+/// configured host, port or path prefix into CI or local logs.
+#[tokio::test]
+async fn transport_failures_do_not_disclose_the_gateway_url() {
+    // A freshly released ephemeral port refuses the connection immediately;
+    // the admin client is then exercised on its non-retrying error path.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let host = addr.ip().to_string();
+    let port = addr.port().to_string();
+    let env = stub_env(format!("http://{addr}"));
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+
+    let error = client.get_health().await.unwrap_err().to_string();
+    assert!(!error.contains(&host), "gateway host disclosed: {error}");
+    assert!(!error.contains(&port), "gateway port disclosed: {error}");
+    assert!(!error.contains("/health"), "gateway path disclosed: {error}");
+    assert!(!error.contains("for url"), "the URL suffix was not stripped: {error}");
+}
+
 #[test]
 fn delete_treats_404_as_success() {
     // Proxy deletes cascade server-side to scoped plugin configs, so the

@@ -494,15 +494,20 @@ fn gateway_transport_accepts_https_without_warnings() {
 }
 
 /// A cleartext gateway is refused by default, and the refusal names both the
-/// variable that is wrong and the variable that would change the answer.
+/// variable that is wrong and the variable that would change the answer — but
+/// never the secret-backed URL itself.
 #[test]
 fn gateway_transport_refuses_cleartext_http_by_default() {
     let error =
-        validate_gateway_transport(Some("http://gateway.internal:9000"), false, false, false)
+        validate_gateway_transport(Some("http://secret.internal:9443"), false, false, false)
             .expect_err("http:// must not be accepted without the opt-in");
     let error = error.to_string();
     assert!(error.contains("FERRUM_GATEWAY_URL"), "{error}");
-    assert!(error.contains("http://gateway.internal:9000"), "{error}");
+    assert!(
+        !error.contains("secret.internal") && !error.contains("9443"),
+        "the secret-backed URL must be withheld: {error}"
+    );
+    assert!(error.contains("environment secret"), "{error}");
     assert!(error.contains("https://"), "{error}");
     assert!(error.contains("FERRUM_ALLOW_INSECURE_HTTP"), "{error}");
 }
@@ -547,14 +552,18 @@ fn gateway_transport_refuses_every_other_scheme_unconditionally() {
 }
 
 /// A URL that is not a URL fails at load, naming the variable rather than
-/// surfacing later as an opaque request error.
+/// surfacing later as an opaque request error. The value is withheld, since
+/// `FERRUM_GATEWAY_URL` is an environment secret.
 #[test]
 fn gateway_transport_refuses_a_malformed_url() {
-    for url in ["gateway.internal:9000", "https://", "not a url"] {
+    for url in ["secret.internal:9443", "https://", "not a url"] {
         let error = validate_gateway_transport(Some(url), true, false, false)
             .expect_err("a malformed URL must fail at env load");
         let error = error.to_string();
         assert!(error.contains("FERRUM_GATEWAY_URL"), "{url}: {error}");
+        assert!(error.contains("environment secret"), "{url}: {error}");
+        assert!(!error.contains("secret.internal"), "{url}: {error}");
+        assert!(!error.contains("not a url"), "{url}: {error}");
     }
 }
 
@@ -563,8 +572,8 @@ fn gateway_transport_refuses_a_malformed_url() {
 #[test]
 fn gateway_transport_refuses_embedded_credentials_without_echoing_them() {
     for url in [
-        "https://admin:hunter2@gateway.internal:9000",
-        "http://admin@gateway.internal:9000",
+        "https://admin:hunter2@secret.internal:9443",
+        "http://admin@secret.internal:9443",
     ] {
         let error = validate_gateway_transport(Some(url), true, false, false)
             .expect_err("userinfo must never reach the gateway");
@@ -573,6 +582,10 @@ fn gateway_transport_refuses_embedded_credentials_without_echoing_them() {
         assert!(error.contains("credentials"), "{url}: {error}");
         assert!(!error.contains("hunter2"), "secret echoed back: {error}");
         assert!(!error.contains("admin@"), "userinfo echoed back: {error}");
+        assert!(
+            !error.contains("secret.internal"),
+            "the secret-backed host must be withheld: {url}: {error}"
+        );
     }
 }
 
@@ -599,7 +612,10 @@ fn verify_base_url_follows_the_gateway_transport_rule() {
         .expect_err("the opt-in does not reach a remote host in CI")
         .to_string();
     assert!(error.contains("GITHUB_ACTIONS"), "{error}");
-    assert!(error.contains("edge.example.com"), "{error}");
+    assert!(
+        !error.contains("edge.example.com"),
+        "the secret-backed data-plane URL must be withheld: {error}"
+    );
 
     // The lifecycle suite's shape: a loopback data plane in CI, opted in.
     let warnings = validate_verify_transport(Some("http://127.0.0.1:18081"), true, true)
@@ -641,7 +657,10 @@ fn insecure_opt_ins_are_refused_in_ci_for_remote_hosts() {
         .to_string();
     assert!(error.contains("FERRUM_ALLOW_INSECURE_HTTP"), "{error}");
     assert!(error.contains("GITHUB_ACTIONS"), "{error}");
-    assert!(error.contains("gateway.internal"), "{error}");
+    assert!(
+        !error.contains("gateway.internal"),
+        "the secret-backed gateway URL must be withheld: {error}"
+    );
 
     // Same rule for the certificate check, independent of the scheme: TLS
     // that verifies nothing is not transport security.

@@ -190,9 +190,13 @@ impl AdminClient {
             (None, None) => {}
         }
 
-        let client = builder
-            .build()
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+        let client = match builder.build() {
+            Ok(client) => client,
+            Err(error) => {
+                let message = transport_error("building the gateway HTTP client", error);
+                return Err(crate::error::Error::HttpClient(message));
+            }
+        };
 
         Ok(Self {
             client,
@@ -310,10 +314,13 @@ impl AdminClient {
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
-                    last_error = Some(e.to_string());
+                    last_error = Some(transport_error("request to the gateway failed", e));
                     backoff_sleep(attempt).await;
                 }
-                Err(e) => return Err(crate::error::Error::HttpClient(e.to_string())),
+                Err(e) => {
+                    let message = transport_error("request to the gateway failed", e);
+                    return Err(crate::error::Error::HttpClient(message));
+                }
             }
         }
 
@@ -882,6 +889,17 @@ impl AdminClient {
             ))
             .await)
     }
+}
+
+/// Render a `reqwest` transport failure with its request URL removed.
+///
+/// `reqwest::Error`'s `Display` appends `for url (…)`; `FERRUM_GATEWAY_URL` is
+/// a GitHub Environment secret, so that URL — its host, port and path prefix —
+/// must never reach CI or local logs. [`reqwest::Error::without_url`] drops the
+/// suffix, and `context` names the failed operation without restating the
+/// endpoint.
+fn transport_error(context: &str, error: reqwest::Error) -> String {
+    format!("{context}: {}", error.without_url())
 }
 
 /// Whether a tolerated DELETE actually removed something.
