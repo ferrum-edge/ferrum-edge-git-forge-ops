@@ -17,11 +17,11 @@
 use std::process::{Command, Output};
 
 use gitforgeops::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
+use gitforgeops::diagnostics::{sanitize, sanitize_block, sanitize_line, MAX_INLINE_CHARS};
 use gitforgeops::diff::{
     resource_diff::{DiffAction, ResourceDiff},
     security::audit_security,
 };
-use gitforgeops::diagnostics::{sanitize, sanitize_block, sanitize_line, MAX_INLINE_CHARS};
 use gitforgeops::error::Error;
 use gitforgeops::policy::config::{PolicyRules, RequireAuthPluginRuleConfig};
 use gitforgeops::policy::{evaluate_policies, PolicyConfig, Severity};
