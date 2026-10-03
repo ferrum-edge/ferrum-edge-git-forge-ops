@@ -676,11 +676,9 @@ impl ProbeConsumerAllowlist {
             }
             // Exactly one `/`: `a/b/c` would match both `(a, b/c)` and
             // `(a/b, c)`.
-            let qualified = entry
-                .split_once('/')
-                .is_some_and(|(namespace, id)| {
-                    !namespace.is_empty() && !id.is_empty() && !id.contains('/')
-                });
+            let qualified = entry.split_once('/').is_some_and(|(namespace, id)| {
+                !namespace.is_empty() && !id.is_empty() && !id.contains('/')
+            });
             let clean = !entry.chars().any(|c| c.is_control() || c.is_whitespace());
             if !qualified || !clean {
                 return Err(crate::error::Error::Config(format!(
