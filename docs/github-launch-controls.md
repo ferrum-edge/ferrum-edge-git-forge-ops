@@ -412,6 +412,14 @@ file:
 
 `check_supply_chain.py` accepts only that exact form.
 
+`rotate.yml` runs the same guard with the same classifier. Rotation waits on
+the same `ferrum-apply-<env>` lock and then builds and runs the refreshed head
+with the gateway, broker and state-writer credentials, so its environment
+approval must also cover only the revision it was dispatched from. It is not
+held to strict equality: apply's own ledger commit moves the branch while a
+rotation waits, and the classifier treats that output as inert. A rotation
+refused this way is not rescheduled; dispatch it again from the current head.
+
 Using one list means an approval-gated deployment is not cancelled by accident.
 While a merge waits for its reviewer, other merges land on `main`:
 
@@ -460,14 +468,25 @@ any workflow expression that reaches the whole `secrets` context
 credential broker only ever needs the `FERRUM_CREDS_BUNDLE[_N]` shards, bound
 by name.
 
-The `security-supply-chain-policy` check always runs the **protected branch's**
-copy of the checker against the candidate tree, so a pull request cannot weaken
-the policy that judges it. The cost: a PR that changes the checker *and* the
+The `security-supply-chain-policy` check runs the **protected branch's** copy
+of the checker against the candidate tree, under `python3 -I` so that no module
+in the candidate checkout can load before the trusted policy. A pull request
+therefore cannot weaken the policy by editing the checker: its edits take
+effect only after merge. The cost: a PR that changes the checker *and* the
 workflow shape it governs fails its own policy check once, because the old
 policy judges the new shape. Prefer expand/contract pairs (accept both shapes,
 migrate, then reject the old one). The baseline ruleset has no human bypass,
 so merging past that red required check takes a deliberate admin decision.
 The next run on `main` uses the new policy.
+
+That is not yet a complete boundary. The check runs under `pull_request`, so
+GitHub executes the pull request's own copy of `security.yml`. The trusted
+checker inspects that copy with substring rules, and it is the job that copy
+defines which runs those rules. A pull request that changes workflow
+definitions can therefore still influence what this check reports. Until the
+required check moves to a workflow whose definition comes from the protected
+branch, a green `security-supply-chain-policy` is trustworthy only together
+with exact-head review of every change under `.github/workflows/`.
 
 ### Repository security features
 
