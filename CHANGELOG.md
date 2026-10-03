@@ -86,9 +86,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `<ns>/<plugin-id>/@plugin-config/config/<path>`. A plugin that keeps its id
   and config path but changes `plugin_name` no longer resolves the previous
   type's stored secret. While the bundle still holds a slot of another type
-  under that id, the change is a credential slot remap: `apply`,
-  `export --materialize` and `rotate` refuse, and `plan` and `review` report
-  it as blocking. Bundle keys in the old type-less form are never looked up.
+  under that id, the change is a credential slot remap: `apply` and
+  `export --materialize` refuse, and `plan` and `review` report it as
+  blocking. `rotate` publishes Consumers only and never resolves a plugin
+  config, so it is unaffected. Bundle keys in the old type-less form are never
+  looked up.
   A declared plugin with the same id refuses on them until each value is
   reseeded under its typed slot (only if it was issued for that type) and the
   old key is removed. Import, diff and review masking, validator stand-ins and

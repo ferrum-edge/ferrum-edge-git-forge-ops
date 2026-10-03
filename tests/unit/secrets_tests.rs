@@ -3378,6 +3378,7 @@ fn plugin_type_identity_matches_whole_components_only() {
     for foreign in [
         "ferrum/telemetry/@plugin/otel_tracing_v2/config/headers/x-api-key",
         "ferrum/telemetry/@plugin/otel_tracing~1config/headers/x-api-key",
+        "ferrum/telemetry/@plugin/otel_tracing/configx/headers/x-api-key",
         "ferrum/telemetry/@plugin/otel_tracing/headers/x-api-key",
         "ferrum/telemetry/@plugin",
     ] {
@@ -3429,6 +3430,38 @@ fn plugin_type_identity_ignores_other_keyspaces() {
         cfg.plugin_configs[0].config["headers"]["x-api-key"],
         CURRENT
     );
+}
+
+/// `plugin_name` is one escaped slot component, so a `/` or `~` in the declared
+/// type cannot split the slot or stand in for another component. The typed slot
+/// still resolves its own stored value.
+#[test]
+fn plugin_name_is_escaped_as_one_slot_component() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    const SLASH_TYPE_SLOT: &str = "ferrum/telemetry/@plugin/otel~1tracing/config/headers/x-api-key";
+    const TILDE_TYPE_SLOT: &str = "ferrum/telemetry/@plugin/otel~0tracing/config/headers/x-api-key";
+    const SLASH_TYPE_VALUE: &str = "synthetic-slash-type-value";
+    const TILDE_TYPE_VALUE: &str = "synthetic-tilde-type-value";
+
+    for (plugin_name, slot, value) in [
+        ("otel/tracing", SLASH_TYPE_SLOT, SLASH_TYPE_VALUE),
+        ("otel~tracing", TILDE_TYPE_SLOT, TILDE_TYPE_VALUE),
+    ] {
+        let bundle = single_slot_bundle(slot, value);
+        let mut cfg = telemetry_cfg(plugin_name, REQUIRE);
+        let report = resolve_secrets_with_mode_and_options(
+            &mut cfg,
+            &bundle,
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .expect("the escaped declared type is this plugin's own component");
+        assert_eq!(report.results[0].slot, slot);
+        assert_eq!(report.results[0].status, SlotStatus::Resolved);
+        assert_eq!(cfg.plugin_configs[0].config["headers"]["x-api-key"], value);
+    }
 }
 
 // --- Plugin-config endpoint generation (#329) -------------------------------

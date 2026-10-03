@@ -2021,7 +2021,8 @@ fn enforce_slot_remap_policy(
     }
     Err(crate::error::Error::CredentialSlotRemap(format!(
         "Refusing to resolve credentials: {} credential slot(s) would be reassigned or \
-         revived by a credential shape change or a retired Consumer:\n  {}",
+         revived by a credential shape change, a retired Consumer, or a PluginConfig that \
+         changed `plugin_name` (or still has retired type-less `@plugin-config` keys):\n  {}",
         report.slot_remaps.len(),
         report.slot_remaps.join("\n  ")
     )))
