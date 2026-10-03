@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -116,6 +117,108 @@ def write_reviewed_tree(
         encoding="utf-8",
     )
     return tree_path
+
+
+HOSTILE_CARGO_CONFIG = (
+    '[alias]\naudit = ["run", "--quiet", "--bin", "forged-audit"]\n'
+    '[env]\nRUSTSEC_FORGED = "1"\n'
+)
+HOSTILE_AUDIT_CONFIG = '[advisories]\nignore = ["RUSTSEC-2099-0001"]\n'
+HOSTILE_TOOLCHAIN = '[toolchain]\npath = "./forged-toolchain"\n'
+
+
+def write_hostile_cargo_inputs(root):
+    """Every candidate file that steers cargo, rustup or cargo-audit by location."""
+    (root / ".cargo").mkdir(parents=True, exist_ok=True)
+    (root / ".cargo" / "config.toml").write_text(HOSTILE_CARGO_CONFIG, encoding="utf-8")
+    (root / ".cargo" / "config").write_text(HOSTILE_CARGO_CONFIG, encoding="utf-8")
+    (root / ".cargo" / "audit.toml").write_text(HOSTILE_AUDIT_CONFIG, encoding="utf-8")
+    (root / "rust-toolchain.toml").write_text(HOSTILE_TOOLCHAIN, encoding="utf-8")
+    (root / "rust-toolchain").write_text("forged\n", encoding="utf-8")
+    (root / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
+
+
+# A stand-in `cargo` that answers the way a steered cargo would whenever it can
+# see candidate configuration where cargo, rustup or cargo-audit look for it
+# (the working directory and its ancestors, CARGO_HOME, CARGO_ALIAS_*,
+# RUSTUP_TOOLCHAIN), and honestly otherwise. Every call is recorded.
+FAKE_CARGO = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+HIERARCHICAL = (".cargo/config", ".cargo/config.toml", "rust-toolchain", "rust-toolchain.toml")
+HOME_CONFIG = ("config", "config.toml", "audit.toml")
+
+
+def steered():
+    cwd = Path.cwd()
+    for directory in (cwd, *cwd.parents):
+        if any(os.path.lexists(directory / name) for name in HIERARCHICAL):
+            return True
+    if os.path.lexists(cwd / ".cargo" / "audit.toml"):
+        return True
+    cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    if any(os.path.lexists(cargo_home / name) for name in HOME_CONFIG):
+        return True
+    return any(
+        key.startswith("CARGO_ALIAS_") or key == "RUSTUP_TOOLCHAIN" for key in os.environ
+    )
+
+
+mode = "steered" if steered() else "honest"
+with open(os.environ["FAKE_CARGO_RECORD"], "a", encoding="utf-8") as record:
+    record.write(
+        json.dumps(
+            {
+                "args": sys.argv[1:],
+                "cwd": os.getcwd(),
+                "cargo_home": os.environ.get("CARGO_HOME"),
+                "mode": mode,
+            }
+        )
+        + "\n"
+    )
+with open(os.environ["FAKE_CARGO_OUTPUTS"], encoding="utf-8") as outputs:
+    output = json.load(outputs)[sys.argv[1]][mode]
+sys.stdout.write(output["stdout"])
+sys.exit(output["exit"])
+"""
+
+REVIEWED_RSA_TREE = (
+    "rsa v0.9.10\n"
+    "└── age v0.12.1\n"
+    "    └── gitforgeops v0.1.0 (/candidate)\n"
+)
+SECOND_RSA_PATH_TREE = (
+    "rsa v0.9.10\n"
+    "├── age v0.12.1\n"
+    "│   └── gitforgeops v0.1.0 (/candidate)\n"
+    "└── forged-free v1.0.0\n"
+    "    └── gitforgeops v0.1.0 (/candidate)\n"
+)
+
+
+def fake_cargo_outputs():
+    return {
+        "audit": {
+            "honest": {
+                "stdout": json.dumps(
+                    report(
+                        [vulnerability("RUSTSEC-2099-0001", "forged-free", "1.0.0")],
+                        count=1,
+                    )
+                ),
+                "exit": 1,
+            },
+            "steered": {"stdout": json.dumps(report()), "exit": 0},
+        },
+        "tree": {
+            "honest": {"stdout": SECOND_RSA_PATH_TREE, "exit": 0},
+            "steered": {"stdout": REVIEWED_RSA_TREE, "exit": 0},
+        },
+    }
 
 
 class CargoAuditPolicyTests(unittest.TestCase):
@@ -508,6 +611,236 @@ class CargoAuditPolicyTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertEqual(command[command.index("--color") + 1], "never")
             self.assertEqual(command[command.index("-i") + 1], "rsa@0.9.10")
+            self.assertEqual(
+                command[command.index("--manifest-path") + 1], str(root / "Cargo.toml")
+            )
+            workdir = Path(run.call_args.kwargs["cwd"]).resolve()
+            self.assertNotIn(root.resolve(), (workdir, *workdir.parents))
+
+
+class CandidateCargoIsolationTests(unittest.TestCase):
+    """Candidate cargo, rustup and cargo-audit configuration cannot steer the gate."""
+
+    def install_fake_cargo(self, scratch, candidate):
+        bindir = scratch / "bin"
+        bindir.mkdir()
+        cargo = bindir / "cargo"
+        cargo.write_text(f"#!{sys.executable}\n{FAKE_CARGO}", encoding="utf-8")
+        cargo.chmod(0o755)
+        outputs = scratch / "outputs.json"
+        outputs.write_text(json.dumps(fake_cargo_outputs()), encoding="utf-8")
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "FAKE_CARGO_RECORD": str(scratch / "record.jsonl"),
+                "FAKE_CARGO_OUTPUTS": str(outputs),
+                # Inherited selection variables pointing back at the candidate.
+                "CARGO_HOME": str(candidate / ".cargo"),
+                "CARGO_ALIAS_AUDIT": "run --quiet --bin forged-audit",
+                "RUSTUP_TOOLCHAIN": "forged",
+            }
+        )
+        return cargo, environment
+
+    def run_gate(self, scratch, candidate, environment, exceptions):
+        policy = scratch / "policy.json"
+        policy.write_text(
+            json.dumps({"schema_version": 1, "exceptions": exceptions}), encoding="utf-8"
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--policy",
+                str(policy),
+                "--today",
+                TODAY,
+                "--source-root",
+                str(candidate),
+            ],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def records(self, scratch):
+        lines = (scratch / "record.jsonl").read_text(encoding="utf-8").splitlines()
+        return [json.loads(line) for line in lines]
+
+    def assert_outside_candidate(self, call, candidate):
+        root = candidate.resolve()
+        workdir = Path(call["cwd"]).resolve()
+        cargo_home = Path(call["cargo_home"]).resolve()
+        self.assertNotIn(root, (workdir, *workdir.parents))
+        self.assertNotIn(root, (cargo_home, *cargo_home.parents))
+        self.assertEqual(call["mode"], "honest")
+
+    def test_candidate_configuration_cannot_forge_a_clean_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            candidate = scratch / "candidate"
+            candidate.mkdir()
+            write_hostile_cargo_inputs(candidate)
+            (candidate / "Cargo.toml").write_text(REVIEWED_MANIFEST, encoding="utf-8")
+            cargo, environment = self.install_fake_cargo(scratch, candidate)
+
+            # Control: from inside the candidate tree, the stand-in is steered
+            # and reports a clean lockfile, as a steered cargo-audit would.
+            control_environment = dict(environment)
+            control_environment["FAKE_CARGO_RECORD"] = str(scratch / "control.jsonl")
+            control = subprocess.run(
+                [str(cargo), "audit", "--json"],
+                cwd=candidate,
+                env=control_environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertEqual(json.loads(control.stdout), report())
+
+            result = self.run_gate(scratch, candidate, environment, [])
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Unreviewed cargo-audit findings", result.stderr)
+            self.assertIn("RUSTSEC-2099-0001", result.stderr)
+            for name in (".cargo/config.toml", ".cargo/audit.toml", "rust-toolchain.toml"):
+                self.assertIn(name, result.stdout)
+            (call,) = self.records(scratch)
+            self.assertEqual(call["args"][0], "audit")
+            self.assertEqual(
+                call["args"][call["args"].index("--file") + 1],
+                str(candidate.resolve() / "Cargo.lock"),
+            )
+            self.assert_outside_candidate(call, candidate)
+
+    def test_candidate_configuration_cannot_forge_the_rsa_dependency_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            candidate = scratch / "candidate"
+            candidate.mkdir()
+            write_reviewed_tree(candidate)
+            write_hostile_cargo_inputs(candidate)
+            _cargo, environment = self.install_fake_cargo(scratch, candidate)
+
+            result = self.run_gate(scratch, candidate, environment, [exception()])
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("dependency path changed", result.stderr)
+            (call,) = self.records(scratch)
+            self.assertEqual(call["args"][0], "tree")
+            self.assertEqual(
+                call["args"][call["args"].index("--manifest-path") + 1],
+                str(candidate.resolve() / "Cargo.toml"),
+            )
+            self.assertIn("--locked", call["args"])
+            self.assert_outside_candidate(call, candidate)
+
+    def test_inherited_cargo_selection_variables_are_scrubbed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_hostile_cargo_inputs(root)
+            hostile_environment = {
+                "CARGO": "/bin/false",
+                "CARGO_HOME": str(root / ".cargo"),
+                "CARGO_ALIAS_AUDIT": "tree",
+                "CARGO_BUILD_RUSTC_WRAPPER": "/bin/false",
+                "RUSTC_BOOTSTRAP": "1",
+                "RUSTC_WRAPPER": "/bin/false",
+                "RUSTFLAGS": "--cfg forged",
+                "RUSTUP_TOOLCHAIN": "forged",
+                "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS": "nightly",
+                "__CARGO_FIX_YOLO": "1",
+            }
+            # Every explicitly scrubbed name is exercised, not just a sample.
+            for name in check_cargo_audit.SCRUBBED_ENVIRONMENT:
+                hostile_environment.setdefault(name, "/bin/false")
+            seen = {}
+
+            def fake_run(command, **kwargs):
+                workdir = Path(kwargs["cwd"])
+                environment = kwargs["env"]
+                seen["command"] = command
+                seen["cwd"] = workdir
+                seen["env"] = environment
+                seen["cwd_entries"] = sorted(path.name for path in workdir.iterdir())
+                seen["home_entries"] = sorted(
+                    path.name for path in Path(environment["CARGO_HOME"]).iterdir()
+                )
+                return subprocess.CompletedProcess(command, 0, json.dumps(report()), "")
+
+            with mock.patch.dict(os.environ, hostile_environment):
+                inherited_path = os.environ.get("PATH")
+                with mock.patch.object(
+                    check_cargo_audit.subprocess, "run", side_effect=fake_run
+                ):
+                    audit_report, status = check_cargo_audit.run_cargo_audit(root)
+
+            self.assertEqual((audit_report, status), (report(), 0))
+            environment = seen["env"]
+            for name in hostile_environment:
+                if name != "CARGO_HOME":
+                    self.assertNotIn(name, environment)
+            self.assertEqual(
+                [name for name in environment if name.startswith(("CARGO_", "__CARGO_"))],
+                ["CARGO_HOME"],
+                "only the isolated CARGO_HOME reaches cargo",
+            )
+            cargo_home = Path(environment["CARGO_HOME"]).resolve()
+            self.assertNotIn(root.resolve(), (cargo_home, *cargo_home.parents))
+            self.assertEqual(environment.get("PATH"), inherited_path)
+            self.assertEqual(seen["cwd_entries"], [])
+            self.assertEqual(seen["home_entries"], [])
+            self.assertNotIn(root.resolve(), (seen["cwd"], *seen["cwd"].parents))
+            self.assertFalse(seen["cwd"].exists(), "the isolated directory is removed")
+            command = seen["command"]
+            self.assertEqual(command[command.index("--file") + 1], str(root / "Cargo.lock"))
+
+    def test_lockfile_and_manifest_must_be_regular_candidate_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(check_cargo_audit.subprocess, "run") as run:
+                with self.assertRaises(check_cargo_audit.PolicyError) as missing:
+                    check_cargo_audit.run_cargo_audit(root)
+                (root / "elsewhere.lock").write_text("version = 4\n", encoding="utf-8")
+                (root / "Cargo.lock").symlink_to(root / "elsewhere.lock")
+                with self.assertRaises(check_cargo_audit.PolicyError) as linked_lock:
+                    check_cargo_audit.run_cargo_audit(root)
+                (root / "elsewhere.toml").write_text(REVIEWED_MANIFEST, encoding="utf-8")
+                (root / "Cargo.toml").symlink_to(root / "elsewhere.toml")
+                with self.assertRaises(check_cargo_audit.PolicyError) as linked_manifest:
+                    check_cargo_audit._read_dependency_tree("rsa", "0.9.10", root, None)
+            run.assert_not_called()
+            for raised in (missing, linked_lock, linked_manifest):
+                self.assertIn("must be a regular file", str(raised.exception))
+
+    def test_isolated_directory_must_be_outside_the_candidate_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tmp").mkdir()
+            with mock.patch.object(check_cargo_audit.tempfile, "tempdir", str(root / "tmp")):
+                with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                    with check_cargo_audit.isolated_cargo(root):
+                        self.fail("isolation must refuse before cargo runs")
+            self.assertIn("inside the candidate tree", str(raised.exception))
+
+    def test_cargo_configuration_above_the_isolated_directory_is_refused(self):
+        for name in check_cargo_audit.CARGO_CONTROL_FILES:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                outer = Path(directory)
+                candidate = outer / "candidate"
+                candidate.mkdir()
+                scratch = outer / "scratch"
+                control = scratch / name
+                control.parent.mkdir(parents=True, exist_ok=True)
+                control.write_text("", encoding="utf-8")
+                with mock.patch.object(check_cargo_audit.tempfile, "tempdir", str(scratch)):
+                    with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                        with check_cargo_audit.isolated_cargo(candidate):
+                            self.fail("isolation must refuse before cargo runs")
+                self.assertIn("cargo would read", str(raised.exception))
 
 
 class RustSourceStrippingTests(unittest.TestCase):

@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 MAX_REVIEW_HORIZON_DAYS = 120
@@ -63,6 +66,39 @@ ALLOWED_AGE_REFERENCES = {
 }
 AGE_REFERENCE = re.compile(r"\bage(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 CARGO_TREE_NO_MATCH = "did not match any packages"
+
+# Files that steer `cargo` or `cargo audit` from the working directory: cargo
+# discovers `.cargo/config[.toml]` (aliases, `[env]`, source replacement) in the
+# working directory and every ancestor, rustup discovers `rust-toolchain[.toml]`
+# (including a `path` toolchain) the same way, and cargo-audit reads
+# `./.cargo/audit.toml` (ignore lists, advisory database location, yanked
+# checks). None of them is looked up next to `--manifest-path` or `--file`, so
+# the gate runs cargo from an isolated directory: candidate copies are ignored
+# (and only listed in the log), and none may exist at or above that directory.
+CARGO_CONTROL_FILES = (
+    ".cargo/config",
+    ".cargo/config.toml",
+    ".cargo/audit.toml",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+)
+# Inherited variables that would otherwise select a toolchain, wrap rustc,
+# unlock nightly-only behaviour (`RUSTC_BOOTSTRAP`, cargo's internal
+# `__CARGO_*` overrides) or configure cargo (`CARGO_ALIAS_<name>`,
+# `CARGO_HOME`, ...) for the gate.
+SCRUBBED_ENVIRONMENT = frozenset(
+    {
+        "CARGO",
+        "RUSTC",
+        "RUSTC_BOOTSTRAP",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOCFLAGS",
+        "RUSTFLAGS",
+        "RUSTUP_TOOLCHAIN",
+    }
+)
+SCRUBBED_ENVIRONMENT_PREFIXES = ("CARGO_", "__CARGO_")
 
 _RAW_STRING_START = re.compile(r'b?r(?P<hashes>#*)"')
 _CHAR_LITERAL = re.compile(r"b?'(?:\\.|[^\\'\n])'")
@@ -345,6 +381,68 @@ def evaluate(
     return reviewed, blocked, stale, informational
 
 
+def ignored_candidate_cargo_inputs(source_root: Path) -> list[str]:
+    """Candidate cargo/toolchain control files this gate deliberately ignores."""
+    return [name for name in CARGO_CONTROL_FILES if os.path.lexists(source_root / name)]
+
+
+def _candidate_regular_file(source_root: Path, name: str) -> Path:
+    """Return a candidate input that must be a regular file, never a link."""
+    path = source_root / name
+    if path.is_symlink() or not path.is_file():
+        raise PolicyError(f"candidate {name} must be a regular file: {path}")
+    return path
+
+
+def _scrubbed_cargo_environment(cargo_home: Path) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in SCRUBBED_ENVIRONMENT
+        and not key.startswith(SCRUBBED_ENVIRONMENT_PREFIXES)
+    }
+    environment["CARGO_HOME"] = str(cargo_home)
+    return environment
+
+
+@contextlib.contextmanager
+def isolated_cargo(source_root: Path) -> Iterator[tuple[Path, dict[str, str]]]:
+    """Yield a working directory and environment that no candidate file reaches.
+
+    Cargo, rustup and cargo-audit all read configuration relative to the
+    working directory, not to `--manifest-path` or `--file`. Running from a
+    fresh directory outside the candidate tree, with a fresh `CARGO_HOME` and
+    no inherited cargo/rustup selection variables, leaves the candidate's
+    manifest and lockfile as the only inputs. The toolchain is the runner's
+    default, installed by the workflow's pinned toolchain step.
+    """
+    root = source_root.resolve()
+    # Downloaded crate sources and the advisory database land in this
+    # CARGO_HOME; failing to delete them afterwards must not fail the gate.
+    with tempfile.TemporaryDirectory(
+        prefix="cargo-audit-isolated-", ignore_cleanup_errors=True
+    ) as directory:
+        base = Path(directory).resolve()
+        workdir = base / "work"
+        cargo_home = base / "cargo-home"
+        workdir.mkdir()
+        cargo_home.mkdir()
+        if root == workdir or root in workdir.parents:
+            raise PolicyError(
+                f"the isolated cargo directory {workdir} is inside the candidate "
+                f"tree {root}; point TMPDIR outside the checkout"
+            )
+        for ancestor in (workdir, *workdir.parents):
+            for name in CARGO_CONTROL_FILES:
+                if os.path.lexists(ancestor / name):
+                    raise PolicyError(
+                        f"cargo would read {ancestor / name} from the isolated "
+                        "working directory; point TMPDIR at a directory without "
+                        "cargo or rustup configuration above it"
+                    )
+        yield workdir, _scrubbed_cargo_environment(cargo_home)
+
+
 def _read_dependency_tree(
     package: str, version: str, source_root: Path, dependency_tree_path: Path | None
 ) -> str:
@@ -357,24 +455,29 @@ def _read_dependency_tree(
             ) from exc
 
     spec = f"{package}@{version}"
+    manifest = _candidate_regular_file(source_root, "Cargo.toml")
     try:
-        result = subprocess.run(
-            [
-                "cargo",
-                "tree",
-                "--color",
-                "never",
-                "--locked",
-                "--target",
-                "all",
-                "-i",
-                spec,
-            ],
-            cwd=source_root,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        with isolated_cargo(source_root) as (workdir, environment):
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--manifest-path",
+                    str(manifest),
+                    "--color",
+                    "never",
+                    "--locked",
+                    "--target",
+                    "all",
+                    "-i",
+                    spec,
+                ],
+                cwd=workdir,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
     except OSError as exc:
         raise PolicyError(
             f"could not inspect the {package} dependency path: {exc}"
@@ -524,14 +627,30 @@ def _format_finding(finding: dict[str, str | None]) -> str:
 
 
 def run_cargo_audit(source_root: Path) -> tuple[dict[str, Any], int]:
+    # An explicit `--file` also stops cargo-audit from generating a lockfile
+    # when the candidate has none: a missing lockfile is a refusal, not a
+    # fresh resolution.
+    lockfile = _candidate_regular_file(source_root, "Cargo.lock")
     try:
-        result = subprocess.run(
-            ["cargo", "audit", "--json", "--deny", "unsound", "--deny", "yanked"],
-            cwd=source_root,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        with isolated_cargo(source_root) as (workdir, environment):
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "audit",
+                    "--json",
+                    "--deny",
+                    "unsound",
+                    "--deny",
+                    "yanked",
+                    "--file",
+                    str(lockfile),
+                ],
+                cwd=workdir,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
     except OSError as exc:
         raise PolicyError(f"could not execute cargo audit: {exc}") from exc
 
@@ -584,6 +703,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     source_root = args.source_root.resolve()
+    ignored = ignored_candidate_cargo_inputs(source_root)
+    if ignored:
+        print(
+            "cargo runs outside the candidate tree; ignoring candidate cargo and "
+            f"toolchain configuration: {', '.join(ignored)}"
+        )
     try:
         policy = load_policy(args.policy, args.today)
         verify_exception_reachability(policy, source_root, args.dependency_tree)
