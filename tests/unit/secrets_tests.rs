@@ -2233,7 +2233,7 @@ fn ordinary_consumer_secrets_and_placeholder_shaped_plugin_seeds_resolve() {
     let mut bundle = BTreeMap::new();
     bundle.insert("ferrum/app/keyauth/key".to_string(), SECRET.to_string());
     bundle.insert(
-        "ferrum/otel/@plugin-config/config/authorization".to_string(),
+        "ferrum/otel/@plugin/otel_tracing/config/authorization".to_string(),
         REQUIRE.to_string(),
     );
 
@@ -2755,7 +2755,7 @@ fn revival_check_is_limited_to_consumer_slots() {
     .unwrap();
     let mut bundle = BTreeMap::new();
     bundle.insert(
-        "ferrum/opaque/@plugin-config/config/display_mode".to_string(),
+        "ferrum/opaque/@plugin/custom_fixture/config/display_mode".to_string(),
         "stored".to_string(),
     );
     let ledger = ledger_of(&[], ConsumerCoverage::Complete);
@@ -2974,9 +2974,9 @@ fn a_retry_after_a_state_commit_keeps_its_recorded_allocation() {
 // --- Plugin-config array slot identity (#328) -------------------------------
 
 const OIDC_SECRET_A_SLOT: &str =
-    "ferrum/oidc/@plugin-config/config/providers/[0]/client_auth/client_secret";
+    "ferrum/oidc/@plugin/oidc_relying_party/config/providers/[0]/client_auth/client_secret";
 const OIDC_SECRET_B_SLOT: &str =
-    "ferrum/oidc/@plugin-config/config/providers/[1]/client_auth/client_secret";
+    "ferrum/oidc/@plugin/oidc_relying_party/config/providers/[1]/client_auth/client_secret";
 
 fn oidc_providers_cfg(issuers: &[&str]) -> GatewayConfig {
     let providers: Vec<_> = issuers
@@ -3084,10 +3084,9 @@ fn steady_plugin_config_array_resolves_without_a_remap() {
 
     assert!(report.slot_remaps.is_empty());
     assert!(
-        report.warnings.iter().any(
-            |w| w.contains("ferrum/oidc/@plugin-config/config/providers")
-                && w.contains("slot identity")
-        ),
+        report.warnings.iter().any(|w| w
+            .contains("ferrum/oidc/@plugin/oidc_relying_party/config/providers")
+            && w.contains("slot identity")),
         "expected the positional advisory"
     );
     let providers = &cfg.plugin_configs[0].config["providers"];
@@ -3138,7 +3137,7 @@ fn plugin_config_array_without_orphaned_index_slots_is_not_a_remap() {
         "SECRET-FOR-IDP-A-aaaaaaaa".to_string(),
     );
     bundle.insert(
-        "ferrum/oidc/@plugin-config/config/providers/client_secret".to_string(),
+        "ferrum/oidc/@plugin/oidc_relying_party/config/providers/client_secret".to_string(),
         "object-shaped-slot".to_string(),
     );
     let cfg = oidc_providers_cfg(&["https://idp-a.example.com"]);
@@ -3154,9 +3153,320 @@ fn plugin_config_array_without_orphaned_index_slots_is_not_a_remap() {
     assert!(report.warnings.is_empty());
 }
 
+// --- Plugin-config slot identity includes the plugin type -------------------
+
+const OLD_TYPE_HEADER_SLOT: &str = "ferrum/telemetry/@plugin/opa/config/headers/x-api-key";
+const TYPED_HEADER_SLOT: &str = "ferrum/telemetry/@plugin/otel_tracing/config/headers/x-api-key";
+const TYPELESS_HEADER_SLOT: &str = "ferrum/telemetry/@plugin-config/config/headers/x-api-key";
+const RETYPED_HEADER_VALUE: &str = "synthetic-old-type-header-value";
+const UNRELATED_VALUE: &str = "synthetic-unrelated-value";
+
+/// One `telemetry` plugin of `plugin_name` whose `headers.x-api-key` is
+/// `header` (a placeholder, or literal text for an unbrokered leaf).
+fn telemetry_cfg(plugin_name: &str, header: &str) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "telemetry",
+            "namespace": "ferrum",
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "config": {"headers": {"x-api-key": header}}
+        }]
+    }))
+    .unwrap()
+}
+
+fn single_slot_bundle(slot: &str, value: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(slot.to_string(), value.to_string())])
+}
+
+/// A plugin-config slot names the plugin type, so the walk reports the typed
+/// slot, and the credential key and recorded slot kind carry it too.
+#[test]
+fn plugin_config_slots_carry_the_plugin_type() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let cfg = telemetry_cfg("otel_tracing", REQUIRE);
+    let report = report_secrets_with_mode_and_options(
+        &cfg,
+        &BTreeMap::new(),
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].slot, TYPED_HEADER_SLOT);
+    assert_eq!(
+        report.results[0].cred_key,
+        "@plugin/otel_tracing/config/headers/x-api-key"
+    );
+    assert_eq!(report.results[0].status, SlotStatus::MissingRequired);
+    assert_eq!(
+        report.credential_type_for(TYPED_HEADER_SLOT),
+        Some("@plugin")
+    );
+}
+
+/// A plugin that keeps its id and config path but changes type must not
+/// inherit the old type's stored value. The new type's slot is distinct, and
+/// the old type's value, still bound to the id, refuses both walks until it is
+/// retired. The refusal names slots, never the value.
+#[test]
+fn retyped_plugin_refuses_the_previous_types_slot_and_never_resolves_it() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    let bundle = single_slot_bundle(OLD_TYPE_HEADER_SLOT, RETYPED_HEADER_VALUE);
+    let cfg = telemetry_cfg("otel_tracing", REQUIRE);
+
+    let err = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("a plugin type change must not plan clean over the old type's slot")
+    .to_string();
+    assert!(
+        err.contains(OLD_TYPE_HEADER_SLOT),
+        "the refusal must name the old type's slot"
+    );
+    assert!(err.contains("'otel_tracing'"));
+    assert!(err.contains("--allow-credential-slot-remap"));
+    assert!(
+        !err.contains(RETYPED_HEADER_VALUE),
+        "a refusal must never echo bundle values"
+    );
+
+    let mut resolved = cfg.clone();
+    let err = resolve_secrets_with_mode_and_options(
+        &mut resolved,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("resolve must refuse what report refuses");
+    assert!(
+        matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+        "the refusal did not match the expected variant"
+    );
+    assert_eq!(
+        resolved.plugin_configs[0].config["headers"]["x-api-key"], REQUIRE,
+        "a refused resolution must not hand the new plugin type the old value"
+    );
+}
+
+/// Accepting the remap (`plan`, `review`, `--allow-credential-slot-remap`)
+/// reports it, but the old type's value still never reaches the new plugin:
+/// its typed slot has no value, so the leaf stays a placeholder.
+#[test]
+fn accepted_plugin_type_remap_still_never_rebinds_the_old_value() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    for alloc in [REQUIRE, GENERATE] {
+        let bundle = single_slot_bundle(OLD_TYPE_HEADER_SLOT, RETYPED_HEADER_VALUE);
+        let mut cfg = telemetry_cfg("otel_tracing", alloc);
+
+        let report = resolve_secrets_with_mode_and_options(
+            &mut cfg,
+            &bundle,
+            GatewayMode::Api,
+            ResolveOptions::allowing_slot_remap(true),
+        )
+        .expect("an acknowledged remap is reported, not refused");
+
+        assert_eq!(report.slot_remaps.len(), 1);
+        assert!(report.slot_remaps[0].contains(OLD_TYPE_HEADER_SLOT));
+        assert!(!report.slot_remaps[0].contains(RETYPED_HEADER_VALUE));
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].slot, TYPED_HEADER_SLOT);
+        assert_ne!(report.results[0].status, SlotStatus::Resolved);
+        assert_eq!(cfg.plugin_configs[0].config["headers"]["x-api-key"], alloc);
+        let rendered = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !rendered.contains(RETYPED_HEADER_VALUE),
+            "the old type's value must not reach the new plugin"
+        );
+    }
+}
+
+/// The refusal does not depend on the new type brokering anything: changing
+/// the type back later would otherwise resurrect a value nobody reviewed.
+#[test]
+fn retyped_plugin_without_brokered_leaves_still_refuses() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let bundle = single_slot_bundle(OLD_TYPE_HEADER_SLOT, RETYPED_HEADER_VALUE);
+    let cfg = telemetry_cfg("otel_tracing", "literal-header-text");
+
+    let err = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("the old type's slot is still bound to this plugin id");
+    assert!(
+        matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+        "the refusal did not match the expected variant"
+    );
+}
+
+/// The retired type-less encoding names no plugin type, so its value is never
+/// looked up, and a declared plugin with the same id refuses until the value
+/// is reseeded under the typed slot and the old key retired.
+#[test]
+fn typeless_plugin_config_slots_are_refused_and_never_resolved() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    let bundle = single_slot_bundle(TYPELESS_HEADER_SLOT, RETYPED_HEADER_VALUE);
+    let cfg = telemetry_cfg("otel_tracing", REQUIRE);
+
+    let err = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("a type-less slot bound to a declared plugin id must refuse")
+    .to_string();
+    assert!(
+        err.contains(TYPELESS_HEADER_SLOT),
+        "the refusal must name the type-less slot"
+    );
+    assert!(err.contains("type-less"));
+    assert!(
+        !err.contains(RETYPED_HEADER_VALUE),
+        "a refusal must never echo bundle values"
+    );
+
+    let mut resolved = cfg.clone();
+    let report = resolve_secrets_with_mode_and_options(
+        &mut resolved,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::allowing_slot_remap(true),
+    )
+    .expect("an acknowledged remap is reported, not refused");
+    assert_eq!(report.slot_remaps.len(), 1);
+    assert_eq!(report.results[0].status, SlotStatus::MissingRequired);
+    assert_eq!(
+        resolved.plugin_configs[0].config["headers"]["x-api-key"],
+        REQUIRE
+    );
+}
+
+/// A stored type that merely extends the declared name, or a key under the
+/// declared type but outside its `config` tree, is still not one of this
+/// plugin's slots.
+#[test]
+fn plugin_type_identity_matches_whole_components_only() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let cfg = telemetry_cfg("otel_tracing", REQUIRE);
+    for foreign in [
+        "ferrum/telemetry/@plugin/otel_tracing_v2/config/headers/x-api-key",
+        "ferrum/telemetry/@plugin/otel_tracing~1config/headers/x-api-key",
+        "ferrum/telemetry/@plugin/otel_tracing/configx/headers/x-api-key",
+        "ferrum/telemetry/@plugin/otel_tracing/headers/x-api-key",
+        "ferrum/telemetry/@plugin",
+    ] {
+        let bundle = single_slot_bundle(foreign, UNRELATED_VALUE);
+        let err = report_secrets_with_mode_and_options(
+            &cfg,
+            &bundle,
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .expect_err("a slot the declared type does not own must refuse")
+        .to_string();
+        assert!(err.contains(foreign), "the refusal must name the slot");
+    }
+}
+
+/// Steady state: the declared type's own slot resolves, and slots of other
+/// kinds, namespaces or ids that share text with this plugin are not its
+/// slots.
+#[test]
+fn plugin_type_identity_ignores_other_keyspaces() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    const CURRENT: &str = "synthetic-current-type-value";
+    let mut bundle = single_slot_bundle(TYPED_HEADER_SLOT, CURRENT);
+    for neighbour in [
+        "ferrum/telemetry/keyauth/key",
+        "ferrum/telemetry/@service-discovery/consul/token",
+        "ferrum/telemetry-2/@plugin/opa/config/headers/x-api-key",
+        "ferrum/telemetry~1x/@plugin/opa/config/headers/x-api-key",
+        "other/telemetry/@plugin/opa/config/headers/x-api-key",
+        "other/telemetry/@plugin-config/config/headers/x-api-key",
+    ] {
+        bundle.insert(neighbour.to_string(), UNRELATED_VALUE.to_string());
+    }
+    let mut cfg = telemetry_cfg("otel_tracing", REQUIRE);
+
+    let report = resolve_secrets_with_mode_and_options(
+        &mut cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect("only this plugin's own type and id are evidence");
+    assert!(report.slot_remaps.is_empty());
+    assert_eq!(report.results[0].status, SlotStatus::Resolved);
+    assert_eq!(
+        cfg.plugin_configs[0].config["headers"]["x-api-key"],
+        CURRENT
+    );
+}
+
+/// `plugin_name` is one escaped slot component, so a `/` or `~` in the declared
+/// type cannot split the slot or stand in for another component. The typed slot
+/// still resolves its own stored value.
+#[test]
+fn plugin_name_is_escaped_as_one_slot_component() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+
+    const SLASH_TYPE_SLOT: &str = "ferrum/telemetry/@plugin/otel~1tracing/config/headers/x-api-key";
+    const TILDE_TYPE_SLOT: &str = "ferrum/telemetry/@plugin/otel~0tracing/config/headers/x-api-key";
+    const SLASH_TYPE_VALUE: &str = "synthetic-slash-type-value";
+    const TILDE_TYPE_VALUE: &str = "synthetic-tilde-type-value";
+
+    for (plugin_name, slot, value) in [
+        ("otel/tracing", SLASH_TYPE_SLOT, SLASH_TYPE_VALUE),
+        ("otel~tracing", TILDE_TYPE_SLOT, TILDE_TYPE_VALUE),
+    ] {
+        let bundle = single_slot_bundle(slot, value);
+        let mut cfg = telemetry_cfg(plugin_name, REQUIRE);
+        let report = resolve_secrets_with_mode_and_options(
+            &mut cfg,
+            &bundle,
+            GatewayMode::Api,
+            ResolveOptions::default(),
+        )
+        .expect("the escaped declared type is this plugin's own component");
+        assert_eq!(report.results[0].slot, slot);
+        assert_eq!(report.results[0].status, SlotStatus::Resolved);
+        assert_eq!(cfg.plugin_configs[0].config["headers"]["x-api-key"], value);
+    }
+}
+
 // --- Plugin-config endpoint generation (#329) -------------------------------
 
-const LDAP_URL_SLOT: &str = "ferrum/ldap/@plugin-config/config/ldap_url";
+const LDAP_URL_SLOT: &str = "ferrum/ldap/@plugin/ldap_auth/config/ldap_url";
 
 fn ldap_cfg(ldap_url: &str) -> GatewayConfig {
     serde_json::from_value(serde_json::json!({
@@ -3258,7 +3568,7 @@ fn seeded_plugin_endpoint_resolves_regardless_of_allocation_mode() {
         "ldaps://svc:pw@ldap.internal.example:636".to_string(),
     );
     bundle.insert(
-        "ferrum/ldap/@plugin-config/config/service_account_password".to_string(),
+        "ferrum/ldap/@plugin/ldap_auth/config/service_account_password".to_string(),
         "seeded-service-account-password".to_string(),
     );
     let mut cfg = ldap_cfg(GENERATE);
@@ -3377,7 +3687,7 @@ fn rotation_accepts_only_supported_consumer_fields() {
     for key in [
         "@service-discovery/consul/token",
         "@service-discovery/future/token",
-        "@plugin-config/config/api_key",
+        "@plugin/custom/config/api_key",
         "basicauth/[1]/password_hash",
         "basicauth/username",
         "mtls_auth/identity",
@@ -3392,7 +3702,7 @@ fn rotation_accepts_only_supported_consumer_fields() {
     // Plugin allocation via apply remains supported; only Consumer rotation
     // is restricted. A plugin needs its own publication contract to rotate.
     assert!(generate_credential_value_with_mode(
-        "ferrum/plugin/@plugin-config/config/api_key",
+        "ferrum/plugin/@plugin/custom/config/api_key",
         32,
         None,
         &GatewayMode::Api,
@@ -3427,7 +3737,7 @@ async fn allocator_refusals_leave_network_and_shards_untouched() {
         .unwrap();
     for key in [
         "@service-discovery/consul/token",
-        "@plugin-config/config/api_key",
+        "@plugin/custom/config/api_key",
         "basicauth/[1]/password_hash",
         "mtls_auth/identity",
         "jwt/key",

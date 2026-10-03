@@ -321,8 +321,10 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
             );
         }
     });
-    let bundle =
-        r#"{"FERRUM_CREDS_BUNDLE":{"ferrum/shield/@plugin-config/config/mode":"dry_run"}}"#;
+    let bundle = serde_json::json!({
+        "FERRUM_CREDS_BUNDLE": { "ferrum/shield/@plugin/ai_prompt_shield/config/mode": "dry_run" }
+    })
+    .to_string();
     let output = repo.run(
         &["apply", "--auto-approve"],
         &[
@@ -333,7 +335,7 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
                 "FERRUM_ADMIN_JWT_SECRET",
                 "synthetic-admin-secret-at-least-32-bytes",
             ),
-            ("FERRUM_CREDS_JSON", bundle),
+            ("FERRUM_CREDS_JSON", &bundle),
         ],
     );
 
@@ -447,7 +449,7 @@ fn cli_validator_uses_resolution_provenance_for_every_substituted_leaf() {
     let secret = "Kp9Rt2Xq7Ln4Bv6Zs3Mw8Hd5Yj";
     let bundle = format!(
         r#"{{"FERRUM_CREDS_BUNDLE": {{
-        "ferrum/opaque/@plugin-config/config/display_mode": "{secret}"
+        "ferrum/opaque/@plugin/custom_fixture/config/display_mode": "{secret}"
     }}}}"#
     );
     for mode in ["api", "file"] {
@@ -717,7 +719,7 @@ fn file_apply_standins_validate_the_publication_document_not_the_resolved_report
     // placeholder-shaped seed, which is a value (#364).
     let bundle = r#"{"FERRUM_CREDS_BUNDLE": {
         "ferrum/app/jwt/secret": "seeded-short-jwt",
-        "ferrum/ldap/@plugin-config/config/ldap_url": "${gh-env-secret:alloc=require}"
+        "ferrum/ldap/@plugin/ldap_auth/config/ldap_url": "${gh-env-secret:alloc=require}"
     }}"#;
     let repo = Repo::with_files(&[
         ("resources/ferrum/consumers/app.yaml", consumer),
@@ -965,6 +967,66 @@ fn plan_exits_nonzero_on_an_unacknowledged_credential_slot_remap() {
         stdout(&allowed).contains("Accepted via --allow-credential-slot-remap"),
         "{}",
         stdout(&allowed)
+    );
+}
+
+/// A PluginConfig that keeps its id and header path but changes
+/// `plugin_name` from `opa` to `otel_tracing`. Its new typed slot is seeded,
+/// so the only finding is the old type's value still bound to the id.
+const RETYPED: &str = r#"kind: PluginConfig
+spec:
+  id: telemetry
+  plugin_name: otel_tracing
+  scope: global
+  config:
+    headers:
+      x-api-key: "${gh-env-secret:alloc=require}"
+"#;
+
+const RETYPED_OLD_SLOT: &str = "ferrum/telemetry/@plugin/opa/config/headers/x-api-key";
+
+const RETYPED_BUNDLE: &str = r#"{"FERRUM_CREDS_BUNDLE": {
+  "ferrum/telemetry/@plugin/opa/config/headers/x-api-key": "synthetic-old-type-header",
+  "ferrum/telemetry/@plugin/otel_tracing/config/headers/x-api-key": "synthetic-new-type-header"
+}}"#;
+
+#[test]
+fn apply_and_plan_refuse_a_plugin_type_change_over_a_stored_slot() {
+    let repo = Repo::with_files(&[("resources/ferrum/plugins/telemetry.yaml", RETYPED)]);
+    let env = [("FERRUM_CREDS_JSON", RETYPED_BUNDLE)];
+
+    let applied = repo.run(&["apply", "--auto-approve"], &env);
+    assert!(
+        !applied.status.success(),
+        "a plugin type change must not apply while the old type's slot is stored"
+    );
+    let refusal = stderr(&applied);
+    assert!(
+        refusal.contains(RETYPED_OLD_SLOT),
+        "the refusal must name the old type's slot"
+    );
+    assert!(
+        !refusal.contains("synthetic-old-type") && !refusal.contains("synthetic-new-type"),
+        "a refusal must never echo bundle values"
+    );
+    assert!(
+        !repo.published().exists(),
+        "a refused apply must leave the published document untouched"
+    );
+
+    let planned = repo.run(&["plan"], &env);
+    assert!(
+        !planned.status.success(),
+        "plan's verdict must match apply's"
+    );
+    let rendered = stdout(&planned);
+    assert!(
+        rendered.contains("Credential Slot Remaps") && rendered.contains(RETYPED_OLD_SLOT),
+        "the hazard must be rendered in plan output"
+    );
+    assert!(
+        !rendered.contains("synthetic-old-type") && !rendered.contains("synthetic-new-type"),
+        "plan must never echo bundle values"
     );
 }
 
@@ -1614,10 +1676,10 @@ fn rotate_checks_target_generation_before_any_network_or_state_publication() {
             "'platform/app/@service-discovery/consul/token'",
         ),
         (
-            "@plugin-config/config/api_key",
+            "@plugin/custom/config/api_key",
             r#"{"keyauth":[{"key":"${gh-env-secret:alloc=require}"}]}"#,
             "PluginConfig and Upstream slots cannot be published",
-            "'platform/app/@plugin-config/config/api_key'",
+            "'platform/app/@plugin/custom/config/api_key'",
         ),
         (
             "basicauth/password_hash",

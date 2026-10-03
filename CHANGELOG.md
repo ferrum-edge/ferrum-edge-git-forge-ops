@@ -121,6 +121,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `TIMEOUT`, never a pass. Both `Verify traffic` steps in `apply-on-merge.yml`
   carry a step-level `timeout-minutes: 20` backstop; a step timeout fails only
   the step, so the ledger commit still runs.
+- Plugin-config credential slots now include the plugin type:
+  `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>` replaces
+  `<ns>/<plugin-id>/@plugin-config/config/<path>`. A plugin that keeps its id
+  and config path but changes `plugin_name` no longer resolves the previous
+  type's stored secret. While the bundle still holds a slot of another type
+  under that id, the change is a credential slot remap: `apply` and
+  `export --materialize` refuse, and `plan` and `review` report it as
+  blocking. `rotate` publishes Consumers only and never resolves a plugin
+  config, so it is unaffected. Bundle keys in the old type-less form are never
+  looked up.
+  A declared plugin with the same id refuses on them until each value is
+  reseeded under its typed slot (only if it was issued for that type) and the
+  old key is removed. Import, diff and review masking, validator stand-ins and
+  output scrubbing use the typed slot (GHSA-j6xj-prxm-wp2q).
 - `rotate.yml` binds a queued rotation to the revision it was dispatched from.
   After taking the shared `ferrum-apply-<env>` lock and refreshing onto the
   current head of `main`, its freshness guard now also runs the
@@ -160,3 +174,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `apply` evaluates policy before the state lock on the unresolved document,
   as the security audit sees it, and checks again after API credential
   resolution (GHSA-92v7-rq7m-pxfq).
+- Neutralize both GitHub Actions workflow-command syntaxes in terminal output.
+  Fenced validator diagnostics and resource IDs could reach stdout with `::`
+  at the start of a line or the legacy `##[command]` form anywhere in a line,
+  letting resource data forge annotations, add masks, fold logs, or suppress
+  later output with `stop-commands`. Shared diagnostic sanitization now breaks
+  both forms for validate, plan, apply and review terminal output, while the
+  Markdown sent to the GitHub comment and step summary keeps readable text
+  (GHSA-955f-64c5-hvfx).

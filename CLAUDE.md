@@ -69,8 +69,8 @@ Global flags:
 - `--env <name>` selects an environment from `.gitforgeops/config.yaml`.
   Fallbacks: `FERRUM_ENV`, then the only entry or `default_environment`.
 - `--allow-credential-slot-remap` downgrades the credential slot-remap refusal
-  (array shrink, dropped credential type, deleted Consumer, revived slot) to a
-  report. See [Credential slot remaps](#credential-slot-remaps).
+  (array shrink, dropped credential type, deleted Consumer, revived slot,
+  plugin type change) to a report. See [Credential slot remaps](#credential-slot-remaps).
 - `--allow-empty-namespace` demotes the empty-selection refusal (a
   `FERRUM_NAMESPACE` that selects zero desired resources while the tree is
   non-empty) from an error to a warning in `validate`, `plan`, `diff` and
@@ -1310,6 +1310,12 @@ consequences by evidence:
   `[N]` for every entry (no index-0 elision), so only a stored index at or past
   the array length is a remap. Remedy: reseed the bundle (`rotate` is
   Consumer-only).
+- **Plugin type change**: `PluginWalk::check_type_slot_identity` runs for
+  every declared plugin in both walks. A bundle key under the same `ns/id`
+  with another `@plugin/<type>/…`, anything under its own type outside
+  `config`, or the retired type-less `@plugin-config/…` kind is a remap. The
+  value is never resolved even when accepted. Remedy: seed the new type's
+  slots, remove the old keys.
 
 The bundle-update procedure for an intentional shrink: rotation replaces a value
 at its current slot but does not remove that bundle key. Before shrinking or
@@ -1333,8 +1339,12 @@ literal.
 Two more places hold brokered secrets, each with a reserved slot kind (the `@`
 prefix keeps them out of the credential-type keyspace):
 
-- `PluginConfig.config` → `<ns>/<plugin-id>/@plugin-config/config/<path>`,
-  classified by `src/secrets/plugin_config.rs`.
+- `PluginConfig.config` → `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>`,
+  classified by `src/secrets/plugin_config.rs`. The plugin type is part of the
+  identity (`resolver::plugin_config_slot`, the one builder for import capture,
+  both walks, diff masking, stand-ins and scrubbing), so a retyped plugin
+  never resolves the old type's values. Never add the retired type-less
+  `@plugin-config/config/…` form to any lookup.
 - `Upstream.service_discovery` → `<ns>/<upstream-id>/@service-discovery/<path>`
   (e.g. `ferrum/orders/@service-discovery/consul/token`). Modeled secret leaves
   live in one table, `src/secrets/service_discovery.rs::SD_SECRET_FIELDS`, read

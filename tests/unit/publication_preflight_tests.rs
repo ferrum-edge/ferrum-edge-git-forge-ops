@@ -433,7 +433,7 @@ environments:
         expect_status: 200
         headers:
           Authorization:
-            slot: ferrum/upstream-auth/@plugin-config/config/token
+            slot: ferrum/upstream-auth/@plugin/http_logging/config/token
 "#;
 
 const SMOKE_VALID: &str = r#"version: 1

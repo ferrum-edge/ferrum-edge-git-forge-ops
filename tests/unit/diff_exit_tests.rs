@@ -360,7 +360,7 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                         "synthetic-hash-value-0001".into(),
                     );
                     slots.insert(
-                        "ferrum/otel/@plugin-config/config/authorization".into(),
+                        "ferrum/otel/@plugin/otel_tracing/config/authorization".into(),
                         "synthetic-bearer-0001".into(),
                     );
                 }
@@ -477,12 +477,12 @@ fn resolved_placeholder_shaped_values_remain_authoritative_in_cli_comparisons() 
         (
             "plugin_configs",
             "/config/authorization",
-            "@plugin-config/config/authorization",
+            "@plugin/otel_tracing/config/authorization",
         ),
         (
             "plugin_configs",
             "/config/headers/0/api~1key~0[1]",
-            "@plugin-config/config/headers/[0]/api~1key~0~21]",
+            "@plugin/otel_tracing/config/headers/[0]/api~1key~0~21]",
         ),
         (
             "upstreams",
@@ -1645,7 +1645,7 @@ fn a_bundle_resolved_placeholder_stays_uncompared() {
         &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
         vec![("ferrum".to_string(), plugin_export(live))],
     );
-    let slot = "ferrum/otel/@plugin-config/config/service_label";
+    let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
     let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: "resolved-label-0001" } });
     let bundle = bundle.to_string();
     let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
