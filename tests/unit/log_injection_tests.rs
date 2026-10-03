@@ -118,7 +118,10 @@ fn review_terminal_output_neutralizes_fenced_workflow_commands() {
         "hostile workflow command reached the terminal verbatim:\n{terminal}"
     );
     // Neutralized means prefixed, not dropped: the diagnostic stays readable.
-    assert!(terminal.contains("::error::forged annotation"), "{terminal}");
+    assert!(
+        terminal.contains("::error::forged annotation"),
+        "{terminal}"
+    );
     assert!(terminal.contains("ordinary diagnostic"), "{terminal}");
 }
 
