@@ -11,7 +11,8 @@ use crate::diff::resource_diff::{
     DiffAction, DiffOptions, DiffResult, OwnershipScope, ResourceDiff, SpecOwnedResource,
 };
 use crate::http_client::{
-    self, AdminClient, BackupExtras, BatchCreate, DeleteOutcome, BATCH_MAX_BODY_BYTES,
+    self, AdminClient, BackupExtras, BatchCreate, ConditionalUpdate, DeleteOutcome,
+    BATCH_MAX_BODY_BYTES,
 };
 
 /// A single per-resource operation that completed successfully against the
@@ -373,7 +374,7 @@ pub async fn preflight_api_apply(
     extras_by_namespace: Option<&BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
 ) -> crate::error::Result<BlockedNamespaces> {
-    let blocked = apply_blocked_namespaces(
+    let prepared = prepare_apply(
         desired,
         client,
         namespaces,
@@ -384,7 +385,90 @@ pub async fn preflight_api_apply(
     )
     .await?;
     preflight_writes(client).await?;
-    Ok(blocked)
+    if matches!(options.strategy, ApplyStrategy::Incremental) {
+        let targets = overwrite_targets(desired, namespaces, ownership_scope, &prepared, options)?;
+        if let Some(refusal) = conditional_write_refusal(client, &targets).await {
+            return Err(crate::error::Error::ConditionalWriteUnavailable(refusal));
+        }
+    }
+    Ok(prepared.blocked)
+}
+
+/// Most rows [`conditional_write_refusal`] reads.
+const CONDITIONAL_WRITE_PROBES: usize = 3;
+
+/// Learn, before any write, whether the gateway issues the strong `ETag`
+/// every incremental overwrite needs; `Some(refusal)` when it issues none.
+///
+/// Every overwrite is conditional (see [`Preconditions`]), and a gateway older
+/// than Ferrum Edge v0.9.10 issues no tag, so without this it would be found
+/// only at the first overwrite, after earlier creates had landed. One read of a
+/// row the run will overwrite settles it. `targets` are `(namespace, kind, id)`;
+/// a row gone since the plan, or a read that fails, settles nothing, so the
+/// next target is tried, and every write still checks for itself.
+async fn conditional_write_refusal(
+    client: &AdminClient,
+    targets: &[(String, String, String)],
+) -> Option<String> {
+    for (namespace, kind, id) in targets.iter().take(CONDITIONAL_WRITE_PROBES) {
+        match client.get_tagged(kind, id, namespace).await {
+            Ok(Some(_)) => return None,
+            Err(error @ crate::error::Error::ConditionalWriteUnavailable(_)) => {
+                return Some(error.to_string());
+            }
+            Ok(None) | Err(_) => {}
+        }
+    }
+    None
+}
+
+/// The first row each unrefused namespace will overwrite, as
+/// `(namespace, kind, id)`: a Modify, Delete or pending-create assertion, or,
+/// in shared mode, an adoption claim.
+fn overwrite_targets(
+    desired: &GatewayConfig,
+    namespaces: &[String],
+    ownership_scope: OwnershipScope<'_>,
+    prepared: &PreparedApply<'_>,
+    options: &ApplyOptions,
+) -> crate::error::Result<Vec<(String, String, String)>> {
+    let mut targets = Vec::new();
+    for namespace in namespaces {
+        if prepared.blocked.contains_key(namespace) {
+            continue;
+        }
+        let Some(actual) = prepared.actuals.get(namespace) else {
+            continue;
+        };
+        let desired = crate::config::filter_config_by_namespace(desired, namespace);
+        let diff_options = DiffOptions {
+            prune_spec_owned: options.confirm_api_spec_deletion,
+        };
+        let result = compute_diff_with_options(&desired, actual, ownership_scope, diff_options)?;
+        let pending = &options.pending_create_assertions;
+        let assertions = pending_create_assertion_diffs(&desired, actual, pending, namespace)?;
+        let mut overwrite = result
+            .diffs
+            .iter()
+            .chain(&assertions)
+            .find(|diff| diff.action != DiffAction::Add)
+            .map(|diff| (diff.kind.clone(), diff.id.clone()));
+        if overwrite.is_none() && matches!(ownership_scope, OwnershipScope::Shared { .. }) {
+            let handled: BTreeSet<String> = result
+                .diffs
+                .iter()
+                .map(|diff| state_key(&diff.namespace, &diff.kind, &diff.id))
+                .chain(pending.iter().cloned())
+                .collect();
+            let candidates =
+                adoption_candidates(&desired, actual, &options.managed_ledger, &handled)?;
+            overwrite = candidates.into_iter().next().map(|row| (row.kind, row.id));
+        }
+        if let Some((kind, id)) = overwrite {
+            targets.push((namespace.clone(), kind, id));
+        }
+    }
+    Ok(targets)
 }
 
 /// The per-namespace refusals an apply with these inputs would report, without
@@ -1693,6 +1777,11 @@ async fn apply_incremental(
             match batched {
                 Ok(Some(batched)) => {
                     writes_failed |= !batched.errors.is_empty();
+                    for op in &batched.applied_incremental {
+                        if op.kind == "PluginConfig" {
+                            preconditions.note_plugin_write(&op.id);
+                        }
+                    }
                     for pending in &attempt {
                         if pending.kind == "PluginConfig"
                             && !batched
@@ -1855,6 +1944,7 @@ async fn apply_incremental(
             }
             Ok(op) => {
                 if diff.kind == "PluginConfig" && diff.action != DiffAction::Delete {
+                    preconditions.note_plugin_write(&diff.id);
                     for plugin in actual
                         .plugin_configs
                         .iter()
@@ -2088,10 +2178,12 @@ fn partition_cyclic_creates(
 /// pending row still needs its explicit ownership assertion.
 ///
 /// That read is also the proxy's precondition (see [`Preconditions`]): a proxy
-/// an API spec claimed since the plan is refused, and so is one whose fields
-/// other than `plugins` changed. The associations are excluded because the
-/// gateway rewrites them itself when this run creates, retargets or removes a
-/// scoped plugin. The update is sent with `If-Match` on that read.
+/// an API spec claimed since the plan is refused, and so is one that changed in
+/// any other way. Only the associations to plugin configs this run wrote are
+/// left out of the comparison, because the gateway rewrites those itself. An
+/// association to any other plugin that appeared or vanished since the plan is
+/// a concurrent change, which the repository's association list must not
+/// revert. The update is sent with `If-Match` on that read.
 async fn update_proxy_after_plugins(
     proxy: &Proxy,
     preconditions: &Preconditions<'_>,
@@ -2114,19 +2206,19 @@ async fn update_proxy_after_plugins(
             proxy.id
         )));
     }
-    let key = state_key(namespace, "Proxy", &proxy.id);
     let observed = observed_row("Proxy", None, &live)?;
-    if let Some(reason) = stale_reason(preconditions.planned.get(&key), &observed, &["plugins"]) {
-        return Err(crate::error::Error::StalePlan(reason));
-    }
+    preconditions
+        .confirm_content("Proxy", &proxy.id, &observed)
+        .await?;
+    let key = state_key(namespace, "Proxy", &proxy.id);
     let needs_assertion = options.pending_create_assertions.contains(&key)
         || matches!(ownership_scope, OwnershipScope::Shared { .. })
             && !options.managed_ledger.contains(&key);
     if !needs_assertion && compare_fields("Proxy", proxy, &live).is_empty() {
         return Ok(OpOutcome::Unchanged);
     }
-    client
-        .update_if_match("Proxy", &proxy.id, proxy, namespace, &tagged.etag)
+    CreateResource::Proxy(proxy)
+        .update_if_match(client, namespace, &tagged.etag)
         .await
         .map(applied)
 }
@@ -2134,6 +2226,10 @@ async fn update_proxy_after_plugins(
 /// Why a planned overwrite was withheld because its row changed after the plan.
 const STALE_PLAN_CHANGED: &str =
     "not sent: the live row changed after this run planned the write, so sending it would overwrite a concurrent change. Re-run apply to plan against the current gateway";
+
+fn stale_plan_changed() -> crate::error::Error {
+    crate::error::Error::StalePlan(STALE_PLAN_CHANGED.to_string())
+}
 
 /// Why a planned overwrite was withheld because its row lost or changed its
 /// API-spec owner after the plan.
@@ -2157,7 +2253,8 @@ const STALE_PLAN_GONE: &str =
 ///    strong `ETag` for the stored representation;
 /// 2. refuses the write (as [`crate::error::Error::StalePlan`]) when that row
 ///    gained, lost or changed its `api_spec_id`, or changed in any field other
-///    than server timestamps, since the plan; and
+///    than server timestamps, since the plan (see
+///    [`Preconditions::confirm_content`]); and
 /// 3. sends the write with `If-Match: <etag>`. Edge compares the tag and
 ///    commits under one namespace admission lease that every admin writer
 ///    takes, so a change after the read is refused with `412` (also
@@ -2168,11 +2265,11 @@ const STALE_PLAN_GONE: &str =
 /// refused. A row served from cache, or one without a strong `ETag`, stops the
 /// run: no write to it can be made conditional.
 ///
-/// Consumers need one more read. Edge redacts consumer credentials on a
+/// Consumers always take one more read. Edge redacts consumer credentials on a
 /// single-resource `GET`, although its tag covers them, so the read cannot show
 /// that the credentials still match the plan. Every consumer the namespace
 /// will overwrite is therefore read first, then one `/backup` (which carries
-/// the credentials) is read after all of them: a change before a consumer's
+/// the credentials) is compared with the plan: a change before a consumer's
 /// read shows in the backup, and a change after it fails the `If-Match`.
 struct Preconditions<'a> {
     client: &'a AdminClient,
@@ -2184,6 +2281,10 @@ struct Preconditions<'a> {
     /// Filled by the first consumer overwrite. `Err` when the backup read
     /// failed, which refuses every consumer overwrite in the namespace.
     consumers: Option<Result<HashMap<String, ConsumerPrecondition>, String>>,
+    /// PluginConfigs this run created or updated in the namespace. The gateway
+    /// rewrites proxy associations to them itself, so a proxy comparison
+    /// leaves those associations, and only those, out.
+    written_plugins: BTreeSet<String>,
 }
 
 /// What the consumer reads decided for one consumer.
@@ -2220,7 +2321,13 @@ impl<'a> Preconditions<'a> {
             planned: observe_rows(planned)?,
             consumer_targets,
             consumers: None,
+            written_plugins: BTreeSet::new(),
         })
+    }
+
+    /// Record a PluginConfig this run created or updated.
+    fn note_plugin_write(&mut self, id: &str) {
+        self.written_plugins.insert(id.to_string());
     }
 
     /// Send the planned update of `resource` conditionally.
@@ -2267,11 +2374,65 @@ impl<'a> Preconditions<'a> {
         if update {
             refuse_dropped_field(dropped)?;
         }
-        let planned = self.planned.get(&state_key(self.namespace, kind, id));
-        match stale_reason(planned, &live, &[]) {
-            Some(reason) => Err(crate::error::Error::StalePlan(reason)),
-            None => Ok(Some(tagged.etag)),
+        self.confirm_content(kind, id, &live).await?;
+        Ok(Some(tagged.etag))
+    }
+
+    /// Prove that `live`, from a single-resource read, is still the row the
+    /// plan judged; otherwise [`crate::error::Error::StalePlan`].
+    ///
+    /// The owner must match. The content is compared with the read first and,
+    /// only when that differs, with one `/backup` taken after the read. The
+    /// plan came from `/backup`, which Ferrum Edge normalizes on load, while
+    /// the read returns the row as stored, so a row stored before a
+    /// normalization rule existed reads differently without having changed.
+    /// The later backup shows any change made before it in the plan's own
+    /// form, and the `If-Match` write refuses any change made after the read.
+    async fn confirm_content(
+        &self,
+        kind: &str,
+        id: &str,
+        live: &ObservedRow,
+    ) -> crate::error::Result<()> {
+        let key = state_key(self.namespace, kind, id);
+        let planned = self.planned.get(&key);
+        if let Some(reason) = ownership_refusal(planned, live) {
+            return Err(crate::error::Error::StalePlan(reason));
         }
+        if self.content_matches(kind, planned, live) {
+            return Ok(());
+        }
+        let snapshot = self
+            .client
+            .get_backup_snapshot_for_mutation(self.namespace)
+            .await?;
+        ensure_authoritative_view(self.client)?;
+        let confirmed = observe_rows(&snapshot.config)?;
+        let Some(row) = confirmed.get(&key) else {
+            return Err(stale_plan_changed());
+        };
+        if let Some(reason) = ownership_refusal(planned, row) {
+            return Err(crate::error::Error::StalePlan(reason));
+        }
+        if self.content_matches(kind, planned, row) {
+            return Ok(());
+        }
+        Err(stale_plan_changed())
+    }
+
+    /// Content equality apart from server timestamps and, for a proxy, the
+    /// associations to plugin configs this run wrote.
+    fn content_matches(
+        &self,
+        kind: &str,
+        planned: Option<&ObservedRow>,
+        live: &ObservedRow,
+    ) -> bool {
+        planned.is_some_and(|planned| {
+            let written = &self.written_plugins;
+            without_written_associations(kind, &planned.value, written)
+                == without_written_associations(kind, &live.value, written)
+        })
     }
 
     async fn confirm_consumer(
@@ -2350,6 +2511,10 @@ impl<'a> Preconditions<'a> {
 }
 
 /// Decide one consumer from its tagged read and the backup read after it.
+///
+/// Only the backup is compared with the plan: it is in the plan's own form,
+/// carries the credentials the tagged read redacts, and was taken after that
+/// read, so it shows every change the tag does not already fence.
 fn consumer_precondition(
     planned: Option<&ObservedRow>,
     confirmed: Option<&ObservedRow>,
@@ -2365,23 +2530,18 @@ fn consumer_precondition(
             ));
         }
     };
-    // The backup row carries the credentials the tagged read redacts.
     let Some(confirmed) = confirmed else {
         return ConsumerPrecondition::Stale(STALE_PLAN_CHANGED.to_string());
     };
-    if let Some(reason) = stale_reason(planned, confirmed, &[]) {
+    if let Some(reason) = stale_reason(planned, confirmed) {
         return ConsumerPrecondition::Stale(reason);
     }
-    let (live, dropped) = match observe_body("Consumer", &tagged.body) {
-        Ok(observed) => observed,
-        Err(error) => return ConsumerPrecondition::Failed(format!("not sent: {error}")),
-    };
-    match stale_reason(planned, &live, &["credentials"]) {
-        Some(reason) => ConsumerPrecondition::Stale(reason),
-        None => ConsumerPrecondition::Ready {
+    match observe_body("Consumer", &tagged.body) {
+        Ok((_, dropped)) => ConsumerPrecondition::Ready {
             etag: tagged.etag,
             dropped,
         },
+        Err(error) => ConsumerPrecondition::Failed(format!("not sent: {error}")),
     }
 }
 
@@ -2393,29 +2553,54 @@ struct ObservedRow {
     value: serde_json::Value,
 }
 
-/// `Some(reason)` when `live` is not the row the plan judged.
-///
-/// `ignored` top-level keys are left out of the content comparison: the proxy
-/// associations this run's own plugin writes rewrote, or the consumer
-/// credentials a single-resource read redacts.
-fn stale_reason(
-    planned: Option<&ObservedRow>,
-    live: &ObservedRow,
-    ignored: &[&str],
-) -> Option<String> {
-    let Some(planned) = planned else {
-        return Some(STALE_PLAN_CHANGED.to_string());
-    };
-    if planned.api_spec_id != live.api_spec_id {
-        return Some(match &live.api_spec_id {
-            Some(spec) => format!(
-                "not sent: the live row became owned by API spec `{spec}` after this run planned the write. Re-run apply to plan against the current gateway"
-            ),
-            None => STALE_PLAN_OWNERSHIP.to_string(),
+/// `Some(reason)` when `live` is not the row the plan judged, by owner or by
+/// content apart from server timestamps.
+fn stale_reason(planned: Option<&ObservedRow>, live: &ObservedRow) -> Option<String> {
+    if let Some(reason) = ownership_refusal(planned, live) {
+        return Some(reason);
+    }
+    let unchanged = planned.is_some_and(|planned| planned.value == live.value);
+    (!unchanged).then(|| STALE_PLAN_CHANGED.to_string())
+}
+
+/// `Some(reason)` when `live` gained, lost or changed its `api_spec_id`
+/// since the plan.
+fn ownership_refusal(planned: Option<&ObservedRow>, live: &ObservedRow) -> Option<String> {
+    let planned_owner = planned.and_then(|row| row.api_spec_id.as_deref());
+    if planned_owner == live.api_spec_id.as_deref() {
+        return None;
+    }
+    Some(match &live.api_spec_id {
+        Some(spec) => format!(
+            "not sent: the live row became owned by API spec `{spec}` after this run planned the write. Re-run apply to plan against the current gateway"
+        ),
+        None => STALE_PLAN_OWNERSHIP.to_string(),
+    })
+}
+
+/// A proxy comparison value without its associations to `written` plugin
+/// configs. Any other kind is returned unchanged.
+fn without_written_associations(
+    kind: &str,
+    value: &serde_json::Value,
+    written: &BTreeSet<String>,
+) -> serde_json::Value {
+    let mut value = value.clone();
+    if kind != "Proxy" {
+        return value;
+    }
+    if let Some(associations) = value
+        .get_mut("plugins")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        associations.retain(|association| {
+            association
+                .get("plugin_config_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|id| !written.contains(id))
         });
     }
-    let unchanged = without_keys(&planned.value, ignored) == without_keys(&live.value, ignored);
-    (!unchanged).then(|| STALE_PLAN_CHANGED.to_string())
+    value
 }
 
 /// `row` as an [`ObservedRow`].
@@ -3071,11 +3256,33 @@ impl<'a> CreateResource<'a> {
         etag: &str,
     ) -> crate::error::Result<()> {
         let (kind, id) = (self.kind(), self.id());
-        match self {
+        let outcome = match self {
             Self::Proxy(row) => client.update_if_match(kind, id, row, namespace, etag).await,
             Self::Consumer(row) => client.update_if_match(kind, id, row, namespace, etag).await,
             Self::Upstream(row) => client.update_if_match(kind, id, row, namespace, etag).await,
             Self::PluginConfig(row) => client.update_if_match(kind, id, row, namespace, etag).await,
+        };
+        let refusal = match outcome? {
+            ConditionalUpdate::Applied => return Ok(()),
+            ConditionalUpdate::Refused(refusal) => refusal,
+        };
+        if refusal.after_retry && self.wrote_itself(client, namespace).await {
+            return Ok(());
+        }
+        Err(crate::error::Error::StalePlan(refusal.message))
+    }
+
+    /// After a `412` that followed a retried attempt: does the row now carry
+    /// what this run sent, unowned? Then that earlier attempt committed this
+    /// write, and the `412` only refused its replay. Consumers never qualify:
+    /// their read redacts the credentials that would have to match.
+    async fn wrote_itself(self, client: &AdminClient, namespace: &str) -> bool {
+        if matches!(self, Self::Consumer(_)) {
+            return false;
+        }
+        match client.get_tagged(self.kind(), self.id(), namespace).await {
+            Ok(Some(tagged)) => self.tagged_row_is(&tagged.body, false),
+            _ => false,
         }
     }
 

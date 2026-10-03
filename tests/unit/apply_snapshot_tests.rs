@@ -34,27 +34,33 @@ const ALL_KINDS: [Kind; 4] = [
 ];
 
 /// `(needle, status, body, headers)`. The first route whose needle appears
-/// anywhere in a request answers it; any other request gets `200 {}`.
+/// anywhere in a request answers it; any other request gets `200 {}`. A needle
+/// starting with [`ONCE`] answers only the first request it matches, so a
+/// later route with the same needle answers the rest.
 type RecordingRoute = (String, u16, String, Vec<(String, String)>);
+
+/// Prefix for a route that answers one request only.
+const ONCE: &str = "once:";
 
 fn spawn_recording_gateway(routes: Vec<RecordingRoute>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let thread_requests = Arc::clone(&requests);
+    let spent = Arc::new(Mutex::new(HashSet::new()));
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
             let routes = routes.clone();
             let requests = Arc::clone(&thread_requests);
+            let spent = Arc::clone(&spent);
             std::thread::spawn(move || loop {
                 let request = match read_request(&mut stream) {
                     Some(request) => request,
                     None => return,
                 };
                 requests.lock().unwrap().push(request.clone());
-                let (status, body, headers) = routes
-                    .iter()
-                    .find(|(needle, _, _, _)| request.contains(needle))
+                let route = route_for(&routes, &mut spent.lock().unwrap(), &request);
+                let (status, body, headers) = route
                     .map(|(_, status, body, headers)| (*status, body.as_str(), headers.as_slice()))
                     .unwrap_or((200, "{}", &[]));
                 let headers = headers
@@ -75,6 +81,28 @@ fn spawn_recording_gateway(routes: Vec<RecordingRoute>) -> (String, Arc<Mutex<Ve
         }
     });
     (format!("http://{addr}"), requests)
+}
+
+/// The route that answers `request`. See [`RecordingRoute`].
+fn route_for<'r>(
+    routes: &'r [RecordingRoute],
+    spent: &mut HashSet<usize>,
+    request: &str,
+) -> Option<&'r RecordingRoute> {
+    for (index, route) in routes.iter().enumerate() {
+        let (needle, once) = match route.0.strip_prefix(ONCE) {
+            Some(needle) => (needle, true),
+            None => (route.0.as_str(), false),
+        };
+        if !request.contains(needle) || (once && spent.contains(&index)) {
+            continue;
+        }
+        if once {
+            spent.insert(index);
+        }
+        return Some(route);
+    }
+    None
 }
 
 fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
@@ -107,11 +135,15 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
 }
 
 fn client(url: String) -> AdminClient {
+    client_with_retries(url, 0)
+}
+
+fn client_with_retries(url: String, gateway_max_retries: u32) -> AdminClient {
     let env = EnvConfig {
         gateway_url: Some(url),
         admin_jwt_secret: Some("test-secret-must-be-32-chars-long".to_string()),
         gateway_mode: GatewayMode::Api,
-        gateway_max_retries: 0,
+        gateway_max_retries,
         ..EnvConfig::default()
     };
     AdminClient::new_scoped(&env, [NS]).unwrap()
@@ -955,7 +987,9 @@ async fn a_post_plugin_proxy_update_is_confirmed_outside_its_associations() {
         assert_eq!(run.count("GET /proxies/p1 "), 1, "concurrent={concurrent}");
         let plugin_write = run.position("POST /plugins/config");
         assert!(plugin_write < run.position("GET /proxies/p1 "));
-        assert_eq!(run.backup_reads(), 0, "concurrent={concurrent}");
+        // A read that disagrees with the plan is settled by one backup read.
+        let backups = usize::from(concurrent);
+        assert_eq!(run.backup_reads(), backups, "concurrent={concurrent}");
     }
 }
 
@@ -1008,4 +1042,244 @@ fn only_one_strong_entity_tag_can_make_a_write_conditional() {
     ] {
         assert_eq!(strong_entity_tag(raw), None, "{raw:?}");
     }
+}
+
+/// Proxies `id → associated plugin ids`, plus proxy-scoped plugins
+/// `id → proxy`, as one document.
+fn graph(proxies: &[(&str, &[&str])], plugins: &[(&str, &str)]) -> GatewayConfig {
+    let proxies: Vec<serde_json::Value> = proxies
+        .iter()
+        .map(|(id, associated)| {
+            let plugins: Vec<serde_json::Value> = associated
+                .iter()
+                .map(|plugin| serde_json::json!({"plugin_config_id": plugin}))
+                .collect();
+            serde_json::json!({
+                "id": id,
+                "namespace": NS,
+                "backend_host": "127.0.0.1",
+                "backend_port": 1,
+                "listen_path": format!("/{id}"),
+                "plugins": plugins,
+            })
+        })
+        .collect();
+    let plugin_configs: Vec<serde_json::Value> = plugins
+        .iter()
+        .map(|(id, proxy)| {
+            serde_json::json!({
+                "id": id,
+                "namespace": NS,
+                "plugin_name": "cors",
+                "config": {},
+                "scope": "proxy",
+                "proxy_id": proxy,
+            })
+        })
+        .collect();
+    let document = serde_json::json!({"proxies": proxies, "plugin_configs": plugin_configs});
+    serde_json::from_value(document).unwrap()
+}
+
+#[tokio::test]
+async fn a_post_plugin_proxy_update_does_not_detach_a_concurrently_attached_plugin() {
+    // `pc1` is this run's; `audit` was attached by someone else after the
+    // plan. Only the association this run wrote may differ from the plan.
+    let planned = graph(&[("p1", &[]), ("p2", &[])], &[("audit", "p2")]);
+    let desired = graph(
+        &[("p1", &["pc1"]), ("p2", &[])],
+        &[("audit", "p2"), ("pc1", "p1")],
+    );
+    let live = graph(&[("p1", &["pc1", "audit"]), ("p2", &[])], &[]);
+    let routes = vec![
+        health(),
+        tagged(Kind::Proxy, "p1", &live, TAG),
+        backup(&live),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert_eq!(run.mutations(), ["POST /plugins/config HTTP/1.1"]);
+    let errors = &run.result.errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_starts(errors, 0, "Proxy p1 update");
+    assert!(errors[0].contains(CHANGED), "{errors:?}");
+}
+
+#[tokio::test]
+async fn moving_a_scoped_plugin_off_a_proxy_and_deleting_that_proxy_is_one_apply() {
+    // `move` goes from `old` to `new`, and `old` is deleted, in one commit. The
+    // gateway detaches `move` from `old` when the plugin is retargeted, so the
+    // delete's read no longer shows that association: this run wrote it.
+    let planned = graph(&[("new", &[]), ("old", &["move"])], &[("move", "old")]);
+    let desired = graph(&[("new", &["move"])], &[("move", "new")]);
+    let after = graph(&[("new", &["move"]), ("old", &[])], &[("move", "new")]);
+    let routes = vec![
+        health(),
+        tagged(Kind::PluginConfig, "move", &planned, "\"move-tag\""),
+        tagged(Kind::Proxy, "new", &after, "\"new-tag\""),
+        tagged(Kind::Proxy, "old", &after, "\"old-tag\""),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+    assert_eq!(
+        run.mutations(),
+        [
+            "PUT /plugins/config/move HTTP/1.1",
+            "DELETE /proxies/old?cleanup_orphaned_upstream=false HTTP/1.1",
+        ]
+    );
+    let sent = run.request("DELETE /proxies/old");
+    assert!(sent.contains("if-match: \"old-tag\"\r\n"), "{sent}");
+    assert_eq!(run.backup_reads(), 0);
+}
+
+#[tokio::test]
+async fn a_row_stored_unnormalized_is_written_once_a_backup_confirms_the_plan() {
+    // The plan comes from `/backup`, which Ferrum Edge normalizes on load; the
+    // single-row read returns the row as stored. A difference the backup does
+    // not show is representation, not a concurrent change.
+    for kind in [Kind::Upstream, Kind::PluginConfig, Kind::Proxy] {
+        for (backup_version, written) in [(1, true), (3, false)] {
+            let context = format!("{kind:?} backup_version={backup_version}");
+            let planned = document(kind, "r1", None, 1);
+            let stored = document(kind, "r1", None, 9);
+            let routes = vec![
+                health(),
+                tagged(kind, "r1", &stored, TAG),
+                backup(&document(kind, "r1", None, backup_version)),
+            ];
+
+            let run = apply_exclusive(&document(kind, "r1", None, 2), planned, routes).await;
+
+            let read = format!("GET {}/r1 ", kind.path());
+            let backup_read = run.position("GET /backup ");
+            assert!(run.position(&read) < backup_read, "{context}");
+            if written {
+                assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+                let write = format!("PUT {}/r1", kind.path());
+                let sent = run.request(&write);
+                assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+            } else {
+                assert_refused(&run, CHANGED, &context);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_412_after_a_retried_put_that_landed_counts_as_applied() {
+    // The first attempt reached the gateway and committed; its response was
+    // lost to a 503, and the replay's If-Match no longer matches. The row now
+    // carrying exactly what this run sent proves the write landed.
+    let planned = document(Kind::Upstream, "u1", None, 1);
+    let desired = document(Kind::Upstream, "u1", None, 2);
+    for (reread_version, applied) in [(2, true), (3, false)] {
+        let context = format!("reread_version={reread_version}");
+        let reread = document(Kind::Upstream, "u1", None, reread_version);
+        let mut routes = vec![health()];
+        let first_read = tagged(Kind::Upstream, "u1", &planned, TAG);
+        routes.push((
+            format!("{ONCE}{}", first_read.0),
+            200,
+            first_read.2,
+            first_read.3,
+        ));
+        routes.push(tagged(Kind::Upstream, "u1", &reread, "\"after\""));
+        let lost = format!("{ONCE}PUT /upstreams/u1");
+        routes.push((lost, 503, "{}".into(), vec![]));
+        routes.push(("PUT /upstreams/u1".into(), 412, "{}".into(), vec![]));
+        let (url, requests) = spawn_recording_gateway(routes);
+
+        let result = apply_api(
+            &desired,
+            &client_with_retries(url, 1),
+            &[NS.to_string()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([(NS.to_string(), planned.clone())])),
+            Some(&BTreeMap::from([(NS.to_string(), BackupExtras::default())])),
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let puts = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("PUT /upstreams/u1"))
+            .count();
+        assert_eq!(puts, 2, "{context}");
+        if applied {
+            assert!(result.errors.is_empty(), "{context}: {:?}", result.errors);
+            assert_eq!(result.updated, 1, "{context}");
+        } else {
+            assert_eq!(result.updated, 0, "{context}");
+            let errors = &result.errors;
+            assert_eq!(errors.len(), 1, "{context}: {errors:?}");
+            assert!(errors[0].contains("412 Precondition Failed"), "{errors:?}");
+            assert!(errors[0].contains("itself have committed"), "{errors:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_apply_preflight_refuses_a_gateway_without_entity_tags_before_any_write() {
+    use gitforgeops::apply::preflight_api_apply;
+
+    // `u0` is a create and `u1` an update: without the preflight the create
+    // would land before the update found the gateway cannot fence it.
+    let planned = document(Kind::Upstream, "u1", None, 1);
+    let mut desired = document(Kind::Upstream, "u1", None, 2);
+    desired
+        .upstreams
+        .extend(document(Kind::Upstream, "u0", None, 1).upstreams);
+    let untagged = row(Kind::Upstream, "u1", &planned).to_string();
+    for (etag, refused) in [(None, true), (Some(TAG), false)] {
+        let headers: Vec<(&str, &str)> = etag.map(|etag| ("ETag", etag)).into_iter().collect();
+        let read = read_route(Kind::Upstream, "u1", untagged.clone(), &headers);
+        let (url, requests) = spawn_recording_gateway(vec![health(), read]);
+
+        let preflight = preflight_api_apply(
+            &desired,
+            &client(url),
+            &[NS.to_string()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([(NS.to_string(), planned.clone())])),
+            Some(&BTreeMap::from([(NS.to_string(), BackupExtras::default())])),
+            &ApplyOptions::default(),
+        )
+        .await;
+
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        if refused {
+            let error = preflight.expect_err("no entity-tag, no apply").to_string();
+            assert!(error.contains("no strong ETag"), "{error}");
+        } else {
+            assert!(preflight.unwrap().is_empty());
+        }
+    }
+
+    // A namespace that only creates never reads a row for the probe.
+    let (url, requests) = spawn_recording_gateway(vec![health()]);
+    let empty = BTreeMap::from([(NS.to_string(), GatewayConfig::default())]);
+    let created = preflight_api_apply(
+        &document(Kind::Upstream, "u0", None, 1),
+        &client(url),
+        &[NS.to_string()],
+        OwnershipScope::Exclusive,
+        Some(&empty),
+        Some(&BTreeMap::from([(NS.to_string(), BackupExtras::default())])),
+        &ApplyOptions::default(),
+    )
+    .await;
+    assert!(created.unwrap().is_empty());
+    let requests = requests.lock().unwrap();
+    let only_health = requests
+        .iter()
+        .all(|request| request.starts_with("GET /health"));
+    assert!(only_health);
 }

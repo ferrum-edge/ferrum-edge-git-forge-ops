@@ -380,10 +380,18 @@ namespace payload is built before the first mutation.
   `api_target::Preconditions` (or the same steps inline):
   1. `GET /<kind>/{id}` (`AdminClient::get_tagged`); Edge v0.9.10+
      (`src/admin/preconditions.rs`) returns a strong `ETag` for the stored row;
-  2. the row must still be the planned one: same `api_spec_id`, same content
-     minus server timestamps (`stale_reason`; post-plugin proxies ignore
-     `plugins`), and for an update no nested field the typed mirror drops
-     (`decode_live_row` / `refuse_dropped_field`);
+  2. the row must still be the planned one (`Preconditions::confirm_content`):
+     same `api_spec_id` (`ownership_refusal`), same content minus server
+     timestamps, and for an update no nested field the typed mirror drops
+     (`decode_live_row` / `refuse_dropped_field`). A proxy is compared without
+     its associations to plugin configs this run wrote
+     (`Preconditions::written_plugins`, `without_written_associations`) and
+     with every other association, so a concurrently attached plugin is not
+     detached and a scoped plugin can move off a proxy deleted in the same
+     run. When the read's content differs, one `/backup` taken after the read
+     decides: `/backup` is normalized on load and the read is the stored row,
+     so representation-only differences (legacy un-normalized rows) must not
+     refuse forever;
   3. `PUT`/`DELETE` with `If-Match: <etag>` (`update_if_match` /
      `delete_if_match`). Edge compares and commits under the namespace
      admission lease every admin writer takes, so a `412` proves the row
@@ -392,15 +400,26 @@ namespace payload is built before the first mutation.
   A mismatch or `412` is `Error::StalePlan`: a per-resource error that also
   withholds **every later write in the namespace** (creates and updates
   reported, deletes deferred, adoption skipped); other namespaces continue. A
-  gone row: delete not sent (already gone), update refused. A cached single
-  read is `StaleGatewayView`; a missing or weak `ETag` (pre-0.9.10 gateway,
-  which would also ignore `If-Match`) is the run-stopping
-  `ConditionalWriteUnavailable`. Edge redacts consumer credentials on `GET
-  /consumers/{id}` while its tag covers them, so a namespace's consumer
-  targets are all read first, then one `/backup` (credentials) is compared to
-  the plan: a change before a read shows in the backup, one after it fails
-  `If-Match`. Proxies, upstreams and plugin configs need no backup read. Only
-  `rotate`'s consumer `PUT` and `/restore` stay unconditional.
+  `412` answering a `PUT` retried after a response
+  (`ConditionalUpdate::Refused`, `after_retry`) counts as applied when a
+  re-read shows the desired row unowned (`CreateResource::wrote_itself`;
+  never for consumers). A gone row: delete not sent (already gone), update
+  refused. A cached single read is `StaleGatewayView`; a missing or weak
+  `ETag` (pre-0.9.10 gateway, which would also ignore `If-Match`) is the
+  run-stopping `ConditionalWriteUnavailable`, which `preflight_api_apply`
+  (before allocation and any write) and `doctor`'s
+  `gateway-conditional-writes` check also probe for. Edge redacts consumer
+  credentials on `GET /consumers/{id}` while its tag covers them, so a
+  namespace's consumer targets are all read first, then one `/backup`
+  (credentials) is compared to the plan: a change before a read shows in the
+  backup, one after it fails `If-Match`. Only `rotate`'s consumer `PUT` and
+  `/restore` stay unconditional. `plan` does not probe: it reads `/backup`
+  only.
+- **Credentials travel only over TLS or loopback.** Every admin request is
+  built through `AdminClient::authorize` / `Authorized::request`, the only
+  place the bearer token is minted and attached; it refuses a target that is
+  not `https://` or `http://` to a loopback host (`credential_transport_allowed`),
+  and client construction refuses such a gateway URL up front.
 - A `GET /health` preflight runs before the first mutation, so a read-only
   plane fails once instead of N times.
 - A sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations:
@@ -1547,7 +1566,7 @@ credentials. Booleans accept `true|false|1|0`.
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Standalone `{version, mesh}` document. File-mode `validate`/`plan`/`apply` and `export --output` refuse, before any publication, state or broker write, when it resolves to the same file as the gateway document (`apply::ensure_distinct_publication_paths`: `./`/`..` spellings, symlinked parents and existing file identity all count). |
 | `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `verify`. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Dev only. TLS stays on but any certificate is accepted. |
-| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://`. |
+| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://` at load; the admin client still sends its token over `http://` only to a loopback host (`AdminClient::authorize`). |
 | `FERRUM_GATEWAY_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | unset | Base64-encoded PEM. mTLS needs both cert and key. |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS handshake cap. |
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end cap; raise for large `/backup` or slow `/restore`. |

@@ -394,22 +394,46 @@ def scenario_conditional_overwrite(harness: Harness) -> str:
         raise ScenarioFailure("the refused conditional PUT changed the proxy anyway")
 
     # The client half: apply plans from the edited row and sends conditional
-    # writes that the real gateway accepts. A consumer update takes the
-    # redacted read plus the /backup that carries its credentials.
-    harness.write(
-        f"resources/{NAMESPACE}/consumers/orders-client.yaml",
-        (harness.workdir / f"resources/{NAMESPACE}/consumers/orders-client.yaml")
-        .read_text(encoding="utf-8")
-        .replace('username: "orders-client"', 'username: "orders-client"\n  acl_groups: ["orders"]'),
+    # writes that the real gateway accepts, for every kind it overwrites. A
+    # consumer update takes the redacted read plus the /backup that carries
+    # its credentials. Each single-row read must agree with the /backup row
+    # the plan came from, or apply would refuse a row nobody changed.
+    edit_resource(
+        harness,
+        "consumers/orders-client.yaml",
+        'username: "orders-client"',
+        'username: "orders-client"\n  acl_groups: ["orders"]',
+    )
+    edit_resource(
+        harness,
+        "upstreams/orders.yaml",
+        'name: "Orders service"',
+        'name: "Orders service v2"',
+    )
+    edit_resource(
+        harness,
+        "plugins/orders-key-auth.yaml",
+        'plugin_name: "key_auth"',
+        'plugin_name: "key_auth"\n  labels:\n    team: "orders"',
     )
     harness.run("apply", "--auto-approve")
     harness.run("diff", "--exit-on-drift")
     harness.expect_status("/orders/status/200", 200, {"X-API-Key": harness_key(harness)})
     return (
         "the gateway tags every overwritten kind and refuses a superseded If-Match "
-        "with 412; apply re-planned over an out-of-band edit and updated a proxy "
-        "and a consumer through If-Match, converging with no drift"
+        "with 412; apply re-planned over an out-of-band edit and updated a proxy, "
+        "an upstream, a plugin config and a consumer through If-Match, converging "
+        "with no drift"
     )
+
+
+def edit_resource(harness: Harness, relative: str, old: str, new: str) -> None:
+    """Rewrite one seeded resource file, failing loudly if `old` is absent."""
+    path = harness.workdir / f"resources/{NAMESPACE}/{relative}"
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        raise ScenarioFailure(f"the seeded {relative} no longer contains {old!r}")
+    harness.write(f"resources/{NAMESPACE}/{relative}", text.replace(old, new))
 
 
 def scenario_credentials_generate_and_rotate(harness: Harness) -> str:

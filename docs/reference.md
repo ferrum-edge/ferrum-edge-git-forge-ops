@@ -249,6 +249,11 @@ exists:
   under `GITHUB_ACTIONS=true` are refused unless the host is literally
   loopback (`localhost`, `127.0.0.0/8`, `::1`). Put a private CA in
   `FERRUM_GATEWAY_CA_CERT` instead.
+- The admin client itself sends the admin token over cleartext `http://` only
+  to a loopback host (`localhost`, `127.0.0.0/8`, `::1`), whatever was
+  configured: it refuses to build, and every request refuses to attach the
+  token, for a remote `http://` gateway. `FERRUM_ALLOW_INSECURE_HTTP=true`
+  therefore makes a cleartext gateway usable only on loopback.
 
 See also [GitHub launch controls](github-launch-controls.md#the-gateway-url-must-be-https).
 
@@ -400,8 +405,8 @@ with the admin credential.
 - **Transport.** The viewer token is sent only to an `https://` gateway URL,
   or over `http://` to a literal loopback IP address (`127.0.0.0/8`, `[::1]`;
   not `localhost`). This is stricter than the admin client, whose opted-in
-  `http://` (`FERRUM_ALLOW_INSECURE_HTTP=true`) may name any host outside
-  GitHub Actions. Any other URL is refused before a request is made.
+  `http://` (`FERRUM_ALLOW_INSECURE_HTTP=true`) may also name `localhost`.
+  Any other URL is refused before a request is made.
 - **Refusals.** `404` means the gateway predates the export, `401` a viewer key
   or claim mismatch, `403` a namespace outside
   `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` or the token's `ns` claim. Each message

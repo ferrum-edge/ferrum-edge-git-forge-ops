@@ -54,6 +54,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Incremental `apply` needs Ferrum Edge v0.9.10 or later to modify or delete
+  existing rows: every such write is sent with `If-Match`, and an older
+  gateway issues no `ETag`. The apply preflight reads one row the run will
+  overwrite and refuses such a gateway before any credential is allocated or
+  any row written; creates alone still work. `doctor --scope gateway` reports
+  it as `gateway-conditional-writes`. Each modify or delete now costs one
+  extra `GET`.
 - `diff --format json` gains two fields on every path: `live_source`
   (`backup` or `config_export`) and `secret_fingerprints` (`null` on the
   `/backup` path). The cached-read warning now names the source it came from,
@@ -92,14 +99,29 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   row changed after that read with `412`, atomically with the write. A refusal
   is a per-resource error and withholds every later write in that namespace
   (its deletes are deferred and adoption is skipped); the run exits non-zero.
-  A delete whose row is already gone is not sent. Because Edge redacts
-  consumer credentials on a single-resource read, a namespace's consumers are
-  read first and then checked against one `/backup`. A cached read stops the
-  run, and so does a read without a strong `ETag` (`ConditionalWriteUnavailable`),
-  since an older gateway would ignore `If-Match`. An ambiguous create whose
-  readback finds the declared content under an `api_spec_id` no longer claims
-  that row. A new `conditional-overwrite` lifecycle scenario certifies the
-  gateway's tags and `412` and an apply through them (GHSA-fh5w-5x4f-86gh).
+  A delete whose row is already gone is not sent. When the read differs from
+  the plan only because `/backup` normalizes rows the read returns as stored,
+  a `/backup` taken after the read settles it, so such a row is not refused
+  forever. Consumers are always checked against that later `/backup`, since
+  Edge redacts their credentials on a single-row read. A proxy read after
+  this run's plugin writes ignores only the associations to plugin configs
+  this run wrote, so a plugin someone else attached is never detached, and a
+  scoped plugin can move off a proxy deleted in the same apply. A `412` that
+  answers a retried `PUT` whose earlier attempt committed, shown by a re-read
+  of the desired row, counts as applied. A cached read stops the run, and so
+  does a read without a strong `ETag` (`ConditionalWriteUnavailable`), since
+  an older gateway would ignore `If-Match`. An ambiguous create whose readback
+  finds the declared content under an `api_spec_id` no longer claims that
+  row. A new `conditional-overwrite` lifecycle scenario certifies the
+  gateway's tags and `412` and an apply through them for every overwritten
+  kind (GHSA-fh5w-5x4f-86gh).
+- The admin client sends its bearer token, and the resolved credentials in
+  request bodies, over cleartext `http://` only to a loopback host
+  (`localhost`, `127.0.0.0/8`, `::1`). Every admin request is built through one
+  guarded path that mints and attaches the token only after checking the
+  target, and the client refuses to build for a remote `http://` gateway.
+  `FERRUM_ALLOW_INSECURE_HTTP=true` no longer makes a remote cleartext gateway
+  usable.
 - `FERRUM_GATEWAY_URL` and `FERRUM_VERIFY_BASE_URL` are GitHub Environment
   secrets, so no diagnostic echoes them any more (GHSA-pp23-79rj-gp54).
   Transport-validation errors report only the variable name — never the
