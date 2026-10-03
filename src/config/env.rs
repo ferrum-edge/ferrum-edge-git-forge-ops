@@ -189,8 +189,9 @@ pub struct EnvConfig {
 }
 
 /// `Debug` that never prints a secret: the admin and viewer JWT signing keys,
-/// both GitHub tokens, the inline credential bundle and the mTLS client key
-/// render as `<redacted>` when set, so a stray `{:?}` cannot leak them.
+/// both GitHub tokens, the inline credential bundle, the mTLS client key and
+/// the two secret-backed transport URLs render as `<redacted>` when set, so a
+/// stray `{:?}` cannot leak them.
 impl fmt::Debug for EnvConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let admin_jwt_secret = redacted(self.admin_jwt_secret.as_deref());
@@ -199,8 +200,10 @@ impl fmt::Debug for EnvConfig {
         let github_provisioner_token = redacted(self.github_provisioner_token.as_deref());
         let creds_bundle_json = redacted(self.creds_bundle_json.as_deref());
         let client_key = redacted(self.client_key.as_deref());
+        let gateway_url = redacted(self.gateway_url.as_deref());
+        let verify_base_url = redacted(self.verify_base_url.as_deref());
         f.debug_struct("EnvConfig")
-            .field("gateway_url", &self.gateway_url)
+            .field("gateway_url", &gateway_url)
             .field("admin_jwt_secret", &admin_jwt_secret)
             .field("admin_jwt_viewer_secret", &admin_jwt_viewer_secret)
             .field("admin_jwt_issuer", &self.admin_jwt_issuer)
@@ -231,7 +234,7 @@ impl fmt::Debug for EnvConfig {
             .field("mesh_file_output_path", &self.mesh_file_output_path)
             .field("edge_binary_path", &self.edge_binary_path)
             .field("tls_no_verify", &self.tls_no_verify)
-            .field("verify_base_url", &self.verify_base_url)
+            .field("verify_base_url", &verify_base_url)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .field("ca_cert", &self.ca_cert)
             .field("client_cert", &self.client_cert)
@@ -535,29 +538,27 @@ pub fn validate_gateway_transport(
     // an environment whose URL secret is still unset. That is not a loopback
     // target, but it is not a remote one either: there is no request to
     // protect yet, and `AdminClient` refuses to build without a URL. Only a
-    // host we can see and that is *not* loopback trips the CI refusals.
+    // host we can see and that is *not* loopback trips the CI refusals. The
+    // host itself is never named: `FERRUM_GATEWAY_URL` is an environment
+    // secret, and its host, port and path prefix are exactly what the advisory
+    // forbids disclosing.
     let remote_host = parsed
         .as_ref()
         .and_then(Url::host)
-        .filter(|host| !host_is_loopback(host))
-        .map(|host| host.to_string());
+        .is_some_and(|host| !host_is_loopback(&host));
 
-    if let (Some(url), Some(raw)) = (parsed.as_ref(), gateway_url) {
+    if let Some(url) = parsed.as_ref() {
         if url.scheme() == "http" {
             if !allow_insecure_http {
-                return Err(cleartext_gateway_refused(raw));
+                return Err(cleartext_gateway_refused());
             }
-            if in_github_actions {
-                if let Some(ref host) = remote_host {
-                    return Err(refused_in_github_actions(
-                        "FERRUM_ALLOW_INSECURE_HTTP",
-                        &format!(
-                            "the gateway host {host} is not loopback, so an http:// admin API \
-                             would put the admin JWT and every resolved consumer credential on \
-                             the wire in cleartext"
-                        ),
-                    ));
-                }
+            if in_github_actions && remote_host {
+                return Err(refused_in_github_actions(
+                    "FERRUM_ALLOW_INSECURE_HTTP",
+                    "the configured gateway host is not loopback, so an http:// admin API \
+                     would put the admin JWT and every resolved consumer credential on \
+                     the wire in cleartext",
+                ));
             }
             warnings.push(insecure_warning(
                 "FERRUM_ALLOW_INSECURE_HTTP=true: talking to the admin API over cleartext http://.",
@@ -568,16 +569,12 @@ pub fn validate_gateway_transport(
     }
 
     if tls_no_verify {
-        if in_github_actions {
-            if let Some(ref host) = remote_host {
-                return Err(refused_in_github_actions(
-                    "FERRUM_TLS_NO_VERIFY",
-                    &format!(
-                        "the gateway host {host} is not loopback, so skipping certificate \
-                         verification would make any interceptor's certificate acceptable"
-                    ),
-                ));
-            }
+        if in_github_actions && remote_host {
+            return Err(refused_in_github_actions(
+                "FERRUM_TLS_NO_VERIFY",
+                "the configured gateway host is not loopback, so skipping certificate \
+                 verification would make any interceptor's certificate acceptable",
+            ));
         }
         warnings.push(insecure_warning(
             "FERRUM_TLS_NO_VERIFY=true: the gateway's TLS certificate is NOT verified.",
@@ -602,11 +599,8 @@ fn parse_gateway_url(raw: &str) -> crate::error::Result<Url> {
 /// resolved credential-slot headers.
 fn parse_transport_url(var: &str, raw: &str) -> crate::error::Result<Url> {
     let parsed = Url::parse(raw).map_err(|e| {
-        invalid_env(
-            var,
-            &redacted_url(raw),
-            &format!("{GATEWAY_URL_ACCEPTED} ({e})"),
-        )
+        let accepted = format!("{GATEWAY_URL_ACCEPTED} ({e})");
+        invalid_secret_env(var, &accepted)
     })?;
 
     // Checked before the scheme so a rejected value carrying a password is
@@ -622,13 +616,13 @@ fn parse_transport_url(var: &str, raw: &str) -> crate::error::Result<Url> {
     }
 
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(invalid_env(var, &redacted_url(raw), GATEWAY_URL_ACCEPTED));
+        return Err(invalid_secret_env(var, GATEWAY_URL_ACCEPTED));
     }
 
     // `url` guarantees a non-empty host for http/https, so this is a
     // belt-and-braces check that keeps the loopback test total.
     if parsed.host().is_none() {
-        return Err(invalid_env(var, &redacted_url(raw), GATEWAY_URL_ACCEPTED));
+        return Err(invalid_secret_env(var, GATEWAY_URL_ACCEPTED));
     }
 
     Ok(parsed)
@@ -656,24 +650,24 @@ pub fn validate_verify_transport(
     }
     if !allow_insecure_http {
         return Err(crate::error::Error::Config(format!(
-            "invalid FERRUM_VERIFY_BASE_URL value {:?}; expected {GATEWAY_URL_ACCEPTED}. \
-             Traffic checks can send credential-bundle values in their headers, so a \
-             cleartext data plane is refused unless FERRUM_ALLOW_INSECURE_HTTP=true declares \
-             it a local development gateway",
-            redacted_url(raw)
+            "invalid FERRUM_VERIFY_BASE_URL: the value is an environment secret and is \
+             withheld; expected {GATEWAY_URL_ACCEPTED}. Traffic checks can send \
+             credential-bundle values in their headers, so a cleartext data plane is refused \
+             unless FERRUM_ALLOW_INSECURE_HTTP=true declares it a local development gateway"
         )));
     }
-    if in_github_actions {
-        if let Some(host) = parsed.host().filter(|host| !host_is_loopback(host)) {
-            return Err(refused_in_github_actions(
-                "FERRUM_ALLOW_INSECURE_HTTP",
-                &format!(
-                    "the data-plane host {host} is not loopback, so an http:// \
-                     FERRUM_VERIFY_BASE_URL would put every credential a traffic check sends \
-                     on the wire in cleartext"
-                ),
-            ));
-        }
+    if in_github_actions
+        && parsed
+            .host()
+            .filter(|host| !host_is_loopback(host))
+            .is_some()
+    {
+        return Err(refused_in_github_actions(
+            "FERRUM_ALLOW_INSECURE_HTTP",
+            "the configured data-plane host is not loopback, so an http:// \
+             FERRUM_VERIFY_BASE_URL would put every credential a traffic check sends \
+             on the wire in cleartext",
+        ));
     }
     Ok(vec![insecure_warning(
         "FERRUM_ALLOW_INSECURE_HTTP=true: traffic checks talk to the data plane over cleartext http://.",
@@ -694,25 +688,15 @@ fn host_is_loopback(host: &Host<&str>) -> bool {
     }
 }
 
-/// A gateway URL is never echoed verbatim once it carries an `@`: the
-/// authority may hold `user:password`, and these errors land in CI logs.
-fn redacted_url(raw: &str) -> String {
-    if raw.contains('@') {
-        "<redacted: value contains '@' and may embed credentials>".to_string()
-    } else {
-        raw.to_string()
-    }
-}
-
 /// The default refusal: a well-formed `http://` gateway URL with no opt-in.
 /// Says what is at stake and names the one variable that changes the answer.
-fn cleartext_gateway_refused(raw: &str) -> crate::error::Error {
+/// The value is withheld because the URL is an environment secret.
+fn cleartext_gateway_refused() -> crate::error::Error {
     crate::error::Error::Config(format!(
-        "invalid FERRUM_GATEWAY_URL value {:?}; expected {GATEWAY_URL_ACCEPTED}. The admin JWT \
-         and every resolved consumer credential travel in these requests, so a cleartext gateway \
-         is refused unless FERRUM_ALLOW_INSECURE_HTTP=true declares it a local development \
-         gateway",
-        redacted_url(raw)
+        "invalid FERRUM_GATEWAY_URL: the value is an environment secret and is withheld; \
+         expected {GATEWAY_URL_ACCEPTED}. The admin JWT and every resolved consumer credential \
+         travel in these requests, so a cleartext gateway is refused unless \
+         FERRUM_ALLOW_INSECURE_HTTP=true declares it a local development gateway"
     ))
 }
 
@@ -829,5 +813,22 @@ fn parse_u32_env(var: &str, default: u32) -> crate::error::Result<u32> {
 fn invalid_env(var: &str, value: &str, accepted: &str) -> crate::error::Error {
     crate::error::Error::Config(format!(
         "invalid {var} value {value:?}; expected {accepted} (unset or blank uses the documented default)"
+    ))
+}
+
+/// [`invalid_env`] for a malformed environment **secret**.
+///
+/// `FERRUM_GATEWAY_URL` and `FERRUM_VERIFY_BASE_URL` come from GitHub
+/// Environment secrets: the host, port and path prefix they name are internal
+/// control-plane topology, and a normalized or path-bearing value can itself
+/// carry a token. Naming the variable is enough to make the message
+/// actionable, so no error echoes even a byte of the value. Unlike
+/// [`invalid_env`], there is no rendered `value` slot — an unquoted sentinel
+/// would only repeat the variable name — so this names the variable exactly
+/// once.
+fn invalid_secret_env(var: &str, accepted: &str) -> crate::error::Error {
+    crate::error::Error::Config(format!(
+        "invalid {var}: the value is an environment secret and is withheld; expected {accepted} \
+         (unset or blank uses the documented default)"
     ))
 }
