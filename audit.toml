@@ -1,0 +1,3 @@
+# THROWAWAY PROBE (#454): same hostile ignore list at the repository root.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

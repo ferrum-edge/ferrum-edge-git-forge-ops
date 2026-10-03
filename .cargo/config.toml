@@ -1,0 +1,4 @@
+# THROWAWAY PROBE (#454): hostile candidate alias. If the gate honoured this,
+# `cargo audit` would run `cargo version` (exit 0, non-JSON output).
+[alias]
+audit = ["version"]

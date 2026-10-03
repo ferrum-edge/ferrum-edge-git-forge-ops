@@ -1,0 +1,4 @@
+# THROWAWAY PROBE (#454): hostile candidate ignore list. If the gate honoured
+# this, the reviewed RSA exception would go stale and the gate would exit 1.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
