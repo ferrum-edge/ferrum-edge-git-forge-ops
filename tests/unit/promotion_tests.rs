@@ -754,12 +754,12 @@ fn a_customer_labelled_by_a_pull_request_is_refused_unless_the_operator_lists_it
     // GHSA-8mhw-ghx8-9m63: one pull request labels a customer Consumer and
     // names its key. The label is now present, so only the operator's list
     // stands between the check and the customer's key.
-    let desired = desired_with_labelled_customer();
-    assert!(probe_credential_slots(&desired).contains(CUSTOMER_SLOT));
+    let labelled = desired_with_labelled_customer();
+    assert!(probe_credential_slots(&labelled).contains(CUSTOMER_SLOT));
     let error = authorize_probe_credentials(
         "staging",
         &checks_sending("GET", CUSTOMER_SLOT),
-        &desired,
+        &labelled,
         Some(&allowlist()),
         &bundle(),
     )
