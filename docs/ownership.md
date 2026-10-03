@@ -88,7 +88,7 @@ spec-owned.
 
 | Mode | What adoption does |
 |---|---|
-| `shared` | Claims the row with an idempotent `PUT` against a freshly re-read backup. A row that changed since the diff is skipped and stays unclaimed, so a concurrent edit is never reverted. |
+| `shared` | Claims the row with an idempotent `PUT`, sent with `If-Match` on a fresh read of the row that must still equal the declaration (and on a freshly re-read backup). A row that changed since the diff, or changes before the `PUT` lands, is skipped and stays unclaimed, so a concurrent edit is never reverted. |
 | `exclusive` | Records the ledger entry without writing. |
 | file mode | Nothing extra; the file write records the whole desired set. |
 | `full_replace` | Not applicable; a restore rebuilds the namespace's ledger entries. |
@@ -164,10 +164,11 @@ whatever the ledger says:
   namespaces reconcile normally.
 - **Never deleted**, except in `exclusive` mode with
   `apply --confirm-api-spec-deletion`. Otherwise apply lists each skipped row.
-- **Never claimed after the plan.** A row an `/api-specs` import tags between
-  apply's plan and its write is refused, not modified or deleted, and a
-  confirmed spec deletion still requires the owner the plan saw. See
-  [Changes made during an apply](apply.md#changes-made-during-an-apply).
+- **Never claimed after the plan.** Every overwrite is sent with `If-Match` on
+  a read that must still show the planned owner, so a row an `/api-specs`
+  import tags between apply's plan and its write is refused, not modified or
+  deleted, and a confirmed spec deletion still requires the owner the plan
+  saw. See [Changes made during an apply](apply.md#changes-made-during-an-apply).
 - **Always reported** in `plan`, `diff` and the PR comment's
   "Spec-owned Resources" section, regardless of `ownership.drift_report`.
 - **Never authored.** An `api_spec_id` in repository YAML is rejected, even

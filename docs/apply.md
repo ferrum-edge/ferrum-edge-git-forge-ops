@@ -14,9 +14,9 @@ Apply works one namespace at a time (`apply_api` over
 - **`incremental`** (default) reads `/backup` once per namespace, diffs
   locally, and sends one `POST`/`PUT`/`DELETE` per changed resource. At about
   100 ms per call, 1,000 changes take about two minutes. A namespace whose diff
-  is only adds uses `POST /batch` instead. A namespace that overwrites existing
-  rows reads `/backup` once more before its first overwrite; see
-  [Changes made during an apply](#changes-made-during-an-apply).
+  is only adds uses `POST /batch` instead. Every `PUT` or `DELETE` of an
+  existing row is first read with `GET /<kind>/{id}` and sent with `If-Match`;
+  see [Changes made during an apply](#changes-made-during-an-apply).
 - **`full_replace`** (exclusive mode only) builds and validates every
   namespace payload first, then calls `POST /restore?confirm=true` once per
   namespace. Deterministic errors in any namespace mean no restore is sent.
@@ -58,7 +58,9 @@ Never retried:
 - **`/restore` failures** other than the connectivity case. A 500 with
   `rollback: incomplete` or `unknown_outcome` is `RestoreNeedsManualRecovery`.
 - **Request timeouts.** The outcome is unknown; the next run re-diffs.
-- **Other 4xx** (400, 401, 403, 404, 409, 422).
+- **Other 4xx** (400, 401, 403, 404, 409, 412, 422). A `412` answers a
+  conditional write; see
+  [Changes made during an apply](#changes-made-during-an-apply).
 - **3xx.** Redirects are never followed. The error names the `Location`; point
   `FERRUM_GATEWAY_URL` at the final origin.
 
@@ -79,7 +81,15 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
 - **`StaleGatewayView`.** A `/backup` answered with `X-Data-Source: cached`
   is the gateway's in-memory fallback, which lacks API-spec documents and
   ownership tags. Every api-mode mutation is refused before allocation or any
-  write, and `--allow-large-prune` does not bypass it.
+  write, and `--allow-large-prune` does not bypass it. A cached single-row
+  read before a conditional write stops the run the same way.
+- **`StalePlan`.** A row changed after this run planned its write: its
+  conditional read disagreed with the plan, or the gateway answered `412` to
+  the `If-Match` write. The row is not written and the namespace's remaining
+  writes are withheld. See
+  [Changes made during an apply](#changes-made-during-an-apply).
+- **`ConditionalWriteUnavailable`.** The gateway returned no strong `ETag` for
+  a row apply must overwrite (Ferrum Edge before v0.9.10). It stops the run.
 - **Namespace-scoped backups** must carry an explicit, matching `namespace` on
   every row, and must not contain duplicate `(namespace, id)` rows within a
   kind. Otherwise the snapshot is rejected before diffing: `diff`, `plan` and
@@ -94,8 +104,8 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
 
 Incremental errors are collected per resource: 99 successes and 1 failure
 report exactly that, and the CLI exits non-zero. Read-only refusals, stale
-views, unsupported backup sections and restore rollback damage stop the whole
-run.
+views, missing entity-tags, unsupported backup sections and restore rollback
+damage stop the whole run.
 
 ## Apply ordering and the batch fast path
 
@@ -155,33 +165,55 @@ exclusive `full_replace`.
 
 `apply` plans each namespace from the `/backup` it reads before allocating and
 delivering credentials, so another writer can change the gateway before the
-writes go out. Before a namespace's first write that overwrites an existing row
-(a modify, a delete, or a pending-create ownership assertion), incremental
-apply reads `/backup` again and compares every row it is about to overwrite
-with the row it planned against:
+writes go out. Incremental apply therefore never overwrites or deletes an
+existing row unconditionally. For every modify, delete, pending-create
+ownership assertion, adoption claim and ambiguous-create ownership assertion it:
+
+1. reads the row with `GET /<kind>/{id}`, which Ferrum Edge (v0.9.10 and later)
+   answers with a strong `ETag` for the stored row;
+2. compares that row with the row it planned against; and
+3. sends the `PUT` or `DELETE` with `If-Match: <etag>`.
+
+Edge compares the tag and commits the write under one namespace admission lease
+that every admin writer (CRUD, `/batch`, `/restore`, `/api-specs`, credential
+endpoints) takes, so a change that lands after the read is refused with
+`412 Precondition Failed` instead of being overwritten. The read refuses what
+changed before it:
 
 - **Ownership moved.** A row that gained, lost or changed its `api_spec_id` is
   not written: an `/api-specs` import claimed it after the plan. See
   [Spec-owned resources](ownership.md#spec-owned-resources).
 - **Content changed.** A row that differs in anything but server timestamps is
-  not written, so someone else's edit is not reverted.
-- **Row gone.** The write goes out and the gateway answers for itself: a
-  `DELETE` gets a tolerated 404, a `PUT` fails.
+  not written, so someone else's edit is not reverted. An update is also
+  refused when the row now carries a nested field this build cannot represent,
+  because the write would reset it.
+- **Row gone.** A delete is not sent and counts as already gone; sending it
+  could only remove a row someone created since. An update is refused.
 
-Each refusal is a per-resource error naming the row, so the run exits non-zero,
-and a refused modify defers the namespace's deletes like any failed write.
-Re-run apply to plan against the current gateway. A cached confirmation stops
-the run; a failed confirmation read refuses every overwrite in the namespace.
+A refused write (by the read or by a `412`) is a per-resource error naming the
+row, and it proves the namespace's plan stale: **nothing more is sent to that
+namespace** in this run. Its remaining creates and updates are reported as
+withheld, its deletes are deferred, and adoption is skipped. Other namespaces
+continue, and the run exits non-zero. Re-run apply to plan against the current
+gateway. A `412` after a retried request may also mean the earlier attempt
+committed; the message says so, and the re-run reconciles it.
 
-Creates need no confirmation, because `POST` and `POST /batch` are create-only.
-A proxy update that follows this run's scoped-plugin writes is checked against
-the post-plugin backup instead, ignoring the associations the gateway rewrote
-itself. After an ambiguous create, a readback row that carries an
-`api_spec_id` is never claimed, even when its content matches.
+A read served from cache (`X-Data-Source: cached`), or one without a strong
+`ETag` (a gateway older than v0.9.10), stops the run: no write can be made
+conditional on it. A read that fails refuses that write like any failed write.
 
-The confirmation narrows the race to one read-to-write interval per namespace.
-It cannot close it: `/backup` carries no per-row revision that a `PUT` or
-`DELETE` could be made conditional on.
+**Consumers** take one more read. Edge redacts consumer credentials on a
+single-resource `GET`, although its tag covers them, so that read cannot show
+the credentials still match the plan. Before a namespace's first consumer
+overwrite, apply reads every consumer it will overwrite, then one `/backup`,
+which carries the credentials. A change before a consumer's read shows in the
+backup; a change after it fails the `If-Match`.
+
+Creates need no precondition, because `POST` and `POST /batch` are create-only.
+A proxy update that follows this run's scoped-plugin writes is read after them,
+and the comparison ignores the associations the gateway rewrote itself. After
+an ambiguous create, the row is read before the verification backup, and a row
+that carries an `api_spec_id` is never claimed, even when its content matches.
 
 ## Ordering between runs
 

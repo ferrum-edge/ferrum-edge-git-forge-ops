@@ -83,18 +83,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Incremental `apply` no longer overwrites or deletes a row from a stale plan.
   The plan comes from the `/backup` read before credential allocation and
-  delivery, so before a namespace's first `PUT` or `DELETE` of an existing row
-  (a modify, a delete or a pending-create ownership assertion) apply reads
-  `/backup` again. A row that gained, lost or changed its `api_spec_id`, or
-  whose content changed, since the plan is not written: the refusal is a
-  per-resource error, a refused modify defers the namespace's deletes, and the
-  run exits non-zero. A cached confirmation stops the run; a failed one refuses
-  every overwrite in the namespace. A proxy updated after this run's
-  scoped-plugin writes is checked the same way against the post-plugin backup,
-  ignoring the associations the gateway rewrote. An ambiguous create whose
+  delivery, so every `PUT` or `DELETE` of an existing row (a modify, a delete,
+  a pending-create, ambiguous-create or adoption ownership assertion, and a
+  proxy update after scoped-plugin writes) is now conditional: apply reads the
+  row with `GET /<kind>/{id}`, refuses it when it gained, lost or changed its
+  `api_spec_id` or changed content since the plan, and sends the write with
+  `If-Match` on the strong `ETag` Ferrum Edge v0.9.10 returned. Edge refuses a
+  row changed after that read with `412`, atomically with the write. A refusal
+  is a per-resource error and withholds every later write in that namespace
+  (its deletes are deferred and adoption is skipped); the run exits non-zero.
+  A delete whose row is already gone is not sent. Because Edge redacts
+  consumer credentials on a single-resource read, a namespace's consumers are
+  read first and then checked against one `/backup`. A cached read stops the
+  run, and so does a read without a strong `ETag` (`ConditionalWriteUnavailable`),
+  since an older gateway would ignore `If-Match`. An ambiguous create whose
   readback finds the declared content under an `api_spec_id` no longer claims
-  that row with an ownership `PUT`; the run stops instead. The check narrows the
-  race to one read-to-write interval per namespace (GHSA-fh5w-5x4f-86gh).
+  that row. A new `conditional-overwrite` lifecycle scenario certifies the
+  gateway's tags and `412` and an apply through them (GHSA-fh5w-5x4f-86gh).
 - `rotate.yml` binds a queued rotation to the revision it was dispatched from.
   After taking the shared `ferrum-apply-<env>` lock and refreshing onto the
   current head of `main`, its freshness guard now also runs the

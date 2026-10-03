@@ -277,6 +277,7 @@ impl AdminClient {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
                     let location = header_string(&resp, "location");
+                    let etag = header_string(&resp, "etag");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
                     let body = resp
                         .text()
@@ -289,6 +290,8 @@ impl AdminClient {
                             body,
                             data_source,
                             location,
+                            etag,
+                            attempts: attempt,
                         });
                     }
 
@@ -307,6 +310,8 @@ impl AdminClient {
                         body,
                         data_source,
                         location,
+                        etag,
+                        attempts: attempt,
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
@@ -701,7 +706,7 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/proxies/{id}?cleanup_orphaned_upstream=false");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
     }
 
     pub async fn create_consumer(
@@ -750,7 +755,7 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/consumers/{id}");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
     }
 
     pub async fn create_upstream(
@@ -799,7 +804,7 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/upstreams/{id}");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
     }
 
     pub async fn create_plugin_config(
@@ -848,7 +853,112 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/plugins/config/{id}");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
+    }
+
+    /// Read one proxy, consumer, upstream or plugin config for a conditional
+    /// write: the row and the strong entity-tag Ferrum Edge issued for it.
+    ///
+    /// `Ok(None)` is a 404: no row holds the id. A row served from the
+    /// gateway's in-memory cache (`X-Data-Source: cached`) is refused as a
+    /// stale view, and a response without a strong `ETag` is refused as
+    /// [`crate::error::Error::ConditionalWriteUnavailable`]. Ferrum Edge
+    /// issues tags only for a read from its configuration database, so either
+    /// answer means no write can be made conditional on what was read.
+    pub async fn get_tagged(
+        &self,
+        kind: &str,
+        id: &str,
+        namespace: &str,
+    ) -> crate::error::Result<Option<TaggedResource>> {
+        let path = resource_path(kind, id)?;
+        let token = self.token()?;
+        let resp = self
+            .send_with_retry(RequestKind::Read, || {
+                self.client
+                    .get(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
+        if resp.status == 404 {
+            return Ok(None);
+        }
+        self.check(&resp, RequestKind::Read)?;
+        let cached = resp
+            .data_source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("cached"));
+        if cached {
+            return Err(crate::error::Error::StaleGatewayView(format!(
+                "Refusing to overwrite {kind} `{id}` in namespace `{namespace}`: the gateway \
+                 served GET {path} from its in-memory cache (X-Data-Source: cached), which may \
+                 predate the configuration database and carries no entity-tag to make the write \
+                 conditional on. Wait for the database to recover and retry."
+            )));
+        }
+        let Some(etag) = strong_entity_tag(resp.etag.as_deref()) else {
+            return Err(crate::error::Error::ConditionalWriteUnavailable(format!(
+                "GET {path} in namespace `{namespace}` returned no strong ETag, so a write to \
+                 {kind} `{id}` cannot be made conditional (If-Match) on the row this run \
+                 validated. Ferrum Edge v0.9.10 and later issue one for proxies, consumers, \
+                 upstreams and plugin configs. No overwrite was attempted."
+            )));
+        };
+        let body = serde_json::from_str(&resp.body)
+            .map_err(|e| crate::error::Error::HttpClient(format!("GET {path}: {e}")))?;
+        Ok(Some(TaggedResource { etag, body }))
+    }
+
+    /// `PUT` one resource only if its stored row still carries `etag`.
+    ///
+    /// A `412 Precondition Failed` is
+    /// [`crate::error::Error::StalePlan`]: Ferrum Edge compares the tag and
+    /// commits the write under one namespace admission lease, so a 412 proves
+    /// the row changed after it was read and the write did not happen.
+    pub async fn update_if_match<T: Serialize>(
+        &self,
+        kind: &str,
+        id: &str,
+        resource: &T,
+        namespace: &str,
+        etag: &str,
+    ) -> crate::error::Result<()> {
+        let path = resource_path(kind, id)?;
+        let token = self.token()?;
+        let resp = self
+            .send_with_retry(RequestKind::Mutation, || {
+                self.client
+                    .put(self.url(&path))
+                    .bearer_auth(&token)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .header("If-Match", etag)
+                    .json(resource)
+            })
+            .await?;
+        if resp.status == 412 {
+            return Err(precondition_failed("PUT", &path, resp.attempts));
+        }
+        self.check_mutation(&resp, RequestKind::Mutation).await
+    }
+
+    /// `DELETE` one resource only if its stored row still carries `etag`.
+    /// A 404 is tolerated as for [`AdminClient::delete_proxy`]; a 412 is
+    /// [`crate::error::Error::StalePlan`], as for
+    /// [`AdminClient::update_if_match`]. A proxy is deleted without the
+    /// server-side orphan cleanup, as [`AdminClient::delete_proxy`] explains.
+    pub async fn delete_if_match(
+        &self,
+        kind: &str,
+        id: &str,
+        namespace: &str,
+        etag: &str,
+    ) -> crate::error::Result<DeleteOutcome> {
+        let mut path = resource_path(kind, id)?;
+        if kind == "Proxy" {
+            path.push_str("?cleanup_orphaned_upstream=false");
+        }
+        self.delete(&path, namespace, Some(etag)).await
     }
 
     /// Shared DELETE path with 404 tolerance — see [`delete_succeeded`].
@@ -857,16 +967,29 @@ impl AdminClient {
     /// flattened into `Ok(())`: individually a 404 is benign, but a namespace
     /// where *every* delete 404s is the signature of a misrouted run, and the
     /// caller can only say that if it can count them.
-    async fn delete(&self, path: &str, namespace: &str) -> crate::error::Result<DeleteOutcome> {
+    async fn delete(
+        &self,
+        path: &str,
+        namespace: &str,
+        if_match: Option<&str>,
+    ) -> crate::error::Result<DeleteOutcome> {
         let token = self.token()?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
-                self.client
+                let request = self
+                    .client
                     .delete(self.url(path))
                     .bearer_auth(&token)
-                    .header("X-Ferrum-Namespace", namespace)
+                    .header("X-Ferrum-Namespace", namespace);
+                match if_match {
+                    Some(etag) => request.header("If-Match", etag),
+                    None => request,
+                }
             })
             .await?;
+        if resp.status == 412 && if_match.is_some() {
+            return Err(precondition_failed("DELETE", path, resp.attempts));
+        }
         if resp.status == 404 {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -882,6 +1005,64 @@ impl AdminClient {
             ))
             .await)
     }
+}
+
+/// One resource read for a conditional write.
+#[derive(Debug, Clone)]
+pub struct TaggedResource {
+    /// The `ETag` header exactly as received (quoted), sent back verbatim in
+    /// `If-Match`.
+    pub etag: String,
+    /// The row the tag describes. The admin role reads proxies, upstreams and
+    /// plugin configs in full; consumers come back with their credentials
+    /// redacted, although the tag covers them.
+    pub body: serde_json::Value,
+}
+
+/// The single-resource admin path for a managed kind.
+fn resource_path(kind: &str, id: &str) -> crate::error::Result<String> {
+    validate_resource_id_for_path(id)?;
+    let collection = match kind {
+        "Proxy" => "/proxies",
+        "Consumer" => "/consumers",
+        "Upstream" => "/upstreams",
+        "PluginConfig" => "/plugins/config",
+        other => {
+            return Err(crate::error::Error::Config(format!(
+                "no single-resource admin endpoint for kind `{other}`"
+            )));
+        }
+    };
+    Ok(format!("{collection}/{id}"))
+}
+
+/// The `ETag` value when it is one strong entity-tag (RFC 9110 §8.8.3).
+///
+/// A weak tag (`W/"…"`) never satisfies `If-Match`, and a list or malformed
+/// value cannot name one representation, so neither can make a write
+/// conditional.
+pub fn strong_entity_tag(raw: Option<&str>) -> Option<String> {
+    let tag = raw?.trim();
+    let opaque = tag.strip_prefix('"')?.strip_suffix('"')?;
+    let valid = !opaque.is_empty()
+        && opaque
+            .bytes()
+            .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte));
+    valid.then(|| tag.to_string())
+}
+
+fn precondition_failed(method: &str, path: &str, attempts: u32) -> crate::error::Error {
+    let retried = if attempts > 1 {
+        " An earlier attempt of this request failed with a retryable error and may itself \
+         have committed the write; check the row before retrying."
+    } else {
+        ""
+    };
+    crate::error::Error::StalePlan(format!(
+        "not applied: the gateway answered 412 Precondition Failed to the conditional \
+         {method} {path}, so the row changed after this run read and validated it and the \
+         write was refused.{retried} Re-run apply to plan against the current gateway"
+    ))
 }
 
 /// Whether a tolerated DELETE actually removed something.
@@ -904,6 +1085,12 @@ struct RawResponse {
     /// `Location`, kept only so a 3xx can name where the admin API is
     /// actually being served from. Redirects are never followed.
     location: Option<String>,
+    /// `ETag`, which a single-resource `GET` carries for a conditional write.
+    etag: Option<String>,
+    /// How many times the request was sent. A conditional write answered
+    /// `412` after a retry may have been refused because its own earlier
+    /// attempt committed.
+    attempts: u32,
 }
 
 /// What kind of call is being made, for retry/error classification. `/restore`

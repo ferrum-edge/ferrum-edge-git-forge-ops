@@ -320,6 +320,7 @@ class CoverageTests(unittest.TestCase):
                 "create-and-route",
                 "reapply-is-a-no-op",
                 "modify-and-delete-in-order",
+                "conditional-overwrite",
                 "credentials-generate-and-rotate",
                 "partial-failure-recovery",
                 "ledger-publication-failure",

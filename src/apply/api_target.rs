@@ -970,6 +970,7 @@ fn is_fatal(error: &crate::error::Error) -> bool {
             | crate::error::Error::UnsupportedBackupSections(_)
             | crate::error::Error::CommittedNotLive { .. }
             | crate::error::Error::AmbiguousMutation(_)
+            | crate::error::Error::ConditionalWriteUnavailable(_)
     )
 }
 
@@ -1619,14 +1620,18 @@ async fn apply_incremental(
             ..batched
         };
         if result.fatal_error.is_none() {
-            adopt_matching_rows(
+            let adoption = AdoptionContext {
                 desired,
                 actual,
+                index: &index,
+                diffs: &diffs,
+                stale_plan: None,
+            };
+            adopt_matching_rows(
+                &adoption,
                 client,
                 namespace,
                 ownership_scope,
-                &index,
-                &diffs,
                 options,
                 &mut result,
             )
@@ -1644,13 +1649,15 @@ async fn apply_incremental(
     let mut failed_plugins = BTreeSet::new();
     let mut failed_proxy_deletions = BTreeSet::new();
     let mut changed_proxy_associations = BTreeSet::new();
-    let mut post_plugin_snapshot = None;
     // The plan above came from `actual`, which the caller may have read long
     // before this point (`cmd_apply` reads it before credential allocation and
-    // delivery). Every write that overwrites an existing row is checked against
-    // one confirmation read taken after the plan; see [`PlanConfirmation`].
-    let planned_rows = LiveIndex::build(actual);
-    let mut confirmation: Option<Result<PlanConfirmation, String>> = None;
+    // delivery). Every write that overwrites or deletes an existing row is made
+    // conditional on a fresh read that still matches the plan; see
+    // [`Preconditions`].
+    let mut preconditions = Preconditions::new(client, namespace, actual, &diffs)?;
+    // The first write refused because its row changed after the plan. The
+    // namespace's plan is then known to be stale, so nothing more is sent.
+    let mut plan_stale: Option<String> = None;
     for diff in &diffs {
         if diff.namespace != namespace {
             return Err(crate::error::Error::BackupNamespace(format!(
@@ -1659,6 +1666,10 @@ async fn apply_incremental(
             )));
         }
         let namespace = diff.namespace.as_str();
+        if let Some(first) = &plan_stale {
+            withhold_after_stale_plan(diff, first, &mut result);
+            continue;
+        }
         if cyclic_pending
             && (operation_rank(&diff.action, &diff.kind) >= 2
                 || cyclic_keys.contains(&state_key(namespace, &diff.kind, &diff.id)))
@@ -1751,69 +1762,12 @@ async fn apply_incremental(
             continue;
         }
         let key = (diff.namespace.as_str(), diff.id.as_str());
-        if diff.action == DiffAction::Modify
-            && diff.kind == "Proxy"
-            && changed_proxy_associations.contains(&diff.id)
-            && post_plugin_snapshot.is_none()
-        {
-            // All rank-1 writes and the create batch have finished. Share one
-            // authoritative snapshot across this namespace's proxy updates.
-            // Its unmodeled fields (nested or top-level) are deliberately not
-            // re-checked: `prepare_apply` already refused rows carrying them,
-            // and a field appearing in between is a narrow, inherent race.
-            post_plugin_snapshot = Some(
-                match client.get_backup_snapshot_for_mutation(namespace).await {
-                    Ok(snapshot) => {
-                        if let Err(error) = ensure_authoritative_view(client) {
-                            result.fatal_error = Some(error.to_string());
-                            return Ok(result);
-                        }
-                        Ok(snapshot.config)
-                    }
-                    Err(error) if is_fatal(&error) => {
-                        result.fatal_error = Some(error.to_string());
-                        return Ok(result);
-                    }
-                    Err(error) => Err(error.to_string()),
-                },
-            );
-        }
-        // Creates need no confirmation: `POST` and `POST /batch` are create-only,
-        // so the gateway refuses an id someone else took after the plan. A
-        // post-plugin proxy update is confirmed against the fresher post-plugin
-        // snapshot in `update_proxy_after_plugins`. Every other Modify, Delete
-        // and pending-create assertion overwrites a row the plan judged from
-        // `actual`, so it must still be that row now.
-        let associations_rewritten =
-            diff.kind == "Proxy" && changed_proxy_associations.contains(&diff.id);
-        let mut stale_plan = None;
-        if diff.action == DiffAction::Delete
-            || (diff.action == DiffAction::Modify && !associations_rewritten)
-        {
-            if confirmation.is_none() {
-                confirmation = Some(
-                    match PlanConfirmation::read(client, namespace, actual).await {
-                        Ok(confirmed) => Ok(confirmed),
-                        Err(error) if is_fatal(&error) => {
-                            result.fatal_error = Some(error.to_string());
-                            return Ok(result);
-                        }
-                        Err(error) => Err(error.to_string()),
-                    },
-                );
-            }
-            stale_plan = match &confirmation {
-                Some(Ok(confirmed)) => confirmed.refusal(diff, associations_rewritten),
-                Some(Err(error)) => Some(format!(
-                    "not sent: the confirmation read before overwriting planned rows failed ({error}), so the plan cannot be shown to match the gateway. Re-run apply"
-                )),
-                None => Some("not sent: no confirmation read was taken".to_string()),
-            };
-        }
+        // Creates need no precondition: `POST` and `POST /batch` are
+        // create-only, so the gateway refuses an id someone else took after
+        // the plan. Every Modify, Delete and pending-create assertion goes
+        // through `preconditions`, which sends it only with `If-Match` on a
+        // fresh read that still matches the plan.
         let outcome = match (&diff.action, diff.kind.as_str()) {
-            _ if stale_plan.is_some() => {
-                Err(crate::error::Error::Config(stale_plan.take().unwrap_or_default()))
-            }
             (DiffAction::Add, "Proxy") => match index.proxies.get(&key) {
                 Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
                     Err(failed_plugin_dependency(p, &failed_plugins))
@@ -1828,33 +1782,11 @@ async fn apply_incremental(
                     Err(failed_plugin_dependency(p, &failed_plugins))
                 }
                 Some(p) if changed_proxy_associations.contains(&diff.id) => {
-                    match &post_plugin_snapshot {
-                        Some(Ok(snapshot)) => {
-                            update_proxy_after_plugins(
-                                p,
-                                planned_rows.proxies.get(&key).copied(),
-                                snapshot,
-                                client,
-                                namespace,
-                                ownership_scope,
-                                options,
-                            )
-                            .await
-                        }
-                        Some(Err(error)) => Err(crate::error::Error::Config(error.clone())),
-                        None => Err(crate::error::Error::Config(
-                            "post-plugin backup unavailable; proxy update not attempted"
-                                .to_string(),
-                        )),
-                    }
+                    update_proxy_after_plugins(p, &preconditions, ownership_scope, options).await
                 }
-                Some(p) => client.update_proxy(p, namespace).await.map(applied),
+                Some(p) => preconditions.update(CreateResource::Proxy(p)).await,
                 None => continue,
             },
-            (DiffAction::Delete, "Proxy") => client
-                .delete_proxy(&diff.id, namespace)
-                .await
-                .map(OpOutcome::from),
 
             (DiffAction::Add, "Consumer") => match index.consumers.get(&key) {
                 Some(c) => {
@@ -1865,13 +1797,9 @@ async fn apply_incremental(
                 None => continue,
             },
             (DiffAction::Modify, "Consumer") => match index.consumers.get(&key) {
-                Some(c) => client.update_consumer(c, namespace).await.map(applied),
+                Some(c) => preconditions.update(CreateResource::Consumer(c)).await,
                 None => continue,
             },
-            (DiffAction::Delete, "Consumer") => client
-                .delete_consumer(&diff.id, namespace)
-                .await
-                .map(OpOutcome::from),
 
             (DiffAction::Add, "Upstream") => match index.upstreams.get(&key) {
                 Some(u) => {
@@ -1882,13 +1810,9 @@ async fn apply_incremental(
                 None => continue,
             },
             (DiffAction::Modify, "Upstream") => match index.upstreams.get(&key) {
-                Some(u) => client.update_upstream(u, namespace).await.map(applied),
+                Some(u) => preconditions.update(CreateResource::Upstream(u)).await,
                 None => continue,
             },
-            (DiffAction::Delete, "Upstream") => client
-                .delete_upstream(&diff.id, namespace)
-                .await
-                .map(OpOutcome::from),
 
             (DiffAction::Add, "PluginConfig") => match index.plugin_configs.get(&key) {
                 Some(p) => {
@@ -1899,13 +1823,13 @@ async fn apply_incremental(
                 None => continue,
             },
             (DiffAction::Modify, "PluginConfig") => match index.plugin_configs.get(&key) {
-                Some(p) => client.update_plugin_config(p, namespace).await.map(applied),
+                Some(p) => preconditions.update(CreateResource::PluginConfig(p)).await,
                 None => continue,
             },
-            (DiffAction::Delete, "PluginConfig") => client
-                .delete_plugin_config(&diff.id, namespace)
-                .await
-                .map(OpOutcome::from),
+
+            (DiffAction::Delete, "Proxy" | "Consumer" | "Upstream" | "PluginConfig") => {
+                preconditions.delete(&diff.kind, &diff.id).await
+            }
 
             _ => continue,
         };
@@ -1976,6 +1900,9 @@ async fn apply_incremental(
                 return Ok(result);
             }
             Err(e) => {
+                if matches!(e, crate::error::Error::StalePlan(_)) {
+                    plan_stale = Some(format!("{} `{}`", diff.kind, diff.id));
+                }
                 if matches!(diff.action, DiffAction::Add | DiffAction::Modify) {
                     writes_failed = true;
                     if diff.kind == "PluginConfig" {
@@ -2002,21 +1929,53 @@ async fn apply_incremental(
     // Claim declared rows that were already identical. Per-resource failures
     // above do not block this: an adoption candidate is by definition a row no
     // operation touched, so a neighbour's failed update says nothing about it,
-    // and leaving it unclaimed is precisely the bug being fixed.
-    adopt_matching_rows(
+    // and leaving it unclaimed is precisely the bug being fixed. A plan proved
+    // stale does block it: nothing more is written to this namespace.
+    let adoption = AdoptionContext {
         desired,
         actual,
+        index: &index,
+        diffs: &diffs,
+        stale_plan: plan_stale.as_deref(),
+    };
+    adopt_matching_rows(
+        &adoption,
         client,
         namespace,
         ownership_scope,
-        &index,
-        &diffs,
         options,
         &mut result,
     )
     .await;
 
     Ok(result)
+}
+
+/// Withhold one write in a namespace whose plan an earlier refusal proved
+/// stale. A withheld Add or Modify is an error; a withheld Delete is deferred.
+fn withhold_after_stale_plan(diff: &ResourceDiff, first: &str, result: &mut ApplyResult) {
+    let reason = format!(
+        "{first} changed after this run planned namespace `{}`, so the namespace's remaining writes were withheld. Re-run apply to plan against the current gateway",
+        diff.namespace
+    );
+    if diff.action == DiffAction::Delete {
+        result.deletes_deferred += 1;
+        eprintln!(
+            "[{}] DEFER DELETE {} `{}`: {}",
+            safe(&diff.namespace),
+            safe(&diff.kind),
+            safe(&diff.id),
+            safe_line(&reason)
+        );
+        return;
+    }
+    let verb = if diff.action == DiffAction::Add {
+        "create"
+    } else {
+        "update"
+    };
+    let message = format!("{} {} {verb}: not sent: {reason}", diff.kind, diff.id);
+    result.errors.push(message);
 }
 
 fn proxy_has_failed_plugin(proxy: &Proxy, failed_plugins: &BTreeSet<String>) -> bool {
@@ -2122,52 +2081,54 @@ fn partition_cyclic_creates(
     (blocked, attempt)
 }
 
-/// Use the namespace snapshot read after Edge's attachment/detachment writes.
-/// Never infer proxy reconciliation from a plugin response alone. A shared
-/// unowned or pending row still needs its explicit ownership assertion.
+/// Update a proxy whose associations this run's own plugin writes rewrote.
 ///
-/// That snapshot also serves as the proxy's confirmation read (see
-/// [`PlanConfirmation`]): a proxy an API spec claimed since the plan is
-/// refused, and so is one whose fields other than `plugins` changed. The
-/// associations are excluded because the gateway rewrites them itself when
-/// this run creates, retargets or removes a scoped plugin.
+/// Never infer proxy reconciliation from a plugin response alone: the proxy is
+/// read again after Edge's attachment/detachment writes. A shared unowned or
+/// pending row still needs its explicit ownership assertion.
+///
+/// That read is also the proxy's precondition (see [`Preconditions`]): a proxy
+/// an API spec claimed since the plan is refused, and so is one whose fields
+/// other than `plugins` changed. The associations are excluded because the
+/// gateway rewrites them itself when this run creates, retargets or removes a
+/// scoped plugin. The update is sent with `If-Match` on that read.
 async fn update_proxy_after_plugins(
     proxy: &Proxy,
-    planned: Option<&Proxy>,
-    snapshot: &GatewayConfig,
-    client: &AdminClient,
-    namespace: &str,
+    preconditions: &Preconditions<'_>,
     ownership_scope: OwnershipScope<'_>,
     options: &ApplyOptions,
 ) -> crate::error::Result<OpOutcome> {
-    ensure_authoritative_view(client)?;
-    let live = snapshot
-        .proxies
-        .iter()
-        .find(|live| live.namespace == namespace && live.id == proxy.id)
-        .ok_or_else(|| {
-            crate::error::Error::Config(format!(
-                "proxy `{}` disappeared after plugin writes; re-run apply",
-                proxy.id
-            ))
-        })?;
+    let client = preconditions.client;
+    let namespace = preconditions.namespace;
+    let Some(tagged) = client.get_tagged("Proxy", &proxy.id, namespace).await? else {
+        return Err(crate::error::Error::StalePlan(format!(
+            "proxy `{}` disappeared after plugin writes; no proxy update was attempted. Re-run apply",
+            proxy.id
+        )));
+    };
+    let (live, dropped): (Proxy, _) = decode_live_row("Proxy", &tagged.body)?;
+    refuse_dropped_field(dropped)?;
     if let Some(spec_id) = &live.api_spec_id {
-        return Err(crate::error::Error::Config(format!(
+        return Err(crate::error::Error::StalePlan(format!(
             "proxy `{}` became owned by API spec `{spec_id}` after plugin writes; no proxy update was attempted. Re-run apply to reassess namespace ownership",
             proxy.id
         )));
     }
-    if planned.is_some_and(|planned| proxy_changed_outside_associations(planned, live)) {
-        return Err(crate::error::Error::Config(STALE_PLAN_CHANGED.to_string()));
-    }
     let key = state_key(namespace, "Proxy", &proxy.id);
+    let observed = observed_row("Proxy", None, &live)?;
+    if let Some(reason) = stale_reason(preconditions.planned.get(&key), &observed, &["plugins"]) {
+        return Err(crate::error::Error::StalePlan(reason));
+    }
     let needs_assertion = options.pending_create_assertions.contains(&key)
         || matches!(ownership_scope, OwnershipScope::Shared { .. })
             && !options.managed_ledger.contains(&key);
-    if !needs_assertion && compare_fields("Proxy", proxy, live).is_empty() {
+    if !needs_assertion && compare_fields("Proxy", proxy, &live).is_empty() {
         return Ok(OpOutcome::Unchanged);
     }
-    client.update_proxy(proxy, namespace).await.map(applied)
+    client
+        .update_if_match("Proxy", &proxy.id, proxy, namespace, &tagged.etag)
+        .await
+        .map(applied)
 }
 
 /// Why a planned overwrite was withheld because its row changed after the plan.
@@ -2179,37 +2140,249 @@ const STALE_PLAN_CHANGED: &str =
 const STALE_PLAN_OWNERSHIP: &str =
     "not sent: the live row's API-spec ownership changed after this run planned the write. Re-run apply to plan against the current gateway";
 
-/// Proves, immediately before an incremental namespace's first overwrite, that
-/// the rows the plan will overwrite are still the rows it planned against.
+/// Why a planned update was withheld because its row no longer exists.
+const STALE_PLAN_GONE: &str =
+    "not sent: the live row no longer exists, so it changed after this run planned the write. Re-run apply to plan against the current gateway";
+
+/// Makes every incremental overwrite conditional on the row the plan judged.
 ///
 /// The plan is computed from a live view the caller may have read long before
 /// the first write: `cmd_apply` reads every namespace's `/backup`, then
 /// allocates and delivers credentials and journals creates, and only then
-/// applies. A concurrent `/api-specs` import or admin edit in that window would
-/// otherwise be overwritten (a PUT) or removed (a DELETE) from a stale
-/// ownership decision. So the first Modify, Delete or pending-create assertion
-/// in a namespace takes one authoritative `GET /backup`, and every such write
-/// is refused (an ordinary per-resource error, which also defers the
-/// namespace's deletes after a refused Modify) when its row:
+/// applies. A concurrent `/api-specs` import or admin edit in that window must
+/// not be overwritten (a PUT) or removed (a DELETE) from a stale ownership
+/// decision. So every Modify, Delete and pending-create assertion:
 ///
-/// - gained, lost or changed its `api_spec_id` (ownership moved), or
-/// - changed in any field other than server timestamps.
+/// 1. reads the row with `GET /<kind>/{id}`, which Ferrum Edge answers with a
+///    strong `ETag` for the stored representation;
+/// 2. refuses the write (as [`crate::error::Error::StalePlan`]) when that row
+///    gained, lost or changed its `api_spec_id`, or changed in any field other
+///    than server timestamps, since the plan; and
+/// 3. sends the write with `If-Match: <etag>`. Edge compares the tag and
+///    commits under one namespace admission lease that every admin writer
+///    takes, so a change after the read is refused with `412` (also
+///    `StalePlan`) instead of being overwritten.
 ///
-/// A row that is gone from the confirmation read is left to the write itself:
-/// a DELETE answers 404 (tolerated) and a PUT answers 404 (an error), so
-/// neither can touch a row someone else owns. A cached or duplicate-bearing
-/// confirmation stops the run like every other such view; a failed read refuses
-/// every overwrite in the namespace.
+/// A row that is gone needs no write to be deleted, so its DELETE is not sent
+/// and is counted as already gone; an update of a row that is gone is
+/// refused. A row served from cache, or one without a strong `ETag`, stops the
+/// run: no write to it can be made conditional.
 ///
-/// This narrows the race to one read-to-write interval per namespace; it cannot
-/// close it. `/backup` carries no per-row revision that a `PUT` or `DELETE`
-/// could be made conditional on, so a change landing between this read and a
-/// write is still overwritten.
-struct PlanConfirmation {
+/// Consumers need one more read. Edge redacts consumer credentials on a
+/// single-resource `GET`, although its tag covers them, so the read cannot show
+/// that the credentials still match the plan. Every consumer the namespace
+/// will overwrite is therefore read first, then one `/backup` (which carries
+/// the credentials) is read after all of them: a change before a consumer's
+/// read shows in the backup, and a change after it fails the `If-Match`.
+struct Preconditions<'a> {
+    client: &'a AdminClient,
+    namespace: &'a str,
     /// Rows as the plan saw them, keyed by `namespace:Kind:id`.
     planned: HashMap<String, ObservedRow>,
-    /// Rows as the confirmation read saw them.
-    confirmed: HashMap<String, ObservedRow>,
+    /// Every consumer this namespace overwrites, in diff order.
+    consumer_targets: Vec<String>,
+    /// Filled by the first consumer overwrite. `Err` when the backup read
+    /// failed, which refuses every consumer overwrite in the namespace.
+    consumers: Option<Result<HashMap<String, ConsumerPrecondition>, String>>,
+}
+
+/// What the consumer reads decided for one consumer.
+enum ConsumerPrecondition {
+    /// Matches the plan; write with `If-Match` on `etag`. `dropped` is the
+    /// first nested field the typed decode dropped, which refuses an update.
+    Ready {
+        etag: String,
+        dropped: Option<String>,
+    },
+    /// No row holds the id.
+    Gone,
+    /// Changed since the plan.
+    Stale(String),
+    /// Could not be read.
+    Failed(String),
+}
+
+impl<'a> Preconditions<'a> {
+    fn new(
+        client: &'a AdminClient,
+        namespace: &'a str,
+        planned: &GatewayConfig,
+        diffs: &[ResourceDiff],
+    ) -> crate::error::Result<Self> {
+        let consumer_targets = diffs
+            .iter()
+            .filter(|diff| diff.kind == "Consumer" && diff.action != DiffAction::Add)
+            .map(|diff| diff.id.clone())
+            .collect();
+        Ok(Self {
+            client,
+            namespace,
+            planned: observe_rows(planned)?,
+            consumer_targets,
+            consumers: None,
+        })
+    }
+
+    /// Send the planned update of `resource` conditionally.
+    async fn update(&mut self, resource: CreateResource<'_>) -> crate::error::Result<OpOutcome> {
+        match self.confirm(resource.kind(), resource.id(), true).await? {
+            Some(etag) => resource
+                .update_if_match(self.client, self.namespace, &etag)
+                .await
+                .map(applied),
+            None => Err(crate::error::Error::StalePlan(STALE_PLAN_GONE.to_string())),
+        }
+    }
+
+    /// Send the planned delete of `kind`/`id` conditionally.
+    async fn delete(&mut self, kind: &str, id: &str) -> crate::error::Result<OpOutcome> {
+        match self.confirm(kind, id, false).await? {
+            Some(etag) => self
+                .client
+                .delete_if_match(kind, id, self.namespace, &etag)
+                .await
+                .map(OpOutcome::from),
+            None => Ok(OpOutcome::AlreadyGone),
+        }
+    }
+
+    /// The tag to write `kind`/`id` with, or `None` when no row holds it.
+    ///
+    /// An `update` also refuses a row carrying a nested field this client does
+    /// not model: the rewrite would reset it, and `prepare_apply` refused every
+    /// rewritten row carrying one at plan time, so it is new.
+    async fn confirm(
+        &mut self,
+        kind: &str,
+        id: &str,
+        update: bool,
+    ) -> crate::error::Result<Option<String>> {
+        if kind == "Consumer" {
+            return self.confirm_consumer(id, update).await;
+        }
+        let Some(tagged) = self.client.get_tagged(kind, id, self.namespace).await? else {
+            return Ok(None);
+        };
+        let (live, dropped) = observe_body(kind, &tagged.body)?;
+        if update {
+            refuse_dropped_field(dropped)?;
+        }
+        let planned = self.planned.get(&state_key(self.namespace, kind, id));
+        match stale_reason(planned, &live, &[]) {
+            Some(reason) => Err(crate::error::Error::StalePlan(reason)),
+            None => Ok(Some(tagged.etag)),
+        }
+    }
+
+    async fn confirm_consumer(
+        &mut self,
+        id: &str,
+        update: bool,
+    ) -> crate::error::Result<Option<String>> {
+        if self.consumers.is_none() {
+            let reads = self.read_consumers().await?;
+            self.consumers = Some(reads);
+        }
+        let read = match self.consumers.as_mut() {
+            Some(Ok(reads)) => reads.remove(id),
+            Some(Err(error)) => {
+                return Err(crate::error::Error::Config(format!(
+                    "not sent: the backup read that confirms consumer credentials before overwriting them failed ({error}), so the plan cannot be shown to match the gateway. Re-run apply"
+                )));
+            }
+            None => None,
+        };
+        match read {
+            Some(ConsumerPrecondition::Ready { etag, dropped }) => {
+                if update {
+                    refuse_dropped_field(dropped)?;
+                }
+                Ok(Some(etag))
+            }
+            Some(ConsumerPrecondition::Gone) => Ok(None),
+            Some(ConsumerPrecondition::Stale(reason)) => {
+                Err(crate::error::Error::StalePlan(reason))
+            }
+            Some(ConsumerPrecondition::Failed(reason)) => Err(crate::error::Error::Config(reason)),
+            None => Err(crate::error::Error::Config(
+                "not sent: no conditional read was taken for this consumer".to_string(),
+            )),
+        }
+    }
+
+    /// Read every consumer target, then one `/backup`, and decide each one.
+    ///
+    /// The outer `Err` is run-stopping; the inner one is a failed backup read.
+    async fn read_consumers(
+        &self,
+    ) -> crate::error::Result<Result<HashMap<String, ConsumerPrecondition>, String>> {
+        let mut reads = Vec::with_capacity(self.consumer_targets.len());
+        for id in &self.consumer_targets {
+            let read = match self.client.get_tagged("Consumer", id, self.namespace).await {
+                Ok(read) => Ok(read),
+                Err(error) if is_fatal(&error) => return Err(error),
+                Err(error) => Err(error.to_string()),
+            };
+            reads.push((id, read));
+        }
+        let snapshot = match self
+            .client
+            .get_backup_snapshot_for_mutation(self.namespace)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) if is_fatal(&error) => return Err(error),
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+        // The client's sticky flag is already set for a cached read; this
+        // turns it into the run-stopping error every other cached view gets.
+        ensure_authoritative_view(self.client)?;
+        let confirmed = observe_rows(&snapshot.config)?;
+        let mut decided = HashMap::with_capacity(reads.len());
+        for (id, read) in reads {
+            let key = state_key(self.namespace, "Consumer", id);
+            let planned = self.planned.get(&key);
+            let verdict = consumer_precondition(planned, confirmed.get(&key), read);
+            decided.insert(id.clone(), verdict);
+        }
+        Ok(Ok(decided))
+    }
+}
+
+/// Decide one consumer from its tagged read and the backup read after it.
+fn consumer_precondition(
+    planned: Option<&ObservedRow>,
+    confirmed: Option<&ObservedRow>,
+    read: Result<Option<http_client::TaggedResource>, String>,
+) -> ConsumerPrecondition {
+    let tagged = match read {
+        Ok(Some(tagged)) => tagged,
+        Ok(None) if confirmed.is_none() => return ConsumerPrecondition::Gone,
+        Ok(None) => return ConsumerPrecondition::Stale(STALE_PLAN_CHANGED.to_string()),
+        Err(error) => {
+            return ConsumerPrecondition::Failed(format!(
+                "not sent: the conditional read failed ({error}), so the consumer cannot be shown to match the plan. Re-run apply"
+            ));
+        }
+    };
+    // The backup row carries the credentials the tagged read redacts.
+    let Some(confirmed) = confirmed else {
+        return ConsumerPrecondition::Stale(STALE_PLAN_CHANGED.to_string());
+    };
+    if let Some(reason) = stale_reason(planned, confirmed, &[]) {
+        return ConsumerPrecondition::Stale(reason);
+    }
+    let (live, dropped) = match observe_body("Consumer", &tagged.body) {
+        Ok(observed) => observed,
+        Err(error) => return ConsumerPrecondition::Failed(format!("not sent: {error}")),
+    };
+    match stale_reason(planned, &live, &["credentials"]) {
+        Some(reason) => ConsumerPrecondition::Stale(reason),
+        None => ConsumerPrecondition::Ready {
+            etag: tagged.etag,
+            dropped,
+        },
+    }
 }
 
 /// One row's ownership tag and comparable content.
@@ -2220,121 +2393,146 @@ struct ObservedRow {
     value: serde_json::Value,
 }
 
-impl PlanConfirmation {
-    async fn read(
-        client: &AdminClient,
-        namespace: &str,
-        planned: &GatewayConfig,
-    ) -> crate::error::Result<Self> {
-        let snapshot = client.get_backup_snapshot_for_mutation(namespace).await?;
-        // A cached read clears `api_spec_id`, so it cannot confirm ownership.
-        // The client's sticky flag is already set; this turns it into the
-        // run-stopping error every other cached view produces.
-        ensure_authoritative_view(client)?;
-        Ok(Self {
-            planned: observe_rows(planned)?,
-            confirmed: observe_rows(&snapshot.config)?,
-        })
-    }
-
-    /// `Some(reason)` when the planned write for `diff` must not be sent.
-    ///
-    /// `associations_rewritten` excludes a proxy's `plugins` from the content
-    /// comparison: this run's own plugin writes make the gateway rewrite them.
-    fn refusal(&self, diff: &ResourceDiff, associations_rewritten: bool) -> Option<String> {
-        let key = state_key(&diff.namespace, &diff.kind, &diff.id);
-        let confirmed = self.confirmed.get(&key)?;
-        let planned = self.planned.get(&key);
-        let planned_owner = planned.and_then(|row| row.api_spec_id.as_deref());
-        if planned_owner != confirmed.api_spec_id.as_deref() {
-            return Some(match &confirmed.api_spec_id {
-                Some(spec) => format!(
-                    "not sent: the live row became owned by API spec `{spec}` after this run planned the write. Re-run apply to plan against the current gateway"
-                ),
-                None => STALE_PLAN_OWNERSHIP.to_string(),
-            });
-        }
-        let unchanged = planned.is_some_and(|planned| {
-            if associations_rewritten {
-                without_associations(&planned.value) == without_associations(&confirmed.value)
-            } else {
-                planned.value == confirmed.value
-            }
+/// `Some(reason)` when `live` is not the row the plan judged.
+///
+/// `ignored` top-level keys are left out of the content comparison: the proxy
+/// associations this run's own plugin writes rewrote, or the consumer
+/// credentials a single-resource read redacts.
+fn stale_reason(
+    planned: Option<&ObservedRow>,
+    live: &ObservedRow,
+    ignored: &[&str],
+) -> Option<String> {
+    let Some(planned) = planned else {
+        return Some(STALE_PLAN_CHANGED.to_string());
+    };
+    if planned.api_spec_id != live.api_spec_id {
+        return Some(match &live.api_spec_id {
+            Some(spec) => format!(
+                "not sent: the live row became owned by API spec `{spec}` after this run planned the write. Re-run apply to plan against the current gateway"
+            ),
+            None => STALE_PLAN_OWNERSHIP.to_string(),
         });
-        (!unchanged).then(|| STALE_PLAN_CHANGED.to_string())
     }
+    let unchanged = without_keys(&planned.value, ignored) == without_keys(&live.value, ignored);
+    (!unchanged).then(|| STALE_PLAN_CHANGED.to_string())
+}
+
+/// `row` as an [`ObservedRow`].
+fn observed_row<T: serde::Serialize>(
+    kind: &str,
+    api_spec_id: Option<&str>,
+    row: &T,
+) -> crate::error::Result<ObservedRow> {
+    let value = comparison_value(kind, row).ok_or_else(|| {
+        crate::error::Error::Config(format!(
+            "a {kind} row could not be serialized for comparison"
+        ))
+    })?;
+    Ok(ObservedRow {
+        api_spec_id: api_spec_id.map(str::to_string),
+        value,
+    })
 }
 
 /// Every row of one live view as an [`ObservedRow`], keyed by
 /// `namespace:Kind:id`. Duplicate identities are refused, as on every other
 /// view a mutation is authorized from.
 fn observe_rows(config: &GatewayConfig) -> crate::error::Result<HashMap<String, ObservedRow>> {
-    fn observe<T: serde::Serialize>(
-        rows: &mut HashMap<String, ObservedRow>,
-        kind: &str,
-        (namespace, id): (&str, &str),
-        api_spec_id: Option<&str>,
-        row: &T,
-    ) -> crate::error::Result<()> {
-        let value = comparison_value(kind, row).ok_or_else(|| {
-            crate::error::Error::Config(format!(
-                "{kind} `{id}` in namespace `{namespace}` could not be serialized for comparison"
-            ))
-        })?;
-        let observed = ObservedRow {
-            api_spec_id: api_spec_id.map(str::to_string),
-            value,
-        };
-        rows.insert(state_key(namespace, kind, id), observed);
-        Ok(())
-    }
-
     crate::config::validate_unique_live_resource_keys(config)?;
     let mut rows = HashMap::new();
     for row in &config.proxies {
-        let key = (row.namespace.as_str(), row.id.as_str());
-        let owner = row.api_spec_id.as_deref();
-        observe(&mut rows, "Proxy", key, owner, row)?;
+        let observed = observed_row("Proxy", row.api_spec_id.as_deref(), row)?;
+        rows.insert(state_key(&row.namespace, "Proxy", &row.id), observed);
     }
     for row in &config.consumers {
-        let key = (row.namespace.as_str(), row.id.as_str());
-        observe(&mut rows, "Consumer", key, None, row)?;
+        let observed = observed_row("Consumer", None, row)?;
+        rows.insert(state_key(&row.namespace, "Consumer", &row.id), observed);
     }
     for row in &config.upstreams {
-        let key = (row.namespace.as_str(), row.id.as_str());
-        let owner = row.api_spec_id.as_deref();
-        observe(&mut rows, "Upstream", key, owner, row)?;
+        let observed = observed_row("Upstream", row.api_spec_id.as_deref(), row)?;
+        rows.insert(state_key(&row.namespace, "Upstream", &row.id), observed);
     }
     for row in &config.plugin_configs {
-        let key = (row.namespace.as_str(), row.id.as_str());
-        let owner = row.api_spec_id.as_deref();
-        observe(&mut rows, "PluginConfig", key, owner, row)?;
+        let observed = observed_row("PluginConfig", row.api_spec_id.as_deref(), row)?;
+        rows.insert(state_key(&row.namespace, "PluginConfig", &row.id), observed);
     }
     Ok(rows)
 }
 
-/// A comparison value without the proxy `plugins` association list.
-fn without_associations(value: &serde_json::Value) -> serde_json::Value {
-    let mut value = value.clone();
-    if let Some(map) = value.as_object_mut() {
-        map.remove("plugins");
-    }
-    value
+/// A single-resource read as an [`ObservedRow`], with the first nested field
+/// its typed decode dropped (see [`decode_live_row`]).
+fn observe_body(
+    kind: &str,
+    body: &serde_json::Value,
+) -> crate::error::Result<(ObservedRow, Option<String>)> {
+    let (observed, dropped) = match kind {
+        "Proxy" => {
+            let (row, dropped): (Proxy, _) = decode_live_row(kind, body)?;
+            (observed_row(kind, row.api_spec_id.as_deref(), &row)?, dropped)
+        }
+        "Consumer" => {
+            let (row, dropped): (Consumer, _) = decode_live_row(kind, body)?;
+            (observed_row(kind, None, &row)?, dropped)
+        }
+        "Upstream" => {
+            let (row, dropped): (Upstream, _) = decode_live_row(kind, body)?;
+            (observed_row(kind, row.api_spec_id.as_deref(), &row)?, dropped)
+        }
+        "PluginConfig" => {
+            let (row, dropped): (PluginConfig, _) = decode_live_row(kind, body)?;
+            (observed_row(kind, row.api_spec_id.as_deref(), &row)?, dropped)
+        }
+        other => {
+            return Err(crate::error::Error::Config(format!(
+                "no conditional write for resource kind `{other}`"
+            )));
+        }
+    };
+    Ok((observed, dropped))
 }
 
-/// Did anything about a proxy other than its associations and server
-/// timestamps change between the plan's view and `live`? An unserializable row
-/// counts as changed.
-fn proxy_changed_outside_associations(planned: &Proxy, live: &Proxy) -> bool {
-    match (
-        comparison_value("Proxy", planned),
-        comparison_value("Proxy", live),
-    ) {
-        (Some(planned), Some(live)) => {
-            without_associations(&planned) != without_associations(&live)
+/// Decode one single-resource read, with the first nested field the typed
+/// mirror dropped. Top-level unknown fields are kept in the row's flattened
+/// `extra` map, so the content comparison already sees those.
+fn decode_live_row<T: serde::de::DeserializeOwned>(
+    kind: &str,
+    body: &serde_json::Value,
+) -> crate::error::Result<(T, Option<String>)> {
+    let mut dropped = None;
+    let row = serde_ignored::deserialize(body.clone(), |path| {
+        if dropped.is_none() {
+            dropped = Some(path.to_string());
         }
-        _ => true,
+    })
+    .map_err(|error| {
+        crate::error::Error::HttpClient(format!(
+            "the gateway returned a {kind} this client cannot read: {error}"
+        ))
+    })?;
+    Ok((row, dropped))
+}
+
+/// Refuse an update whose live row carries a nested field this client does
+/// not model: the write is built from the repository row and would reset it.
+fn refuse_dropped_field(dropped: Option<String>) -> crate::error::Result<()> {
+    match dropped {
+        Some(field) => Err(crate::error::Error::StalePlan(format!(
+            "not sent: the live row now carries `{field}`, which this build of gitforgeops does not model, so the write would reset it. Re-run apply to plan against the current gateway"
+        ))),
+        None => Ok(()),
     }
+}
+
+/// A comparison value without the given top-level keys.
+fn without_keys(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    let mut value = value.clone();
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            map.remove(*key);
+        }
+    }
+    value
 }
 
 /// New scoped configs and their new target proxies need a create transaction,
@@ -2465,11 +2663,15 @@ pub fn adoption_summary_line(adopted: usize) -> Option<String> {
 /// authority over somebody else's resource. The PUT makes the repository the
 /// row's last writer, which is a claim the gateway acknowledged.
 ///
-/// Because that PUT overwrites the row, it is issued only against a *freshly
-/// re-read* authoritative backup: a human edit landing between this run's diff
-/// and this assertion would otherwise be silently reverted. A row that moved is
-/// skipped with a per-resource message and stays unclaimed; the next run sees
-/// it as an ordinary Modify.
+/// Because that PUT overwrites the row, it is conditional: each candidate is
+/// read with `GET /<kind>/{id}` and must still be exactly the declared row,
+/// unowned by any API spec, and the PUT carries `If-Match` on that read (see
+/// [`Preconditions`]). A human edit landing between this run's diff and the
+/// assertion would otherwise be silently reverted. A row that moved is skipped
+/// with a per-resource message and stays unclaimed; the next run sees it as an
+/// ordinary Modify. A freshly re-read authoritative backup also has to show the
+/// row unchanged; it is the only read that shows consumer credentials, so
+/// every consumer candidate is read before it.
 ///
 /// **Exclusive mode** writes nothing. The repo is already authoritative for the
 /// namespace and does not need a claim; the ledger entry is recorded anyway so
@@ -2477,25 +2679,29 @@ pub fn adoption_summary_line(adopted: usize) -> Option<String> {
 ///
 /// Nothing is adopted from a cached (`X-Data-Source: cached`) view in either
 /// mode: that backup clears `api_spec_id` tags, so it cannot prove a row is not
-/// spec-owned.
-#[allow(clippy::too_many_arguments)]
+/// spec-owned. Nothing is adopted from a namespace whose plan an earlier
+/// refusal proved stale either.
 async fn adopt_matching_rows(
-    desired: &GatewayConfig,
-    actual: &GatewayConfig,
+    context: &AdoptionContext<'_>,
     client: &AdminClient,
     namespace: &str,
     ownership_scope: OwnershipScope<'_>,
-    index: &DesiredIndex<'_>,
-    diffs: &[ResourceDiff],
     options: &ApplyOptions,
     result: &mut ApplyResult,
 ) {
-    let handled: BTreeSet<String> = diffs
+    let handled: BTreeSet<String> = context
+        .diffs
         .iter()
         .map(|d| state_key(&d.namespace, &d.kind, &d.id))
         .chain(options.pending_create_assertions.iter().cloned())
         .collect();
-    let candidates = match adoption_candidates(desired, actual, &options.managed_ledger, &handled) {
+    let candidates = adoption_candidates(
+        context.desired,
+        context.actual,
+        &options.managed_ledger,
+        &handled,
+    );
+    let candidates = match candidates {
         Ok(candidates) => candidates,
         Err(error) => {
             result.fatal_error = Some(error.to_string());
@@ -2517,6 +2723,14 @@ async fn adopt_matching_rows(
             .push(format!("[{namespace}] {message}"));
     };
 
+    if let Some(first) = context.stale_plan {
+        skip_all(
+            result,
+            format!("{first} changed after this run planned the namespace"),
+        );
+        return;
+    }
+
     if client.served_from_cache() {
         skip_all(
             result,
@@ -2525,113 +2739,178 @@ async fn adopt_matching_rows(
         return;
     }
 
-    // Exclusive mode asserts nothing, so there is nothing to overwrite and no
-    // confirmation read to make.
-    let confirmation = match ownership_scope {
-        OwnershipScope::Exclusive => None,
-        OwnershipScope::Shared { .. } => {
-            // The confirmation read's `unmodeled_nested_fields` are not
-            // re-checked; `prepare_apply` refused every candidate carrying
-            // them, and one appearing since is a narrow, inherent race.
-            match client.get_backup_snapshot_for_mutation(namespace).await {
-                Ok(snapshot) if snapshot.cached => {
-                    skip_all(
-                        result,
-                        "the confirmation backup was served from cache (X-Data-Source: cached)"
-                            .to_string(),
-                    );
-                    return;
-                }
-                Ok(snapshot) => Some(snapshot.config),
-                Err(error) if is_fatal(&error) => {
-                    result.fatal_error = Some(error.to_string());
-                    return;
-                }
-                Err(error) => {
-                    skip_all(
-                        result,
-                        format!("the confirmation backup could not be read: {error}"),
-                    );
-                    return;
-                }
+    let index = context.index;
+    let resources: Vec<CreateResource<'_>> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let key = (candidate.namespace.as_str(), candidate.id.as_str());
+            match candidate.kind.as_str() {
+                "Proxy" => index.proxies.get(&key).copied().map(CreateResource::Proxy),
+                "Consumer" => index
+                    .consumers
+                    .get(&key)
+                    .copied()
+                    .map(CreateResource::Consumer),
+                "Upstream" => index
+                    .upstreams
+                    .get(&key)
+                    .copied()
+                    .map(CreateResource::Upstream),
+                "PluginConfig" => index
+                    .plugin_configs
+                    .get(&key)
+                    .copied()
+                    .map(CreateResource::PluginConfig),
+                _ => None,
             }
-        }
-    };
-    let confirmation = confirmation.as_ref().map(LiveIndex::build);
+        })
+        .collect();
 
-    for candidate in &candidates {
-        let key = (candidate.namespace.as_str(), candidate.id.as_str());
-        let resource = match candidate.kind.as_str() {
-            "Proxy" => index.proxies.get(&key).copied().map(CreateResource::Proxy),
-            "Consumer" => index
-                .consumers
-                .get(&key)
-                .copied()
-                .map(CreateResource::Consumer),
-            "Upstream" => index
-                .upstreams
-                .get(&key)
-                .copied()
-                .map(CreateResource::Upstream),
-            "PluginConfig" => index
-                .plugin_configs
-                .get(&key)
-                .copied()
-                .map(CreateResource::PluginConfig),
-            _ => None,
-        };
-        let Some(resource) = resource else { continue };
-
-        if let Some(confirmation) = &confirmation {
-            if confirmation.is_spec_owned(&candidate.kind, &candidate.namespace, &candidate.id)
-                || !resource.safe_to_overwrite(confirmation)
-            {
-                let message = format!(
-                    "not adopting {} `{}`: the live row changed between this run's diff and the ownership assertion, so the repository is not overwriting it. The next apply reconciles it as an ordinary change.",
-                    candidate.kind, candidate.id
-                );
-                eprintln!("[{}] {}", safe(namespace), safe_line(&message));
-                result
-                    .adoption_skipped
-                    .push(format!("[{namespace}] {message}"));
-                continue;
-            }
-            if let Err(error) = resource.assert_ownership(client, namespace).await {
-                eprintln!(
-                    "[{}] failed to adopt {} `{}`: {}",
-                    safe(namespace),
-                    safe(&candidate.kind),
-                    safe(&candidate.id),
-                    safe_line(&error)
-                );
-                result.errors.push(format!(
-                    "{} {} adopt: {error}",
-                    candidate.kind, candidate.id
-                ));
-                continue;
-            }
-            eprintln!(
-                "[{}] adopted {} `{}` into the ownership ledger with an idempotent update",
-                safe(namespace),
-                safe(&candidate.kind),
-                safe(&candidate.id)
-            );
-        } else {
+    if matches!(ownership_scope, OwnershipScope::Exclusive) {
+        // Exclusive mode asserts nothing, so there is nothing to overwrite and
+        // no read to make.
+        for resource in resources {
             eprintln!(
                 "[{}] adopted {} `{}` into the ownership ledger (exclusive ownership needs no assertion)",
                 safe(namespace),
-                safe(&candidate.kind),
-                safe(&candidate.id)
+                safe(resource.kind()),
+                safe(resource.id())
             );
+            result.adopted.push(adopted_op(resource));
         }
-
-        result.adopted.push(AppliedOp {
-            kind: candidate.kind.clone(),
-            namespace: candidate.namespace.clone(),
-            id: candidate.id.clone(),
-            action: DiffAction::Modify,
-        });
+        return;
     }
+
+    // Consumer reads come before the backup that shows their credentials.
+    let mut consumer_reads = HashMap::new();
+    for resource in &resources {
+        if let CreateResource::Consumer(consumer) = resource {
+            let id = consumer.id.as_str();
+            consumer_reads.insert(id, client.get_tagged("Consumer", id, namespace).await);
+        }
+    }
+    // The confirmation read's `unmodeled_nested_fields` are not re-checked:
+    // each candidate's own read refuses a nested field this client drops.
+    let confirmation = match client.get_backup_snapshot_for_mutation(namespace).await {
+        Ok(snapshot) if snapshot.cached => {
+            skip_all(
+                result,
+                "the confirmation backup was served from cache (X-Data-Source: cached)"
+                    .to_string(),
+            );
+            return;
+        }
+        Ok(snapshot) => snapshot.config,
+        Err(error) if is_fatal(&error) => {
+            result.fatal_error = Some(error.to_string());
+            return;
+        }
+        Err(error) => {
+            skip_all(
+                result,
+                format!("the confirmation backup could not be read: {error}"),
+            );
+            return;
+        }
+    };
+    let confirmation = LiveIndex::build(&confirmation);
+
+    for resource in resources {
+        let (kind, id) = (resource.kind(), resource.id());
+        let changed = format!(
+            "not adopting {kind} `{id}`: the live row changed between this run's diff and the ownership assertion, so the repository is not overwriting it. The next apply reconciles it as an ordinary change."
+        );
+        if confirmation.is_spec_owned(kind, resource.namespace(), id)
+            || !resource.safe_to_overwrite(&confirmation)
+        {
+            skip_adoption(result, namespace, &changed);
+            continue;
+        }
+        let read = match resource {
+            CreateResource::Consumer(_) => consumer_reads.remove(id).unwrap_or(Ok(None)),
+            _ => client.get_tagged(kind, id, namespace).await,
+        };
+        let etag = match read {
+            Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body, true) => tagged.etag,
+            Ok(_) => {
+                skip_adoption(result, namespace, &changed);
+                continue;
+            }
+            Err(error) if is_fatal(&error) => {
+                result.fatal_error = Some(error.to_string());
+                return;
+            }
+            Err(error) => {
+                fail_adoption(result, namespace, kind, id, &error);
+                continue;
+            }
+        };
+        match resource.update_if_match(client, namespace, &etag).await {
+            Ok(()) => {}
+            Err(crate::error::Error::StalePlan(_)) => {
+                skip_adoption(result, namespace, &changed);
+                continue;
+            }
+            Err(error) if is_fatal(&error) => {
+                result.fatal_error = Some(error.to_string());
+                return;
+            }
+            Err(error) => {
+                fail_adoption(result, namespace, kind, id, &error);
+                continue;
+            }
+        }
+        eprintln!(
+            "[{}] adopted {} `{}` into the ownership ledger with an idempotent update",
+            safe(namespace),
+            safe(kind),
+            safe(id)
+        );
+        result.adopted.push(adopted_op(resource));
+    }
+}
+
+/// The rows [`adopt_matching_rows`] chooses its candidates from.
+struct AdoptionContext<'a> {
+    desired: &'a GatewayConfig,
+    actual: &'a GatewayConfig,
+    index: &'a DesiredIndex<'a>,
+    diffs: &'a [ResourceDiff],
+    /// The write whose refusal proved the namespace's plan stale, if any.
+    stale_plan: Option<&'a str>,
+}
+
+fn adopted_op(resource: CreateResource<'_>) -> AppliedOp {
+    AppliedOp {
+        kind: resource.kind().to_string(),
+        namespace: resource.namespace().to_string(),
+        id: resource.id().to_string(),
+        action: DiffAction::Modify,
+    }
+}
+
+fn skip_adoption(result: &mut ApplyResult, namespace: &str, message: &str) {
+    eprintln!("[{}] {}", safe(namespace), safe_line(message));
+    result
+        .adoption_skipped
+        .push(format!("[{namespace}] {message}"));
+}
+
+fn fail_adoption(
+    result: &mut ApplyResult,
+    namespace: &str,
+    kind: &str,
+    id: &str,
+    error: &crate::error::Error,
+) {
+    eprintln!(
+        "[{}] failed to adopt {} `{}`: {}",
+        safe(namespace),
+        safe(kind),
+        safe(id),
+        safe_line(error)
+    );
+    result.errors.push(format!("{kind} {id} adopt: {error}"));
 }
 
 /// What a single successful admin call actually did.
@@ -2772,18 +3051,59 @@ impl<'a> CreateResource<'a> {
         }
     }
 
-    /// Idempotently assert that the repository, rather than a racing external
-    /// writer, authored the exact live row observed after an uncertain POST.
-    async fn assert_ownership(
+    /// `PUT` this resource only if its stored row still carries `etag`.
+    ///
+    /// Every overwrite incremental apply sends goes through here: a planned
+    /// update, and the idempotent ownership assertion of a row a pending or
+    /// ambiguous create, or adoption, found already live.
+    async fn update_if_match(
         self,
         client: &AdminClient,
         namespace: &str,
+        etag: &str,
     ) -> crate::error::Result<()> {
+        let (kind, id) = (self.kind(), self.id());
         match self {
-            Self::Proxy(resource) => client.update_proxy(resource, namespace).await,
-            Self::Consumer(resource) => client.update_consumer(resource, namespace).await,
-            Self::Upstream(resource) => client.update_upstream(resource, namespace).await,
-            Self::PluginConfig(resource) => client.update_plugin_config(resource, namespace).await,
+            Self::Proxy(row) => client.update_if_match(kind, id, row, namespace, etag).await,
+            Self::Consumer(row) => client.update_if_match(kind, id, row, namespace, etag).await,
+            Self::Upstream(row) => client.update_if_match(kind, id, row, namespace, etag).await,
+            Self::PluginConfig(row) => client.update_if_match(kind, id, row, namespace, etag).await,
+        }
+    }
+
+    /// Does a single-resource read show this row, unowned by any API spec and
+    /// carrying no nested field the typed mirror drops?
+    ///
+    /// `exact` asks for strict equality (adoption); otherwise the read only has
+    /// to carry everything this row declares (create recovery, see
+    /// [`resource_values_match`]). Consumer credentials are left out: the read
+    /// redacts them, so callers prove them from a backup read taken after it.
+    fn tagged_row_is(self, body: &serde_json::Value, exact: bool) -> bool {
+        let Ok((live, None)) = observe_body(self.kind(), body) else {
+            return false;
+        };
+        if live.api_spec_id.is_some() {
+            return false;
+        }
+        let desired = match self {
+            Self::Proxy(row) => comparison_value(self.kind(), row),
+            Self::Consumer(row) => comparison_value(self.kind(), row),
+            Self::Upstream(row) => comparison_value(self.kind(), row),
+            Self::PluginConfig(row) => comparison_value(self.kind(), row),
+        };
+        let Some(desired) = desired else {
+            return false;
+        };
+        let ignored: &[&str] = match self {
+            Self::Consumer(_) => &["credentials"],
+            _ => &[],
+        };
+        let desired = without_keys(&desired, ignored);
+        let live = without_keys(&live.value, ignored);
+        if exact {
+            desired == live
+        } else {
+            json_contains(&desired, &live)
         }
     }
 
@@ -2924,9 +3244,15 @@ async fn create_with_reconciliation(
         Ok(()) => Ok(()),
         Err(error) if create_outcome_is_ambiguous(&error) => {
             let original = error.to_string();
+            // The tagged read comes first, so the ownership assertion below is
+            // conditional on a row the verification backup then confirms. The
+            // backup is the only read that shows consumer credentials.
+            let tagged = client
+                .get_tagged(resource.kind(), resource.id(), namespace)
+                .await;
             // The row was absent at diff time, so this verification read's
-            // `unmodeled_nested_fields` are intentionally not checked: only a
-            // concurrent writer could have added one, a narrow, inherent race.
+            // `unmodeled_nested_fields` are not checked: the tagged read refuses
+            // a nested field this client drops before anything is written.
             let snapshot = client
                 .get_backup_snapshot_for_mutation(namespace)
                 .await
@@ -2946,8 +3272,27 @@ async fn create_with_reconciliation(
             }
             match resource.live_match(&LiveIndex::build(&snapshot.config)) {
                 LiveMatch::Exact => {
+                    let etag = match tagged {
+                        Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body, false) => {
+                            tagged.etag
+                        }
+                        Ok(_) => {
+                            return Err(crate::error::Error::AmbiguousMutation(format!(
+                                "{} `{}` in namespace `{namespace}` returned `{original}`; an authoritative backup found the exact desired row, but the conditional read before it did not show that row, so no ownership assertion was sent. The row remains outside the managed delete fence; re-run diff before retrying.",
+                                resource.kind(),
+                                resource.id(),
+                            )));
+                        }
+                        Err(read) => {
+                            return Err(crate::error::Error::AmbiguousMutation(format!(
+                                "{} `{}` in namespace `{namespace}` returned `{original}`; an authoritative backup found the exact desired row, but its conditional read failed: {read}. No ownership assertion was sent; the row remains outside the managed delete fence.",
+                                resource.kind(),
+                                resource.id(),
+                            )));
+                        }
+                    };
                     resource
-                        .assert_ownership(client, namespace)
+                        .update_if_match(client, namespace, &etag)
                         .await
                         .map_err(|assertion| {
                             crate::error::Error::AmbiguousMutation(format!(
@@ -3338,8 +3683,15 @@ async fn try_batch_create(
                     || create_outcome_is_ambiguous(&e) =>
             {
                 let original = e.to_string();
-                // As in `create_with_reconciliation`, this verification read's
-                // `unmodeled_nested_fields` are intentionally not checked.
+                // As in `create_with_reconciliation`, consumers are read before
+                // the verification backup (the only read that shows their
+                // credentials), and its `unmodeled_nested_fields` are not
+                // checked: each row's own read refuses one before its PUT.
+                let mut consumer_reads = HashMap::new();
+                for consumer in &chunk.consumers {
+                    let id = consumer.id.as_str();
+                    consumer_reads.insert(id, client.get_tagged("Consumer", id, namespace).await);
+                }
                 let snapshot = match client.get_backup_snapshot_for_mutation(namespace).await {
                     Ok(snapshot) if snapshot.cached => {
                         result.fatal_error = Some(
@@ -3369,7 +3721,14 @@ async fn try_batch_create(
                 match batch_live_match(chunk, &snapshot.config) {
                     LiveMatch::Exact => {
                         let errors_before = result.errors.len();
-                        assert_batch_ownership(chunk, client, namespace, &mut result).await;
+                        assert_batch_ownership(
+                            chunk,
+                            client,
+                            namespace,
+                            consumer_reads,
+                            &mut result,
+                        )
+                        .await;
                         if result.fatal_error.is_some() || result.errors.len() > errors_before {
                             note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
                             return Ok(Some(result));
@@ -3505,38 +3864,46 @@ fn note_unattempted_chunks(
     ));
 }
 
+/// Assert ownership of every row an ambiguous batch was proven to have created,
+/// each with a conditional `PUT` on a read that still shows the exact row.
+///
+/// Consumers were read before the verification backup (`consumer_reads`);
+/// every other row is read immediately before its own PUT, because the
+/// assertions before it may rewrite it (a plugin PUT touches its proxy's
+/// associations). Exact batch readback already proved every dependency
+/// committed, so a failed plugin ownership assertion does not stop the proxy's.
 async fn assert_batch_ownership(
     batch: &BatchCreate,
     client: &AdminClient,
     namespace: &str,
+    mut consumer_reads: HashMap<&str, crate::error::Result<Option<http_client::TaggedResource>>>,
     result: &mut ApplyResult,
 ) {
-    for resource in &batch.upstreams {
-        let outcome = client.update_upstream(resource, namespace).await;
-        record_create(result, outcome, "Upstream", &resource.id, namespace);
-        if result.fatal_error.is_some() {
-            return;
-        }
-    }
-    for resource in &batch.consumers {
-        let outcome = client.update_consumer(resource, namespace).await;
-        record_create(result, outcome, "Consumer", &resource.id, namespace);
-        if result.fatal_error.is_some() {
-            return;
-        }
-    }
-    for resource in &batch.plugin_configs {
-        let outcome = client.update_plugin_config(resource, namespace).await;
-        record_create(result, outcome, "PluginConfig", &resource.id, namespace);
-        if result.fatal_error.is_some() {
-            return;
-        }
-    }
-    for resource in &batch.proxies {
-        // Exact batch readback already proved every dependency committed.
-        // A failed plugin ownership assertion does not invalidate that graph.
-        let outcome = client.update_proxy(resource, namespace).await;
-        record_create(result, outcome, "Proxy", &resource.id, namespace);
+    let resources = batch
+        .upstreams
+        .iter()
+        .map(CreateResource::Upstream)
+        .chain(batch.consumers.iter().map(CreateResource::Consumer))
+        .chain(batch.plugin_configs.iter().map(CreateResource::PluginConfig))
+        .chain(batch.proxies.iter().map(CreateResource::Proxy));
+    for resource in resources {
+        let (kind, id) = (resource.kind(), resource.id());
+        let read = match resource {
+            CreateResource::Consumer(_) => consumer_reads.remove(id).unwrap_or(Ok(None)),
+            _ => client.get_tagged(kind, id, namespace).await,
+        };
+        let outcome = match read {
+            Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body, false) => {
+                resource
+                    .update_if_match(client, namespace, &tagged.etag)
+                    .await
+            }
+            Ok(_) => Err(crate::error::Error::StalePlan(
+                "not sent: the conditional read before the ownership assertion did not show the exact row the batch created. Re-run diff before retrying".to_string(),
+            )),
+            Err(error) => Err(error),
+        };
+        record_create(result, outcome, kind, id, namespace);
         if result.fatal_error.is_some() {
             return;
         }
@@ -3731,15 +4098,7 @@ fn record_create(
                 action: DiffAction::Add,
             });
         }
-        Err(e @ crate::error::Error::GatewayReadOnly(_)) => {
-            result.fatal_error = Some(e.to_string());
-        }
-        Err(
-            e @ (crate::error::Error::CommittedNotLive { .. }
-            | crate::error::Error::AmbiguousMutation(_)),
-        ) => {
-            result.fatal_error = Some(e.to_string());
-        }
+        Err(e) if is_fatal(&e) => result.fatal_error = Some(e.to_string()),
         Err(e) => result.errors.push(format!("{kind} {id} create: {e}")),
     }
 }

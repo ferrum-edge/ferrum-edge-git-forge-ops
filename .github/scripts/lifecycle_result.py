@@ -78,6 +78,14 @@ REQUIRED_SCENARIOS: tuple[tuple[str, str], ...] = (
         "unmanaged resources survive in shared mode.",
     ),
     (
+        "conditional-overwrite",
+        "Incremental apply overwrites existing rows only conditionally: the "
+        "gateway issues a strong ETag for every kind apply overwrites and "
+        "refuses a stale If-Match with 412, and an apply over an out-of-band "
+        "edit re-plans and converges through its conditional writes, consumers "
+        "included.",
+    ),
+    (
         "credentials-generate-and-rotate",
         "Generate and rotate a consumer credential; prove the new value "
         "authenticates, the old one does not, and no plaintext reaches logs, "

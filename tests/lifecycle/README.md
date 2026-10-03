@@ -17,16 +17,17 @@ revision can be published. The ids are declared once, in
 [`.github/scripts/lifecycle_result.py`](../../.github/scripts/lifecycle_result.py),
 and a test checks that this file lists each of them.
 
-The harness (`run.sh`) runs five scenarios itself: `create-and-route`,
-`reapply-is-a-no-op`, `modify-and-delete-in-order`, `drift-monitoring` and
-`file-and-mesh-boundary`. The other six always record `skipped` and are
-exercised by hand (see below).
+The harness (`run.sh`) runs six scenarios itself: `create-and-route`,
+`reapply-is-a-no-op`, `modify-and-delete-in-order`, `conditional-overwrite`,
+`drift-monitoring` and `file-and-mesh-boundary`. The other six always record
+`skipped` and are exercised by hand (see below).
 
 | Scenario | Question it answers |
 | --- | --- |
 | `create-and-route` | Do an upstream, proxy, scoped plugin and consumer actually serve authenticated traffic? |
 | `reapply-is-a-no-op` | Does applying the same desired state again change nothing — no normalization-induced false drift? |
 | `modify-and-delete-in-order` | Do modify and delete succeed in dependency-safe order — including the large-prune guard refusing first, and `--allow-large-prune` carrying it through — and does an unmanaged row survive shared mode? |
+| `conditional-overwrite` | Does the gateway issue a strong `ETag` for every kind incremental apply overwrites and refuse a write carrying a superseded one with `412` — and does an apply over an out-of-band edit re-plan and converge through its `If-Match` writes, consumers (redacted read, credentials from `/backup`) included? |
 | `credentials-generate-and-rotate` | Does a rotated credential authenticate, does the old one stop, and does no plaintext reach a log, a commit, a comment or an artifact? |
 | `partial-failure-recovery` | Do the recovery safeguards preserve successful work and ownership across an injected partial failure and an ambiguous response? |
 | `ledger-publication-failure` | When state publication is rejected after a gateway mutation and retries are exhausted, does a fresh runner recover ownership by the documented procedure — rather than treating a runner-local ledger as durable? |

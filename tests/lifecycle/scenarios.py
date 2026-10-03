@@ -359,6 +359,59 @@ def scenario_modify_and_delete_in_order(harness: Harness) -> str:
     )
 
 
+def scenario_conditional_overwrite(harness: Harness) -> str:
+    ensure_deployed(harness)
+
+    # The gateway half: every kind incremental apply overwrites carries a
+    # strong entity-tag. Apply refuses to overwrite a row without one.
+    for path in (
+        "/proxies/orders-proxy",
+        "/upstreams/orders-upstream",
+        "/plugins/config/orders-key-auth",
+        "/consumers/orders-client",
+    ):
+        status, etag, _ = _admin_exchange(harness, "GET", path)
+        if status != 200 or not etag or not etag.startswith('"'):
+            raise ScenarioFailure(
+                f"GET {path} answered {status} with ETag {etag!r}; incremental "
+                "apply refuses every overwrite of a row without a strong entity-tag"
+            )
+
+    # ...and a write carrying a superseded tag is refused, writing nothing.
+    _, planned_tag, _ = _admin_exchange(harness, "GET", "/proxies/orders-proxy")
+    mutate_proxy_out_of_band(harness)
+    stale = out_of_band_proxy("A write planned before the out-of-band edit")
+    status, _, _ = _admin_exchange(
+        harness, "PUT", "/proxies/orders-proxy", stale, if_match=planned_tag
+    )
+    if status != 412:
+        raise ScenarioFailure(
+            f"a PUT carrying a superseded If-Match answered {status}, expected "
+            "412; the gateway cannot fence a write planned from a stale read"
+        )
+    _, _, body = _admin_exchange(harness, "GET", "/proxies/orders-proxy")
+    if json.loads(body).get("name") != OUT_OF_BAND_PROXY_NAME:
+        raise ScenarioFailure("the refused conditional PUT changed the proxy anyway")
+
+    # The client half: apply plans from the edited row and sends conditional
+    # writes that the real gateway accepts. A consumer update takes the
+    # redacted read plus the /backup that carries its credentials.
+    harness.write(
+        f"resources/{NAMESPACE}/consumers/orders-client.yaml",
+        (harness.workdir / f"resources/{NAMESPACE}/consumers/orders-client.yaml")
+        .read_text(encoding="utf-8")
+        .replace('username: "orders-client"', 'username: "orders-client"\n  acl_groups: ["orders"]'),
+    )
+    harness.run("apply", "--auto-approve")
+    harness.run("diff", "--exit-on-drift")
+    harness.expect_status("/orders/status/200", 200, {"X-API-Key": harness_key(harness)})
+    return (
+        "the gateway tags every overwritten kind and refuses a superseded If-Match "
+        "with 412; apply re-planned over an out-of-band edit and updated a proxy "
+        "and a consumer through If-Match, converging with no drift"
+    )
+
+
 def scenario_credentials_generate_and_rotate(harness: Harness) -> str:
     raise NotImplementedError(
         "needs a disposable GitHub Environment for the credential broker; run "
@@ -508,6 +561,7 @@ SCENARIOS = {
     "create-and-route": scenario_create_and_route,
     "reapply-is-a-no-op": scenario_reapply_is_a_no_op,
     "modify-and-delete-in-order": scenario_modify_and_delete_in_order,
+    "conditional-overwrite": scenario_conditional_overwrite,
     "credentials-generate-and-rotate": scenario_credentials_generate_and_rotate,
     "partial-failure-recovery": scenario_partial_failure_recovery,
     "ledger-publication-failure": scenario_ledger_publication_failure,
@@ -574,6 +628,39 @@ def __admin(harness: Harness, method: str, path: str, body: dict | None = None) 
         return error.code
 
 
+def _admin_exchange(
+    harness: Harness,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    if_match: str | None = None,
+) -> tuple[int, str | None, str]:
+    """An out-of-band admin call returning its status, `ETag` and body.
+
+    For the conditional-write probe, whose outcomes (a 412 included) are the
+    findings, so it asserts nothing itself. `if_match` is sent verbatim.
+    """
+    token = os.environ["GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Ferrum-Namespace": NAMESPACE,
+    }
+    if if_match is not None:
+        headers["If-Match"] = if_match
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(
+        f"{harness.gateway_url}{path}", data=data, method=method, headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            text = response.read().decode("utf-8", "replace")
+            return response.status, response.headers.get("ETag"), text
+    except urllib.error.HTTPError as error:
+        text = error.read().decode("utf-8", "replace")
+        return error.code, error.headers.get("ETag"), text
+
+
 def create_unmanaged_proxy(harness: Harness) -> None:
     _admin(
         harness,
@@ -596,20 +683,28 @@ def unmanaged_proxy_exists(harness: Harness) -> bool:
     return __admin(harness, "GET", "/proxies/admin-owned-proxy") == 200
 
 
+OUT_OF_BAND_PROXY_NAME = "Edited on the gateway, behind the repository's back"
+
+
+def out_of_band_proxy(name: str) -> dict:
+    """The orders proxy as an administrator rewrites it, outside the repository."""
+    return {
+        "id": "orders-proxy",
+        "name": name,
+        "listen_path": "/orders",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 1,
+        "namespace": NAMESPACE,
+    }
+
+
 def mutate_proxy_out_of_band(harness: Harness) -> None:
     _admin(
         harness,
         "PUT",
         "/proxies/orders-proxy",
-        {
-            "id": "orders-proxy",
-            "name": "Edited on the gateway, behind the repository's back",
-            "listen_path": "/orders",
-            "backend_scheme": "http",
-            "backend_host": "127.0.0.1",
-            "backend_port": 1,
-            "namespace": NAMESPACE,
-        },
+        out_of_band_proxy(OUT_OF_BAND_PROXY_NAME),
     )
 
 

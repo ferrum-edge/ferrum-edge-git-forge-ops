@@ -1,11 +1,12 @@
-//! Incremental apply confirms every row it overwrites against a backup read
-//! after the plan (GHSA-fh5w-5x4f-86gh).
+//! Incremental apply sends every overwrite conditionally on the row the plan
+//! judged (GHSA-fh5w-5x4f-86gh).
 //!
 //! `cmd_apply` plans from a `/backup` it read before credential allocation,
 //! delivery and create journaling. An `/api-specs` import or admin edit that
 //! lands in that window must not be overwritten or deleted from the stale
-//! plan. Each test hands `apply_api` the plan's view and serves a different
-//! confirmation `/backup`, the way a concurrent writer would leave it.
+//! plan. Each test hands `apply_api` the plan's view and serves the rows the
+//! way a concurrent writer would leave them: on `GET /<kind>/{id}` with an
+//! `ETag`, and on `/backup` where a consumer's credentials need it.
 
 use gitforgeops::apply::{apply_api, ApplyOptions, ApplyResult};
 use gitforgeops::config::env::{EnvConfig, GatewayMode};
@@ -22,7 +23,15 @@ const NS: &str = "team-alpha";
 const SPEC: &str = "concurrent-spec";
 const HEALTHY: &str = r#"{"status":"ok","mode":"database","admin_writes_enabled":true}"#;
 const CHANGED: &str = "changed after this run planned the write";
+const WITHHELD: &str = "so the namespace's remaining writes were withheld";
+const TAG: &str = "\"planned-tag\"";
 const SPEC_KINDS: [Kind; 3] = [Kind::Proxy, Kind::Upstream, Kind::PluginConfig];
+const ALL_KINDS: [Kind; 4] = [
+    Kind::Proxy,
+    Kind::Upstream,
+    Kind::PluginConfig,
+    Kind::Consumer,
+];
 
 /// `(needle, status, body, headers)`. The first route whose needle appears
 /// anywhere in a request answers it; any other request gets `200 {}`.
@@ -134,6 +143,15 @@ impl Kind {
             Kind::Consumer => "consumers",
         }
     }
+
+    fn path(self) -> &'static str {
+        match self {
+            Kind::Proxy => "/proxies",
+            Kind::Upstream => "/upstreams",
+            Kind::PluginConfig => "/plugins/config",
+            Kind::Consumer => "/consumers",
+        }
+    }
 }
 
 /// A one-row document. `version` sets one ordinary field, so two versions of
@@ -172,6 +190,30 @@ fn document(kind: Kind, id: &str, owner: Option<&str>, version: u16) -> GatewayC
     serde_json::from_value(serde_json::Value::Object(document)).unwrap()
 }
 
+/// One upstream per `(id, version)`, as [`document`] builds it.
+fn upstreams(rows: &[(&str, u16)]) -> GatewayConfig {
+    let mut config = GatewayConfig::default();
+    for (id, version) in rows {
+        config
+            .upstreams
+            .extend(document(Kind::Upstream, id, None, *version).upstreams);
+    }
+    config
+}
+
+/// Consumer `c1`, whose keyauth key is `key`.
+fn keyed_consumer(username: &str, key: &str) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "consumers": [{
+            "id": "c1",
+            "namespace": NS,
+            "username": username,
+            "credentials": {"keyauth": [{"key": key}]},
+        }]
+    }))
+    .unwrap()
+}
+
 /// Proxy `p1` on `port`. With `with_plugin`, its scoped plugin `pc1` exists
 /// and is attached.
 fn scoped_pair(port: u16, with_plugin: bool) -> GatewayConfig {
@@ -207,10 +249,54 @@ fn health() -> RecordingRoute {
     ("GET /health".into(), 200, HEALTHY.into(), vec![])
 }
 
-/// Serve `config` as every `GET /backup`: the confirmation read.
+/// Serve `config` as every `GET /backup`.
 fn backup(config: &GatewayConfig) -> RecordingRoute {
     let body = serde_json::to_string(config).unwrap();
     ("GET /backup".into(), 200, body, vec![])
+}
+
+/// The row `id` of `config` as JSON.
+fn row(kind: Kind, id: &str, config: &GatewayConfig) -> serde_json::Value {
+    let document = serde_json::to_value(config).unwrap();
+    document[kind.section()]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap()
+        .clone()
+}
+
+/// Serve `body` on `GET /<kind>/{id}` with the given response headers.
+fn read_route(kind: Kind, id: &str, body: String, headers: &[(&str, &str)]) -> RecordingRoute {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    (format!("GET {}/{id} ", kind.path()), 200, body, headers)
+}
+
+/// Serve the row `id` of `config` on `GET /<kind>/{id}` with `etag`, the way
+/// Ferrum Edge answers a single-resource read from its database.
+fn tagged(kind: Kind, id: &str, config: &GatewayConfig, etag: &str) -> RecordingRoute {
+    let body = row(kind, id, config).to_string();
+    read_route(kind, id, body, &[("ETag", etag)])
+}
+
+/// `GET /<kind>/{id}` answering 404.
+fn missing(kind: Kind, id: &str) -> RecordingRoute {
+    let body = r#"{"error":"not found"}"#.to_string();
+    (format!("GET {}/{id} ", kind.path()), 404, body, vec![])
+}
+
+/// Every route that lets `id`'s row read as `config`: consumers also need the
+/// backup that carries their credentials.
+fn live(kind: Kind, id: &str, config: &GatewayConfig, etag: &str) -> Vec<RecordingRoute> {
+    let mut routes = vec![tagged(kind, id, config, etag)];
+    if matches!(kind, Kind::Consumer) {
+        routes.push(backup(config));
+    }
+    routes
 }
 
 struct Run {
@@ -229,11 +315,30 @@ impl Run {
             .collect()
     }
 
-    fn backup_reads(&self) -> usize {
+    /// The first request whose line starts with `prefix`.
+    fn request(&self, prefix: &str) -> &str {
         self.requests
             .iter()
-            .filter(|request| request.starts_with("GET /backup "))
+            .find(|request| request.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` request"))
+    }
+
+    fn position(&self, prefix: &str) -> usize {
+        self.requests
+            .iter()
+            .position(|request| request.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` request"))
+    }
+
+    fn count(&self, prefix: &str) -> usize {
+        self.requests
+            .iter()
+            .filter(|request| request.starts_with(prefix))
             .count()
+    }
+
+    fn backup_reads(&self) -> usize {
+        self.count("GET /backup ")
     }
 }
 
@@ -270,6 +375,15 @@ async fn apply(
     Run { result, requests }
 }
 
+/// [`apply`] in exclusive mode with default options.
+async fn apply_exclusive(
+    desired: &GatewayConfig,
+    planned: GatewayConfig,
+    routes: Vec<RecordingRoute>,
+) -> Run {
+    apply(desired, planned, routes, false, Default::default()).await
+}
+
 /// The run sent no write, reported exactly one refusal naming `reason`, and
 /// recorded nothing for the ledger.
 fn assert_refused(run: &Run, reason: &str, context: &str) {
@@ -281,6 +395,21 @@ fn assert_refused(run: &Run, reason: &str, context: &str) {
     assert!(run.result.fatal_error.is_none(), "{context}");
 }
 
+/// `(desired, options)` for one overwrite of `planned`'s row `r1`.
+fn overwrite(kind: Kind, action: &str, planned: &GatewayConfig) -> (GatewayConfig, ApplyOptions) {
+    let mut options = ApplyOptions::default();
+    let desired = match action {
+        "modify" => document(kind, "r1", None, 2),
+        "delete" => GatewayConfig::default(),
+        _ => {
+            let key = state_key(NS, kind.name(), "r1");
+            options.pending_create_assertions.insert(key);
+            planned.clone()
+        }
+    };
+    (desired, options)
+}
+
 #[tokio::test]
 async fn a_row_an_api_spec_claimed_after_the_plan_is_never_overwritten() {
     let claimed_by = format!("became owned by API spec `{SPEC}`");
@@ -289,27 +418,21 @@ async fn a_row_an_api_spec_claimed_after_the_plan_is_never_overwritten() {
             for shared in [false, true] {
                 let context = format!("{kind:?} {action} shared={shared}");
                 let planned = document(kind, "r1", None, 1);
-                let key = state_key(NS, kind.name(), "r1");
-                let mut options = ApplyOptions::default();
+                let (desired, mut options) = overwrite(kind, action, &planned);
                 if shared {
-                    options.managed_ledger.insert(key.clone());
+                    let key = state_key(NS, kind.name(), "r1");
+                    options.managed_ledger.insert(key);
                 }
-                let desired = match action {
-                    "modify" => document(kind, "r1", None, 2),
-                    "delete" => GatewayConfig::default(),
-                    _ => {
-                        options.pending_create_assertions.insert(key);
-                        planned.clone()
-                    }
-                };
                 // Same content, now tagged by a spec import.
                 let claimed = document(kind, "r1", Some(SPEC), 1);
-                let routes = vec![health(), backup(&claimed)];
+                let routes = vec![health(), tagged(kind, "r1", &claimed, TAG)];
 
                 let run = apply(&desired, planned, routes, shared, options).await;
 
                 assert_refused(&run, &claimed_by, &context);
-                assert_eq!(run.backup_reads(), 1, "{context}");
+                let read = format!("GET {}/r1 ", kind.path());
+                assert_eq!(run.count(&read), 1, "{context}");
+                assert_eq!(run.backup_reads(), 0, "{context}");
             }
         }
     }
@@ -317,24 +440,16 @@ async fn a_row_an_api_spec_claimed_after_the_plan_is_never_overwritten() {
 
 #[tokio::test]
 async fn a_row_edited_after_the_plan_is_not_overwritten() {
-    for kind in [
-        Kind::Proxy,
-        Kind::Upstream,
-        Kind::PluginConfig,
-        Kind::Consumer,
-    ] {
-        for action in ["modify", "delete"] {
+    for kind in ALL_KINDS {
+        for action in ["modify", "delete", "pending-create assertion"] {
             let context = format!("{kind:?} {action}");
             let planned = document(kind, "r1", None, 1);
-            let desired = if action == "modify" {
-                document(kind, "r1", None, 2)
-            } else {
-                GatewayConfig::default()
-            };
+            let (desired, options) = overwrite(kind, action, &planned);
             let edited = document(kind, "r1", None, 3);
-            let routes = vec![health(), backup(&edited)];
+            let mut routes = vec![health()];
+            routes.extend(live(kind, "r1", &edited, TAG));
 
-            let run = apply(&desired, planned, routes, false, Default::default()).await;
+            let run = apply(&desired, planned, routes, false, options).await;
 
             assert_refused(&run, CHANGED, &context);
         }
@@ -342,54 +457,94 @@ async fn a_row_edited_after_the_plan_is_not_overwritten() {
 }
 
 #[tokio::test]
-async fn a_refused_update_defers_the_namespace_deletes() {
-    let mut planned = document(Kind::Upstream, "edited", None, 1);
-    planned
-        .upstreams
-        .extend(document(Kind::Upstream, "pruned", None, 1).upstreams);
-    let desired = document(Kind::Upstream, "edited", None, 2);
-    let mut concurrent = document(Kind::Upstream, "edited", None, 3);
-    concurrent
-        .upstreams
-        .extend(document(Kind::Upstream, "pruned", None, 1).upstreams);
-    let routes = vec![health(), backup(&concurrent)];
+async fn every_overwrite_is_sent_with_the_etag_its_read_returned() {
+    for kind in ALL_KINDS {
+        for action in ["modify", "delete", "pending-create assertion"] {
+            let context = format!("{kind:?} {action}");
+            let planned = document(kind, "r1", None, 1);
+            let (desired, options) = overwrite(kind, action, &planned);
+            let etag = format!("\"{}-r1-v1\"", kind.name());
+            let mut routes = vec![health()];
+            routes.extend(live(kind, "r1", &planned, &etag));
 
-    let run = apply(&desired, planned, routes, false, Default::default()).await;
+            let run = apply(&desired, planned, routes, false, options).await;
 
-    assert_refused(&run, CHANGED, "refused update");
-    assert!(run.result.errors[0].contains("Upstream edited update"));
-    assert_eq!(run.result.deletes_deferred, 1);
+            assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+            assert!(run.result.fatal_error.is_none(), "{context}");
+            let method = if action == "delete" { "DELETE" } else { "PUT" };
+            let mutations = run.mutations();
+            assert_eq!(mutations.len(), 1, "{context}: {mutations:?}");
+            let write = format!("{method} {}/r1", kind.path());
+            assert!(mutations[0].starts_with(&write), "{mutations:?}");
+            let sent = run.request(&write);
+            assert!(
+                sent.contains(&format!("if-match: {etag}\r\n")),
+                "{context}: {sent}"
+            );
+            assert_eq!(run.result.applied_incremental.len(), 1, "{context}");
+            if matches!(kind, Kind::Consumer) {
+                // The backup that shows the credentials is read after the
+                // tagged read, so a change between the two cannot hide.
+                let read = run.position("GET /consumers/r1 ");
+                assert!(read < run.position("GET /backup "), "{context}");
+            } else {
+                assert_eq!(run.backup_reads(), 0, "{context}");
+            }
+        }
+    }
 }
 
 #[tokio::test]
-async fn an_unchanged_confirmation_lets_every_planned_write_through() {
-    let mut planned = document(Kind::Proxy, "p1", None, 1);
-    planned.upstreams = document(Kind::Upstream, "stale-upstream", None, 1).upstreams;
-    let desired = document(Kind::Proxy, "p1", None, 2);
-    let routes = vec![health(), backup(&planned)];
-
-    let run = apply(&desired, planned, routes, false, Default::default()).await;
-
-    assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
-    assert_eq!(
-        run.mutations(),
-        [
-            "PUT /proxies/p1 HTTP/1.1",
-            "DELETE /upstreams/stale-upstream HTTP/1.1",
-        ]
+async fn a_412_refuses_the_write_and_withholds_the_rest_of_the_namespace() {
+    // u1 and u2 are updated, u9 created and u3 pruned. The gateway refuses the
+    // first conditional write because the row changed after it was read: the
+    // plan is stale, so nothing else in the namespace is sent.
+    let planned = upstreams(&[("u1", 1), ("u2", 1), ("u3", 1)]);
+    let desired = upstreams(&[("u1", 2), ("u2", 2), ("u9", 1)]);
+    let refused: RecordingRoute = (
+        "PUT /upstreams/u1".into(),
+        412,
+        r#"{"error":"Upstream 'u1' has changed since its If-Match tag was issued"}"#.into(),
+        vec![],
     );
-    assert_eq!(run.result.updated, 1);
-    assert_eq!(run.result.deleted, 1);
-    // One confirmation read serves every overwrite in the namespace.
-    assert_eq!(run.backup_reads(), 1);
+    let routes = vec![
+        health(),
+        tagged(Kind::Upstream, "u1", &planned, TAG),
+        refused,
+    ];
+
+    let run = apply(&desired, planned, routes, false, Default::default()).await;
+
+    assert_eq!(run.mutations(), ["PUT /upstreams/u1 HTTP/1.1"]);
+    let sent = run.request("PUT /upstreams/u1");
+    assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+    // Nothing after the refusal was even read.
+    assert_eq!(run.count("GET /upstreams/u2 "), 0);
+    assert_eq!(run.count("GET /upstreams/u3 "), 0);
+    let errors = &run.result.errors;
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert!(errors[0].starts_with("Upstream u1 update"), "{errors:?}");
+    assert!(errors[0].contains("412 Precondition Failed"), "{errors:?}");
+    assert!(errors[1].starts_with("Upstream u2 update"), "{errors:?}");
+    assert!(errors[2].starts_with("Upstream u9 create"), "{errors:?}");
+    for withheld in &errors[1..] {
+        assert!(withheld.contains("Upstream `u1`"), "{errors:?}");
+        assert!(withheld.contains(WITHHELD), "{errors:?}");
+    }
+    assert_eq!(run.result.deletes_deferred, 1);
+    assert!(run.result.applied_incremental.is_empty());
+    assert!(run.result.fatal_error.is_none());
 }
 
 #[tokio::test]
-async fn a_row_already_gone_is_left_to_the_gateway() {
-    // Nothing holds the id any more, so nothing can be overwritten: the DELETE
-    // goes out and the gateway's 404 (here a 200) answers for itself.
-    let planned = document(Kind::Upstream, "u1", None, 1);
-    let routes = vec![health(), backup(&GatewayConfig::default())];
+async fn a_412_on_a_delete_defers_the_namespace_remaining_deletes() {
+    let planned = upstreams(&[("u1", 1), ("u2", 1)]);
+    let refused: RecordingRoute = ("DELETE /upstreams/u1".into(), 412, "{}".into(), vec![]);
+    let routes = vec![
+        health(),
+        tagged(Kind::Upstream, "u1", &planned, TAG),
+        refused,
+    ];
 
     let run = apply(
         &GatewayConfig::default(),
@@ -400,40 +555,164 @@ async fn a_row_already_gone_is_left_to_the_gateway() {
     )
     .await;
 
-    assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
     assert_eq!(run.mutations(), ["DELETE /upstreams/u1 HTTP/1.1"]);
+    assert_eq!(run.count("GET /upstreams/u2 "), 0);
+    let errors = &run.result.errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("Upstream u1 delete"), "{errors:?}");
+    assert!(errors[0].contains("412 Precondition Failed"), "{errors:?}");
+    assert_eq!(run.result.deleted, 0);
+    assert_eq!(run.result.deletes_deferred, 1);
 }
 
 #[tokio::test]
-async fn a_cached_confirmation_stops_the_run_before_any_overwrite() {
-    let planned = document(Kind::Upstream, "u1", None, 1);
-    let desired = document(Kind::Upstream, "u1", None, 2);
-    let body = serde_json::to_string(&planned).unwrap();
-    let cached: RecordingRoute = (
-        "GET /backup".into(),
-        200,
-        body,
-        vec![("X-Data-Source".into(), "cached".into())],
-    );
-
-    let routes = vec![health(), cached];
+async fn a_stale_read_withholds_the_rest_of_the_namespace() {
+    // The refusal does not need the gateway's 412: a read that disagrees with
+    // the plan proves it stale just the same.
+    let planned = upstreams(&[("edited", 1), ("next", 1), ("pruned", 1)]);
+    let desired = upstreams(&[("edited", 2), ("next", 2)]);
+    let live = upstreams(&[("edited", 3)]);
+    let routes = vec![health(), tagged(Kind::Upstream, "edited", &live, TAG)];
 
     let run = apply(&desired, planned, routes, false, Default::default()).await;
 
     assert_eq!(run.mutations(), Vec::<String>::new());
+    assert_eq!(run.count("GET /upstreams/next "), 0);
+    let errors = &run.result.errors;
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].starts_with("Upstream edited"), "{errors:?}");
+    assert!(errors[0].contains(CHANGED), "{errors:?}");
+    assert!(errors[1].starts_with("Upstream next update"), "{errors:?}");
+    assert!(errors[1].contains(WITHHELD), "{errors:?}");
+    assert_eq!(run.result.deletes_deferred, 1);
+}
+
+#[tokio::test]
+async fn a_consumer_whose_credentials_changed_after_the_plan_is_not_overwritten() {
+    // The tagged read redacts credentials, so it looks unchanged; only the
+    // backup read after it shows the rotated key.
+    let planned = keyed_consumer("user-1", "planned-key-value");
+    let desired = keyed_consumer("user-2", "planned-key-value");
+    let redacted = keyed_consumer("user-1", "[REDACTED]");
+    for (backup_key, refused) in [("rotated-key-value", true), ("planned-key-value", false)] {
+        let routes = vec![
+            health(),
+            tagged(Kind::Consumer, "c1", &redacted, TAG),
+            backup(&keyed_consumer("user-1", backup_key)),
+        ];
+
+        let run = apply_exclusive(&desired, planned.clone(), routes).await;
+
+        let read = run.position("GET /consumers/c1 ");
+        assert!(read < run.position("GET /backup "));
+        if refused {
+            assert_refused(&run, CHANGED, "rotated credential");
+        } else {
+            assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+            assert_eq!(run.mutations(), ["PUT /consumers/c1 HTTP/1.1"]);
+            let sent = run.request("PUT /consumers/c1");
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_row_already_gone_is_neither_deleted_again_nor_recreated() {
+    let planned = document(Kind::Upstream, "u1", None, 1);
+    for (desired, gone_is_fine) in [
+        (GatewayConfig::default(), true),
+        (document(Kind::Upstream, "u1", None, 2), false),
+    ] {
+        let routes = vec![health(), missing(Kind::Upstream, "u1")];
+
+        let run = apply_exclusive(&desired, planned.clone(), routes).await;
+
+        assert_eq!(run.mutations(), Vec::<String>::new());
+        if gone_is_fine {
+            // A DELETE now could only remove a row someone recreated since.
+            assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+            assert_eq!(run.result.deleted, 1);
+            assert_eq!(run.result.deletes_missing, 1);
+        } else {
+            // A PUT now would recreate a row someone deleted.
+            assert_refused(&run, "no longer exists", "gone before its update");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cached_read_stops_the_run_before_any_overwrite() {
+    let planned = document(Kind::Upstream, "u1", None, 1);
+    let desired = document(Kind::Upstream, "u1", None, 2);
+    let body = row(Kind::Upstream, "u1", &planned).to_string();
+    let cached = read_route(
+        Kind::Upstream,
+        "u1",
+        body,
+        &[("X-Data-Source", "cached"), ("ETag", TAG)],
+    );
+
+    let run = apply(
+        &desired,
+        planned,
+        vec![health(), cached],
+        false,
+        Default::default(),
+    )
+    .await;
+
+    assert_eq!(run.mutations(), Vec::<String>::new());
     let fatal = run.result.fatal_error.expect("cached view is fatal");
+    assert!(fatal.contains("X-Data-Source: cached"), "{fatal}");
+
+    // A consumer's credentials come from /backup, which must not be cached
+    // either.
+    let planned = document(Kind::Consumer, "c1", None, 1);
+    let desired = document(Kind::Consumer, "c1", None, 2);
+    let cached_backup: RecordingRoute = (
+        "GET /backup".into(),
+        200,
+        serde_json::to_string(&planned).unwrap(),
+        vec![("X-Data-Source".into(), "cached".into())],
+    );
+    let routes = vec![
+        health(),
+        tagged(Kind::Consumer, "c1", &planned, TAG),
+        cached_backup,
+    ];
+
+    let run = apply(&desired, planned, routes, false, Default::default()).await;
+
+    assert_eq!(run.mutations(), Vec::<String>::new());
+    let fatal = run.result.fatal_error.expect("cached backup is fatal");
     assert!(fatal.contains("X-Data-Source: cached"), "{fatal}");
 }
 
 #[tokio::test]
-async fn a_failed_confirmation_read_refuses_the_overwrite_and_defers_deletes() {
-    let mut planned = document(Kind::Upstream, "u1", None, 1);
-    planned
-        .upstreams
-        .extend(document(Kind::Upstream, "u2", None, 1).upstreams);
+async fn a_read_without_a_strong_etag_stops_the_run() {
+    // An older gateway issues no tag and would ignore `If-Match`, so nothing
+    // may be written on the strength of its read.
+    let planned = document(Kind::Upstream, "u1", None, 1);
     let desired = document(Kind::Upstream, "u1", None, 2);
+    for etag in [None, Some("W/\"weak\""), Some("unquoted")] {
+        let body = row(Kind::Upstream, "u1", &planned).to_string();
+        let headers: Vec<(&str, &str)> = etag.map(|etag| ("ETag", etag)).into_iter().collect();
+        let routes = vec![health(), read_route(Kind::Upstream, "u1", body, &headers)];
+
+        let run = apply_exclusive(&desired, planned.clone(), routes).await;
+
+        assert_eq!(run.mutations(), Vec::<String>::new(), "{etag:?}");
+        let fatal = run.result.fatal_error.expect("no conditional write");
+        assert!(fatal.contains("no strong ETag"), "{etag:?}: {fatal}");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_read_refuses_the_overwrite_and_defers_deletes() {
+    let planned = upstreams(&[("u1", 1), ("u2", 1)]);
+    let desired = upstreams(&[("u1", 2)]);
     let failed: RecordingRoute = (
-        "GET /backup".into(),
+        "GET /upstreams/u1 ".into(),
         500,
         r#"{"error":"boom"}"#.into(),
         vec![],
@@ -442,13 +721,63 @@ async fn a_failed_confirmation_read_refuses_the_overwrite_and_defers_deletes() {
 
     let run = apply(&desired, planned, routes, false, Default::default()).await;
 
-    assert_refused(&run, "confirmation read", "failed read");
-    assert!(run.result.errors[0].contains("Upstream u1 update"));
+    assert_refused(&run, "boom", "failed read");
+    assert!(run.result.errors[0].starts_with("Upstream u1 update"));
+    assert_eq!(run.count("GET /upstreams/u2 "), 0);
     assert_eq!(run.result.deletes_deferred, 1);
+
+    // A consumer whose credential backup cannot be read is refused too.
+    let planned = document(Kind::Consumer, "c1", None, 1);
+    let desired = document(Kind::Consumer, "c1", None, 2);
+    let failed: RecordingRoute = (
+        "GET /backup".into(),
+        500,
+        r#"{"error":"boom"}"#.into(),
+        vec![],
+    );
+    let routes = vec![
+        health(),
+        tagged(Kind::Consumer, "c1", &planned, TAG),
+        failed,
+    ];
+
+    let run = apply(&desired, planned, routes, false, Default::default()).await;
+
+    assert_refused(&run, "confirms consumer credentials", "failed backup");
 }
 
 #[tokio::test]
-async fn a_pure_add_namespace_needs_no_confirmation_read() {
+async fn an_update_never_resets_a_nested_field_the_plan_did_not_see() {
+    let planned = document(Kind::Upstream, "u1", None, 1);
+    let mut body = row(Kind::Upstream, "u1", &planned);
+    body["targets"][0]["future_target_option"] = serde_json::json!(true);
+    for (desired, refused) in [
+        (document(Kind::Upstream, "u1", None, 2), true),
+        // A delete rewrites nothing, so the field does not matter.
+        (GatewayConfig::default(), false),
+    ] {
+        let read = read_route(Kind::Upstream, "u1", body.to_string(), &[("ETag", TAG)]);
+
+        let run = apply(
+            &desired,
+            planned.clone(),
+            vec![health(), read],
+            false,
+            Default::default(),
+        )
+        .await;
+
+        if refused {
+            assert_refused(&run, "future_target_option", "nested field");
+        } else {
+            assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+            assert_eq!(run.mutations(), ["DELETE /upstreams/u1 HTTP/1.1"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_pure_add_namespace_needs_no_read() {
     // `POST /batch` is create-only: an id taken since the plan is refused by
     // the gateway itself, so there is nothing to confirm.
     let desired = document(Kind::Upstream, "u1", None, 1);
@@ -468,6 +797,7 @@ async fn a_pure_add_namespace_needs_no_confirmation_read() {
     assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
     assert_eq!(run.mutations(), ["POST /batch HTTP/1.1"]);
     assert_eq!(run.backup_reads(), 0);
+    assert_eq!(run.count("GET /upstreams/"), 0);
 }
 
 #[tokio::test]
@@ -477,7 +807,11 @@ async fn an_ambiguous_create_never_claims_a_row_an_api_spec_now_owns() {
     let desired = document(Kind::Upstream, "u1", None, 1);
     let spec_row = document(Kind::Upstream, "u1", Some(SPEC), 1);
     for per_resource in [false, true] {
-        let mut routes = vec![health(), backup(&spec_row)];
+        let mut routes = vec![
+            health(),
+            backup(&spec_row),
+            tagged(Kind::Upstream, "u1", &spec_row, TAG),
+        ];
         let mut expected = vec!["POST /batch HTTP/1.1"];
         if per_resource {
             routes.push(("POST /batch".into(), 501, "{}".into(), vec![]));
@@ -503,13 +837,87 @@ async fn an_ambiguous_create_never_claims_a_row_an_api_spec_now_owns() {
 }
 
 #[tokio::test]
+async fn an_ambiguous_create_claims_its_row_only_with_if_match_on_a_matching_read() {
+    let desired = document(Kind::Upstream, "u1", None, 1);
+    for (read_port, claimed) in [(1, true), (9, false)] {
+        let read = document(Kind::Upstream, "u1", None, read_port);
+        let routes = vec![
+            health(),
+            ("POST /batch".into(), 501, "{}".into(), vec![]),
+            ("POST /upstreams".into(), 502, "{}".into(), vec![]),
+            tagged(Kind::Upstream, "u1", &read, TAG),
+            backup(&desired),
+        ];
+
+        let run = apply(
+            &desired,
+            GatewayConfig::default(),
+            routes,
+            false,
+            Default::default(),
+        )
+        .await;
+
+        let context = format!("read_port={read_port}");
+        // The tagged read precedes the backup that proves the row exact.
+        assert!(
+            run.position("GET /upstreams/u1 ") < run.position("GET /backup "),
+            "{context}"
+        );
+        if claimed {
+            assert!(run.result.fatal_error.is_none(), "{context}");
+            let mutations = run.mutations();
+            assert_eq!(mutations.last().unwrap(), "PUT /upstreams/u1 HTTP/1.1");
+            let sent = run.request("PUT /upstreams/u1");
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+            assert_eq!(run.result.created, 1, "{context}");
+        } else {
+            assert_eq!(run.count("PUT /upstreams/u1"), 0, "{context}");
+            let fatal = run.result.fatal_error.expect("an unproven claim stops the run");
+            assert!(fatal.contains("did not show that row"), "{fatal}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn adoption_claims_a_row_only_with_if_match_on_a_matching_read() {
+    // Shared mode: a declared row identical to live and not in the ledger is
+    // claimed with an ownership PUT, which must not revert a concurrent edit.
+    let planned = document(Kind::Upstream, "u1", None, 1);
+    for (read_version, adopted) in [(1, true), (3, false)] {
+        let read = document(Kind::Upstream, "u1", None, read_version);
+        let routes = vec![
+            health(),
+            tagged(Kind::Upstream, "u1", &read, TAG),
+            backup(&planned),
+        ];
+
+        let run = apply(&planned, planned.clone(), routes, true, Default::default()).await;
+
+        let context = format!("read_version={read_version}");
+        assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+        if adopted {
+            assert_eq!(run.mutations(), ["PUT /upstreams/u1 HTTP/1.1"]);
+            let sent = run.request("PUT /upstreams/u1");
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+            assert_eq!(run.result.adopted.len(), 1, "{context}");
+        } else {
+            assert_eq!(run.mutations(), Vec::<String>::new(), "{context}");
+            assert!(run.result.adopted.is_empty(), "{context}");
+            assert_eq!(run.result.adoption_skipped.len(), 1, "{context}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_post_plugin_proxy_update_is_confirmed_outside_its_associations() {
-    // Creating `pc1` makes the gateway attach it to `p1`, so the post-plugin
-    // snapshot's associations legitimately differ from the plan. Any other
-    // field that moved was somebody else's edit.
+    // Creating `pc1` makes the gateway attach it to `p1`, so the proxy's read
+    // after the plugin write legitimately shows associations the plan did
+    // not. Any other field that moved was somebody else's edit.
     for (live_port, concurrent) in [(1, false), (7, true)] {
         let desired = scoped_pair(2, true);
-        let routes = vec![health(), backup(&scoped_pair(live_port, true))];
+        let after_plugins = scoped_pair(live_port, true);
+        let routes = vec![health(), tagged(Kind::Proxy, "p1", &after_plugins, TAG)];
 
         let run = apply(
             &desired,
@@ -529,9 +937,15 @@ async fn a_post_plugin_proxy_update_is_confirmed_outside_its_associations() {
         } else {
             expected.push("PUT /proxies/p1 HTTP/1.1");
             assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+            let sent = run.request("PUT /proxies/p1");
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
         }
         assert_eq!(run.mutations(), expected, "concurrent={concurrent}");
-        assert_eq!(run.backup_reads(), 1, "concurrent={concurrent}");
+        // One read, after the plugin write, and no backup.
+        assert_eq!(run.count("GET /proxies/p1 "), 1, "concurrent={concurrent}");
+        let plugin_write = run.position("POST /plugins/config");
+        assert!(plugin_write < run.position("GET /proxies/p1 "));
+        assert_eq!(run.backup_reads(), 0, "concurrent={concurrent}");
     }
 }
 
@@ -548,7 +962,7 @@ async fn a_confirmed_spec_deletion_still_requires_the_same_owner() {
         let run = apply(
             &GatewayConfig::default(),
             planned.clone(),
-            vec![health(), backup(&live)],
+            vec![health(), tagged(Kind::Upstream, "u1", &live, TAG)],
             false,
             options,
         )
@@ -557,8 +971,31 @@ async fn a_confirmed_spec_deletion_still_requires_the_same_owner() {
         if deleted {
             assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
             assert_eq!(run.mutations(), ["DELETE /upstreams/u1 HTTP/1.1"]);
+            let sent = run.request("DELETE /upstreams/u1");
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
         } else {
             assert_refused(&run, "became owned by API spec `spec-b`", owner);
         }
+    }
+}
+
+#[test]
+fn only_one_strong_entity_tag_can_make_a_write_conditional() {
+    use gitforgeops::http_client::strong_entity_tag;
+
+    assert_eq!(
+        strong_entity_tag(Some(" \"abc\" ")).as_deref(),
+        Some("\"abc\"")
+    );
+    for raw in [
+        None,
+        Some(""),
+        Some("\"\""),
+        Some("W/\"abc\""),
+        Some("abc"),
+        Some("\"a\", \"b\""),
+        Some("\"a b\""),
+    ] {
+        assert_eq!(strong_entity_tag(raw), None, "{raw:?}");
     }
 }
