@@ -679,10 +679,74 @@ run arbitrary commands from a repository file, so the closed schema in
 - Header values are exactly one of `literal:` or `slot:`. An unresolvable slot
   fails the check instead of sending an empty header (which could make a
   `401`-expecting check pass for the wrong reason).
+- Reserved headers (case-insensitive, `_` read as `-`): `Host`, `Forwarded`,
+  `X-Forwarded-*`, `X-Real-IP`, `Via`, the method overrides
+  (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) and the
+  hop-by-hop and framing headers. Refused at load in every check.
 - Results carry name, method, path and status only. The body is never read.
 - `validate`, `plan` and `apply` load `smoke.yaml` through `SmokeConfig::load`
   before any mutation, so a malformed or unknown-field check fails the preview.
   An absent file is fine.
+- `SMOKE_CONFIG_VERSION` is 2. A version 1 file, or one with no `version`,
+  loads only if no check sends a `slot:`; one that names a slot is refused, so
+  a slot written when it could name any bundle credential is reviewed again.
+
+**Probe credentials (GHSA-8mhw-ghx8-9m63).** The verify step holds the
+environment's whole bundle. A `slot:` is sent only when all hold, else
+`verify` exits 1 before the bundle is read or a request is sent:
+
+- load-time shape (`slot_shape_refusal`): a Consumer credential secret slot
+  (`<ns>/<id>/<built-in type>/<field>`), never plugin-config,
+  service-discovery or an identity leaf, on a `GET`/`HEAD` check;
+- the Consumer is in `FERRUM_VERIFY_PROBE_CONSUMERS`
+  (`verify::ProbeConsumerAllowlist`, comma-separated `<ns>/<consumer-id>`).
+  This operator-held GitHub Environment **variable** is the authorization: no
+  change to `resources/` or `.gitforgeops/` can change it (the workflow lines
+  binding it are guarded by review; a trusted-checker pin is a follow-up).
+  Unset or empty while a check sends a slot is a refusal; a malformed entry
+  (anything but exactly one `/`) is an error;
+- the Consumer carries `gitforgeops/verify-probe: "true"` in the unresolved
+  desired configuration and the slot is one of its brokered secret leaves.
+  The label is required but authorizes nothing alone: `resources/` has no
+  code owner, so the pull request naming a slot can also add the label.
+
+`authorize_probe_slots` decides from desired config + allowlist, then
+`ProbeAuthorization::project` copies only those bundle values into
+`ProbeCredentials`. `runner::run`, `run_within` and `run_check` take only
+`ProbeCredentials`, never a bundle. `bind_probe_slots` /
+`refuse_unbound_slots` are the shared binding: `validate`, `plan` and `apply`
+(`preflight_probe_bindings`, on the pre-resolve assembly) refuse a missing,
+unlabelled or (when the variable is visible) unlisted Consumer; `review`
+reports it as `invalid-smoke-checks` and renders check → header → slot →
+Consumer plus every labelled Consumer, names only
+(`review::pr_comment::render_probe_bindings`).
+
+- `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND=true` (`EnvConfig::verify_probe_consumers_bound`)
+  marks a run bound to the environment. There an unset, blank or malformed
+  allowlist (`ProbeAllowlistState::Unset` / `Malformed`) is refused while a
+  check sends a slot, as `verify` refuses it (`missing_allowlist_error`);
+  `review` reports it as the separate `ProbeConsumerAllowlist` blocker
+  (`probe-consumer-allowlist`), an operator action, never
+  `invalid-smoke-checks`.
+- Without the marker the allowlist half reads `AllowlistNotVisible` and does
+  not refuse (`ProbeAllowlistState::NotVisible`).
+- Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
+  makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
+  Under the environment's own scope it is `NotAConsumerSecret`, as at verify.
+- `apply-on-merge.yml` binds `vars.FERRUM_VERIFY_PROBE_CONSUMERS` into both
+  `Validate` (with the marker) and both `Verify traffic` steps;
+  `trusted-pr-review.yml` binds it, with the marker, into the live review.
+
+**Budgets (GHSA-p95x-q89j-hrhv).** Refused at load for every environment in
+the file: `attempts` ≤ 10, `timeout_secs` ≤ 60, `retry_backoff_ms` ≤ 30000,
+≤ 50 checks per environment, and an aggregate worst case
+(`EnvironmentChecks::worst_case_budget`: every attempt timing out plus linear
+backoff) ≤ 15 minutes. `runner::run` holds the run to
+`runner::deadline_budget` (worst case, capped at 15 minutes, plus 30 s grace);
+an interrupted or unstarted check is `TIMEOUT` and fails verification. Both
+`Verify traffic` steps carry `timeout-minutes: 20` as a **step** timeout: it
+fails only the step, so `continue-on-error` records it and the ledger commit
+still runs (a job timeout would skip it).
 - `runner::run_check` retries an ambiguous attempt (timeout, or any failure
   except a connect error) only when `SmokeCheck::replays_ambiguous_attempts`: an
   RFC 9110 idempotent method (`GET HEAD OPTIONS TRACE PUT DELETE`,
@@ -1081,7 +1145,7 @@ correctness). A 401 remediation prints the four JWT claim settings to compare.
 Two pure computations, shared so a preview cannot disagree with the run.
 
 **`apply_blockers`** returns every fail-closed `apply` gate decidable without a
-gateway, as `Vec<ApplyBlocker>` over ten `BlockerKind`s:
+gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
 
 | BlockerKind | Gate |
 |---|---|
@@ -1094,7 +1158,8 @@ gateway, as `Vec<ApplyBlocker>` over ten `BlockerKind`s:
 | `ProvisioningRepository` | pending allocation, `GITHUB_REPOSITORY` unset |
 | `NarrowedFilePublication` | file-mode apply narrowed by ad-hoc `FERRUM_NAMESPACE` |
 | `PublicationPathCollision` | gateway and mesh destinations resolve to one file |
-| `InvalidSmokeChecks` | `.gitforgeops/smoke.yaml` exists but does not load |
+| `InvalidSmokeChecks` | `.gitforgeops/smoke.yaml` does not load, or names a slot `verify` would refuse |
+| `ProbeConsumerAllowlist` | environment-bound run, a check sends a slot, `FERRUM_VERIFY_PROBE_CONSUMERS` unset/blank/malformed |
 
 - `plan` evaluates the whole set, prints `=== Apply Blockers ===` (class, count,
   remedy) plus a summary, and exits 1 when non-empty.
@@ -1523,6 +1588,8 @@ credentials. Booleans accept `true|false|1|0`.
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode gateway document. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Standalone `{version, mesh}` document. File-mode `validate`/`plan`/`apply` and `export --output` refuse, before any publication, state or broker write, when it resolves to the same file as the gateway document (`apply::ensure_distinct_publication_paths`: `./`/`..` spellings, symlinked parents and existing file identity all count). |
 | `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `verify`. |
+| `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set by environment-bound workflow steps; makes an unset allowlist a refusal instead of "not visible". |
+| `FERRUM_VERIFY_PROBE_CONSUMERS` | unset | Operator allowlist of probe Consumers (`<ns>/<consumer-id>`, comma-separated); a GitHub Environment variable in CI. Unset: `verify` refuses every slot-sending check. See [Traffic verification](#traffic-verification-srcverify). |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Dev only. TLS stays on but any certificate is accepted. |
 | `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://`. |
 | `FERRUM_GATEWAY_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | unset | Base64-encoded PEM. mTLS needs both cert and key. |

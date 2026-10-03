@@ -333,6 +333,13 @@ jobs:
       - name: Validate
         env:
           FERRUM_ENV: ${{ matrix.environment }}
+          # The operator's probe-Consumer allowlist, so a traffic-check slot
+          # whose Consumer it does not list is refused here, before Apply
+          # changes the gateway, rather than only by Verify traffic after.
+          FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}
+          # This step runs inside the environment, so an unset variable means
+          # the operator set no allowlist, and is refused as Verify refuses it.
+          FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"
         run: gitforgeops validate
 
       # Map the merge commit back to the PR that produced it. The binary uses
@@ -498,9 +505,22 @@ jobs:
         id: verify
         if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' && hashFiles('.gitforgeops/smoke.yaml') != '' }}
         continue-on-error: true
+        # A step timeout, never a job one: it fails this step, which
+        # `continue-on-error` records, and the ledger commit below still runs.
+        # A job timeout would cancel the job and skip that commit after the
+        # gateway changed. 20 minutes covers the 15-minute worst case
+        # `smoke.yaml` is held to at load, the runner's 30-second grace, and
+        # start-up.
+        timeout-minutes: 20
         env:
           FERRUM_ENV: ${{ matrix.environment }}
           FERRUM_VERIFY_BASE_URL: ${{ secrets.FERRUM_VERIFY_BASE_URL }}
+          # A GitHub Environment variable only a repository administrator
+          # can set: the Consumers whose credentials a check may send. It is
+          # the authorization; the `gitforgeops/verify-probe` label in
+          # resources/ is a second, repository-side condition, never enough
+          # alone. Unset, every check that sends a slot is refused.
+          FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           APPLIED_CREDS_FILE: ${{ steps.load-bundles.outputs.applied_file }}
         run: |
@@ -946,6 +966,13 @@ jobs:
       - name: Validate
         env:
           FERRUM_ENV: ${{ matrix.scope.environment }}
+          # The operator's probe-Consumer allowlist, so a traffic-check slot
+          # whose Consumer it does not list is refused here, before Apply
+          # changes the gateway, rather than only by Verify traffic after.
+          FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}
+          # This step runs inside the environment, so an unset variable means
+          # the operator set no allowlist, and is refused as Verify refuses it.
+          FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"
         run: gitforgeops validate
 
       # Map the merge commit back to the PR that produced it. The binary uses
@@ -1111,9 +1138,22 @@ jobs:
         id: verify
         if: ${{ !cancelled() && steps.deployment-mode.outputs.mode == 'api' && hashFiles('.gitforgeops/smoke.yaml') != '' }}
         continue-on-error: true
+        # A step timeout, never a job one: it fails this step, which
+        # `continue-on-error` records, and the ledger commit below still runs.
+        # A job timeout would cancel the job and skip that commit after the
+        # gateway changed. 20 minutes covers the 15-minute worst case
+        # `smoke.yaml` is held to at load, the runner's 30-second grace, and
+        # start-up.
+        timeout-minutes: 20
         env:
           FERRUM_ENV: ${{ matrix.scope.environment }}
           FERRUM_VERIFY_BASE_URL: ${{ secrets.FERRUM_VERIFY_BASE_URL }}
+          # A GitHub Environment variable only a repository administrator
+          # can set: the Consumers whose credentials a check may send. It is
+          # the authorization; the `gitforgeops/verify-probe` label in
+          # resources/ is a second, repository-side condition, never enough
+          # alone. Unset, every check that sends a slot is refused.
+          FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}
           APPLIED_CREDS_FILE: ${{ steps.load-bundles.outputs.applied_file }}
         run: |

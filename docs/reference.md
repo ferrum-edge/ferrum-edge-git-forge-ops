@@ -110,7 +110,11 @@ and prints an `=== Apply Blockers ===` section for:
   (`provisioner-token`) or `GITHUB_REPOSITORY` (`provisioning-repository`);
 - gateway and mesh file outputs resolving to one file
   (`publication-path-collision`);
-- a `.gitforgeops/smoke.yaml` that does not load (`invalid-smoke-checks`);
+- a `.gitforgeops/smoke.yaml` that does not load, or names a slot `verify`
+  would refuse (`invalid-smoke-checks`);
+- in a run bound to the environment, a check that sends a slot while
+  `FERRUM_VERIFY_PROBE_CONSUMERS` is unset, blank or malformed
+  (`probe-consumer-allowlist`, a repository administrator's fix);
 - a live comparison finding declarations that collide with API-spec-owned
   rows.
 
@@ -167,6 +171,7 @@ Set these per deployment environment (Settings → Environments, or
 | `FERRUM_GATEWAY_CA_CERT` | optional | Private CA, base64 PEM. |
 | `FERRUM_GATEWAY_CLIENT_CERT` / `FERRUM_GATEWAY_CLIENT_KEY` | optional | mTLS client pair, base64 PEM; both or neither. |
 | `FERRUM_VERIFY_BASE_URL` | for traffic checks | Data-plane base URL for `verify`. |
+| `FERRUM_VERIFY_PROBE_CONSUMERS` | when a check sends a `slot:` | An Environment **variable**, not a secret: comma-separated `<namespace>/<consumer-id>` of the probe Consumers a traffic check may spend. See [Probe credentials](promotion.md#probe-credentials). |
 | `FERRUM_CREDS_BUNDLE[_N]` | written by the broker | Credential bundles, shards 0–15. See [Storage](credential-broker.md#storage). |
 
 The JWT claim settings are optional to set, but when set they must match the
@@ -221,6 +226,8 @@ case-insensitive), malformed or zero numbers, and bad URLs are errors. See
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Mesh document. Must not resolve to the same file as the gateway document. |
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validator binary. |
 | `FERRUM_VERIFY_BASE_URL` | — | Data-plane URL for `verify`. |
+| `FERRUM_VERIFY_PROBE_CONSUMERS` | — | Operator allowlist of probe Consumers (`<namespace>/<consumer-id>`, comma-separated). `verify` refuses every check that sends a slot while it is unset; `validate`, `plan`, `apply` and `review` check it when set. |
+| `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set (`true`) only by workflow steps bound to the environment. Then an unset, blank or malformed allowlist refuses a slot-sending check in `validate`, `plan`, `apply` and `review`, as `verify` refuses it, instead of reading as "not visible". |
 | `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown top-level `spec` fields. See [Writing resources](resources.md#supported-fields-and-unknown-fields). |
 | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same as `apply --allow-nontransactional-plugin-attach`. |
 | `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same as `review --fail-on-blockers`. |

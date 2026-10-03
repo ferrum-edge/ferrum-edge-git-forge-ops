@@ -7,6 +7,7 @@ use crate::policy::config::OverrideConfig;
 use crate::policy::github_override::OverrideDecision;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
+use crate::verify::{ProbeAllowlistState, SlotBinding};
 
 /// GitHub accepts issue comments up to 65,536 characters. Keep a byte-based
 /// safety margin so multi-byte UTF-8 and future envelope changes cannot turn a
@@ -810,6 +811,105 @@ pub fn render_mesh_retraction(publication: MeshPublication, output_path: &str) -
         ),
     };
     Some(format!("\n\n{body}"))
+}
+
+/// Most traffic-check slot bindings, and most labelled Consumers, the probe
+/// section lists. It rides on the environment banner, above the size-bounded
+/// sections, so it is held to a small, fixed size.
+const MAX_PROBE_BINDING_ITEMS: usize = 20;
+/// Longest identifier one probe-section entry prints.
+const MAX_PROBE_IDENTIFIER_BYTES: usize = 128;
+
+fn probe_identifier(value: &str) -> String {
+    let (bounded, omitted) = truncate_utf8(value, MAX_PROBE_IDENTIFIER_BYTES);
+    if omitted > 0 {
+        inline_code(&format!("{bounded}…"))
+    } else {
+        inline_code(bounded)
+    }
+}
+
+/// The traffic-check credential section: each `slot:` header the
+/// environment's declared checks send, the Consumer it would spend and
+/// whether `verify` may send it, then every Consumer carrying the probe
+/// label, so a slot or a label a change adds is visible to its reviewer.
+/// Empty when there is neither.
+///
+/// Names only — checks, headers, slots and Consumers, each fenced — and fixed
+/// status wording. No credential value reaches this function.
+pub fn render_probe_bindings(
+    bindings: &[SlotBinding],
+    labelled: &[String],
+    allowlist: ProbeAllowlistState,
+) -> String {
+    if bindings.is_empty() && labelled.is_empty() {
+        return String::new();
+    }
+    let mut md = String::from(
+        "\n\n**Traffic-check credentials** — the Consumer each `slot:` header in \
+         `.gitforgeops/smoke.yaml` would spend (names only, never a value):\n",
+    );
+    for binding in bindings.iter().take(MAX_PROBE_BINDING_ITEMS) {
+        let consumer = match &binding.consumer {
+            Some(consumer) => probe_identifier(consumer),
+            None => "(no Consumer)".to_string(),
+        };
+        let verdict = if binding.status.is_refusal() {
+            "**refused**"
+        } else {
+            "ok"
+        };
+        md.push_str(&format!(
+            "\n- check {} · header {} · slot {} → {consumer}: {verdict}, {}",
+            probe_identifier(&binding.check),
+            probe_identifier(&binding.header),
+            probe_identifier(&binding.slot),
+            binding.status.describe()
+        ));
+    }
+    let omitted = bindings.len().saturating_sub(MAX_PROBE_BINDING_ITEMS);
+    if omitted > 0 {
+        md.push_str(&format!(
+            "\n- _{omitted} additional slot binding(s) omitted_"
+        ));
+    }
+    if bindings.is_empty() {
+        md.push_str("\n- _no declared check sends a slot_");
+    }
+    if !labelled.is_empty() {
+        let names: Vec<String> = labelled
+            .iter()
+            .take(MAX_PROBE_BINDING_ITEMS)
+            .map(String::as_str)
+            .map(probe_identifier)
+            .collect();
+        md.push_str("\n\nConsumers labelled `gitforgeops/verify-probe: \"true\"`: ");
+        md.push_str(&names.join(", "));
+        let omitted = labelled.len().saturating_sub(MAX_PROBE_BINDING_ITEMS);
+        if omitted > 0 {
+            md.push_str(&format!(" and {omitted} more"));
+        }
+        md.push('.');
+    }
+    let note = match allowlist {
+        ProbeAllowlistState::Listed => "",
+        ProbeAllowlistState::NotVisible => {
+            "\n\n`FERRUM_VERIFY_PROBE_CONSUMERS` is not visible to this review, so the \
+             operator allowlist was not checked here. `verify` refuses every slot whose \
+             Consumer the operator does not list there; a label alone authorizes nothing."
+        }
+        ProbeAllowlistState::Unset => {
+            "\n\n`FERRUM_VERIFY_PROBE_CONSUMERS` is not set for this environment, so \
+             `verify` would refuse every check that sends a slot. A repository \
+             administrator must set it; the pull request cannot."
+        }
+        ProbeAllowlistState::Malformed => {
+            "\n\n`FERRUM_VERIFY_PROBE_CONSUMERS` does not parse for this environment. A \
+             repository administrator must correct it; the pull request cannot."
+        }
+    };
+    md.push_str(note);
+    md
 }
 
 /// The "Spec-owned resources" section, or an empty string when there are none.
