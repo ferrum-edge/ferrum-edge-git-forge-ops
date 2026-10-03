@@ -205,6 +205,11 @@ published. Before building anything, the run is refused if:
 - the head changed a [deployment input](../README.md#deployment-inputs-one-list-for-scheduling-and-for-supersession)
   since the triggering commit (`Superseded deployment`).
 
+Both workflows run both checks. For a rotation the triggering commit is the
+one it was dispatched from, so its environment approval never carries a newer
+binary, helper or resource change; see
+[A superseded rotation](../README.md#a-superseded-rotation).
+
 Policy-override lookup and credential delivery stay tied to the triggering
 merge's PR; the supersession check guarantees no later PR's input is applied
 under that attribution. The classifier is taken from the triggering commit and

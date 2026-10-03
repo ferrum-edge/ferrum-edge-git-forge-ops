@@ -546,7 +546,8 @@ Applies to one environment never overlap: they share the
 the lock, it moves onto the **current** head of `main` and applies that, so it
 builds from and reconciles against the latest ledger. It refuses to run if its
 triggering commit is no longer on `main` (`Stale deployment`) or if a later
-merge changed a deployment input (`Superseded deployment`). See
+merge changed a deployment input (`Superseded deployment`). Rotation follows
+the same rules. See
 [Ordering between runs](docs/apply.md#ordering-between-runs).
 
 ### What if apply fails after merge?
@@ -620,6 +621,23 @@ Credentials are delivered by the run that allocates them. If your merge added
 a consumer credential and a later merge superseded it, the later PR's author
 receives it; rotate the slot with `rotate.yml` to deliver it to the right
 person.
+
+#### A superseded rotation
+
+`rotate.yml` runs the same guard with the same classifier. A rotation waits on
+the same lock as apply, so a merge can land while it is queued or waiting for
+the environment reviewer. When that merge changed a deployment input, the
+rotation refuses with the same `Superseded deployment` error, before it builds
+anything, loads a credential bundle or writes a secret. The error mentions the
+apply run because that is what the newer merge schedules. Rotations are never
+rescheduled automatically, so to recover:
+
+1. Let the apply for the newer head finish (approve or re-run it as above).
+2. Dispatch **Actions → GitForgeOps Rotate Credential** again from `main`. The
+   new run is bound to the current head and its own environment approval.
+
+Apply's own ledger commits (`.state/**`, `assembled/**`) and documentation-only
+merges do not supersede a queued rotation.
 
 ## Staged promotion
 

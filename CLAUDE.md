@@ -597,10 +597,15 @@ recipient) stays on the triggering merge.
 `check_supply_chain.py::stale_deployment_guard_violations` enforces the shape
 and step order.
 
-Apply also runs `.github/scripts/deployment_scope.py classify`, which refuses
+Both also run `.github/scripts/deployment_scope.py classify`, which refuses
 the queued run when the refreshed head changed a **deployment input**. This
-binds the triggering PR's authorization and credential recipient to unchanged
-executable and desired inputs.
+binds the triggering PR's authorization and credential recipient (apply) and
+the dispatched run's environment approval (rotate) to unchanged executable and
+desired inputs. `stale_deployment_guard_violations` requires the binding in
+every reconciling job of every `FRESH_HEAD_WORKFLOWS` entry. Rotation is not
+held to `fresh_head == TRIGGER_SHA`: apply's ledger commit moves the branch
+while a rotation waits on the shared lock, and the classifier treats it as
+inert. A superseded rotation is never rescheduled; the operator re-dispatches.
 
 - `DEPLOYMENT_INPUT_PATHS` is one list used twice: it is also
   `apply-on-merge.yml`'s `on.push.paths`, and
@@ -613,7 +618,8 @@ executable and desired inputs.
   approve its own helper or executable changes.
 - `GENERATED_PATHS` (`.state/**`, `assembled/**`) is in neither half: apply
   writes them, so they must not reject a queued run or re-trigger the job.
-- Operator recovery: `README.md#recovering-a-superseded-apply`.
+- Operator recovery: `README.md#recovering-a-superseded-apply` (rotation:
+  `README.md#a-superseded-rotation`).
 
 ### Staged promotion
 
