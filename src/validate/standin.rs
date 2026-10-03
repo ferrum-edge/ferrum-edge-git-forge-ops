@@ -222,7 +222,12 @@ fn substitute_plugin_leaves(
             }
             // The canonical broker slot, so a stand-in is distinct per leaf
             // and stable across runs for the same repository.
-            let slot = crate::secrets::resolver::plugin_config_slot(namespace, plugin_id, path);
+            let slot = crate::secrets::resolver::plugin_config_slot(
+                namespace,
+                plugin_id,
+                plugin_name,
+                path,
+            );
             if !eligible(&slot) {
                 return false;
             }
