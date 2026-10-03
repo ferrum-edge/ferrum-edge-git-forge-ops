@@ -132,8 +132,10 @@ cargo fmt --all && cargo fmt --all -- --check
   from the protected branch) reports `trusted-supply-chain-policy`. It checks
   the PR head out into `candidate/` as data and runs only `python3 -I
   base/.github/scripts/check_supply_chain.py --root candidate`. The checker
-  pins every non-comment line of that file and refuses any other workflow job
-  keyed or named `trusted-supply-chain-policy`. `security.yml`'s
+  first refuses symlinks that leave the judged tree and special files, pins
+  every non-comment line of that file, refuses the context name in other
+  workflows (two exact allow-listed lines), computed job display names and
+  `checks`/`statuses` write permissions. `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check").

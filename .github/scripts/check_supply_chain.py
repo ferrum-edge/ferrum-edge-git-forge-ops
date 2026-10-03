@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -1576,6 +1577,9 @@ PINNED_ACTION_COMMIT = "<40-hex commit>"
 # second trigger, a write permission, `secrets`, an environment, another step —
 # is a different line list. The action commit is the only free part, so
 # Dependabot can still bump it; the repository-wide rule requires 40 hex.
+# Deliberate trade-off: any 40-hex commit is accepted here, including one
+# GitHub resolves through a fork of `actions/checkout`, so a commit change to
+# this file needs the same exact-head review as any other workflow change.
 SUPPLY_CHAIN_POLICY_SHAPE = (
     "name: GitForgeOps Supply-Chain Policy",
     "on:",
@@ -1590,6 +1594,7 @@ SUPPLY_CHAIN_POLICY_SHAPE = (
     "jobs:",
     f"  {SUPPLY_CHAIN_POLICY_JOB}:",
     "    runs-on: ubuntu-24.04",
+    "    timeout-minutes: 10",
     "    steps:",
     "      - name: Check out protected supply-chain policy",
     f"        uses: actions/checkout@{PINNED_ACTION_COMMIT}",
@@ -1609,36 +1614,36 @@ SUPPLY_CHAIN_POLICY_SHAPE = (
 )
 _PINNED_USES = re.compile(r"^(\s*(?:-\s+)?uses:\s*[^@\s]+)@[0-9a-f]{40}$")
 # YAML starts a comment at a `#` preceded by whitespace. A `#` glued to a
-# value is part of it, so it is kept and the line no longer matches.
-_TRAILING_COMMENT = re.compile(r"\s+#.*$")
-# A job's `name:` whose value is an expression. It would compute the check
-# run's name, which is what a ruleset matches, so the literal-name ban could
-# not see it. Job keys sit at four spaces under `jobs:`; a flow-style mapping
-# is matched wherever it appears in the jobs section. Step titles and action
-# inputs (an artifact's `name:`) never name a check and stay free.
-_JOB_EXPRESSION_NAME = re.compile(
-    r"""^ {4}["']?name["']?\s*:[^\n]*\$\{\{""", re.IGNORECASE | re.MULTILINE
+# value is part of it, so it is kept and the line no longer matches. A
+# lookbehind rather than `\s+#`: a long run of blanks with no `#` must not
+# backtrack quadratically on candidate input.
+_TRAILING_COMMENT = re.compile(r"(?<=[ \t])#.*$")
+# Lines of other workflows that may name the protected context without
+# defining a job: the audit's expected contexts and the release gate.
+POLICY_CHECK_MENTIONS = {
+    ".github/workflows/settings-audit.yml": frozenset(
+        {f"--required-check '{SUPPLY_CHAIN_POLICY_JOB}'"}
+    ),
+    ".github/workflows/release.yml": frozenset(
+        {f'"GitForgeOps Supply-Chain Policy / {SUPPLY_CHAIN_POLICY_JOB}"'}
+    ),
+}
+# One block-mapping key line: a plain or quoted key, then an optional inline
+# value. Anything else where a key is expected is unclassifiable.
+_BLOCK_KEY = re.compile(
+    r"""^(?P<indent> *)(?P<key>"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_-]+)"""
+    r"""[ \t]*:(?:[ \t]+(?P<value>.*?))?[ \t]*$"""
 )
-_FLOW_EXPRESSION_NAME = re.compile(
-    r"""[{,]\s*["']?name["']?\s*:[^,}\n]*\$\{\{""", re.IGNORECASE
-)
-_JOBS_SECTION = re.compile(r"^jobs\s*:", re.MULTILINE)
-_POLICY_JOB_PATTERN = re.escape(SUPPLY_CHAIN_POLICY_JOB)
-# The protected job's name as a mapping key anywhere in the jobs section: a
-# block key at any indentation (after an optional `- `), a flow key, or an
-# explicit `? ` key whose `:` sits on the next line.
-_POLICY_JOB_KEY = re.compile(
-    rf"""(?:(?:^[ \t]*(?:-[ \t]+)?|[{{,][ \t]*)["']?[ \t]*{_POLICY_JOB_PATTERN}"""
-    rf"""[ \t]*["']?[ \t]*:)|(?:^[ \t]*\?[ \t]*["']?[ \t]*{_POLICY_JOB_PATTERN}"""
-    r"""(?![\w-]))""",
+# Workflows that may grant a token the right to create check runs or commit
+# statuses. Empty: with either, a job could report any context name it
+# computes at run time, which no static rule can see.
+STATUS_WRITE_ALLOWED: frozenset[str] = frozenset()
+_STATUS_PERMISSION = re.compile(
+    r"""(?:^[ \t]*(?:-[ \t]+)?|[{,][ \t]*)["']?(?P<scope>checks|statuses)["']?"""
+    r"""[ \t]*:[ \t]*(?P<value>[^,}\n]*)""",
     re.IGNORECASE | re.MULTILINE,
 )
-# ...or as the whole value of any `name:` there, quoted or not.
-_POLICY_JOB_NAME = re.compile(
-    rf"""["']?name["']?[ \t]*:[ \t]*["']?[ \t]*{_POLICY_JOB_PATTERN}[ \t]*["']?"""
-    r"""[ \t]*(?:[,}#]|$)""",
-    re.IGNORECASE | re.MULTILINE,
-)
+_WRITE_ALL = re.compile(r"\bwrite-all\b", re.IGNORECASE)
 
 
 def policy_workflow_shape(text: str) -> list[str]:
@@ -1688,6 +1693,170 @@ def supply_chain_policy_workflow_violations(root: Path) -> list[str]:
     return supply_chain_policy_shape_violations(path.read_text(encoding="utf-8"))
 
 
+def candidate_tree_violations(root: Path) -> list[str]:
+    """Every path in the judged tree must be a plain file, a directory, or a
+    symlink that resolves inside the tree.
+
+    The policy job lays the protected checkout out beside the candidate
+    (`base/` next to `candidate/`), and every other workflow runs the same
+    tree at the workspace root. A link that is absolute or climbs out of the
+    tree therefore reads one file here and a different one everywhere else:
+    `.github/scripts` pointing at the workspace's `base/.github/scripts` shows
+    this check the protected scripts while later runs execute the pull
+    request's own copy. Every path component is visited without following a
+    link, and nothing is read until the walk passes. Devices, FIFOs and
+    sockets are refused too, since reading one can hang or exhaust the job.
+    `.git` directories are the checkout's own metadata and are skipped.
+    """
+    if root.is_symlink() or not root.is_dir():
+        return [f"{root}: the tree under review must be a directory"]
+    real_root = Path(os.path.realpath(root))
+    violations: list[str] = []
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(directory)
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not (name == ".git" and not (here / name).is_symlink())
+        )
+        for name in sorted(dirnames + filenames):
+            path = here / name
+            relative = path.relative_to(root).as_posix()
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                target = os.readlink(path)
+                resolved = Path(os.path.realpath(path))
+                if os.path.isabs(target) or not (
+                    resolved == real_root or resolved.is_relative_to(real_root)
+                ):
+                    violations.append(
+                        f"{relative}: symlink leaves the tree under review "
+                        f"({target!r}); it would resolve differently in the "
+                        "policy job and in the workflows that run this tree"
+                    )
+                elif not os.path.exists(path):
+                    violations.append(
+                        f"{relative}: symlink does not resolve ({target!r})"
+                    )
+            elif not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                violations.append(
+                    f"{relative}: only regular files, directories and in-tree "
+                    "symlinks may be reviewed; this is a special file"
+                )
+    return violations
+
+
+def _strip_trailing_comment(line: str) -> str:
+    return _TRAILING_COMMENT.sub("", line).rstrip()
+
+
+def _yaml_key(token: str) -> str:
+    """A block key's text: quotes removed and double-quoted escapes decoded."""
+    if token[:1] == '"':
+        return _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, token[1:-1])
+    if token[:1] == "'":
+        return token[1:-1].replace("''", "'")
+    return token
+
+
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _job_display_name_violations(workflow: str, text: str) -> list[str]:
+    """No job's display name may be computed, and every job must be readable.
+
+    Not a YAML parser, so it reads the structure that decides a check-run
+    name and fails closed on anything else: top-level keys, the jobs mapping
+    (quoted `"jobs":` included), each job, and each job's own keys at
+    whatever indentation the file uses. A job must be a block mapping; a
+    job-level value may not carry an anchor, alias or tag; and `name:` must be
+    a single-line literal with no `${{ }}`, not empty, not a block or flow
+    scalar and not continued on the next line.
+    """
+    lines = [
+        line
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    def unclassifiable(what: str, line: str) -> list[str]:
+        return [
+            f"{workflow}: cannot classify {what}, so the check names its jobs "
+            f"report cannot be verified; found {line.strip()!r}"
+        ]
+
+    bodies: list[list[str]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line[0] == " ":
+            index += 1
+            continue
+        if line.rstrip() in ("---", "..."):
+            index += 1
+            continue
+        match = _BLOCK_KEY.match(_strip_trailing_comment(line))
+        if match is None:
+            return unclassifiable("a top-level line", line)
+        end = index + 1
+        while end < len(lines) and lines[end][0] == " ":
+            end += 1
+        if _yaml_key(match["key"]).casefold() == "jobs":
+            if match["value"]:
+                return unclassifiable("a jobs section that is not a block mapping", line)
+            bodies.append(lines[index + 1:end])
+        index = end
+
+    for body in bodies:
+        if not body:
+            continue
+        job_indent = _line_indent(body[0])
+        key_indent: int | None = None
+        for position, line in enumerate(body):
+            indent = _line_indent(line)
+            if line[indent] == "\t" or indent < job_indent:
+                return unclassifiable("a line in the jobs mapping", line)
+            stripped = _strip_trailing_comment(line)
+            if indent == job_indent:
+                match = _BLOCK_KEY.match(stripped)
+                if match is None or match["value"]:
+                    return unclassifiable("a job that is not a block mapping", line)
+                key_indent = None
+                continue
+            if key_indent is None:
+                key_indent = indent
+            if indent < key_indent:
+                return unclassifiable("a line in a job mapping", line)
+            if indent > key_indent:
+                continue
+            match = _BLOCK_KEY.match(stripped)
+            if match is None:
+                return unclassifiable("a job-level key", line)
+            value = match["value"] or ""
+            if value[:1] in ("&", "*", "!"):
+                return unclassifiable("a job-level anchor, alias or tag", line)
+            if _yaml_key(match["key"]).casefold() != "name":
+                continue
+            decoded = _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, value)
+            following = body[position + 1] if position + 1 < len(body) else ""
+            quoted = value[:1] in ('"', "'")
+            if (
+                not value
+                or value[0] in "|>{["
+                or (quoted and (len(value) < 2 or value[-1] != value[0]))
+                or (following and _line_indent(following) > key_indent)
+            ):
+                return unclassifiable("a job display name that is not one literal line", line)
+            if "${{" in decoded:
+                return [
+                    f"{workflow}: a job display name must be a literal, so no workflow "
+                    f"can compute the {SUPPLY_CHAIN_POLICY_JOB!r} check name; found "
+                    f"{line.strip()!r}"
+                ]
+    return []
+
+
 def policy_check_impersonation_violations(workflow: str, text: str) -> list[str]:
     """Only the protected policy workflow may report `trusted-supply-chain-policy`.
 
@@ -1696,37 +1865,55 @@ def policy_check_impersonation_violations(workflow: str, text: str) -> list[str]
     definitions, so a job keyed or named like the trusted one would put a
     second, candidate-defined result under the required name.
 
-    Not a YAML parser, so it reads the jobs section fail-closed, after
-    full-line comments are dropped and double-quoted escapes decoded, in any
-    case: no mapping key there (block or flow, quoted or not) may be the
-    name, no `name:` there may be set to it, and no job's display name may be
-    computed. Mentioning the context elsewhere (the settings audit's
-    `--required-check`, the release gate) stays allowed.
+    Two fail-closed rules. The name may not appear anywhere in another
+    workflow, in any case, after full-line comments are dropped and
+    double-quoted escapes decoded, except on the exact lines in
+    `POLICY_CHECK_MENTIONS`. And no job's display name may be computed, or
+    written in a shape this reader cannot classify
+    (`_job_display_name_violations`).
 
     `workflow` is the path relative to the repository root.
     """
     if workflow == SUPPLY_CHAIN_POLICY_PATH:
         return []
-    content = decoded_workflow_content(text)
-    jobs = _JOBS_SECTION.search(content)
-    section = content[jobs.end():] if jobs else ""
     violations: list[str] = []
-    claimed = _POLICY_JOB_KEY.search(section) or _POLICY_JOB_NAME.search(section)
-    if claimed is not None:
+    allowed = POLICY_CHECK_MENTIONS.get(workflow, frozenset())
+    for line in decoded_workflow_content(text).splitlines():
+        if SUPPLY_CHAIN_POLICY_JOB in line.casefold() and line.strip() not in allowed:
+            violations.append(
+                f"{workflow}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may name the "
+                f"{SUPPLY_CHAIN_POLICY_JOB!r} check; another job reporting that name "
+                "would stand beside the protected verdict; found "
+                f"{line.strip()!r}"
+            )
+            break
+    violations.extend(_job_display_name_violations(workflow, text))
+    return violations
+
+
+def status_write_permission_violations(workflow: str, text: str) -> list[str]:
+    """No workflow may let its token create check runs or commit statuses.
+
+    With `checks: write` or `statuses: write` (or `write-all`), a job can post
+    a result under any context it computes at run time, including a required
+    one. Only `read`, `none` or an absent grant is accepted, outside the
+    allow-list `STATUS_WRITE_ALLOWED` (empty).
+    """
+    if workflow in STATUS_WRITE_ALLOWED:
+        return []
+    content = decoded_workflow_content(text)
+    violations: list[str] = []
+    for match in _STATUS_PERMISSION.finditer(content):
+        value = _strip_trailing_comment(match["value"]).strip().strip("'\"").lower()
+        if value not in ("read", "none"):
+            violations.append(
+                f"{workflow}: {match['scope'].lower()} may only be read; a token "
+                "that writes check runs or commit statuses can report a required "
+                f"check under any name; found {match.group(0).strip()!r}"
+            )
+    if _WRITE_ALL.search(content):
         violations.append(
-            f"{workflow}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
-            f"{SUPPLY_CHAIN_POLICY_JOB!r} check; another job reporting that name "
-            "would stand beside the protected verdict; found "
-            f"{claimed.group(0).strip()!r}"
-        )
-    computed = _JOB_EXPRESSION_NAME.search(section) or _FLOW_EXPRESSION_NAME.search(
-        section
-    )
-    if computed is not None:
-        violations.append(
-            f"{workflow}: a job display name must be a literal, so no workflow can "
-            f"compute the {SUPPLY_CHAIN_POLICY_JOB!r} check name; found "
-            f"{computed.group(0).strip()!r}"
+            f"{workflow}: write-all would grant checks: write and statuses: write"
         )
     return violations
 
@@ -1928,6 +2115,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     root = args.root.resolve()
+    # Before any read: a link out of the tree, or a special file, would make
+    # every later rule judge something other than what the tree carries.
+    tree_violations = candidate_tree_violations(root)
+    if tree_violations:
+        print("Supply-chain policy violations:", file=sys.stderr)
+        for violation in tree_violations:
+            print(f"  - {violation}", file=sys.stderr)
+        return 1
     workflows = root / ".github" / "workflows"
     checked_action_files = action_files(root)
     violations: list[str] = []
@@ -1970,6 +2165,11 @@ def main(argv: list[str] | None = None) -> int:
         if workflow.parent == workflows:
             violations.extend(
                 policy_check_impersonation_violations(
+                    workflow.relative_to(root).as_posix(), text
+                )
+            )
+            violations.extend(
+                status_write_permission_violations(
                     workflow.relative_to(root).as_posix(), text
                 )
             )

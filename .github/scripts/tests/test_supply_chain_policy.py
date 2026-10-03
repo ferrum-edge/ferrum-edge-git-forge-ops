@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import re
 import shlex
 import shutil
@@ -482,6 +483,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "    runs-on: ubuntu-24.04\n",
                 "    runs-on: ubuntu-24.04\n    continue-on-error: true\n",
             ),
+            "no_timeout": ("    timeout-minutes: 10\n", ""),
+            "default_timeout": ("    timeout-minutes: 10\n", "    timeout-minutes: 360\n"),
             "renamed_check": (
                 "  trusted-supply-chain-policy:\n    runs-on",
                 "  trusted-supply-chain-policy:\n    name: policy\n    runs-on",
@@ -509,6 +512,14 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(len(violations), 1, violations)
                 self.assertIn("must keep its pinned shape", violations[0])
+
+        # Trailing-comment removal is linear: a long run of blanks with no
+        # `#` in candidate input must not backtrack quadratically.
+        padded = "x" + " " * 50_000 + "y"
+        self.assertEqual(check_supply_chain.policy_workflow_shape(padded), [padded])
+        self.assertEqual(
+            check_supply_chain.policy_workflow_shape("a: b" + " " * 50_000 + "# c"), ["a: b"]
+        )
 
         # Comments, blank lines and a reviewed commit bump are not shape.
         bumped = workflow.replace(
@@ -556,101 +567,301 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "    steps:\n"
             "      - run: true\n"
         )
+        workflow = ".github/workflows/impostor.yml"
         self.assertEqual(
-            check_supply_chain.policy_check_impersonation_violations(
-                ".github/workflows/impostor.yml", base
-            ),
-            [],
+            check_supply_chain.policy_check_impersonation_violations(workflow, base), []
         )
-        claimed = {
-            "job_key": base.replace("  build:\n", "  trusted-supply-chain-policy:\n"),
-            "quoted_job_key": base.replace(
-                "  build:\n", '  "trusted-supply-chain-policy":\n'
+        job = "  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n"
+        named = "  build:\n    name: {}\n    runs-on: ubuntu-24.04\n"
+        computed = "${{ format('{0}-supply-chain-policy', 'trusted') }}"
+        named_by = "may name the 'trusted-supply-chain-policy' check"
+        literal = "a job display name must be a literal"
+        unreadable = "cannot classify"
+        cases = {
+            # The name itself, in any spelling, anywhere outside the
+            # allow-listed lines.
+            "job_key": (base.replace("  build:\n", "  trusted-supply-chain-policy:\n"), named_by),
+            "quoted_job_key": (
+                base.replace("  build:\n", '  "trusted-supply-chain-policy":\n'),
+                named_by,
             ),
-            "upper_case_job_key": base.replace(
-                "  build:\n", "  TRUSTED-SUPPLY-CHAIN-POLICY:\n"
+            "upper_case_job_key": (
+                base.replace("  build:\n", "  TRUSTED-SUPPLY-CHAIN-POLICY:\n"),
+                named_by,
             ),
-            "escaped_job_key": base.replace(
-                "  build:\n", '  "\\x74rusted-supply-chain-policy":\n'
+            "escaped_job_key": (
+                base.replace("  build:\n", '  "\\x74rusted-supply-chain-policy":\n'),
+                named_by,
             ),
-            "explicit_job_key": base.replace(
-                "  build:\n", "  ? trusted-supply-chain-policy\n  :\n"
+            "quoted_jobs_key": (
+                base.replace("jobs:\n  build:\n", '"jobs":\n  trusted-supply-chain-policy:\n'),
+                named_by,
             ),
-            "indented_job_key": base.replace(
-                "  build:\n    runs-on: ubuntu-24.04\n",
-                "    trusted-supply-chain-policy:\n      runs-on: ubuntu-24.04\n",
+            "explicit_job_key": (
+                base.replace("  build:\n", "  ? trusted-supply-chain-policy\n  :\n"),
+                named_by,
             ),
-            "job_name": base.replace(
-                "    runs-on:", "    name: trusted-supply-chain-policy\n    runs-on:"
+            "job_name": (base.replace(job, named.format("trusted-supply-chain-policy")), named_by),
+            "next_line_name": (
+                base.replace(
+                    job, "  build:\n    name:\n      trusted-supply-chain-policy\n"
+                ),
+                named_by,
             ),
-            "quoted_job_name": base.replace(
-                "    runs-on:", "    name: 'trusted-supply-chain-policy'\n    runs-on:"
+            "block_scalar_name": (
+                base.replace(
+                    job, "  build:\n    name: >-\n      trusted-supply-chain-policy\n"
+                ),
+                named_by,
             ),
-            "commented_job_name": base.replace(
-                "    runs-on:",
-                "    name: trusted-supply-chain-policy # looks harmless\n    runs-on:",
+            "anchored_name": (
+                base.replace(job, named.format("&n trusted-supply-chain-policy")),
+                named_by,
             ),
-            "flow_job_name": base.replace(
-                "  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n",
-                "  build: {runs-on: ubuntu-24.04, name: trusted-supply-chain-policy, "
-                "steps: [{run: 'true'}]}\n",
+            "tagged_key": (
+                base.replace("  build:\n", "  !!str trusted-supply-chain-policy:\n"),
+                named_by,
             ),
-            "flow_job_key": base.replace(
-                "jobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n",
-                "jobs: {trusted-supply-chain-policy: {runs-on: ubuntu-24.04}}\n",
+            "flow_job": (
+                base.replace(
+                    job, "  build: {runs-on: ubuntu-24.04, name: trusted-supply-chain-policy}\n"
+                ),
+                named_by,
             ),
+            "allow_listed_text_elsewhere": (
+                base.replace(
+                    "      - run: true\n",
+                    "      - run: |\n"
+                    "          audit --required-check 'trusted-supply-chain-policy'\n",
+                ),
+                named_by,
+            ),
+            # A computed display name, at any indentation.
+            "computed_name": (base.replace(job, named.format(computed)), literal),
+            "computed_name_deeper_indent": (
+                "name: Impostor\non:\n  pull_request:\njobs:\n"
+                "    build:\n"
+                f"        name: {computed}\n"
+                "        runs-on: ubuntu-24.04\n",
+                literal,
+            ),
+            "computed_name_under_quoted_jobs": (
+                base.replace("jobs:\n", '"jobs":\n').replace(job, named.format(computed)),
+                literal,
+            ),
+            "escaped_expression": (
+                base.replace(job, named.format('"\\x24{{ github.event.number }}"')),
+                literal,
+            ),
+            # Shapes this reader cannot classify fail closed.
+            "next_line_computed_name": (
+                base.replace(job, "  build:\n    name:\n      " + computed + "\n"),
+                unreadable,
+            ),
+            "continued_name": (
+                base.replace(job, "  build:\n    name: build\n      " + computed + "\n"),
+                unreadable,
+            ),
+            "unterminated_quoted_name": (
+                base.replace(job, '  build:\n    name: "build\n      ' + computed + '"\n'),
+                unreadable,
+            ),
+            "aliased_name": (base.replace(job, named.format("*n")), unreadable),
+            "merged_job_keys": (
+                base.replace("    runs-on:", "    <<: *defaults\n    runs-on:"),
+                unreadable,
+            ),
+            "flow_job_without_the_name": (
+                base.replace(job, "  build: {runs-on: ubuntu-24.04, name: x}\n"),
+                unreadable,
+            ),
+            "flow_top_level": ("{jobs: {build: {runs-on: ubuntu-24.04}}}\n", unreadable),
+            "aliased_job": (base.replace(job, "  build: *other\n"), unreadable),
         }
-        computed = {
-            "computed_job_name": base.replace(
-                "    runs-on:",
-                "    name: ${{ format('trusted-{0}', 'supply-chain-policy') }}\n    runs-on:",
-            ),
-            "computed_flow_name": base.replace(
-                "  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n",
-                "  build: {runs-on: ubuntu-24.04, name: \"${{ github.event.number }}\"}\n",
-            ),
-        }
-        for expected, cases in (
-            ("may define the 'trusted-supply-chain-policy' check", claimed),
-            ("a job display name must be a literal", computed),
-        ):
-            for label, text in cases.items():
-                with self.subTest(label=label):
-                    self.assertNotEqual(text, base)
-                    violations = check_supply_chain.policy_check_impersonation_violations(
-                        ".github/workflows/impostor.yml", text
-                    )
-                    self.assertTrue(
-                        any(expected in item for item in violations), violations
-                    )
+        for label, (text, expected) in cases.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(text, base)
+                violations = check_supply_chain.policy_check_impersonation_violations(
+                    workflow, text
+                )
+                self.assertTrue(any(expected in item for item in violations), violations)
 
-        # Naming the context is not defining it, and step titles and action
-        # inputs never name a check run.
-        allowed = base.replace(
-            "      - run: true\n",
-            "      # trusted-supply-chain-policy: a comment\n"
-            "      - name: Upload ${{ matrix.shard }}\n"
-            "        uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
-            "        with:\n"
-            "          name: result-${{ github.sha }}\n"
-            "      - run: |\n"
-            "          audit --required-check 'trusted-supply-chain-policy'\n"
-            "          echo \"Workflow / trusted-supply-chain-policy\"\n",
+        # Step titles and action inputs never name a check run, other
+        # indentations and quoted keys read fine, and comments are not content.
+        allowed = (
+            "name: Fine\n"
+            "on:\n"
+            "  pull_request:\n"
+            '"jobs":\n'
+            "    'build':\n"
+            "        # trusted-supply-chain-policy: a comment\n"
+            "        \"name\": Build # a trailing comment\n"
+            "        runs-on: ubuntu-24.04\n"
+            "        steps:\n"
+            "          - name: Upload ${{ matrix.shard }}\n"
+            "            uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
+            "            with:\n"
+            "              name: result-${{ github.sha }}\n"
+            "          - run: |\n"
+            "              case \"$x\" in\n"
+            "                *) echo ok ;;\n"
+            "              esac\n"
         )
         self.assertEqual(
-            check_supply_chain.policy_check_impersonation_violations(
-                ".github/workflows/impostor.yml", allowed
-            ),
-            [],
+            check_supply_chain.policy_check_impersonation_violations(workflow, allowed), []
         )
+        # The allow-listed lines are exact and belong to their own workflow.
+        for path, line in (
+            (".github/workflows/settings-audit.yml", "--required-check 'trusted-supply-chain-policy'"),
+            (
+                ".github/workflows/release.yml",
+                '"GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"',
+            ),
+        ):
+            mention = base.replace(
+                "      - run: true\n", f"      - run: |\n          {line}\n"
+            )
+            with self.subTest(path=path):
+                self.assertEqual(
+                    check_supply_chain.policy_check_impersonation_violations(path, mention),
+                    [],
+                )
+                self.assertTrue(
+                    check_supply_chain.policy_check_impersonation_violations(
+                        workflow, mention
+                    )
+                )
         # The protected workflow itself is the one place the job is defined.
         self.assertEqual(
             check_supply_chain.policy_check_impersonation_violations(
-                check_supply_chain.SUPPLY_CHAIN_POLICY_PATH,
-                claimed["job_key"],
+                check_supply_chain.SUPPLY_CHAIN_POLICY_PATH, cases["job_key"][0]
             ),
             [],
         )
+
+    def test_no_workflow_may_write_check_runs_or_commit_statuses(self):
+        base = "name: W\non:\n  push:\npermissions:\n  contents: read\njobs: {}\n"
+        workflow = ".github/workflows/w.yml"
+        self.assertEqual(
+            check_supply_chain.status_write_permission_violations(workflow, base), []
+        )
+        for label, permission in {
+            "checks": "  checks: write\n",
+            "statuses": "  statuses: write\n",
+            "quoted": "  'statuses': 'write'\n",
+            "upper_case": "  Checks: WRITE\n",
+            "aliased": "  checks: *grant\n",
+            "anchored": "  statuses: &grant write\n",
+            "flow": "  scoped: {contents: read, checks: write}\n",
+            "write_all": "  all: write-all\n",
+        }.items():
+            with self.subTest(label=label):
+                text = base.replace("  contents: read\n", "  contents: read\n" + permission)
+                self.assertTrue(
+                    check_supply_chain.status_write_permission_violations(workflow, text)
+                )
+        for permission in ("  checks: read\n", "  statuses: none\n"):
+            text = base.replace("  contents: read\n", "  contents: read\n" + permission)
+            self.assertEqual(
+                check_supply_chain.status_write_permission_violations(workflow, text), []
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/rust-ci.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count("permissions:\n  contents: read\n"), 1)
+            path.write_text(
+                text.replace(
+                    "permissions:\n  contents: read\n",
+                    "permissions:\n  contents: read\n  statuses: write\n",
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(item.startswith(".github/workflows/rust-ci.yml: statuses") for item in violations),
+            violations,
+        )
+
+    def test_links_out_of_the_tree_and_special_files_stop_the_check(self):
+        # The policy job puts the protected checkout at `base/` beside
+        # `candidate/`. A link from the candidate into `base/` would show the
+        # check protected files while every other workflow, running the tree
+        # at the workspace root, reads the pull request's own copy.
+        def run(candidate: Path) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(candidate)],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=120,
+            )
+
+        layouts = {
+            "absolute_scripts_dir": lambda workspace, candidate: (
+                shutil.rmtree(candidate / ".github/scripts"),
+                (candidate / ".github/scripts").symlink_to(
+                    workspace / "base/.github/scripts", target_is_directory=True
+                ),
+                ".github/scripts: symlink leaves the tree under review",
+            )[-1],
+            "relative_escape": lambda workspace, candidate: (
+                shutil.rmtree(candidate / ".github/scripts"),
+                (candidate / ".github/scripts").symlink_to(
+                    "../../base/.github/scripts", target_is_directory=True
+                ),
+                ".github/scripts: symlink leaves the tree under review",
+            )[-1],
+            "absolute_inside": lambda workspace, candidate: (
+                (candidate / "Dockerfile").unlink(),
+                (candidate / "Dockerfile").symlink_to(candidate / ".dockerignore"),
+                "Dockerfile: symlink leaves the tree under review",
+            )[-1],
+            "nested_escape": lambda workspace, candidate: (
+                (candidate / "src/link").symlink_to("../../base"),
+                "src/link: symlink leaves the tree under review",
+            )[-1],
+            "device": lambda workspace, candidate: (
+                (candidate / "rust-toolchain.toml").unlink(),
+                (candidate / "rust-toolchain.toml").symlink_to("/dev/zero"),
+                "rust-toolchain.toml: symlink leaves the tree under review",
+            )[-1],
+            "fifo": lambda workspace, candidate: (
+                (candidate / "rust-toolchain.toml").unlink(),
+                os.mkfifo(candidate / "rust-toolchain.toml"),
+                "rust-toolchain.toml: only regular files, directories and in-tree "
+                "symlinks may be reviewed",
+            )[-1],
+            "dangling": lambda workspace, candidate: (
+                (candidate / "missing").symlink_to("nowhere"),
+                "missing: symlink does not resolve",
+            )[-1],
+        }
+        for label, arrange in layouts.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                self._mirror_repo(workspace / "base")
+                candidate = self._mirror_repo(workspace / "candidate")
+                expected = arrange(workspace, candidate)
+                result = run(candidate)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(expected, result.stderr)
+                # Nothing else is judged once the tree itself is refused.
+                self.assertNotIn("must refresh the protected branch", result.stderr)
+
+        # Links that stay inside the tree are fine, and `.git` is not judged.
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = self._mirror_repo(Path(directory))
+            (candidate / "AGENTS.md").symlink_to(".github/CODEOWNERS")
+            (candidate / "docs").mkdir()
+            (candidate / "docs/workflows").symlink_to(
+                "../.github/workflows", target_is_directory=True
+            )
+            (candidate / ".git").mkdir()
+            (candidate / ".git/elsewhere").symlink_to("/dev/null")
+            self.assertEqual(check_supply_chain.candidate_tree_violations(candidate), [])
+            result = run(candidate)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_an_impostor_policy_job_fails_the_whole_tree(self):
         with tempfile.TemporaryDirectory() as directory:

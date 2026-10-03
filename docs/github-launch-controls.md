@@ -210,15 +210,22 @@ Take step 2 after step 1 has merged, as an administrator:
 1. Confirm `.github/workflows/supply-chain-policy.yml` is on `main`. A new
    `pull_request_target` workflow does not run on the pull request that adds
    it, because GitHub loads it from the base branch.
-2. Open, push to or edit any pull request that targets `main`. Confirm that
-   `GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy` appears and
-   passes.
+2. Open a pull request from a branch created from `main` **after** that merge
+   (a branch from before it lacks the workflow file, so the check fails).
+   Confirm that `GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy`
+   appears and passes.
 3. Add the context **without removing `security-supply-chain-policy`**. That
-   job still runs the workflow-script unit tests until the retire step. Either:
+   job still runs the workflow-script unit tests until the retire step. Bind it
+   to the GitHub Actions app: a required context with no source accepts a
+   commit status of that name from anyone with write access, posted with their
+   own token. Either:
    - from an up-to-date checkout of `main`, re-run the bootstrap with the same
-     flags you used before (it rewrites the whole `main` ruleset). Check that
-     the plan's only `main ruleset` change adds `trusted-supply-chain-policy`
-     to `rules.required_status_checks.required_status_checks`, then apply:
+     flags you used before (it rewrites the whole `main` ruleset). It writes
+     every required context bound to GitHub Actions (`integration_id` 15368).
+     Check that the plan's only `main ruleset` change is to
+     `rules.required_status_checks.required_status_checks`: it adds
+     `trusted-supply-chain-policy (app 15368)` and moves any existing
+     `(any source)` context to `(app 15368)`. Then apply:
 
      ```bash
      python3 .github/scripts/bootstrap_repo_settings.py --repo owner/repo \
@@ -229,22 +236,26 @@ Take step 2 after step 1 has merged, as an administrator:
 
    - or, by hand: **Settings → Rules → Rulesets → main → Require status checks
      to pass → Add checks**, enter `trusted-supply-chain-policy`, choose GitHub
-     Actions as the source, and save.
-4. Confirm the ruleset now lists both contexts:
+     Actions as the source, and save. Set GitHub Actions as the source of the
+     other required checks as well.
+4. Confirm the ruleset lists both contexts, each with integration 15368:
 
    ```bash
    gh api repos/owner/repo/rulesets --jq '.[] | select(.target == "branch") | .id' |
      xargs -I{} gh api repos/owner/repo/rulesets/{} \
        --jq '.rules[] | select(.type == "required_status_checks")
-             | .parameters.required_status_checks[].context'
+             | .parameters.required_status_checks[] | "\(.context) \(.integration_id)"'
    ```
 
    Then dispatch `GitHub Settings Audit` from `main`. The
-   `trusted-supply-chain-policy` warning must be gone.
-5. Pull requests opened before the switch report the new check only after
-   their next `opened`, `synchronize`, `reopened` or `edited` event. Until
-   then they wait for it. Push, edit the description, or close and reopen
-   them.
+   `trusted-supply-chain-policy` warning must be gone. The audit fails if
+   `trusted-supply-chain-policy` is required from any source other than
+   GitHub Actions, and warns for each older context that is not yet bound.
+5. Pull requests whose branch predates the merge do not carry
+   `supply-chain-policy.yml`, so the new check **fails** on them ("must remain
+   a regular file"). Re-running it does not help: update the branch from
+   `main`. Pull requests branched after the merge report the check on their
+   next `opened`, `synchronize`, `reopened` or `edited` event.
 
 ## 3. Protect every deployment environment
 
@@ -555,14 +566,44 @@ definition the pull request does not supply. It runs on `pull_request_target`,
 so GitHub always loads the workflow from the protected default branch. It
 checks out the protected branch into `base/` and the pull request's head into
 `candidate/` as data, with no persisted credentials, and runs only
-`python3 -I base/.github/scripts/check_supply_chain.py --root candidate`. The
-job holds `contents: read`, no secrets and no environment, and nothing from
-the candidate executes. The checker holds the file to that exact shape: every
-non-comment line is pinned, and only the action commit may change. No other
-workflow may define a job keyed or named `trusted-supply-chain-policy`, or
-compute a job's display name. A pull request that edits
-`supply-chain-policy.yml` is judged by the protected copy, and its edit takes
-effect only after merge.
+`python3 -I base/.github/scripts/check_supply_chain.py --root candidate`, with
+a 10-minute timeout. The job holds `contents: read`, no secrets and no
+environment, and nothing from the candidate executes. A pull request that
+edits `supply-chain-policy.yml` is judged by the protected copy, and its edit
+takes effect only after merge.
+
+What the checker enforces for this check:
+
+- **Shape.** Every non-comment line of `supply-chain-policy.yml` is pinned.
+  The `actions/checkout` commit is the one free part, so Dependabot can bump
+  it. Any 40-hex commit is accepted there, including one GitHub resolves
+  through a fork of `actions/checkout`, so a change to that commit needs the
+  same exact-head review as any other workflow change.
+- **The tree it reads.** Before reading anything, it walks the whole candidate
+  without following links. It refuses any symlink that is absolute, climbs out
+  of the tree or does not resolve, and any device, FIFO or socket. Because
+  `base/` sits beside `candidate/`, a link into `base/` would show this check
+  protected files while every other workflow, which runs the tree at the
+  workspace root, executes the pull request's own copy. Links that stay inside
+  the tree are allowed.
+- **The check name.** No other workflow may contain the text
+  `trusted-supply-chain-policy` (in any case, after comments are dropped and
+  double-quoted escapes decoded). The only exceptions are the exact
+  `--required-check` line in `settings-audit.yml` and the release gate's entry
+  in `release.yml`. No job may compute its display name with `${{ }}`. The
+  checker is not a YAML parser: it fails closed on a jobs layout it cannot
+  classify, such as a flow-style job, a job-level anchor, alias, tag or merge
+  key, or a `name:` that is empty, a block or flow scalar, or continued on the
+  next line.
+- **Status forgery.** No workflow may grant `checks: write`,
+  `statuses: write` or `write-all`. With either permission, a job could post a
+  result under any context it computes at run time, which no static rule can
+  see. The allow-list (`STATUS_WRITE_ALLOWED`) is empty.
+- **Ruleset source.** The bootstrap binds every required context to the GitHub
+  Actions app (`integration_id` 15368). The audit requires that binding for
+  `trusted-supply-chain-policy` and warns for older contexts that lack it.
+  Unbound, a commit status a collaborator posts with their own token
+  satisfies the rule.
 
 Until the `main` ruleset requires `trusted-supply-chain-policy`
 ([Switching the supply-chain policy check](#switching-the-supply-chain-policy-check)),

@@ -18,6 +18,10 @@ name: GitForgeOps Supply-Chain Policy
 # - Never `cd candidate`, never add `env:` or `defaults:` (bash reads
 #   `BASH_ENV` before the first command), and never add a step that runs,
 #   sources or installs anything from `candidate/`.
+# - `base/` sits beside `candidate/`, so the checker refuses any symlink in
+#   the candidate that is absolute or leaves it (it would read `base/` here
+#   and the pull request's own files in every other workflow), and any
+#   special file, before it reads anything.
 #
 # The job holds `contents: read`, no secrets and no environment.
 # `check_supply_chain.py` pins every non-comment line of this file, and no
@@ -44,6 +48,8 @@ concurrency:
 jobs:
   trusted-supply-chain-policy:
     runs-on: ubuntu-24.04
+    # The check reads a few hundred files; a stuck run must not hold a runner.
+    timeout-minutes: 10
     steps:
       - name: Check out protected supply-chain policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

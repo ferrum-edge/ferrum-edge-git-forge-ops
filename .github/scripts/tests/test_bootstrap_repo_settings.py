@@ -1108,6 +1108,30 @@ class SharedConstantTests(unittest.TestCase):
         self.assertIn("trusted-supply-chain-policy", contexts)
         self.assertIn("security-supply-chain-policy", contexts)
         self.assertEqual(len(contexts), len(set(contexts)))
+        # Every context is bound to the GitHub Actions app, as the manual
+        # ruleset method does, so a status from another source cannot satisfy it.
+        self.assertEqual(
+            {check.get("integration_id") for check in rule["parameters"]["required_status_checks"]},
+            {15368},
+        )
+        self.assertEqual(bootstrap.GITHUB_ACTIONS_APP_ID, 15368)
+
+    def test_an_unbound_context_is_planned_as_a_change(self):
+        responses = configured_responses()
+        ruleset = responses[f"repos/{REPO}/rulesets/7"]
+        for rule in ruleset["rules"]:
+            if rule["type"] == "required_status_checks":
+                for check in rule["parameters"]["required_status_checks"]:
+                    check.pop("integration_id", None)
+        plan = bootstrap.build_plan(FakeApi(responses), namespace())
+        detail = "\n".join(
+            line
+            for step in plan.steps
+            if step.target == "main ruleset"
+            for line in step.details
+        )
+        self.assertIn("trusted-supply-chain-policy (any source)", detail)
+        self.assertIn("trusted-supply-chain-policy (app 15368)", detail)
 
         tag = bootstrap.release_tag_ruleset_body(
             [{"actor_type": "Integration", "actor_id": 1234, "bypass_mode": "always"}]

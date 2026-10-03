@@ -65,7 +65,11 @@ def secure_responses():
                     "parameters": {
                         "strict_required_status_checks_policy": True,
                         "required_status_checks": [
-                            {"context": context} for context in sorted(REQUIRED_CHECKS)
+                            {
+                                "context": context,
+                                "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID,
+                            }
+                            for context in sorted(REQUIRED_CHECKS)
                         ]
                     },
                 },
@@ -947,12 +951,17 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
     TRUSTED = "trusted-supply-chain-policy"
     RETIRING = "security-supply-chain-policy"
 
-    def audit_ruleset(self, contexts: set[str]) -> "audit_settings.Audit":
+    def audit_ruleset(
+        self, contexts: set[str], unbound: frozenset[str] = frozenset()
+    ) -> "audit_settings.Audit":
         ruleset = secure_responses()["repos/acme/repo/rulesets/7"]
         next(
             rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks"
         )["parameters"]["required_status_checks"] = [
-            {"context": context} for context in sorted(contexts)
+            {"context": context}
+            if context in unbound
+            else {"context": context, "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID}
+            for context in sorted(contexts)
         ]
         audit = audit_settings.Audit()
         audit_settings.audit_main_ruleset(
@@ -982,6 +991,42 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
         rendered = "\n".join(audit.violations)
         self.assertIn("missing required status checks", rendered)
         self.assertIn(self.RETIRING, rendered)
+
+    def test_the_trusted_check_must_be_bound_to_github_actions(self):
+        # Unbound, a commit status a collaborator posts with their own token
+        # satisfies the rule.
+        for source in (None, 1):
+            with self.subTest(source=source):
+                ruleset = secure_responses()["repos/acme/repo/rulesets/7"]
+                checks = [
+                    {"context": context, "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID}
+                    for context in sorted(REQUIRED_CHECKS)
+                ]
+                checks.append(
+                    {"context": self.TRUSTED}
+                    if source is None
+                    else {"context": self.TRUSTED, "integration_id": source}
+                )
+                next(
+                    rule
+                    for rule in ruleset["rules"]
+                    if rule["type"] == "required_status_checks"
+                )["parameters"]["required_status_checks"] = checks
+                audit = audit_settings.Audit()
+                audit_settings.audit_main_ruleset(
+                    audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), 99
+                )
+                rendered = "\n".join(audit.violations)
+                self.assertIn("GitHub Actions app", rendered)
+                self.assertIn(self.TRUSTED, rendered)
+
+    def test_older_unbound_contexts_are_a_warning(self):
+        audit = self.audit_ruleset(
+            REQUIRED_CHECKS | {self.TRUSTED}, unbound=frozenset({"rust-ci-check"})
+        )
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(len(audit.warnings), 1, audit.warnings)
+        self.assertIn("'rust-ci-check' from any source", audit.warnings[0])
 
     def test_only_the_transitional_context_is_softened(self):
         for context in sorted(REQUIRED_CHECKS):
