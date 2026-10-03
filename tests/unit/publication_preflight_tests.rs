@@ -389,6 +389,41 @@ environments:
         expect_status: 200
 "#;
 
+/// Every check within its own limits, but the environment's worst case is
+/// 2 x 10 x 60s = 20 minutes: a deployment held long after the gateway
+/// changed (GHSA-p95x-q89j-hrhv).
+const SMOKE_OVER_BUDGET: &str = r#"version: 1
+environments:
+  default:
+    checks:
+      - name: slow one
+        path: /ready
+        expect_status: 200
+        attempts: 10
+        timeout_secs: 60
+        retry_backoff_ms: 0
+      - name: slow two
+        path: /ready
+        expect_status: 200
+        attempts: 10
+        timeout_secs: 60
+        retry_backoff_ms: 0
+"#;
+
+/// A plugin's upstream credential is never a traffic-check credential
+/// (GHSA-8mhw-ghx8-9m63).
+const SMOKE_PLUGIN_SLOT: &str = r#"version: 1
+environments:
+  default:
+    checks:
+      - name: spends a plugin secret
+        path: /ready
+        expect_status: 200
+        headers:
+          Authorization:
+            slot: ferrum/upstream-auth/@plugin-config/config/token
+"#;
+
 const SMOKE_VALID: &str = r#"version: 1
 environments:
   default:
@@ -405,6 +440,8 @@ fn cli_refuses_a_malformed_smoke_file_before_any_write() {
         (SMOKE_ZERO_ATTEMPTS, "attempts must be at least 1"),
         (SMOKE_UNKNOWN_FIELD, "run"),
         (SMOKE_BAD_OTHER_ENVIRONMENT, "path must start with '/'"),
+        (SMOKE_OVER_BUDGET, "worst-case duration"),
+        (SMOKE_PLUGIN_SLOT, "not a Consumer credential type"),
     ] {
         for args in [
             vec!["validate"],
@@ -433,6 +470,8 @@ fn cli_review_reports_a_malformed_smoke_file_as_an_apply_blocker() {
         (SMOKE_ZERO_ATTEMPTS, "attempts must be at least 1"),
         (SMOKE_UNKNOWN_FIELD, "run"),
         (SMOKE_BAD_OTHER_ENVIRONMENT, "path must start with '/'"),
+        (SMOKE_OVER_BUDGET, "worst-case duration"),
+        (SMOKE_PLUGIN_SLOT, "not a Consumer credential type"),
     ] {
         let repo = Repo::new(Some(smoke));
 

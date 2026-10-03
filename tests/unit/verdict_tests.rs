@@ -286,6 +286,17 @@ fn publication_preflight_refusals_are_blockers_in_apply_order() {
     }
 }
 
+#[test]
+fn the_smoke_blocker_names_the_bounds_and_the_credential_rule() {
+    // A reviewer sees the blocker before the merge, so it has to say which
+    // refusals it covers: the budgets (GHSA-p95x-q89j-hrhv) and the
+    // Consumer-credential-only, GET/HEAD-only slot rule (GHSA-8mhw-ghx8-9m63).
+    let remedy = BlockerKind::InvalidSmokeChecks.remedy();
+    for expected in ["time budgets", "Consumer credential slots", "GET/HEAD"] {
+        assert!(remedy.contains(expected), "{expected}: {remedy}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Drift verdict
 // ---------------------------------------------------------------------------

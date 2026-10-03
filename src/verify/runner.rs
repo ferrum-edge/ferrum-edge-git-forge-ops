@@ -8,14 +8,19 @@
 //!
 //! Every attempt is bounded and every retry is counted, because a promotion
 //! gate that can hang is a promotion gate that is never blocked — it is just
-//! late, indefinitely.
+//! late, indefinitely. The whole run is bounded too: [`run`] holds it to the
+//! checks' declared worst case (itself capped at load) plus a short grace, and
+//! a check the deadline interrupts is reported as timed out, never passed.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use base64::Engine as _;
 
-use super::{resolve_headers, CheckResult, EnvironmentChecks, Outcome, SmokeCheck, VerifyReport};
+use super::{
+    resolve_headers, CheckResult, EnvironmentChecks, Outcome, ProbeCredentials, SmokeCheck,
+    VerifyReport, MAX_ENVIRONMENT_VERIFY_BUDGET_SECS, VERIFY_DEADLINE_GRACE_SECS,
+};
 
 /// Build a client for one check. Each gets its own because the per-check
 /// timeout is the bound that matters.
@@ -207,19 +212,93 @@ pub async fn run_check(
     }
 }
 
+/// The outer deadline for `checks`: their declared worst case, never more
+/// than [`MAX_ENVIRONMENT_VERIFY_BUDGET_SECS`], plus
+/// [`VERIFY_DEADLINE_GRACE_SECS`].
+pub fn deadline_budget(checks: &EnvironmentChecks) -> Duration {
+    let cap = Duration::from_secs(MAX_ENVIRONMENT_VERIFY_BUDGET_SECS);
+    let grace = Duration::from_secs(VERIFY_DEADLINE_GRACE_SECS);
+    checks.worst_case_budget().min(cap).saturating_add(grace)
+}
+
+/// Run every check, one after another, within [`deadline_budget`].
+///
+/// `credentials` is the projection [`super::authorize_probe_credentials`]
+/// built, never the environment's bundle: a check can only resolve a slot
+/// that was authorized for verification.
 pub async fn run(
     environment: &str,
     base_url: &str,
     checks: &EnvironmentChecks,
-    bundle: &BTreeMap<String, String>,
+    credentials: &ProbeCredentials,
     ca_cert: Option<&str>,
 ) -> VerifyReport {
+    run_within(
+        environment,
+        base_url,
+        checks,
+        credentials,
+        ca_cert,
+        deadline_budget(checks),
+    )
+    .await
+}
+
+/// [`run`] with an explicit outer deadline.
+///
+/// A check still running when `budget` elapses is abandoned and reported as
+/// [`Outcome::TimedOut`]; a check not yet started is not sent at all and is
+/// reported the same way. Either fails the verification.
+pub async fn run_within(
+    environment: &str,
+    base_url: &str,
+    checks: &EnvironmentChecks,
+    credentials: &ProbeCredentials,
+    ca_cert: Option<&str>,
+    budget: Duration,
+) -> VerifyReport {
+    let deadline = tokio::time::Instant::now() + budget;
     let mut results = Vec::with_capacity(checks.checks.len());
     for check in &checks.checks {
-        results.push(run_check(base_url, check, bundle, ca_cert).await);
+        // Checked before starting, so a check is never begun (and a request
+        // never sent) after the deadline.
+        if tokio::time::Instant::now() >= deadline {
+            results.push(deadline_result(
+                check,
+                format!(
+                    "not run: the {}s verification deadline had already elapsed",
+                    budget.as_secs()
+                ),
+            ));
+            continue;
+        }
+        let attempt = run_check(base_url, check, credentials.values(), ca_cert);
+        match tokio::time::timeout_at(deadline, attempt).await {
+            Ok(result) => results.push(result),
+            Err(_) => results.push(deadline_result(
+                check,
+                format!(
+                    "interrupted: the {}s verification deadline elapsed before the check finished",
+                    budget.as_secs()
+                ),
+            )),
+        }
     }
     VerifyReport {
         environment: environment.to_string(),
         results,
+    }
+}
+
+fn deadline_result(check: &SmokeCheck, detail: String) -> CheckResult {
+    CheckResult {
+        name: check.name.clone(),
+        method: check.method.clone(),
+        path: check.path.clone(),
+        expected_status: check.expect_status,
+        actual_status: None,
+        outcome: Outcome::TimedOut,
+        attempts: 0,
+        detail,
     }
 }

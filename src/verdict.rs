@@ -66,7 +66,10 @@ pub enum BlockerKind {
     /// to one file; the second publication would overwrite the first.
     PublicationPathCollision,
     /// `.gitforgeops/smoke.yaml` exists but does not load: `verify` would
-    /// only discover it after `apply` changed the gateway.
+    /// only discover it after `apply` changed the gateway. That covers the
+    /// closed schema, the per-check and per-environment budgets, and the
+    /// half of the probe-credential binding decidable offline (Consumer
+    /// credential slots only, sent only by `GET`/`HEAD` checks).
     InvalidSmokeChecks,
 }
 
@@ -128,8 +131,10 @@ impl BlockerKind {
                  file; point the gateway and mesh documents at distinct paths"
             }
             BlockerKind::InvalidSmokeChecks => {
-                ".gitforgeops/smoke.yaml does not load; fix the reported check, or remove the \
-                 file if the environment declares no traffic checks"
+                ".gitforgeops/smoke.yaml does not load; fix the reported check (closed schema, \
+                 per-check and per-environment time budgets, Consumer credential slots on \
+                 GET/HEAD checks only), or remove the file if the environment declares no \
+                 traffic checks"
             }
         }
     }

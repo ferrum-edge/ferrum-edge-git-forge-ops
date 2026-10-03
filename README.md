@@ -637,9 +637,14 @@ environments:
 `production` then waits until `staging` has applied **and** passed its traffic
 checks for the same source revision. Traffic checks are declared in
 `.gitforgeops/smoke.yaml` and run by `gitforgeops verify` against the gateway's
-data plane (`FERRUM_VERIFY_BASE_URL`). An environment with no checks records
-`skipped`, which authorizes no promotion. Promotion is one stage deep, and
-staging's approval grants nothing in production. See
+data plane (`FERRUM_VERIFY_BASE_URL`). A check may send only a credential of a
+dedicated Consumer labelled `gitforgeops/verify-probe: "true"`, and only on a
+`GET` or `HEAD` request; any other slot refuses the run before a request is
+sent. Checks are bounded (at most 10 attempts, 60 seconds per attempt, 50
+checks and a 15-minute worst case per environment), and a file over a bound is
+refused at load. An environment with no checks records `skipped`, which
+authorizes no promotion. Promotion is one stage deep, and staging's approval
+grants nothing in production. See
 [Staged promotion and traffic checks](docs/promotion.md).
 
 ## Drift detection

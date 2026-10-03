@@ -4098,7 +4098,8 @@ async fn cmd_review(
 /// and nothing failed, and a deployment job must be able to record that as
 /// `skipped` rather than fail on it. Everything else that stops a declared
 /// check from running — an unparsable `smoke.yaml`, no data-plane URL, an
-/// unreadable bundle — is an error (exit 1), never a pass.
+/// unreadable bundle, a slot that is not a verification probe credential — is
+/// an error (exit 1), never a pass.
 async fn cmd_verify(
     format: cli::ReportFormat,
     explicit_env: Option<&str>,
@@ -4120,16 +4121,31 @@ async fn cmd_verify(
                         .to_string(),
                 )
             })?;
-            // Header values may name credential-bundle slots. The bundle is
-            // loaded the same way every other command loads it; a slot that is
-            // not in it fails the check rather than sending an empty header.
-            let (bundle, _) = load_credential_bundles(&env_config)?;
+            // Header values may name credential-bundle slots, and this job
+            // holds the environment's whole bundle. A check may spend only a
+            // brokered secret of a Consumer the environment's desired
+            // configuration labels as a verification probe; anything else
+            // refuses the run before a request is sent. The runner only ever
+            // sees that projection, never the bundle. An authorized slot the
+            // bundle lacks fails its check rather than sending an empty header.
+            let credentials = if checks.sends_credentials() {
+                let desired = load_and_assemble_for(&resolved, &env_config)?;
+                let (bundle, _) = load_credential_bundles(&env_config)?;
+                gitforgeops::verify::authorize_probe_credentials(
+                    &resolved.name,
+                    checks,
+                    &desired,
+                    &bundle,
+                )?
+            } else {
+                gitforgeops::verify::ProbeCredentials::none()
+            };
 
             gitforgeops::verify::runner::run(
                 &resolved.name,
                 &base_url,
                 checks,
-                &bundle,
+                &credentials,
                 // A private CA is configuration; `FERRUM_TLS_NO_VERIFY` is
                 // deliberately not honoured here. A check that accepts any
                 // certificate has not verified TLS, and a promotion gate that

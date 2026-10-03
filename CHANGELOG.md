@@ -81,6 +81,29 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Traffic checks can no longer spend arbitrary credentials from the
+  environment's bundle (GHSA-8mhw-ghx8-9m63). A `slot:` header in
+  `.gitforgeops/smoke.yaml` must name a Consumer credential secret slot
+  (`<namespace>/<consumer-id>/<credential-type>/<field>` with a built-in type;
+  plugin-config, service-discovery and identity slots are refused at load) on a
+  `GET` or `HEAD` check. `verify` then assembles the environment's desired
+  configuration and honours the slot only when it is a brokered
+  `${gh-env-secret:...}` secret of a Consumer labelled
+  `gitforgeops/verify-probe: "true"`; anything else exits 1 before any request
+  is sent. The runner receives only those values, never the bundle. `Host`,
+  forwarding (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`), hop-by-hop and
+  framing headers are refused in every check. Breaking: label a dedicated,
+  low-privilege probe Consumer and point existing slot checks at it.
+- Traffic-check budgets are bounded (GHSA-p95x-q89j-hrhv). `attempts` is at
+  most 10, `timeout_secs` at most 60 and `retry_backoff_ms` at most 30000; an
+  environment declares at most 50 checks, and their worst case together (every
+  attempt timing out, plus backoff) is at most 15 minutes. `validate`, `plan`
+  and `apply` refuse a file over any bound before anything changes, and
+  `review` reports it as `invalid-smoke-checks`. `verify` holds the run to that
+  worst case plus 30 seconds and reports an interrupted or unstarted check as
+  `TIMEOUT`, never a pass. Both `Verify traffic` steps in `apply-on-merge.yml`
+  carry a step-level `timeout-minutes: 20` backstop; a step timeout fails only
+  the step, so the ledger commit still runs.
 - Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
   CVE-2026-103111 finding while the pinned Debian base remains behind.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on

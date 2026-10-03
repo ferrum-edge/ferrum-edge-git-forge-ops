@@ -16,10 +16,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gitforgeops::config::repo_config::RepoConfig;
-use gitforgeops::verify::runner::run_check;
+use gitforgeops::config::GatewayConfig;
+use gitforgeops::verify::runner::{deadline_budget, run_check, run_within};
 use gitforgeops::verify::{
-    is_idempotent_method, resolve_headers, HeaderValue, Outcome, SmokeCheck, SmokeConfig,
-    VerifyReport, VerifyStatus, SMOKE_CONFIG_VERSION, VERIFY_FAILED_EXIT_CODE,
+    authorize_probe_credentials, is_idempotent_method, probe_credential_slots, resolve_headers,
+    EnvironmentChecks, HeaderValue, Outcome, ProbeCredentials, SmokeCheck, SmokeConfig,
+    VerifyReport, VerifyStatus, MAX_CHECKS_PER_ENVIRONMENT, MAX_CHECK_ATTEMPTS,
+    MAX_CHECK_RETRY_BACKOFF_MS, MAX_CHECK_TIMEOUT_SECS, MAX_ENVIRONMENT_VERIFY_BUDGET_SECS,
+    SMOKE_CONFIG_VERSION, VERIFY_DEADLINE_GRACE_SECS, VERIFY_FAILED_EXIT_CODE, VERIFY_PROBE_LABEL,
     VERIFY_SKIPPED_EXIT_CODE,
 };
 use tempfile::NamedTempFile;
@@ -226,6 +230,498 @@ fn an_unsupported_smoke_version_is_refused() {
         "{error}"
     );
     assert_eq!(SMOKE_CONFIG_VERSION, 1);
+}
+
+// -- budgets (GHSA-p95x-q89j-hrhv) -------------------------------------------
+
+fn one_check(fragment: &str) -> String {
+    format!(
+        "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
+         \n        path: /x\n        expect_status: 200\n{fragment}"
+    )
+}
+
+#[test]
+fn each_check_budget_has_a_hard_upper_bound() {
+    // Verification runs after the gateway changed and before the ledger is
+    // committed. An attempt count, timeout or backoff nobody bounded is a
+    // deployment job nobody can finish.
+    for (fragment, expected) in [
+        (
+            format!("        attempts: {}\n", MAX_CHECK_ATTEMPTS + 1),
+            format!("above the maximum of {MAX_CHECK_ATTEMPTS}"),
+        ),
+        (
+            "        attempts: 4294967295\n".to_string(),
+            format!("above the maximum of {MAX_CHECK_ATTEMPTS}"),
+        ),
+        (
+            format!("        timeout_secs: {}\n", MAX_CHECK_TIMEOUT_SECS + 1),
+            format!("above the maximum of {MAX_CHECK_TIMEOUT_SECS}"),
+        ),
+        (
+            "        timeout_secs: 18446744073709551615\n".to_string(),
+            format!("above the maximum of {MAX_CHECK_TIMEOUT_SECS}"),
+        ),
+        (
+            format!(
+                "        retry_backoff_ms: {}\n",
+                MAX_CHECK_RETRY_BACKOFF_MS + 1
+            ),
+            format!("above the maximum of {MAX_CHECK_RETRY_BACKOFF_MS}"),
+        ),
+    ] {
+        let error = load_smoke(&one_check(&fragment)).expect_err("must refuse");
+        assert!(error.contains(&expected), "{fragment}: {error}");
+    }
+}
+
+#[test]
+fn a_check_at_every_per_check_maximum_that_fits_the_environment_budget_loads() {
+    let config = load_smoke(&one_check(&format!(
+        "        attempts: {MAX_CHECK_ATTEMPTS}\n        timeout_secs: {MAX_CHECK_TIMEOUT_SECS}\n\
+         \n        retry_backoff_ms: 0\n"
+    )))
+    .expect("a single bounded check loads");
+    let staging = config.for_environment("staging").expect("staging");
+    assert_eq!(
+        staging.checks[0].worst_case_budget(),
+        Duration::from_secs(u64::from(MAX_CHECK_ATTEMPTS) * MAX_CHECK_TIMEOUT_SECS)
+    );
+}
+
+#[test]
+fn the_worst_case_budget_counts_every_timeout_and_every_backoff() {
+    // 5 attempts of 10s, and pauses of 1, 2, 3 and 4 times 500ms.
+    let config = load_smoke(&one_check(
+        "        attempts: 5\n        timeout_secs: 10\n        retry_backoff_ms: 500\n",
+    ))
+    .expect("loads");
+    let staging = config.for_environment("staging").expect("staging");
+    assert_eq!(
+        staging.checks[0].worst_case_budget(),
+        Duration::from_millis(55_000)
+    );
+    assert_eq!(staging.worst_case_budget(), Duration::from_millis(55_000));
+    // A single attempt never pauses.
+    let single = load_smoke(&one_check(
+        "        attempts: 1\n        timeout_secs: 7\n        retry_backoff_ms: 30000\n",
+    ))
+    .expect("loads");
+    let single = single.for_environment("staging").expect("staging");
+    assert_eq!(single.worst_case_budget(), Duration::from_secs(7));
+}
+
+fn many_checks(count: usize, fields: &str) -> String {
+    let mut yaml = String::from("version: 1\nenvironments:\n  staging:\n    checks:\n");
+    for index in 0..count {
+        yaml.push_str(&format!(
+            "      - name: check-{index}\n        path: /x\n        expect_status: 200\n{fields}"
+        ));
+    }
+    yaml
+}
+
+#[test]
+fn individually_valid_checks_are_refused_when_their_sum_exceeds_the_environment_budget() {
+    let fields = format!(
+        "        attempts: {MAX_CHECK_ATTEMPTS}\n        timeout_secs: {MAX_CHECK_TIMEOUT_SECS}\n\
+         \n        retry_backoff_ms: 0\n"
+    );
+    // One fits; two together do not.
+    load_smoke(&many_checks(1, &fields)).expect("one check fits");
+    let error = load_smoke(&many_checks(2, &fields)).expect_err("must refuse the sum");
+    assert!(error.contains("worst-case duration is 1200s"), "{error}");
+    assert!(
+        error.contains(&format!("{MAX_ENVIRONMENT_VERIFY_BUDGET_SECS}s limit")),
+        "{error}"
+    );
+    // The refusal applies to every environment in the file, not only the one
+    // a run selects, exactly as `verify` loads it.
+    let other = many_checks(2, &fields).replace("  staging:", "  production:");
+    assert!(load_smoke(&other).is_err());
+}
+
+#[test]
+fn an_environment_may_declare_a_bounded_number_of_checks() {
+    let tiny = "        attempts: 1\n        timeout_secs: 1\n        retry_backoff_ms: 0\n";
+    load_smoke(&many_checks(MAX_CHECKS_PER_ENVIRONMENT, tiny)).expect("at the cap loads");
+    let error = load_smoke(&many_checks(MAX_CHECKS_PER_ENVIRONMENT + 1, tiny))
+        .expect_err("over the cap is refused");
+    assert!(
+        error.contains(&format!("at most {MAX_CHECKS_PER_ENVIRONMENT} are allowed")),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_shipped_example_fits_its_budget() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".gitforgeops/smoke.example.yaml");
+    let config = SmokeConfig::load_from_path(&path)
+        .expect("the shipped example must load")
+        .expect("present");
+    let staging = config.for_environment("staging").expect("staging");
+    // 55s for the authenticated check, 31.5s for the 401 check.
+    assert_eq!(staging.worst_case_budget(), Duration::from_millis(86_500));
+    assert_eq!(
+        deadline_budget(staging),
+        Duration::from_millis(86_500) + Duration::from_secs(VERIFY_DEADLINE_GRACE_SECS)
+    );
+}
+
+#[test]
+fn the_runner_deadline_is_capped_even_for_checks_that_skipped_load() {
+    // `run` can be handed checks that never went through `load`. The outer
+    // deadline still never exceeds the environment cap plus the grace.
+    let check = SmokeCheck {
+        name: "unbounded".to_string(),
+        method: "GET".to_string(),
+        path: "/x".to_string(),
+        headers: BTreeMap::new(),
+        expect_status: 200,
+        timeout_secs: u64::MAX,
+        attempts: u32::MAX,
+        retry_backoff_ms: u64::MAX,
+        replay_safe: false,
+    };
+    let checks = EnvironmentChecks {
+        checks: vec![check],
+    };
+    assert_eq!(
+        deadline_budget(&checks),
+        Duration::from_secs(MAX_ENVIRONMENT_VERIFY_BUDGET_SECS + VERIFY_DEADLINE_GRACE_SECS)
+    );
+}
+
+/// A `timeout-minutes` key at step indentation in `apply-on-merge.yml`.
+const STEP_TIMEOUT: &str = "        timeout-minutes: ";
+
+#[test]
+fn both_verify_steps_carry_a_step_timeout_that_covers_the_budget() {
+    // A backstop for the in-process deadline. It must be a STEP timeout: a job
+    // timeout cancels the job, and the `!cancelled()` ledger commit after a
+    // live mutation is then skipped.
+    let workflow = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/apply-on-merge.yml"),
+    )
+    .expect("read apply-on-merge.yml");
+    let marker = "      - name: Verify traffic\n";
+    let steps: Vec<&str> = workflow
+        .match_indices(marker)
+        .map(|(start, _)| {
+            let body = &workflow[start + marker.len()..];
+            &body[..body.find("\n      - name: ").unwrap_or(body.len())]
+        })
+        .collect();
+    assert_eq!(steps.len(), 2, "the apply and promote jobs each verify");
+    let needed = MAX_ENVIRONMENT_VERIFY_BUDGET_SECS + VERIFY_DEADLINE_GRACE_SECS;
+    for step in steps {
+        let found = step.lines().find_map(|line| line.strip_prefix(STEP_TIMEOUT));
+        let value = found.expect("a step-level timeout-minutes");
+        let minutes: u64 = value.trim().parse().expect("a whole number of minutes");
+        assert!(minutes * 60 > needed, "{minutes} minutes");
+        assert!(step.contains("continue-on-error: true"), "{step}");
+    }
+    for line in workflow.lines() {
+        assert!(
+            !line.starts_with("    timeout-minutes:"),
+            "a job-level timeout would skip the ledger commit: {line}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_outer_deadline_times_out_a_hung_check_and_sends_nothing_after_it() {
+    // The endpoint holds the first request for 2.5s; the run's deadline is
+    // far shorter. The interrupted check and the one after it both fail, and
+    // the second is never sent.
+    let (base_url, committed) = spawn_committing_endpoint(200);
+    let config = load_smoke(
+        "version: 1\nenvironments:\n  staging:\n    checks:\n\
+         \n      - name: first\n        path: /a\n        expect_status: 200\n\
+         \n        attempts: 1\n        timeout_secs: 5\n\
+         \n      - name: second\n        path: /b\n        expect_status: 200\n\
+         \n        attempts: 1\n        timeout_secs: 5\n",
+    )
+    .expect("loads");
+    let staging = config.for_environment("staging").expect("staging");
+    let report = run_within(
+        "staging",
+        &base_url,
+        staging,
+        &ProbeCredentials::none(),
+        None,
+        Duration::from_millis(300),
+    )
+    .await;
+    assert_eq!(report.results.len(), 2);
+    assert_eq!(report.results[0].outcome, Outcome::TimedOut);
+    assert!(
+        report.results[0].detail.contains("interrupted"),
+        "{}",
+        report.results[0].detail
+    );
+    assert_eq!(report.results[1].outcome, Outcome::TimedOut);
+    assert_eq!(report.results[1].attempts, 0);
+    assert!(
+        report.results[1].detail.contains("not run"),
+        "{}",
+        report.results[1].detail
+    );
+    assert!(committed.load(Ordering::SeqCst) <= 1);
+    assert_eq!(report.status(), VerifyStatus::Failed);
+}
+
+// -- probe credentials (GHSA-8mhw-ghx8-9m63) ----------------------------------
+
+const PROBE_SLOT: &str = "ferrum/orders-probe/keyauth/key";
+const PROBE_PASSWORD_SLOT: &str = "ferrum/orders-probe/basicauth/password";
+const CUSTOMER_SLOT: &str = "ferrum/orders-client/keyauth/key";
+const MISLABELLED_SLOT: &str = "ferrum/almost-probe/keyauth/key";
+const PLUGIN_SLOT: &str = "ferrum/upstream-auth/@plugin-config/config/token";
+const PROBE_VALUE: &str = "probe-value-0001";
+const CUSTOMER_VALUE: &str = "customer-value-0002";
+const PLUGIN_VALUE: &str = "plugin-value-0003";
+
+fn desired() -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "consumers": [
+            {
+                "id": "orders-probe",
+                "username": "orders-probe",
+                "namespace": "ferrum",
+                "labels": { VERIFY_PROBE_LABEL: "true" },
+                "credentials": {
+                    "keyauth": [{ "key": "${gh-env-secret:alloc=generate}" }],
+                    "basicauth": [{
+                        "username": "orders-probe",
+                        "password": "${gh-env-secret:alloc=generate}"
+                    }]
+                }
+            },
+            {
+                "id": "orders-client",
+                "username": "orders-client",
+                "namespace": "ferrum",
+                "credentials": {
+                    "keyauth": [{ "key": "${gh-env-secret:alloc=require}" }]
+                }
+            },
+            {
+                "id": "almost-probe",
+                "username": "almost-probe",
+                "namespace": "ferrum",
+                "labels": { VERIFY_PROBE_LABEL: "yes" },
+                "credentials": {
+                    "keyauth": [{ "key": "${gh-env-secret:alloc=generate}" }]
+                }
+            }
+        ]
+    }))
+    .expect("desired config")
+}
+
+fn bundle() -> BTreeMap<String, String> {
+    [
+        (PROBE_SLOT, PROBE_VALUE),
+        (CUSTOMER_SLOT, CUSTOMER_VALUE),
+        (MISLABELLED_SLOT, CUSTOMER_VALUE),
+        (PLUGIN_SLOT, PLUGIN_VALUE),
+    ]
+    .into_iter()
+    .map(|(slot, value)| (slot.to_string(), value.to_string()))
+    .collect()
+}
+
+/// One check, built directly so the runtime binding is tested without the
+/// load-time half in front of it.
+fn checks_sending(method: &str, slot: &str) -> EnvironmentChecks {
+    EnvironmentChecks {
+        checks: vec![SmokeCheck {
+            name: "probe".to_string(),
+            method: method.to_string(),
+            path: "/orders/healthz".to_string(),
+            headers: BTreeMap::from([("X-API-Key".to_string(), HeaderValue::slot(slot))]),
+            expect_status: 200,
+            timeout_secs: 5,
+            attempts: 1,
+            retry_backoff_ms: 0,
+            replay_safe: false,
+        }],
+    }
+}
+
+#[test]
+fn only_brokered_secrets_of_labelled_consumers_are_probe_slots() {
+    let slots = probe_credential_slots(&desired());
+    let expected: std::collections::BTreeSet<String> = [PROBE_SLOT, PROBE_PASSWORD_SLOT]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    // Not the customer, not a label that only looks like opt-in, and never an
+    // identity such as basicauth.username.
+    assert_eq!(slots, expected);
+}
+
+#[test]
+fn a_probe_slot_is_projected_and_nothing_else_is() {
+    let credentials = authorize_probe_credentials(
+        "staging",
+        &checks_sending("GET", PROBE_SLOT),
+        &desired(),
+        &bundle(),
+    )
+    .expect("a labelled probe credential is authorized");
+    assert_eq!(credentials.slots().collect::<Vec<_>>(), vec![PROBE_SLOT]);
+    // The runner resolves against the projection only.
+    let debug = format!("{credentials:?}");
+    for value in [PROBE_VALUE, CUSTOMER_VALUE] {
+        assert!(!debug.contains(value), "Debug must never print a value");
+    }
+}
+
+#[test]
+fn a_check_cannot_spend_an_unrelated_credential_from_the_bundle() {
+    for (method, slot) in [
+        // A customer Consumer with no opt-in.
+        ("GET", CUSTOMER_SLOT),
+        // A label that is not exactly "true".
+        ("GET", MISLABELLED_SLOT),
+        // A plugin's upstream credential.
+        ("GET", PLUGIN_SLOT),
+        // A service-discovery secret.
+        ("GET", "ferrum/registry/@service-discovery/consul/token"),
+        // An identity of the probe itself.
+        ("HEAD", "ferrum/orders-probe/basicauth/username"),
+        // The probe credential on a request that may act on the endpoint.
+        ("POST", PROBE_SLOT),
+        ("PUT", PROBE_SLOT),
+        // A Consumer the environment does not declare at all.
+        ("GET", "other/orders-probe/keyauth/key"),
+    ] {
+        let error = authorize_probe_credentials(
+            "staging",
+            &checks_sending(method, slot),
+            &desired(),
+            &bundle(),
+        )
+        .expect_err("must refuse")
+        .to_string();
+        for expected in [slot, "no request was sent", VERIFY_PROBE_LABEL] {
+            assert!(error.contains(expected), "{method} {slot}: {error}");
+        }
+        for value in [PROBE_VALUE, CUSTOMER_VALUE, PLUGIN_VALUE] {
+            assert!(
+                !error.contains(value),
+                "a refusal must never carry a bundle value ({method} {slot})"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_authorized_slot_missing_from_the_bundle_still_fails_its_check() {
+    let mut partial = bundle();
+    partial.remove(PROBE_SLOT);
+    let credentials = authorize_probe_credentials(
+        "staging",
+        &checks_sending("GET", PROBE_SLOT),
+        &desired(),
+        &partial,
+    )
+    .expect("authorized");
+    assert_eq!(credentials.slots().count(), 0);
+}
+
+#[test]
+fn checks_that_send_no_credential_need_no_authorization() {
+    let checks = EnvironmentChecks {
+        checks: vec![SmokeCheck {
+            headers: BTreeMap::from([("X-Tenant".to_string(), HeaderValue::literal("acme"))]),
+            ..checks_sending("POST", PROBE_SLOT).checks[0].clone()
+        }],
+    };
+    assert!(!checks.sends_credentials());
+    let credentials = authorize_probe_credentials(
+        "staging",
+        &checks,
+        &GatewayConfig::default(),
+        &bundle(),
+    )
+    .expect("nothing to authorize");
+    assert_eq!(credentials.slots().count(), 0);
+    assert!(checks_sending("GET", PROBE_SLOT).sends_credentials());
+}
+
+#[test]
+fn a_slot_that_cannot_be_a_consumer_credential_is_refused_at_load() {
+    for (slot, expected) in [
+        (PLUGIN_SLOT, "not a Consumer credential type"),
+        (
+            "ferrum/registry/@service-discovery/consul/token",
+            "not a Consumer credential type",
+        ),
+        ("ferrum/c/custom/key", "not a Consumer credential type"),
+        ("ferrum/c/keyauth", "is not a Consumer credential slot"),
+        ("ferrum//keyauth/key", "is not a Consumer credential slot"),
+        ("ferrum/c/basicauth/username", "credential identity"),
+        ("ferrum/c/mtls_auth/identity", "credential identity"),
+    ] {
+        let error = load_smoke(&one_check(&format!(
+            "        headers:\n          X-API-Key:\n            slot: '{slot}'\n"
+        )))
+        .expect_err("must refuse");
+        assert!(error.contains(expected), "{slot}: {error}");
+    }
+}
+
+#[test]
+fn a_check_that_sends_a_slot_must_be_get_or_head() {
+    for method in ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "get"] {
+        let error = load_smoke(&one_check(&format!(
+            "        method: {method}\n        headers:\n          X-API-Key:\n\
+             \n            slot: {PROBE_SLOT}\n"
+        )))
+        .expect_err("must refuse");
+        assert!(error.contains("must be GET or HEAD"), "{method}: {error}");
+    }
+    for method in ["GET", "HEAD"] {
+        load_smoke(&one_check(&format!(
+            "        method: {method}\n        headers:\n          X-API-Key:\n\
+             \n            slot: {PROBE_SLOT}\n"
+        )))
+        .expect("a read-only probe loads");
+    }
+    // A literal header carries no credential, so the method stays free.
+    load_smoke(&one_check(
+        "        method: POST\n        headers:\n          X-Tenant:\n            literal: acme\n",
+    ))
+    .expect("loads");
+}
+
+#[test]
+fn routing_and_hop_by_hop_headers_are_refused() {
+    for name in [
+        "Host",
+        "host",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "x_forwarded_proto",
+        "Forwarded",
+        "X-Real-IP",
+        "Via",
+        "Connection",
+        "Transfer-Encoding",
+        "Content-Length",
+        "Upgrade",
+        "Proxy-Authorization",
+    ] {
+        let error = load_smoke(&one_check(&format!(
+            "        headers:\n          {name}:\n            literal: x\n"
+        )))
+        .expect_err("must refuse");
+        assert!(error.contains("is reserved"), "{name}: {error}");
+    }
 }
 
 // -- header values: literal or slot, never guessed --------------------------
