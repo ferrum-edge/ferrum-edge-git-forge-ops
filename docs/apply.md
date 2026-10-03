@@ -57,8 +57,11 @@ Never retried:
   `rollback: incomplete` or `unknown_outcome` is `RestoreNeedsManualRecovery`.
 - **Request timeouts.** The outcome is unknown; the next run re-diffs.
 - **Other 4xx** (400, 401, 403, 404, 409, 422).
-- **3xx.** Redirects are never followed. The error names the `Location`; point
-  `FERRUM_GATEWAY_URL` at the final origin.
+- **3xx.** Redirects are never followed. Because `FERRUM_GATEWAY_URL` is a
+  GitHub Environment secret, the error describes the `Location` only by how it
+  relates to the configured base (same origin and a different path, a changed
+  scheme, or another origin) instead of echoing it; point `FERRUM_GATEWAY_URL`
+  at the final origin.
 
 Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
 `Retry-After` (delta-seconds) is honored, capped at 30 s.
