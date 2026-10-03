@@ -396,6 +396,11 @@ jobs:
         env:
           FERRUM_ENV: ${{ matrix.environment }}
           FERRUM_NAMESPACE: ${{ matrix.namespace }}
+          # The operator's probe-Consumer allowlist, so the review can show
+          # and block a traffic-check slot whose Consumer it does not list.
+          FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}
+          # Bound to the environment: an unset variable is a missing allowlist.
+          FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITFORGEOPS_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}

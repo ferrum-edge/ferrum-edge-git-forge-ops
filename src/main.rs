@@ -1301,6 +1301,132 @@ fn preflight_smoke_checks() -> gitforgeops::error::Result<()> {
     gitforgeops::verify::SmokeConfig::load().map(|_| ())
 }
 
+/// The operator's probe-Consumer allowlist as this run sees it.
+struct OperatorAllowlist {
+    /// The parsed list, when it names at least one Consumer.
+    list: Option<gitforgeops::verify::ProbeConsumerAllowlist>,
+    state: gitforgeops::verify::ProbeAllowlistState,
+    /// Why the variable does not parse; the error names the operator action.
+    malformed: Option<gitforgeops::error::Error>,
+}
+
+/// Read `FERRUM_VERIFY_PROBE_CONSUMERS` once.
+///
+/// A workflow step bound to the environment also sets
+/// `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND=true`. There an unset or blank
+/// variable means the operator set no allowlist (`ProbeAllowlistState::Unset`),
+/// which is what `verify` will see. Without the marker the run has no
+/// environment (a pull request's `plan` or `review`), and the allowlist is
+/// only not visible.
+fn operator_allowlist(env_config: &EnvConfig) -> OperatorAllowlist {
+    use gitforgeops::verify::{ProbeAllowlistState, ProbeConsumerAllowlist};
+    let parsed = env_config
+        .verify_probe_consumers
+        .as_deref()
+        .map(ProbeConsumerAllowlist::parse);
+    match parsed {
+        Some(Err(error)) => OperatorAllowlist {
+            list: None,
+            state: ProbeAllowlistState::Malformed,
+            malformed: Some(error),
+        },
+        Some(Ok(list)) if !list.is_empty() => OperatorAllowlist {
+            list: Some(list),
+            state: ProbeAllowlistState::Listed,
+            malformed: None,
+        },
+        _ => OperatorAllowlist {
+            list: None,
+            state: if env_config.verify_probe_consumers_bound {
+                ProbeAllowlistState::Unset
+            } else {
+                ProbeAllowlistState::NotVisible
+            },
+            malformed: None,
+        },
+    }
+}
+
+/// Every `slot:` header the environment's declared checks send, bound to the
+/// Consumer of the *unresolved* desired configuration it would spend, plus
+/// every Consumer that carries the probe label. Names only, never a value.
+struct ProbeBindingPreview {
+    bindings: Vec<gitforgeops::verify::SlotBinding>,
+    labelled: Vec<String>,
+    allowlist: gitforgeops::verify::ProbeAllowlistState,
+    /// The operator-side refusal `verify` would raise while a check sends a
+    /// slot: the allowlist is malformed, or unset in an environment-bound
+    /// run. Not something the pull request can fix.
+    operator_error: Option<gitforgeops::error::Error>,
+}
+
+impl ProbeBindingPreview {
+    /// The slot refusal `verify` would raise after the gateway changed.
+    fn check(&self, environment: &str) -> gitforgeops::error::Result<()> {
+        gitforgeops::verify::refuse_unbound_slots(environment, &self.bindings)
+    }
+}
+
+/// `desired` must be the assembled configuration *before* credential
+/// resolution: a slot is a probe credential only while its leaf is still a
+/// `${gh-env-secret:...}` placeholder.
+fn probe_binding_preview(
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    desired: &GatewayConfig,
+) -> gitforgeops::error::Result<ProbeBindingPreview> {
+    use gitforgeops::verify::{
+        bind_probe_slots, labelled_probe_consumers, missing_allowlist_error, ProbeAllowlistState,
+    };
+    let operator = operator_allowlist(env_config);
+    let smoke = gitforgeops::verify::SmokeConfig::load()?;
+    let checks = smoke
+        .as_ref()
+        .and_then(|smoke| smoke.declared_checks(&resolved.name));
+    // Only an ad-hoc `FERRUM_NAMESPACE` leaves other namespaces to another
+    // run. `verify` assembles under the environment's own declared scope, so
+    // a slot outside that scope is refused here exactly as it will be there.
+    let adhoc_namespace = resolved
+        .namespace_filter
+        .as_deref()
+        .filter(|_| !resolved.namespace_filter_is_environment_scope);
+    let bindings = match checks {
+        Some(checks) => bind_probe_slots(checks, desired, operator.list.as_ref(), adhoc_namespace),
+        None => Vec::new(),
+    };
+    let sends_slot = !bindings.is_empty();
+    let operator_error = match operator.state {
+        ProbeAllowlistState::Malformed if sends_slot => operator.malformed,
+        ProbeAllowlistState::Unset if sends_slot => Some(missing_allowlist_error(&resolved.name)),
+        _ => None,
+    };
+    Ok(ProbeBindingPreview {
+        bindings,
+        labelled: labelled_probe_consumers(desired),
+        allowlist: operator.state,
+        operator_error,
+    })
+}
+
+/// The probe-credential binding `verify` enforces only after `apply` changed
+/// the gateway, refused here, before anything changes: a slot must be a
+/// brokered secret of a Consumer labelled `gitforgeops/verify-probe: "true"`,
+/// and, when this run can see `FERRUM_VERIFY_PROBE_CONSUMERS`, one the
+/// operator lists there. In a run bound to the environment, an unset or
+/// malformed allowlist is refused first, as `verify` would refuse it. `review`
+/// reports both as blockers.
+fn preflight_probe_bindings(
+    env_config: &EnvConfig,
+    resolved: &ResolvedEnv,
+    desired: &GatewayConfig,
+) -> gitforgeops::error::Result<()> {
+    let mut preview = probe_binding_preview(env_config, resolved, desired)?;
+    if let Some(error) = preview.operator_error.take() {
+        return Err(error);
+    }
+    preview.check(&resolved.name)
+}
+
 /// Print one document's plan-time validation verdict and return whether it
 /// counts as passing.
 ///
@@ -1341,6 +1467,7 @@ fn cmd_validate(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     preflight_deployment_inputs(&env_config)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    preflight_probe_bindings(&env_config, &resolved, &assembled.gateway)?;
     let mut gateway_config = assembled.gateway;
     let namespace_scope = assembled.namespace_scope;
     enforce_exclusive_scope(&resolved, &gateway_config)?;
@@ -2132,6 +2259,7 @@ async fn cmd_plan(
     let (env_config, resolved, _repo) = resolve_runtime(explicit_env)?;
     preflight_deployment_inputs(&env_config)?;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    preflight_probe_bindings(&env_config, &resolved, &assembled.gateway)?;
     let desired_mesh = assembled.mesh;
     let mut desired = assembled.gateway;
     let mut namespace_scope = assembled.namespace_scope;
@@ -2578,6 +2706,7 @@ async fn cmd_plan(
         // `preflight_deployment_inputs` already refused both before assembly.
         publication_paths_collide: false,
         smoke_checks_invalid: false,
+        probe_allowlist_invalid: false,
     });
     let offline_summary = verdict::blocker_summary(&blockers);
     let conflict_namespaces: std::collections::BTreeSet<&str> = spec_owned
@@ -2682,6 +2811,9 @@ async fn cmd_apply(
         return Err(format!("Refusing to apply: {}", blocker.summary()).into());
     }
     if let Err(error) = preflight_deployment_inputs(&env_config) {
+        return Err(format!("Refusing to apply: {error}").into());
+    }
+    if let Err(error) = preflight_probe_bindings(&env_config, &resolved, &assembled.gateway) {
         return Err(format!("Refusing to apply: {error}").into());
     }
     let desired_mesh = assembled.mesh;
@@ -3786,6 +3918,28 @@ async fn cmd_review(
         eprintln!("{}", safe_block(error));
     }
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    // The probe-credential binding, judged on the unresolved configuration
+    // before credentials are resolved into it. A file that does not load is
+    // already a blocker, so it is not bound a second time.
+    // A missing or malformed operator allowlist is reported apart from the
+    // smoke checks: the pull request author cannot fix it.
+    let (probe_preview, probe_error, allowlist_error) = if smoke_error.is_some() {
+        (None, None, None)
+    } else {
+        match probe_binding_preview(&env_config, &resolved, &assembled.gateway) {
+            Ok(mut preview) => {
+                let refused = preview.check(&resolved.name).err();
+                let operator = preview.operator_error.take();
+                (Some(preview), refused, operator)
+            }
+            Err(error) => (None, Some(error), None),
+        }
+    };
+    for error in [&probe_error, &allowlist_error].into_iter().flatten() {
+        eprintln!("{}", safe_block(error));
+    }
+    let smoke_invalid = smoke_error.is_some() || probe_error.is_some();
+    let probe_allowlist_invalid = allowlist_error.is_some();
     let file_publication_narrowed =
         file_publication_narrowed(&env_config, &resolved, &assembled.namespace_scope);
     let mut desired = assembled.gateway;
@@ -3976,11 +4130,22 @@ async fn cmd_review(
     // text, so nothing from the environment or the smoke file reaches the PR.
     let preflight_blockers = [
         verdict::publication_path_collision_blocker(publication_path_error.is_some()),
-        verdict::invalid_smoke_checks_blocker(smoke_error.is_some()),
+        verdict::invalid_smoke_checks_blocker(smoke_invalid),
+        verdict::probe_consumer_allowlist_blocker(probe_allowlist_invalid),
     ];
     for blocker in preflight_blockers.into_iter().flatten() {
         let remedy = blocker.kind.remedy();
         ownership_note.push_str(&format!("\n\n**Apply blocked** — {remedy}"));
+    }
+    // Which Consumer each traffic-check slot would spend, and every Consumer
+    // carrying the probe label, so a label or slot a change adds is visible.
+    if let Some(preview) = &probe_preview {
+        let section = review::pr_comment::render_probe_bindings(
+            &preview.bindings,
+            &preview.labelled,
+            preview.allowlist,
+        );
+        ownership_note.push_str(&section);
     }
 
     let provisioning_blockers = verdict::credential_provisioning_blockers(
@@ -4005,7 +4170,8 @@ async fn cmd_review(
         github_repository_present: env_config.github_repository.is_some(),
         file_publication_narrowed,
         publication_paths_collide: publication_path_error.is_some(),
-        smoke_checks_invalid: smoke_error.is_some(),
+        smoke_checks_invalid: smoke_invalid,
+        probe_allowlist_invalid,
     });
 
     let comment = review::pr_comment::build_review_comment_with_preview(
@@ -4098,7 +4264,8 @@ async fn cmd_review(
 /// and nothing failed, and a deployment job must be able to record that as
 /// `skipped` rather than fail on it. Everything else that stops a declared
 /// check from running — an unparsable `smoke.yaml`, no data-plane URL, an
-/// unreadable bundle — is an error (exit 1), never a pass.
+/// unreadable bundle, a slot that is not a verification probe credential — is
+/// an error (exit 1), never a pass.
 async fn cmd_verify(
     format: cli::ReportFormat,
     explicit_env: Option<&str>,
@@ -4120,16 +4287,39 @@ async fn cmd_verify(
                         .to_string(),
                 )
             })?;
-            // Header values may name credential-bundle slots. The bundle is
-            // loaded the same way every other command loads it; a slot that is
-            // not in it fails the check rather than sending an empty header.
-            let (bundle, _) = load_credential_bundles(&env_config)?;
+            // Header values may name credential-bundle slots, and this job
+            // holds the environment's whole bundle. A check may spend only a
+            // brokered secret of a Consumer that the operator lists in
+            // FERRUM_VERIFY_PROBE_CONSUMERS (a GitHub Environment variable no
+            // change to resources/ can reach) and that the desired
+            // configuration labels as a verification probe. Anything else
+            // refuses the run before the bundle is read or a request is sent.
+            // The runner only ever sees that projection, never the bundle. An
+            // authorized slot the bundle lacks fails its check rather than
+            // sending an empty header.
+            let credentials = if checks.sends_credentials() {
+                let desired = load_and_assemble_for(&resolved, &env_config)?;
+                let operator = operator_allowlist(&env_config);
+                if let Some(error) = operator.malformed {
+                    return Err(error.into());
+                }
+                let authorization = gitforgeops::verify::authorize_probe_slots(
+                    &resolved.name,
+                    checks,
+                    &desired,
+                    operator.list.as_ref(),
+                )?;
+                let (bundle, _) = load_credential_bundles(&env_config)?;
+                authorization.project(&bundle)
+            } else {
+                gitforgeops::verify::ProbeCredentials::none()
+            };
 
             gitforgeops::verify::runner::run(
                 &resolved.name,
                 &base_url,
                 checks,
-                &bundle,
+                &credentials,
                 // A private CA is configuration; `FERRUM_TLS_NO_VERIFY` is
                 // deliberately not honoured here. A check that accepts any
                 // certificate has not verified TLS, and a promotion gate that
