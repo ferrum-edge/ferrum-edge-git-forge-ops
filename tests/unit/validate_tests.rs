@@ -330,7 +330,7 @@ fn scrubber_provenance_preserves_canonical_indexed_escaped_slots_and_unresolved_
         "ferrum/app/keyauth/key",
         "ferrum/app/keyauth/a~1b~0~21]",
         "ferrum/app/keyauth/[1]/key",
-        "ferrum/plugin/@plugin-config/config/a~1b~0~21]/[1]",
+        "ferrum/plugin/@plugin/custom/config/a~1b~0~21]/[1]",
         "ferrum/discovery/@service-discovery/consul/token",
     ];
     // Consumer secrets may not be placeholder text (#379); plugin-config and
@@ -1237,7 +1237,7 @@ exit 0
                 consumer_config(serde_json::json!({"jwt": [{"secret": placeholder}]}))
             };
             let slot = if plugin {
-                "ferrum/ldap/@plugin-config/config/ldap_url"
+                "ferrum/ldap/@plugin/ldap_auth/config/ldap_url"
             } else {
                 "ferrum/app/jwt/secret"
             };
@@ -1324,7 +1324,7 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
     let resolved_slots = [
         "n~1s~0~2/a~1p~0~2/keyauth/a~1b~0~21]",
         "n~1s~0~2/a~1p~0~2/keyauth/[1]/a~1b~0~21]/[1]",
-        "n~1s~0~2/p~1l~0~2/@plugin-config/config/a~1b~0~21]/[0]",
+        "n~1s~0~2/p~1l~0~2/@plugin/custom_fixture/config/a~1b~0~21]/[0]",
         "ferrum/discovery/@service-discovery/consul/token",
     ];
     // Consumer secrets may not be placeholder text (#379); plugin-config and
@@ -1371,7 +1371,7 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
         }
         for (index, slot) in [
             resolved_slots[2],
-            "n~1s~0~2/p~1l~0~2/@plugin-config/config/a~1b~0~21]/[1]",
+            "n~1s~0~2/p~1l~0~2/@plugin/custom_fixture/config/a~1b~0~21]/[1]",
         ]
         .iter()
         .enumerate()
@@ -1413,7 +1413,7 @@ fn validator_report_never_grants_standins_to_unreported_or_conflicting_slots() {
     let report = resolve_secrets(&mut config, &Default::default()).unwrap();
     let mut wrong_slot = report.clone();
     wrong_slot.results[0].slot = "ferrum/app/jwt/[0]/secret".to_string();
-    wrong_slot.results[1].slot = "ferrum/ldap/@plugin-config/config/ldap_url/[0]".to_string();
+    wrong_slot.results[1].slot = "ferrum/ldap/@plugin/ldap_auth/config/ldap_url/[0]".to_string();
     let mut conflicting = report.clone();
     for mut resolved in report.results {
         resolved.status = SlotStatus::Resolved;

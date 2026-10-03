@@ -21,7 +21,9 @@ paths:
   label, a latest labeler who currently has at least the required repository permission, and that
   account's latest review on the current head with body `gitforgeops-override <label>`
   (`src/policy/github_override.rs`). Pagination and unknown permissions fail closed.
-- `PluginConfig.config` secrets are brokered under `<ns>/<plugin-id>/@plugin-config/config/<path>`.
+- `PluginConfig.config` secrets are brokered under
+  `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>`; the plugin type is part of the slot
+  identity, and a stored slot of another type under a declared plugin id is a slot remap.
   `src/secrets/plugin_config.rs` classifies which leaves are sensitive; the same paths drive
   import capture, diff/review masking, and validator-output scrubbing. A new secret-bearing plugin
   field needs a classification entry plus import, diff, review, and redaction tests.

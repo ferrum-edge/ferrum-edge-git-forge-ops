@@ -72,9 +72,13 @@ pub fn mask_indeterminate_secret_values(
                 &mut live.config,
                 &mut Vec::new(),
                 &|path| {
-                    unresolved.contains(
-                        plugin_config_slot(&expected.namespace, &expected.id, path).as_str(),
-                    )
+                    let slot = plugin_config_slot(
+                        &expected.namespace,
+                        &expected.id,
+                        &expected.plugin_name,
+                        path,
+                    );
+                    unresolved.contains(slot.as_str())
                 },
             );
         }
