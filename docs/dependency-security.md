@@ -58,10 +58,11 @@ So `check_cargo_audit.py` never runs cargo from the candidate checkout:
 - `cargo tree --manifest-path <candidate>/Cargo.toml` and
   `cargo audit --file <candidate>/Cargo.lock` run from a fresh temporary
   directory with a fresh, empty `CARGO_HOME`;
-- inherited `CARGO_*` variables (including `CARGO_ALIAS_<name>`),
-  `RUSTUP_TOOLCHAIN`, `RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`,
-  `RUSTFLAGS` and `RUSTDOCFLAGS` are removed from their environment, so the
-  toolchain is the runner's default from the workflow's pinned toolchain step;
+- inherited `CARGO_*` variables (including `CARGO_ALIAS_<name>`), cargo's
+  internal `__CARGO_*` overrides, `RUSTUP_TOOLCHAIN`, `RUSTC`,
+  `RUSTC_BOOTSTRAP`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTFLAGS`
+  and `RUSTDOCFLAGS` are removed from their environment, so the toolchain is
+  the runner's default from the workflow's pinned toolchain step;
 - `Cargo.toml` and `Cargo.lock` must be regular files, not symlinks, and a
   missing lockfile is refused rather than generated;
 - the gate refuses to run when the temporary directory is inside the
@@ -203,6 +204,15 @@ python3 .github/scripts/check_cargo_audit.py
 cargo tree --locked --target all -i rsa@0.9.10
 cargo test --test unit_tests
 ```
+
+Run locally, `check_cargo_audit.py` behaves exactly as it does in CI. Each
+`cargo tree` and `cargo audit` call gets a fresh, empty `CARGO_HOME`, so every
+run downloads the crates.io index, the needed crate manifests and the RustSec
+advisory database again; your `~/.cargo` cache, registry configuration and
+`~/.cargo/audit.toml` are not used. It also runs from a temporary directory, so
+the repository's `rust-toolchain.toml` does not apply: cargo comes from your
+rustup default toolchain (or `PATH`), and `RUSTUP_TOOLCHAIN` is ignored. To
+match CI, make the channel pinned in `rust-toolchain.toml` your rustup default.
 
 `cargo audit` reads the committed `Cargo.lock` as-is. Run `cargo update` only
 when you mean to move the lockfile; it is an upgrade, not a check.

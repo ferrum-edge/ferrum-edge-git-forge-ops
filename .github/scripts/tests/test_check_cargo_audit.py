@@ -747,10 +747,16 @@ class CandidateCargoIsolationTests(unittest.TestCase):
                 "CARGO_HOME": str(root / ".cargo"),
                 "CARGO_ALIAS_AUDIT": "tree",
                 "CARGO_BUILD_RUSTC_WRAPPER": "/bin/false",
+                "RUSTC_BOOTSTRAP": "1",
                 "RUSTC_WRAPPER": "/bin/false",
                 "RUSTFLAGS": "--cfg forged",
                 "RUSTUP_TOOLCHAIN": "forged",
+                "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS": "nightly",
+                "__CARGO_FIX_YOLO": "1",
             }
+            # Every explicitly scrubbed name is exercised, not just a sample.
+            for name in check_cargo_audit.SCRUBBED_ENVIRONMENT:
+                hostile_environment.setdefault(name, "/bin/false")
             seen = {}
 
             def fake_run(command, **kwargs):
@@ -777,6 +783,11 @@ class CandidateCargoIsolationTests(unittest.TestCase):
             for name in hostile_environment:
                 if name != "CARGO_HOME":
                     self.assertNotIn(name, environment)
+            self.assertEqual(
+                [name for name in environment if name.startswith(("CARGO_", "__CARGO_"))],
+                ["CARGO_HOME"],
+                "only the isolated CARGO_HOME reaches cargo",
+            )
             cargo_home = Path(environment["CARGO_HOME"]).resolve()
             self.assertNotIn(root.resolve(), (cargo_home, *cargo_home.parents))
             self.assertEqual(environment.get("PATH"), inherited_path)

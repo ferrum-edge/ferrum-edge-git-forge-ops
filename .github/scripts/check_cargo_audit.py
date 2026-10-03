@@ -82,12 +82,15 @@ CARGO_CONTROL_FILES = (
     "rust-toolchain",
     "rust-toolchain.toml",
 )
-# Inherited variables that would otherwise select a toolchain, wrap rustc or
-# configure cargo (`CARGO_ALIAS_<name>`, `CARGO_HOME`, ...) for the gate.
+# Inherited variables that would otherwise select a toolchain, wrap rustc,
+# unlock nightly-only behaviour (`RUSTC_BOOTSTRAP`, cargo's internal
+# `__CARGO_*` overrides) or configure cargo (`CARGO_ALIAS_<name>`,
+# `CARGO_HOME`, ...) for the gate.
 SCRUBBED_ENVIRONMENT = frozenset(
     {
         "CARGO",
         "RUSTC",
+        "RUSTC_BOOTSTRAP",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
         "RUSTDOCFLAGS",
@@ -95,7 +98,7 @@ SCRUBBED_ENVIRONMENT = frozenset(
         "RUSTUP_TOOLCHAIN",
     }
 )
-SCRUBBED_ENVIRONMENT_PREFIXES = ("CARGO_",)
+SCRUBBED_ENVIRONMENT_PREFIXES = ("CARGO_", "__CARGO_")
 
 _RAW_STRING_START = re.compile(r'b?r(?P<hashes>#*)"')
 _CHAR_LITERAL = re.compile(r"b?'(?:\\.|[^\\'\n])'")
