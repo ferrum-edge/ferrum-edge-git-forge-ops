@@ -172,6 +172,14 @@ jobs:
           # behind an ordinary apply. A refusal is resolved by dispatching the
           # rotation again from the current head; see
           # README.md#a-superseded-rotation.
+          #
+          # The classifier's refusal text is written for apply ("wait for or
+          # re-run the apply"). No apply reschedules a rotation, so say what
+          # this run needs first; the binding below must stay three
+          # uninterrupted lines.
+          if [ "$fresh_head" != "$TRIGGER_SHA" ]; then
+            echo "::notice::${DEFAULT_BRANCH} moved past the dispatched revision $TRIGGER_SHA while this rotation waited. If the check below refuses it, its message is worded for GitForgeOps Apply, but no apply run will rotate this credential: dispatch the rotation again from the current head. See README.md#a-superseded-rotation."
+          fi
           # Load the classifier from the dispatched revision, not the refreshed
           # checkout it is judging, so a newer head cannot replace the program
           # that decides whether it may ride this approval. The pipe leaves no

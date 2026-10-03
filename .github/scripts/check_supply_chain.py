@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -979,12 +980,21 @@ def declares_concurrency(text: str) -> bool:
     all, in any case. A run script or trailing comment that merely mentions it
     is refused too; reword it.
     """
+    return _CONCURRENCY_WORD.search(decoded_workflow_content(text)) is not None
+
+
+def decoded_workflow_content(text: str) -> str:
+    """A workflow without full-line comments, double-quoted escapes decoded.
+
+    Not a YAML parser. It is the fail-closed reading the word-level rules use:
+    a key or value spelled with `\\x`/`\\u`/`\\U` escapes or an escaped line
+    break reads the same as its plain spelling.
+    """
     content = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
     content = _YAML_ESCAPED_LINE_BREAK.sub("", content)
-    content = _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, content)
-    return _CONCURRENCY_WORD.search(content) is not None
+    return _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, content)
 
 
 # The last step before the guard reports an authorized override re-reads the
@@ -1486,8 +1496,11 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
     This is a substring contract over the candidate's own copy of
     `security.yml`, enforced by the run that copy defines. It catches an honest
     regression and a shadowed import; it cannot stop a pull request that
-    rewrites the job itself. That boundary needs a workflow whose definition
-    the pull request does not supply (see docs/github-launch-controls.md).
+    rewrites the job itself. `supply-chain-policy.yml` is the workflow whose
+    definition the pull request does not supply (see
+    `supply_chain_policy_workflow_violations`). This job stays, unchanged,
+    until the ruleset requires that workflow's check instead (see
+    docs/github-launch-controls.md).
     """
     required = (
         "if: github.event_name == 'pull_request'",
@@ -1540,6 +1553,695 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
         violations.append(
             "security.yml: an unprotected PR base SHA must not supply the policy checker"
         )
+    return violations
+
+
+# GHSA-x5m2-4555-q4cr. The supply-chain verdict comes from a
+# `pull_request_target` workflow, which GitHub always loads from the protected
+# default branch: the pull request under review cannot edit the job that
+# judges it. It can propose a new shape for LATER pull requests, and that
+# proposal is held to the shape below by the protected checker before merge.
+SUPPLY_CHAIN_POLICY_WORKFLOW = "supply-chain-policy.yml"
+SUPPLY_CHAIN_POLICY_PATH = f".github/workflows/{SUPPLY_CHAIN_POLICY_WORKFLOW}"
+SUPPLY_CHAIN_POLICY_JOB = "trusted-supply-chain-policy"
+# The checker runs from the protected checkout, isolated, with the candidate
+# as `--root`. The working directory is the workspace, never the candidate.
+SUPPLY_CHAIN_POLICY_INVOCATION = (
+    "python3 -I base/.github/scripts/check_supply_chain.py --root candidate"
+)
+PINNED_ACTION_COMMIT = "<40-hex commit>"
+# Every non-comment line of the workflow, in order, with trailing comments
+# dropped. Exact rather than substring: an added key — `env:` (bash reads
+# `BASH_ENV` before the first command), `defaults:` (a working directory
+# inside the candidate), `if:` (a skipped required job reports success), a
+# second trigger, a write permission, `secrets`, an environment, another step —
+# is a different line list. The action commit is the only free part, so
+# Dependabot can still bump it; the repository-wide rule requires 40 hex.
+# Deliberate trade-off: any 40-hex commit is accepted here, including one
+# GitHub resolves through a fork of `actions/checkout`, so a commit change to
+# this file needs the same exact-head review as any other workflow change.
+SUPPLY_CHAIN_POLICY_SHAPE = (
+    "name: GitForgeOps Supply-Chain Policy",
+    "on:",
+    "  pull_request_target:",
+    "    types: [opened, synchronize, reopened, edited]",
+    "    branches: [main]",
+    "permissions:",
+    "  contents: read",
+    "concurrency:",
+    "  group: trusted-supply-chain-policy-${{ github.event.pull_request.number }}",
+    "  cancel-in-progress: true",
+    "jobs:",
+    f"  {SUPPLY_CHAIN_POLICY_JOB}:",
+    "    runs-on: ubuntu-24.04",
+    "    timeout-minutes: 10",
+    "    steps:",
+    "      - name: Check out protected supply-chain policy",
+    f"        uses: actions/checkout@{PINNED_ACTION_COMMIT}",
+    "        with:",
+    "          ref: ${{ github.event.repository.default_branch }}",
+    "          path: base",
+    "          persist-credentials: false",
+    "      - name: Check out candidate as policy data",
+    f"        uses: actions/checkout@{PINNED_ACTION_COMMIT}",
+    "        with:",
+    "          repository: ${{ github.event.pull_request.head.repo.full_name }}",
+    "          ref: ${{ github.event.pull_request.head.sha }}",
+    "          path: candidate",
+    "          persist-credentials: false",
+    "      - name: Judge candidate with protected supply-chain policy",
+    f"        run: {SUPPLY_CHAIN_POLICY_INVOCATION}",
+)
+_PINNED_USES = re.compile(r"^(\s*(?:-\s+)?uses:\s*[^@\s]+)@[0-9a-f]{40}$")
+# YAML starts a comment at a `#` preceded by whitespace. A `#` glued to a
+# value is part of it, so it is kept and the line no longer matches. A
+# lookbehind rather than `\s+#`: a long run of blanks with no `#` must not
+# backtrack quadratically on candidate input.
+_TRAILING_COMMENT = re.compile(r"(?<=[ \t])#.*$")
+
+
+def policy_workflow_shape(text: str) -> list[str]:
+    """The non-comment lines of a workflow, with action commits normalized."""
+    shape: list[str] = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        line = _TRAILING_COMMENT.sub("", line).rstrip()
+        shape.append(_PINNED_USES.sub(rf"\1@{PINNED_ACTION_COMMIT}", line))
+    return shape
+
+
+def supply_chain_policy_shape_violations(text: str) -> list[str]:
+    """The trusted policy workflow must keep exactly its reviewed shape."""
+    shape = policy_workflow_shape(text)
+    expected = list(SUPPLY_CHAIN_POLICY_SHAPE)
+    if shape == expected:
+        return []
+    index = next(
+        (
+            position
+            for position, (found, wanted) in enumerate(zip(shape, expected))
+            if found != wanted
+        ),
+        min(len(shape), len(expected)),
+    )
+    wanted = expected[index].strip() if index < len(expected) else "<end of file>"
+    found = shape[index].strip() if index < len(shape) else "<end of file>"
+    return [
+        f"{SUPPLY_CHAIN_POLICY_WORKFLOW}: the trusted policy workflow must keep its "
+        "pinned shape (pull_request_target only, contents: read, no secrets or "
+        "environment, the candidate checked out as data, and exactly "
+        f"{SUPPLY_CHAIN_POLICY_INVOCATION!r}); non-comment line {index + 1} "
+        f"should be {wanted!r}, found {found!r}"
+    ]
+
+
+def supply_chain_policy_workflow_violations(root: Path) -> list[str]:
+    """The `pull_request_target` policy workflow must exist and keep its shape."""
+    path = root / SUPPLY_CHAIN_POLICY_PATH
+    if path.is_symlink() or not path.is_file():
+        return [
+            f"{SUPPLY_CHAIN_POLICY_WORKFLOW}: the trusted supply-chain policy "
+            "workflow must remain a regular file"
+        ]
+    return supply_chain_policy_shape_violations(path.read_text(encoding="utf-8"))
+
+
+def candidate_tree_violations(root: Path) -> list[str]:
+    """Every path in the judged tree must be a plain file, a directory, or a
+    symlink that stays inside the tree.
+
+    The policy job lays the protected checkout out beside the candidate
+    (`base/` next to `candidate/`), and every other workflow runs the same
+    tree at the workspace root. A link that is absolute or climbs above the
+    tree root therefore reads one file here and a different one everywhere
+    else: `.github/scripts` pointing at the workspace's `base/.github/scripts`
+    shows this check the protected scripts while later runs execute the pull
+    request's own copy. A relative target is followed component by component
+    from the link's directory: it may not pass through another link (the
+    kernel would take `..` of that link's target, not of its name), and it may
+    not climb above the tree root, even to come back in, so `../candidate/x`
+    cannot re-enter this layout through the directory name. The resolved
+    target is checked too, for chains of links. Every path
+    component is visited without following a link, and nothing is read until
+    the walk passes. Devices, FIFOs and sockets are refused, since reading
+    one can hang or exhaust the job. `.git` directories are the checkout's own
+    metadata and are skipped.
+
+    `root` is taken as given, before any resolution, so a root that is itself
+    a symlink is refused rather than silently followed.
+    """
+    if root.is_symlink() or not root.is_dir():
+        return [f"{root}: the tree under review must be a real directory"]
+    real_root = Path(os.path.realpath(root))
+    violations: list[str] = []
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(directory)
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not (name == ".git" and not (here / name).is_symlink())
+        )
+        for name in sorted(dirnames + filenames):
+            path = here / name
+            relative = path.relative_to(root).as_posix()
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                target = os.readlink(path)
+                through = None if os.path.isabs(target) else _link_traversal(root, path, target)
+                resolved = Path(os.path.realpath(path))
+                if through is not None:
+                    violations.append(
+                        f"{relative}: symlink target passes through another "
+                        f"symlink ({through}); only a direct path inside the tree "
+                        "resolves the same everywhere"
+                    )
+                elif (
+                    os.path.isabs(target)
+                    or _link_climbs(root, path, target)
+                    or not (resolved == real_root or resolved.is_relative_to(real_root))
+                ):
+                    violations.append(
+                        f"{relative}: symlink leaves the tree under review "
+                        f"({target!r}); it would resolve differently in the "
+                        "policy job and in the workflows that run this tree"
+                    )
+                elif not os.path.exists(path):
+                    violations.append(
+                        f"{relative}: symlink does not resolve ({target!r})"
+                    )
+            elif not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                violations.append(
+                    f"{relative}: only regular files, directories and in-tree "
+                    "symlinks may be reviewed; this is a special file"
+                )
+    return violations
+
+
+def _link_climbs(root: Path, path: Path, target: str) -> bool:
+    """Whether a relative link target climbs above the tree root, even to return."""
+    parts = list(path.parent.relative_to(root).parts)
+    for component in target.split("/"):
+        if component == "..":
+            if not parts:
+                return True
+            parts.pop()
+        elif component not in ("", "."):
+            parts.append(component)
+    return False
+
+
+def _link_traversal(root: Path, path: Path, target: str) -> str | None:
+    """The first intermediate component of a link target that is itself a link.
+
+    Each prefix of the target, followed from the link's directory, is
+    `lstat`-ed; only the final component may be a link (a chain, which the
+    walk judges on its own). With no link in between, the text names exactly
+    the path the kernel resolves, in every checkout layout.
+    """
+    parts = list(path.parent.relative_to(root).parts)
+    components = [part for part in target.split("/") if part not in ("", ".")]
+    for component in components[:-1]:
+        if component == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        parts.append(component)
+        prefix = root.joinpath(*parts)
+        try:
+            if stat.S_ISLNK(os.lstat(prefix).st_mode):
+                return "/".join(parts)
+        except OSError:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Strict workflow reader
+# ---------------------------------------------------------------------------
+# GHSA-x5m2-4555-q4cr. Rules that pattern-match YAML text stay evadable: YAML
+# spells one key or value many ways (an indented root, explicit `? key`,
+# anchors, aliases, tags, merge keys, flow mappings). So every workflow under
+# `.github/workflows/` must be written in a small, unambiguous subset of YAML
+# that this stdlib-only reader turns into dicts, lists and strings, and the
+# check-name, permission and action-pin rules read that structure. Anything
+# outside the subset is a violation reported before any rule runs: a spelling
+# this reader does not know cannot carry a meaning past it.
+#
+# The subset:
+# - top-level keys at column 0, indentation by spaces only, block mappings and
+#   block sequences (a sequence nested under a key is indented below it);
+# - keys are plain `[A-Za-z0-9_-]+` and unique within their mapping;
+# - scalars are plain, single-quoted or double-quoted, each on one line;
+# - a block scalar (`|` or `>`, optional `-`/`+`) only as the value of a key in
+#   `BLOCK_SCALAR_KEYS`;
+# - a one-line flow sequence of scalars only as the value of a key in
+#   `FLOW_SEQUENCE_KEYS` (`branches: [main]`); never a flow mapping;
+# - nowhere: anchors, aliases, tags, explicit keys, merge keys, directives,
+#   document markers other than one leading `---`, tabs outside block
+#   scalars, a byte-order mark, control characters or Unicode line breaks.
+
+
+class WorkflowSyntaxError(ValueError):
+    """A workflow uses YAML outside the subset the policy can read."""
+
+
+BLOCK_SCALAR_KEYS = frozenset(
+    {"run", "script", "body", "description", "if", "path", "restore-keys", "images", "tags"}
+)
+FLOW_SEQUENCE_KEYS = frozenset(
+    {
+        "branches",
+        "branches-ignore",
+        "tags",
+        "tags-ignore",
+        "paths",
+        "paths-ignore",
+        "types",
+        "needs",
+        "workflows",
+    }
+)
+_WORKFLOW_KEY = re.compile(r"([A-Za-z0-9_-]+):(?: +(.*))?")
+_FORBIDDEN_WORKFLOW_CHARACTER = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ﻿]"
+)
+_BLOCK_SCALAR_HEADERS = frozenset({"|", "|-", "|+", ">", ">-", ">+"})
+# Characters that would begin something other than a plain scalar.
+_PLAIN_START = frozenset("&*!|>{}[],#'\"%@`")
+_DOUBLE_QUOTED_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\x85",
+    "_": "\xa0",
+    "L": " ",
+    "P": " ",
+}
+_HEX_ESCAPE_WIDTHS = {"x": 2, "u": 4, "U": 8}
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _cut_comment(text: str) -> str:
+    """Drop a comment: YAML starts one at a `#` that follows a space."""
+    position = text.find(" #")
+    return (text if position < 0 else text[:position]).rstrip(" ")
+
+
+class _WorkflowReader:
+    def __init__(self, text: str) -> None:
+        forbidden = _FORBIDDEN_WORKFLOW_CHARACTER.search(text)
+        if forbidden is not None:
+            line = text.count("\n", 0, forbidden.start()) + 1
+            raise WorkflowSyntaxError(
+                f"line {line}: character U+{ord(forbidden.group()):04X} is not "
+                "allowed (byte-order mark, control character or line separator)"
+            )
+        self.lines = text.split("\n")
+        self.index = 0
+
+    def fail(self, message: str) -> None:
+        raise WorkflowSyntaxError(f"line {self.index + 1}: {message}")
+
+    def next_indent(self) -> int | None:
+        """Skip blank and comment lines; the next line's indentation."""
+        while self.index < len(self.lines):
+            line = self.lines[self.index]
+            content = line.lstrip(" ")
+            if not content or content.startswith("#"):
+                self.index += 1
+                continue
+            if "\t" in line:
+                self.fail("tabs are only allowed inside block scalars")
+            return len(line) - len(content)
+        return None
+
+    def document(self) -> dict:
+        indent = self.next_indent()
+        if indent == 0 and self.lines[self.index].rstrip(" ") == "---":
+            self.index += 1
+            indent = self.next_indent()
+        if indent is None:
+            return {}
+        if indent != 0:
+            self.fail("the top-level mapping must start at column 0")
+        root = self.mapping(0)
+        if self.next_indent() is not None:
+            self.fail("unexpected content after the top-level mapping")
+        return root
+
+    def block_node(self, indent: int):
+        content = self.lines[self.index][indent:].rstrip(" ")
+        if content == "-" or content.startswith("- "):
+            return self.sequence(indent)
+        return self.mapping(indent)
+
+    def mapping(self, indent: int) -> dict:
+        result: dict = {}
+        while True:
+            current = self.next_indent()
+            if current is None or current < indent:
+                return result
+            if current > indent:
+                self.fail("unexpected indentation")
+            content = self.lines[self.index][indent:].rstrip(" ")
+            match = _WORKFLOW_KEY.fullmatch(content)
+            if match is None:
+                self.fail(
+                    "expected a plain `key:`; quoted, explicit (`?`), anchored, "
+                    "tagged, aliased and merge keys are not supported"
+                )
+            key = match.group(1)
+            if key in result:
+                self.fail(f"duplicate key {key!r}")
+            result[key] = self.value(key, match.group(2) or "", indent)
+
+    def value(self, key: str, rest: str, indent: int):
+        """The value of the key on the current line; leaves the reader after it."""
+        if not rest or rest.startswith("#"):
+            self.index += 1
+            nested = self.next_indent()
+            if nested is None or nested <= indent:
+                return None
+            return self.block_node(nested)
+        if rest[0] in "|>":
+            if key not in BLOCK_SCALAR_KEYS:
+                self.fail(f"a block scalar is not accepted as the value of {key!r}")
+            if _cut_comment(rest) not in _BLOCK_SCALAR_HEADERS:
+                self.fail("a block scalar header must be one of | |- |+ > >- >+")
+            self.index += 1
+            return self.block_scalar(indent, folded=rest[0] == ">")
+        if rest[0] == "[":
+            if key not in FLOW_SEQUENCE_KEYS:
+                self.fail(f"a flow sequence is not accepted as the value of {key!r}")
+            result = self.flow_sequence(rest)
+        else:
+            result = self.scalar(rest)
+        self.index += 1
+        nested = self.next_indent()
+        if nested is not None and nested > indent:
+            self.fail("a value may not continue on the next line")
+        return result
+
+    def sequence(self, indent: int) -> list:
+        items: list = []
+        while True:
+            current = self.next_indent()
+            if current is None or current < indent:
+                return items
+            if current > indent:
+                self.fail("unexpected indentation")
+            line = self.lines[self.index].rstrip(" ")
+            content = line[indent:]
+            if content != "-" and not content.startswith("- "):
+                return items
+            rest = content[1:].lstrip(" ")
+            if not rest or rest.startswith("#"):
+                self.index += 1
+                nested = self.next_indent()
+                items.append(
+                    self.block_node(nested) if nested is not None and nested > indent else None
+                )
+                continue
+            if rest == "-" or rest.startswith("- "):
+                self.fail("nested compact sequences are not supported")
+            if _WORKFLOW_KEY.fullmatch(rest):
+                # A compact mapping: read it as a mapping at its first key's column.
+                column = len(line) - len(rest)
+                self.lines[self.index] = " " * column + rest
+                items.append(self.mapping(column))
+                continue
+            if rest[0] in "|>[":
+                self.fail("a sequence item must be a scalar or a mapping")
+            items.append(self.scalar(rest))
+            self.index += 1
+            nested = self.next_indent()
+            if nested is not None and nested > indent:
+                self.fail("a value may not continue on the next line")
+
+    def scalar(self, text: str) -> str:
+        if text[0] in "'\"":
+            value, end = self.quoted(text)
+            remainder = text[end:]
+            if remainder and not (
+                remainder[0] == " " and remainder.lstrip(" ")[:1] in ("", "#")
+            ):
+                self.fail("unexpected text after a quoted scalar")
+            return value
+        value = _cut_comment(text)
+        self.check_plain(value)
+        return value
+
+    def check_plain(self, value: str) -> None:
+        if (
+            not value
+            or value[0] in _PLAIN_START
+            or (value[0] in "-?:" and value[1:2] in ("", " "))
+        ):
+            self.fail(
+                f"{value[:20]!r} does not start a plain scalar; anchors, aliases, "
+                "tags and flow mappings are not supported"
+            )
+        if ": " in value or value.endswith(":"):
+            self.fail("a plain scalar may not contain ': '; quote it")
+
+    def quoted(self, text: str) -> tuple[str, int]:
+        quote = text[0]
+        out: list[str] = []
+        position = 1
+        while position < len(text):
+            character = text[position]
+            if quote == "'":
+                if character == "'":
+                    if text[position + 1:position + 2] == "'":
+                        out.append("'")
+                        position += 2
+                        continue
+                    return "".join(out), position + 1
+                out.append(character)
+                position += 1
+                continue
+            if character == '"':
+                return "".join(out), position + 1
+            if character != "\\":
+                out.append(character)
+                position += 1
+                continue
+            code = text[position + 1:position + 2]
+            if code in _HEX_ESCAPE_WIDTHS:
+                digits = text[position + 2:position + 2 + _HEX_ESCAPE_WIDTHS[code]]
+                if len(digits) != _HEX_ESCAPE_WIDTHS[code] or not set(digits) <= _HEX_DIGITS:
+                    self.fail("malformed escape in a double-quoted scalar")
+                point = int(digits, 16)
+                if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                    self.fail("escape names no Unicode scalar value")
+                out.append(chr(point))
+                position += 2 + len(digits)
+                continue
+            if code not in _DOUBLE_QUOTED_ESCAPES:
+                self.fail("unsupported escape in a double-quoted scalar")
+            out.append(_DOUBLE_QUOTED_ESCAPES[code])
+            position += 2
+        self.fail("a quoted scalar must close on its own line")
+        raise AssertionError("unreachable")
+
+    def flow_sequence(self, text: str) -> list[str]:
+        """A one-line `[a, 'b', "c"]` of scalars; nothing nested."""
+        items: list[str] = []
+        position = self.skip_spaces(text, 1)
+        if text[position:position + 1] == "]":
+            position += 1
+        else:
+            while True:
+                position = self.skip_spaces(text, position)
+                if position < len(text) and text[position] in "'\"":
+                    value, end = self.quoted(text[position:])
+                    position += end
+                else:
+                    end = position
+                    while end < len(text) and text[end] not in ",]":
+                        end += 1
+                    value = text[position:end].rstrip(" ")
+                    if any(mark in value for mark in "[]{}") or " #" in value:
+                        self.fail("a flow sequence item must be a plain or quoted scalar")
+                    self.check_plain(value)
+                    position = end
+                items.append(value)
+                position = self.skip_spaces(text, position)
+                if position >= len(text):
+                    self.fail("a flow sequence must close on its own line")
+                if text[position] == ",":
+                    position += 1
+                    continue
+                if text[position] != "]":
+                    self.fail("expected ',' or ']' in a flow sequence")
+                position += 1
+                break
+        remainder = text[position:]
+        if remainder and not (
+            remainder[0] == " " and remainder.lstrip(" ")[:1] in ("", "#")
+        ):
+            self.fail("unexpected text after a flow sequence")
+        return items
+
+    @staticmethod
+    def skip_spaces(text: str, position: int) -> int:
+        while text[position:position + 1] == " ":
+            position += 1
+        return position
+
+    def block_scalar(self, indent: int, folded: bool) -> str:
+        lines: list[str] = []
+        content_indent: int | None = None
+        while self.index < len(self.lines):
+            line = self.lines[self.index]
+            # YAML counts only spaces and tabs as blank; other Unicode
+            # spaces are content.
+            if not line.strip(" \t"):
+                lines.append("")
+                self.index += 1
+                continue
+            current = len(line) - len(line.lstrip(" "))
+            if content_indent is None:
+                if current <= indent:
+                    break
+                content_indent = current
+            if current < content_indent:
+                break
+            lines.append(line[content_indent:])
+            self.index += 1
+        while lines and not lines[-1]:
+            lines.pop()
+        return (" " if folded else "\n").join(lines)
+
+
+def parse_workflow(text: str) -> dict:
+    """Read a workflow written in the policy's YAML subset, or raise."""
+    return _WorkflowReader(text).document()
+
+
+def _values_for_key(node, name: str):
+    """Every value stored under `name` (any case), anywhere in a document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key.casefold() == name:
+                yield value
+            yield from _values_for_key(value, name)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _values_for_key(item, name)
+
+
+def workflow_action_references(document: dict) -> list[str]:
+    """Every `uses:` value in a parsed workflow (steps and reusable jobs)."""
+    return [
+        value if isinstance(value, str) else repr(value)
+        for value in _values_for_key(document, "uses")
+    ]
+
+
+def policy_check_impersonation_violations(workflow: str, document: dict) -> list[str]:
+    """Only the protected policy workflow may report `trusted-supply-chain-policy`.
+
+    A ruleset requires a check by name, and a check run is named by its job's
+    key or its `name:`. A candidate's `pull_request` workflows run its own
+    definitions, so a job keyed or named like the trusted one would put a
+    second, candidate-defined result under the required name. Read from the
+    parsed workflow: no job key and no job `name:` may equal the context (in
+    any case, ignoring surrounding whitespace), and no job `name:` may be
+    computed with `${{ }}`. A matrix suffix or a reusable workflow's
+    `caller / callee` form can never equal it.
+
+    `workflow` is the path relative to the repository root.
+    """
+    if workflow == SUPPLY_CHAIN_POLICY_PATH:
+        return []
+    violations: list[str] = []
+    for jobs in (value for key, value in document.items() if key.casefold() == "jobs"):
+        if jobs is None:
+            continue
+        if not isinstance(jobs, dict):
+            violations.append(f"{workflow}: `jobs` must be a mapping of jobs")
+            continue
+        for job_id, job in jobs.items():
+            label = f"{workflow}: job {job_id!r}"
+            if job_id.casefold() == SUPPLY_CHAIN_POLICY_JOB:
+                violations.append(
+                    f"{label}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
+                    f"{SUPPLY_CHAIN_POLICY_JOB!r} check"
+                )
+            if not isinstance(job, dict):
+                violations.append(f"{label}: a job must be a mapping")
+                continue
+            for key, name in job.items():
+                if key.casefold() != "name" or name is None:
+                    continue
+                if not isinstance(name, str):
+                    violations.append(f"{label}: a job display name must be one string")
+                elif "${{" in name:
+                    violations.append(
+                        f"{label}: a job display name must be a literal, so no "
+                        f"workflow can compute the {SUPPLY_CHAIN_POLICY_JOB!r} "
+                        f"check name; found {name!r}"
+                    )
+                elif name.strip().casefold() == SUPPLY_CHAIN_POLICY_JOB:
+                    violations.append(
+                        f"{label}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
+                        f"{SUPPLY_CHAIN_POLICY_JOB!r} check"
+                    )
+    return violations
+
+
+# Workflows that may grant a token the right to create check runs or commit
+# statuses. Empty: with either, a job could report any context name it
+# computes at run time, which no static rule can see.
+STATUS_WRITE_ALLOWED: frozenset[str] = frozenset()
+
+
+def status_write_permission_violations(workflow: str, document: dict) -> list[str]:
+    """No workflow may let its token create check runs or commit statuses.
+
+    Read from the parsed workflow, at every `permissions:` (workflow and job
+    level): a string must be `read-all`, and a mapping may give `checks` and
+    `statuses` (any case) only `read` or `none`. `write-all` grants both.
+    Workflows in `STATUS_WRITE_ALLOWED` (none) are exempt.
+    """
+    if workflow in STATUS_WRITE_ALLOWED:
+        return []
+    violations: list[str] = []
+    for permissions in _values_for_key(document, "permissions"):
+        if permissions is None:
+            continue
+        if isinstance(permissions, str):
+            if permissions.strip().casefold() != "read-all":
+                violations.append(
+                    f"{workflow}: permissions: {permissions!r} may grant checks or "
+                    "statuses write; use read-all or a mapping"
+                )
+            continue
+        if not isinstance(permissions, dict):
+            violations.append(f"{workflow}: permissions must be read-all or a mapping")
+            continue
+        for scope, level in permissions.items():
+            if scope.casefold() not in ("checks", "statuses"):
+                continue
+            if not (isinstance(level, str) and level.strip().casefold() in ("read", "none")):
+                violations.append(
+                    f"{workflow}: {scope.casefold()} may only be read; a token that "
+                    "writes check runs or commit statuses can report a required "
+                    f"check under any name; found {scope}: {level!r}"
+                )
     return violations
 
 
@@ -1739,9 +2441,40 @@ def main(argv: list[str] | None = None) -> int:
         help="write the exact reviewed build inputs after policy validation",
     )
     args = parser.parse_args(argv)
+    # Before any read: a link out of the tree, or a special file, would make
+    # every later rule judge something other than what the tree carries. The
+    # root is judged as given, so a root that is itself a link is refused.
+    tree_violations = candidate_tree_violations(Path(os.path.abspath(args.root)))
+    if tree_violations:
+        print("Supply-chain policy violations:", file=sys.stderr)
+        for violation in tree_violations:
+            print(f"  - {violation}", file=sys.stderr)
+        return 1
     root = args.root.resolve()
     workflows = root / ".github" / "workflows"
     checked_action_files = action_files(root)
+    # Every workflow must be in the YAML subset the structural rules read,
+    # before any rule runs (GHSA-x5m2-4555-q4cr).
+    workflow_documents: dict[str, dict] = {}
+    syntax_violations: list[str] = []
+    for workflow in checked_action_files:
+        if workflow.parent != workflows:
+            continue
+        relative = workflow.relative_to(root).as_posix()
+        try:
+            workflow_documents[relative] = parse_workflow(
+                workflow.read_text(encoding="utf-8")
+            )
+        except WorkflowSyntaxError as error:
+            syntax_violations.append(
+                f"{relative}: workflow is outside the YAML subset the policy reads "
+                f"(see check_supply_chain.py, Strict workflow reader): {error}"
+            )
+    if syntax_violations:
+        print("Supply-chain policy violations:", file=sys.stderr)
+        for violation in syntax_violations:
+            print(f"  - {violation}", file=sys.stderr)
+        return 1
     violations: list[str] = []
     candidate_checker = root / ".github" / "scripts" / "check_supply_chain.py"
     if candidate_checker.is_symlink() or not candidate_checker.is_file():
@@ -1751,7 +2484,12 @@ def main(argv: list[str] | None = None) -> int:
     action_pins: dict[str, list[str]] = {}
     for workflow in checked_action_files:
         text = workflow.read_text(encoding="utf-8")
-        references = [reference.strip("'\"") for reference in USES.findall(text)]
+        document = workflow_documents.get(workflow.relative_to(root).as_posix())
+        references = (
+            [reference.strip("'\"") for reference in USES.findall(text)]
+            if document is None
+            else workflow_action_references(document)
+        )
         action_pins[str(workflow.relative_to(root))] = references
         for reference in references:
             if reference.startswith("./"):
@@ -1779,6 +2517,17 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(
             viewer_jwt_scope_violations(workflow.relative_to(root).as_posix(), text)
         )
+        if document is not None:
+            violations.extend(
+                policy_check_impersonation_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
+                status_write_permission_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
                 f"{workflow.relative_to(root)}: download must go through install-ferrum-edge.sh"
@@ -2077,6 +2826,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     security_workflow = (workflows / "security.yml").read_text(encoding="utf-8")
     violations.extend(trusted_supply_chain_policy_violations(security_workflow))
+    violations.extend(supply_chain_policy_workflow_violations(root))
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     violations.extend(cargo_audit_install_violations(security_workflow))
     violations.extend(security_push_trigger_violations(security_workflow))

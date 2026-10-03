@@ -38,6 +38,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from audit_settings import (  # noqa: E402  (the path bootstrap above must run first)
     ALLOWED_ACTION_PATTERNS,
+    GITHUB_ACTIONS_APP_ID,
     RELEASE_TAG_PATTERN,
     REQUIRED_STATUS_CHECKS,
     SETTINGS_AUDIT_ENVIRONMENT,
@@ -470,8 +471,11 @@ def main_ruleset_body(bypass_actors: list[dict]) -> dict:
                 "type": "required_status_checks",
                 "parameters": {
                     "strict_required_status_checks_policy": True,
+                    # Bound to the GitHub Actions app: a status or check run
+                    # with the same name from any other source does not count.
                     "required_status_checks": [
-                        {"context": context} for context in REQUIRED_STATUS_CHECKS
+                        {"context": context, "integration_id": GITHUB_ACTIONS_APP_ID}
+                        for context in REQUIRED_STATUS_CHECKS
                     ],
                 },
             },
@@ -523,6 +527,13 @@ def normalize_actors(actors) -> list[list]:
     )
 
 
+def status_check_label(check: dict) -> str:
+    """A required check as `context` plus its bound source, for plan output."""
+    context = check.get("context")
+    source = check.get("integration_id")
+    return f"{context} (app {source})" if source else f"{context} (any source)"
+
+
 def ruleset_differences(current, desired: dict) -> list[str]:
     if not isinstance(current, dict):
         current = {}
@@ -561,11 +572,11 @@ def ruleset_differences(current, desired: dict) -> list[str]:
             have = have_parameters.get(key, "<absent>")
             if key == "required_status_checks":
                 have_contexts = sorted(
-                    check.get("context")
+                    status_check_label(check)
                     for check in (have if isinstance(have, list) else [])
                     if isinstance(check, dict)
                 )
-                want_contexts = sorted(check["context"] for check in want)
+                want_contexts = sorted(status_check_label(check) for check in want)
                 if have_contexts != want_contexts:
                     lines.append(
                         f"rules.{rule_type}.{key}: "

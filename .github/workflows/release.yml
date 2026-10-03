@@ -97,18 +97,24 @@ jobs:
             exit 1
           }
 
+          # `accepted` lists checks that are being added to the ruleset: absent
+          # is tolerated while the ruleset does not require them yet, but a
+          # reported one must pass (GHSA-x5m2-4555-q4cr, expand step).
           jq -e --argjson required '[
             "Rust CI / rust-ci-check",
             "Security / security-cargo-audit",
             "Security / security-supply-chain-policy",
             "GitForgeOps State Guard / state-guard-reject-state-edits",
             "GitForgeOps PR Static Validation / gitforgeops-required-static-validation"
+          ]' --argjson accepted '[
+            "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"
           ]' '
             map({
               context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
               bucket
             }) as $checks
             | ($required | all(. as $wanted | any($checks[]; .context == $wanted and .bucket == "pass")))
+            and ($accepted | all(. as $wanted | all($checks[] | select(.context == $wanted); .bucket == "pass")))
           ' "$checks_file" >/dev/null || {
             echo "::error::The merged PR is missing one or more successful launch-required checks."
             cat "$checks_file"
