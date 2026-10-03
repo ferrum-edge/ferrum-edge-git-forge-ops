@@ -154,6 +154,15 @@ pub struct EnvConfig {
     /// transport rule as the gateway URL ([`validate_verify_transport`]),
     /// because a check's headers can carry credential-bundle values.
     pub verify_base_url: Option<String>,
+    /// The operator-held allowlist of verification probe Consumers
+    /// (`FERRUM_VERIFY_PROBE_CONSUMERS`), raw; parsed by
+    /// [`crate::verify::ProbeConsumerAllowlist::parse`].
+    ///
+    /// A GitHub Environment *variable*, not repository content: a merge cannot
+    /// change it, so it, not a label under `resources/`, decides which
+    /// Consumer's credential a traffic check may send. `verify` refuses every
+    /// check that sends a slot while it is unset.
+    pub verify_probe_consumers: Option<String>,
     /// Permit a cleartext `http://` gateway URL (default `false`).
     ///
     /// The admin JWT and every resolved consumer credential travel in the
@@ -232,6 +241,7 @@ impl fmt::Debug for EnvConfig {
             .field("edge_binary_path", &self.edge_binary_path)
             .field("tls_no_verify", &self.tls_no_verify)
             .field("verify_base_url", &self.verify_base_url)
+            .field("verify_probe_consumers", &self.verify_probe_consumers)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .field("ca_cert", &self.ca_cert)
             .field("client_cert", &self.client_cert)
@@ -298,6 +308,7 @@ impl Default for EnvConfig {
             edge_binary_path: "ferrum-edge".to_string(),
             tls_no_verify: false,
             verify_base_url: None,
+            verify_probe_consumers: None,
             allow_insecure_http: false,
             ca_cert: None,
             client_cert: None,
@@ -346,6 +357,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
 /// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run declared checks) |
+/// | `FERRUM_VERIFY_PROBE_CONSUMERS` | `verify_probe_consumers` | unset (`verify` refuses every check that sends a slot) |
 /// | `FERRUM_ALLOW_INSECURE_HTTP` | `allow_insecure_http` | `false` (an `http://` gateway URL is refused) |
 /// | `FERRUM_GATEWAY_CA_CERT`     | `ca_cert`          | `None`                           |
 /// | `FERRUM_GATEWAY_CLIENT_CERT` | `client_cert`      | `None`                           |
@@ -416,6 +428,9 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
         // short") instead of the clear "not configured" ones.
         gateway_url,
         verify_base_url,
+        // A GitHub Environment variable: unset interpolates to "", which
+        // reads as "no probe Consumer allowlisted".
+        verify_probe_consumers: non_empty_env("FERRUM_VERIFY_PROBE_CONSUMERS"),
         // The signing key and the opaque `iss` / `aud` strings keep their
         // exact bytes: the gateway verifies against the raw value, so a trim
         // here would mint tokens it rejects.

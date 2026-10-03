@@ -19,12 +19,14 @@ use gitforgeops::config::repo_config::RepoConfig;
 use gitforgeops::config::GatewayConfig;
 use gitforgeops::verify::runner::{deadline_budget, run_check, run_within};
 use gitforgeops::verify::{
-    authorize_probe_credentials, is_idempotent_method, probe_credential_slots, resolve_headers,
-    EnvironmentChecks, HeaderValue, Outcome, ProbeCredentials, SmokeCheck, SmokeConfig,
-    VerifyReport, VerifyStatus, MAX_CHECKS_PER_ENVIRONMENT, MAX_CHECK_ATTEMPTS,
+    authorize_probe_credentials, authorize_probe_slots, bind_probe_slots, is_idempotent_method,
+    labelled_probe_consumers, probe_credential_slots, refuse_unbound_slots, resolve_headers,
+    BindingStatus, EnvironmentChecks, HeaderValue, Outcome, ProbeConsumerAllowlist,
+    ProbeCredentials, SmokeCheck, SmokeConfig, VerifyReport, VerifyStatus,
+    LEGACY_SMOKE_CONFIG_VERSION, MAX_CHECKS_PER_ENVIRONMENT, MAX_CHECK_ATTEMPTS,
     MAX_CHECK_RETRY_BACKOFF_MS, MAX_CHECK_TIMEOUT_SECS, MAX_ENVIRONMENT_VERIFY_BUDGET_SECS,
-    SMOKE_CONFIG_VERSION, VERIFY_DEADLINE_GRACE_SECS, VERIFY_FAILED_EXIT_CODE, VERIFY_PROBE_LABEL,
-    VERIFY_SKIPPED_EXIT_CODE,
+    SMOKE_CONFIG_VERSION, VERIFY_DEADLINE_GRACE_SECS, VERIFY_FAILED_EXIT_CODE,
+    VERIFY_PROBE_CONSUMERS_ENV, VERIFY_PROBE_LABEL, VERIFY_SKIPPED_EXIT_CODE,
 };
 use tempfile::NamedTempFile;
 
@@ -167,7 +169,7 @@ fn smoke_checks_are_data_with_no_execution_surface() {
     // key must not be silently accepted.
     for key in ["command", "run", "script", "exec"] {
         let error = load_smoke(&format!(
-            "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
+            "version: 2\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
              \n        path: /x\n        expect_status: 200\n        {key}: 'rm -rf /'\n"
         ))
         .expect_err("must refuse");
@@ -178,7 +180,7 @@ fn smoke_checks_are_data_with_no_execution_surface() {
 #[test]
 fn a_check_declares_the_status_it_expects() {
     let config = load_smoke(
-        "version: 1\nenvironments:\n  staging:\n    checks:\n\
+        "version: 2\nenvironments:\n  staging:\n    checks:\n\
          \n      - name: authenticated\n        path: /orders\n        expect_status: 200\n\
          \n        headers:\n          X-API-Key:\n            slot: ferrum/c/keyauth/key\n\
          \n      - name: unauthenticated is rejected\n        path: /orders\n        expect_status: 401\n",
@@ -215,7 +217,7 @@ fn malformed_checks_are_refused_at_load_not_at_promotion_time() {
         ),
     ] {
         let error = load_smoke(&format!(
-            "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: x\n{fragment}"
+            "version: 2\nenvironments:\n  staging:\n    checks:\n      - name: x\n{fragment}"
         ))
         .expect_err("must refuse");
         assert!(error.contains(expected), "{expected}: {error}");
@@ -224,19 +226,58 @@ fn malformed_checks_are_refused_at_load_not_at_promotion_time() {
 
 #[test]
 fn an_unsupported_smoke_version_is_refused() {
-    let error = load_smoke("version: 2\nenvironments: {}\n").expect_err("must refuse");
+    let error = load_smoke("version: 3\nenvironments: {}\n").expect_err("must refuse");
     assert!(
         error.contains("unsupported smoke-check config version"),
         "{error}"
     );
-    assert_eq!(SMOKE_CONFIG_VERSION, 1);
+    assert_eq!(SMOKE_CONFIG_VERSION, 2);
+    assert_eq!(LEGACY_SMOKE_CONFIG_VERSION, 1);
+}
+
+/// A check sending `ferrum/orders-client/keyauth/key`, at `version`.
+fn slot_file(version: Option<u32>) -> String {
+    let version = version
+        .map(|version| format!("version: {version}\n"))
+        .unwrap_or_default();
+    format!(
+        "{version}environments:\n  staging:\n    checks:\n      - name: x\n\
+         \n        path: /x\n        expect_status: 200\n        headers:\n\
+         \n          X-API-Key:\n            slot: ferrum/orders-client/keyauth/key\n"
+    )
+}
+
+#[test]
+fn a_version_1_file_that_names_a_slot_is_refused_for_review_again() {
+    // Under version 1 a slot could name any credential in the bundle, so the
+    // checks written then may name customer keys. They are refused rather
+    // than reinterpreted under the probe binding, and leaving `version` out
+    // does not slip past.
+    for version in [Some(LEGACY_SMOKE_CONFIG_VERSION), None] {
+        let error = load_smoke(&slot_file(version)).expect_err("must refuse");
+        for expected in [
+            "names a credential slot",
+            "Review every slot again",
+            "version: 2",
+            VERIFY_PROBE_CONSUMERS_ENV,
+        ] {
+            assert!(error.contains(expected), "{version:?} {expected}: {error}");
+        }
+    }
+    load_smoke(&slot_file(Some(SMOKE_CONFIG_VERSION))).expect("version 2 loads");
+    // A version 1 file that sends no credential carries no such risk.
+    load_smoke(
+        "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
+         \n        path: /x\n        expect_status: 401\n",
+    )
+    .expect("a slot-free version 1 file loads");
 }
 
 // -- budgets (GHSA-p95x-q89j-hrhv) -------------------------------------------
 
 fn one_check(fragment: &str) -> String {
     format!(
-        "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
+        "version: 2\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
          \n        path: /x\n        expect_status: 200\n{fragment}"
     )
 }
@@ -313,7 +354,7 @@ fn the_worst_case_budget_counts_every_timeout_and_every_backoff() {
 }
 
 fn many_checks(count: usize, fields: &str) -> String {
-    let mut yaml = String::from("version: 1\nenvironments:\n  staging:\n    checks:\n");
+    let mut yaml = String::from("version: 2\nenvironments:\n  staging:\n    checks:\n");
     for index in 0..count {
         yaml.push_str(&format!(
             "      - name: check-{index}\n        path: /x\n        expect_status: 200\n{fields}"
@@ -430,6 +471,44 @@ fn both_verify_steps_carry_a_step_timeout_that_covers_the_budget() {
     }
 }
 
+/// The bodies of every step named `name` in `workflow`, at step indentation.
+fn workflow_steps<'a>(workflow: &'a str, name: &str) -> Vec<&'a str> {
+    let marker = format!("      - name: {name}\n");
+    workflow
+        .match_indices(marker.as_str())
+        .map(|(start, _)| {
+            let body = &workflow[start + marker.len()..];
+            &body[..body.find("\n      - name: ").unwrap_or(body.len())]
+        })
+        .collect()
+}
+
+#[test]
+fn the_operator_allowlist_reaches_verify_and_the_steps_before_a_change() {
+    // GHSA-8mhw-ghx8-9m63: the allowlist must come from a GitHub Environment
+    // variable, which no merge can change. `verify` enforces it; `validate`
+    // before Apply and the trusted review refuse an unlisted Consumer before
+    // the gateway changes.
+    let binding = "FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}";
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let apply = std::fs::read_to_string(root.join("apply-on-merge.yml")).expect("read apply");
+    for name in ["Verify traffic", "Validate"] {
+        let steps = workflow_steps(&apply, name);
+        assert_eq!(steps.len(), 2, "the apply and promote jobs each run {name}");
+        for step in steps {
+            assert!(step.contains(binding), "{name}: {step}");
+        }
+    }
+    assert!(
+        !apply.contains("secrets.FERRUM_VERIFY_PROBE_CONSUMERS"),
+        "the allowlist is a variable, not a secret"
+    );
+    let review = std::fs::read_to_string(root.join("trusted-pr-review.yml")).expect("read review");
+    let steps = workflow_steps(&review, "Post trusted live review");
+    assert_eq!(steps.len(), 1);
+    assert!(steps[0].contains(binding), "{}", steps[0]);
+}
+
 #[tokio::test]
 async fn the_outer_deadline_times_out_a_hung_check_and_sends_nothing_after_it() {
     // The endpoint holds the first request for 2.5s; the run's deadline is
@@ -437,7 +516,7 @@ async fn the_outer_deadline_times_out_a_hung_check_and_sends_nothing_after_it() 
     // the second is never sent.
     let (base_url, committed) = spawn_committing_endpoint(200);
     let config = load_smoke(
-        "version: 1\nenvironments:\n  staging:\n    checks:\n\
+        "version: 2\nenvironments:\n  staging:\n    checks:\n\
          \n      - name: first\n        path: /a\n        expect_status: 200\n\
          \n        attempts: 1\n        timeout_secs: 5\n\
          \n      - name: second\n        path: /b\n        expect_status: 200\n\
@@ -563,21 +642,49 @@ fn only_brokered_secrets_of_labelled_consumers_are_probe_slots() {
     assert_eq!(slots, expected);
 }
 
+/// The operator's allowlist: the probe, and nothing else.
+fn allowlist() -> ProbeConsumerAllowlist {
+    ProbeConsumerAllowlist::parse("ferrum/orders-probe").expect("allowlist")
+}
+
+/// `desired()` after a pull request labelled the customer as a probe.
+fn desired_with_labelled_customer() -> GatewayConfig {
+    let mut desired = desired();
+    let customer = desired
+        .consumers
+        .iter_mut()
+        .find(|consumer| consumer.id == "orders-client")
+        .expect("customer");
+    customer
+        .labels
+        .insert(VERIFY_PROBE_LABEL.to_string(), "true".to_string());
+    desired
+}
+
+/// No synthetic bundle value may appear in `text`.
+fn assert_no_value(text: &str, context: &str) {
+    for value in [PROBE_VALUE, CUSTOMER_VALUE, PLUGIN_VALUE] {
+        assert!(
+            !text.contains(value),
+            "{context}: a bundle value was printed"
+        );
+    }
+}
+
 #[test]
 fn a_probe_slot_is_projected_and_nothing_else_is() {
     let credentials = authorize_probe_credentials(
         "staging",
         &checks_sending("GET", PROBE_SLOT),
         &desired(),
+        Some(&allowlist()),
         &bundle(),
     )
-    .expect("a labelled probe credential is authorized");
+    .expect("an allowlisted, labelled probe credential is authorized");
     assert_eq!(credentials.slots().collect::<Vec<_>>(), vec![PROBE_SLOT]);
     // The runner resolves against the projection only.
     let debug = format!("{credentials:?}");
-    for value in [PROBE_VALUE, CUSTOMER_VALUE] {
-        assert!(!debug.contains(value), "Debug must never print a value");
-    }
+    assert_no_value(&debug, "ProbeCredentials Debug");
 }
 
 #[test]
@@ -603,6 +710,7 @@ fn a_check_cannot_spend_an_unrelated_credential_from_the_bundle() {
             "staging",
             &checks_sending(method, slot),
             &desired(),
+            Some(&allowlist()),
             &bundle(),
         )
         .expect_err("must refuse")
@@ -610,27 +718,87 @@ fn a_check_cannot_spend_an_unrelated_credential_from_the_bundle() {
         for expected in [slot, "no request was sent", VERIFY_PROBE_LABEL] {
             assert!(error.contains(expected), "{method} {slot}: {error}");
         }
-        for value in [PROBE_VALUE, CUSTOMER_VALUE, PLUGIN_VALUE] {
-            assert!(
-                !error.contains(value),
-                "a refusal must never carry a bundle value ({method} {slot})"
-            );
+        assert_no_value(&error, &format!("{method} {slot}"));
+    }
+}
+
+#[test]
+fn the_label_alone_authorizes_nothing_without_the_operator_allowlist() {
+    // The label lives in resources/, which the pull request naming the slot
+    // can change. Without the operator's list, a labelled probe is refused
+    // before the bundle is read.
+    let empty = ProbeConsumerAllowlist::parse(" , ").expect("parses");
+    for allowlist in [None, Some(&empty)] {
+        let error = authorize_probe_slots(
+            "staging",
+            &checks_sending("GET", PROBE_SLOT),
+            &desired(),
+            allowlist,
+        )
+        .expect_err("must refuse")
+        .to_string();
+        for expected in [
+            VERIFY_PROBE_CONSUMERS_ENV,
+            "unset or empty",
+            "no request was sent",
+        ] {
+            assert!(error.contains(expected), "{allowlist:?}: {error}");
         }
     }
+}
+
+#[test]
+fn a_customer_labelled_by_a_pull_request_is_refused_unless_the_operator_lists_it() {
+    // GHSA-8mhw-ghx8-9m63: one pull request labels a customer Consumer and
+    // names its key. The label is now present, so only the operator's list
+    // stands between the check and the customer's key.
+    let desired = desired_with_labelled_customer();
+    assert!(probe_credential_slots(&desired).contains(CUSTOMER_SLOT));
+    let error = authorize_probe_credentials(
+        "staging",
+        &checks_sending("GET", CUSTOMER_SLOT),
+        &desired,
+        Some(&allowlist()),
+        &bundle(),
+    )
+    .expect_err("an unlisted Consumer must be refused")
+    .to_string();
+    for expected in [
+        CUSTOMER_SLOT,
+        "ferrum/orders-client",
+        VERIFY_PROBE_CONSUMERS_ENV,
+        "no request was sent",
+    ] {
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    assert_no_value(&error, "labelled customer refusal");
+    // Listing a Consumer is not enough without the label either.
+    let both = ProbeConsumerAllowlist::parse("ferrum/orders-probe,ferrum/orders-client")
+        .expect("allowlist");
+    let error = authorize_probe_slots(
+        "staging",
+        &checks_sending("GET", CUSTOMER_SLOT),
+        &desired(),
+        Some(&both),
+    )
+    .expect_err("an unlabelled Consumer must be refused")
+    .to_string();
+    assert!(error.contains("not labelled"), "{error}");
 }
 
 #[test]
 fn an_authorized_slot_missing_from_the_bundle_still_fails_its_check() {
     let mut partial = bundle();
     partial.remove(PROBE_SLOT);
-    let credentials = authorize_probe_credentials(
+    let authorization = authorize_probe_slots(
         "staging",
         &checks_sending("GET", PROBE_SLOT),
         &desired(),
-        &partial,
+        Some(&allowlist()),
     )
     .expect("authorized");
-    assert_eq!(credentials.slots().count(), 0);
+    assert_eq!(authorization.slots().collect::<Vec<_>>(), vec![PROBE_SLOT]);
+    assert_eq!(authorization.project(&partial).slots().count(), 0);
 }
 
 #[test]
@@ -642,15 +810,141 @@ fn checks_that_send_no_credential_need_no_authorization() {
         }],
     };
     assert!(!checks.sends_credentials());
+    // No slot, so neither the label nor the operator's list is needed.
     let credentials = authorize_probe_credentials(
         "staging",
         &checks,
         &GatewayConfig::default(),
+        None,
         &bundle(),
     )
     .expect("nothing to authorize");
     assert_eq!(credentials.slots().count(), 0);
     assert!(checks_sending("GET", PROBE_SLOT).sends_credentials());
+}
+
+#[test]
+fn the_operator_allowlist_names_namespace_qualified_consumers() {
+    let list = ProbeConsumerAllowlist::parse(" ferrum/orders-probe , ,team-a/probe ,")
+        .expect("parses");
+    assert!(list.contains("ferrum", "orders-probe"));
+    assert!(list.contains("team-a", "probe"));
+    // Exact, namespace-qualified matches only.
+    assert!(!list.contains("team-a", "orders-probe"));
+    assert!(!list.contains("ferrum", "orders"));
+    assert_eq!(
+        list.consumers().collect::<Vec<_>>(),
+        vec!["ferrum/orders-probe", "team-a/probe"]
+    );
+    // A typo surfaces instead of silently allowing nothing.
+    for raw in [
+        "orders-probe",
+        "ferrum/",
+        "/orders-probe",
+        "ferrum/orders probe",
+    ] {
+        let error = ProbeConsumerAllowlist::parse(raw)
+            .expect_err("must refuse")
+            .to_string();
+        assert!(error.contains(VERIFY_PROBE_CONSUMERS_ENV), "{raw}: {error}");
+        assert!(error.contains("<namespace>/<consumer-id>"), "{raw}: {error}");
+    }
+}
+
+#[test]
+fn bindings_map_each_slot_to_the_consumer_it_would_spend() {
+    let checks = EnvironmentChecks {
+        checks: vec![SmokeCheck {
+            headers: BTreeMap::from([
+                ("A-Probe".to_string(), HeaderValue::slot(PROBE_SLOT)),
+                ("B-Customer".to_string(), HeaderValue::slot(CUSTOMER_SLOT)),
+                ("C-Plugin".to_string(), HeaderValue::slot(PLUGIN_SLOT)),
+                (
+                    "D-Elsewhere".to_string(),
+                    HeaderValue::slot("team-b/probe/keyauth/key"),
+                ),
+                ("E-Tenant".to_string(), HeaderValue::literal("acme")),
+            ]),
+            ..checks_sending("GET", PROBE_SLOT).checks[0].clone()
+        }],
+    };
+    let statuses = |allowlist: Option<&ProbeConsumerAllowlist>, filter: Option<&str>| {
+        bind_probe_slots(&checks, &desired(), allowlist, filter)
+            .into_iter()
+            .map(|binding| (binding.header, binding.consumer, binding.status))
+            .collect::<Vec<_>>()
+    };
+    let probe = Some("ferrum/orders-probe".to_string());
+    let customer = Some("ferrum/orders-client".to_string());
+
+    // A pull request's run cannot see the operator's list: the label half is
+    // judged, the list half is left to `verify`, and a slot in a namespace
+    // the run did not select is not judged at all.
+    let preview = statuses(None, Some("ferrum"));
+    assert_eq!(
+        preview,
+        vec![
+            (
+                "A-Probe".to_string(),
+                probe,
+                BindingStatus::AllowlistNotVisible,
+            ),
+            (
+                "B-Customer".to_string(),
+                customer,
+                BindingStatus::NotLabelled,
+            ),
+            ("C-Plugin".to_string(), None, BindingStatus::InvalidSlot),
+            (
+                "D-Elsewhere".to_string(),
+                None,
+                BindingStatus::OutsideNamespaceScope,
+            ),
+        ]
+    );
+    // With the list visible and no namespace selection, everything is judged.
+    let full = statuses(Some(&allowlist()), None);
+    assert_eq!(full[0].2, BindingStatus::Approved);
+    assert_eq!(full[3].2, BindingStatus::NotAConsumerSecret);
+    let unlisted = ProbeConsumerAllowlist::parse("ferrum/someone-else").expect("parses");
+    assert_eq!(
+        statuses(Some(&unlisted), None)[0].2,
+        BindingStatus::NotAllowlisted
+    );
+
+    // Only the refusals stop a run, and they name slot and Consumer.
+    let probe_only = bind_probe_slots(
+        &checks_sending("GET", PROBE_SLOT),
+        &desired(),
+        None,
+        Some("ferrum"),
+    );
+    refuse_unbound_slots("staging", &probe_only).expect("label half satisfied");
+    let error = refuse_unbound_slots(
+        "staging",
+        &bind_probe_slots(&checks, &desired(), None, Some("ferrum")),
+    )
+    .expect_err("customer and plugin slots refuse")
+    .to_string();
+    for expected in [CUSTOMER_SLOT, "ferrum/orders-client", PLUGIN_SLOT] {
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    assert!(!error.contains("team-b/probe"), "{error}");
+}
+
+#[test]
+fn a_review_lists_every_labelled_probe_consumer() {
+    assert_eq!(
+        labelled_probe_consumers(&desired()),
+        vec!["ferrum/orders-probe".to_string()]
+    );
+    assert_eq!(
+        labelled_probe_consumers(&desired_with_labelled_customer()),
+        vec![
+            "ferrum/orders-client".to_string(),
+            "ferrum/orders-probe".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -715,6 +1009,12 @@ fn routing_and_hop_by_hop_headers_are_refused() {
         "Content-Length",
         "Upgrade",
         "Proxy-Authorization",
+        // A GET probe must not become a DELETE at an upstream that honours
+        // a method override.
+        "X-HTTP-Method-Override",
+        "x-http-method",
+        "X_Method_Override",
+        "X-METHOD-OVERRIDE",
     ] {
         let error = load_smoke(&one_check(&format!(
             "        headers:\n          {name}:\n            literal: x\n"
@@ -740,7 +1040,7 @@ fn a_header_must_name_exactly_one_source() {
         ("            slot: '  '\n", "empty credential slot"),
     ] {
         let error = load_smoke(&format!(
-            "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
+            "version: 2\nenvironments:\n  staging:\n    checks:\n      - name: x\n\
              \n        path: /x\n        expect_status: 200\n        headers:\n\
              \n          X-Api-Key:\n{fragment}"
         ))
@@ -829,7 +1129,7 @@ fn read_request_head(stream: &mut TcpStream) -> bool {
 /// The check from #353: `attempts` omitted, so the default of three applies.
 fn enqueue_probe(extra: &str) -> SmokeCheck {
     let config = load_smoke(&format!(
-        "version: 1\nenvironments:\n  staging:\n    checks:\n      - name: enqueue probe\n\
+        "version: 2\nenvironments:\n  staging:\n    checks:\n      - name: enqueue probe\n\
          \n        path: /smoke/enqueue\n        expect_status: 201\n        timeout_secs: 1\n\
          \n        retry_backoff_ms: 0\n{extra}"
     ))
@@ -868,7 +1168,7 @@ async fn a_post_that_committed_but_answered_late_is_not_replayed() {
     ] {
         let (base_url, committed) = spawn_committing_endpoint(201);
         let check = enqueue_probe(extra);
-        let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+        let result = run_check(&base_url, &check, &ProbeCredentials::none(), None).await;
         assert_eq!(committed.load(Ordering::SeqCst), 1, "{extra}");
         assert_eq!(result.outcome, Outcome::TimedOut, "{extra}");
         assert_eq!(result.attempts, 1, "{extra}");
@@ -883,7 +1183,7 @@ async fn patch_and_unknown_methods_are_not_replayed_either() {
     for method in ["PATCH", "PURGE", "get"] {
         let (base_url, committed) = spawn_committing_endpoint(201);
         let check = enqueue_probe(&format!("        method: {method}\n"));
-        let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+        let result = run_check(&base_url, &check, &ProbeCredentials::none(), None).await;
         assert_eq!(committed.load(Ordering::SeqCst), 1, "{method}");
         assert_eq!(result.outcome, Outcome::TimedOut, "{method}");
         assert_eq!(result.attempts, 1, "{method}");
@@ -896,7 +1196,7 @@ async fn an_idempotent_check_still_retries_a_timeout_within_its_bound() {
     // retries of a GET remain the point of `attempts`.
     let (base_url, committed) = spawn_committing_endpoint(201);
     let check = enqueue_probe("        method: GET\n");
-    let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+    let result = run_check(&base_url, &check, &ProbeCredentials::none(), None).await;
     assert_eq!(committed.load(Ordering::SeqCst), 2);
     assert_eq!(result.outcome, Outcome::Passed);
     assert_eq!(result.attempts, 2);
@@ -907,7 +1207,7 @@ async fn an_idempotent_check_still_retries_a_timeout_within_its_bound() {
 async fn replay_safe_is_the_explicit_opt_in_for_a_non_idempotent_retry() {
     let (base_url, committed) = spawn_committing_endpoint(201);
     let check = enqueue_probe("        method: POST\n        replay_safe: true\n");
-    let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+    let result = run_check(&base_url, &check, &ProbeCredentials::none(), None).await;
     assert_eq!(committed.load(Ordering::SeqCst), 2);
     assert_eq!(result.outcome, Outcome::Passed);
     assert_eq!(result.attempts, 2);
@@ -921,7 +1221,7 @@ async fn a_connection_that_was_never_established_is_retried_for_any_method() {
     let base_url = format!("http://{}", closed.local_addr().expect("addr"));
     drop(closed);
     let check = enqueue_probe("        method: POST\n");
-    let result = run_check(&base_url, &check, &BTreeMap::new(), None).await;
+    let result = run_check(&base_url, &check, &ProbeCredentials::none(), None).await;
     assert_eq!(result.outcome, Outcome::Unreachable);
     assert_eq!(result.attempts, 3);
     assert!(!result.detail.contains("not retried"), "{}", result.detail);

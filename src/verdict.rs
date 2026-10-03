@@ -65,11 +65,14 @@ pub enum BlockerKind {
     /// A file-mode run whose gateway and mesh document destinations resolve
     /// to one file; the second publication would overwrite the first.
     PublicationPathCollision,
-    /// `.gitforgeops/smoke.yaml` exists but does not load: `verify` would
-    /// only discover it after `apply` changed the gateway. That covers the
-    /// closed schema, the per-check and per-environment budgets, and the
-    /// half of the probe-credential binding decidable offline (Consumer
-    /// credential slots only, sent only by `GET`/`HEAD` checks).
+    /// `.gitforgeops/smoke.yaml` exists but does not load, or names a slot
+    /// `verify` would refuse: `verify` would only discover it after `apply`
+    /// changed the gateway. That covers the closed schema, the per-check and
+    /// per-environment budgets, and the probe-credential binding on the
+    /// unresolved desired configuration: Consumer credential slots only,
+    /// sent only by `GET`/`HEAD` checks, of a Consumer labelled
+    /// `gitforgeops/verify-probe: "true"` and, when the run can see
+    /// `FERRUM_VERIFY_PROBE_CONSUMERS`, listed there.
     InvalidSmokeChecks,
 }
 
@@ -131,10 +134,12 @@ impl BlockerKind {
                  file; point the gateway and mesh documents at distinct paths"
             }
             BlockerKind::InvalidSmokeChecks => {
-                ".gitforgeops/smoke.yaml does not load; fix the reported check (closed schema, \
-                 per-check and per-environment time budgets, Consumer credential slots on \
-                 GET/HEAD checks only), or remove the file if the environment declares no \
-                 traffic checks"
+                ".gitforgeops/smoke.yaml does not load or names a credential verify would \
+                 refuse; fix the reported check (closed schema, per-check and per-environment \
+                 time budgets, Consumer credential slots on GET/HEAD checks only, of a probe \
+                 Consumer labelled gitforgeops/verify-probe and listed by the operator in \
+                 FERRUM_VERIFY_PROBE_CONSUMERS), or remove the file if the environment \
+                 declares no traffic checks"
             }
         }
     }
@@ -198,7 +203,8 @@ pub struct ApplyGateInputs<'a> {
     /// ([`crate::apply::ensure_distinct_publication_paths`] refused them).
     pub publication_paths_collide: bool,
     /// `.gitforgeops/smoke.yaml` exists and
-    /// [`crate::verify::SmokeConfig::load`] refused it.
+    /// [`crate::verify::SmokeConfig::load`] refused it, or a slot it names
+    /// failed [`crate::verify::refuse_unbound_slots`].
     pub smoke_checks_invalid: bool,
 }
 

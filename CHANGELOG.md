@@ -86,14 +86,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `.gitforgeops/smoke.yaml` must name a Consumer credential secret slot
   (`<namespace>/<consumer-id>/<credential-type>/<field>` with a built-in type;
   plugin-config, service-discovery and identity slots are refused at load) on a
-  `GET` or `HEAD` check. `verify` then assembles the environment's desired
-  configuration and honours the slot only when it is a brokered
-  `${gh-env-secret:...}` secret of a Consumer labelled
-  `gitforgeops/verify-probe: "true"`; anything else exits 1 before any request
-  is sent. The runner receives only those values, never the bundle. `Host`,
-  forwarding (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`), hop-by-hop and
-  framing headers are refused in every check. Breaking: label a dedicated,
-  low-privilege probe Consumer and point existing slot checks at it.
+  `GET` or `HEAD` check. `verify` honours the slot only when it is a brokered
+  `${gh-env-secret:...}` secret of a Consumer that a repository administrator
+  lists in the new `FERRUM_VERIFY_PROBE_CONSUMERS` GitHub Environment variable
+  (comma-separated `<namespace>/<consumer-id>`) **and** that the environment's
+  desired configuration labels `gitforgeops/verify-probe: "true"`. The variable
+  is the authorization, because no merge can change it; the label lives in
+  `resources/` and authorizes nothing alone. With the variable unset or empty,
+  every check that sends a slot is refused; a malformed entry is an error.
+  Anything else exits 1 before the bundle is read or any request is sent, and
+  the runner (including `runner::run_check`) receives only the authorized
+  values, never the bundle. `validate`, `plan` and `apply` refuse a slot whose
+  Consumer is missing, unlabelled or, when the variable is visible to the run,
+  unlisted, before anything changes; `review` reports it as
+  `invalid-smoke-checks` and lists each check's header, slot and Consumer and
+  every labelled Consumer, by name only. `apply-on-merge.yml` binds
+  `vars.FERRUM_VERIFY_PROBE_CONSUMERS` into both `Validate` and both
+  `Verify traffic` steps, and `trusted-pr-review.yml` into the live review.
+  `Host`, forwarding (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`),
+  method-override (`X-HTTP-Method-Override`, `X-HTTP-Method`,
+  `X-Method-Override`), hop-by-hop and framing headers are refused in every
+  check. Breaking: `smoke.yaml` is now `version: 2`; a `version: 1` file (or
+  one with no `version`) that names a slot is refused so every slot is
+  reviewed again. Create a dedicated, low-privilege probe Consumer, label it,
+  list it in `FERRUM_VERIFY_PROBE_CONSUMERS` for each environment, and point
+  slot checks at it.
 - Traffic-check budgets are bounded (GHSA-p95x-q89j-hrhv). `attempts` is at
   most 10, `timeout_secs` at most 60 and `retry_backoff_ms` at most 30000; an
   environment declares at most 50 checks, and their worst case together (every

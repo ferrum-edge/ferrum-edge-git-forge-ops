@@ -24,10 +24,14 @@
 //! **A check spends only a probe credential.** The environment's credential
 //! bundle holds every Consumer, plugin-config and service-discovery secret.
 //! A `slot:` header is honoured only when it names a brokered secret of a
-//! Consumer the environment's desired configuration labels
-//! [`VERIFY_PROBE_LABEL`]` = "true"`, and `verify` hands the runner a
-//! projection holding exactly those values ([`authorize_probe_credentials`]).
-//! Anything else refuses the run before a request is sent.
+//! Consumer that the operator lists in [`VERIFY_PROBE_CONSUMERS_ENV`] (a
+//! GitHub Environment variable, outside anything a merge can change) **and**
+//! the environment's desired configuration labels
+//! [`VERIFY_PROBE_LABEL`]` = "true"`. `verify` hands the runner a projection
+//! holding exactly those values ([`authorize_probe_slots`]); anything else
+//! refuses the run before the bundle is read or a request is sent. The label
+//! alone authorizes nothing: it lives in `resources/`, which the same pull
+//! request that names the slot can change.
 //!
 //! **A check spends a bounded amount of time.** Verification runs after the
 //! gateway changed and before the ownership ledger is committed, in the
@@ -46,14 +50,23 @@ use crate::config::{read_bounded_repo_file, GatewayConfig, MAX_REPO_CONFIG_FILE_
 use crate::secrets::parse_placeholder;
 use crate::secrets::plugin_config::ConfigPathComponent;
 use crate::secrets::resolver::{
-    consumer_credential_slot, credential_type_from_slot, is_identity_credential_leaf,
+    consumer_credential_slot, credential_type_from_slot, escape_slot_component,
+    is_identity_credential_leaf,
 };
 
 pub mod runner;
 
 pub const SMOKE_CONFIG_PATH: &str = ".gitforgeops/smoke.yaml";
-/// The only smoke contract this release reads.
-pub const SMOKE_CONFIG_VERSION: u32 = 1;
+/// The smoke contract this release writes and reads in full.
+///
+/// Version 2 is the contract in which a `slot:` names only an operator
+/// allowlisted, labelled probe Consumer's credential.
+pub const SMOKE_CONFIG_VERSION: u32 = 2;
+/// The earlier contract, under which a `slot:` could name any credential in
+/// the environment's bundle. A file at this version (or with no `version`)
+/// still loads when it sends no credential; one that names a slot is refused,
+/// so every slot written under the old meaning is reviewed again.
+pub const LEGACY_SMOKE_CONFIG_VERSION: u32 = 1;
 
 /// Exit code when a declared check did not pass. Distinct from 1 (the run
 /// could not be performed at all), because a promotion gate has to tell
@@ -98,10 +111,23 @@ pub const VERIFY_DEADLINE_GRACE_SECS: u64 = 30;
 /// low-privilege Consumer that exists to be probed, never on a customer.
 pub const VERIFY_PROBE_LABEL: &str = "gitforgeops/verify-probe";
 
+/// The operator-held allowlist of probe Consumers: a comma-separated list of
+/// `<namespace>/<consumer-id>` entries.
+///
+/// Bound from a GitHub Environment variable of the same name
+/// (`vars.FERRUM_VERIFY_PROBE_CONSUMERS`), which only a repository
+/// administrator can set and no merge can change. `verify` refuses every check
+/// that sends a slot while it is unset or empty, and every slot whose Consumer
+/// it does not list. [`VERIFY_PROBE_LABEL`] is required as well, but a label
+/// is repository content and authorizes nothing by itself.
+pub const VERIFY_PROBE_CONSUMERS_ENV: &str = "FERRUM_VERIFY_PROBE_CONSUMERS";
+
 /// Headers a check may not set, compared case-insensitively with `_` read as
 /// `-`. `Host` and the forwarding headers would steer a request (and a
 /// credential) to a different virtual host or misstate its origin; the
-/// hop-by-hop and framing headers belong to the client, not the check.
+/// method-override headers would turn a `GET` probe into a `DELETE` at any
+/// upstream that honours them; the hop-by-hop and framing headers belong to
+/// the client, not the check.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -117,6 +143,9 @@ const RESERVED_HEADERS: &[&str] = &[
     "forwarded",
     "via",
     "x-real-ip",
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
 ];
 
 fn is_reserved_header(name: &str) -> bool {
@@ -131,8 +160,10 @@ fn is_credential_method(method: &str) -> bool {
     matches!(method, "GET" | "HEAD")
 }
 
+/// A file that does not state its version is read as the earlier contract,
+/// so a slot written under the old meaning cannot slip past by omission.
 fn default_version() -> u32 {
-    SMOKE_CONFIG_VERSION
+    LEGACY_SMOKE_CONFIG_VERSION
 }
 
 fn default_method() -> String {
@@ -165,10 +196,11 @@ pub struct HeaderValue {
     pub literal: Option<String>,
     /// A Consumer credential slot, e.g. `ferrum/orders-probe/keyauth/key`.
     ///
-    /// Only a brokered secret of a Consumer labelled
-    /// [`VERIFY_PROBE_LABEL`]` = "true"` in the environment's desired
-    /// configuration is honoured, and only on a `GET` or `HEAD` check;
-    /// plugin-config and service-discovery slots never are. Resolved from
+    /// Only a brokered secret of a Consumer the operator lists in
+    /// [`VERIFY_PROBE_CONSUMERS_ENV`] and the environment's desired
+    /// configuration labels [`VERIFY_PROBE_LABEL`]` = "true"` is honoured, and
+    /// only on a `GET` or `HEAD` check; plugin-config and service-discovery
+    /// slots never are. Resolved from
     /// `FERRUM_CREDS_JSON_FILE` / `FERRUM_CREDS_JSON`; an unresolvable slot
     /// fails the check rather than sending an empty header, because an empty
     /// credential would make a 401-expecting check pass for entirely the
@@ -292,13 +324,36 @@ impl SmokeConfig {
                 path: path.to_path_buf(),
                 source,
             })?;
-        if config.version != SMOKE_CONFIG_VERSION {
-            return Err(crate::error::Error::Config(format!(
-                "unsupported smoke-check config version {} in {}; expected version {}",
-                config.version,
-                path.display(),
-                SMOKE_CONFIG_VERSION
-            )));
+        match config.version {
+            SMOKE_CONFIG_VERSION => {}
+            // Under version 1 a slot could name any credential in the
+            // bundle. Such a file is refused rather than reinterpreted, so a
+            // reviewer decides again what each slot may send.
+            LEGACY_SMOKE_CONFIG_VERSION => {
+                if config
+                    .environments
+                    .values()
+                    .any(EnvironmentChecks::sends_credentials)
+                {
+                    return Err(crate::error::Error::Config(format!(
+                        "{}: smoke-check config version {LEGACY_SMOKE_CONFIG_VERSION} (or no \
+                         `version`) names a credential slot. Under that contract a slot could \
+                         name any credential in the environment's bundle; version \
+                         {SMOKE_CONFIG_VERSION} sends only the credential of a dedicated probe \
+                         Consumer that the operator lists in {VERIFY_PROBE_CONSUMERS_ENV} and \
+                         the desired configuration labels `{VERIFY_PROBE_LABEL}: \"true\"`. \
+                         Review every slot again, then declare `version: {SMOKE_CONFIG_VERSION}`.",
+                        path.display()
+                    )));
+                }
+            }
+            other => {
+                return Err(crate::error::Error::Config(format!(
+                    "unsupported smoke-check config version {other} in {}; expected version \
+                     {SMOKE_CONFIG_VERSION}",
+                    path.display()
+                )));
+            }
         }
         for (environment, entry) in &config.environments {
             entry.validate(environment)?;
@@ -362,7 +417,8 @@ impl EnvironmentChecks {
 /// `<namespace>/<consumer-id>/<credential-type>/<field>…`.
 ///
 /// This is the half of the binding `load` can decide without the assembled
-/// configuration. [`authorize_probe_credentials`] decides the rest.
+/// configuration. [`bind_probe_slots`] and [`authorize_probe_slots`] decide
+/// the rest.
 fn slot_shape_refusal(slot: &str) -> Option<String> {
     if slot.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Some("contains whitespace or a control character".to_string());
@@ -463,7 +519,7 @@ impl SmokeCheck {
             if is_reserved_header(name) {
                 return refuse(format!(
                     "header {:?} is reserved: a check may not set Host, forwarding, \
-                     hop-by-hop or framing headers",
+                     method-override, hop-by-hop or framing headers",
                     crate::diagnostics::sanitize_line(name)
                 ));
             }
@@ -559,12 +615,12 @@ impl SmokeCheck {
 }
 
 /// The credential values a verification run may send: brokered secrets of
-/// verification probe Consumers that a declared check names, and nothing
-/// else.
+/// allowlisted, labelled probe Consumers that a declared check names, and
+/// nothing else.
 ///
-/// Built only by [`authorize_probe_credentials`] (or empty, by
-/// [`ProbeCredentials::none`]), so [`runner::run`] can never be handed the
-/// environment's whole bundle.
+/// Built only by [`ProbeAuthorization::project`] (or empty, by
+/// [`ProbeCredentials::none`]), so neither [`runner::run`] nor
+/// [`runner::run_check`] can ever be handed the environment's whole bundle.
 #[derive(Default)]
 pub struct ProbeCredentials {
     values: BTreeMap<String, String>,
@@ -595,20 +651,100 @@ impl std::fmt::Debug for ProbeCredentials {
     }
 }
 
-/// Every slot a traffic check may spend in `desired`: each brokered
-/// (`${gh-env-secret:…}`) secret leaf of each Consumer labelled
-/// [`VERIFY_PROBE_LABEL`]` = "true"`, in the canonical slot spelling.
+/// The operator-held list of Consumers whose credentials a traffic check may
+/// send, parsed from [`VERIFY_PROBE_CONSUMERS_ENV`].
+///
+/// Entries are `<namespace>/<consumer-id>`, separated by commas; surrounding
+/// whitespace and empty entries are ignored. Names only: the list holds no
+/// credential and may appear in a diagnostic.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeConsumerAllowlist {
+    consumers: BTreeSet<String>,
+}
+
+impl ProbeConsumerAllowlist {
+    /// Parse the variable's value. A malformed entry is refused rather than
+    /// skipped, so a typo surfaces instead of silently allowing nothing.
+    pub fn parse(raw: &str) -> crate::error::Result<Self> {
+        let mut consumers = BTreeSet::new();
+        for entry in raw.split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            let qualified = entry
+                .split_once('/')
+                .is_some_and(|(namespace, id)| !namespace.is_empty() && !id.is_empty());
+            let clean = !entry.chars().any(|c| c.is_control() || c.is_whitespace());
+            if !qualified || !clean {
+                return Err(crate::error::Error::Config(format!(
+                    "{VERIFY_PROBE_CONSUMERS_ENV}: entry {:?} is not \
+                     <namespace>/<consumer-id>; list probe Consumers as a comma-separated \
+                     list such as ferrum/orders-probe",
+                    crate::diagnostics::sanitize_line(entry)
+                )));
+            }
+            consumers.insert(entry.to_string());
+        }
+        Ok(Self { consumers })
+    }
+
+    /// Does the list name the Consumer `namespace`/`consumer_id`?
+    pub fn contains(&self, namespace: &str, consumer_id: &str) -> bool {
+        self.consumers
+            .contains(&format!("{namespace}/{consumer_id}"))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.consumers.is_empty()
+    }
+
+    /// The listed Consumers, as `<namespace>/<consumer-id>`.
+    pub fn consumers(&self) -> impl Iterator<Item = &str> {
+        self.consumers.iter().map(String::as_str)
+    }
+}
+
+/// The Consumer a brokered credential slot belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotOwner {
+    namespace: String,
+    consumer_id: String,
+    labelled: bool,
+}
+
+impl SlotOwner {
+    fn qualified(&self) -> String {
+        format!("{}/{}", self.namespace, self.consumer_id)
+    }
+
+    /// The label half, then the allowlist half when this run can see it.
+    fn binding_status(&self, allowlist: Option<&ProbeConsumerAllowlist>) -> BindingStatus {
+        if !self.labelled {
+            return BindingStatus::NotLabelled;
+        }
+        match allowlist {
+            None => BindingStatus::AllowlistNotVisible,
+            Some(list) if list.contains(&self.namespace, &self.consumer_id) => {
+                BindingStatus::Approved
+            }
+            Some(_) => BindingStatus::NotAllowlisted,
+        }
+    }
+}
+
+/// Every brokered (`${gh-env-secret:…}`) secret leaf of every Consumer in
+/// `desired`, in the canonical slot spelling, with the Consumer it belongs to.
 ///
 /// Identity leaves (`basicauth.username`, `mtls_auth.identity`), unknown
 /// credential types and literal values are never slots, and no plugin-config
 /// or service-discovery slot can be produced here.
-pub fn probe_credential_slots(desired: &GatewayConfig) -> BTreeSet<String> {
-    let mut slots = BTreeSet::new();
+fn consumer_secret_slots(desired: &GatewayConfig) -> BTreeMap<String, SlotOwner> {
+    let mut owners = BTreeMap::new();
     for consumer in &desired.consumers {
-        let opted_in = is_probe_consumer(&consumer.labels);
-        if !opted_in || consumer.id.is_empty() || consumer.namespace.is_empty() {
+        if consumer.id.is_empty() || consumer.namespace.is_empty() {
             continue;
         }
+        let mut slots = BTreeSet::new();
         for (credential_type, value) in &consumer.credentials {
             if !is_known_credential_type(credential_type) {
                 continue;
@@ -623,8 +759,40 @@ pub fn probe_credential_slots(desired: &GatewayConfig) -> BTreeSet<String> {
                 &mut slots,
             );
         }
+        let owner = SlotOwner {
+            namespace: consumer.namespace.clone(),
+            consumer_id: consumer.id.clone(),
+            labelled: is_probe_consumer(&consumer.labels),
+        };
+        for slot in slots {
+            owners.insert(slot, owner.clone());
+        }
     }
-    slots
+    owners
+}
+
+/// Every slot of a Consumer labelled [`VERIFY_PROBE_LABEL`]` = "true"` in
+/// `desired`: the label half of the binding. A slot must also belong to a
+/// Consumer in the operator's [`ProbeConsumerAllowlist`] before `verify`
+/// sends it.
+pub fn probe_credential_slots(desired: &GatewayConfig) -> BTreeSet<String> {
+    consumer_secret_slots(desired)
+        .into_iter()
+        .filter(|(_, owner)| owner.labelled)
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
+/// The Consumers `desired` labels [`VERIFY_PROBE_LABEL`]` = "true"`, as
+/// `<namespace>/<consumer-id>`, so a review shows every label a change adds.
+pub fn labelled_probe_consumers(desired: &GatewayConfig) -> Vec<String> {
+    let labelled: BTreeSet<String> = desired
+        .consumers
+        .iter()
+        .filter(|consumer| is_probe_consumer(&consumer.labels))
+        .map(|consumer| format!("{}/{}", consumer.namespace, consumer.id))
+        .collect();
+    labelled.into_iter().collect()
 }
 
 /// Exactly `"true"`: a label that merely looks like consent is not consent.
@@ -687,71 +855,256 @@ fn collect_brokered_secret_slots(
     }
 }
 
-/// Bind every credential `checks` would send to a verification probe
-/// Consumer of `desired`, and project `bundle` down to those values.
-///
-/// Fails closed, before any request, when a check names a slot that is not a
-/// brokered secret of a Consumer labelled [`VERIFY_PROBE_LABEL`]` = "true"`
-/// in the environment's desired configuration, or sends one with a method
-/// other than `GET` or `HEAD`. The refusal names checks, headers and slots;
-/// a bundle value never appears in it. An authorized slot the bundle lacks is
-/// left out of the projection, so its check fails as unresolvable.
-pub fn authorize_probe_credentials(
-    environment: &str,
-    checks: &EnvironmentChecks,
-    desired: &GatewayConfig,
-    bundle: &BTreeMap<String, String>,
-) -> crate::error::Result<ProbeCredentials> {
-    let allowed = probe_credential_slots(desired);
-    let mut refusals = Vec::new();
-    let mut values = BTreeMap::new();
-    for check in &checks.checks {
-        for (name, value) in &check.headers {
-            let Some(slot) = &value.slot else {
-                continue;
-            };
-            let refusal = if let Some(reason) = slot_shape_refusal(slot) {
-                Some(reason)
-            } else if !is_credential_method(&check.method) {
-                Some("is sent by a check whose method is not GET or HEAD".to_string())
-            } else if !allowed.contains(slot) {
-                Some(format!(
-                    "is not a brokered secret of a Consumer labelled \
-                     `{VERIFY_PROBE_LABEL}: \"true\"` in this environment's desired \
-                     configuration"
-                ))
-            } else {
-                None
-            };
-            match refusal {
-                Some(reason) => refusals.push(format!(
-                    "check {:?}, header {:?}: slot {:?} {reason}",
-                    crate::diagnostics::sanitize_line(&check.name),
-                    crate::diagnostics::sanitize_line(name),
-                    crate::diagnostics::sanitize_line(slot)
-                )),
-                None => {
-                    if let Some(secret) = bundle.get(slot) {
-                        values.insert(slot.clone(), secret.clone());
-                    }
-                }
+/// How one `slot:` header binds to the environment's Consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingStatus {
+    /// A brokered secret of a labelled Consumer the operator allowlists, sent
+    /// by a `GET` or `HEAD` check: `verify` may send it.
+    Approved,
+    /// Labelled, but the operator allowlist is not visible to this run, so
+    /// `verify` decides the allowlist half. Not a refusal here.
+    AllowlistNotVisible,
+    /// The slot is in a namespace this run did not select, so its Consumer
+    /// is not in this run's desired configuration. Not judged here.
+    OutsideNamespaceScope,
+    /// Not the shape of a Consumer credential secret slot.
+    InvalidSlot,
+    /// Sent by a check whose method is not `GET` or `HEAD`.
+    NotReadOnlyMethod,
+    /// Not a brokered secret of any Consumer in the desired configuration.
+    NotAConsumerSecret,
+    /// The Consumer does not carry [`VERIFY_PROBE_LABEL`]` = "true"`.
+    NotLabelled,
+    /// The Consumer is not in the operator's [`VERIFY_PROBE_CONSUMERS_ENV`].
+    NotAllowlisted,
+}
+
+impl BindingStatus {
+    /// Does this binding stop the run?
+    pub fn is_refusal(self) -> bool {
+        !matches!(
+            self,
+            BindingStatus::Approved
+                | BindingStatus::AllowlistNotVisible
+                | BindingStatus::OutsideNamespaceScope
+        )
+    }
+
+    /// Fixed wording: nothing from the repository or the environment.
+    pub fn describe(self) -> &'static str {
+        match self {
+            BindingStatus::Approved => "approved probe credential",
+            BindingStatus::AllowlistNotVisible => {
+                "labelled probe Consumer; the operator allowlist is not visible to this run"
+            }
+            BindingStatus::OutsideNamespaceScope => {
+                "in a namespace this run did not select; not judged here"
+            }
+            BindingStatus::InvalidSlot => "is not a Consumer credential secret slot",
+            BindingStatus::NotReadOnlyMethod => {
+                "is sent by a check whose method is not GET or HEAD"
+            }
+            BindingStatus::NotAConsumerSecret => {
+                "is not a brokered secret of a Consumer in this environment's desired \
+                 configuration"
+            }
+            BindingStatus::NotLabelled => {
+                "belongs to a Consumer not labelled `gitforgeops/verify-probe: \"true\"`"
+            }
+            BindingStatus::NotAllowlisted => {
+                "belongs to a Consumer the operator does not list in \
+                 FERRUM_VERIFY_PROBE_CONSUMERS"
             }
         }
     }
+}
+
+/// One `slot:` header of a declared check, the Consumer it would spend, and
+/// whether it may. Names only, never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotBinding {
+    pub check: String,
+    pub header: String,
+    pub slot: String,
+    /// `<namespace>/<consumer-id>` of the Consumer whose brokered secret the
+    /// slot names, when the desired configuration declares one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<String>,
+    pub status: BindingStatus,
+}
+
+/// Bind every `slot:` header in `checks` to the Consumer of `desired` it
+/// would spend.
+///
+/// `allowlist` is the operator's [`ProbeConsumerAllowlist`] when this run can
+/// see it, and `None` when it cannot (a pull request's `validate` or `plan`),
+/// in which case a labelled Consumer reads as
+/// [`BindingStatus::AllowlistNotVisible`]. `verify` always passes it.
+/// `namespace_filter` is the run's namespace selection: a slot outside it is
+/// [`BindingStatus::OutsideNamespaceScope`] rather than a false refusal.
+pub fn bind_probe_slots(
+    checks: &EnvironmentChecks,
+    desired: &GatewayConfig,
+    allowlist: Option<&ProbeConsumerAllowlist>,
+    namespace_filter: Option<&str>,
+) -> Vec<SlotBinding> {
+    let owners = consumer_secret_slots(desired);
+    let selected_namespace = namespace_filter.map(escape_slot_component);
+    let mut bindings = Vec::new();
+    for check in &checks.checks {
+        for (header, value) in &check.headers {
+            let Some(slot) = &value.slot else {
+                continue;
+            };
+            let owner = owners.get(slot);
+            // The first slot component is the escaped namespace.
+            let in_scope = match &selected_namespace {
+                Some(selected) => slot.split('/').next() == Some(selected.as_str()),
+                None => true,
+            };
+            let status = if slot_shape_refusal(slot).is_some() {
+                BindingStatus::InvalidSlot
+            } else if !is_credential_method(&check.method) {
+                BindingStatus::NotReadOnlyMethod
+            } else if let Some(owner) = owner {
+                owner.binding_status(allowlist)
+            } else if in_scope {
+                BindingStatus::NotAConsumerSecret
+            } else {
+                BindingStatus::OutsideNamespaceScope
+            };
+            bindings.push(SlotBinding {
+                check: check.name.clone(),
+                header: header.clone(),
+                slot: slot.clone(),
+                consumer: owner.map(SlotOwner::qualified),
+                status,
+            });
+        }
+    }
+    bindings
+}
+
+/// Refuse when any binding is a refusal. The error names checks, headers,
+/// slots and Consumers; it never carries a credential value.
+pub fn refuse_unbound_slots(
+    environment: &str,
+    bindings: &[SlotBinding],
+) -> crate::error::Result<()> {
+    let mut refusals: Vec<String> = bindings
+        .iter()
+        .filter(|binding| binding.status.is_refusal())
+        .map(refusal_line)
+        .collect();
     if refusals.is_empty() {
-        return Ok(ProbeCredentials { values });
+        return Ok(());
     }
     refusals.sort();
     refusals.dedup();
     Err(crate::error::Error::Config(format!(
         "{SMOKE_CONFIG_PATH}: environment '{}': a traffic check may send only a credential \
          of a dedicated verification probe Consumer; no request was sent.\n  - {}\n\
-         Label a dedicated, low-privilege Consumer `{VERIFY_PROBE_LABEL}: \"true\"`, give it \
-         a brokered ${{gh-env-secret:...}} credential, and name that slot. Never label a \
-         customer Consumer.",
+         Create a dedicated, low-privilege Consumer with a brokered ${{gh-env-secret:...}} \
+         credential, label it `{VERIFY_PROBE_LABEL}: \"true\"`, ask a repository \
+         administrator to add it as <namespace>/<consumer-id> to the \
+         {VERIFY_PROBE_CONSUMERS_ENV} variable of this GitHub Environment, and name that \
+         slot. Never label or list a customer Consumer.",
         crate::diagnostics::sanitize_line(environment),
         refusals.join("\n  - ")
     )))
+}
+
+fn refusal_line(binding: &SlotBinding) -> String {
+    use crate::diagnostics::sanitize_line;
+    let consumer = match &binding.consumer {
+        Some(consumer) => format!(" (Consumer {:?})", sanitize_line(consumer)),
+        None => String::new(),
+    };
+    format!(
+        "check {:?}, header {:?}: slot {:?}{consumer} {}",
+        sanitize_line(&binding.check),
+        sanitize_line(&binding.header),
+        sanitize_line(&binding.slot),
+        binding.status.describe()
+    )
+}
+
+/// The slots a verification run may send, decided from the desired
+/// configuration and the operator allowlist before any bundle is read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeAuthorization {
+    slots: BTreeSet<String>,
+}
+
+impl ProbeAuthorization {
+    /// The authorized slots, by name.
+    pub fn slots(&self) -> impl Iterator<Item = &str> {
+        self.slots.iter().map(String::as_str)
+    }
+
+    /// Project `bundle` down to the authorized slots. An authorized slot the
+    /// bundle lacks is left out, so its check fails as unresolvable.
+    pub fn project(&self, bundle: &BTreeMap<String, String>) -> ProbeCredentials {
+        let mut values = BTreeMap::new();
+        for slot in &self.slots {
+            if let Some(secret) = bundle.get(slot) {
+                values.insert(slot.clone(), secret.clone());
+            }
+        }
+        ProbeCredentials { values }
+    }
+}
+
+/// Bind every credential `checks` would send to an allowlisted, labelled
+/// verification probe Consumer of `desired`.
+///
+/// Fails closed, before the bundle is read and before any request, when a
+/// check sends a slot while `allowlist` is absent or empty, or names a slot
+/// that is not a brokered secret of a Consumer both listed in the operator's
+/// [`VERIFY_PROBE_CONSUMERS_ENV`] and labelled [`VERIFY_PROBE_LABEL`]` =
+/// "true"`, or sends one with a method other than `GET` or `HEAD`. Checks
+/// that send no slot need no allowlist.
+pub fn authorize_probe_slots(
+    environment: &str,
+    checks: &EnvironmentChecks,
+    desired: &GatewayConfig,
+    allowlist: Option<&ProbeConsumerAllowlist>,
+) -> crate::error::Result<ProbeAuthorization> {
+    if !checks.sends_credentials() {
+        return Ok(ProbeAuthorization::default());
+    }
+    let Some(allowlist) = allowlist.filter(|list| !list.is_empty()) else {
+        return Err(crate::error::Error::Config(format!(
+            "{SMOKE_CONFIG_PATH}: environment '{}': a traffic check sends a credential slot, \
+             but {VERIFY_PROBE_CONSUMERS_ENV} is unset or empty; no request was sent. A \
+             repository administrator must list the environment's dedicated probe Consumers \
+             (comma-separated <namespace>/<consumer-id>) in the {VERIFY_PROBE_CONSUMERS_ENV} \
+             variable of this GitHub Environment. The `{VERIFY_PROBE_LABEL}` label alone \
+             authorizes nothing.",
+            crate::diagnostics::sanitize_line(environment)
+        )));
+    };
+    let bindings = bind_probe_slots(checks, desired, Some(allowlist), None);
+    refuse_unbound_slots(environment, &bindings)?;
+    let slots = bindings
+        .into_iter()
+        .filter(|binding| binding.status == BindingStatus::Approved)
+        .map(|binding| binding.slot)
+        .collect();
+    Ok(ProbeAuthorization { slots })
+}
+
+/// [`authorize_probe_slots`], then [`ProbeAuthorization::project`] `bundle`.
+pub fn authorize_probe_credentials(
+    environment: &str,
+    checks: &EnvironmentChecks,
+    desired: &GatewayConfig,
+    allowlist: Option<&ProbeConsumerAllowlist>,
+    bundle: &BTreeMap<String, String>,
+) -> crate::error::Result<ProbeCredentials> {
+    let authorization = authorize_probe_slots(environment, checks, desired, allowlist)?;
+    Ok(authorization.project(bundle))
 }
 
 /// Turn declared header values into the exact bytes to send.

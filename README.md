@@ -256,6 +256,13 @@ environment through to a first apply and authenticated traffic.
    first apply that allocates a credential. Full list:
    [CLI and configuration reference](docs/reference.md#github-environment-secrets).
 
+   If a traffic check sends a credential `slot:`, also add the Environment
+   **variable** (not a secret) `FERRUM_VERIFY_PROBE_CONSUMERS`: the
+   comma-separated `<namespace>/<consumer-id>` of the dedicated probe
+   Consumers it may spend, for example
+   `gh variable set FERRUM_VERIFY_PROBE_CONSUMERS --env staging --body ferrum/orders-probe`.
+   See [Probe credentials](docs/promotion.md#probe-credentials).
+
 9. **Optionally add `.gitforgeops/policies.yaml`** from
    `policies.example.yaml`. See [Policy framework](#policy-framework-gitforgeopspoliciesyaml).
 
@@ -656,9 +663,15 @@ environments:
 checks for the same source revision. Traffic checks are declared in
 `.gitforgeops/smoke.yaml` and run by `gitforgeops verify` against the gateway's
 data plane (`FERRUM_VERIFY_BASE_URL`). A check may send only a credential of a
-dedicated Consumer labelled `gitforgeops/verify-probe: "true"`, and only on a
-`GET` or `HEAD` request; any other slot refuses the run before a request is
-sent. Checks are bounded (at most 10 attempts, 60 seconds per attempt, 50
+dedicated probe Consumer that a repository administrator lists in the
+`FERRUM_VERIFY_PROBE_CONSUMERS` variable of the environment's GitHub
+Environment (comma-separated `<namespace>/<consumer-id>`) **and** that the
+resources label `gitforgeops/verify-probe: "true"`, and only on a `GET` or
+`HEAD` request. The variable is the authorization, because no merge can change
+it; with it unset, every check that sends a slot is refused. Any other slot
+refuses the run before a request is sent, and `validate`, `plan` and `review`
+report it before the merge (`smoke.yaml` `version: 2`; a `version: 1` file
+that names a slot is refused). Checks are bounded (at most 10 attempts, 60 seconds per attempt, 50
 checks and a 15-minute worst case per environment), and a file over a bound is
 refused at load. An environment with no checks records `skipped`, which
 authorizes no promotion. Promotion is one stage deep, and staging's approval

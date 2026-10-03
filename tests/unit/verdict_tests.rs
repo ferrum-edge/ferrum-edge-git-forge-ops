@@ -290,9 +290,16 @@ fn publication_preflight_refusals_are_blockers_in_apply_order() {
 fn the_smoke_blocker_names_the_bounds_and_the_credential_rule() {
     // A reviewer sees the blocker before the merge, so it has to say which
     // refusals it covers: the budgets (GHSA-p95x-q89j-hrhv) and the
-    // Consumer-credential-only, GET/HEAD-only slot rule (GHSA-8mhw-ghx8-9m63).
+    // Consumer-credential-only, GET/HEAD-only slot rule bound to a labelled,
+    // operator-listed probe Consumer (GHSA-8mhw-ghx8-9m63).
     let remedy = BlockerKind::InvalidSmokeChecks.remedy();
-    for expected in ["time budgets", "Consumer credential slots", "GET/HEAD"] {
+    for expected in [
+        "time budgets",
+        "Consumer credential slots",
+        "GET/HEAD",
+        "gitforgeops/verify-probe",
+        "FERRUM_VERIFY_PROBE_CONSUMERS",
+    ] {
         assert!(remedy.contains(expected), "{expected}: {remedy}");
     }
 }

@@ -57,7 +57,7 @@ declared in `.gitforgeops/smoke.yaml` (see
 [`smoke.example.yaml`](../.gitforgeops/smoke.example.yaml)):
 
 ```yaml
-version: 1
+version: 2
 
 environments:
   staging:
@@ -82,12 +82,18 @@ environments:
 | `name` | required | Label in results. |
 | `method` | `GET` | HTTP method. |
 | `path` | required | Must start with `/`. |
-| `headers` | none | Each value is exactly one of `literal:` or `slot:` (a [probe credential](#probe-credentials) slot). `Host`, `Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via` and hop-by-hop or framing headers are refused. |
+| `headers` | none | Each value is exactly one of `literal:` or `slot:` (a [probe credential](#probe-credentials) slot). `Host`, `Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`, the method overrides (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) and hop-by-hop or framing headers are refused, case-insensitively. |
 | `expect_status` | required | Status the check must see. |
 | `timeout_secs` | `10` | Per attempt, 1 to 60. |
 | `attempts` | `3` | Including the first, 1 to 10. |
 | `retry_backoff_ms` | `500` | Base delay, at most 30000. The pause before attempt `n + 1` is `n` times it. |
 | `replay_safe` | `false` | Allow retrying a non-idempotent method after a possible delivery. |
+
+`version: 2` is the current contract. A `version: 1` file, or one with no
+`version`, still loads when no check sends a `slot:`; one that names a slot is
+refused, because under version 1 a slot could name any credential in the
+bundle. Review every slot against [Probe credentials](#probe-credentials),
+then declare `version: 2`.
 
 There are no hooks or shell commands: the job holds deployment credentials,
 and the closed schema is the whole execution surface. An unknown key such as
@@ -123,9 +129,9 @@ timeout would cancel the job and skip that commit.
 ### Probe credentials
 
 The verify step holds the environment's whole credential bundle, so a check
-may send only a credential that was set aside for verification. A `slot:`
-header is honoured only when all of these hold; otherwise `verify` exits 1
-before any request is sent:
+may send only a credential that the operator set aside for verification. A
+`slot:` header is honoured only when all of these hold; otherwise `verify`
+exits 1 before the bundle is read or any request is sent:
 
 - The slot is a Consumer credential secret slot,
   `<namespace>/<consumer-id>/<credential-type>/<field>`, with a built-in
@@ -134,26 +140,62 @@ before any request is sent:
   `mtls_auth` `identity`) and unknown types are refused at load.
 - The check's method is `GET` or `HEAD`, so a probe credential is never spent
   on a side effect. Also refused at load.
+- **The operator lists the Consumer** in the `FERRUM_VERIFY_PROBE_CONSUMERS`
+  variable of the environment's GitHub Environment, as
+  `<namespace>/<consumer-id>`. This is the authorization. A GitHub Environment
+  variable can be changed only by a repository administrator, never by a
+  merge. Unset or empty, every check that sends a slot is refused; a
+  malformed entry is an error.
 - The Consumer is in the environment's desired configuration (after overlays
   and namespace scope) and carries the label `gitforgeops/verify-probe: "true"`.
+  The label is required too, but it lives in `resources/`, which the pull
+  request that names the slot could also change, so it authorizes nothing by
+  itself.
 - The slot is one of that Consumer's brokered (`${gh-env-secret:...}`) secret
   leaves, in canonical spelling.
 
-`verify` hands the runner only those values, never the bundle. Give the label
-to a dedicated, low-privilege Consumer that exists to be probed, never to a
-customer:
+`verify` hands the runner only those values, never the bundle.
 
-```yaml
-kind: Consumer
-spec:
-  id: "orders-probe"
-  username: "orders-probe"
-  labels:
-    gitforgeops/verify-probe: "true"
-  credentials:
-    keyauth:
-      - key: "${gh-env-secret:alloc=generate}"
-```
+The same binding is checked before anything changes. `validate`, `plan` and
+`apply` refuse a slot whose Consumer is missing, unlabelled or (when the run
+can see `FERRUM_VERIFY_PROBE_CONSUMERS`) not listed. `review` reports it as the
+`invalid-smoke-checks` blocker and lists, by name only, each check's header,
+slot and the Consumer it would spend, plus every Consumer carrying the label,
+so a pull request that adds a label or a slot is visible. A run narrowed by
+`FERRUM_NAMESPACE` does not judge slots in other namespaces. The bundled
+workflows bind the variable into both `Validate` steps (before Apply) and both
+`Verify traffic` steps of `apply-on-merge.yml`, and into the trusted live
+review.
+
+#### Operator setup
+
+1. Create a dedicated, low-privilege Consumer that exists to be probed, never
+   a customer, with a brokered credential and the label:
+
+   ```yaml
+   kind: Consumer
+   spec:
+     id: "orders-probe"
+     username: "orders-probe"
+     labels:
+       gitforgeops/verify-probe: "true"
+     credentials:
+       keyauth:
+         - key: "${gh-env-secret:alloc=generate}"
+   ```
+
+2. A repository administrator adds the variable to each GitHub Environment
+   whose checks send a slot (**Settings → Environments → _env_ → Environment
+   variables**, or
+   `gh variable set FERRUM_VERIFY_PROBE_CONSUMERS --env <env> --body ferrum/orders-probe`).
+   List several probes comma-separated. Use an Environment variable, not a
+   repository variable or a secret: it is per environment and is the value
+   the workflows bind.
+3. Name the probe's slot in `.gitforgeops/smoke.yaml` (`version: 2`) on a
+   `GET` or `HEAD` check.
+
+Removing a Consumer from the variable revokes it at the next `verify`; no
+merge is needed. Never list a customer Consumer.
 
 ### How checks run
 
@@ -183,7 +225,7 @@ spec:
 | `0` | every check passed | `success` | green |
 | `4` | a check ran and failed | `failure` | **failed** |
 | `5` | no checks declared for the environment | `skipped` | green |
-| `1` | could not run (bad `smoke.yaml`, no `FERRUM_VERIFY_BASE_URL`, unreadable bundle, a slot that is not a probe credential) | `failure` | **failed** |
+| `1` | could not run (bad `smoke.yaml`, no `FERRUM_VERIFY_BASE_URL`, unreadable bundle, `FERRUM_VERIFY_PROBE_CONSUMERS` unset or malformed while a check sends a slot, a slot that is not a probe credential) | `failure` | **failed** |
 
 `--format json` reports `"status": "passed" | "failed" | "skipped"`.
 

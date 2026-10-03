@@ -12,7 +12,6 @@
 //! checks' declared worst case (itself capped at load) plus a short grace, and
 //! a check the deadline interrupts is reported as timed out, never passed.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -83,10 +82,14 @@ fn join(base: &str, path: &str) -> String {
 /// the second answer pass the check. Only a connection that was never
 /// established — so carried no request — is retried for such a method, unless
 /// the check declares `replay_safe`.
+///
+/// `credentials` is the projection [`super::authorize_probe_credentials`]
+/// built, never the environment's bundle: like [`run`], a single check can
+/// only resolve a slot that was authorized for verification.
 pub async fn run_check(
     base_url: &str,
     check: &SmokeCheck,
-    bundle: &BTreeMap<String, String>,
+    credentials: &ProbeCredentials,
     ca_cert: Option<&str>,
 ) -> CheckResult {
     let url = join(base_url, &check.path);
@@ -103,7 +106,7 @@ pub async fn run_check(
     // Fail closed on a slot that is not in the bundle. Sending the request
     // without the credential would make a check that expects 401 pass for
     // entirely the wrong reason.
-    let headers = match resolve_headers(&check.headers, bundle) {
+    let headers = match resolve_headers(&check.headers, credentials.values()) {
         Ok(headers) => headers,
         Err(missing) => {
             return failed(
@@ -272,7 +275,7 @@ pub async fn run_within(
             ));
             continue;
         }
-        let attempt = run_check(base_url, check, credentials.values(), ca_cert);
+        let attempt = run_check(base_url, check, credentials, ca_cert);
         match tokio::time::timeout_at(deadline, attempt).await {
             Ok(result) => results.push(result),
             Err(_) => results.push(deadline_result(

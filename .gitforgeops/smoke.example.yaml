@@ -20,11 +20,19 @@
 # A check may send ONLY a verification probe credential. The job holds the
 # environment's whole credential bundle, so a `slot:` header is honoured only
 # when it names a brokered (`${gh-env-secret:...}`) secret of a Consumer that
-# this environment's resources label `gitforgeops/verify-probe: "true"`, and
-# only on a GET or HEAD check. Plugin-config and service-discovery slots are
-# never sent. Anything else fails `gitforgeops verify` before any request.
-# Give the label to a dedicated, low-privilege Consumer that exists to be
-# probed, never to a customer:
+#
+#   1. a repository administrator lists in the FERRUM_VERIFY_PROBE_CONSUMERS
+#      variable of the environment's GitHub Environment (comma-separated
+#      <namespace>/<consumer-id>, e.g. `ferrum/orders-probe`), AND
+#   2. this environment's resources label `gitforgeops/verify-probe: "true"`,
+#
+# and only on a GET or HEAD check. The variable is the authorization: no
+# merge can change it, while the label lives in resources/, which the same
+# pull request could edit. With the variable unset, every check that sends a
+# slot fails. Plugin-config and service-discovery slots are never sent.
+# Anything else fails `gitforgeops verify` before any request, and validate,
+# plan and review report it before the merge. Use a dedicated, low-privilege
+# Consumer that exists to be probed, never a customer:
 #
 #   kind: Consumer
 #   spec:
@@ -44,7 +52,10 @@
 # backoff pauses). A file over any bound is refused by validate, plan and
 # apply before anything changes.
 
-version: 1
+# Version 2: a `slot:` names only an allowlisted, labelled probe Consumer's
+# credential. A version 1 file (or one with no `version`) that names a slot is
+# refused, so a slot written under the old meaning is reviewed again.
+version: 2
 
 environments:
   staging:
