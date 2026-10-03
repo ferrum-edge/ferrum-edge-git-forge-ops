@@ -657,19 +657,18 @@ pub fn validate_verify_transport(
             redacted_url("FERRUM_VERIFY_BASE_URL")
         )));
     }
-    if in_github_actions {
-        if parsed
+    if in_github_actions
+        && parsed
             .host()
             .filter(|host| !host_is_loopback(host))
             .is_some()
-        {
-            return Err(refused_in_github_actions(
-                "FERRUM_ALLOW_INSECURE_HTTP",
-                "the configured data-plane host is not loopback, so an http:// \
-                 FERRUM_VERIFY_BASE_URL would put every credential a traffic check sends \
-                 on the wire in cleartext",
-            ));
-        }
+    {
+        return Err(refused_in_github_actions(
+            "FERRUM_ALLOW_INSECURE_HTTP",
+            "the configured data-plane host is not loopback, so an http:// \
+             FERRUM_VERIFY_BASE_URL would put every credential a traffic check sends \
+             on the wire in cleartext",
+        ));
     }
     Ok(vec![insecure_warning(
         "FERRUM_ALLOW_INSECURE_HTTP=true: traffic checks talk to the data plane over cleartext http://.",
