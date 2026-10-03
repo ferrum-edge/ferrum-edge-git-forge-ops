@@ -1618,32 +1618,6 @@ _PINNED_USES = re.compile(r"^(\s*(?:-\s+)?uses:\s*[^@\s]+)@[0-9a-f]{40}$")
 # lookbehind rather than `\s+#`: a long run of blanks with no `#` must not
 # backtrack quadratically on candidate input.
 _TRAILING_COMMENT = re.compile(r"(?<=[ \t])#.*$")
-# Lines of other workflows that may name the protected context without
-# defining a job: the audit's expected contexts and the release gate.
-POLICY_CHECK_MENTIONS = {
-    ".github/workflows/settings-audit.yml": frozenset(
-        {f"--required-check '{SUPPLY_CHAIN_POLICY_JOB}'"}
-    ),
-    ".github/workflows/release.yml": frozenset(
-        {f'"GitForgeOps Supply-Chain Policy / {SUPPLY_CHAIN_POLICY_JOB}"'}
-    ),
-}
-# One block-mapping key line: a plain or quoted key, then an optional inline
-# value. Anything else where a key is expected is unclassifiable.
-_BLOCK_KEY = re.compile(
-    r"""^(?P<indent> *)(?P<key>"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_-]+)"""
-    r"""[ \t]*:(?:[ \t]+(?P<value>.*?))?[ \t]*$"""
-)
-# Workflows that may grant a token the right to create check runs or commit
-# statuses. Empty: with either, a job could report any context name it
-# computes at run time, which no static rule can see.
-STATUS_WRITE_ALLOWED: frozenset[str] = frozenset()
-_STATUS_PERMISSION = re.compile(
-    r"""(?:^[ \t]*(?:-[ \t]+)?|[{,][ \t]*)["']?(?P<scope>checks|statuses)["']?"""
-    r"""[ \t]*:[ \t]*(?P<value>[^,}\n]*)""",
-    re.IGNORECASE | re.MULTILINE,
-)
-_WRITE_ALL = re.compile(r"\bwrite-all\b", re.IGNORECASE)
 
 
 def policy_workflow_shape(text: str) -> list[str]:
@@ -1695,21 +1669,27 @@ def supply_chain_policy_workflow_violations(root: Path) -> list[str]:
 
 def candidate_tree_violations(root: Path) -> list[str]:
     """Every path in the judged tree must be a plain file, a directory, or a
-    symlink that resolves inside the tree.
+    symlink that stays inside the tree.
 
     The policy job lays the protected checkout out beside the candidate
     (`base/` next to `candidate/`), and every other workflow runs the same
-    tree at the workspace root. A link that is absolute or climbs out of the
-    tree therefore reads one file here and a different one everywhere else:
-    `.github/scripts` pointing at the workspace's `base/.github/scripts` shows
-    this check the protected scripts while later runs execute the pull
-    request's own copy. Every path component is visited without following a
-    link, and nothing is read until the walk passes. Devices, FIFOs and
-    sockets are refused too, since reading one can hang or exhaust the job.
-    `.git` directories are the checkout's own metadata and are skipped.
+    tree at the workspace root. A link that is absolute or climbs above the
+    tree root therefore reads one file here and a different one everywhere
+    else: `.github/scripts` pointing at the workspace's `base/.github/scripts`
+    shows this check the protected scripts while later runs execute the pull
+    request's own copy. A climb is refused by its text, wherever it lands, so
+    `../candidate/x` cannot re-enter this layout through the directory name.
+    The resolved target is checked too, for chains of links. Every path
+    component is visited without following a link, and nothing is read until
+    the walk passes. Devices, FIFOs and sockets are refused, since reading
+    one can hang or exhaust the job. `.git` directories are the checkout's own
+    metadata and are skipped.
+
+    `root` is taken as given, before any resolution, so a root that is itself
+    a symlink is refused rather than silently followed.
     """
     if root.is_symlink() or not root.is_dir():
-        return [f"{root}: the tree under review must be a directory"]
+        return [f"{root}: the tree under review must be a real directory"]
     real_root = Path(os.path.realpath(root))
     violations: list[str] = []
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
@@ -1725,9 +1705,15 @@ def candidate_tree_violations(root: Path) -> list[str]:
             mode = os.lstat(path).st_mode
             if stat.S_ISLNK(mode):
                 target = os.readlink(path)
+                lexical = os.path.normpath(
+                    os.path.join(path.parent.relative_to(root).as_posix(), target)
+                )
                 resolved = Path(os.path.realpath(path))
-                if os.path.isabs(target) or not (
-                    resolved == real_root or resolved.is_relative_to(real_root)
+                if (
+                    os.path.isabs(target)
+                    or lexical == ".."
+                    or lexical.startswith("../")
+                    or not (resolved == real_root or resolved.is_relative_to(real_root))
                 ):
                     violations.append(
                         f"{relative}: symlink leaves the tree under review "
@@ -1746,175 +1732,469 @@ def candidate_tree_violations(root: Path) -> list[str]:
     return violations
 
 
-def _strip_trailing_comment(line: str) -> str:
-    return _TRAILING_COMMENT.sub("", line).rstrip()
+# ---------------------------------------------------------------------------
+# Strict workflow reader
+# ---------------------------------------------------------------------------
+# GHSA-x5m2-4555-q4cr. Rules that pattern-match YAML text stay evadable: YAML
+# spells one key or value many ways (an indented root, explicit `? key`,
+# anchors, aliases, tags, merge keys, flow mappings). So every workflow under
+# `.github/workflows/` must be written in a small, unambiguous subset of YAML
+# that this stdlib-only reader turns into dicts, lists and strings, and the
+# check-name, permission and action-pin rules read that structure. Anything
+# outside the subset is a violation reported before any rule runs: a spelling
+# this reader does not know cannot carry a meaning past it.
+#
+# The subset:
+# - top-level keys at column 0, indentation by spaces only, block mappings and
+#   block sequences (a sequence nested under a key is indented below it);
+# - keys are plain `[A-Za-z0-9_-]+` and unique within their mapping;
+# - scalars are plain, single-quoted or double-quoted, each on one line;
+# - a block scalar (`|` or `>`, optional `-`/`+`) only as the value of a key in
+#   `BLOCK_SCALAR_KEYS`;
+# - a one-line flow sequence of scalars only as the value of a key in
+#   `FLOW_SEQUENCE_KEYS` (`branches: [main]`); never a flow mapping;
+# - nowhere: anchors, aliases, tags, explicit keys, merge keys, directives,
+#   document markers other than one leading `---`, tabs outside block
+#   scalars, a byte-order mark, control characters or Unicode line breaks.
 
 
-def _yaml_key(token: str) -> str:
-    """A block key's text: quotes removed and double-quoted escapes decoded."""
-    if token[:1] == '"':
-        return _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, token[1:-1])
-    if token[:1] == "'":
-        return token[1:-1].replace("''", "'")
-    return token
+class WorkflowSyntaxError(ValueError):
+    """A workflow uses YAML outside the subset the policy can read."""
 
 
-def _line_indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
+BLOCK_SCALAR_KEYS = frozenset(
+    {"run", "script", "body", "description", "if", "path", "restore-keys", "images", "tags"}
+)
+FLOW_SEQUENCE_KEYS = frozenset(
+    {
+        "branches",
+        "branches-ignore",
+        "tags",
+        "tags-ignore",
+        "paths",
+        "paths-ignore",
+        "types",
+        "needs",
+        "workflows",
+    }
+)
+_WORKFLOW_KEY = re.compile(r"([A-Za-z0-9_-]+):(?: +(.*))?")
+_FORBIDDEN_WORKFLOW_CHARACTER = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ﻿]"
+)
+_BLOCK_SCALAR_HEADERS = frozenset({"|", "|-", "|+", ">", ">-", ">+"})
+# Characters that would begin something other than a plain scalar.
+_PLAIN_START = frozenset("&*!|>{}[],#'\"%@`")
+_DOUBLE_QUOTED_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\x85",
+    "_": "\xa0",
+    "L": " ",
+    "P": " ",
+}
+_HEX_ESCAPE_WIDTHS = {"x": 2, "u": 4, "U": 8}
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
-def _job_display_name_violations(workflow: str, text: str) -> list[str]:
-    """No job's display name may be computed, and every job must be readable.
+def _cut_comment(text: str) -> str:
+    """Drop a comment: YAML starts one at a `#` that follows a space."""
+    position = text.find(" #")
+    return (text if position < 0 else text[:position]).rstrip(" ")
 
-    Not a YAML parser, so it reads the structure that decides a check-run
-    name and fails closed on anything else: top-level keys, the jobs mapping
-    (quoted `"jobs":` included), each job, and each job's own keys at
-    whatever indentation the file uses. A job must be a block mapping; a
-    job-level value may not carry an anchor, alias or tag; and `name:` must be
-    a single-line literal with no `${{ }}`, not empty, not a block or flow
-    scalar and not continued on the next line.
-    """
-    lines = [
-        line
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+
+class _WorkflowReader:
+    def __init__(self, text: str) -> None:
+        forbidden = _FORBIDDEN_WORKFLOW_CHARACTER.search(text)
+        if forbidden is not None:
+            line = text.count("\n", 0, forbidden.start()) + 1
+            raise WorkflowSyntaxError(
+                f"line {line}: character U+{ord(forbidden.group()):04X} is not "
+                "allowed (byte-order mark, control character or line separator)"
+            )
+        self.lines = text.split("\n")
+        self.index = 0
+
+    def fail(self, message: str) -> None:
+        raise WorkflowSyntaxError(f"line {self.index + 1}: {message}")
+
+    def next_indent(self) -> int | None:
+        """Skip blank and comment lines; the next line's indentation."""
+        while self.index < len(self.lines):
+            line = self.lines[self.index]
+            content = line.lstrip(" ")
+            if not content or content.startswith("#"):
+                self.index += 1
+                continue
+            if "\t" in line:
+                self.fail("tabs are only allowed inside block scalars")
+            return len(line) - len(content)
+        return None
+
+    def document(self) -> dict:
+        indent = self.next_indent()
+        if indent == 0 and self.lines[self.index].rstrip(" ") == "---":
+            self.index += 1
+            indent = self.next_indent()
+        if indent is None:
+            return {}
+        if indent != 0:
+            self.fail("the top-level mapping must start at column 0")
+        root = self.mapping(0)
+        if self.next_indent() is not None:
+            self.fail("unexpected content after the top-level mapping")
+        return root
+
+    def block_node(self, indent: int):
+        content = self.lines[self.index][indent:].rstrip(" ")
+        if content == "-" or content.startswith("- "):
+            return self.sequence(indent)
+        return self.mapping(indent)
+
+    def mapping(self, indent: int) -> dict:
+        result: dict = {}
+        while True:
+            current = self.next_indent()
+            if current is None or current < indent:
+                return result
+            if current > indent:
+                self.fail("unexpected indentation")
+            content = self.lines[self.index][indent:].rstrip(" ")
+            match = _WORKFLOW_KEY.fullmatch(content)
+            if match is None:
+                self.fail(
+                    "expected a plain `key:`; quoted, explicit (`?`), anchored, "
+                    "tagged, aliased and merge keys are not supported"
+                )
+            key = match.group(1)
+            if key in result:
+                self.fail(f"duplicate key {key!r}")
+            result[key] = self.value(key, match.group(2) or "", indent)
+
+    def value(self, key: str, rest: str, indent: int):
+        """The value of the key on the current line; leaves the reader after it."""
+        if not rest or rest.startswith("#"):
+            self.index += 1
+            nested = self.next_indent()
+            if nested is None or nested <= indent:
+                return None
+            return self.block_node(nested)
+        if rest[0] in "|>":
+            if key not in BLOCK_SCALAR_KEYS:
+                self.fail(f"a block scalar is not accepted as the value of {key!r}")
+            if _cut_comment(rest) not in _BLOCK_SCALAR_HEADERS:
+                self.fail("a block scalar header must be one of | |- |+ > >- >+")
+            self.index += 1
+            return self.block_scalar(indent, folded=rest[0] == ">")
+        if rest[0] == "[":
+            if key not in FLOW_SEQUENCE_KEYS:
+                self.fail(f"a flow sequence is not accepted as the value of {key!r}")
+            result = self.flow_sequence(rest)
+        else:
+            result = self.scalar(rest)
+        self.index += 1
+        nested = self.next_indent()
+        if nested is not None and nested > indent:
+            self.fail("a value may not continue on the next line")
+        return result
+
+    def sequence(self, indent: int) -> list:
+        items: list = []
+        while True:
+            current = self.next_indent()
+            if current is None or current < indent:
+                return items
+            if current > indent:
+                self.fail("unexpected indentation")
+            line = self.lines[self.index].rstrip(" ")
+            content = line[indent:]
+            if content != "-" and not content.startswith("- "):
+                return items
+            rest = content[1:].lstrip(" ")
+            if not rest or rest.startswith("#"):
+                self.index += 1
+                nested = self.next_indent()
+                items.append(
+                    self.block_node(nested) if nested is not None and nested > indent else None
+                )
+                continue
+            if rest == "-" or rest.startswith("- "):
+                self.fail("nested compact sequences are not supported")
+            if _WORKFLOW_KEY.fullmatch(rest):
+                # A compact mapping: read it as a mapping at its first key's column.
+                column = len(line) - len(rest)
+                self.lines[self.index] = " " * column + rest
+                items.append(self.mapping(column))
+                continue
+            if rest[0] in "|>[":
+                self.fail("a sequence item must be a scalar or a mapping")
+            items.append(self.scalar(rest))
+            self.index += 1
+            nested = self.next_indent()
+            if nested is not None and nested > indent:
+                self.fail("a value may not continue on the next line")
+
+    def scalar(self, text: str) -> str:
+        if text[0] in "'\"":
+            value, end = self.quoted(text)
+            remainder = text[end:]
+            if remainder and not (
+                remainder[0] == " " and remainder.lstrip(" ")[:1] in ("", "#")
+            ):
+                self.fail("unexpected text after a quoted scalar")
+            return value
+        value = _cut_comment(text)
+        self.check_plain(value)
+        return value
+
+    def check_plain(self, value: str) -> None:
+        if (
+            not value
+            or value[0] in _PLAIN_START
+            or (value[0] in "-?:" and value[1:2] in ("", " "))
+        ):
+            self.fail(
+                f"{value[:20]!r} does not start a plain scalar; anchors, aliases, "
+                "tags and flow mappings are not supported"
+            )
+        if ": " in value or value.endswith(":"):
+            self.fail("a plain scalar may not contain ': '; quote it")
+
+    def quoted(self, text: str) -> tuple[str, int]:
+        quote = text[0]
+        out: list[str] = []
+        position = 1
+        while position < len(text):
+            character = text[position]
+            if quote == "'":
+                if character == "'":
+                    if text[position + 1:position + 2] == "'":
+                        out.append("'")
+                        position += 2
+                        continue
+                    return "".join(out), position + 1
+                out.append(character)
+                position += 1
+                continue
+            if character == '"':
+                return "".join(out), position + 1
+            if character != "\\":
+                out.append(character)
+                position += 1
+                continue
+            code = text[position + 1:position + 2]
+            if code in _HEX_ESCAPE_WIDTHS:
+                digits = text[position + 2:position + 2 + _HEX_ESCAPE_WIDTHS[code]]
+                if len(digits) != _HEX_ESCAPE_WIDTHS[code] or not set(digits) <= _HEX_DIGITS:
+                    self.fail("malformed escape in a double-quoted scalar")
+                point = int(digits, 16)
+                if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                    self.fail("escape names no Unicode scalar value")
+                out.append(chr(point))
+                position += 2 + len(digits)
+                continue
+            if code not in _DOUBLE_QUOTED_ESCAPES:
+                self.fail("unsupported escape in a double-quoted scalar")
+            out.append(_DOUBLE_QUOTED_ESCAPES[code])
+            position += 2
+        self.fail("a quoted scalar must close on its own line")
+        raise AssertionError("unreachable")
+
+    def flow_sequence(self, text: str) -> list[str]:
+        """A one-line `[a, 'b', "c"]` of scalars; nothing nested."""
+        items: list[str] = []
+        position = self.skip_spaces(text, 1)
+        if text[position:position + 1] == "]":
+            position += 1
+        else:
+            while True:
+                position = self.skip_spaces(text, position)
+                if position < len(text) and text[position] in "'\"":
+                    value, end = self.quoted(text[position:])
+                    position += end
+                else:
+                    end = position
+                    while end < len(text) and text[end] not in ",]":
+                        end += 1
+                    value = text[position:end].rstrip(" ")
+                    if any(mark in value for mark in "[]{}") or " #" in value:
+                        self.fail("a flow sequence item must be a plain or quoted scalar")
+                    self.check_plain(value)
+                    position = end
+                items.append(value)
+                position = self.skip_spaces(text, position)
+                if position >= len(text):
+                    self.fail("a flow sequence must close on its own line")
+                if text[position] == ",":
+                    position += 1
+                    continue
+                if text[position] != "]":
+                    self.fail("expected ',' or ']' in a flow sequence")
+                position += 1
+                break
+        remainder = text[position:]
+        if remainder and not (
+            remainder[0] == " " and remainder.lstrip(" ")[:1] in ("", "#")
+        ):
+            self.fail("unexpected text after a flow sequence")
+        return items
+
+    @staticmethod
+    def skip_spaces(text: str, position: int) -> int:
+        while text[position:position + 1] == " ":
+            position += 1
+        return position
+
+    def block_scalar(self, indent: int, folded: bool) -> str:
+        lines: list[str] = []
+        content_indent: int | None = None
+        while self.index < len(self.lines):
+            line = self.lines[self.index]
+            if not line.strip():
+                lines.append("")
+                self.index += 1
+                continue
+            current = len(line) - len(line.lstrip(" "))
+            if content_indent is None:
+                if current <= indent:
+                    break
+                content_indent = current
+            if current < content_indent:
+                break
+            lines.append(line[content_indent:])
+            self.index += 1
+        while lines and not lines[-1]:
+            lines.pop()
+        return (" " if folded else "\n").join(lines)
+
+
+def parse_workflow(text: str) -> dict:
+    """Read a workflow written in the policy's YAML subset, or raise."""
+    return _WorkflowReader(text).document()
+
+
+def _values_for_key(node, name: str):
+    """Every value stored under `name` (any case), anywhere in a document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key.casefold() == name:
+                yield value
+            yield from _values_for_key(value, name)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _values_for_key(item, name)
+
+
+def workflow_action_references(document: dict) -> list[str]:
+    """Every `uses:` value in a parsed workflow (steps and reusable jobs)."""
+    return [
+        value if isinstance(value, str) else repr(value)
+        for value in _values_for_key(document, "uses")
     ]
 
-    def unclassifiable(what: str, line: str) -> list[str]:
-        return [
-            f"{workflow}: cannot classify {what}, so the check names its jobs "
-            f"report cannot be verified; found {line.strip()!r}"
-        ]
 
-    bodies: list[list[str]] = []
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if line[0] == " ":
-            index += 1
-            continue
-        if line.rstrip() in ("---", "..."):
-            index += 1
-            continue
-        match = _BLOCK_KEY.match(_strip_trailing_comment(line))
-        if match is None:
-            return unclassifiable("a top-level line", line)
-        end = index + 1
-        while end < len(lines) and lines[end][0] == " ":
-            end += 1
-        if _yaml_key(match["key"]).casefold() == "jobs":
-            if match["value"]:
-                return unclassifiable("a jobs section that is not a block mapping", line)
-            bodies.append(lines[index + 1:end])
-        index = end
-
-    for body in bodies:
-        if not body:
-            continue
-        job_indent = _line_indent(body[0])
-        key_indent: int | None = None
-        for position, line in enumerate(body):
-            indent = _line_indent(line)
-            if line[indent] == "\t" or indent < job_indent:
-                return unclassifiable("a line in the jobs mapping", line)
-            stripped = _strip_trailing_comment(line)
-            if indent == job_indent:
-                match = _BLOCK_KEY.match(stripped)
-                if match is None or match["value"]:
-                    return unclassifiable("a job that is not a block mapping", line)
-                key_indent = None
-                continue
-            if key_indent is None:
-                key_indent = indent
-            if indent < key_indent:
-                return unclassifiable("a line in a job mapping", line)
-            if indent > key_indent:
-                continue
-            match = _BLOCK_KEY.match(stripped)
-            if match is None:
-                return unclassifiable("a job-level key", line)
-            value = match["value"] or ""
-            if value[:1] in ("&", "*", "!"):
-                return unclassifiable("a job-level anchor, alias or tag", line)
-            if _yaml_key(match["key"]).casefold() != "name":
-                continue
-            decoded = _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, value)
-            following = body[position + 1] if position + 1 < len(body) else ""
-            quoted = value[:1] in ('"', "'")
-            if (
-                not value
-                or value[0] in "|>{["
-                or (quoted and (len(value) < 2 or value[-1] != value[0]))
-                or (following and _line_indent(following) > key_indent)
-            ):
-                return unclassifiable("a job display name that is not one literal line", line)
-            if "${{" in decoded:
-                return [
-                    f"{workflow}: a job display name must be a literal, so no workflow "
-                    f"can compute the {SUPPLY_CHAIN_POLICY_JOB!r} check name; found "
-                    f"{line.strip()!r}"
-                ]
-    return []
-
-
-def policy_check_impersonation_violations(workflow: str, text: str) -> list[str]:
+def policy_check_impersonation_violations(workflow: str, document: dict) -> list[str]:
     """Only the protected policy workflow may report `trusted-supply-chain-policy`.
 
     A ruleset requires a check by name, and a check run is named by its job's
     key or its `name:`. A candidate's `pull_request` workflows run its own
     definitions, so a job keyed or named like the trusted one would put a
-    second, candidate-defined result under the required name.
-
-    Two fail-closed rules. The name may not appear anywhere in another
-    workflow, in any case, after full-line comments are dropped and
-    double-quoted escapes decoded, except on the exact lines in
-    `POLICY_CHECK_MENTIONS`. And no job's display name may be computed, or
-    written in a shape this reader cannot classify
-    (`_job_display_name_violations`).
+    second, candidate-defined result under the required name. Read from the
+    parsed workflow: no job key and no job `name:` may equal the context (in
+    any case, ignoring surrounding whitespace), and no job `name:` may be
+    computed with `${{ }}`. A matrix suffix or a reusable workflow's
+    `caller / callee` form can never equal it.
 
     `workflow` is the path relative to the repository root.
     """
     if workflow == SUPPLY_CHAIN_POLICY_PATH:
         return []
     violations: list[str] = []
-    allowed = POLICY_CHECK_MENTIONS.get(workflow, frozenset())
-    for line in decoded_workflow_content(text).splitlines():
-        if SUPPLY_CHAIN_POLICY_JOB in line.casefold() and line.strip() not in allowed:
-            violations.append(
-                f"{workflow}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may name the "
-                f"{SUPPLY_CHAIN_POLICY_JOB!r} check; another job reporting that name "
-                "would stand beside the protected verdict; found "
-                f"{line.strip()!r}"
-            )
-            break
-    violations.extend(_job_display_name_violations(workflow, text))
+    for jobs in (value for key, value in document.items() if key.casefold() == "jobs"):
+        if jobs is None:
+            continue
+        if not isinstance(jobs, dict):
+            violations.append(f"{workflow}: `jobs` must be a mapping of jobs")
+            continue
+        for job_id, job in jobs.items():
+            label = f"{workflow}: job {job_id!r}"
+            if job_id.casefold() == SUPPLY_CHAIN_POLICY_JOB:
+                violations.append(
+                    f"{label}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
+                    f"{SUPPLY_CHAIN_POLICY_JOB!r} check"
+                )
+            if not isinstance(job, dict):
+                violations.append(f"{label}: a job must be a mapping")
+                continue
+            for key, name in job.items():
+                if key.casefold() != "name" or name is None:
+                    continue
+                if not isinstance(name, str):
+                    violations.append(f"{label}: a job display name must be one string")
+                elif "${{" in name:
+                    violations.append(
+                        f"{label}: a job display name must be a literal, so no "
+                        f"workflow can compute the {SUPPLY_CHAIN_POLICY_JOB!r} "
+                        f"check name; found {name!r}"
+                    )
+                elif name.strip().casefold() == SUPPLY_CHAIN_POLICY_JOB:
+                    violations.append(
+                        f"{label}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
+                        f"{SUPPLY_CHAIN_POLICY_JOB!r} check"
+                    )
     return violations
 
 
-def status_write_permission_violations(workflow: str, text: str) -> list[str]:
+# Workflows that may grant a token the right to create check runs or commit
+# statuses. Empty: with either, a job could report any context name it
+# computes at run time, which no static rule can see.
+STATUS_WRITE_ALLOWED: frozenset[str] = frozenset()
+
+
+def status_write_permission_violations(workflow: str, document: dict) -> list[str]:
     """No workflow may let its token create check runs or commit statuses.
 
-    With `checks: write` or `statuses: write` (or `write-all`), a job can post
-    a result under any context it computes at run time, including a required
-    one. Only `read`, `none` or an absent grant is accepted, outside the
-    allow-list `STATUS_WRITE_ALLOWED` (empty).
+    Read from the parsed workflow, at every `permissions:` (workflow and job
+    level): a string must be `read-all`, and a mapping may give `checks` and
+    `statuses` (any case) only `read` or `none`. `write-all` grants both.
+    Workflows in `STATUS_WRITE_ALLOWED` (none) are exempt.
     """
     if workflow in STATUS_WRITE_ALLOWED:
         return []
-    content = decoded_workflow_content(text)
     violations: list[str] = []
-    for match in _STATUS_PERMISSION.finditer(content):
-        value = _strip_trailing_comment(match["value"]).strip().strip("'\"").lower()
-        if value not in ("read", "none"):
-            violations.append(
-                f"{workflow}: {match['scope'].lower()} may only be read; a token "
-                "that writes check runs or commit statuses can report a required "
-                f"check under any name; found {match.group(0).strip()!r}"
-            )
-    if _WRITE_ALL.search(content):
-        violations.append(
-            f"{workflow}: write-all would grant checks: write and statuses: write"
-        )
+    for permissions in _values_for_key(document, "permissions"):
+        if permissions is None:
+            continue
+        if isinstance(permissions, str):
+            if permissions.strip().casefold() != "read-all":
+                violations.append(
+                    f"{workflow}: permissions: {permissions!r} may grant checks or "
+                    "statuses write; use read-all or a mapping"
+                )
+            continue
+        if not isinstance(permissions, dict):
+            violations.append(f"{workflow}: permissions must be read-all or a mapping")
+            continue
+        for scope, level in permissions.items():
+            if scope.casefold() not in ("checks", "statuses"):
+                continue
+            if not (isinstance(level, str) and level.strip().casefold() in ("read", "none")):
+                violations.append(
+                    f"{workflow}: {scope.casefold()} may only be read; a token that "
+                    "writes check runs or commit statuses can report a required "
+                    f"check under any name; found {scope}: {level!r}"
+                )
     return violations
 
 
@@ -2114,17 +2394,40 @@ def main(argv: list[str] | None = None) -> int:
         help="write the exact reviewed build inputs after policy validation",
     )
     args = parser.parse_args(argv)
-    root = args.root.resolve()
     # Before any read: a link out of the tree, or a special file, would make
-    # every later rule judge something other than what the tree carries.
-    tree_violations = candidate_tree_violations(root)
+    # every later rule judge something other than what the tree carries. The
+    # root is judged as given, so a root that is itself a link is refused.
+    tree_violations = candidate_tree_violations(Path(os.path.abspath(args.root)))
     if tree_violations:
         print("Supply-chain policy violations:", file=sys.stderr)
         for violation in tree_violations:
             print(f"  - {violation}", file=sys.stderr)
         return 1
+    root = args.root.resolve()
     workflows = root / ".github" / "workflows"
     checked_action_files = action_files(root)
+    # Every workflow must be in the YAML subset the structural rules read,
+    # before any rule runs (GHSA-x5m2-4555-q4cr).
+    workflow_documents: dict[str, dict] = {}
+    syntax_violations: list[str] = []
+    for workflow in checked_action_files:
+        if workflow.parent != workflows:
+            continue
+        relative = workflow.relative_to(root).as_posix()
+        try:
+            workflow_documents[relative] = parse_workflow(
+                workflow.read_text(encoding="utf-8")
+            )
+        except WorkflowSyntaxError as error:
+            syntax_violations.append(
+                f"{relative}: workflow is outside the YAML subset the policy reads "
+                f"(see check_supply_chain.py, Strict workflow reader): {error}"
+            )
+    if syntax_violations:
+        print("Supply-chain policy violations:", file=sys.stderr)
+        for violation in syntax_violations:
+            print(f"  - {violation}", file=sys.stderr)
+        return 1
     violations: list[str] = []
     candidate_checker = root / ".github" / "scripts" / "check_supply_chain.py"
     if candidate_checker.is_symlink() or not candidate_checker.is_file():
@@ -2134,7 +2437,12 @@ def main(argv: list[str] | None = None) -> int:
     action_pins: dict[str, list[str]] = {}
     for workflow in checked_action_files:
         text = workflow.read_text(encoding="utf-8")
-        references = [reference.strip("'\"") for reference in USES.findall(text)]
+        document = workflow_documents.get(workflow.relative_to(root).as_posix())
+        references = (
+            [reference.strip("'\"") for reference in USES.findall(text)]
+            if document is None
+            else workflow_action_references(document)
+        )
         action_pins[str(workflow.relative_to(root))] = references
         for reference in references:
             if reference.startswith("./"):
@@ -2162,15 +2470,15 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(
             viewer_jwt_scope_violations(workflow.relative_to(root).as_posix(), text)
         )
-        if workflow.parent == workflows:
+        if document is not None:
             violations.extend(
                 policy_check_impersonation_violations(
-                    workflow.relative_to(root).as_posix(), text
+                    workflow.relative_to(root).as_posix(), document
                 )
             )
             violations.extend(
                 status_write_permission_violations(
-                    workflow.relative_to(root).as_posix(), text
+                    workflow.relative_to(root).as_posix(), document
                 )
             )
         if "ferrum-edge-linux-x86_64" in text:

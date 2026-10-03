@@ -1020,6 +1020,20 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
                 self.assertIn("GitHub Actions app", rendered)
                 self.assertIn(self.TRUSTED, rendered)
 
+    def test_an_unbound_state_guard_fails_the_audit(self):
+        # Its definition is protected too (pull_request_target), so an
+        # own-token commit status is the only way to forge it.
+        audit = self.audit_ruleset(
+            REQUIRED_CHECKS | {self.TRUSTED},
+            unbound=frozenset({"state-guard-reject-state-edits"}),
+        )
+        rendered = "\n".join(audit.violations)
+        self.assertIn("'state-guard-reject-state-edits' to the GitHub Actions app", rendered)
+        self.assertEqual(
+            audit_settings.SOURCE_BOUND_STATUS_CHECKS,
+            ("trusted-supply-chain-policy", "state-guard-reject-state-edits"),
+        )
+
     def test_older_unbound_contexts_are_a_warning(self):
         audit = self.audit_ruleset(
             REQUIRED_CHECKS | {self.TRUSTED}, unbound=frozenset({"rust-ci-check"})

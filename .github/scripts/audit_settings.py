@@ -55,9 +55,15 @@ TRANSITIONAL_STATUS_CHECKS = ("trusted-supply-chain-policy",)
 # check run from any other source with the same name satisfies the rule: a
 # collaborator's own token can post one. The bootstrap writes the binding for
 # every context. The audit requires it for the contexts in
-# `SOURCE_BOUND_STATUS_CHECKS` and warns for the rest, which predate it.
+# `SOURCE_BOUND_STATUS_CHECKS` and warns for the rest. Those two come from
+# `pull_request_target` workflows, whose definitions a pull request cannot
+# edit, so the binding is what keeps their verdict from being forged; the
+# others are defined by the pull request itself.
 GITHUB_ACTIONS_APP_ID = 15368
-SOURCE_BOUND_STATUS_CHECKS = ("trusted-supply-chain-policy",)
+SOURCE_BOUND_STATUS_CHECKS = (
+    "trusted-supply-chain-policy",
+    "state-guard-reject-state-edits",
+)
 
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 

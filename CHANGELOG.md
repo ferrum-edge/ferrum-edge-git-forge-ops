@@ -87,27 +87,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   only the protected branch's checker under `python3 -I` with `--root`, with
   `contents: read`, no secrets and a 10-minute timeout.
   `check_supply_chain.py`:
-  - pins every non-comment line of that workflow except the `actions/checkout`
-    commit;
-  - refuses, before reading anything, a symlink in the judged tree that is
-    absolute, leaves the tree or does not resolve, and any special file;
-  - refuses the text `trusted-supply-chain-policy` in any other workflow
-    outside two exact allow-listed lines (the settings audit's
-    `--required-check` and the release gate);
-  - refuses a computed job display name, and fails closed on job layouts it
-    cannot classify;
-  - refuses `checks: write`, `statuses: write` and `write-all` in every
-    workflow.
+  - before reading anything, refuses a symlink in the judged tree that is
+    absolute, climbs above the tree root by its target text, resolves outside
+    the tree or does not resolve, any special file, and a `--root` that is
+    itself a link;
+  - requires every workflow to be in a small YAML subset, read by a strict
+    stdlib reader before any rule runs. Anchors, aliases, tags, explicit and
+    merge keys, quoted keys, flow mappings, an indented root, tabs, markers,
+    directives and Unicode line breaks are refused. Block scalars and flow
+    sequences are accepted only for listed keys;
+  - pins every non-comment line of the new workflow except the
+    `actions/checkout` commit;
+  - refuses, on the parsed structure, any other job keyed or named
+    `trusted-supply-chain-policy`, a computed job display name, and
+    `checks`/`statuses` write (or `write-all`) in any workflow.
 
   The bootstrap now writes the new context alongside
   `security-supply-chain-policy` and binds every required context to the
   GitHub Actions app (`integration_id` 15368). The settings audit warns until
-  the `main` ruleset requires the new context, then requires that binding for
-  it, and warns for older unbound contexts. The release gate requires a
-  reported result to pass. Add the context to the ruleset after this change
-  merges (`docs/github-launch-controls.md`, "Switching the supply-chain policy
-  check"). The `security-supply-chain-policy` job stays, unchanged, until a
-  later change retires it (GHSA-x5m2-4555-q4cr).
+  the `main` ruleset requires the new context. It fails when
+  `trusted-supply-chain-policy` or `state-guard-reject-state-edits` is
+  unbound, so it is red after this merges until the operator re-runs the
+  bootstrap, and it warns for the other unbound contexts. The release gate
+  requires a reported result to pass. Add the context to the ruleset after
+  this change merges (`docs/github-launch-controls.md`, "Switching the
+  supply-chain policy check"). The `security-supply-chain-policy` job stays,
+  unchanged, until a later change retires it (GHSA-x5m2-4555-q4cr).
 - A queued rotation whose protected branch moved first prints a
   rotation-specific notice: the freshness guard's refusal text is written for
   apply, but no apply reschedules a rotation, so dispatch it again from the

@@ -63,7 +63,7 @@ stay red on `main` until the settings behind them exist:
 | Workflow | Red until | Section |
 | --- | --- | --- |
 | `Release` | the `main` ruleset declares required checks. Until then `gh pr checks --required` exits non-zero with "no required checks reported", so every push to `main` fails the publication gate. | [§2](#2-protect-main-with-an-active-ruleset) |
-| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, and repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template) | [§1](#1-create-the-state-writer-github-app), [§5](#5-enable-settings-drift-monitoring) |
+| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), and the `main` ruleset binds `state-guard-reject-state-edits` (and, once required, `trusted-supply-chain-policy`) to the GitHub Actions app | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§5](#5-enable-settings-drift-monitoring) |
 
 Neither workflow may assume a control it cannot verify. Configure §1-§5 first
 and neither goes red.
@@ -195,10 +195,13 @@ The supply-chain verdict is moving from `security-supply-chain-policy` (in
 1. **Expand (merged).** `supply-chain-policy.yml` is on `main`.
    `bootstrap_repo_settings.py` writes both contexts. `audit_settings.py`
    still requires `security-supply-chain-policy` and reports a missing
-   `trusted-supply-chain-policy` as a `WARN`, not a failure. The release gate
-   requires a reported `trusted-supply-chain-policy` result to pass.
+   `trusted-supply-chain-policy` as a `WARN`, not a failure. It does fail
+   while `state-guard-reject-state-edits` is not bound to the GitHub Actions
+   app. The release gate requires a reported `trusted-supply-chain-policy`
+   result to pass.
 2. **Ruleset switch (operator).** Add `trusted-supply-chain-policy` to the
-   `main` ruleset, as described below.
+   `main` ruleset and bind the required contexts to GitHub Actions, as
+   described below.
 3. **Retire (a later pull request).** The workflow-script unit tests move out
    of `security-supply-chain-policy`, the candidate-run policy runner is
    removed, and the audit, bootstrap and release gate require only the new
@@ -249,8 +252,11 @@ Take step 2 after step 1 has merged, as an administrator:
 
    Then dispatch `GitHub Settings Audit` from `main`. The
    `trusted-supply-chain-policy` warning must be gone. The audit fails if
-   `trusted-supply-chain-policy` is required from any source other than
-   GitHub Actions, and warns for each older context that is not yet bound.
+   `trusted-supply-chain-policy` or `state-guard-reject-state-edits` is
+   required from any source other than GitHub Actions, and warns for each
+   other context that is not yet bound. The scheduled audit therefore goes
+   red as soon as step 1 merges, until this step binds
+   `state-guard-reject-state-edits`.
 5. Pull requests whose branch predates the merge do not carry
    `supply-chain-policy.yml`, so the new check **fails** on them ("must remain
    a regular file"). Re-running it does not help: update the branch from
@@ -580,30 +586,48 @@ What the checker enforces for this check:
   through a fork of `actions/checkout`, so a change to that commit needs the
   same exact-head review as any other workflow change.
 - **The tree it reads.** Before reading anything, it walks the whole candidate
-  without following links. It refuses any symlink that is absolute, climbs out
-  of the tree or does not resolve, and any device, FIFO or socket. Because
-  `base/` sits beside `candidate/`, a link into `base/` would show this check
-  protected files while every other workflow, which runs the tree at the
-  workspace root, executes the pull request's own copy. Links that stay inside
-  the tree are allowed.
-- **The check name.** No other workflow may contain the text
-  `trusted-supply-chain-policy` (in any case, after comments are dropped and
-  double-quoted escapes decoded). The only exceptions are the exact
-  `--required-check` line in `settings-audit.yml` and the release gate's entry
-  in `release.yml`. No job may compute its display name with `${{ }}`. The
-  checker is not a YAML parser: it fails closed on a jobs layout it cannot
-  classify, such as a flow-style job, a job-level anchor, alias, tag or merge
-  key, or a `name:` that is empty, a block or flow scalar, or continued on the
-  next line.
-- **Status forgery.** No workflow may grant `checks: write`,
-  `statuses: write` or `write-all`. With either permission, a job could post a
-  result under any context it computes at run time, which no static rule can
-  see. The allow-list (`STATUS_WRITE_ALLOWED`) is empty.
+  without following links. It refuses any symlink that is absolute, whose
+  target text climbs above the tree root (even if it comes back in), that
+  resolves outside the tree, or that does not resolve, and any device, FIFO
+  or socket. Because `base/` sits beside `candidate/`, a link into `base/`
+  would show this check protected files while every other workflow, which
+  runs the tree at the workspace root, executes the pull request's own copy.
+  Links that stay inside the tree are allowed. A `--root` that is itself a
+  link is refused.
+- **Workflow syntax.** Every file in `.github/workflows/` must be written in
+  a small YAML subset, read by a strict standard-library reader before any
+  rule runs. A file outside it fails the check on its own. The subset:
+  - top-level keys at column 0, space indentation only, block mappings and
+    block sequences, and plain `[A-Za-z0-9_-]+` keys, unique per mapping;
+  - plain, single-quoted or double-quoted scalars on one line;
+  - block scalars (`|`, `>`) only for `run`, `script`, `body`, `description`,
+    `if`, `path`, `restore-keys`, `images` and `tags`;
+  - one-line flow sequences of scalars only for `branches`, `tags`, `paths`
+    (and their `-ignore` forms), `types`, `needs` and `workflows`.
+
+  Anchors, aliases, tags, explicit (`?`) keys, merge keys, quoted keys, flow
+  mappings, directives, document markers after a leading `---`, tabs outside
+  block scalars, a byte-order mark, control characters and Unicode line
+  breaks are all refused. YAML spells one key many ways. The rules below read
+  the parsed structure, so a spelling the reader does not accept cannot carry
+  a meaning past it.
+- **The check name.** No other workflow may define a job whose key or
+  `name:` equals `trusted-supply-chain-policy` (in any case, ignoring
+  surrounding whitespace), and no job's `name:` may be computed with
+  `${{ }}`. Mentioning the context in a script, a step title or an action
+  input is fine, since none of those names a check run.
+- **Status forgery.** At every `permissions:` in every workflow, `checks` and
+  `statuses` may only be `read` or `none`, and a string grant must be
+  `read-all` (`write-all` grants both). With write access, a job could post
+  a result under any context it computes at run time, which no static rule
+  can see. The allow-list (`STATUS_WRITE_ALLOWED`) is empty.
 - **Ruleset source.** The bootstrap binds every required context to the GitHub
-  Actions app (`integration_id` 15368). The audit requires that binding for
-  `trusted-supply-chain-policy` and warns for older contexts that lack it.
-  Unbound, a commit status a collaborator posts with their own token
-  satisfies the rule.
+  Actions app (`integration_id` 15368). The audit fails when
+  `trusted-supply-chain-policy` or `state-guard-reject-state-edits` lacks
+  that binding: both come from `pull_request_target` workflows a pull request
+  cannot edit, so an own-token commit status is the remaining way to forge
+  them. It warns for the other contexts, whose job definitions the pull
+  request supplies anyway.
 
 Until the `main` ruleset requires `trusted-supply-chain-policy`
 ([Switching the supply-chain policy check](#switching-the-supply-chain-policy-check)),

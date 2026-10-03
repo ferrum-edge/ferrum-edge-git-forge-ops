@@ -1092,6 +1092,18 @@ class SharedConstantTests(unittest.TestCase):
         self.assertEqual(audit.warnings, [])
         self.assertTrue(audit_settings.ruleset_targets_branch(ruleset, "main"))
 
+        tag = bootstrap.release_tag_ruleset_body(
+            [{"actor_type": "Integration", "actor_id": 1234, "bypass_mode": "always"}]
+        )
+        audit = audit_settings.Audit()
+        audit_settings.audit_tag_ruleset(audit, tag)
+        self.assertEqual(audit.violations, [])
+        self.assertTrue(
+            audit_settings.ruleset_targets_release_tags(
+                tag, audit_settings.RELEASE_TAG_PATTERN
+            )
+        )
+
     def test_the_ruleset_adds_the_trusted_policy_check_beside_the_retiring_one(self):
         # GHSA-x5m2-4555-q4cr expand step: the bootstrap writes the
         # protected-definition check and keeps the in-tree job's context,
@@ -1110,10 +1122,10 @@ class SharedConstantTests(unittest.TestCase):
         self.assertEqual(len(contexts), len(set(contexts)))
         # Every context is bound to the GitHub Actions app, as the manual
         # ruleset method does, so a status from another source cannot satisfy it.
-        self.assertEqual(
-            {check.get("integration_id") for check in rule["parameters"]["required_status_checks"]},
-            {15368},
-        )
+        sources = {
+            check.get("integration_id") for check in rule["parameters"]["required_status_checks"]
+        }
+        self.assertEqual(sources, {15368})
         self.assertEqual(bootstrap.GITHUB_ACTIONS_APP_ID, 15368)
 
     def test_an_unbound_context_is_planned_as_a_change(self):
@@ -1132,18 +1144,6 @@ class SharedConstantTests(unittest.TestCase):
         )
         self.assertIn("trusted-supply-chain-policy (any source)", detail)
         self.assertIn("trusted-supply-chain-policy (app 15368)", detail)
-
-        tag = bootstrap.release_tag_ruleset_body(
-            [{"actor_type": "Integration", "actor_id": 1234, "bypass_mode": "always"}]
-        )
-        audit = audit_settings.Audit()
-        audit_settings.audit_tag_ruleset(audit, tag)
-        self.assertEqual(audit.violations, [])
-        self.assertTrue(
-            audit_settings.ruleset_targets_release_tags(
-                tag, audit_settings.RELEASE_TAG_PATTERN
-            )
-        )
 
 
 if __name__ == "__main__":
