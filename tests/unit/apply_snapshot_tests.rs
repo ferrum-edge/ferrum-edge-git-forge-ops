@@ -395,6 +395,13 @@ fn assert_refused(run: &Run, reason: &str, context: &str) {
     assert!(run.result.fatal_error.is_none(), "{context}");
 }
 
+/// `errors[index]` names `what` (`<Kind> <id> <verb>`) for this test's
+/// namespace, with the `[<namespace>] ` prefix `apply_api` adds.
+fn assert_starts(errors: &[String], index: usize, what: &str) {
+    let expected = format!("[{NS}] {what}");
+    assert!(errors[index].starts_with(&expected), "{errors:?}");
+}
+
 /// `(desired, options)` for one overwrite of `planned`'s row `r1`.
 fn overwrite(kind: Kind, action: &str, planned: &GatewayConfig) -> (GatewayConfig, ApplyOptions) {
     let mut options = ApplyOptions::default();
@@ -523,10 +530,10 @@ async fn a_412_refuses_the_write_and_withholds_the_rest_of_the_namespace() {
     assert_eq!(run.count("GET /upstreams/u3 "), 0);
     let errors = &run.result.errors;
     assert_eq!(errors.len(), 3, "{errors:?}");
-    assert!(errors[0].starts_with("Upstream u1 update"), "{errors:?}");
+    assert_starts(errors, 0, "Upstream u1 update");
     assert!(errors[0].contains("412 Precondition Failed"), "{errors:?}");
-    assert!(errors[1].starts_with("Upstream u2 update"), "{errors:?}");
-    assert!(errors[2].starts_with("Upstream u9 create"), "{errors:?}");
+    assert_starts(errors, 1, "Upstream u2 update");
+    assert_starts(errors, 2, "Upstream u9 create");
     for withheld in &errors[1..] {
         assert!(withheld.contains("Upstream `u1`"), "{errors:?}");
         assert!(withheld.contains(WITHHELD), "{errors:?}");
@@ -559,7 +566,7 @@ async fn a_412_on_a_delete_defers_the_namespace_remaining_deletes() {
     assert_eq!(run.count("GET /upstreams/u2 "), 0);
     let errors = &run.result.errors;
     assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(errors[0].starts_with("Upstream u1 delete"), "{errors:?}");
+    assert_starts(errors, 0, "Upstream u1 delete");
     assert!(errors[0].contains("412 Precondition Failed"), "{errors:?}");
     assert_eq!(run.result.deleted, 0);
     assert_eq!(run.result.deletes_deferred, 1);
@@ -580,9 +587,9 @@ async fn a_stale_read_withholds_the_rest_of_the_namespace() {
     assert_eq!(run.count("GET /upstreams/next "), 0);
     let errors = &run.result.errors;
     assert_eq!(errors.len(), 2, "{errors:?}");
-    assert!(errors[0].starts_with("Upstream edited"), "{errors:?}");
+    assert_starts(errors, 0, "Upstream edited");
     assert!(errors[0].contains(CHANGED), "{errors:?}");
-    assert!(errors[1].starts_with("Upstream next update"), "{errors:?}");
+    assert_starts(errors, 1, "Upstream next update");
     assert!(errors[1].contains(WITHHELD), "{errors:?}");
     assert_eq!(run.result.deletes_deferred, 1);
 }
@@ -722,7 +729,7 @@ async fn a_failed_read_refuses_the_overwrite_and_defers_deletes() {
     let run = apply(&desired, planned, routes, false, Default::default()).await;
 
     assert_refused(&run, "boom", "failed read");
-    assert!(run.result.errors[0].starts_with("Upstream u1 update"));
+    assert_starts(&run.result.errors, 0, "Upstream u1 update");
     assert_eq!(run.count("GET /upstreams/u2 "), 0);
     assert_eq!(run.result.deletes_deferred, 1);
 
@@ -873,7 +880,10 @@ async fn an_ambiguous_create_claims_its_row_only_with_if_match_on_a_matching_rea
             assert_eq!(run.result.created, 1, "{context}");
         } else {
             assert_eq!(run.count("PUT /upstreams/u1"), 0, "{context}");
-            let fatal = run.result.fatal_error.expect("an unproven claim stops the run");
+            let fatal = run
+                .result
+                .fatal_error
+                .expect("an unproven claim stops the run");
             assert!(fatal.contains("did not show that row"), "{fatal}");
         }
     }

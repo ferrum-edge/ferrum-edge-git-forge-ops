@@ -2469,7 +2469,10 @@ fn observe_body(
     let (observed, dropped) = match kind {
         "Proxy" => {
             let (row, dropped): (Proxy, _) = decode_live_row(kind, body)?;
-            (observed_row(kind, row.api_spec_id.as_deref(), &row)?, dropped)
+            (
+                observed_row(kind, row.api_spec_id.as_deref(), &row)?,
+                dropped,
+            )
         }
         "Consumer" => {
             let (row, dropped): (Consumer, _) = decode_live_row(kind, body)?;
@@ -2477,11 +2480,17 @@ fn observe_body(
         }
         "Upstream" => {
             let (row, dropped): (Upstream, _) = decode_live_row(kind, body)?;
-            (observed_row(kind, row.api_spec_id.as_deref(), &row)?, dropped)
+            (
+                observed_row(kind, row.api_spec_id.as_deref(), &row)?,
+                dropped,
+            )
         }
         "PluginConfig" => {
             let (row, dropped): (PluginConfig, _) = decode_live_row(kind, body)?;
-            (observed_row(kind, row.api_spec_id.as_deref(), &row)?, dropped)
+            (
+                observed_row(kind, row.api_spec_id.as_deref(), &row)?,
+                dropped,
+            )
         }
         other => {
             return Err(crate::error::Error::Config(format!(
@@ -2795,8 +2804,7 @@ async fn adopt_matching_rows(
         Ok(snapshot) if snapshot.cached => {
             skip_all(
                 result,
-                "the confirmation backup was served from cache (X-Data-Source: cached)"
-                    .to_string(),
+                "the confirmation backup was served from cache (X-Data-Source: cached)".to_string(),
             );
             return;
         }
@@ -3884,7 +3892,12 @@ async fn assert_batch_ownership(
         .iter()
         .map(CreateResource::Upstream)
         .chain(batch.consumers.iter().map(CreateResource::Consumer))
-        .chain(batch.plugin_configs.iter().map(CreateResource::PluginConfig))
+        .chain(
+            batch
+                .plugin_configs
+                .iter()
+                .map(CreateResource::PluginConfig),
+        )
         .chain(batch.proxies.iter().map(CreateResource::Proxy));
     for resource in resources {
         let (kind, id) = (resource.kind(), resource.id());
