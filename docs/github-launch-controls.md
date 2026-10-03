@@ -586,10 +586,13 @@ What the checker enforces for this check:
   through a fork of `actions/checkout`, so a change to that commit needs the
   same exact-head review as any other workflow change.
 - **The tree it reads.** Before reading anything, it walks the whole candidate
-  without following links. It refuses any symlink that is absolute, whose
-  target text climbs above the tree root (even if it comes back in), that
-  resolves outside the tree, or that does not resolve, and any device, FIFO
-  or socket. Because `base/` sits beside `candidate/`, a link into `base/`
+  without following links. It follows each relative link target component by
+  component from the link's directory, and refuses any symlink that is
+  absolute, whose target passes through another symlink, whose target climbs
+  above the tree root (even if it comes back in), that resolves outside the
+  tree, or that does not resolve. It also refuses any device, FIFO or socket.
+  With no link in between, a target's text names the path the kernel
+  resolves, in every checkout layout. Because `base/` sits beside `candidate/`, a link into `base/`
   would show this check protected files while every other workflow, which
   runs the tree at the workspace root, executes the pull request's own copy.
   Links that stay inside the tree are allowed. A `--root` that is itself a

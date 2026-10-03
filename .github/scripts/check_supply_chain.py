@@ -1677,9 +1677,12 @@ def candidate_tree_violations(root: Path) -> list[str]:
     tree root therefore reads one file here and a different one everywhere
     else: `.github/scripts` pointing at the workspace's `base/.github/scripts`
     shows this check the protected scripts while later runs execute the pull
-    request's own copy. A climb is refused by its text, wherever it lands, so
-    `../candidate/x` cannot re-enter this layout through the directory name.
-    The resolved target is checked too, for chains of links. Every path
+    request's own copy. A relative target is followed component by component
+    from the link's directory: it may not pass through another link (the
+    kernel would take `..` of that link's target, not of its name), and it may
+    not climb above the tree root, even to come back in, so `../candidate/x`
+    cannot re-enter this layout through the directory name. The resolved
+    target is checked too, for chains of links. Every path
     component is visited without following a link, and nothing is read until
     the walk passes. Devices, FIFOs and sockets are refused, since reading
     one can hang or exhaust the job. `.git` directories are the checkout's own
@@ -1705,14 +1708,17 @@ def candidate_tree_violations(root: Path) -> list[str]:
             mode = os.lstat(path).st_mode
             if stat.S_ISLNK(mode):
                 target = os.readlink(path)
-                lexical = os.path.normpath(
-                    os.path.join(path.parent.relative_to(root).as_posix(), target)
-                )
+                through = None if os.path.isabs(target) else _link_traversal(root, path, target)
                 resolved = Path(os.path.realpath(path))
-                if (
+                if through is not None:
+                    violations.append(
+                        f"{relative}: symlink target passes through another "
+                        f"symlink ({through}); only a direct path inside the tree "
+                        "resolves the same everywhere"
+                    )
+                elif (
                     os.path.isabs(target)
-                    or lexical == ".."
-                    or lexical.startswith("../")
+                    or _link_climbs(root, path, target)
                     or not (resolved == real_root or resolved.is_relative_to(real_root))
                 ):
                     violations.append(
@@ -1730,6 +1736,45 @@ def candidate_tree_violations(root: Path) -> list[str]:
                     "symlinks may be reviewed; this is a special file"
                 )
     return violations
+
+
+def _link_climbs(root: Path, path: Path, target: str) -> bool:
+    """Whether a relative link target climbs above the tree root, even to return."""
+    parts = list(path.parent.relative_to(root).parts)
+    for component in target.split("/"):
+        if component == "..":
+            if not parts:
+                return True
+            parts.pop()
+        elif component not in ("", "."):
+            parts.append(component)
+    return False
+
+
+def _link_traversal(root: Path, path: Path, target: str) -> str | None:
+    """The first intermediate component of a link target that is itself a link.
+
+    Each prefix of the target, followed from the link's directory, is
+    `lstat`-ed; only the final component may be a link (a chain, which the
+    walk judges on its own). With no link in between, the text names exactly
+    the path the kernel resolves, in every checkout layout.
+    """
+    parts = list(path.parent.relative_to(root).parts)
+    components = [part for part in target.split("/") if part not in ("", ".")]
+    for component in components[:-1]:
+        if component == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        parts.append(component)
+        prefix = root.joinpath(*parts)
+        try:
+            if stat.S_ISLNK(os.lstat(prefix).st_mode):
+                return "/".join(parts)
+        except OSError:
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2061,7 +2106,9 @@ class _WorkflowReader:
         content_indent: int | None = None
         while self.index < len(self.lines):
             line = self.lines[self.index]
-            if not line.strip():
+            # YAML counts only spaces and tabs as blank; other Unicode
+            # spaces are content.
+            if not line.strip(" \t"):
                 lines.append("")
                 self.index += 1
                 continue

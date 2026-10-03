@@ -973,6 +973,17 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 (candidate / ".dockerignore").symlink_to("../candidate/x"),
                 ".dockerignore: symlink leaves the tree under review",
             )[-1],
+            # The same re-entry one hop longer: `d` points back at the root,
+            # so the kernel takes `d/..` above it while the text reads as
+            # `a/b/candidate/di`. A target may not pass through another link.
+            "reentry_through_link": lambda workspace, candidate: (
+                (candidate / "a/b").mkdir(parents=True),
+                (candidate / "a/b/d").symlink_to("../..", target_is_directory=True),
+                (candidate / "di").write_text(".git\n", encoding="utf-8"),
+                (candidate / ".dockerignore").unlink(),
+                (candidate / ".dockerignore").symlink_to("a/b/d/../candidate/di"),
+                ".dockerignore: symlink target passes through another symlink (a/b/d)",
+            )[-1],
         }
         for label, arrange in layouts.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:

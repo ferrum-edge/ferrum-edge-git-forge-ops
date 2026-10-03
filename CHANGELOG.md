@@ -88,9 +88,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `contents: read`, no secrets and a 10-minute timeout.
   `check_supply_chain.py`:
   - before reading anything, refuses a symlink in the judged tree that is
-    absolute, climbs above the tree root by its target text, resolves outside
-    the tree or does not resolve, any special file, and a `--root` that is
-    itself a link;
+    absolute, whose target passes through another symlink or climbs above the
+    tree root (followed component by component), that resolves outside the
+    tree or does not resolve, any special file, and a `--root` that is itself
+    a link;
   - requires every workflow to be in a small YAML subset, read by a strict
     stdlib reader before any rule runs. Anchors, aliases, tags, explicit and
     merge keys, quoted keys, flow mappings, an indented root, tabs, markers,
@@ -113,6 +114,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   this change merges (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check"). The `security-supply-chain-policy` job stays,
   unchanged, until a later change retires it (GHSA-x5m2-4555-q4cr).
+- Upgrade note for repositories made from this template: every workflow in
+  `.github/workflows/`, including your own, must now fit the YAML subset
+  above, or the supply-chain policy check fails. Common forms to rewrite
+  include `permissions: {}`, bracketed lists other than
+  `branches`/`tags`/`paths`/`types`/`needs`/`workflows` (for example a
+  matrix `environment: [staging, prod]` or `runs-on: [self-hosted, x]`),
+  anchors and aliases, a multi-line plain `if:`, and `|2` block scalars. Use
+  block style instead. The violation names the file and line.
 - A queued rotation whose protected branch moved first prints a
   rotation-specific notice: the freshness guard's refusal text is written for
   apply, but no apply reschedules a rotation, so dispatch it again from the
