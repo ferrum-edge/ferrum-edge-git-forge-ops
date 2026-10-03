@@ -134,3 +134,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `apply` evaluates policy before the state lock on the unresolved document,
   as the security audit sees it, and checks again after API credential
   resolution (GHSA-92v7-rq7m-pxfq).
+- Neutralize both GitHub Actions workflow-command syntaxes in terminal output.
+  Fenced validator diagnostics and resource IDs could reach stdout with `::`
+  at the start of a line or the legacy `##[command]` form anywhere in a line,
+  letting resource data forge annotations, add masks, fold logs, or suppress
+  later output with `stop-commands`. Shared diagnostic sanitization now breaks
+  both forms for validate, plan, apply and review terminal output, while the
+  Markdown sent to the GitHub comment and step summary keeps readable text
+  (GHSA-955f-64c5-hvfx).

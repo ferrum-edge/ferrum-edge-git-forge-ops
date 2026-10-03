@@ -543,6 +543,35 @@ fn terminal_review_leaves_fenced_validation_output_undecoded() {
     assert!(terminal.contains("skipped &#46; reason"), "{terminal}");
 }
 
+/// Markdown fences do not hide a leading `::` from the Actions runner, so the
+/// terminal rendering neutralizes every physical line — including one that is
+/// indented, which the runner trims before parsing — without decoding the
+/// fenced validator bytes.
+#[test]
+fn terminal_review_neutralizes_workflow_commands_inside_a_fence() {
+    let comment = build_review_comment(
+        false,
+        "::error::forged\n\t::warning::indented\nliteral &#96;&#96;&#96; and &#46;",
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+    let terminal = markdown_comment_for_terminal(&comment);
+
+    for line in terminal.lines() {
+        assert!(
+            !line.trim_start().starts_with("::"),
+            "terminal line parses as a workflow command: {line:?}"
+        );
+    }
+    assert!(terminal.contains('\u{fffd}'), "{terminal}");
+    // Fenced content is still not entity-decoded.
+    assert!(terminal.contains("literal &#96;&#96;&#96;"), "{terminal}");
+    assert!(terminal.contains("&#46;"), "{terminal}");
+}
+
 #[test]
 fn terminal_review_decodes_only_entities_emitted_by_the_markdown_sanitizer() {
     let comment = build_review_comment(
