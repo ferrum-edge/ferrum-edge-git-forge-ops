@@ -141,7 +141,10 @@ fn review_terminal_output_neutralizes_fenced_workflow_commands() {
     // The published comment keeps the validator's text verbatim inside its
     // dynamic fence; only the terminal rendering is neutralized.
     assert!(comment.contains("::error::forged annotation"), "{comment}");
-    assert!(comment.contains("##[error file=path]forged annotation"), "{comment}");
+    assert!(
+        comment.contains("##[error file=path]forged annotation"),
+        "{comment}"
+    );
 
     let terminal = markdown_comment_for_terminal(&comment);
     assert_no_workflow_command(&terminal, "review terminal");
