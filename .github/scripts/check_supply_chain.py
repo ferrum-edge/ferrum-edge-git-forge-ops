@@ -178,6 +178,14 @@ FRESH_HEAD_CONTROLS = (
 # an ad-hoc diff, so the paths that refuse a queued apply stay exactly the paths
 # that schedule a replacement one.
 #
+# Every reconciling job in every `FRESH_HEAD_WORKFLOWS` entry carries it, not
+# only apply's. Rotation waits on the same `ferrum-apply-<env>` lock and then
+# builds and runs the refreshed head with the same credentials; ancestry alone
+# let a later merge spend the dispatched run's environment approval. Strict
+# `fresh_head == TRIGGER_SHA` is not the rule either: apply's own ledger commit
+# moves the branch while a rotation waits, and the classifier already treats
+# that output as inert.
+#
 # Spelled as a family of families, because a half-present implementation is the
 # dangerous case: the classifier invoked without its branch argument silently
 # changes what the guard refuses and what its message tells the operator to do.
@@ -600,8 +608,11 @@ def stale_deployment_guard_violations(
             if required not in guard:
                 violations.append(f"{label}: {FRESH_HEAD_STEP!r} is missing {required!r}")
 
-        if workflow == "apply-on-merge.yml":
-            violations.extend(_revision_binding_violations(label, guard))
+        # Unconditional: a job that holds the lock and refreshes onto a newer
+        # head must prove that head is the revision its approval covers. Gating
+        # this on one workflow name is what left rotation binding by ancestry
+        # alone.
+        violations.extend(_revision_binding_violations(label, guard))
 
         for marker in contract["gateway"]:
             # Present AND after the guard. "After" alone would let the step be
@@ -641,9 +652,9 @@ def _revision_binding_violations(label: str, guard: str) -> list[str]:
             else "closest has every line, but not as one uninterrupted sequence"
         )
         return [
-            f"{label}: {FRESH_HEAD_STEP!r} must bind PR attribution to "
-            "unchanged executable and desired inputs; no recognized "
-            f"implementation is complete ({detail})"
+            f"{label}: {FRESH_HEAD_STEP!r} must bind PR attribution and "
+            "environment approval to unchanged executable and desired inputs; "
+            f"no recognized implementation is complete ({detail})"
         ]
 
     prelude = guard.find(PIPED_BINDING_PRELUDE)
@@ -1455,7 +1466,29 @@ def validator_locator_violations(texts: list[str]) -> list[str]:
     return violations
 
 
+# The runner executes inside the candidate checkout. Without `-I`, `python3 -`
+# puts that directory first on `sys.path`, so a candidate root module named
+# after anything the runner or the checker imports (`pathlib.py`,
+# `importlib/`, `argparse.py`) runs before the trusted policy and can exit 0.
+# Isolated mode drops the working directory and the user site directory and
+# ignores every `PYTHON*` environment variable.
+TRUSTED_POLICY_RUNNER = 'python3 -I - "$CHECKER" "$GITHUB_WORKSPACE"'
+TRUSTED_POLICY_RUNNER_ARGUMENTS = '"$CHECKER" "$GITHUB_WORKSPACE"'
+# `-I` already ignores these, but naming one in the policy workflow is still
+# an attempt to move the interpreter's import path or start-up code onto
+# candidate files, and the reviewed workflow has no use for any of them.
+TRUSTED_POLICY_FORBIDDEN_ENV = re.compile(r"\bPYTHON(?:PATH|STARTUP|HOME)\b")
+
+
 def trusted_supply_chain_policy_violations(text: str) -> list[str]:
+    """`security.yml` must run `main`'s checker, isolated, against the candidate.
+
+    This is a substring contract over the candidate's own copy of
+    `security.yml`, enforced by the run that copy defines. It catches an honest
+    regression and a shadowed import; it cannot stop a pull request that
+    rewrites the job itself. That boundary needs a workflow whose definition
+    the pull request does not supply (see docs/github-launch-controls.md).
+    """
     required = (
         "if: github.event_name == 'pull_request'",
         "ref: ${{ github.event.repository.default_branch }}",
@@ -1463,6 +1496,7 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
         "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
         "Candidate must retain the regular-file supply-chain checker.",
         "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
+        TRUSTED_POLICY_RUNNER,
         "module.ROOT = candidate",
         'module.WORKFLOWS = candidate / ".github" / "workflows"',
         "module.ACTION_FILES = sorted(",
@@ -1477,6 +1511,20 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
     if text.count("CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py") != 1:
         violations.append(
             "security.yml: the protected default-branch policy checker must be selected exactly once"
+        )
+    # Exactly one invocation, and it is the isolated one: a second, plain
+    # `python3 -` run of the same checker would reopen the import path.
+    if text.count(TRUSTED_POLICY_RUNNER_ARGUMENTS) != 1:
+        violations.append(
+            "security.yml: the trusted policy checker must be invoked exactly once, "
+            f"as {TRUSTED_POLICY_RUNNER!r}"
+        )
+    forbidden = sorted(set(TRUSTED_POLICY_FORBIDDEN_ENV.findall(text)))
+    if forbidden:
+        violations.append(
+            "security.yml: the policy workflow must not set "
+            f"{', '.join(forbidden)}; the trusted checker's interpreter takes no "
+            "import path or start-up code from the environment"
         )
     # The one-time pinned bootstrap covered the window where `main` did not yet
     # carry this checker. Now that it does, any fallback can only substitute an

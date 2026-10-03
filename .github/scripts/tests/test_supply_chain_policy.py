@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -258,6 +259,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
                 "Candidate must retain the regular-file supply-chain checker.",
                 "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
+                'python3 -I - "$CHECKER" "$GITHUB_WORKSPACE" <<\'PY\'',
                 "module.ROOT = candidate",
                 'module.WORKFLOWS = candidate / ".github" / "workflows"',
                 "module.ACTION_FILES = sorted(",
@@ -278,6 +280,114 @@ class SupplyChainPolicyTests(unittest.TestCase):
         )
         self.assertTrue(any("missing" in item for item in violations))
         self.assertTrue(any("unprotected PR base" in item for item in violations))
+
+    def test_security_policy_runner_must_be_isolated_from_the_candidate(self):
+        # GHSA-x5m2-4555-q4cr: the runner executes in the candidate checkout,
+        # and a plain `python3 -` imports candidate root modules first.
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.TRUSTED_POLICY_RUNNER,
+            'python3 -I - "$CHECKER" "$GITHUB_WORKSPACE"',
+        )
+        self.assertEqual(workflow.count(check_supply_chain.TRUSTED_POLICY_RUNNER), 1)
+        self.assertEqual(
+            check_supply_chain.trusted_supply_chain_policy_violations(workflow), []
+        )
+
+        importable = workflow.replace(
+            check_supply_chain.TRUSTED_POLICY_RUNNER,
+            'python3 - "$CHECKER" "$GITHUB_WORKSPACE"',
+            1,
+        )
+        self.assertNotEqual(importable, workflow)
+        violations = check_supply_chain.trusted_supply_chain_policy_violations(
+            importable
+        )
+        self.assertTrue(
+            any(
+                "missing" in item and "python3 -I -" in item for item in violations
+            ),
+            violations,
+        )
+
+        # Keeping the isolated line while adding a second, plain run of the
+        # same checker reopens the import path.
+        doubled = workflow.replace(
+            check_supply_chain.TRUSTED_POLICY_RUNNER,
+            'python3 - "$CHECKER" "$GITHUB_WORKSPACE" </dev/null || true\n'
+            "            " + check_supply_chain.TRUSTED_POLICY_RUNNER,
+            1,
+        )
+        self.assertNotEqual(doubled, workflow)
+        violations = check_supply_chain.trusted_supply_chain_policy_violations(
+            doubled
+        )
+        self.assertTrue(
+            any("invoked exactly once" in item for item in violations), violations
+        )
+
+        anchor = "        env:\n          EVENT_NAME: ${{ github.event_name }}\n"
+        self.assertIn(anchor, workflow)
+        for variable in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"):
+            with self.subTest(variable=variable):
+                redirected = workflow.replace(
+                    anchor, anchor + f"          {variable}: ${{{{ github.workspace }}}}\n", 1
+                )
+                violations = check_supply_chain.trusted_supply_chain_policy_violations(
+                    redirected
+                )
+                self.assertTrue(
+                    any(
+                        "must not set" in item and variable in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_candidate_root_modules_cannot_preempt_the_trusted_checker(self):
+        # Hostile candidate-root modules named after what the runner and the
+        # checker import. Without `-I` one of them runs first and exits green;
+        # with it the trusted checker runs and still reports a real violation.
+        runner = self._trusted_policy_runner_source()
+        hostile = (
+            "import os\n"
+            "print('shadowed', flush=True)\n"
+            "os._exit(0)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = self._mirror_repo(Path(directory))
+            for module in ("pathlib.py", "argparse.py", "json.py", "re.py"):
+                (candidate / module).write_text(hostile, encoding="utf-8")
+            # A known violation the trusted checker must still find.
+            path = candidate / ".github/workflows/rotate.yml"
+            text = path.read_text(encoding="utf-8")
+            start = text.index(
+                "      - name: Refresh protected branch and reject stale deployments"
+            )
+            end = text.index("      - name: ", start + 20)
+            path.write_text(text[:start] + text[end:], encoding="utf-8")
+
+            def run(flags: list[str]) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [sys.executable, *flags, "-", str(SCRIPT), str(candidate)],
+                    input=runner,
+                    cwd=str(candidate),
+                    check=False,
+                    text=True,
+                    capture_output=True,
+                )
+
+            shadowed = run([])
+            isolated = run(["-I"])
+        # The planted modules really are reachable without isolation...
+        self.assertEqual(shadowed.returncode, 0, shadowed.stdout + shadowed.stderr)
+        self.assertIn("shadowed", shadowed.stdout)
+        # ...and isolated mode runs the trusted checker, which rejects the tree.
+        self.assertEqual(isolated.returncode, 1, isolated.stdout + isolated.stderr)
+        self.assertNotIn("shadowed", isolated.stdout)
+        self.assertIn("must refresh the protected branch", isolated.stderr)
 
     def test_pr_trigger_must_rerun_on_retarget_and_target_main(self):
         secure = """on:
@@ -2140,20 +2250,88 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("merge-base --is-ancestor" in item for item in violations), violations
         )
 
-    def test_apply_freshness_guard_must_bind_pr_attribution_to_revision(self):
+    def test_freshness_guard_must_bind_authorization_to_revision(self):
         # A queued old run may consume newer state-writer output, but it must
         # not apply a later PR's resources or policy under the old PR's label
-        # and credential recipient.
-        with tempfile.TemporaryDirectory() as directory:
-            root = self._mirror_repo(Path(directory))
-            path = root / ".github/workflows/apply-on-merge.yml"
-            text = path.read_text(encoding="utf-8")
-            self.assertIn(STDIN_CLASSIFIER, text)
-            text = text.replace(STDIN_CLASSIFIER, "          true\n", 1)
-            path.write_text(text, encoding="utf-8")
-            violations = self._violations(root)
-        self.assertTrue(
-            any("must bind PR attribution" in item for item in violations), violations
+        # and credential recipient — nor rotate with a later merge's binary,
+        # helpers or resources under the dispatched run's environment approval
+        # (GHSA-xwxm-vjgq-mxhj).
+        self.assertEqual(
+            sorted(check_supply_chain.FRESH_HEAD_WORKFLOWS),
+            ["apply-on-merge.yml", "rotate.yml"],
+        )
+        for workflow in check_supply_chain.FRESH_HEAD_WORKFLOWS:
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                text = path.read_text(encoding="utf-8")
+                self.assertIn(STDIN_CLASSIFIER, text)
+                text = text.replace(STDIN_CLASSIFIER, "          true\n", 1)
+                path.write_text(text, encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        workflow in item and "must bind PR attribution" in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_rotation_guard_accepts_only_the_trigger_pinned_classifier(self):
+        contract = check_supply_chain.FRESH_HEAD_WORKFLOWS["rotate.yml"]
+        workflow = (ROOT / ".github/workflows/rotate.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count(STDIN_CLASSIFIER), 1)
+        self.assertEqual(
+            check_supply_chain.stale_deployment_guard_violations(
+                "rotate.yml", workflow, contract
+            ),
+            [],
+        )
+
+        def rejected(candidate: str, needle: str) -> None:
+            self.assertNotEqual(candidate, workflow)
+            violations = check_supply_chain.stale_deployment_guard_violations(
+                "rotate.yml", candidate, contract
+            )
+            self.assertTrue(any(needle in item for item in violations), violations)
+
+        incomplete = "no recognized implementation is complete"
+        # Ancestry alone — the shape this replaces.
+        rejected(workflow.replace(STDIN_CLASSIFIER, "", 1), incomplete)
+        # Strict equality is not a recognized binding either: it would refuse
+        # every rotation queued behind an apply's own ledger commit.
+        rejected(
+            workflow.replace(
+                STDIN_CLASSIFIER,
+                '          [ "$fresh_head" = "$TRIGGER_SHA" ] || exit 1\n',
+                1,
+            ),
+            incomplete,
+        )
+        # Not isolated: the refreshed checkout could shadow a classifier import.
+        rejected(
+            workflow.replace(
+                "            python3 -I - classify \\\n",
+                "            python3 - classify \\\n",
+                1,
+            ),
+            incomplete,
+        )
+        # Run from the refreshed checkout it is judging.
+        rejected(
+            workflow.replace(
+                "            python3 -I - classify \\\n",
+                "            python3 -I .github/scripts/deployment_scope.py classify \\\n",
+                1,
+            ),
+            incomplete,
+        )
+        # Without pipefail a failed extraction approves the revision.
+        opening = "        run: |\n          set -euo pipefail\n          [[ \"$TRIGGER_SHA\""
+        self.assertEqual(workflow.count(opening), 1)
+        rejected(
+            workflow.replace(opening, opening.replace("set -euo pipefail", "set -eu"), 1),
+            "must open with 'set -euo pipefail'",
         )
 
     def test_the_classifier_is_the_only_recognized_attribution_binding(self):
@@ -2695,6 +2873,16 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     # -- helpers ------------------------------------------------------------
+
+    def _trusted_policy_runner_source(self) -> str:
+        """The inline runner `security.yml` feeds the trusted checker."""
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        start = workflow.index(check_supply_chain.TRUSTED_POLICY_RUNNER + " <<'PY'\n")
+        body = workflow.index("\n", start) + 1
+        end = workflow.index("\n          PY\n", body)
+        return textwrap.dedent(workflow[body:end]) + "\n"
 
     def _mirror_repo(self, root: Path) -> Path:
         """Copy the policy-relevant tree so a test can mutate one file.

@@ -93,6 +93,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reseeded under its typed slot (only if it was issued for that type) and the
   old key is removed. Import, diff and review masking, validator stand-ins and
   output scrubbing use the typed slot (GHSA-j6xj-prxm-wp2q).
+- `rotate.yml` binds a queued rotation to the revision it was dispatched from.
+  After taking the shared `ferrum-apply-<env>` lock and refreshing onto the
+  current head of `main`, its freshness guard now also runs the
+  trigger-pinned `deployment_scope.py classify`, as apply does. A rotation is
+  refused before it builds anything, loads a credential bundle or writes a
+  secret when a later merge changed a deployment input; apply's own ledger
+  commits and other inert changes do not refuse it. Re-dispatch a refused
+  rotation from the current head. `check_supply_chain.py` now requires the
+  binding in every reconciling job of every freshness-guarded workflow, not
+  only apply (GHSA-xwxm-vjgq-mxhj).
+- The `security-supply-chain-policy` job runs the protected-branch checker
+  under `python3 -I`, so no module in the pull request's checkout can load
+  before the trusted policy. `check_supply_chain.py` requires the isolated
+  invocation, exactly once, and rejects `PYTHONPATH`, `PYTHONSTARTUP` and
+  `PYTHONHOME` in `security.yml`. `docs/github-launch-controls.md` now states
+  that, until the required check moves to a workflow whose definition comes
+  from the protected branch, a green result also depends on reviewing workflow
+  changes (GHSA-x5m2-4555-q4cr).
 - Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
   CVE-2026-103111 finding while the pinned Debian base remains behind.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on
