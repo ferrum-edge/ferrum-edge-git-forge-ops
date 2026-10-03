@@ -925,19 +925,68 @@ async fn admin_mutations_reject_redirects_without_following_them() {
         ),
         "{error:?}"
     );
-    // A bare "API error (307)" told the operator nothing. The one thing they
-    // need is where the admin API actually lives.
+    // A bare "API error (307)" told the operator nothing, but the `Location`
+    // usually names the secret-backed gateway URL — often as a normalized
+    // variant GitHub's exact-value masking would not catch — so it must be
+    // classified, never echoed. The hint the operator needs is the shape of
+    // the move.
     let message = error.to_string();
     assert!(
-        message.contains(&format!("http://{target_addr}/captured")),
-        "the Location must be named: {message}"
+        !message.contains(&target_addr.to_string()),
+        "the redirect target must not be disclosed: {message}"
     );
+    assert!(
+        !message.contains("captured"),
+        "the redirect path must not be disclosed: {message}"
+    );
+    assert!(message.contains("a different origin"), "{message}");
     assert!(message.contains("FERRUM_GATEWAY_URL"), "{message}");
     assert!(message.contains("never follows redirects"), "{message}");
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(
         target_rx.try_recv().is_err(),
         "the redirect target must never receive the admin mutation"
+    );
+}
+
+/// A redirect whose `Location` sits on the gateway's own origin — the common
+/// `/admin` → `/admin/` canonicalization — is classified without echoing the
+/// host, port or path. This is exactly the normalized variant GitHub's
+/// exact-value masking would not catch.
+#[tokio::test]
+async fn redirect_on_the_gateway_origin_is_classified_not_echoed() {
+    let source = TcpListener::bind("127.0.0.1:0").unwrap();
+    let source_addr = source.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = source.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let body = r#"{"error":"moved"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: http://{source_addr}/admin/backup\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let client =
+        AdminClient::new_scoped(&stub_env(format!("http://{source_addr}")), TEST_NAMESPACES)
+            .unwrap();
+    let message = client.get_backup("team-alpha").await.unwrap_err().to_string();
+
+    assert!(
+        !message.contains(&source_addr.to_string()),
+        "the gateway host:port must not be disclosed: {message}"
+    );
+    assert!(
+        !message.contains("/admin/backup"),
+        "the redirect path must not be disclosed: {message}"
+    );
+    assert!(
+        message.contains("same origin under a different path"),
+        "{message}"
     );
 }
 
@@ -1087,6 +1136,35 @@ fn redirect_message_reads_with_single_spaces() {
         assert!(
             message.contains("(scheme, host, port and any path prefix)"),
             "{message}"
+        );
+    }
+}
+
+/// The `Location` is described by how it relates to the configured base, never
+/// by its own host, port or path — those are the secret-backed gateway URL.
+#[test]
+fn redirect_location_is_classified_against_the_configured_base() {
+    let base = "https://gateway.example:9000";
+    for (location, expected) in [
+        ("https://gateway.example:9000/other", "same origin under a different path"),
+        ("https://gateway.example:9443/other", "a different origin"),
+        ("http://gateway.example:9000/other", "changed scheme"),
+        ("https://elsewhere.example/x", "a different origin"),
+        ("/admin/", "same origin under a different path"),
+        ("//elsewhere.example/x", "a different origin"),
+    ] {
+        let message = gitforgeops::http_client::map_api_error_with_redirect_base(
+            301,
+            "",
+            RequestKind::Read,
+            Some(location),
+            Some(base),
+        )
+        .to_string();
+        assert!(message.contains(expected), "{location}: {message}");
+        assert!(
+            !message.contains("gateway.example") && !message.contains("elsewhere.example"),
+            "{location} disclosed its host: {message}"
         );
     }
 }

@@ -607,6 +607,11 @@ fn verify_base_url_follows_the_gateway_transport_rule() {
         .to_string();
     assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{error}");
     assert!(error.contains("FERRUM_ALLOW_INSECURE_HTTP"), "{error}");
+    assert!(error.contains("environment secret"), "{error}");
+    assert!(
+        !error.contains("edge.example.com"),
+        "the secret-backed data-plane URL must be withheld: {error}"
+    );
 
     let error = validate_verify_transport(Some("http://edge.example.com"), true, true)
         .expect_err("the opt-in does not reach a remote host in CI")
@@ -670,6 +675,10 @@ fn insecure_opt_ins_are_refused_in_ci_for_remote_hosts() {
             .to_string();
     assert!(error.contains("FERRUM_TLS_NO_VERIFY"), "{error}");
     assert!(error.contains("GITHUB_ACTIONS"), "{error}");
+    assert!(
+        !error.contains("gateway.internal"),
+        "the secret-backed gateway URL must be withheld: {error}"
+    );
 
     // Outside CI the same combination is a developer's own machine: allowed,
     // with a banner.
@@ -773,10 +782,12 @@ fn the_viewer_secret_keeps_its_exact_bytes() {
 }
 
 #[test]
-fn env_config_debug_redacts_both_jwt_secrets() {
+fn env_config_debug_redacts_every_secret() {
     let admin = "synthetic-admin-signing-key-at-least-32-bytes";
     let viewer = "synthetic-viewer-signing-key-at-least-32-bytes";
     let config = EnvConfig {
+        gateway_url: Some("https://synthetic-gateway.internal:9443".to_string()),
+        verify_base_url: Some("https://synthetic-data-plane.internal:9443".to_string()),
         admin_jwt_secret: Some(admin.to_string()),
         admin_jwt_viewer_secret: Some(viewer.to_string()),
         github_token: Some("synthetic-github-token".to_string()),
@@ -794,6 +805,16 @@ fn env_config_debug_redacts_both_jwt_secrets() {
     assert!(!rendered.contains("synthetic-client-key"), "{rendered}");
     assert!(!rendered.contains("synthetic-provisioner-token"));
     assert!(!rendered.contains("synthetic-inline-bundle"));
+    // Both transport URLs are GitHub Environment secrets, so the derived URL
+    // must not survive a stray `{:?}` on the config.
+    assert!(
+        !rendered.contains("synthetic-gateway.internal"),
+        "the gateway URL must be redacted: {rendered}"
+    );
+    assert!(
+        !rendered.contains("synthetic-data-plane.internal"),
+        "the verify base URL must be redacted: {rendered}"
+    );
     assert!(rendered.contains("<redacted>"), "{rendered}");
     assert!(rendered.contains("admin_jwt_issuer"), "{rendered}");
 }

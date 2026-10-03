@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -335,11 +336,12 @@ impl AdminClient {
         if is_success_status(resp.status) {
             return Ok(());
         }
-        Err(map_api_error_with_location(
+        Err(map_api_error_with_redirect_base(
             resp.status,
             &resp.body,
             kind,
             resp.location.as_deref(),
+            Some(self.gateway_url.as_str()),
         ))
     }
 
@@ -881,11 +883,12 @@ impl AdminClient {
             return Ok(DeleteOutcome::Deleted);
         }
         Err(self
-            .refine_mutation_error(map_api_error_with_location(
+            .refine_mutation_error(map_api_error_with_redirect_base(
                 resp.status,
                 &resp.body,
                 RequestKind::Mutation,
                 resp.location.as_deref(),
+                Some(self.gateway_url.as_str()),
             ))
             .await)
     }
@@ -899,7 +902,64 @@ impl AdminClient {
 /// suffix, and `context` names the failed operation without restating the
 /// endpoint.
 fn transport_error(context: &str, error: reqwest::Error) -> String {
-    format!("{context}: {}", error.without_url())
+    // Name the transport class outright rather than deferring to reqwest's
+    // top-level `Display`, which reads the same for a refused connection and a
+    // timeout. The remaining failures keep reqwest's own text, stripped of the
+    // `for url (…)` suffix it appends.
+    if error.is_connect() {
+        format!("{context}: could not connect")
+    } else if error.is_timeout() {
+        format!("{context}: timed out")
+    } else {
+        format!("{context}: {}", error.without_url())
+    }
+}
+
+/// Classify a 3xx `Location` against the configured gateway base without
+/// disclosing either value.
+///
+/// The `Location` header usually names the gateway — often a normalized
+/// variant of `FERRUM_GATEWAY_URL` (an added slash, a canonicalized path) that
+/// GitHub's exact-value masking would not match — so it must never be printed.
+/// What an operator needs is the *shape* of the move: a different path on the
+/// same origin, the same host under a changed scheme, a wholly different
+/// origin, or a relative path. None of those name a host, port or path prefix.
+fn describe_redirect(base: Option<&str>, location: Option<&str>) -> String {
+    let Some(raw) = location.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "It carried no usable `Location` header. ".to_string();
+    };
+    let base = base.and_then(|raw| url::Url::parse(raw).ok());
+    let destination = match url::Url::parse(raw) {
+        Ok(parsed) => parsed,
+        // A relative or scheme-relative reference still has to be classified:
+        // resolve it against the base and compare, so `//other.host/x` is not
+        // mistaken for a same-origin path.
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            match base.as_ref().and_then(|base| base.join(raw).ok()) {
+                Some(resolved) => resolved,
+                None => return "It pointed at a relative path. ".to_string(),
+            }
+        }
+        Err(_) => {
+            return "It carried a `Location` that is not a URL gitforgeops can classify. "
+                .to_string();
+        }
+    };
+    let Some(base) = base else {
+        return "It pointed at another origin. ".to_string();
+    };
+    let same_host = destination.host_str() == base.host_str()
+        && destination.port_or_known_default() == base.port_or_known_default();
+    if !same_host {
+        "It pointed at a different origin. ".to_string()
+    } else if destination.scheme() == base.scheme() {
+        "It pointed at the same origin under a different path. ".to_string()
+    } else {
+        format!(
+            "It pointed at the same host under a changed scheme ({}://). ",
+            destination.scheme()
+        )
+    }
 }
 
 /// Whether a tolerated DELETE actually removed something.
@@ -1033,9 +1093,19 @@ fn rollback_needs_manual_recovery(rollback: Option<&str>) -> bool {
 
 /// The `GET /config/export` URL, checked for the transport a viewer bearer
 /// token may use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExportEndpoint {
     url: String,
+}
+
+/// The URL is derived from `FERRUM_GATEWAY_URL`, an environment secret, so it
+/// renders `<redacted>` rather than the host, port and path prefix it names.
+impl fmt::Debug for ExportEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExportEndpoint")
+            .field("url", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ExportEndpoint {
@@ -1182,11 +1252,29 @@ pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error
 
 /// [`map_api_error`] with the response's `Location` header, which only the 3xx
 /// arm consults.
+///
+/// This base-less form has no configured gateway URL to compare against, so it
+/// can only say whether a destination is relative or an absolute URL at some
+/// unclassifiable other origin. A live call site holds the base URL and uses
+/// [`map_api_error_with_redirect_base`] to classify the relationship fully.
 pub fn map_api_error_with_location(
     status: u16,
     body: &str,
     kind: RequestKind,
     location: Option<&str>,
+) -> crate::error::Error {
+    map_api_error_with_redirect_base(status, body, kind, location, None)
+}
+
+/// [`map_api_error_with_location`] with the configured gateway base URL, so the
+/// 3xx arm can describe how a redirect's `Location` relates to it without
+/// echoing either value.
+pub fn map_api_error_with_redirect_base(
+    status: u16,
+    body: &str,
+    kind: RequestKind,
+    location: Option<&str>,
+    base: Option<&str>,
 ) -> crate::error::Error {
     let parsed = ApiErrorBody::parse(body);
     let message = parsed.error.clone().unwrap_or_else(|| body.to_string());
@@ -1198,12 +1286,7 @@ pub fn map_api_error_with_location(
     // has moved, or a load balancer terminating TLS and bouncing http→https —
     // was invisible. Applies to reads as much as to mutations.
     if (300..=399).contains(&status) {
-        let destination = match location {
-            Some(location) if !location.trim().is_empty() => {
-                format!("It pointed at `{}`. ", location.trim())
-            }
-            _ => "It carried no usable `Location` header. ".to_string(),
-        };
+        let destination = describe_redirect(base, location);
         return crate::error::Error::ApiError {
             status,
             message: format!(
