@@ -763,3 +763,15 @@ fn the_viewer_token_is_sent_only_over_https_or_to_a_loopback_ip() {
     let error = ExportEndpoint::from_gateway_url("http://localhost:9000").unwrap_err();
     assert!(error.to_string().contains("literal loopback IP"), "{error}");
 }
+
+/// The endpoint embeds `FERRUM_GATEWAY_URL`, an environment secret, so its
+/// `Debug` must not render the host, port or path prefix it names.
+#[test]
+fn export_endpoint_debug_redacts_the_gateway_url() {
+    let endpoint = ExportEndpoint::from_gateway_url("https://secret.internal:9443/admin").unwrap();
+    let rendered = format!("{endpoint:?}");
+    assert!(!rendered.contains("secret.internal"), "{rendered}");
+    assert!(!rendered.contains("9443"), "{rendered}");
+    assert!(!rendered.contains("/admin"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+}
