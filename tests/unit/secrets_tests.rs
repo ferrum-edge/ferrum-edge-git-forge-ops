@@ -3084,10 +3084,9 @@ fn steady_plugin_config_array_resolves_without_a_remap() {
 
     assert!(report.slot_remaps.is_empty());
     assert!(
-        report.warnings.iter().any(
-            |w| w.contains("ferrum/oidc/@plugin/oidc_relying_party/config/providers")
-                && w.contains("slot identity")
-        ),
+        report.warnings.iter().any(|w| w
+            .contains("ferrum/oidc/@plugin/oidc_relying_party/config/providers")
+            && w.contains("slot identity")),
         "expected the positional advisory"
     );
     let providers = &cfg.plugin_configs[0].config["providers"];

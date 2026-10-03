@@ -2278,7 +2278,10 @@ impl<'a> PluginWalk<'a> {
         let namespace = escape_slot_component(self.namespace);
         let plugin_id = escape_slot_component(self.plugin_id);
         let owned = plugin_config_slot(self.namespace, self.plugin_id, self.plugin_name, &[]);
-        for kind in [PLUGIN_CONFIG_SLOT_KIND, RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND] {
+        for kind in [
+            PLUGIN_CONFIG_SLOT_KIND,
+            RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND,
+        ] {
             let prefix = format!("{namespace}/{plugin_id}/{kind}");
             let foreign = bundle
                 .range(prefix.clone()..)
