@@ -102,3 +102,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `apply` evaluates policy before the state lock on the unresolved document,
   as the security audit sees it, and checks again after API credential
   resolution (GHSA-92v7-rq7m-pxfq).
+- Neutralize GitHub Actions workflow-command syntax in the review comment's
+  terminal rendering. Fenced validator diagnostics were printed to stdout
+  verbatim, so a resource-triggered line beginning with `::` was parsed by the
+  runner as a workflow command (forged annotations, masked values, folded logs,
+  or `::stop-commands::` suppressing later output). Every physical line of
+  `review`'s stdout rendering now goes through the line-aware diagnostic
+  sanitizer, while the Markdown sent to the GitHub comment and step summary
+  keeps the validator's readable text (GHSA-955f-64c5-hvfx).

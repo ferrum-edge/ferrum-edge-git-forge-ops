@@ -20,6 +20,7 @@ use gitforgeops::diff::security::audit_security;
 use gitforgeops::error::Error;
 use gitforgeops::policy::config::{PolicyRules, RequireAuthPluginRuleConfig};
 use gitforgeops::policy::{evaluate_policies, PolicyConfig, Severity};
+use gitforgeops::review::pr_comment::{build_review_comment, markdown_comment_for_terminal};
 
 use tempfile::TempDir;
 
@@ -87,6 +88,38 @@ fn sanitize_block_keeps_line_structure_but_not_commands() {
 
     // CRLF input reads normally rather than growing a replacement character.
     assert_eq!(sanitize_block("one\r\ntwo\r\n"), "one\ntwo\n");
+}
+
+/// The review terminal renderer is the last stop before `validate-pr.yml`'s
+/// job log. Fenced validator output is deliberately left undecoded for the
+/// rendered comment, but Markdown fencing means nothing to the Actions runner:
+/// a diagnostic line beginning with `::` must be neutralized on the way to
+/// stdout, while the Markdown sent to GitHub keeps the readable diagnostic.
+#[test]
+fn review_terminal_output_neutralizes_fenced_workflow_commands() {
+    let validation = concat!(
+        "::error::forged annotation\n",
+        "  ::stop-commands::7c6d\n",
+        "::add-mask::literal-secret\n",
+        "::group::folded\n",
+        "::warning::second annotation\n",
+        "ordinary diagnostic\n",
+    );
+    let comment = build_review_comment(false, validation, &[], &[], &[], &[], None);
+
+    // The published comment keeps the validator's text verbatim inside its
+    // dynamic fence; only the terminal rendering is neutralized.
+    assert!(comment.contains("::error::forged annotation"), "{comment}");
+
+    let terminal = markdown_comment_for_terminal(&comment);
+    assert_no_workflow_command(&terminal, "review terminal");
+    assert!(
+        terminal.contains('\u{fffd}'),
+        "hostile workflow command reached the terminal verbatim:\n{terminal}"
+    );
+    // Neutralized means prefixed, not dropped: the diagnostic stays readable.
+    assert!(terminal.contains("::error::forged annotation"), "{terminal}");
+    assert!(terminal.contains("ordinary diagnostic"), "{terminal}");
 }
 
 /// A composed message keeps its length; only the hostile bytes change.
