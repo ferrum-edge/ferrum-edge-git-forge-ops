@@ -13,7 +13,10 @@ use gitforgeops::secrets::{
     DEFAULT_GITHUB_API_BASE,
 };
 use gitforgeops::verify::runner::run_check;
-use gitforgeops::verify::{HeaderValue, Outcome, SmokeCheck};
+use gitforgeops::verify::{
+    authorize_probe_slots, EnvironmentChecks, HeaderValue, Outcome, ProbeConsumerAllowlist,
+    SmokeCheck, VERIFY_PROBE_LABEL,
+};
 
 const REPO: &str = "test/fixture";
 const ENVIRONMENT: &str = "staging";
@@ -777,17 +780,39 @@ async fn a_same_job_first_allocation_reaches_the_traffic_check_through_the_hando
         retry_backoff_ms: 0,
         replay_safe: false,
     };
+    // `verify` authorizes the slot (an allowlisted, labelled probe Consumer)
+    // before reading a bundle, and the runner sees only that projection.
+    let desired: gitforgeops::config::schema::GatewayConfig =
+        serde_json::from_value(serde_json::json!({
+            "consumers": [{
+                "id": "app",
+                "username": "app",
+                "namespace": "ferrum",
+                "labels": { VERIFY_PROBE_LABEL: "true" },
+                "credentials": {
+                    "keyauth": [{ "key": "${gh-env-secret:alloc=generate}" }]
+                }
+            }]
+        }))
+        .expect("desired config");
+    let allowlist = ProbeConsumerAllowlist::parse("ferrum/app").expect("allowlist");
+    let checks = EnvironmentChecks {
+        checks: vec![check.clone()],
+    };
+    let authorization = authorize_probe_slots("staging", &checks, &desired, Some(&allowlist))
+        .expect("the probe slot is authorized");
     let (base_url, seen) = spawn_data_plane(generated.clone());
 
     // The pre-apply snapshot is what verify used to read: the slot is
     // missing, and the check fails before sending anything.
-    let stale = merge_bundles(&pre_apply);
+    let stale = authorization.project(&merge_bundles(&pre_apply));
     let result = run_check(&base_url, &check, &stale, None).await;
     assert_eq!(result.outcome, Outcome::Unreachable);
     assert_eq!(result.attempts, 0);
     assert!(result.detail.contains("not in the bundle"));
     assert!(seen.lock().expect("seen").is_empty());
 
+    let finalized = authorization.project(&finalized);
     let result = run_check(&base_url, &check, &finalized, None).await;
     assert_eq!(result.outcome, Outcome::Passed);
     assert_eq!(result.actual_status, Some(200));
