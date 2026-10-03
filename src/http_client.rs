@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
@@ -12,6 +12,9 @@ use crate::config::EnvConfig;
 use crate::config_export::ConfigExport;
 use crate::diagnostics::{safe, safe_line};
 use crate::jwt::{self, JwtOptions};
+
+/// Most namespaces [`AdminClient::issues_entity_tags`] looks in for a row.
+const ENTITY_TAG_PROBE_NAMESPACES: usize = 20;
 
 /// Page size requested from paginated list endpoints. The server clamps to
 /// 1000, so this is the largest single round-trip it will serve.
@@ -199,6 +202,13 @@ impl AdminClient {
             }
         };
 
+        // Refuse up front what every request would refuse anyway (see
+        // `AdminClient::authorize`), so a command fails once, before any call.
+        let parsed = url::Url::parse(&gateway_url).map_err(|_| unusable_gateway_url())?;
+        if !credential_transport_allowed(&parsed) {
+            return Err(cleartext_credential_refused());
+        }
+
         Ok(Self {
             client,
             gateway_url: gateway_url.trim_end_matches('/').to_string(),
@@ -254,6 +264,31 @@ impl AdminClient {
         format!("{}{}", self.gateway_url, path)
     }
 
+    /// [`AdminClient::authorize`] for a path under the gateway URL.
+    fn authorized(&self, path: &str) -> crate::error::Result<Authorized<'_>> {
+        self.authorize(self.url(path))
+    }
+
+    /// The only way to build a request that carries the admin bearer token.
+    ///
+    /// The token is minted, and attached, only after `url` is shown to be
+    /// `https://`, or cleartext `http://` to a loopback host
+    /// ([`credential_transport_allowed`]). Every admin call builds its request
+    /// through the returned [`Authorized`], so no call can send the token to a
+    /// remote host in cleartext, whatever was configured.
+    fn authorize(&self, target: String) -> crate::error::Result<Authorized<'_>> {
+        let parsed = url::Url::parse(&target).map_err(|_| unusable_gateway_url())?;
+        if !credential_transport_allowed(&parsed) {
+            return Err(cleartext_credential_refused());
+        }
+        let token = self.token()?;
+        Ok(Authorized {
+            client: &self.client,
+            url: target,
+            token,
+        })
+    }
+
     /// Send an HTTP request with automatic retry on transient failures.
     ///
     /// The retry decision is made by [`classify_retry`] from the status code
@@ -275,6 +310,10 @@ impl AdminClient {
     {
         let max_attempts = self.max_retries.saturating_add(1);
         let mut last_error: Option<String> = None;
+        // Set once an attempt got an HTTP response and was retried anyway: the
+        // gateway saw that attempt, which may have committed a write. A retry
+        // after a connect error does not count; nothing was sent.
+        let mut answered_before = false;
 
         for attempt in 1..=max_attempts {
             match build().send().await {
@@ -282,6 +321,7 @@ impl AdminClient {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
                     let location = header_string(&resp, "location");
+                    let etag = header_string(&resp, "etag");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
                     let body = resp
                         .text()
@@ -294,6 +334,8 @@ impl AdminClient {
                             body,
                             data_source,
                             location,
+                            etag,
+                            retried: answered_before,
                         });
                     }
 
@@ -301,6 +343,7 @@ impl AdminClient {
                     let retryable = classify_retry(status, &parsed, kind) == RetryDecision::Retry;
                     if retryable && attempt < max_attempts {
                         last_error = Some(format!("HTTP {status}"));
+                        answered_before = true;
                         match retry_after {
                             Some(delay) => tokio::time::sleep(delay).await,
                             None => backoff_sleep(attempt).await,
@@ -312,6 +355,8 @@ impl AdminClient {
                         body,
                         data_source,
                         location,
+                        etag,
+                        retried: answered_before,
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
@@ -387,11 +432,9 @@ impl AdminClient {
     /// Authenticated `GET /health`. Carries `mode`, `ready` and
     /// `admin_writes_enabled` — the ahead-of-time signal for read-only mode.
     pub async fn get_health(&self) -> crate::error::Result<HealthStatus> {
-        let token = self.token()?;
+        let target = self.authorized("/health")?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
-                self.client.get(self.url("/health")).bearer_auth(&token)
-            })
+            .send_with_retry(RequestKind::Read, || target.request(Method::GET))
             .await?;
         self.check(&resp, RequestKind::Read)?;
         serde_json::from_str::<HealthStatus>(&resp.body)
@@ -415,11 +458,9 @@ impl AdminClient {
     /// shape this build does not model", which `get_cluster` folds into one
     /// error. `doctor` needs the first answer even when the second fails.
     pub async fn get_cluster_body(&self) -> crate::error::Result<String> {
-        let token = self.token()?;
+        let target = self.authorized("/cluster")?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
-                self.client.get(self.url("/cluster")).bearer_auth(&token)
-            })
+            .send_with_retry(RequestKind::Read, || target.request(Method::GET))
             .await?;
         self.check(&resp, RequestKind::Read)?;
         Ok(resp.body)
@@ -432,12 +473,11 @@ impl AdminClient {
         &self,
         namespace: &str,
     ) -> crate::error::Result<BackupSnapshot> {
-        let token = self.token()?;
+        let target = self.authorized("/backup")?;
         let resp = self
             .send_with_retry(RequestKind::Read, || {
-                self.client
-                    .get(self.url("/backup"))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::GET)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -486,13 +526,11 @@ impl AdminClient {
         endpoint: &ExportEndpoint,
         namespace: &str,
     ) -> crate::error::Result<ConfigExport> {
-        let token = self.token()?;
-        let url = endpoint.as_str();
+        let target = self.authorize(endpoint.as_str().to_string())?;
         let resp = self
             .send_with_retry(RequestKind::Read, || {
-                self.client
-                    .get(url)
-                    .bearer_auth(&token)
+                target
+                    .request(Method::GET)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -535,17 +573,15 @@ impl AdminClient {
     /// of 100 (max 1000). Requesting the max and looping until the reported
     /// total is covered keeps `import --from-api` from silently truncating.
     pub async fn list_namespaces(&self) -> crate::error::Result<Vec<String>> {
-        let token = self.token()?;
         let mut pages: Vec<Vec<String>> = Vec::new();
         let mut offset: i64 = 0;
         let mut accumulated: usize = 0;
 
         loop {
             let path = format!("/namespaces?offset={offset}&limit={LIST_PAGE_LIMIT}");
+            let target = self.authorized(&path)?;
             let resp = self
-                .send_with_retry(RequestKind::Read, || {
-                    self.client.get(self.url(&path)).bearer_auth(&token)
-                })
+                .send_with_retry(RequestKind::Read, || target.request(Method::GET))
                 .await?;
             self.check(&resp, RequestKind::Read)?;
 
@@ -581,18 +617,17 @@ impl AdminClient {
         extras: &BackupExtras,
         confirm_api_spec_deletion: bool,
     ) -> crate::error::Result<()> {
-        let token = self.token()?;
         let body = build_restore_body(config, extras, confirm_api_spec_deletion)?;
         let path = if confirm_api_spec_deletion {
             "/restore?confirm=true&confirm_api_spec_deletion=true"
         } else {
             "/restore?confirm=true"
         };
+        let target = self.authorized(path)?;
         let resp = self
             .send_with_retry(RequestKind::Restore, || {
-                self.client
-                    .post(self.url(path))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::POST)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(&body)
             })
@@ -622,12 +657,11 @@ impl AdminClient {
         batch: &BatchCreate,
         namespace: &str,
     ) -> crate::error::Result<Option<BatchCreated>> {
-        let token = self.token()?;
+        let target = self.authorized("/batch")?;
         let resp = self
             .send_with_retry(RequestKind::NonIdempotentMutation, || {
-                self.client
-                    .post(self.url("/batch"))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::POST)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(batch)
             })
@@ -665,12 +699,11 @@ impl AdminClient {
     }
 
     pub async fn create_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
-        let token = self.token()?;
+        let target = self.authorized("/proxies")?;
         let resp = self
             .send_with_retry(RequestKind::NonIdempotentMutation, || {
-                self.client
-                    .post(self.url("/proxies"))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::POST)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(proxy)
             })
@@ -680,14 +713,13 @@ impl AdminClient {
     }
 
     pub async fn update_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
-        let token = self.token()?;
         validate_resource_id_for_path(&proxy.id)?;
         let path = format!("/proxies/{}", proxy.id);
+        let target = self.authorized(&path)?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
-                self.client
-                    .put(self.url(&path))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::PUT)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(proxy)
             })
@@ -710,7 +742,7 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/proxies/{id}?cleanup_orphaned_upstream=false");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
     }
 
     pub async fn create_consumer(
@@ -718,12 +750,11 @@ impl AdminClient {
         consumer: &Consumer,
         namespace: &str,
     ) -> crate::error::Result<()> {
-        let token = self.token()?;
+        let target = self.authorized("/consumers")?;
         let resp = self
             .send_with_retry(RequestKind::NonIdempotentMutation, || {
-                self.client
-                    .post(self.url("/consumers"))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::POST)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(consumer)
             })
@@ -737,14 +768,13 @@ impl AdminClient {
         consumer: &Consumer,
         namespace: &str,
     ) -> crate::error::Result<()> {
-        let token = self.token()?;
         validate_resource_id_for_path(&consumer.id)?;
         let path = format!("/consumers/{}", consumer.id);
+        let target = self.authorized(&path)?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
-                self.client
-                    .put(self.url(&path))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::PUT)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(consumer)
             })
@@ -759,7 +789,7 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/consumers/{id}");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
     }
 
     pub async fn create_upstream(
@@ -767,12 +797,11 @@ impl AdminClient {
         upstream: &Upstream,
         namespace: &str,
     ) -> crate::error::Result<()> {
-        let token = self.token()?;
+        let target = self.authorized("/upstreams")?;
         let resp = self
             .send_with_retry(RequestKind::NonIdempotentMutation, || {
-                self.client
-                    .post(self.url("/upstreams"))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::POST)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(upstream)
             })
@@ -786,14 +815,13 @@ impl AdminClient {
         upstream: &Upstream,
         namespace: &str,
     ) -> crate::error::Result<()> {
-        let token = self.token()?;
         validate_resource_id_for_path(&upstream.id)?;
         let path = format!("/upstreams/{}", upstream.id);
+        let target = self.authorized(&path)?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
-                self.client
-                    .put(self.url(&path))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::PUT)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(upstream)
             })
@@ -808,7 +836,7 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/upstreams/{id}");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
     }
 
     pub async fn create_plugin_config(
@@ -816,12 +844,11 @@ impl AdminClient {
         pc: &PluginConfig,
         namespace: &str,
     ) -> crate::error::Result<()> {
-        let token = self.token()?;
+        let target = self.authorized("/plugins/config")?;
         let resp = self
             .send_with_retry(RequestKind::NonIdempotentMutation, || {
-                self.client
-                    .post(self.url("/plugins/config"))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::POST)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(pc)
             })
@@ -835,14 +862,13 @@ impl AdminClient {
         pc: &PluginConfig,
         namespace: &str,
     ) -> crate::error::Result<()> {
-        let token = self.token()?;
         validate_resource_id_for_path(&pc.id)?;
         let path = format!("/plugins/config/{}", pc.id);
+        let target = self.authorized(&path)?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
-                self.client
-                    .put(self.url(&path))
-                    .bearer_auth(&token)
+                target
+                    .request(Method::PUT)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(pc)
             })
@@ -857,7 +883,161 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         validate_resource_id_for_path(id)?;
         let path = format!("/plugins/config/{id}");
-        self.delete(&path, namespace).await
+        self.delete(&path, namespace, None).await
+    }
+
+    /// Read one proxy, consumer, upstream or plugin config for a conditional
+    /// write: the row and the strong entity-tag Ferrum Edge issued for it.
+    ///
+    /// `Ok(None)` is a 404: no row holds the id. A row served from the
+    /// gateway's in-memory cache (`X-Data-Source: cached`) is refused as a
+    /// stale view, and a response without a strong `ETag` is refused as
+    /// [`crate::error::Error::ConditionalWriteUnavailable`]. Ferrum Edge
+    /// issues tags only for a read from its configuration database, so either
+    /// answer means no write can be made conditional on what was read.
+    pub async fn get_tagged(
+        &self,
+        kind: &str,
+        id: &str,
+        namespace: &str,
+    ) -> crate::error::Result<Option<TaggedResource>> {
+        let path = resource_path(kind, id)?;
+        let target = self.authorized(&path)?;
+        let resp = self
+            .send_with_retry(RequestKind::Read, || {
+                target
+                    .request(Method::GET)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
+        if resp.status == 404 {
+            return Ok(None);
+        }
+        self.check(&resp, RequestKind::Read)?;
+        let cached = resp
+            .data_source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("cached"));
+        if cached {
+            return Err(crate::error::Error::StaleGatewayView(format!(
+                "Refusing to overwrite {kind} `{id}` in namespace `{namespace}`: the gateway \
+                 served GET {path} from its in-memory cache (X-Data-Source: cached), which may \
+                 predate the configuration database and carries no entity-tag to make the write \
+                 conditional on. Wait for the database to recover and retry."
+            )));
+        }
+        let Some(etag) = strong_entity_tag(resp.etag.as_deref()) else {
+            return Err(crate::error::Error::ConditionalWriteUnavailable(format!(
+                "GET {path} in namespace `{namespace}` returned no strong ETag, so a write to \
+                 {kind} `{id}` cannot be made conditional (If-Match) on the row this run \
+                 validated. Ferrum Edge v0.9.10 and later issue one for proxies, consumers, \
+                 upstreams and plugin configs. No overwrite was attempted."
+            )));
+        };
+        let body = serde_json::from_str(&resp.body)
+            .map_err(|e| crate::error::Error::HttpClient(format!("GET {path}: {e}")))?;
+        Ok(Some(TaggedResource { etag, body }))
+    }
+
+    /// `PUT` one resource only if its stored row still carries `etag`.
+    ///
+    /// A `412 Precondition Failed` is [`ConditionalUpdate::Refused`]: Ferrum
+    /// Edge compares the tag and commits the write under one namespace
+    /// admission lease, so a 412 proves the row changed after it was read and
+    /// this attempt wrote nothing. After a retried attempt, the change may be
+    /// that earlier attempt's own commit; the caller decides.
+    pub async fn update_if_match<T: Serialize>(
+        &self,
+        kind: &str,
+        id: &str,
+        resource: &T,
+        namespace: &str,
+        etag: &str,
+    ) -> crate::error::Result<ConditionalUpdate> {
+        let path = resource_path(kind, id)?;
+        let target = self.authorized(&path)?;
+        let resp = self
+            .send_with_retry(RequestKind::Mutation, || {
+                target
+                    .request(Method::PUT)
+                    .header("X-Ferrum-Namespace", namespace)
+                    .header("If-Match", etag)
+                    .json(resource)
+            })
+            .await?;
+        if resp.status == 412 {
+            return Ok(ConditionalUpdate::Refused(PreconditionRefusal {
+                after_retry: resp.retried,
+                message: precondition_failed_message("PUT", &path, resp.retried),
+            }));
+        }
+        self.check_mutation(&resp, RequestKind::Mutation).await?;
+        Ok(ConditionalUpdate::Applied)
+    }
+
+    /// Whether the gateway issues the strong `ETag` every conditional
+    /// overwrite needs, learned from one existing row: `Some(true)` or
+    /// `Some(false)` (Ferrum Edge before v0.9.10), or `None` when no row was
+    /// found to read. Reads only: a list page and one single-resource read.
+    pub async fn issues_entity_tags(&self) -> crate::error::Result<Option<bool>> {
+        let namespaces = self.list_namespaces().await?;
+        for namespace in namespaces.iter().take(ENTITY_TAG_PROBE_NAMESPACES) {
+            for kind in ["Proxy", "Upstream", "PluginConfig", "Consumer"] {
+                let Some(id) = self.first_row_id(kind, namespace).await? else {
+                    continue;
+                };
+                match self.get_tagged(kind, &id, namespace).await {
+                    Ok(Some(_)) => return Ok(Some(true)),
+                    Ok(None) => {}
+                    Err(crate::error::Error::ConditionalWriteUnavailable(_)) => {
+                        return Ok(Some(false));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The id of the first `kind` row in `namespace`, from one list page.
+    async fn first_row_id(
+        &self,
+        kind: &str,
+        namespace: &str,
+    ) -> crate::error::Result<Option<String>> {
+        let path = format!("{}?offset=0&limit=1", collection_path(kind)?);
+        let target = self.authorized(&path)?;
+        let resp = self
+            .send_with_retry(RequestKind::Read, || {
+                target
+                    .request(Method::GET)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
+        self.check(&resp, RequestKind::Read)?;
+        let page: Page<serde_json::Value> = serde_json::from_str(&resp.body)
+            .map_err(|e| crate::error::Error::HttpClient(format!("GET {path}: {e}")))?;
+        let id = page.data.first().and_then(|row| row["id"].as_str());
+        Ok(id.map(str::to_string))
+    }
+
+    /// `DELETE` one resource only if its stored row still carries `etag`.
+    /// A 404 is tolerated as for [`AdminClient::delete_proxy`]; a 412 is
+    /// [`crate::error::Error::StalePlan`], as for
+    /// [`AdminClient::update_if_match`]. A proxy is deleted without the
+    /// server-side orphan cleanup, as [`AdminClient::delete_proxy`] explains.
+    pub async fn delete_if_match(
+        &self,
+        kind: &str,
+        id: &str,
+        namespace: &str,
+        etag: &str,
+    ) -> crate::error::Result<DeleteOutcome> {
+        let mut path = resource_path(kind, id)?;
+        if kind == "Proxy" {
+            path.push_str("?cleanup_orphaned_upstream=false");
+        }
+        self.delete(&path, namespace, Some(etag)).await
     }
 
     /// Shared DELETE path with 404 tolerance — see [`delete_succeeded`].
@@ -866,16 +1046,28 @@ impl AdminClient {
     /// flattened into `Ok(())`: individually a 404 is benign, but a namespace
     /// where *every* delete 404s is the signature of a misrouted run, and the
     /// caller can only say that if it can count them.
-    async fn delete(&self, path: &str, namespace: &str) -> crate::error::Result<DeleteOutcome> {
-        let token = self.token()?;
+    async fn delete(
+        &self,
+        path: &str,
+        namespace: &str,
+        if_match: Option<&str>,
+    ) -> crate::error::Result<DeleteOutcome> {
+        let target = self.authorized(path)?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
-                self.client
-                    .delete(self.url(path))
-                    .bearer_auth(&token)
-                    .header("X-Ferrum-Namespace", namespace)
+                let request = target
+                    .request(Method::DELETE)
+                    .header("X-Ferrum-Namespace", namespace);
+                match if_match {
+                    Some(etag) => request.header("If-Match", etag),
+                    None => request,
+                }
             })
             .await?;
+        if resp.status == 412 && if_match.is_some() {
+            let message = precondition_failed_message("DELETE", path, resp.retried);
+            return Err(crate::error::Error::StalePlan(message));
+        }
         if resp.status == 404 {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -892,6 +1084,140 @@ impl AdminClient {
             ))
             .await)
     }
+}
+
+/// A request target the admin bearer token may be sent to, with that token.
+///
+/// Only [`AdminClient::authorize`] builds one, after checking the transport,
+/// so every request that carries the token went through that check.
+struct Authorized<'a> {
+    client: &'a Client,
+    url: String,
+    token: String,
+}
+
+impl Authorized<'_> {
+    fn request(&self, method: Method) -> RequestBuilder {
+        self.client
+            .request(method, self.url.as_str())
+            .bearer_auth(&self.token)
+    }
+}
+
+/// Whether the admin bearer token, and the consumer credentials in request
+/// bodies, may be sent to `url`: over `https://` always, over cleartext
+/// `http://` only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`).
+///
+/// `FERRUM_ALLOW_INSECURE_HTTP=true` admits a cleartext gateway URL at
+/// configuration time; it does not extend this to a remote host.
+fn credential_transport_allowed(target: &url::Url) -> bool {
+    match target.scheme() {
+        "https" => true,
+        "http" => match target.host() {
+            Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn unusable_gateway_url() -> crate::error::Error {
+    crate::error::Error::Config(
+        "FERRUM_GATEWAY_URL is not a usable URL; the value is an environment secret and is \
+         withheld"
+            .to_string(),
+    )
+}
+
+fn cleartext_credential_refused() -> crate::error::Error {
+    crate::error::Error::Config(
+        "refusing to send the admin token over cleartext http:// to a gateway host that is not \
+         loopback; the value is an environment secret and is withheld. Use https://, or http:// \
+         only to localhost, 127.0.0.0/8 or [::1]. FERRUM_ALLOW_INSECURE_HTTP=true does not \
+         extend cleartext to a remote host"
+            .to_string(),
+    )
+}
+
+/// One resource read for a conditional write.
+#[derive(Debug, Clone)]
+pub struct TaggedResource {
+    /// The `ETag` header exactly as received (quoted), sent back verbatim in
+    /// `If-Match`.
+    pub etag: String,
+    /// The row the tag describes. The admin role reads proxies, upstreams and
+    /// plugin configs in full; consumers come back with their credentials
+    /// redacted, although the tag covers them.
+    pub body: serde_json::Value,
+}
+
+/// The single-resource admin path for a managed kind.
+fn resource_path(kind: &str, id: &str) -> crate::error::Result<String> {
+    validate_resource_id_for_path(id)?;
+    let collection = collection_path(kind)?;
+    Ok(format!("{collection}/{id}"))
+}
+
+/// The admin collection path for a managed kind.
+fn collection_path(kind: &str) -> crate::error::Result<&'static str> {
+    match kind {
+        "Proxy" => Ok("/proxies"),
+        "Consumer" => Ok("/consumers"),
+        "Upstream" => Ok("/upstreams"),
+        "PluginConfig" => Ok("/plugins/config"),
+        other => {
+            let message = format!("no admin endpoint for kind `{other}`");
+            Err(crate::error::Error::Config(message))
+        }
+    }
+}
+
+/// The `ETag` value when it is one strong entity-tag (RFC 9110 §8.8.3).
+///
+/// A weak tag (`W/"…"`) never satisfies `If-Match`, and a list or malformed
+/// value cannot name one representation, so neither can make a write
+/// conditional.
+pub fn strong_entity_tag(raw: Option<&str>) -> Option<String> {
+    let tag = raw?.trim();
+    let opaque = tag.strip_prefix('"')?.strip_suffix('"')?;
+    let valid = !opaque.is_empty()
+        && opaque
+            .bytes()
+            .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte));
+    valid.then(|| tag.to_string())
+}
+
+/// What a conditional `PUT` ([`AdminClient::update_if_match`]) did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalUpdate {
+    Applied,
+    /// `412 Precondition Failed`: the row no longer carries the tag.
+    Refused(PreconditionRefusal),
+}
+
+/// A `412 Precondition Failed` answer to a conditional write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreconditionRefusal {
+    /// An earlier attempt of the same request reached the gateway and was
+    /// retried, so it may itself have committed the write.
+    pub after_retry: bool,
+    pub message: String,
+}
+
+fn precondition_failed_message(method: &str, path: &str, retried: bool) -> String {
+    let retried = if retried {
+        " An earlier attempt of this request reached the gateway and was retried, so it may \
+         itself have committed the write."
+    } else {
+        ""
+    };
+    format!(
+        "not applied: the gateway answered 412 Precondition Failed to the conditional \
+         {method} {path}, so the row changed after this run read and validated it and the \
+         write was refused.{retried} Re-run apply to plan against the current gateway"
+    )
 }
 
 /// Render a `reqwest` transport failure with its request URL removed.
@@ -982,6 +1308,12 @@ struct RawResponse {
     /// `Location`, kept only so a 3xx can name where the admin API is
     /// actually being served from. Redirects are never followed.
     location: Option<String>,
+    /// `ETag`, which a single-resource `GET` carries for a conditional write.
+    etag: Option<String>,
+    /// An earlier attempt got an HTTP response and was retried. A conditional
+    /// write answered `412` after that may have been refused because its own
+    /// earlier attempt committed.
+    retried: bool,
 }
 
 /// What kind of call is being made, for retry/error classification. `/restore`

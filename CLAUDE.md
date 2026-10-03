@@ -293,10 +293,12 @@ deletes in reverse).
 
 - Association comparison sorts IDs without deduplicating live data. Payloads
   and printed changes keep original order.
-- After scoped plugin writes, one fresh backup per namespace suppresses proxy
-  updates that already converged, while keeping required ownership assertions
-  (including ledger adoption of unchanged exclusive rows).
-- Deletes tolerate 404.
+- After scoped plugin writes, each affected proxy is re-read (`GET
+  /proxies/{id}`), which suppresses proxy updates that already converged while
+  keeping required ownership assertions (including ledger adoption of
+  unchanged exclusive rows).
+- Deletes tolerate 404. A delete whose row is already gone at its conditional
+  read is not sent (counted as already gone).
 - **Pure-add namespace** → transactional `POST /batch` (create-only,
   all-or-nothing, chunked under the 1 MiB `BATCH_MAX_BODY_BYTES` cap), falling
   back to per-resource creates on 501.
@@ -361,14 +363,63 @@ namespace payload is built before the first mutation.
   bundles always survive.
 - Refused before mutation: a spec graph that cannot be proven complete, a
   repo/spec ID conflict, cached data, or an unfamiliar top-level backup section.
-- A non-empty `api_specs` section is wipe-and-reinsert, and the admin API has no
-  `ETag`/`If-Match`/revision precondition. So the section is re-read (`GET
-  /backup`) right before the POST, and that namespace's restore is abandoned if
-  any spec document changed. This narrows the lost-update window to one round
-  trip; it cannot close it.
+- A non-empty `api_specs` section is wipe-and-reinsert, and `/restore` takes no
+  precondition (Edge's `If-Match` covers only single-resource `PUT`/`DELETE` of
+  proxies, upstreams, consumers and plugin configs). So the section is re-read
+  (`GET /backup`) right before the POST, and that namespace's restore is
+  abandoned if any spec document changed. This narrows the lost-update window
+  to one round trip; it cannot close it.
 
 #### Mutation safety (both strategies)
 
+- **Incremental overwrites are conditional** (GHSA-fh5w-5x4f-86gh). The plan
+  comes from a `/backup` read before credential allocation and delivery, so
+  every `PUT`/`DELETE` of an existing row — Modify, Delete, pending-create
+  assertion, post-plugin proxy update, shared adoption claim, ambiguous-create
+  and ambiguous-batch ownership assertions — goes through
+  `api_target::Preconditions` (or the same steps inline):
+  1. `GET /<kind>/{id}` (`AdminClient::get_tagged`); Edge v0.9.10+
+     (`src/admin/preconditions.rs`) returns a strong `ETag` for the stored row;
+  2. the row must still be the planned one (`Preconditions::confirm_content`):
+     same `api_spec_id` (`ownership_refusal`), same content minus server
+     timestamps, and for an update no nested field the typed mirror drops
+     (`decode_live_row` / `refuse_dropped_field`). A proxy is compared without
+     its associations to plugin configs this run wrote
+     (`Preconditions::written_plugins`, `without_written_associations`) and
+     with every other association, so a concurrently attached plugin is not
+     detached and a scoped plugin can move off a proxy deleted in the same
+     run. When the read's content differs, one `/backup` taken after the read
+     decides: `/backup` is normalized on load and the read is the stored row,
+     so representation-only differences (legacy un-normalized rows) must not
+     refuse forever;
+  3. `PUT`/`DELETE` with `If-Match: <etag>` (`update_if_match` /
+     `delete_if_match`). Edge compares and commits under the namespace
+     admission lease every admin writer takes, so a `412` proves the row
+     changed after the read and nothing was written.
+
+  A mismatch or `412` is `Error::StalePlan`: a per-resource error that also
+  withholds **every later write in the namespace** (creates and updates
+  reported, deletes deferred, adoption skipped); other namespaces continue. A
+  `412` answering a `PUT` retried after a response
+  (`ConditionalUpdate::Refused`, `after_retry`) counts as applied when a
+  re-read shows the desired row unowned (`CreateResource::wrote_itself`;
+  never for consumers). A gone row: delete not sent (already gone), update
+  refused. A cached single read is `StaleGatewayView`; a missing or weak
+  `ETag` (pre-0.9.10 gateway, which would also ignore `If-Match`) is the
+  run-stopping `ConditionalWriteUnavailable`, which `preflight_api_apply`
+  (before allocation and any write) and `doctor`'s
+  `gateway-conditional-writes` check also probe for. Edge redacts consumer
+  credentials on `GET /consumers/{id}` while its tag covers them, so a
+  namespace's consumer targets are all read first, then one `/backup`
+  (credentials) is compared to the plan: a change before a read shows in the
+  backup, one after it fails `If-Match`. Only `rotate`'s consumer `PUT` and
+  `/restore` stay unconditional. `plan` does not probe: it reads `/backup`
+  only.
+- **Credentials travel only over TLS or loopback.** Every admin request is
+  built through `AdminClient::authorize` / `Authorized::request`, the only
+  place the bearer token is minted and attached; it refuses a target that is
+  not `https://` or `http://` to a loopback host (`credential_transport_allowed`),
+  and client construction refuses such a gateway URL up front.
 - A `GET /health` preflight runs before the first mutation, so a read-only
   plane fails once instead of N times.
 - A sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations:
@@ -377,7 +428,7 @@ namespace payload is built before the first mutation.
 - Create and batch POST errors are never retried blindly. An ambiguous outcome
   is checked against an authoritative (non-cached) backup (`LiveMatch`):
   - **exact** row live → an idempotent PUT declares repository ownership and the
-    create is recorded;
+    create is recorded (conditional on a tagged read taken before the backup);
   - row **absent** → the write did not commit; ordinary per-resource error, run
     continues;
   - row **present but different**, or no usable verification → run-stopping
@@ -804,8 +855,10 @@ that is live exactly as declared, untouched this run, absent from
 recorded (`ApplyResult::adopted`, replayed through `StateFile::record_op`).
 
 - **shared**: the same idempotent PUT as pending-create recovery (equality is
-  not provenance), only against a *fresh* `GET /backup`. A row edited in between
-  is skipped with a message (`ApplyResult::adoption_skipped`).
+  not provenance), only against a *fresh* `GET /backup` and with `If-Match` on
+  a read that still equals the declaration (consumers are read before the
+  backup). A row edited in between, or a `412`, is skipped with a message
+  (`ApplyResult::adoption_skipped`).
 - **exclusive**: recorded without a PUT (keeps the fence correct if the env later
   switches to shared).
 - **file mode**: `StateFile::record` stamps the whole desired set.
@@ -966,8 +1019,10 @@ row"**: in exclusive mode that deletes the live row.
   `ResolveReport::without_namespaces` and journals creates only outside that
   set. The interactive preview prints it via `apply_blocked_namespaces` (same
   preparation, no `/health` probe).
-- Later re-reads (post-plugin proxy snapshot, shared adoption confirmation,
-  ambiguous-create verification) intentionally do not re-check.
+- Later backup re-reads (consumer credential confirmation, shared adoption
+  confirmation, ambiguous-create verification) do not re-check. The
+  conditional single-row read before every update does: a nested field the
+  typed mirror drops refuses the write as `StalePlan`.
 - Offenders render through `http_client::describe_unmodeled_nested_fields`,
   capped at `MAX_LISTED_UNMODELED_NESTED_FIELDS` with `…and N more`.
 - Keep `config::schema` nested structs in step with each ferrum-edge pin bump so
@@ -1174,8 +1229,9 @@ Rules that must not drift:
   reads `overridden_by`). `plan` resolves the override through the same
   `resolve_pr_number` + `check_override` path as `apply` and fails closed: no
   PR, an inactive decision, or a GitHub error leaves every blocking finding.
-- Gateway-dependent gates (large-prune, stale view, per-resource write failures)
-  are excluded; a preview cannot decide them.
+- Gateway-dependent gates (large-prune, stale view, stale plan / `412`,
+  missing `ETag`, per-resource write failures) are excluded; a preview cannot
+  decide them.
 - Pending allocations need both provisioning variables (presence only; validity
   is a remote question). With nothing pending, neither is required. The
   secretless PR check has no bundle, so every `alloc=generate` slot reads as
@@ -1577,7 +1633,7 @@ credentials. Booleans accept `true|false|1|0`.
 | `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set by environment-bound workflow steps; makes an unset allowlist a refusal instead of "not visible". |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | unset | Operator allowlist of probe Consumers (`<ns>/<consumer-id>`, comma-separated); a GitHub Environment variable in CI. Unset: `verify` refuses every slot-sending check. See [Traffic verification](#traffic-verification-srcverify). |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Dev only. TLS stays on but any certificate is accepted. |
-| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://`. |
+| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://` at load; the admin client still sends its token over `http://` only to a loopback host (`AdminClient::authorize`). |
 | `FERRUM_GATEWAY_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | unset | Base64-encoded PEM. mTLS needs both cert and key. |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS handshake cap. |
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end cap; raise for large `/backup` or slow `/restore`. |

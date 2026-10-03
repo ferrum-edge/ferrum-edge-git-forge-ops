@@ -200,6 +200,7 @@ class IsolationTests(unittest.TestCase):
         for identifier in (
             "reapply_is_a_no_op",
             "modify_and_delete_in_order",
+            "conditional_overwrite",
             "drift_monitoring",
         ):
             with self.subTest(scenario=identifier):
@@ -212,6 +213,22 @@ class IsolationTests(unittest.TestCase):
         body = source[start : source.index("\n\n\nSCENARIOS", start)]
         self.assertIn("seed_repository(harness)", body)
         self.assertNotIn("ensure_deployed(harness)", body)
+
+    def test_the_stale_write_probe_sends_if_match_to_the_admin_api(self):
+        # `conditional-overwrite` certifies the gateway half of the guarantee:
+        # a write carrying a superseded entity-tag must be refused. The probe
+        # has to send that tag, to the admin API, or it certifies nothing.
+        source = (ROOT / "tests/lifecycle/scenarios.py").read_text(encoding="utf-8")
+        exchange = source[
+            source.index("def _admin_exchange(") : source.index("def create_unmanaged_proxy(")
+        ]
+        self.assertIn('headers["If-Match"] = if_match', exchange)
+        self.assertIn("harness.gateway_url", exchange)
+        self.assertNotIn("harness.proxy_url", exchange)
+        start = source.index("def scenario_conditional_overwrite(")
+        body = source[start : source.index("\n\n\ndef ", start)]
+        self.assertIn("if_match=", body)
+        self.assertIn("!= 412", body)
 
     def test_out_of_band_admin_calls_assert_their_own_outcome(self):
         # A silently failed admin call is the worst kind of harness bug: the

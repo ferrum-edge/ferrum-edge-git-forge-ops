@@ -2053,3 +2053,30 @@ fn scoped_backup_requires_explicit_matching_namespace_for_every_resource_kind() 
         }
     }
 }
+
+/// The admin token, and the consumer credentials in request bodies, never
+/// travel in cleartext to a host that is not loopback, whatever was
+/// configured. The refusal names no part of the secret-backed URL.
+#[test]
+fn the_admin_client_never_sends_its_token_in_cleartext_to_a_remote_host() {
+    for (url, accepted) in [
+        ("https://gateway.example:9000", true),
+        ("http://127.0.0.1:9000", true),
+        ("http://[::1]:9000", true),
+        ("http://localhost:9000", true),
+        ("http://gateway.example:9000", false),
+        ("http://10.0.0.5:9000", false),
+    ] {
+        let mut env = base_env();
+        env.gateway_url = Some(url.to_string());
+        env.allow_insecure_http = true;
+        let built = AdminClient::new_scoped(&env, TEST_NAMESPACES);
+        assert_eq!(built.is_ok(), accepted, "{url}");
+        if let Err(error) = built {
+            let message = error.to_string();
+            assert!(message.contains("cleartext"), "{message}");
+            assert!(!message.contains("gateway.example"), "{message}");
+            assert!(!message.contains("10.0.0.5"), "{message}");
+        }
+    }
+}
