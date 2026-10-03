@@ -81,6 +81,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- New `supply-chain-policy.yml` reports a `trusted-supply-chain-policy` check
+  whose definition the pull request under review cannot edit. It runs on
+  `pull_request_target`, checks out the pull request's head as data, and runs
+  only the protected branch's checker under `python3 -I` with `--root`, with
+  `contents: read` and no secrets. `check_supply_chain.py` pins every
+  non-comment line of that workflow and refuses any other workflow job keyed
+  or named `trusted-supply-chain-policy`, or a computed job display name. The
+  bootstrap now writes the new context alongside `security-supply-chain-policy`.
+  The settings audit warns until the `main` ruleset requires it, and the
+  release gate requires a reported result to pass. Add it to the ruleset after
+  this change merges (`docs/github-launch-controls.md`, "Switching the
+  supply-chain policy check"). The `security-supply-chain-policy` job stays,
+  unchanged, until a later change retires it (GHSA-x5m2-4555-q4cr).
+- A queued rotation whose protected branch moved first prints a
+  rotation-specific notice: the freshness guard's refusal text is written for
+  apply, but no apply reschedules a rotation, so dispatch it again from the
+  current head.
 - `rotate.yml` binds a queued rotation to the revision it was dispatched from.
   After taking the shared `ferrum-apply-<env>` lock and refreshing onto the
   current head of `main`, its freshness guard now also runs the

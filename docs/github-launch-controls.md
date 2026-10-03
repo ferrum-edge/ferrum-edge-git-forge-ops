@@ -159,6 +159,8 @@ no other include or exclude patterns. It must:
   - `rust-ci-check`
   - `security-cargo-audit`
   - `security-supply-chain-policy`
+  - `trusted-supply-chain-policy` (being added; see
+    [Switching the supply-chain policy check](#switching-the-supply-chain-policy-check))
   - `state-guard-reject-state-edits`
   - `gitforgeops-required-static-validation`
 - have exactly one bypass actor in any mode: the state-writer App, as an
@@ -181,6 +183,68 @@ therefore treats an empty bypass list as a misconfiguration.
 The release workflow also checks that a tag's commit is reachable from the
 protected default branch. Tag protection stops a branch-controlled workflow
 from removing that check before secrets are used.
+
+### Switching the supply-chain policy check
+
+The supply-chain verdict is moving from `security-supply-chain-policy` (in
+`security.yml`, whose definition the pull request under review supplies) to
+`trusted-supply-chain-policy` (in `supply-chain-policy.yml`, which
+`pull_request_target` always loads from the protected branch; see
+[section 4](#4-restrict-github-actions)). It lands in three steps:
+
+1. **Expand (merged).** `supply-chain-policy.yml` is on `main`.
+   `bootstrap_repo_settings.py` writes both contexts. `audit_settings.py`
+   still requires `security-supply-chain-policy` and reports a missing
+   `trusted-supply-chain-policy` as a `WARN`, not a failure. The release gate
+   requires a reported `trusted-supply-chain-policy` result to pass.
+2. **Ruleset switch (operator).** Add `trusted-supply-chain-policy` to the
+   `main` ruleset, as described below.
+3. **Retire (a later pull request).** The workflow-script unit tests move out
+   of `security-supply-chain-policy`, the candidate-run policy runner is
+   removed, and the audit, bootstrap and release gate require only the new
+   context. That pull request says when to remove the old context from the
+   ruleset.
+
+Take step 2 after step 1 has merged, as an administrator:
+
+1. Confirm `.github/workflows/supply-chain-policy.yml` is on `main`. A new
+   `pull_request_target` workflow does not run on the pull request that adds
+   it, because GitHub loads it from the base branch.
+2. Open, push to or edit any pull request that targets `main`. Confirm that
+   `GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy` appears and
+   passes.
+3. Add the context **without removing `security-supply-chain-policy`**. That
+   job still runs the workflow-script unit tests until the retire step. Either:
+   - from an up-to-date checkout of `main`, re-run the bootstrap with the same
+     flags you used before (it rewrites the whole `main` ruleset). Check that
+     the plan's only `main ruleset` change adds `trusted-supply-chain-policy`
+     to `rules.required_status_checks.required_status_checks`, then apply:
+
+     ```bash
+     python3 .github/scripts/bootstrap_repo_settings.py --repo owner/repo \
+       --state-writer-app-id ID            # plan; add your other flags
+     python3 .github/scripts/bootstrap_repo_settings.py --repo owner/repo \
+       --state-writer-app-id ID --apply    # write
+     ```
+
+   - or, by hand: **Settings → Rules → Rulesets → main → Require status checks
+     to pass → Add checks**, enter `trusted-supply-chain-policy`, choose GitHub
+     Actions as the source, and save.
+4. Confirm the ruleset now lists both contexts:
+
+   ```bash
+   gh api repos/owner/repo/rulesets --jq '.[] | select(.target == "branch") | .id' |
+     xargs -I{} gh api repos/owner/repo/rulesets/{} \
+       --jq '.rules[] | select(.type == "required_status_checks")
+             | .parameters.required_status_checks[].context'
+   ```
+
+   Then dispatch `GitHub Settings Audit` from `main`. The
+   `trusted-supply-chain-policy` warning must be gone.
+5. Pull requests opened before the switch report the new check only after
+   their next `opened`, `synchronize`, `reopened` or `edited` event. Until
+   then they wait for it. Push, edit the description, or close and reopen
+   them.
 
 ## 3. Protect every deployment environment
 
@@ -479,14 +543,31 @@ migrate, then reject the old one). The baseline ruleset has no human bypass,
 so merging past that red required check takes a deliberate admin decision.
 The next run on `main` uses the new policy.
 
-That is not yet a complete boundary. The check runs under `pull_request`, so
-GitHub executes the pull request's own copy of `security.yml`. The trusted
-checker inspects that copy with substring rules, and it is the job that copy
-defines which runs those rules. A pull request that changes workflow
-definitions can therefore still influence what this check reports. Until the
-required check moves to a workflow whose definition comes from the protected
-branch, a green `security-supply-chain-policy` is trustworthy only together
-with exact-head review of every change under `.github/workflows/`.
+That is not a complete boundary on its own. The check runs under
+`pull_request`, so GitHub executes the pull request's own copy of
+`security.yml`. The trusted checker inspects that copy with substring rules,
+and it is the job that copy defines which runs those rules. A pull request that
+changes workflow definitions can therefore still influence what this check
+reports.
+
+`trusted-supply-chain-policy` (`supply-chain-policy.yml`) is the check whose
+definition the pull request does not supply. It runs on `pull_request_target`,
+so GitHub always loads the workflow from the protected default branch. It
+checks out the protected branch into `base/` and the pull request's head into
+`candidate/` as data, with no persisted credentials, and runs only
+`python3 -I base/.github/scripts/check_supply_chain.py --root candidate`. The
+job holds `contents: read`, no secrets and no environment, and nothing from
+the candidate executes. The checker holds the file to that exact shape: every
+non-comment line is pinned, and only the action commit may change. No other
+workflow may define a job keyed or named `trusted-supply-chain-policy`, or
+compute a job's display name. A pull request that edits
+`supply-chain-policy.yml` is judged by the protected copy, and its edit takes
+effect only after merge.
+
+Until the `main` ruleset requires `trusted-supply-chain-policy`
+([Switching the supply-chain policy check](#switching-the-supply-chain-policy-check)),
+a green `security-supply-chain-policy` is trustworthy only together with
+exact-head review of every change under `.github/workflows/`.
 
 ### Repository security features
 
@@ -577,13 +658,16 @@ GH_TOKEN=<administration-read-token> python3 .github/scripts/audit_settings.py \
   --required-check 'rust-ci-check' \
   --required-check 'security-cargo-audit' \
   --required-check 'security-supply-chain-policy' \
+  --required-check 'trusted-supply-chain-policy' \
   --required-check 'state-guard-reject-state-edits' \
   --required-check 'gitforgeops-required-static-validation'
 ```
 
-`--required-check` may be omitted; those five contexts are the default. On a
-template repository, pass `--template-repo` instead of `--state-writer-app-id`
-(one of the two is required).
+`--required-check` may be omitted; those six contexts are the default. Until
+the [ruleset switch](#switching-the-supply-chain-policy-check), a ruleset
+without `trusted-supply-chain-policy` is reported as a `WARN`, not a failure.
+On a template repository, pass `--template-repo` instead of
+`--state-writer-app-id` (one of the two is required).
 
 The audit fails closed on missing token scope, API errors, pagination or
 response-shape changes, missing controls, and any always-on bypass that is not

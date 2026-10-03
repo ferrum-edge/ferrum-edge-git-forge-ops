@@ -629,8 +629,9 @@ the same lock as apply, so a merge can land while it is queued or waiting for
 the environment reviewer. When that merge changed a deployment input, the
 rotation refuses with the same `Superseded deployment` error, before it builds
 anything, loads a credential bundle or writes a secret. The error mentions the
-apply run because that is what the newer merge schedules. Rotations are never
-rescheduled automatically, so to recover:
+apply run because that is what the newer merge schedules, so whenever the head
+moved, the guard first prints a rotation-specific notice that links here.
+Rotations are never rescheduled automatically, so to recover:
 
 1. Let the apply for the newer head finish (approve or re-run it as above).
 2. Dispatch **Actions → GitForgeOps Rotate Credential** again from `main`. The

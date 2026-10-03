@@ -1087,7 +1087,27 @@ class SharedConstantTests(unittest.TestCase):
             audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), APP_ID
         )
         self.assertEqual(audit.violations, [])
+        # Including the transitional context: running the bootstrap is the
+        # documented way to add it, so what it writes draws no warning.
+        self.assertEqual(audit.warnings, [])
         self.assertTrue(audit_settings.ruleset_targets_branch(ruleset, "main"))
+
+    def test_the_ruleset_adds_the_trusted_policy_check_beside_the_retiring_one(self):
+        # GHSA-x5m2-4555-q4cr expand step: the bootstrap writes the
+        # protected-definition check and keeps the in-tree job's context,
+        # which still runs the workflow-script unit tests.
+        ruleset = bootstrap.main_ruleset_body(
+            [{"actor_type": "Integration", "actor_id": APP_ID, "bypass_mode": "always"}]
+        )
+        rule = next(
+            rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks"
+        )
+        contexts = [
+            check["context"] for check in rule["parameters"]["required_status_checks"]
+        ]
+        self.assertIn("trusted-supply-chain-policy", contexts)
+        self.assertIn("security-supply-chain-policy", contexts)
+        self.assertEqual(len(contexts), len(set(contexts)))
 
         tag = bootstrap.release_tag_ruleset_body(
             [{"actor_type": "Integration", "actor_id": 1234, "bypass_mode": "always"}]

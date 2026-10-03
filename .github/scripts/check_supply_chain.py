@@ -979,12 +979,21 @@ def declares_concurrency(text: str) -> bool:
     all, in any case. A run script or trailing comment that merely mentions it
     is refused too; reword it.
     """
+    return _CONCURRENCY_WORD.search(decoded_workflow_content(text)) is not None
+
+
+def decoded_workflow_content(text: str) -> str:
+    """A workflow without full-line comments, double-quoted escapes decoded.
+
+    Not a YAML parser. It is the fail-closed reading the word-level rules use:
+    a key or value spelled with `\\x`/`\\u`/`\\U` escapes or an escaped line
+    break reads the same as its plain spelling.
+    """
     content = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
     content = _YAML_ESCAPED_LINE_BREAK.sub("", content)
-    content = _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, content)
-    return _CONCURRENCY_WORD.search(content) is not None
+    return _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, content)
 
 
 # The last step before the guard reports an authorized override re-reads the
@@ -1486,8 +1495,11 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
     This is a substring contract over the candidate's own copy of
     `security.yml`, enforced by the run that copy defines. It catches an honest
     regression and a shadowed import; it cannot stop a pull request that
-    rewrites the job itself. That boundary needs a workflow whose definition
-    the pull request does not supply (see docs/github-launch-controls.md).
+    rewrites the job itself. `supply-chain-policy.yml` is the workflow whose
+    definition the pull request does not supply (see
+    `supply_chain_policy_workflow_violations`). This job stays, unchanged,
+    until the ruleset requires that workflow's check instead (see
+    docs/github-launch-controls.md).
     """
     required = (
         "if: github.event_name == 'pull_request'",
@@ -1539,6 +1551,182 @@ def trusted_supply_chain_policy_violations(text: str) -> list[str]:
     ):
         violations.append(
             "security.yml: an unprotected PR base SHA must not supply the policy checker"
+        )
+    return violations
+
+
+# GHSA-x5m2-4555-q4cr. The supply-chain verdict comes from a
+# `pull_request_target` workflow, which GitHub always loads from the protected
+# default branch: the pull request under review cannot edit the job that
+# judges it. It can propose a new shape for LATER pull requests, and that
+# proposal is held to the shape below by the protected checker before merge.
+SUPPLY_CHAIN_POLICY_WORKFLOW = "supply-chain-policy.yml"
+SUPPLY_CHAIN_POLICY_PATH = f".github/workflows/{SUPPLY_CHAIN_POLICY_WORKFLOW}"
+SUPPLY_CHAIN_POLICY_JOB = "trusted-supply-chain-policy"
+# The checker runs from the protected checkout, isolated, with the candidate
+# as `--root`. The working directory is the workspace, never the candidate.
+SUPPLY_CHAIN_POLICY_INVOCATION = (
+    "python3 -I base/.github/scripts/check_supply_chain.py --root candidate"
+)
+PINNED_ACTION_COMMIT = "<40-hex commit>"
+# Every non-comment line of the workflow, in order, with trailing comments
+# dropped. Exact rather than substring: an added key — `env:` (bash reads
+# `BASH_ENV` before the first command), `defaults:` (a working directory
+# inside the candidate), `if:` (a skipped required job reports success), a
+# second trigger, a write permission, `secrets`, an environment, another step —
+# is a different line list. The action commit is the only free part, so
+# Dependabot can still bump it; the repository-wide rule requires 40 hex.
+SUPPLY_CHAIN_POLICY_SHAPE = (
+    "name: GitForgeOps Supply-Chain Policy",
+    "on:",
+    "  pull_request_target:",
+    "    types: [opened, synchronize, reopened, edited]",
+    "    branches: [main]",
+    "permissions:",
+    "  contents: read",
+    "concurrency:",
+    "  group: trusted-supply-chain-policy-${{ github.event.pull_request.number }}",
+    "  cancel-in-progress: true",
+    "jobs:",
+    f"  {SUPPLY_CHAIN_POLICY_JOB}:",
+    "    runs-on: ubuntu-24.04",
+    "    steps:",
+    "      - name: Check out protected supply-chain policy",
+    f"        uses: actions/checkout@{PINNED_ACTION_COMMIT}",
+    "        with:",
+    "          ref: ${{ github.event.repository.default_branch }}",
+    "          path: base",
+    "          persist-credentials: false",
+    "      - name: Check out candidate as policy data",
+    f"        uses: actions/checkout@{PINNED_ACTION_COMMIT}",
+    "        with:",
+    "          repository: ${{ github.event.pull_request.head.repo.full_name }}",
+    "          ref: ${{ github.event.pull_request.head.sha }}",
+    "          path: candidate",
+    "          persist-credentials: false",
+    "      - name: Judge candidate with protected supply-chain policy",
+    f"        run: {SUPPLY_CHAIN_POLICY_INVOCATION}",
+)
+_PINNED_USES = re.compile(r"^(\s*(?:-\s+)?uses:\s*[^@\s]+)@[0-9a-f]{40}$")
+# YAML starts a comment at a `#` preceded by whitespace. A `#` glued to a
+# value is part of it, so it is kept and the line no longer matches.
+_TRAILING_COMMENT = re.compile(r"\s+#.*$")
+# A job's `name:` whose value is an expression. It would compute the check
+# run's name, which is what a ruleset matches, so the literal-name ban could
+# not see it. Job keys sit at four spaces under `jobs:`; a flow-style mapping
+# is matched wherever it appears in the jobs section. Step titles and action
+# inputs (an artifact's `name:`) never name a check and stay free.
+_JOB_EXPRESSION_NAME = re.compile(
+    r"""^ {4}["']?name["']?\s*:[^\n]*\$\{\{""", re.IGNORECASE | re.MULTILINE
+)
+_FLOW_EXPRESSION_NAME = re.compile(
+    r"""[{,]\s*["']?name["']?\s*:[^,}\n]*\$\{\{""", re.IGNORECASE
+)
+_JOBS_SECTION = re.compile(r"^jobs\s*:", re.MULTILINE)
+_POLICY_JOB_PATTERN = re.escape(SUPPLY_CHAIN_POLICY_JOB)
+# The protected job's name as a mapping key anywhere in the jobs section: a
+# block key at any indentation (after an optional `- `), a flow key, or an
+# explicit `? ` key whose `:` sits on the next line.
+_POLICY_JOB_KEY = re.compile(
+    rf"""(?:(?:^[ \t]*(?:-[ \t]+)?|[{{,][ \t]*)["']?[ \t]*{_POLICY_JOB_PATTERN}"""
+    rf"""[ \t]*["']?[ \t]*:)|(?:^[ \t]*\?[ \t]*["']?[ \t]*{_POLICY_JOB_PATTERN}"""
+    r"""(?![\w-]))""",
+    re.IGNORECASE | re.MULTILINE,
+)
+# ...or as the whole value of any `name:` there, quoted or not.
+_POLICY_JOB_NAME = re.compile(
+    rf"""["']?name["']?[ \t]*:[ \t]*["']?[ \t]*{_POLICY_JOB_PATTERN}[ \t]*["']?"""
+    r"""[ \t]*(?:[,}#]|$)""",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def policy_workflow_shape(text: str) -> list[str]:
+    """The non-comment lines of a workflow, with action commits normalized."""
+    shape: list[str] = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        line = _TRAILING_COMMENT.sub("", line).rstrip()
+        shape.append(_PINNED_USES.sub(rf"\1@{PINNED_ACTION_COMMIT}", line))
+    return shape
+
+
+def supply_chain_policy_shape_violations(text: str) -> list[str]:
+    """The trusted policy workflow must keep exactly its reviewed shape."""
+    shape = policy_workflow_shape(text)
+    expected = list(SUPPLY_CHAIN_POLICY_SHAPE)
+    if shape == expected:
+        return []
+    index = next(
+        (
+            position
+            for position, (found, wanted) in enumerate(zip(shape, expected))
+            if found != wanted
+        ),
+        min(len(shape), len(expected)),
+    )
+    wanted = expected[index].strip() if index < len(expected) else "<end of file>"
+    found = shape[index].strip() if index < len(shape) else "<end of file>"
+    return [
+        f"{SUPPLY_CHAIN_POLICY_WORKFLOW}: the trusted policy workflow must keep its "
+        "pinned shape (pull_request_target only, contents: read, no secrets or "
+        "environment, the candidate checked out as data, and exactly "
+        f"{SUPPLY_CHAIN_POLICY_INVOCATION!r}); non-comment line {index + 1} "
+        f"should be {wanted!r}, found {found!r}"
+    ]
+
+
+def supply_chain_policy_workflow_violations(root: Path) -> list[str]:
+    """The `pull_request_target` policy workflow must exist and keep its shape."""
+    path = root / SUPPLY_CHAIN_POLICY_PATH
+    if path.is_symlink() or not path.is_file():
+        return [
+            f"{SUPPLY_CHAIN_POLICY_WORKFLOW}: the trusted supply-chain policy "
+            "workflow must remain a regular file"
+        ]
+    return supply_chain_policy_shape_violations(path.read_text(encoding="utf-8"))
+
+
+def policy_check_impersonation_violations(workflow: str, text: str) -> list[str]:
+    """Only the protected policy workflow may report `trusted-supply-chain-policy`.
+
+    A ruleset requires a check by name, and a check run is named by its job's
+    key or its `name:`. A candidate's `pull_request` workflows run its own
+    definitions, so a job keyed or named like the trusted one would put a
+    second, candidate-defined result under the required name.
+
+    Not a YAML parser, so it reads the jobs section fail-closed, after
+    full-line comments are dropped and double-quoted escapes decoded, in any
+    case: no mapping key there (block or flow, quoted or not) may be the
+    name, no `name:` there may be set to it, and no job's display name may be
+    computed. Mentioning the context elsewhere (the settings audit's
+    `--required-check`, the release gate) stays allowed.
+
+    `workflow` is the path relative to the repository root.
+    """
+    if workflow == SUPPLY_CHAIN_POLICY_PATH:
+        return []
+    content = decoded_workflow_content(text)
+    jobs = _JOBS_SECTION.search(content)
+    section = content[jobs.end():] if jobs else ""
+    violations: list[str] = []
+    claimed = _POLICY_JOB_KEY.search(section) or _POLICY_JOB_NAME.search(section)
+    if claimed is not None:
+        violations.append(
+            f"{workflow}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
+            f"{SUPPLY_CHAIN_POLICY_JOB!r} check; another job reporting that name "
+            "would stand beside the protected verdict; found "
+            f"{claimed.group(0).strip()!r}"
+        )
+    computed = _JOB_EXPRESSION_NAME.search(section) or _FLOW_EXPRESSION_NAME.search(
+        section
+    )
+    if computed is not None:
+        violations.append(
+            f"{workflow}: a job display name must be a literal, so no workflow can "
+            f"compute the {SUPPLY_CHAIN_POLICY_JOB!r} check name; found "
+            f"{computed.group(0).strip()!r}"
         )
     return violations
 
@@ -1779,6 +1967,12 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(
             viewer_jwt_scope_violations(workflow.relative_to(root).as_posix(), text)
         )
+        if workflow.parent == workflows:
+            violations.extend(
+                policy_check_impersonation_violations(
+                    workflow.relative_to(root).as_posix(), text
+                )
+            )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
                 f"{workflow.relative_to(root)}: download must go through install-ferrum-edge.sh"
@@ -2077,6 +2271,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     security_workflow = (workflows / "security.yml").read_text(encoding="utf-8")
     violations.extend(trusted_supply_chain_policy_violations(security_workflow))
+    violations.extend(supply_chain_policy_workflow_violations(root))
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     violations.extend(cargo_audit_install_violations(security_workflow))
     violations.extend(security_push_trigger_violations(security_workflow))

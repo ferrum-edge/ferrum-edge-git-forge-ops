@@ -936,6 +936,62 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
         )
 
 
+class TrustedPolicyCheckTransitionTests(unittest.TestCase):
+    """GHSA-x5m2-4555-q4cr: the protected-definition policy check is being added.
+
+    `trusted-supply-chain-policy` joins the ruleset in an operator step after
+    its workflow reaches the default branch, so the audit accepts a ruleset
+    without it (with a warning) and still requires the in-tree job's context.
+    """
+
+    TRUSTED = "trusted-supply-chain-policy"
+    RETIRING = "security-supply-chain-policy"
+
+    def audit_ruleset(self, contexts: set[str]) -> "audit_settings.Audit":
+        ruleset = secure_responses()["repos/acme/repo/rulesets/7"]
+        next(
+            rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks"
+        )["parameters"]["required_status_checks"] = [
+            {"context": context} for context in sorted(contexts)
+        ]
+        audit = audit_settings.Audit()
+        audit_settings.audit_main_ruleset(
+            audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), 99
+        )
+        return audit
+
+    def test_the_trusted_check_is_part_of_the_launch_baseline(self):
+        self.assertIn(self.TRUSTED, audit_settings.REQUIRED_STATUS_CHECKS)
+        self.assertIn(self.RETIRING, audit_settings.REQUIRED_STATUS_CHECKS)
+        self.assertEqual(audit_settings.TRANSITIONAL_STATUS_CHECKS, (self.TRUSTED,))
+
+    def test_a_ruleset_before_the_switch_passes_with_a_warning(self):
+        audit = self.audit_ruleset(REQUIRED_CHECKS)
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(len(audit.warnings), 1, audit.warnings)
+        self.assertIn(self.TRUSTED, audit.warnings[0])
+
+    def test_a_ruleset_after_the_switch_passes_cleanly(self):
+        audit = self.audit_ruleset(REQUIRED_CHECKS | {self.TRUSTED})
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(audit.warnings, [])
+
+    def test_the_retiring_context_is_still_required(self):
+        # It still runs the workflow-script unit tests until the retire step.
+        audit = self.audit_ruleset((REQUIRED_CHECKS - {self.RETIRING}) | {self.TRUSTED})
+        rendered = "\n".join(audit.violations)
+        self.assertIn("missing required status checks", rendered)
+        self.assertIn(self.RETIRING, rendered)
+
+    def test_only_the_transitional_context_is_softened(self):
+        for context in sorted(REQUIRED_CHECKS):
+            with self.subTest(context=context):
+                audit = self.audit_ruleset(REQUIRED_CHECKS - {context})
+                rendered = "\n".join(audit.violations)
+                self.assertIn("missing required status checks", rendered)
+                self.assertIn(context, rendered)
+
+
 class SharedConstantTests(unittest.TestCase):
     def test_required_status_checks_match_the_settings_audit_workflow(self):
         workflow = (

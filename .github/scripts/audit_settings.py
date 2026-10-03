@@ -34,9 +34,21 @@ REQUIRED_STATUS_CHECKS = (
     "rust-ci-check",
     "security-cargo-audit",
     "security-supply-chain-policy",
+    "trusted-supply-chain-policy",
     "state-guard-reject-state-edits",
     "gitforgeops-required-static-validation",
 )
+
+# TRANSITIONAL (GHSA-x5m2-4555-q4cr, expand step). `trusted-supply-chain-policy`
+# is the supply-chain verdict from `supply-chain-policy.yml`, a
+# `pull_request_target` workflow whose definition the pull request cannot
+# edit. Adding it to a ruleset is an operator step taken after that workflow
+# is on the default branch, so until then a ruleset without it is reported as
+# a warning, not a violation. The bootstrap writes it either way, and
+# `security-supply-chain-policy` stays required: that job still runs the
+# workflow-script unit tests. The retire step makes the new context a hard
+# requirement and drops this tuple (docs/github-launch-controls.md, section 2).
+TRANSITIONAL_STATUS_CHECKS = ("trusted-supply-chain-policy",)
 
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 
@@ -250,12 +262,22 @@ def audit_main_ruleset(
         for check in status_parameters.get("required_status_checks", [])
         if isinstance(check, dict) and check.get("context")
     }
-    missing_checks = sorted(required_checks - configured_checks)
+    absent_checks = sorted(required_checks - configured_checks)
+    missing_checks = [
+        check for check in absent_checks if check not in TRANSITIONAL_STATUS_CHECKS
+    ]
     audit.require(
         not missing_checks,
         f"main ruleset is missing required status checks: {missing_checks}",
         f"required status checks: {sorted(configured_checks)}",
     )
+    for check in absent_checks:
+        if check in TRANSITIONAL_STATUS_CHECKS:
+            audit.warnings.append(
+                f"main ruleset does not yet require {check!r}; add it once its "
+                "workflow is on the default branch "
+                "(docs/github-launch-controls.md, section 2)"
+            )
 
     if not template_repo:
         bypasses = ruleset.get("bypass_actors", [])

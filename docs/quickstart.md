@@ -401,8 +401,8 @@ Open the pull request. You should see:
 
 - **`gitforgeops-required-static-validation`**: secretless assembly and schema
   validation, with no gateway contact.
-- **`rust-ci-check`**, **`security-*`** and **`state-guard-reject-state-edits`**:
-  the other required checks.
+- **`rust-ci-check`**, **`security-*`**, **`trusted-supply-chain-policy`** and
+  **`state-guard-reject-state-edits`**: the other required checks.
 - **`GitForgeOps Trusted PR Live Review`**, waiting for the environment
   reviewer. Once approved, it posts a review comment listing the resources that
   would be added, the credential slots awaiting allocation, and the verdict.
