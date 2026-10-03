@@ -869,7 +869,9 @@ pub fn render_probe_bindings(
     }
     let omitted = bindings.len().saturating_sub(MAX_PROBE_BINDING_ITEMS);
     if omitted > 0 {
-        md.push_str(&format!("\n- _{omitted} additional slot binding(s) omitted_"));
+        md.push_str(&format!(
+            "\n- _{omitted} additional slot binding(s) omitted_"
+        ));
     }
     if bindings.is_empty() {
         md.push_str("\n- _no declared check sends a slot_");

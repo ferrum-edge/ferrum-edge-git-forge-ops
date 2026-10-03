@@ -583,7 +583,10 @@ fn probe_repo(slot: &str, customer: &str) -> Repo {
     Repo::with_files(
         Some(&smoke),
         &[
-            ("resources/ferrum/consumers/orders-probe.yaml", PROBE_CONSUMER),
+            (
+                "resources/ferrum/consumers/orders-probe.yaml",
+                PROBE_CONSUMER,
+            ),
             ("resources/ferrum/consumers/orders-client.yaml", customer),
         ],
     )

@@ -457,7 +457,9 @@ fn both_verify_steps_carry_a_step_timeout_that_covers_the_budget() {
     assert_eq!(steps.len(), 2, "the apply and promote jobs each verify");
     let needed = MAX_ENVIRONMENT_VERIFY_BUDGET_SECS + VERIFY_DEADLINE_GRACE_SECS;
     for step in steps {
-        let found = step.lines().find_map(|line| line.strip_prefix(STEP_TIMEOUT));
+        let found = step
+            .lines()
+            .find_map(|line| line.strip_prefix(STEP_TIMEOUT));
         let value = found.expect("a step-level timeout-minutes");
         let minutes: u64 = value.trim().parse().expect("a whole number of minutes");
         assert!(minutes * 60 > needed, "{minutes} minutes");
@@ -825,8 +827,8 @@ fn checks_that_send_no_credential_need_no_authorization() {
 
 #[test]
 fn the_operator_allowlist_names_namespace_qualified_consumers() {
-    let list = ProbeConsumerAllowlist::parse(" ferrum/orders-probe , ,team-a/probe ,")
-        .expect("parses");
+    let list =
+        ProbeConsumerAllowlist::parse(" ferrum/orders-probe , ,team-a/probe ,").expect("parses");
     assert!(list.contains("ferrum", "orders-probe"));
     assert!(list.contains("team-a", "probe"));
     // Exact, namespace-qualified matches only.
@@ -847,7 +849,10 @@ fn the_operator_allowlist_names_namespace_qualified_consumers() {
             .expect_err("must refuse")
             .to_string();
         assert!(error.contains(VERIFY_PROBE_CONSUMERS_ENV), "{raw}: {error}");
-        assert!(error.contains("<namespace>/<consumer-id>"), "{raw}: {error}");
+        assert!(
+            error.contains("<namespace>/<consumer-id>"),
+            "{raw}: {error}"
+        );
     }
 }
 
