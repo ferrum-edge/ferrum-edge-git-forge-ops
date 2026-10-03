@@ -28,6 +28,7 @@ sys.modules[SPEC.name] = deployment_scope
 SPEC.loader.exec_module(deployment_scope)
 
 APPLY_WORKFLOW = ROOT / ".github/workflows/apply-on-merge.yml"
+ROTATE_WORKFLOW = ROOT / ".github/workflows/rotate.yml"
 
 
 class DeploymentScopeTests(unittest.TestCase):
@@ -218,6 +219,63 @@ class DeploymentScopeTests(unittest.TestCase):
             "            python3 -I - classify \\\n",
             workflow,
         )
+
+    # -- rotation is bound to the dispatched revision -------------------------
+
+    def test_rotation_guard_runs_the_trigger_pinned_classifier(self):
+        # Rotation builds and runs the refreshed head with gateway, broker and
+        # state-writer credentials. Ancestry alone let a later merge spend the
+        # dispatched run's environment approval (GHSA-xwxm-vjgq-mxhj).
+        workflow = ROTATE_WORKFLOW.read_text(encoding="utf-8")
+        guard_start = workflow.index(
+            "      - name: Refresh protected branch and reject stale deployments\n"
+        )
+        guard = workflow[guard_start:workflow.index("      - name: ", guard_start + 20)]
+        binding = (
+            '          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \\\n'
+            "            python3 -I - classify \\\n"
+            '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n'
+        )
+        self.assertEqual(guard.count(binding), 1)
+        # After the ancestry test, before the head is published to later steps.
+        self.assertLess(
+            guard.index('git merge-base --is-ancestor "$TRIGGER_SHA" "$fresh_head"'),
+            guard.index(binding),
+        )
+        self.assertLess(
+            guard.index(binding),
+            guard.index('echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"'),
+        )
+        # Not strict equality: apply's ledger commit always moves the branch
+        # while a rotation waits on the shared lock.
+        self.assertNotIn('"$fresh_head" = "$TRIGGER_SHA"', guard)
+        self.assertNotIn('"$TRIGGER_SHA" = "$fresh_head"', guard)
+
+    def test_queued_rotation_rides_apply_output_but_not_newer_inputs(self):
+        with self._repo() as repo:
+            trigger = self._commit(repo, {"resources/ferrum/consumers/a.yaml": "id: a\n"})
+            # The apply ahead of the rotation in the queue commits its ledger.
+            ledger = self._commit(
+                repo,
+                {
+                    ".state/production.json": '{"version":1}\n',
+                    "assembled/production.yaml": "version: '1'\n",
+                },
+            )
+            self.assertFalse(deployment_scope.classify(trigger, ledger, repo).superseded)
+            # Anything the rotation job would build, execute or publish refuses it.
+            for path in (
+                "src/main.rs",
+                "Cargo.lock",
+                ".github/scripts/credential_bundles.py",
+                "resources/ferrum/consumers/b.yaml",
+                ".gitforgeops/config.yaml",
+            ):
+                with self.subTest(path=path):
+                    head = self._commit(repo, {path: f"changed {path}\n"})
+                    decision = deployment_scope.classify(trigger, head, repo)
+                    self.assertTrue(decision.superseded)
+                    self.assertIn(path, decision.superseding)
 
     # -- CLI ----------------------------------------------------------------
 

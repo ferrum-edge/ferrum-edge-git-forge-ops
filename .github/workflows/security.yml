@@ -65,12 +65,19 @@ jobs:
             # pointing it at the candidate tree. The global assignments keep
             # the runner compatible with a pre-`--root` checker.
             #
+            # `-I` (isolated mode) is load-bearing. The working directory is
+            # the candidate checkout, and a plain `python3 -` puts it first on
+            # the import path, so a candidate root module named after anything
+            # this runner or the checker imports would run before the trusted
+            # policy and could exit green. Isolated mode also ignores every
+            # interpreter environment variable and the user site directory.
+            #
             # There is no fallback. The one-time pinned bootstrap existed only
             # while `main` did not yet carry this checker; once it does, a
             # fallback can only run an older policy against a newer tree.
             CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py
             [ -f "$CHECKER" ] || { echo "Trusted supply-chain checker is unavailable." >&2; exit 1; }
-            python3 - "$CHECKER" "$GITHUB_WORKSPACE" <<'PY'
+            python3 -I - "$CHECKER" "$GITHUB_WORKSPACE" <<'PY'
           import importlib.util
           import sys
           from pathlib import Path

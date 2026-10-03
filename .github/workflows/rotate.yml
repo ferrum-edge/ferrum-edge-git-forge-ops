@@ -160,6 +160,27 @@ jobs:
             echo "::error::Stale deployment: $TRIGGER_SHA is not an ancestor of ${DEFAULT_BRANCH} at $fresh_head. Dispatch the rotation again from the current head."
             exit 1
           }
+          # The environment approval belongs to the dispatched revision, but
+          # everything below builds and runs from the refreshed head: the
+          # binary, the credential-bundle helper and the desired resources all
+          # receive the gateway, broker and state-writer credentials. Ancestry
+          # alone would let a later merge spend this run's authorization, so
+          # the same classifier apply uses refuses any descendant that changed
+          # a deployment input. Ledger and assembled output (apply's own state
+          # commits, which move the branch while a rotation waits on the shared
+          # lock) and documentation are inert, so a queued rotation still runs
+          # behind an ordinary apply. A refusal is resolved by dispatching the
+          # rotation again from the current head; see
+          # README.md#a-superseded-rotation.
+          # Load the classifier from the dispatched revision, not the refreshed
+          # checkout it is judging, so a newer head cannot replace the program
+          # that decides whether it may ride this approval. The pipe leaves no
+          # file to redirect, `pipefail` (set above) fails the step if the
+          # extraction does, and `-I` keeps the refreshed checkout off the
+          # interpreter's import path.
+          git show "${TRIGGER_SHA}:.github/scripts/deployment_scope.py" | \
+            python3 -I - classify \
+            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
