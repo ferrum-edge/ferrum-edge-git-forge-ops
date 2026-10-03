@@ -19,8 +19,20 @@ use super::service_discovery::{
 ///
 /// Consumer slots use their credential type here (`keyauth`, `jwt`, ...), so
 /// the marker keeps plugin config in a separate keyspace while preserving the
-/// existing `<namespace>/<resource-id>/<kind>/...` bundle shape.
-const PLUGIN_CONFIG_SLOT_KIND: &str = "@plugin-config";
+/// existing `<namespace>/<resource-id>/<kind>/...` bundle shape. The plugin
+/// type (`plugin_name`) follows it, so a slot names the plugin that consumes
+/// it, not just its id and path (see [`plugin_config_slot`]).
+const PLUGIN_CONFIG_SLOT_KIND: &str = "@plugin";
+
+/// The retired, type-less plugin-config kind
+/// (`<ns>/<plugin-id>/@plugin-config/config/<path>`).
+///
+/// A value stored under it does not say which plugin type it was issued for,
+/// so it is never looked up. It is a distinct kind, not a prefix of the typed
+/// one, so no plugin name can make a current slot spell a retired one. A
+/// bundle key under it for a declared plugin id is a slot remap
+/// ([`PluginWalk::check_type_slot_identity`]).
+const RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND: &str = "@plugin-config";
 
 /// Credential types whose secret must be at least 32 characters
 /// (`jwt.secret`, `hmac_auth.secret`).
@@ -957,7 +969,8 @@ pub fn capture_and_redact_import_plugin_config_secrets(
             });
         }
         for path in classification.sensitive {
-            let slot = plugin_config_slot(&plugin.namespace, &plugin.id, &path);
+            let slot =
+                plugin_config_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, &path);
             let value = plugin_config_value_mut(&mut plugin.config, &path).ok_or_else(|| {
                 crate::error::Error::Config(format!(
                     "internal: sensitive plugin config path for slot '{slot}' disappeared during import"
@@ -1109,26 +1122,32 @@ fn capture_and_redact_string(
     Ok(())
 }
 
+/// The canonical broker slot of one `PluginConfig.config` leaf:
+/// `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>`.
+///
+/// The plugin type is part of the identity because what a config path means,
+/// and where the plugin sends it, depends on the type: `headers.*` is an
+/// outbound header for more than one plugin. A plugin that keeps its id but
+/// changes `plugin_name` therefore gets new slots and can never resolve the
+/// previous type's stored values.
 pub(crate) fn plugin_config_slot(
     namespace: &str,
     plugin_id: &str,
+    plugin_name: &str,
     path: &[ConfigPathComponent],
 ) -> String {
-    let mut pieces = vec![
-        escape_slot_component(namespace),
-        escape_slot_component(plugin_id),
-        escape_slot_component(PLUGIN_CONFIG_SLOT_KIND),
-        "config".to_string(),
-    ];
-    pieces.extend(path.iter().map(|part| match part {
-        ConfigPathComponent::Key(key) => escape_slot_component(key),
-        ConfigPathComponent::Index(index) => format!("[{index}]"),
-    }));
-    pieces.join("/")
+    let namespace = escape_slot_component(namespace);
+    let plugin_id = escape_slot_component(plugin_id);
+    let cred_key = plugin_config_cred_key(plugin_name, path);
+    format!("{namespace}/{plugin_id}/{cred_key}")
 }
 
-fn plugin_config_cred_key(path: &[ConfigPathComponent]) -> String {
-    let mut pieces = vec![PLUGIN_CONFIG_SLOT_KIND.to_string(), "config".to_string()];
+fn plugin_config_cred_key(plugin_name: &str, path: &[ConfigPathComponent]) -> String {
+    let mut pieces = vec![
+        PLUGIN_CONFIG_SLOT_KIND.to_string(),
+        escape_slot_component(plugin_name),
+        "config".to_string(),
+    ];
     pieces.extend(path.iter().map(|part| match part {
         ConfigPathComponent::Key(key) => escape_slot_component(key),
         ConfigPathComponent::Index(index) => format!("[{index}]"),
@@ -1284,6 +1303,7 @@ fn report_secrets_with_mode_inner(
             &mode,
             constraints,
         );
+        walk.check_type_slot_identity(&mut report);
         let mut path = Vec::new();
         walk_plugin_and_report(&plugin.config, &walk, &mut path, &mut report)?;
     }
@@ -1441,6 +1461,7 @@ fn resolve_secrets_in_place(
             &mode,
             ConstraintMode::Enforce,
         );
+        walk.check_type_slot_identity(&mut report);
         let mut path = Vec::new();
         walk_plugin_report_and_replace(&mut plugin.config, &walk, &mut path, &mut report)?;
     }
@@ -1914,7 +1935,7 @@ fn alloc_label(alloc: PlaceholderAlloc) -> &'static str {
 /// [`check_array_slot_identity`] for one array node inside `PluginConfig.config`.
 ///
 /// Plugin-config slots are positional too
-/// (`<ns>/<plugin>/@plugin-config/config/providers/[1]/client_auth/client_secret`),
+/// (`<ns>/<plugin>/@plugin/oidc/config/providers/[1]/client_auth/client_secret`),
 /// so deleting provider A of `[A, B]` shifts B into `[0]` where it resolves to
 /// A's stored secret. The two findings keep the Consumer split: a multi-entry
 /// brokered array is an advisory, and a stored slot at an index the array no
@@ -1928,14 +1949,13 @@ fn alloc_label(alloc: PlaceholderAlloc) -> &'static str {
 /// `gitforgeops rotate` publishes Consumers only, so the remedy names the
 /// bundle instead: reseed the shifted entries and retire the orphaned slot.
 fn check_plugin_array_slot_identity(
-    namespace: &str,
-    plugin_id: &str,
+    walk: &PluginWalk<'_>,
     path: &[ConfigPathComponent],
     items: &[serde_json::Value],
-    bundle: &CredentialBundle,
     report: &mut ResolveReport,
 ) {
-    let prefix = plugin_config_slot(namespace, plugin_id, path);
+    let bundle = walk.bundle;
+    let prefix = plugin_config_slot(walk.namespace, walk.plugin_id, walk.plugin_name, path);
     let brokered = items.iter().any(contains_placeholder);
 
     if brokered && items.len() > 1 {
@@ -1977,6 +1997,14 @@ fn check_plugin_array_slot_identity(
             );
         }
     }
+}
+
+/// Whether `slot` is `prefix` itself or a slot below it. Slot components are
+/// `/`-joined with a literal `/` escaped, so this never matches a sibling
+/// whose last component merely starts with the same text.
+fn is_slot_under(slot: &str, prefix: &str) -> bool {
+    slot.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Turn detected remaps into the resolution verdict.
@@ -2199,6 +2227,8 @@ fn resolve_service_discovery_leaf(
 struct PluginWalk<'a> {
     namespace: &'a str,
     plugin_id: &'a str,
+    /// Part of every slot this plugin owns ([`plugin_config_slot`]).
+    plugin_name: &'a str,
     /// Rule-declared endpoint leaves of this plugin
     /// ([`crate::secrets::plugin_config::endpoint_paths`]), classified before
     /// any leaf is replaced; replacing a string never moves a path.
@@ -2212,7 +2242,7 @@ impl<'a> PluginWalk<'a> {
     fn new(
         namespace: &'a str,
         plugin_id: &'a str,
-        plugin_name: &str,
+        plugin_name: &'a str,
         config: &serde_json::Value,
         bundle: &'a CredentialBundle,
         mode: &'a GatewayMode,
@@ -2221,11 +2251,71 @@ impl<'a> PluginWalk<'a> {
         Self {
             namespace,
             plugin_id,
+            plugin_name,
             endpoints: endpoint_paths(plugin_name, config),
             bundle,
             mode,
             constraints,
         }
+    }
+
+    /// Refuse stored plugin-config slots that this plugin's type does not own.
+    ///
+    /// Slots carry the plugin type ([`plugin_config_slot`]), so a plugin that
+    /// keeps its id but changes `plugin_name` never resolves the previous
+    /// type's values. Those values are still in the bundle, bound to this id,
+    /// and are evidence of exactly that change, so each one is a proven remap
+    /// under the same [`SlotRemapPolicy`] as an array shrink: the type change
+    /// does not apply until the old type's slots are retired, and any value
+    /// the new type needs is seeded under its own slot. Runs for every
+    /// declared plugin, brokered leaves or not, because a later change back
+    /// to the old type would otherwise resurrect a value nobody reviewed.
+    ///
+    /// The retired type-less kind ([`RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND`])
+    /// is refused the same way: its values name no type at all.
+    fn check_type_slot_identity(&self, report: &mut ResolveReport) {
+        let bundle = self.bundle;
+        let namespace = escape_slot_component(self.namespace);
+        let plugin_id = escape_slot_component(self.plugin_id);
+        let owned = plugin_config_slot(self.namespace, self.plugin_id, self.plugin_name, &[]);
+        for kind in [PLUGIN_CONFIG_SLOT_KIND, RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND] {
+            let prefix = format!("{namespace}/{plugin_id}/{kind}");
+            let foreign = bundle
+                .range(prefix.clone()..)
+                .map(|(slot, _)| slot)
+                .take_while(|slot| slot.starts_with(&prefix))
+                .filter(|slot| is_slot_under(slot, &prefix) && !is_slot_under(slot, &owned));
+            for slot in foreign {
+                push_slot_remap(report, self.foreign_slot_message(slot, kind, &owned));
+            }
+        }
+    }
+
+    /// Why `slot`, found under this plugin's id, is not one of its slots.
+    /// Names slots and the declared type only, never a value.
+    fn foreign_slot_message(&self, slot: &str, kind: &str, owned: &str) -> String {
+        let namespace = self.namespace;
+        let plugin_id = self.plugin_id;
+        let plugin_name = self.plugin_name;
+        if kind == RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND {
+            return format!(
+                "plugin config slot '{slot}' uses the retired type-less encoding, which does not \
+                 record the plugin type its value was stored for, so it is never resolved. If \
+                 the value was issued for plugin '{namespace}/{plugin_id}' of type \
+                 '{plugin_name}', reseed it under that plugin's typed slot (prefix '{owned}/'); \
+                 then retire this slot from the credential bundle — or pass \
+                 --allow-credential-slot-remap to accept it."
+            );
+        }
+        format!(
+            "plugin config slot '{slot}' is orphaned: the credential bundle still holds a value \
+             for plugin '{namespace}/{plugin_id}' under a different plugin type than the declared \
+             '{plugin_name}'. Slot identity includes the plugin type, so the value is never \
+             resolved into the new plugin, and changing the type back would resurrect it. Seed \
+             any value '{plugin_name}' needs under its own slot (prefix '{owned}/') and retire \
+             this slot from the credential bundle — or pass --allow-credential-slot-remap to \
+             accept it."
+        )
     }
 
     /// Report one plugin-config string leaf. Returns the bundle value when
@@ -2244,7 +2334,7 @@ impl<'a> PluginWalk<'a> {
             return Ok(None);
         };
         let placeholder = parsed?;
-        let slot = plugin_config_slot(self.namespace, self.plugin_id, path);
+        let slot = plugin_config_slot(self.namespace, self.plugin_id, self.plugin_name, path);
         let existing = lookup_exact_slot_value(&slot, self.bundle)?;
         let status = classify_status(&placeholder, existing);
         let endpoint = self.endpoints.contains(path);
@@ -2268,7 +2358,7 @@ impl<'a> PluginWalk<'a> {
         report.results.push(ResolveResult {
             consumer_id: self.plugin_id.to_string(),
             namespace: self.namespace.to_string(),
-            cred_key: plugin_config_cred_key(path),
+            cred_key: plugin_config_cred_key(self.plugin_name, path),
             slot,
             placeholder,
             status,
@@ -2295,14 +2385,7 @@ fn walk_plugin_and_report(
             }
         }
         serde_json::Value::Array(items) => {
-            check_plugin_array_slot_identity(
-                walk.namespace,
-                walk.plugin_id,
-                path,
-                items,
-                walk.bundle,
-                report,
-            );
+            check_plugin_array_slot_identity(walk, path, items, report);
             for (index, child) in items.iter().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
                 walk_plugin_and_report(child, walk, path, report)?;
@@ -2407,14 +2490,7 @@ fn walk_plugin_report_and_replace(
             }
         }
         serde_json::Value::Array(items) => {
-            check_plugin_array_slot_identity(
-                walk.namespace,
-                walk.plugin_id,
-                path,
-                items,
-                walk.bundle,
-                report,
-            );
+            check_plugin_array_slot_identity(walk, path, items, report);
             for (index, child) in items.iter_mut().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
                 walk_plugin_report_and_replace(child, walk, path, report)?;

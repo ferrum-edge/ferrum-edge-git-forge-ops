@@ -81,6 +81,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Plugin-config credential slots now include the plugin type:
+  `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>` replaces
+  `<ns>/<plugin-id>/@plugin-config/config/<path>`. A plugin that keeps its id
+  and config path but changes `plugin_name` no longer resolves the previous
+  type's stored secret. While the bundle still holds a slot of another type
+  under that id, the change is a credential slot remap: `apply`,
+  `export --materialize` and `rotate` refuse, and `plan` and `review` report
+  it as blocking. Bundle keys in the old type-less form are never looked up.
+  A declared plugin with the same id refuses on them until each value is
+  reseeded under its typed slot (only if it was issued for that type) and the
+  old key is removed. Import, diff and review masking, validator stand-ins and
+  output scrubbing use the typed slot (GHSA-j6xj-prxm-wp2q).
 - Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
   CVE-2026-103111 finding while the pinned Debian base remains behind.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on

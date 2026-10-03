@@ -762,11 +762,11 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         merged,
         std::collections::BTreeMap::from([
             (
-                "ferrum/otel-main/@plugin-config/config/endpoint".to_string(),
+                "ferrum/otel-main/@plugin/otel_tracing/config/endpoint".to_string(),
                 "https://collector.example/v1/traces?token=live-query-secret".to_string(),
             ),
             (
-                "ferrum/otel-main/@plugin-config/config/headers/x-honeycomb-team".to_string(),
+                "ferrum/otel-main/@plugin/otel_tracing/config/headers/x-honeycomb-team".to_string(),
                 "live-header-secret".to_string(),
             ),
         ])
@@ -2316,7 +2316,7 @@ fn builtin_plaintext_allowance_writes_and_lists_unbrokered_paths() {
             let bundle = std::fs::read_to_string(&bundle_path).unwrap();
             let (values, _) = gitforgeops::secrets::load_bundles_from_env(&bundle).unwrap();
             assert_eq!(
-                values["ferrum/builtin/@plugin-config/config/endpoint"],
+                values["ferrum/builtin/@plugin/otel_tracing/config/endpoint"],
                 "https://collector.example/v1/traces?token=synthetic-endpoint"
             );
         }

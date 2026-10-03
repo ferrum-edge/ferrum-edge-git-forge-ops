@@ -35,8 +35,8 @@ use crate::config::schema::{ServiceDiscoveryConfig, Upstream};
 /// Reserved third slot component for brokered service-discovery strings.
 ///
 /// Consumer slots put the credential type here (`keyauth`, `jwt`, …) and
-/// plugin config puts `@plugin-config`, so this keeps discovery secrets in
-/// their own keyspace while preserving the shared
+/// plugin config puts `@plugin` (followed by the plugin type), so this keeps
+/// discovery secrets in their own keyspace while preserving the shared
 /// `<namespace>/<resource-id>/<kind>/…` bundle shape. The `@` prefix is what
 /// makes the marker unmistakable: no ferrum-edge credential type starts with
 /// one.

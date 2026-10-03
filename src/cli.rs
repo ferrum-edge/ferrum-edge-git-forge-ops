@@ -35,7 +35,10 @@ pub struct Cli {
     /// the Consumer no longer declares, and, in `plan`, `review` and `apply`,
     /// a deleted Consumer the state ledger still records (only in runs that
     /// load its whole namespace) or a stored `alloc=generate` or
-    /// `alloc=rotate` value for a Consumer the ledger does not record.
+    /// `alloc=rotate` value for a Consumer the ledger does not record. It also
+    /// covers a PluginConfig whose id still has stored slots of another plugin
+    /// type (or of the retired type-less form); those values are never
+    /// resolved into the plugin, even when accepted.
     ///
     /// Global rather than per-subcommand because the refusal comes from
     /// credential resolution itself, which `plan`, `apply`, `review`,
