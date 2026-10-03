@@ -570,16 +570,15 @@ fn bounded_inline_code(value: &str) -> String {
 ///
 /// Every physical line then goes through `crate::diagnostics::sanitize_line`,
 /// fenced or not. The terminal sink is a GitHub Actions job log, where the
-/// runner parses a line that begins with `::` (after leading whitespace) as a
-/// workflow command. Markdown fencing is invisible to that parser, so the
-/// validator bytes this function deliberately preserves for the rendered
-/// comment must be neutralized before they reach stdout — otherwise a
-/// diagnostic beginning with `::error::`, `::add-mask::` or
-/// `::stop-commands::` forges log evidence or silences the real annotations a
-/// later step emits. Sanitizing per line rather than with
-/// `crate::diagnostics::sanitize_block` avoids truncating the whole comment at
-/// the 64 KiB block budget; the published Markdown document is built
-/// separately and stays unsanitized.
+/// runner parses a line that begins with `::` (after leading whitespace) or
+/// contains `##[command]` anywhere as a workflow command. Markdown fencing is
+/// invisible to that parser, so the validator bytes this function deliberately
+/// preserves for the rendered comment must be neutralized before they reach
+/// stdout — otherwise a diagnostic can forge log evidence, add masks, fold
+/// output or silence the real annotations a later step emits. Per-line
+/// sanitization avoids truncating the whole comment at the 64 KiB budget used
+/// by `crate::diagnostics::sanitize_block`; the published Markdown stays
+/// unsanitized.
 pub fn markdown_comment_for_terminal(value: &str) -> String {
     let mut rendered = String::with_capacity(value.len());
     let mut open_fence: Option<usize> = None;

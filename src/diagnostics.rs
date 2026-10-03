@@ -9,7 +9,9 @@
 //! strings breaks the premise — a `\n` puts attacker-chosen text at column 0
 //! of the Actions log, where the runner parses `::…::` as a workflow command
 //! (fabricated `::error::` annotations, `::stop-commands::` suppressing the
-//! real ones the very next step emits, `::group::` folding output away).
+//! real ones the very next step emits, `::group::` folding output away). The
+//! runner also accepts `##[command]` anywhere in a line, so that syntax must
+//! be broken even when it appears inside otherwise ordinary text.
 //!
 //! Every diagnostic that interpolates such a string therefore routes it
 //! through this module at the point of interpolation. Two guarantees hold for
@@ -20,9 +22,9 @@
 //!    are line breaks to plenty of downstream readers). [`sanitize_block`] is
 //!    the one exception: it preserves `\n` because its input is already a
 //!    multi-line diagnostic, and it neutralizes each line individually;
-//! 2. no line begins with `::` after leading whitespace — the runner trims a
-//!    command's indentation before parsing it, so `  ::stop-commands::x` is
-//!    just as live as the unindented form.
+//! 2. no line begins with `::` after leading whitespace, and no line contains
+//!    `##[` — the runner trims indentation for `::` commands and searches
+//!    anywhere in a line for the legacy `##[command]` syntax.
 //!
 //! Output is bounded, because an id is as long as the PR author wants it to
 //! be. Truncation appends [`TRUNCATION_MARKER`] so a shortened diagnostic
@@ -30,8 +32,9 @@
 //!
 //! This is the generalization of `import::diagnostic_metadata`, which applied
 //! the same treatment to import diagnostics alone; that function now delegates
-//! here. The PR comment has its own, stricter escaping in
-//! [`crate::review::pr_comment`] and does not use this module.
+//! here. The published PR Markdown has its own stricter escaping in
+//! [`crate::review::pr_comment`], while its terminal rendering uses this
+//! module to neutralize workflow commands before writing to the job log.
 
 use std::fmt;
 use std::path::Path;
@@ -79,12 +82,13 @@ fn replace_unsafe(value: &str, max_chars: usize) -> (String, bool) {
     (sanitized, characters.next().is_some())
 }
 
-/// Make a line that would otherwise parse as a workflow command inert.
+/// Make either Actions workflow-command syntax inert in a line.
 ///
-/// The runner strips leading whitespace before looking for `::`, so the check
-/// has to as well. Prefixing [`REPLACEMENT`] (not a space) is what breaks the
-/// match, because whitespace would simply be trimmed again.
-fn neutralize_command_prefix(line: &mut String) {
+/// The runner strips leading whitespace before looking for `::`, but searches
+/// anywhere in a line for `##[`. Prefixing [`REPLACEMENT`] (not a space) breaks
+/// the former; inserting it between `##` and `[` breaks the latter.
+fn neutralize_workflow_commands(line: &mut String) {
+    *line = line.replace("##[", "##\u{fffd}[");
     if line.trim_start().starts_with("::") {
         line.insert(0, REPLACEMENT);
     }
@@ -113,7 +117,7 @@ fn sanitize_single_line(value: &str, max_chars: usize) -> String {
     if truncated {
         sanitized.push_str(TRUNCATION_MARKER);
     }
-    neutralize_command_prefix(&mut sanitized);
+    neutralize_workflow_commands(&mut sanitized);
     sanitized
 }
 
@@ -138,7 +142,7 @@ pub fn sanitize_block(value: &str) -> String {
         }
         let line = line.strip_suffix('\r').unwrap_or(line);
         let (mut sanitized, _) = replace_unsafe(line, MAX_BLOCK_CHARS);
-        neutralize_command_prefix(&mut sanitized);
+        neutralize_workflow_commands(&mut sanitized);
         output.push_str(&sanitized);
     }
     if truncated {

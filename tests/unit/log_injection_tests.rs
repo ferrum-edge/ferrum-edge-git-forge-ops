@@ -7,16 +7,21 @@
 //! reads inside a secret-bound job. A `\n` in one of them puts attacker text
 //! at column 0 of the Actions log, where `::…::` is a workflow command: a
 //! forged `::error::` annotation, or a `::stop-commands::` that silences the
-//! real annotations a later step writes.
+//! real annotations a later step writes. The runner also parses `##[command]`
+//! anywhere in a line.
 //!
 //! Every assertion here is the same pair: the rendered diagnostic carries no
-//! line break of its own, and no line of it begins a workflow command.
+//! line break of its own, and no line of it begins a `::` workflow command or
+//! contains the legacy `##[` form.
 
 use std::process::{Command, Output};
 
 use gitforgeops::config::schema::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
+use gitforgeops::diff::{
+    resource_diff::{DiffAction, ResourceDiff},
+    security::audit_security,
+};
 use gitforgeops::diagnostics::{sanitize, sanitize_block, sanitize_line, MAX_INLINE_CHARS};
-use gitforgeops::diff::security::audit_security;
 use gitforgeops::error::Error;
 use gitforgeops::policy::config::{PolicyRules, RequireAuthPluginRuleConfig};
 use gitforgeops::policy::{evaluate_policies, PolicyConfig, Severity};
@@ -26,7 +31,7 @@ use tempfile::TempDir;
 
 /// The payload an attacker would put in a resource id: a line break, then a
 /// workflow command that suppresses every later one.
-const HOSTILE: &str = "evil\n::stop-commands::7c6d\n::error::forged";
+const HOSTILE: &str = "evil\n::stop-commands::token\n::error::forged\nx ##[error]payload";
 
 /// No rendered scalar or single-line diagnostic may contain a line break.
 fn assert_single_line(rendered: &str, context: &str) {
@@ -36,13 +41,13 @@ fn assert_single_line(rendered: &str, context: &str) {
     );
 }
 
-/// No line of any rendered output may parse as a workflow command. The runner
-/// trims a command's leading whitespace before parsing it, so this does too.
+/// No rendered line may parse as either Actions workflow-command syntax. The
+/// runner trims indentation for `::` and searches anywhere for `##[`.
 fn assert_no_workflow_command(rendered: &str, context: &str) {
     for (index, line) in rendered.lines().enumerate() {
         assert!(
-            !line.trim_start().starts_with("::"),
-            "{context}: line {index} parses as a workflow command: {line:?}"
+            !line.trim_start().starts_with("::") && !line.contains("##["),
+            "{context}: line {index} contains a workflow command: {line:?}"
         );
     }
 }
@@ -71,17 +76,33 @@ fn sanitize_folds_control_characters_and_bounds_length() {
 
 #[test]
 fn sanitize_neutralizes_a_workflow_command_prefix() {
-    for candidate in ["::error::forged", "  ::stop-commands::7c6d"] {
+    for candidate in [
+        "::error::forged",
+        "  ::stop-commands::token",
+        "##[stop-commands]token",
+        "x ##[error]y",
+        "  ##[add-mask]masked-value",
+    ] {
         let rendered = sanitize(candidate);
         assert_no_workflow_command(&rendered, candidate);
+        let rendered_line = sanitize_line(candidate);
+        assert_no_workflow_command(&rendered_line, candidate);
     }
 }
 
 #[test]
 fn sanitize_block_keeps_line_structure_but_not_commands() {
-    let hostile = "first\n::error::forged\n  ::endgroup::\nlast\ttab";
+    let hostile = concat!(
+        "first\n",
+        "::error::forged\n",
+        "  ::endgroup::\n",
+        "##[error]start\n",
+        "middle ##[group]fold\n",
+        "  ##[notice]space\n",
+        "last\ttab"
+    );
     let rendered = sanitize_block(hostile);
-    assert_eq!(rendered.lines().count(), 4);
+    assert_eq!(rendered.lines().count(), 7);
     assert!(rendered.starts_with("first\n"), "{rendered}");
     assert!(rendered.ends_with("last\u{fffd}tab"), "{rendered}");
     assert_no_workflow_command(&rendered, "block");
@@ -100,16 +121,27 @@ fn review_terminal_output_neutralizes_fenced_workflow_commands() {
     let validation = concat!(
         "::error::forged annotation\n",
         "  ::stop-commands::7c6d\n",
-        "::add-mask::literal-secret\n",
+        "::add-mask::masked-value\n",
         "::group::folded\n",
         "::warning::second annotation\n",
+        "##[error file=path]forged annotation\n",
+        "validator reported x ##[group]folded text\n",
+        "  ##[notice]whitespace prefix\n",
         "ordinary diagnostic\n",
     );
-    let comment = build_review_comment(false, validation, &[], &[], &[], &[], None);
+    let diffs = [ResourceDiff {
+        action: DiffAction::Modify,
+        kind: "Proxy".into(),
+        id: "proxy-##[add-mask]masked-value".into(),
+        namespace: "ferrum".into(),
+        details: vec![],
+    }];
+    let comment = build_review_comment(false, validation, &diffs, &[], &[], &[], None);
 
     // The published comment keeps the validator's text verbatim inside its
     // dynamic fence; only the terminal rendering is neutralized.
     assert!(comment.contains("::error::forged annotation"), "{comment}");
+    assert!(comment.contains("##[error file=path]forged annotation"), "{comment}");
 
     let terminal = markdown_comment_for_terminal(&comment);
     assert_no_workflow_command(&terminal, "review terminal");
