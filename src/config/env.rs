@@ -658,7 +658,11 @@ pub fn validate_verify_transport(
         )));
     }
     if in_github_actions {
-        if parsed.host().filter(|host| !host_is_loopback(host)).is_some() {
+        if parsed
+            .host()
+            .filter(|host| !host_is_loopback(host))
+            .is_some()
+        {
             return Err(refused_in_github_actions(
                 "FERRUM_ALLOW_INSECURE_HTTP",
                 "the configured data-plane host is not loopback, so an http:// \

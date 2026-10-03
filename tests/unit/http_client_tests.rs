@@ -845,8 +845,14 @@ async fn transport_failures_do_not_disclose_the_gateway_url() {
     let error = client.get_health().await.unwrap_err().to_string();
     assert!(!error.contains(&host), "gateway host disclosed: {error}");
     assert!(!error.contains(&port), "gateway port disclosed: {error}");
-    assert!(!error.contains("/health"), "gateway path disclosed: {error}");
-    assert!(!error.contains("for url"), "the URL suffix was not stripped: {error}");
+    assert!(
+        !error.contains("/health"),
+        "gateway path disclosed: {error}"
+    );
+    assert!(
+        !error.contains("for url"),
+        "the URL suffix was not stripped: {error}"
+    );
 }
 
 #[test]
