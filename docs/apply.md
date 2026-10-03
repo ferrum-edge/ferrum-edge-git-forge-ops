@@ -14,7 +14,9 @@ Apply works one namespace at a time (`apply_api` over
 - **`incremental`** (default) reads `/backup` once per namespace, diffs
   locally, and sends one `POST`/`PUT`/`DELETE` per changed resource. At about
   100 ms per call, 1,000 changes take about two minutes. A namespace whose diff
-  is only adds uses `POST /batch` instead.
+  is only adds uses `POST /batch` instead. A namespace that overwrites existing
+  rows reads `/backup` once more before its first overwrite; see
+  [Changes made during an apply](#changes-made-during-an-apply).
 - **`full_replace`** (exclusive mode only) builds and validates every
   namespace payload first, then calls `POST /restore?confirm=true` once per
   namespace. Deterministic errors in any namespace mean no restore is sent.
@@ -148,6 +150,38 @@ Retargeting an existing plugin to a brand-new proxy cannot use a create-only
 batch; the gateway rejects that plugin update, so apply withholds the proxy
 create and defers pruning. Create the proxy in an earlier apply, or use
 exclusive `full_replace`.
+
+## Changes made during an apply
+
+`apply` plans each namespace from the `/backup` it reads before allocating and
+delivering credentials, so another writer can change the gateway before the
+writes go out. Before a namespace's first write that overwrites an existing row
+(a modify, a delete, or a pending-create ownership assertion), incremental
+apply reads `/backup` again and compares every row it is about to overwrite
+with the row it planned against:
+
+- **Ownership moved.** A row that gained, lost or changed its `api_spec_id` is
+  not written: an `/api-specs` import claimed it after the plan. See
+  [Spec-owned resources](ownership.md#spec-owned-resources).
+- **Content changed.** A row that differs in anything but server timestamps is
+  not written, so someone else's edit is not reverted.
+- **Row gone.** The write goes out and the gateway answers for itself: a
+  `DELETE` gets a tolerated 404, a `PUT` fails.
+
+Each refusal is a per-resource error naming the row, so the run exits non-zero,
+and a refused modify defers the namespace's deletes like any failed write.
+Re-run apply to plan against the current gateway. A cached confirmation stops
+the run; a failed confirmation read refuses every overwrite in the namespace.
+
+Creates need no confirmation, because `POST` and `POST /batch` are create-only.
+A proxy update that follows this run's scoped-plugin writes is checked against
+the post-plugin backup instead, ignoring the associations the gateway rewrote
+itself. After an ambiguous create, a readback row that carries an
+`api_spec_id` is never claimed, even when its content matches.
+
+The confirmation narrows the race to one read-to-write interval per namespace.
+It cannot close it: `/backup` carries no per-row revision that a `PUT` or
+`DELETE` could be made conditional on.
 
 ## Ordering between runs
 

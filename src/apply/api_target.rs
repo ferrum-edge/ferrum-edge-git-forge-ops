@@ -1645,6 +1645,12 @@ async fn apply_incremental(
     let mut failed_proxy_deletions = BTreeSet::new();
     let mut changed_proxy_associations = BTreeSet::new();
     let mut post_plugin_snapshot = None;
+    // The plan above came from `actual`, which the caller may have read long
+    // before this point (`cmd_apply` reads it before credential allocation and
+    // delivery). Every write that overwrites an existing row is checked against
+    // one confirmation read taken after the plan; see [`PlanConfirmation`].
+    let planned_rows = LiveIndex::build(actual);
+    let mut confirmation: Option<Result<PlanConfirmation, String>> = None;
     for diff in &diffs {
         if diff.namespace != namespace {
             return Err(crate::error::Error::BackupNamespace(format!(
@@ -1772,7 +1778,42 @@ async fn apply_incremental(
                 },
             );
         }
+        // Creates need no confirmation: `POST` and `POST /batch` are create-only,
+        // so the gateway refuses an id someone else took after the plan. A
+        // post-plugin proxy update is confirmed against the fresher post-plugin
+        // snapshot in `update_proxy_after_plugins`. Every other Modify, Delete
+        // and pending-create assertion overwrites a row the plan judged from
+        // `actual`, so it must still be that row now.
+        let associations_rewritten =
+            diff.kind == "Proxy" && changed_proxy_associations.contains(&diff.id);
+        let mut stale_plan = None;
+        if diff.action == DiffAction::Delete
+            || (diff.action == DiffAction::Modify && !associations_rewritten)
+        {
+            if confirmation.is_none() {
+                confirmation = Some(
+                    match PlanConfirmation::read(client, namespace, actual).await {
+                        Ok(confirmed) => Ok(confirmed),
+                        Err(error) if is_fatal(&error) => {
+                            result.fatal_error = Some(error.to_string());
+                            return Ok(result);
+                        }
+                        Err(error) => Err(error.to_string()),
+                    },
+                );
+            }
+            stale_plan = match &confirmation {
+                Some(Ok(confirmed)) => confirmed.refusal(diff, associations_rewritten),
+                Some(Err(error)) => Some(format!(
+                    "not sent: the confirmation read before overwriting planned rows failed ({error}), so the plan cannot be shown to match the gateway. Re-run apply"
+                )),
+                None => Some("not sent: no confirmation read was taken".to_string()),
+            };
+        }
         let outcome = match (&diff.action, diff.kind.as_str()) {
+            _ if stale_plan.is_some() => {
+                Err(crate::error::Error::Config(stale_plan.take().unwrap_or_default()))
+            }
             (DiffAction::Add, "Proxy") => match index.proxies.get(&key) {
                 Some(p) if proxy_has_failed_plugin(p, &failed_plugins) => {
                     Err(failed_plugin_dependency(p, &failed_plugins))
@@ -1791,6 +1832,7 @@ async fn apply_incremental(
                         Some(Ok(snapshot)) => {
                             update_proxy_after_plugins(
                                 p,
+                                planned_rows.proxies.get(&key).copied(),
                                 snapshot,
                                 client,
                                 namespace,
@@ -2083,8 +2125,15 @@ fn partition_cyclic_creates(
 /// Use the namespace snapshot read after Edge's attachment/detachment writes.
 /// Never infer proxy reconciliation from a plugin response alone. A shared
 /// unowned or pending row still needs its explicit ownership assertion.
+///
+/// That snapshot also serves as the proxy's confirmation read (see
+/// [`PlanConfirmation`]): a proxy an API spec claimed since the plan is
+/// refused, and so is one whose fields other than `plugins` changed. The
+/// associations are excluded because the gateway rewrites them itself when
+/// this run creates, retargets or removes a scoped plugin.
 async fn update_proxy_after_plugins(
     proxy: &Proxy,
+    planned: Option<&Proxy>,
     snapshot: &GatewayConfig,
     client: &AdminClient,
     namespace: &str,
@@ -2108,6 +2157,9 @@ async fn update_proxy_after_plugins(
             proxy.id
         )));
     }
+    if planned.is_some_and(|planned| proxy_changed_outside_associations(planned, live)) {
+        return Err(crate::error::Error::Config(STALE_PLAN_CHANGED.to_string()));
+    }
     let key = state_key(namespace, "Proxy", &proxy.id);
     let needs_assertion = options.pending_create_assertions.contains(&key)
         || matches!(ownership_scope, OwnershipScope::Shared { .. })
@@ -2116,6 +2168,173 @@ async fn update_proxy_after_plugins(
         return Ok(OpOutcome::Unchanged);
     }
     client.update_proxy(proxy, namespace).await.map(applied)
+}
+
+/// Why a planned overwrite was withheld because its row changed after the plan.
+const STALE_PLAN_CHANGED: &str =
+    "not sent: the live row changed after this run planned the write, so sending it would overwrite a concurrent change. Re-run apply to plan against the current gateway";
+
+/// Why a planned overwrite was withheld because its row lost or changed its
+/// API-spec owner after the plan.
+const STALE_PLAN_OWNERSHIP: &str =
+    "not sent: the live row's API-spec ownership changed after this run planned the write. Re-run apply to plan against the current gateway";
+
+/// Proves, immediately before an incremental namespace's first overwrite, that
+/// the rows the plan will overwrite are still the rows it planned against.
+///
+/// The plan is computed from a live view the caller may have read long before
+/// the first write: `cmd_apply` reads every namespace's `/backup`, then
+/// allocates and delivers credentials and journals creates, and only then
+/// applies. A concurrent `/api-specs` import or admin edit in that window would
+/// otherwise be overwritten (a PUT) or removed (a DELETE) from a stale
+/// ownership decision. So the first Modify, Delete or pending-create assertion
+/// in a namespace takes one authoritative `GET /backup`, and every such write
+/// is refused (an ordinary per-resource error, which also defers the
+/// namespace's deletes after a refused Modify) when its row:
+///
+/// - gained, lost or changed its `api_spec_id` (ownership moved), or
+/// - changed in any field other than server timestamps.
+///
+/// A row that is gone from the confirmation read is left to the write itself:
+/// a DELETE answers 404 (tolerated) and a PUT answers 404 (an error), so
+/// neither can touch a row someone else owns. A cached or duplicate-bearing
+/// confirmation stops the run like every other such view; a failed read refuses
+/// every overwrite in the namespace.
+///
+/// This narrows the race to one read-to-write interval per namespace; it cannot
+/// close it. `/backup` carries no per-row revision that a `PUT` or `DELETE`
+/// could be made conditional on, so a change landing between this read and a
+/// write is still overwritten.
+struct PlanConfirmation {
+    /// Rows as the plan saw them, keyed by `namespace:Kind:id`.
+    planned: HashMap<String, ObservedRow>,
+    /// Rows as the confirmation read saw them.
+    confirmed: HashMap<String, ObservedRow>,
+}
+
+/// One row's ownership tag and comparable content.
+struct ObservedRow {
+    api_spec_id: Option<String>,
+    /// [`comparison_value`]: the row without server timestamps, with
+    /// association order normalized.
+    value: serde_json::Value,
+}
+
+impl PlanConfirmation {
+    async fn read(
+        client: &AdminClient,
+        namespace: &str,
+        planned: &GatewayConfig,
+    ) -> crate::error::Result<Self> {
+        let snapshot = client.get_backup_snapshot_for_mutation(namespace).await?;
+        // A cached read clears `api_spec_id`, so it cannot confirm ownership.
+        // The client's sticky flag is already set; this turns it into the
+        // run-stopping error every other cached view produces.
+        ensure_authoritative_view(client)?;
+        Ok(Self {
+            planned: observe_rows(planned)?,
+            confirmed: observe_rows(&snapshot.config)?,
+        })
+    }
+
+    /// `Some(reason)` when the planned write for `diff` must not be sent.
+    ///
+    /// `associations_rewritten` excludes a proxy's `plugins` from the content
+    /// comparison: this run's own plugin writes make the gateway rewrite them.
+    fn refusal(&self, diff: &ResourceDiff, associations_rewritten: bool) -> Option<String> {
+        let key = state_key(&diff.namespace, &diff.kind, &diff.id);
+        let confirmed = self.confirmed.get(&key)?;
+        let planned = self.planned.get(&key);
+        let planned_owner = planned.and_then(|row| row.api_spec_id.as_deref());
+        if planned_owner != confirmed.api_spec_id.as_deref() {
+            return Some(match &confirmed.api_spec_id {
+                Some(spec) => format!(
+                    "not sent: the live row became owned by API spec `{spec}` after this run planned the write. Re-run apply to plan against the current gateway"
+                ),
+                None => STALE_PLAN_OWNERSHIP.to_string(),
+            });
+        }
+        let unchanged = planned.is_some_and(|planned| {
+            if associations_rewritten {
+                without_associations(&planned.value) == without_associations(&confirmed.value)
+            } else {
+                planned.value == confirmed.value
+            }
+        });
+        (!unchanged).then(|| STALE_PLAN_CHANGED.to_string())
+    }
+}
+
+/// Every row of one live view as an [`ObservedRow`], keyed by
+/// `namespace:Kind:id`. Duplicate identities are refused, as on every other
+/// view a mutation is authorized from.
+fn observe_rows(config: &GatewayConfig) -> crate::error::Result<HashMap<String, ObservedRow>> {
+    fn observe<T: serde::Serialize>(
+        rows: &mut HashMap<String, ObservedRow>,
+        kind: &str,
+        (namespace, id): (&str, &str),
+        api_spec_id: Option<&str>,
+        row: &T,
+    ) -> crate::error::Result<()> {
+        let value = comparison_value(kind, row).ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "{kind} `{id}` in namespace `{namespace}` could not be serialized for comparison"
+            ))
+        })?;
+        let observed = ObservedRow {
+            api_spec_id: api_spec_id.map(str::to_string),
+            value,
+        };
+        rows.insert(state_key(namespace, kind, id), observed);
+        Ok(())
+    }
+
+    crate::config::validate_unique_live_resource_keys(config)?;
+    let mut rows = HashMap::new();
+    for row in &config.proxies {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        let owner = row.api_spec_id.as_deref();
+        observe(&mut rows, "Proxy", key, owner, row)?;
+    }
+    for row in &config.consumers {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        observe(&mut rows, "Consumer", key, None, row)?;
+    }
+    for row in &config.upstreams {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        let owner = row.api_spec_id.as_deref();
+        observe(&mut rows, "Upstream", key, owner, row)?;
+    }
+    for row in &config.plugin_configs {
+        let key = (row.namespace.as_str(), row.id.as_str());
+        let owner = row.api_spec_id.as_deref();
+        observe(&mut rows, "PluginConfig", key, owner, row)?;
+    }
+    Ok(rows)
+}
+
+/// A comparison value without the proxy `plugins` association list.
+fn without_associations(value: &serde_json::Value) -> serde_json::Value {
+    let mut value = value.clone();
+    if let Some(map) = value.as_object_mut() {
+        map.remove("plugins");
+    }
+    value
+}
+
+/// Did anything about a proxy other than its associations and server
+/// timestamps change between the plan's view and `live`? An unserializable row
+/// counts as changed.
+fn proxy_changed_outside_associations(planned: &Proxy, live: &Proxy) -> bool {
+    match (
+        comparison_value("Proxy", planned),
+        comparison_value("Proxy", live),
+    ) {
+        (Some(planned), Some(live)) => {
+            without_associations(&planned) != without_associations(&live)
+        }
+        _ => true,
+    }
 }
 
 /// New scoped configs and their new target proxies need a create transaction,
@@ -2535,6 +2754,15 @@ impl<'a> CreateResource<'a> {
         }
     }
 
+    fn namespace(self) -> &'a str {
+        match self {
+            Self::Proxy(resource) => &resource.namespace,
+            Self::Consumer(resource) => &resource.namespace,
+            Self::Upstream(resource) => &resource.namespace,
+            Self::PluginConfig(resource) => &resource.namespace,
+        }
+    }
+
     async fn create(self, client: &AdminClient, namespace: &str) -> crate::error::Result<()> {
         match self {
             Self::Proxy(resource) => client.create_proxy(resource, namespace).await,
@@ -2604,6 +2832,11 @@ impl<'a> CreateResource<'a> {
     /// `Absent` proves the write did not commit, `Different` proves *something*
     /// holds the identity but not what we sent, and `Exact` is the only one
     /// that permits recording the create as landed.
+    ///
+    /// A row carrying an `api_spec_id` is always `Different`. The subset test
+    /// cannot see the tag (the repository never declares one), so without this
+    /// a create racing an `/api-specs` import that produced identical content
+    /// would "recover" by asserting ownership of the spec's row with a PUT.
     fn live_match(self, live: &LiveIndex<'_>) -> LiveMatch {
         fn classify<T: serde::Serialize>(kind: &str, live: Option<&&T>, desired: &T) -> LiveMatch {
             match live {
@@ -2613,6 +2846,9 @@ impl<'a> CreateResource<'a> {
             }
         }
 
+        if live.is_spec_owned(self.kind(), self.namespace(), self.id()) {
+            return LiveMatch::Different;
+        }
         match self {
             Self::Proxy(desired) => classify(
                 self.kind(),

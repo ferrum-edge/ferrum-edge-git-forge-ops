@@ -81,6 +81,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Incremental `apply` no longer overwrites or deletes a row from a stale plan.
+  The plan comes from the `/backup` read before credential allocation and
+  delivery, so before a namespace's first `PUT` or `DELETE` of an existing row
+  (a modify, a delete or a pending-create ownership assertion) apply reads
+  `/backup` again. A row that gained, lost or changed its `api_spec_id`, or
+  whose content changed, since the plan is not written: the refusal is a
+  per-resource error, a refused modify defers the namespace's deletes, and the
+  run exits non-zero. A cached confirmation stops the run; a failed one refuses
+  every overwrite in the namespace. A proxy updated after this run's
+  scoped-plugin writes is checked the same way against the post-plugin backup,
+  ignoring the associations the gateway rewrote. An ambiguous create whose
+  readback finds the declared content under an `api_spec_id` no longer claims
+  that row with an ownership `PUT`; the run stops instead. The check narrows the
+  race to one read-to-write interval per namespace (GHSA-fh5w-5x4f-86gh).
 - Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
   CVE-2026-103111 finding while the pinned Debian base remains behind.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on

@@ -164,6 +164,10 @@ whatever the ledger says:
   namespaces reconcile normally.
 - **Never deleted**, except in `exclusive` mode with
   `apply --confirm-api-spec-deletion`. Otherwise apply lists each skipped row.
+- **Never claimed after the plan.** A row an `/api-specs` import tags between
+  apply's plan and its write is refused, not modified or deleted, and a
+  confirmed spec deletion still requires the owner the plan saw. See
+  [Changes made during an apply](apply.md#changes-made-during-an-apply).
 - **Always reported** in `plan`, `diff` and the PR comment's
   "Spec-owned Resources" section, regardless of `ownership.drift_report`.
 - **Never authored.** An `api_spec_id` in repository YAML is rejected, even
