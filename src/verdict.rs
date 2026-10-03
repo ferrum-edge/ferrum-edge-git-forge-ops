@@ -74,6 +74,12 @@ pub enum BlockerKind {
     /// `gitforgeops/verify-probe: "true"` and, when the run can see
     /// `FERRUM_VERIFY_PROBE_CONSUMERS`, listed there.
     InvalidSmokeChecks,
+    /// The run is bound to the environment and a declared check sends a
+    /// credential slot, but the operator's `FERRUM_VERIFY_PROBE_CONSUMERS`
+    /// is unset, empty or malformed: `verify` would refuse after `apply`
+    /// changed the gateway. An operator action, not a pull-request fix, so it
+    /// is not reported as [`BlockerKind::InvalidSmokeChecks`].
+    ProbeConsumerAllowlist,
 }
 
 impl BlockerKind {
@@ -90,6 +96,7 @@ impl BlockerKind {
             BlockerKind::NarrowedFilePublication => "narrowed-file-publication",
             BlockerKind::PublicationPathCollision => "publication-path-collision",
             BlockerKind::InvalidSmokeChecks => "invalid-smoke-checks",
+            BlockerKind::ProbeConsumerAllowlist => "probe-consumer-allowlist",
         }
     }
 
@@ -140,6 +147,13 @@ impl BlockerKind {
                  Consumer labelled gitforgeops/verify-probe and listed by the operator in \
                  FERRUM_VERIFY_PROBE_CONSUMERS), or remove the file if the environment \
                  declares no traffic checks"
+            }
+            BlockerKind::ProbeConsumerAllowlist => {
+                "FERRUM_VERIFY_PROBE_CONSUMERS is unset, empty or malformed for this \
+                 environment while a traffic check sends a credential slot; a repository \
+                 administrator must set that GitHub Environment variable to the comma-separated \
+                 <namespace>/<consumer-id> of its dedicated probe Consumers (the pull request \
+                 cannot fix this)"
             }
         }
     }
@@ -206,6 +220,9 @@ pub struct ApplyGateInputs<'a> {
     /// [`crate::verify::SmokeConfig::load`] refused it, or a slot it names
     /// failed [`crate::verify::refuse_unbound_slots`].
     pub smoke_checks_invalid: bool,
+    /// The run is bound to the environment, a declared check sends a slot,
+    /// and the operator allowlist is unset, empty or malformed.
+    pub probe_allowlist_invalid: bool,
 }
 
 /// A file-mode publication is document-wide: whatever the run selected
@@ -223,6 +240,11 @@ pub fn publication_path_collision_blocker(collide: bool) -> Option<ApplyBlocker>
 /// A smoke file `verify` would refuse only after the gateway changed.
 pub fn invalid_smoke_checks_blocker(invalid: bool) -> Option<ApplyBlocker> {
     invalid.then(|| ApplyBlocker::new(BlockerKind::InvalidSmokeChecks, 1))
+}
+
+/// An operator allowlist `verify` would refuse only after the gateway changed.
+pub fn probe_consumer_allowlist_blocker(invalid: bool) -> Option<ApplyBlocker> {
+    invalid.then(|| ApplyBlocker::new(BlockerKind::ProbeConsumerAllowlist, 1))
 }
 
 /// Validation is a single gate: it either passed or `apply` refuses.
@@ -298,6 +320,7 @@ pub fn apply_blockers(inputs: ApplyGateInputs<'_>) -> Vec<ApplyBlocker> {
         narrowed_file_publication_blocker(inputs.file_publication_narrowed),
         publication_path_collision_blocker(inputs.publication_paths_collide),
         invalid_smoke_checks_blocker(inputs.smoke_checks_invalid),
+        probe_consumer_allowlist_blocker(inputs.probe_allowlist_invalid),
         security_blocker(inputs.security_findings, inputs.security_overridden),
         slot_remap_blocker(inputs.secret_report, inputs.allow_credential_slot_remap),
         required_credentials_blocker(inputs.secret_report),

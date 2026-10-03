@@ -112,6 +112,9 @@ and prints an `=== Apply Blockers ===` section for:
   (`publication-path-collision`);
 - a `.gitforgeops/smoke.yaml` that does not load, or names a slot `verify`
   would refuse (`invalid-smoke-checks`);
+- in a run bound to the environment, a check that sends a slot while
+  `FERRUM_VERIFY_PROBE_CONSUMERS` is unset, blank or malformed
+  (`probe-consumer-allowlist`, a repository administrator's fix);
 - a live comparison finding declarations that collide with API-spec-owned
   rows.
 
@@ -224,6 +227,7 @@ case-insensitive), malformed or zero numbers, and bad URLs are errors. See
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validator binary. |
 | `FERRUM_VERIFY_BASE_URL` | — | Data-plane URL for `verify`. |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | — | Operator allowlist of probe Consumers (`<namespace>/<consumer-id>`, comma-separated). `verify` refuses every check that sends a slot while it is unset; `validate`, `plan`, `apply` and `review` check it when set. |
+| `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set (`true`) only by workflow steps bound to the environment. Then an unset, blank or malformed allowlist refuses a slot-sending check in `validate`, `plan`, `apply` and `review`, as `verify` refuses it, instead of reading as "not visible". |
 | `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown top-level `spec` fields. See [Writing resources](resources.md#supported-fields-and-unknown-fields). |
 | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same as `apply --allow-nontransactional-plugin-attach`. |
 | `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same as `review --fail-on-blockers`. |

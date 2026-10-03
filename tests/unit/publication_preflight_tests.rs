@@ -774,6 +774,162 @@ fn cli_review_shows_which_consumer_each_slot_would_spend() {
     );
 }
 
+/// Set only by workflow steps bound to the environment.
+const BOUND: &str = "FERRUM_VERIFY_PROBE_CONSUMERS_BOUND";
+/// The `invalid-smoke-checks` remedy: a fix the pull request author makes.
+const PR_FIX: &str = "names a credential verify would refuse";
+
+#[cfg(unix)]
+#[test]
+fn cli_an_environment_bound_run_refuses_a_slot_without_the_operator_allowlist() {
+    // Inside the environment's job an unset variable is the operator's
+    // missing allowlist, not an invisible one: refuse before Apply, exactly
+    // as Verify will refuse after it.
+    let unset: &[(&str, &str)] = &[(BOUND, "true")];
+    let blank: &[(&str, &str)] = &[(BOUND, "true"), (ALLOWLIST, " ")];
+    for vars in [unset, blank] {
+        for args in [
+            vec!["validate"],
+            vec!["plan"],
+            vec!["apply", "--auto-approve"],
+        ] {
+            let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+
+            let output = repo.run_with(
+                &args,
+                "assembled/resources.yaml",
+                "assembled/mesh.yaml",
+                vars,
+            );
+
+            let text = shown(&output);
+            assert!(!output.status.success(), "{args:?}: {text}");
+            for expected in [
+                "unset or empty",
+                "repository administrator",
+                "a pull request cannot fix this",
+            ] {
+                assert!(text.contains(expected), "{expected} {args:?}: {text}");
+            }
+            assert!(!repo.path("assembled/resources.yaml").exists(), "{args:?}");
+            repo.assert_no_state(&format!("{args:?}"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_a_malformed_operator_allowlist_is_refused_as_an_operator_error() {
+    // `a/b/c` would match both `(a, b/c)` and `(a/b, c)`, so it is refused,
+    // and the message names the operator action rather than a smoke fix.
+    let vars: &[(&str, &str)] = &[(ALLOWLIST, "ferrum/orders/probe")];
+    let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+    let args = ["validate"];
+    let output = repo.run_with(
+        &args,
+        "assembled/resources.yaml",
+        "assembled/mesh.yaml",
+        vars,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("exactly one '/'"), "{text}");
+    assert!(text.contains("a pull request cannot fix this"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_review_reports_a_missing_or_malformed_allowlist_for_the_operator() {
+    // The pull request author cannot fix the operator's variable, so it is
+    // its own blocker, never `invalid-smoke-checks`.
+    let bundle = credential_bundle();
+    let missing = [("FERRUM_CREDS_JSON", bundle.as_str()), (BOUND, "true")];
+    let malformed = [
+        ("FERRUM_CREDS_JSON", bundle.as_str()),
+        (ALLOWLIST, "orders-probe"),
+    ];
+    for (vars, note) in [
+        (&missing, "is not set for this environment"),
+        (&malformed, "does not parse for this environment"),
+    ] {
+        let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+        for fail_on_blockers in [false, true] {
+            let mut args = vec!["review"];
+            if fail_on_blockers {
+                args.push("--fail-on-blockers");
+            }
+            let output = repo.run_with(
+                &args,
+                "assembled/resources.yaml",
+                "assembled/mesh.yaml",
+                vars,
+            );
+            let text = shown(&output);
+            let code = i32::from(fail_on_blockers);
+            assert_eq!(output.status.code(), Some(code), "{text}");
+            if fail_on_blockers {
+                assert!(text.contains("probe-consumer-allowlist"), "{text}");
+            }
+            assert!(text.contains(note), "{text}");
+            assert!(text.contains("repository administrator"), "{text}");
+            assert!(!text.contains("invalid-smoke-checks"), "{text}");
+            assert!(!text.contains(PR_FIX), "{text}");
+            let all = combined(&output);
+            assert!(!all.contains(PROBE_VALUE), "review printed a value");
+        }
+    }
+}
+
+const TEAM_B_PROBE: &str = r#"kind: Consumer
+spec:
+  id: probe
+  username: team-b-probe
+  labels:
+    gitforgeops/verify-probe: "true"
+  credentials:
+    keyauth:
+      - key: "${gh-env-secret:alloc=require}"
+"#;
+
+/// The `default` environment, scoped to the `ferrum` namespace.
+const FERRUM_SCOPED_CONFIG: &str = r#"version: 1
+environments:
+  default:
+    namespace_filter: ferrum
+    live_review: false
+"#;
+
+#[cfg(unix)]
+#[test]
+fn cli_a_slot_outside_the_environments_own_scope_is_refused_before_merge() {
+    // `verify` assembles under the environment's declared namespace scope, so
+    // a slot in another namespace has no Consumer there and is refused. The
+    // preview must refuse it too, even though that Consumer is labelled.
+    let smoke = smoke_sending("team-b/probe/keyauth/key");
+    let files = [
+        ("resources/team-b/consumers/probe.yaml", TEAM_B_PROBE),
+        (".gitforgeops/config.yaml", FERRUM_SCOPED_CONFIG),
+    ];
+    let args = ["validate"];
+    let repo = Repo::with_files(Some(&smoke), &files);
+    let output = repo.run(&args, "assembled/resources.yaml", "assembled/mesh.yaml");
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("is not a brokered secret"), "{text}");
+    assert!(text.contains("team-b/probe/keyauth/key"), "{text}");
+
+    // An ad-hoc FERRUM_NAMESPACE only leaves `team-b` to its own run.
+    let adhoc = Repo::with_files(Some(&smoke), &files[..1]);
+    let vars = [("FERRUM_NAMESPACE", "ferrum")];
+    let output = adhoc.run_with(
+        &args,
+        "assembled/resources.yaml",
+        "assembled/mesh.yaml",
+        &vars,
+    );
+    assert!(output.status.success(), "{}", shown(&output));
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_refuses_a_conditional_authenticator_before_validator_or_publication() {

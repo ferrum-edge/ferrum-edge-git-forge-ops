@@ -25,7 +25,8 @@
 //! bundle holds every Consumer, plugin-config and service-discovery secret.
 //! A `slot:` header is honoured only when it names a brokered secret of a
 //! Consumer that the operator lists in [`VERIFY_PROBE_CONSUMERS_ENV`] (a
-//! GitHub Environment variable, outside anything a merge can change) **and**
+//! GitHub Environment variable, which no change to `resources/` or
+//! `.gitforgeops/` can change) **and**
 //! the environment's desired configuration labels
 //! [`VERIFY_PROBE_LABEL`]` = "true"`. `verify` hands the runner a projection
 //! holding exactly those values ([`authorize_probe_slots`]); anything else
@@ -116,7 +117,9 @@ pub const VERIFY_PROBE_LABEL: &str = "gitforgeops/verify-probe";
 ///
 /// Bound from a GitHub Environment variable of the same name
 /// (`vars.FERRUM_VERIFY_PROBE_CONSUMERS`), which only a repository
-/// administrator can set and no merge can change. `verify` refuses every check
+/// administrator can set and no change to `resources/` or `.gitforgeops/` can
+/// change; the workflow lines that bind it are guarded by review of
+/// `.github/workflows/`. `verify` refuses every check
 /// that sends a slot while it is unset or empty, and every slot whose Consumer
 /// it does not list. [`VERIFY_PROBE_LABEL`] is required as well, but a label
 /// is repository content and authorizes nothing by itself.
@@ -671,15 +674,21 @@ impl ProbeConsumerAllowlist {
             if entry.is_empty() {
                 continue;
             }
+            // Exactly one `/`: `a/b/c` would match both `(a, b/c)` and
+            // `(a/b, c)`.
             let qualified = entry
                 .split_once('/')
-                .is_some_and(|(namespace, id)| !namespace.is_empty() && !id.is_empty());
+                .is_some_and(|(namespace, id)| {
+                    !namespace.is_empty() && !id.is_empty() && !id.contains('/')
+                });
             let clean = !entry.chars().any(|c| c.is_control() || c.is_whitespace());
             if !qualified || !clean {
                 return Err(crate::error::Error::Config(format!(
                     "{VERIFY_PROBE_CONSUMERS_ENV}: entry {:?} is not \
-                     <namespace>/<consumer-id>; list probe Consumers as a comma-separated \
-                     list such as ferrum/orders-probe",
+                     <namespace>/<consumer-id> (exactly one '/', no whitespace). A \
+                     repository administrator must correct the {VERIFY_PROBE_CONSUMERS_ENV} \
+                     variable of this GitHub Environment to a comma-separated list such as \
+                     ferrum/orders-probe; a pull request cannot fix this.",
                     crate::diagnostics::sanitize_line(entry)
                 )));
             }
@@ -702,6 +711,22 @@ impl ProbeConsumerAllowlist {
     pub fn consumers(&self) -> impl Iterator<Item = &str> {
         self.consumers.iter().map(String::as_str)
     }
+}
+
+/// What a run knows about the operator allowlist, for a review to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeAllowlistState {
+    /// The variable is bound to this run and lists at least one Consumer.
+    Listed,
+    /// No GitHub Environment is bound to this run (a pull request's `plan`
+    /// or `review`), so the allowlist half is left to `verify`.
+    NotVisible,
+    /// The run is bound to the environment, and the variable is unset or
+    /// empty: `verify` would refuse every check that sends a slot.
+    Unset,
+    /// The variable does not parse.
+    Malformed,
 }
 
 /// The Consumer a brokered credential slot belongs to.
@@ -941,16 +966,20 @@ pub struct SlotBinding {
 /// see it, and `None` when it cannot (a pull request's `validate` or `plan`),
 /// in which case a labelled Consumer reads as
 /// [`BindingStatus::AllowlistNotVisible`]. `verify` always passes it.
-/// `namespace_filter` is the run's namespace selection: a slot outside it is
-/// [`BindingStatus::OutsideNamespaceScope`] rather than a false refusal.
+///
+/// `adhoc_namespace` is an ad-hoc `FERRUM_NAMESPACE` selection only: a slot
+/// outside it is [`BindingStatus::OutsideNamespaceScope`] rather than a false
+/// refusal, because another run covers that namespace. Pass `None` under the
+/// environment's own declared scope: `verify` assembles under that scope too,
+/// so a slot outside it has no Consumer and is refused, here as there.
 pub fn bind_probe_slots(
     checks: &EnvironmentChecks,
     desired: &GatewayConfig,
     allowlist: Option<&ProbeConsumerAllowlist>,
-    namespace_filter: Option<&str>,
+    adhoc_namespace: Option<&str>,
 ) -> Vec<SlotBinding> {
     let owners = consumer_secret_slots(desired);
-    let selected_namespace = namespace_filter.map(escape_slot_component);
+    let selected_namespace = adhoc_namespace.map(escape_slot_component);
     let mut bindings = Vec::new();
     for check in &checks.checks {
         for (header, value) in &check.headers {
@@ -1075,15 +1104,7 @@ pub fn authorize_probe_slots(
         return Ok(ProbeAuthorization::default());
     }
     let Some(allowlist) = allowlist.filter(|list| !list.is_empty()) else {
-        return Err(crate::error::Error::Config(format!(
-            "{SMOKE_CONFIG_PATH}: environment '{}': a traffic check sends a credential slot, \
-             but {VERIFY_PROBE_CONSUMERS_ENV} is unset or empty; no request was sent. A \
-             repository administrator must list the environment's dedicated probe Consumers \
-             (comma-separated <namespace>/<consumer-id>) in the {VERIFY_PROBE_CONSUMERS_ENV} \
-             variable of this GitHub Environment. The `{VERIFY_PROBE_LABEL}` label alone \
-             authorizes nothing.",
-            crate::diagnostics::sanitize_line(environment)
-        )));
+        return Err(missing_allowlist_error(environment));
     };
     let bindings = bind_probe_slots(checks, desired, Some(allowlist), None);
     refuse_unbound_slots(environment, &bindings)?;
@@ -1093,6 +1114,20 @@ pub fn authorize_probe_slots(
         .map(|binding| binding.slot)
         .collect();
     Ok(ProbeAuthorization { slots })
+}
+
+/// The refusal for a check that sends a slot while the operator allowlist is
+/// unset or empty. It names the operator action: a pull request cannot fix it.
+pub fn missing_allowlist_error(environment: &str) -> crate::error::Error {
+    crate::error::Error::Config(format!(
+        "{SMOKE_CONFIG_PATH}: environment '{}': a traffic check sends a credential slot, \
+         but {VERIFY_PROBE_CONSUMERS_ENV} is unset or empty; no request was sent. A \
+         repository administrator must list the environment's dedicated probe Consumers \
+         (comma-separated <namespace>/<consumer-id>) in the {VERIFY_PROBE_CONSUMERS_ENV} \
+         variable of this GitHub Environment; a pull request cannot fix this. The \
+         `{VERIFY_PROBE_LABEL}` label alone authorizes nothing.",
+        crate::diagnostics::sanitize_line(environment)
+    ))
 }
 
 /// [`authorize_probe_slots`], then [`ProbeAuthorization::project`] `bundle`.

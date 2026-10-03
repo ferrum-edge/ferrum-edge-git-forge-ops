@@ -419,7 +419,8 @@ fn a_customer_credential_refuses_the_run_before_any_request() {
 fn a_customer_a_pull_request_labelled_is_refused_unless_the_operator_lists_it() {
     // GHSA-8mhw-ghx8-9m63: `resources/` has no code owner, so one pull
     // request can label a customer Consumer and name its key. The label is
-    // present; the operator's list, which no merge can change, refuses it.
+    // present; the operator's list, which that pull request cannot change,
+    // refuses it.
     let dir = repo_with_consumers(STAGING_CUSTOMER, true, true);
     let (listener, url) = silent_data_plane();
     let output = verify_staging(&dir, &url, LISTS_THE_PROBE);

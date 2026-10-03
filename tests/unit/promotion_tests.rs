@@ -488,7 +488,8 @@ fn workflow_steps<'a>(workflow: &'a str, name: &str) -> Vec<&'a str> {
 #[test]
 fn the_operator_allowlist_reaches_verify_and_the_steps_before_a_change() {
     // GHSA-8mhw-ghx8-9m63: the allowlist must come from a GitHub Environment
-    // variable, which no merge can change. `verify` enforces it; `validate`
+    // variable, which no change to `resources/` or `.gitforgeops/` can
+    // change. `verify` enforces it; `validate`
     // before Apply and the trusted review refuse an unlisted Consumer before
     // the gateway changes.
     let binding = "FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}";
@@ -509,6 +510,15 @@ fn the_operator_allowlist_reaches_verify_and_the_steps_before_a_change() {
     let steps = workflow_steps(&review, "Post trusted live review");
     assert_eq!(steps.len(), 1);
     assert!(steps[0].contains(binding), "{}", steps[0]);
+
+    // Steps that run inside the environment before a change say so, so an
+    // unset variable there is refused as Verify refuses it, not read as
+    // "not visible".
+    let bound = "FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: \"true\"";
+    for step in workflow_steps(&apply, "Validate") {
+        assert!(step.contains(bound), "Validate: {step}");
+    }
+    assert!(steps[0].contains(bound), "{}", steps[0]);
 }
 
 #[tokio::test]
@@ -844,6 +854,8 @@ fn the_operator_allowlist_names_namespace_qualified_consumers() {
         "ferrum/",
         "/orders-probe",
         "ferrum/orders probe",
+        // Ambiguous: `(ferrum, orders/probe)` or `(ferrum/orders, probe)`.
+        "ferrum/orders/probe",
     ] {
         let error = ProbeConsumerAllowlist::parse(raw)
             .expect_err("must refuse")

@@ -143,9 +143,12 @@ exits 1 before the bundle is read or any request is sent:
 - **The operator lists the Consumer** in the `FERRUM_VERIFY_PROBE_CONSUMERS`
   variable of the environment's GitHub Environment, as
   `<namespace>/<consumer-id>`. This is the authorization. A GitHub Environment
-  variable can be changed only by a repository administrator, never by a
-  merge. Unset or empty, every check that sends a slot is refused; a
-  malformed entry is an error.
+  variable can be set only by a repository administrator, so no change to
+  `resources/` or `.gitforgeops/` can change it. The workflow lines that bind
+  it are guarded by review of `.github/workflows/`; a trusted-base checker
+  rule pinning them is tracked as a follow-up. Unset or empty, every check
+  that sends a slot is refused; a malformed entry (anything but exactly one
+  `/` per entry) is an error.
 - The Consumer is in the environment's desired configuration (after overlays
   and namespace scope) and carries the label `gitforgeops/verify-probe: "true"`.
   The label is required too, but it lives in `resources/`, which the pull
@@ -161,11 +164,22 @@ The same binding is checked before anything changes. `validate`, `plan` and
 can see `FERRUM_VERIFY_PROBE_CONSUMERS`) not listed. `review` reports it as the
 `invalid-smoke-checks` blocker and lists, by name only, each check's header,
 slot and the Consumer it would spend, plus every Consumer carrying the label,
-so a pull request that adds a label or a slot is visible. A run narrowed by
-`FERRUM_NAMESPACE` does not judge slots in other namespaces. The bundled
-workflows bind the variable into both `Validate` steps (before Apply) and both
+so a pull request that adds a label or a slot is visible. A slot outside the
+environment's own declared `namespace_filter` is refused, as `verify` refuses
+it; only an ad-hoc `FERRUM_NAMESPACE` leaves slots in other namespaces
+unjudged, to their own run.
+
+A run inside the environment knows the variable is bound: the bundled steps
+set `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` beside it. There an unset,
+blank or malformed variable is refused while a check sends a slot, exactly as
+`verify` will refuse it, so nothing is applied that `verify` rejects.
+`review` reports that as its own `probe-consumer-allowlist` blocker, naming
+the administrator action, because the pull request author cannot fix it.
+Without the marker (a pull request's own `plan` or `review`), an unset list is
+only "not visible", and the review says so. The bundled workflows bind the
+variable into both `Validate` steps (before Apply, with the marker) and both
 `Verify traffic` steps of `apply-on-merge.yml`, and into the trusted live
-review.
+review (with the marker).
 
 #### Operator setup
 

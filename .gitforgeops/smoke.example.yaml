@@ -27,12 +27,14 @@
 #   2. this environment's resources label `gitforgeops/verify-probe: "true"`,
 #
 # and only on a GET or HEAD check. The variable is the authorization: no
-# merge can change it, while the label lives in resources/, which the same
-# pull request could edit. With the variable unset, every check that sends a
-# slot fails. Plugin-config and service-discovery slots are never sent.
-# Anything else fails `gitforgeops verify` before any request, and validate,
-# plan and review report it before the merge. Use a dedicated, low-privilege
-# Consumer that exists to be probed, never a customer:
+# change to resources/ or .gitforgeops/ can change it (the workflow lines that
+# bind it are guarded by review of .github/workflows/), while the label lives
+# in resources/, which the same pull request could edit. With the variable
+# unset, every check that sends a slot fails. Plugin-config and
+# service-discovery slots are never sent. Anything else fails `gitforgeops
+# verify` before any request, and validate, plan and review report it before
+# the merge. Use a dedicated, low-privilege Consumer that exists to be probed,
+# never a customer:
 #
 #   kind: Consumer
 #   spec:

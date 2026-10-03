@@ -667,8 +667,10 @@ dedicated probe Consumer that a repository administrator lists in the
 `FERRUM_VERIFY_PROBE_CONSUMERS` variable of the environment's GitHub
 Environment (comma-separated `<namespace>/<consumer-id>`) **and** that the
 resources label `gitforgeops/verify-probe: "true"`, and only on a `GET` or
-`HEAD` request. The variable is the authorization, because no merge can change
-it; with it unset, every check that sends a slot is refused. Any other slot
+`HEAD` request. The variable is the authorization, because no change to
+`resources/` or `.gitforgeops/` can change it (the workflow lines that bind it
+are guarded by review of `.github/workflows/`); with it unset, every check that
+sends a slot is refused. Any other slot
 refuses the run before a request is sent, and `validate`, `plan` and `review`
 report it before the merge (`smoke.yaml` `version: 2`; a `version: 1` file
 that names a slot is refused). Checks are bounded (at most 10 attempts, 60 seconds per attempt, 50

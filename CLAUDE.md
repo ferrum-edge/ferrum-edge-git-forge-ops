@@ -687,8 +687,10 @@ environment's whole bundle. A `slot:` is sent only when all hold, else
 - the Consumer is in `FERRUM_VERIFY_PROBE_CONSUMERS`
   (`verify::ProbeConsumerAllowlist`, comma-separated `<ns>/<consumer-id>`).
   This operator-held GitHub Environment **variable** is the authorization: no
-  merge can change it. Unset or empty while a check sends a slot is a refusal;
-  a malformed entry is an error;
+  change to `resources/` or `.gitforgeops/` can change it (the workflow lines
+  binding it are guarded by review; a trusted-checker pin is a follow-up).
+  Unset or empty while a check sends a slot is a refusal; a malformed entry
+  (anything but exactly one `/`) is an error;
 - the Consumer carries `gitforgeops/verify-probe: "true"` in the unresolved
   desired configuration and the slot is one of its brokered secret leaves.
   The label is required but authorizes nothing alone: `resources/` has no
@@ -703,11 +705,23 @@ environment's whole bundle. A `slot:` is sent only when all hold, else
 unlabelled or (when the variable is visible) unlisted Consumer; `review`
 reports it as `invalid-smoke-checks` and renders check → header → slot →
 Consumer plus every labelled Consumer, names only
-(`review::pr_comment::render_probe_bindings`). Without the variable the
-allowlist half reads `AllowlistNotVisible`; a slot outside a `FERRUM_NAMESPACE`
-selection is `OutsideNamespaceScope`; neither refuses. `apply-on-merge.yml`
-binds `vars.FERRUM_VERIFY_PROBE_CONSUMERS` into both `Validate` and both
-`Verify traffic` steps; `trusted-pr-review.yml` binds it into the live review.
+(`review::pr_comment::render_probe_bindings`).
+
+- `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND=true` (`EnvConfig::verify_probe_consumers_bound`)
+  marks a run bound to the environment. There an unset, blank or malformed
+  allowlist (`ProbeAllowlistState::Unset` / `Malformed`) is refused while a
+  check sends a slot, as `verify` refuses it (`missing_allowlist_error`);
+  `review` reports it as the separate `ProbeConsumerAllowlist` blocker
+  (`probe-consumer-allowlist`), an operator action, never
+  `invalid-smoke-checks`.
+- Without the marker the allowlist half reads `AllowlistNotVisible` and does
+  not refuse (`ProbeAllowlistState::NotVisible`).
+- Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
+  makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
+  Under the environment's own scope it is `NotAConsumerSecret`, as at verify.
+- `apply-on-merge.yml` binds `vars.FERRUM_VERIFY_PROBE_CONSUMERS` into both
+  `Validate` (with the marker) and both `Verify traffic` steps;
+  `trusted-pr-review.yml` binds it, with the marker, into the live review.
 
 **Budgets (GHSA-p95x-q89j-hrhv).** Refused at load for every environment in
 the file: `attempts` ≤ 10, `timeout_secs` ≤ 60, `retry_backoff_ms` ≤ 30000,
@@ -1117,7 +1131,7 @@ correctness). A 401 remediation prints the four JWT claim settings to compare.
 Two pure computations, shared so a preview cannot disagree with the run.
 
 **`apply_blockers`** returns every fail-closed `apply` gate decidable without a
-gateway, as `Vec<ApplyBlocker>` over ten `BlockerKind`s:
+gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
 
 | BlockerKind | Gate |
 |---|---|
@@ -1130,7 +1144,8 @@ gateway, as `Vec<ApplyBlocker>` over ten `BlockerKind`s:
 | `ProvisioningRepository` | pending allocation, `GITHUB_REPOSITORY` unset |
 | `NarrowedFilePublication` | file-mode apply narrowed by ad-hoc `FERRUM_NAMESPACE` |
 | `PublicationPathCollision` | gateway and mesh destinations resolve to one file |
-| `InvalidSmokeChecks` | `.gitforgeops/smoke.yaml` exists but does not load |
+| `InvalidSmokeChecks` | `.gitforgeops/smoke.yaml` does not load, or names a slot `verify` would refuse |
+| `ProbeConsumerAllowlist` | environment-bound run, a check sends a slot, `FERRUM_VERIFY_PROBE_CONSUMERS` unset/blank/malformed |
 
 - `plan` evaluates the whole set, prints `=== Apply Blockers ===` (class, count,
   remedy) plus a summary, and exits 1 when non-empty.
@@ -1559,6 +1574,7 @@ credentials. Booleans accept `true|false|1|0`.
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode gateway document. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Standalone `{version, mesh}` document. File-mode `validate`/`plan`/`apply` and `export --output` refuse, before any publication, state or broker write, when it resolves to the same file as the gateway document (`apply::ensure_distinct_publication_paths`: `./`/`..` spellings, symlinked parents and existing file identity all count). |
 | `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `verify`. |
+| `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set by environment-bound workflow steps; makes an unset allowlist a refusal instead of "not visible". |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | unset | Operator allowlist of probe Consumers (`<ns>/<consumer-id>`, comma-separated); a GitHub Environment variable in CI. Unset: `verify` refuses every slot-sending check. See [Traffic verification](#traffic-verification-srcverify). |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Dev only. TLS stays on but any certificate is accepted. |
 | `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://`. |

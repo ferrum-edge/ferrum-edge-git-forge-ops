@@ -77,6 +77,7 @@ fn clean_inputs<'a>(report: &'a ResolveReport) -> ApplyGateInputs<'a> {
         file_publication_narrowed: false,
         publication_paths_collide: false,
         smoke_checks_invalid: false,
+        probe_allowlist_invalid: false,
     }
 }
 
@@ -228,6 +229,7 @@ fn every_blocker_class_is_reported_together_and_named_in_the_summary() {
         file_publication_narrowed: false,
         publication_paths_collide: false,
         smoke_checks_invalid: false,
+        probe_allowlist_invalid: false,
     });
 
     let kinds: Vec<BlockerKind> = blockers.iter().map(|b| b.kind).collect();
@@ -284,6 +286,44 @@ fn publication_preflight_refusals_are_blockers_in_apply_order() {
     for blocker in &blockers {
         assert_eq!(blocker.count, 1);
     }
+}
+
+#[test]
+fn an_operator_allowlist_gap_is_its_own_blocker_after_the_smoke_checks() {
+    // The pull request author cannot fix a missing or malformed operator
+    // variable, so it is not reported as `invalid-smoke-checks`.
+    let report = report(vec![], vec![]);
+    let blockers = apply_blockers(ApplyGateInputs {
+        smoke_checks_invalid: true,
+        probe_allowlist_invalid: true,
+        ..clean_inputs(&report)
+    });
+    let kinds: Vec<BlockerKind> = blockers.iter().map(|b| b.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            BlockerKind::InvalidSmokeChecks,
+            BlockerKind::ProbeConsumerAllowlist,
+        ]
+    );
+    assert_eq!(
+        BlockerKind::ProbeConsumerAllowlist.label(),
+        "probe-consumer-allowlist"
+    );
+    let remedy = BlockerKind::ProbeConsumerAllowlist.remedy();
+    for expected in [
+        "FERRUM_VERIFY_PROBE_CONSUMERS",
+        "repository administrator",
+        "pull request cannot fix",
+    ] {
+        assert!(remedy.contains(expected), "{expected}: {remedy}");
+    }
+    let only_operator = apply_blockers(ApplyGateInputs {
+        probe_allowlist_invalid: true,
+        ..clean_inputs(&report)
+    });
+    assert_eq!(only_operator.len(), 1);
+    assert_eq!(only_operator[0].kind, BlockerKind::ProbeConsumerAllowlist);
 }
 
 #[test]

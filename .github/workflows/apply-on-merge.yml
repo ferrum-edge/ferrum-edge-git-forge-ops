@@ -337,6 +337,9 @@ jobs:
           # whose Consumer it does not list is refused here, before Apply
           # changes the gateway, rather than only by Verify traffic after.
           FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}
+          # This step runs inside the environment, so an unset variable means
+          # the operator set no allowlist, and is refused as Verify refuses it.
+          FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"
         run: gitforgeops validate
 
       # Map the merge commit back to the PR that produced it. The binary uses
@@ -967,6 +970,9 @@ jobs:
           # whose Consumer it does not list is refused here, before Apply
           # changes the gateway, rather than only by Verify traffic after.
           FERRUM_VERIFY_PROBE_CONSUMERS: ${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}
+          # This step runs inside the environment, so an unset variable means
+          # the operator set no allowlist, and is refused as Verify refuses it.
+          FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"
         run: gitforgeops validate
 
       # Map the merge commit back to the PR that produced it. The binary uses

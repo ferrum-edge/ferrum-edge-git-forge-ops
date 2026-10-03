@@ -7,7 +7,7 @@ use crate::policy::config::OverrideConfig;
 use crate::policy::github_override::OverrideDecision;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
-use crate::verify::SlotBinding;
+use crate::verify::{ProbeAllowlistState, SlotBinding};
 
 /// GitHub accepts issue comments up to 65,536 characters. Keep a byte-based
 /// safety margin so multi-byte UTF-8 and future envelope changes cannot turn a
@@ -840,7 +840,7 @@ fn probe_identifier(value: &str) -> String {
 pub fn render_probe_bindings(
     bindings: &[SlotBinding],
     labelled: &[String],
-    allowlist_visible: bool,
+    allowlist: ProbeAllowlistState,
 ) -> String {
     if bindings.is_empty() && labelled.is_empty() {
         return String::new();
@@ -891,13 +891,24 @@ pub fn render_probe_bindings(
         }
         md.push('.');
     }
-    if !allowlist_visible {
-        md.push_str(
+    let note = match allowlist {
+        ProbeAllowlistState::Listed => "",
+        ProbeAllowlistState::NotVisible => {
             "\n\n`FERRUM_VERIFY_PROBE_CONSUMERS` is not visible to this review, so the \
              operator allowlist was not checked here. `verify` refuses every slot whose \
-             Consumer the operator does not list there; a label alone authorizes nothing.",
-        );
-    }
+             Consumer the operator does not list there; a label alone authorizes nothing."
+        }
+        ProbeAllowlistState::Unset => {
+            "\n\n`FERRUM_VERIFY_PROBE_CONSUMERS` is not set for this environment, so \
+             `verify` would refuse every check that sends a slot. A repository \
+             administrator must set it; the pull request cannot."
+        }
+        ProbeAllowlistState::Malformed => {
+            "\n\n`FERRUM_VERIFY_PROBE_CONSUMERS` does not parse for this environment. A \
+             repository administrator must correct it; the pull request cannot."
+        }
+    };
+    md.push_str(note);
     md
 }
 

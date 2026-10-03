@@ -91,18 +91,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   lists in the new `FERRUM_VERIFY_PROBE_CONSUMERS` GitHub Environment variable
   (comma-separated `<namespace>/<consumer-id>`) **and** that the environment's
   desired configuration labels `gitforgeops/verify-probe: "true"`. The variable
-  is the authorization, because no merge can change it; the label lives in
-  `resources/` and authorizes nothing alone. With the variable unset or empty,
-  every check that sends a slot is refused; a malformed entry is an error.
-  Anything else exits 1 before the bundle is read or any request is sent, and
-  the runner (including `runner::run_check`) receives only the authorized
-  values, never the bundle. `validate`, `plan` and `apply` refuse a slot whose
-  Consumer is missing, unlabelled or, when the variable is visible to the run,
-  unlisted, before anything changes; `review` reports it as
-  `invalid-smoke-checks` and lists each check's header, slot and Consumer and
-  every labelled Consumer, by name only. `apply-on-merge.yml` binds
-  `vars.FERRUM_VERIFY_PROBE_CONSUMERS` into both `Validate` and both
-  `Verify traffic` steps, and `trusted-pr-review.yml` into the live review.
+  is the authorization, because no change to `resources/` or `.gitforgeops/`
+  can change it (the workflow lines binding it are guarded by review of
+  `.github/workflows/`; a trusted-checker pin is a follow-up); the label lives
+  in `resources/` and authorizes nothing alone. With the variable unset or
+  empty, every check that sends a slot is refused; a malformed entry (anything
+  but exactly one `/`) is an error. Anything else exits 1 before the bundle is
+  read or any request is sent, and the runner (including `runner::run_check`)
+  receives only the authorized values, never the bundle. `validate`, `plan` and
+  `apply` refuse a slot whose Consumer is missing, unlabelled, outside the
+  environment's own declared `namespace_filter` or, when the variable is
+  visible to the run, unlisted, before anything changes; `review` reports it
+  as `invalid-smoke-checks` and lists each check's header, slot and Consumer
+  and every labelled Consumer, by name only. Steps bound to the environment
+  also set `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"`; there an unset, blank
+  or malformed variable refuses a slot-sending check exactly as `verify` does,
+  and `review` reports it as the separate `probe-consumer-allowlist` blocker
+  for a repository administrator, not the pull request author. Without the
+  marker an unset list is only "not visible". `apply-on-merge.yml` binds
+  `vars.FERRUM_VERIFY_PROBE_CONSUMERS` into both `Validate` steps (with the
+  marker) and both `Verify traffic` steps, and `trusted-pr-review.yml` into the
+  live review (with the marker).
   `Host`, forwarding (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, `Via`),
   method-override (`X-HTTP-Method-Override`, `X-HTTP-Method`,
   `X-Method-Override`), hop-by-hop and framing headers are refused in every
