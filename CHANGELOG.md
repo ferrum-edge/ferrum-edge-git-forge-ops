@@ -81,6 +81,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- The cargo-audit policy gate no longer runs `cargo` from the candidate
+  checkout (#448). `cargo tree` and `cargo audit` run from a fresh temporary
+  directory with a fresh `CARGO_HOME`, take the candidate's `Cargo.toml` and
+  `Cargo.lock` through `--manifest-path` and `--file`, and drop inherited
+  `CARGO_*`, `RUSTUP_TOOLCHAIN` and rustc wrapper variables. A pull request's
+  `.cargo/config[.toml]` aliases or `[env]`, `.cargo/audit.toml` ignore list or
+  advisory-database settings, and `rust-toolchain[.toml]` therefore cannot
+  change the audit verdict or the RSA dependency-path check; the gate lists
+  the candidate files it ignored. A missing or symlinked `Cargo.lock` or
+  `Cargo.toml` is refused, and so is a temporary directory inside the
+  checkout or below cargo or rustup configuration.
 - `FERRUM_GATEWAY_URL` and `FERRUM_VERIFY_BASE_URL` are GitHub Environment
   secrets, so no diagnostic echoes them any more (GHSA-pp23-79rj-gp54).
   Transport-validation errors report only the variable name — never the

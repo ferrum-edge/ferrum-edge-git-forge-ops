@@ -42,6 +42,39 @@ Push and schedule runs use the tree's own checker and policy. Those events have
 no untrusted author, and pinning them to the default branch would stop a merged
 policy change from ever taking effect.
 
+### Candidate cargo configuration is ignored
+
+A trusted checker is not enough if the commands it runs read configuration
+from the tree under review. Cargo discovers `.cargo/config.toml` (and the
+legacy `.cargo/config`) in the working directory and every ancestor, so a
+candidate `[alias]` could redefine `audit`. Rustup selects a toolchain from
+`rust-toolchain.toml` or `rust-toolchain` the same way, including a `path`
+toolchain inside the checkout. cargo-audit reads `./.cargo/audit.toml`, whose
+ignore list, advisory-database location and yanked settings decide what it
+reports. None of these is looked up next to `--manifest-path` or `--file`.
+
+So `check_cargo_audit.py` never runs cargo from the candidate checkout:
+
+- `cargo tree --manifest-path <candidate>/Cargo.toml` and
+  `cargo audit --file <candidate>/Cargo.lock` run from a fresh temporary
+  directory with a fresh, empty `CARGO_HOME`;
+- inherited `CARGO_*` variables (including `CARGO_ALIAS_<name>`),
+  `RUSTUP_TOOLCHAIN`, `RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`,
+  `RUSTFLAGS` and `RUSTDOCFLAGS` are removed from their environment, so the
+  toolchain is the runner's default from the workflow's pinned toolchain step;
+- `Cargo.toml` and `Cargo.lock` must be regular files, not symlinks, and a
+  missing lockfile is refused rather than generated;
+- the gate refuses to run when the temporary directory is inside the
+  checkout, or when any of those configuration files exists at or above it
+  (point `TMPDIR` elsewhere).
+
+Candidate copies of these files are ignored, not rejected: the log lists the
+ones present. A local `.cargo/audit.toml` ignore list therefore has no effect on
+the gate; record a reviewed exception in `.github/cargo-audit-policy.json`
+instead. The tests drive the checker with a stand-in `cargo` that answers
+differently whenever it can see candidate configuration, and assert it never
+does.
+
 ### The expand/contract cost
 
 Because the policy comes from `main`, a pull request that *changes* the policy
