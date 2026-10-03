@@ -165,11 +165,16 @@ struct Repo {
 
 impl Repo {
     fn new(smoke: Option<&str>) -> Self {
+        Self::with_files(smoke, &[])
+    }
+
+    fn with_files(smoke: Option<&str>, extra: &[(&str, &str)]) -> Self {
         let dir = TempDir::new().expect("repo tempdir");
         let mut files = vec![
             ("resources/ferrum/proxies/api.yaml", PROXY),
             ("resources/ferrum/mesh/core.yaml", MESH_FRAGMENT),
         ];
+        files.extend_from_slice(extra);
         if let Some(smoke) = smoke {
             files.push((".gitforgeops/smoke.yaml", smoke));
         }
@@ -192,6 +197,12 @@ impl Repo {
     /// child, so an ambient `FERRUM_GATEWAY_URL` cannot turn this into a live
     /// run.
     fn run(&self, args: &[&str], gateway: &str, mesh: &str) -> Output {
+        self.run_with(args, gateway, mesh, &[])
+    }
+
+    /// [`Repo::run`] with `vars` set, such as the operator's
+    /// `FERRUM_VERIFY_PROBE_CONSUMERS`.
+    fn run_with(&self, args: &[&str], gateway: &str, mesh: &str, vars: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
         command.args(args).current_dir(self.dir.path()).env_clear();
         for name in ["PATH", "HOME", "TMPDIR"] {
@@ -215,6 +226,7 @@ impl Repo {
             .env("FERRUM_FILE_OUTPUT_PATH", gateway)
             .env("FERRUM_MESH_FILE_OUTPUT_PATH", mesh)
             .env("FERRUM_EDGE_BINARY_PATH", &self.validator);
+        command.envs(vars.iter().copied());
         command.output().expect("run gitforgeops")
     }
 
@@ -389,6 +401,41 @@ environments:
         expect_status: 200
 "#;
 
+/// Every check within its own limits, but the environment's worst case is
+/// 2 x 10 x 60s = 20 minutes: a deployment held long after the gateway
+/// changed (GHSA-p95x-q89j-hrhv).
+const SMOKE_OVER_BUDGET: &str = r#"version: 1
+environments:
+  default:
+    checks:
+      - name: slow one
+        path: /ready
+        expect_status: 200
+        attempts: 10
+        timeout_secs: 60
+        retry_backoff_ms: 0
+      - name: slow two
+        path: /ready
+        expect_status: 200
+        attempts: 10
+        timeout_secs: 60
+        retry_backoff_ms: 0
+"#;
+
+/// A plugin's upstream credential is never a traffic-check credential
+/// (GHSA-8mhw-ghx8-9m63).
+const SMOKE_PLUGIN_SLOT: &str = r#"version: 2
+environments:
+  default:
+    checks:
+      - name: spends a plugin secret
+        path: /ready
+        expect_status: 200
+        headers:
+          Authorization:
+            slot: ferrum/upstream-auth/@plugin/http_logging/config/token
+"#;
+
 const SMOKE_VALID: &str = r#"version: 1
 environments:
   default:
@@ -405,6 +452,8 @@ fn cli_refuses_a_malformed_smoke_file_before_any_write() {
         (SMOKE_ZERO_ATTEMPTS, "attempts must be at least 1"),
         (SMOKE_UNKNOWN_FIELD, "run"),
         (SMOKE_BAD_OTHER_ENVIRONMENT, "path must start with '/'"),
+        (SMOKE_OVER_BUDGET, "worst-case duration"),
+        (SMOKE_PLUGIN_SLOT, "not a Consumer credential type"),
     ] {
         for args in [
             vec!["validate"],
@@ -433,6 +482,8 @@ fn cli_review_reports_a_malformed_smoke_file_as_an_apply_blocker() {
         (SMOKE_ZERO_ATTEMPTS, "attempts must be at least 1"),
         (SMOKE_UNKNOWN_FIELD, "run"),
         (SMOKE_BAD_OTHER_ENVIRONMENT, "path must start with '/'"),
+        (SMOKE_OVER_BUDGET, "worst-case duration"),
+        (SMOKE_PLUGIN_SLOT, "not a Consumer credential type"),
     ] {
         let repo = Repo::new(Some(smoke));
 
@@ -474,6 +525,409 @@ fn cli_accepts_a_valid_or_absent_smoke_file() {
         assert!(repo.path("assembled/resources.yaml").exists());
         assert!(repo.path(".state/default.json").exists());
     }
+}
+
+// -- the probe-credential binding (GHSA-8mhw-ghx8-9m63) ---------------------
+
+const PROBE_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: orders-probe
+  username: orders-probe
+  labels:
+    gitforgeops/verify-probe: "true"
+  credentials:
+    keyauth:
+      - key: "${gh-env-secret:alloc=require}"
+"#;
+
+const CUSTOMER_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: orders-client
+  username: orders-client
+  credentials:
+    keyauth:
+      - key: "${gh-env-secret:alloc=require}"
+"#;
+
+/// The customer after a pull request added the probe label.
+const LABELLED_CUSTOMER_CONSUMER: &str = r#"kind: Consumer
+spec:
+  id: orders-client
+  username: orders-client
+  labels:
+    gitforgeops/verify-probe: "true"
+  credentials:
+    keyauth:
+      - key: "${gh-env-secret:alloc=require}"
+"#;
+
+const PROBE_SLOT: &str = "ferrum/orders-probe/keyauth/key";
+const CUSTOMER_SLOT: &str = "ferrum/orders-client/keyauth/key";
+const PROBE_VALUE: &str = "probe-value-0001";
+const CUSTOMER_VALUE: &str = "customer-value-0002";
+const ALLOWLIST: &str = "FERRUM_VERIFY_PROBE_CONSUMERS";
+
+/// A `default` check sending `slot` as `X-API-Key`.
+fn smoke_sending(slot: &str) -> String {
+    format!(
+        "version: 2\nenvironments:\n  default:\n    checks:\n      - name: probe\n\
+         \n        path: /api\n        expect_status: 200\n        headers:\n\
+         \n          X-API-Key:\n            slot: {slot}\n"
+    )
+}
+
+/// A repository with the probe and a customer Consumer, `customer` being
+/// either spelling, and a check sending `slot`.
+fn probe_repo(slot: &str, customer: &str) -> Repo {
+    let smoke = smoke_sending(slot);
+    Repo::with_files(
+        Some(&smoke),
+        &[
+            (
+                "resources/ferrum/consumers/orders-probe.yaml",
+                PROBE_CONSUMER,
+            ),
+            ("resources/ferrum/consumers/orders-client.yaml", customer),
+        ],
+    )
+}
+
+fn credential_bundle() -> String {
+    format!(
+        "{{\"FERRUM_CREDS_BUNDLE\": {{\"{PROBE_SLOT}\": \"{PROBE_VALUE}\", \
+         \"{CUSTOMER_SLOT}\": \"{CUSTOMER_VALUE}\"}}}}"
+    )
+}
+
+/// Output with every synthetic bundle value masked, for assertion messages.
+fn shown(output: &Output) -> String {
+    combined(output)
+        .replace(PROBE_VALUE, "[probe value]")
+        .replace(CUSTOMER_VALUE, "[customer value]")
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_refuses_a_slot_verify_would_refuse_before_any_write() {
+    // `verify` enforces the binding only after `apply` changed the gateway.
+    // `validate`, `plan` and `apply` refuse the same slot first.
+    let none: &[(&str, &str)] = &[];
+    let lists_probe: &[(&str, &str)] = &[(ALLOWLIST, "ferrum/orders-probe")];
+    let lists_other: &[(&str, &str)] = &[(ALLOWLIST, "ferrum/someone-else")];
+    for (slot, customer, vars, expected) in [
+        // A customer Consumer with no probe label.
+        (CUSTOMER_SLOT, CUSTOMER_CONSUMER, none, "not labelled"),
+        // A customer a pull request labelled, which the operator's list
+        // (visible to this run) does not name.
+        (
+            CUSTOMER_SLOT,
+            LABELLED_CUSTOMER_CONSUMER,
+            lists_probe,
+            "the operator does not list",
+        ),
+        // The probe itself, when the operator lists someone else.
+        (
+            PROBE_SLOT,
+            CUSTOMER_CONSUMER,
+            lists_other,
+            "the operator does not list",
+        ),
+        // A Consumer the environment does not declare.
+        (
+            "ferrum/ghost/keyauth/key",
+            CUSTOMER_CONSUMER,
+            none,
+            "is not a brokered secret",
+        ),
+    ] {
+        for args in [
+            vec!["validate"],
+            vec!["plan"],
+            vec!["apply", "--auto-approve"],
+        ] {
+            let repo = probe_repo(slot, customer);
+
+            let output = repo.run_with(
+                &args,
+                "assembled/resources.yaml",
+                "assembled/mesh.yaml",
+                vars,
+            );
+
+            let text = shown(&output);
+            assert!(!output.status.success(), "{slot} {args:?}: {text}");
+            assert!(text.contains("smoke.yaml"), "{slot} {args:?}: {text}");
+            assert!(text.contains(slot), "{slot} {args:?}: {text}");
+            assert!(text.contains(expected), "{slot} {args:?}: {text}");
+            assert!(!repo.path("assembled/resources.yaml").exists(), "{args:?}");
+            assert!(!repo.path("assembled/mesh.yaml").exists(), "{args:?}");
+            repo.assert_no_state(&format!("{slot} {args:?}"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_validate_accepts_a_labelled_probe_the_operator_lists_or_cannot_be_seen() {
+    // A pull request's run cannot see the operator's list; the label half is
+    // still judged there, and `verify` judges the rest.
+    let bundle = credential_bundle();
+    let unset = [("FERRUM_CREDS_JSON", bundle.as_str())];
+    let listed = [
+        ("FERRUM_CREDS_JSON", bundle.as_str()),
+        (ALLOWLIST, "ferrum/orders-probe"),
+    ];
+    for (label, vars) in [("unset", &unset[..]), ("listed", &listed[..])] {
+        let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+        let output = repo.run_with(
+            &["validate"],
+            "assembled/resources.yaml",
+            "assembled/mesh.yaml",
+            vars,
+        );
+        assert!(output.status.success(), "{label}: {}", shown(&output));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_review_shows_which_consumer_each_slot_would_spend() {
+    let bundle = credential_bundle();
+
+    // Approved: labelled and listed. The section names the check, header,
+    // slot and Consumer, and never a value.
+    let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+    let vars = [
+        (ALLOWLIST, "ferrum/orders-probe"),
+        ("FERRUM_CREDS_JSON", bundle.as_str()),
+    ];
+    let output = repo.run_with(
+        &["review"],
+        "assembled/resources.yaml",
+        "assembled/mesh.yaml",
+        &vars,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}", shown(&output));
+    for expected in [
+        "Traffic-check credentials",
+        PROBE_SLOT,
+        "ferrum/orders-probe",
+        "X-API-Key",
+        "approved probe credential",
+        "Consumers labelled",
+    ] {
+        assert!(stdout.contains(expected), "{expected}: {}", shown(&output));
+    }
+    assert!(!stdout.contains("names a credential verify would refuse"));
+    assert!(!stdout.contains("is not visible to this review"));
+    let all = combined(&output);
+    for value in [PROBE_VALUE, CUSTOMER_VALUE] {
+        assert!(!all.contains(value), "review printed a value");
+    }
+
+    // A labelled customer the operator does not list is an apply blocker
+    // before the merge, and its Consumer is named.
+    let repo = probe_repo(CUSTOMER_SLOT, LABELLED_CUSTOMER_CONSUMER);
+    for fail_on_blockers in [false, true] {
+        let mut args = vec!["review"];
+        if fail_on_blockers {
+            args.push("--fail-on-blockers");
+        }
+        let output = repo.run_with(
+            &args,
+            "assembled/resources.yaml",
+            "assembled/mesh.yaml",
+            &vars,
+        );
+        let text = shown(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if fail_on_blockers {
+            assert_eq!(output.status.code(), Some(1), "{text}");
+            assert!(text.contains("invalid-smoke-checks"), "{text}");
+        } else {
+            assert_eq!(output.status.code(), Some(0), "{text}");
+        }
+        for expected in [
+            "Apply blocked",
+            "names a credential verify would refuse",
+            CUSTOMER_SLOT,
+            "ferrum/orders-client",
+            "refused",
+        ] {
+            assert!(stdout.contains(expected), "{expected}: {text}");
+        }
+        let all = combined(&output);
+        assert!(!all.contains(CUSTOMER_VALUE), "review printed a value");
+    }
+
+    // Without the variable, the review says the list half was not checked.
+    let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+    let args = ["review"];
+    let output = repo.run(&args, "assembled/resources.yaml", "assembled/mesh.yaml");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}", shown(&output));
+    assert!(
+        stdout.contains("is not visible to this review"),
+        "{}",
+        shown(&output)
+    );
+}
+
+/// Set only by workflow steps bound to the environment.
+const BOUND: &str = "FERRUM_VERIFY_PROBE_CONSUMERS_BOUND";
+/// The `invalid-smoke-checks` remedy: a fix the pull request author makes.
+const PR_FIX: &str = "names a credential verify would refuse";
+
+#[cfg(unix)]
+#[test]
+fn cli_an_environment_bound_run_refuses_a_slot_without_the_operator_allowlist() {
+    // Inside the environment's job an unset variable is the operator's
+    // missing allowlist, not an invisible one: refuse before Apply, exactly
+    // as Verify will refuse after it.
+    let unset: &[(&str, &str)] = &[(BOUND, "true")];
+    let blank: &[(&str, &str)] = &[(BOUND, "true"), (ALLOWLIST, " ")];
+    for vars in [unset, blank] {
+        for args in [
+            vec!["validate"],
+            vec!["plan"],
+            vec!["apply", "--auto-approve"],
+        ] {
+            let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+
+            let output = repo.run_with(
+                &args,
+                "assembled/resources.yaml",
+                "assembled/mesh.yaml",
+                vars,
+            );
+
+            let text = shown(&output);
+            assert!(!output.status.success(), "{args:?}: {text}");
+            for expected in [
+                "unset or empty",
+                "repository administrator",
+                "a pull request cannot fix this",
+            ] {
+                assert!(text.contains(expected), "{expected} {args:?}: {text}");
+            }
+            assert!(!repo.path("assembled/resources.yaml").exists(), "{args:?}");
+            repo.assert_no_state(&format!("{args:?}"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_a_malformed_operator_allowlist_is_refused_as_an_operator_error() {
+    // `a/b/c` would match both `(a, b/c)` and `(a/b, c)`, so it is refused,
+    // and the message names the operator action rather than a smoke fix.
+    let vars: &[(&str, &str)] = &[(ALLOWLIST, "ferrum/orders/probe")];
+    let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+    let args = ["validate"];
+    let output = repo.run_with(
+        &args,
+        "assembled/resources.yaml",
+        "assembled/mesh.yaml",
+        vars,
+    );
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("exactly one '/'"), "{text}");
+    assert!(text.contains("a pull request cannot fix this"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_review_reports_a_missing_or_malformed_allowlist_for_the_operator() {
+    // The pull request author cannot fix the operator's variable, so it is
+    // its own blocker, never `invalid-smoke-checks`.
+    let bundle = credential_bundle();
+    let missing = [("FERRUM_CREDS_JSON", bundle.as_str()), (BOUND, "true")];
+    let malformed = [
+        ("FERRUM_CREDS_JSON", bundle.as_str()),
+        (ALLOWLIST, "orders-probe"),
+    ];
+    for (vars, note) in [
+        (&missing, "is not set for this environment"),
+        (&malformed, "does not parse for this environment"),
+    ] {
+        let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
+        for fail_on_blockers in [false, true] {
+            let mut args = vec!["review"];
+            if fail_on_blockers {
+                args.push("--fail-on-blockers");
+            }
+            let output = repo.run_with(
+                &args,
+                "assembled/resources.yaml",
+                "assembled/mesh.yaml",
+                vars,
+            );
+            let text = shown(&output);
+            let code = i32::from(fail_on_blockers);
+            assert_eq!(output.status.code(), Some(code), "{text}");
+            if fail_on_blockers {
+                assert!(text.contains("probe-consumer-allowlist"), "{text}");
+            }
+            assert!(text.contains(note), "{text}");
+            assert!(text.contains("repository administrator"), "{text}");
+            assert!(!text.contains("invalid-smoke-checks"), "{text}");
+            assert!(!text.contains(PR_FIX), "{text}");
+            let all = combined(&output);
+            assert!(!all.contains(PROBE_VALUE), "review printed a value");
+        }
+    }
+}
+
+const TEAM_B_PROBE: &str = r#"kind: Consumer
+spec:
+  id: probe
+  username: team-b-probe
+  labels:
+    gitforgeops/verify-probe: "true"
+  credentials:
+    keyauth:
+      - key: "${gh-env-secret:alloc=require}"
+"#;
+
+/// The `default` environment, scoped to the `ferrum` namespace.
+const FERRUM_SCOPED_CONFIG: &str = r#"version: 1
+environments:
+  default:
+    namespace_filter: ferrum
+    live_review: false
+"#;
+
+#[cfg(unix)]
+#[test]
+fn cli_a_slot_outside_the_environments_own_scope_is_refused_before_merge() {
+    // `verify` assembles under the environment's declared namespace scope, so
+    // a slot in another namespace has no Consumer there and is refused. The
+    // preview must refuse it too, even though that Consumer is labelled.
+    let smoke = smoke_sending("team-b/probe/keyauth/key");
+    let files = [
+        ("resources/team-b/consumers/probe.yaml", TEAM_B_PROBE),
+        (".gitforgeops/config.yaml", FERRUM_SCOPED_CONFIG),
+    ];
+    let args = ["validate"];
+    let repo = Repo::with_files(Some(&smoke), &files);
+    let output = repo.run(&args, "assembled/resources.yaml", "assembled/mesh.yaml");
+    let text = shown(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("is not a brokered secret"), "{text}");
+    assert!(text.contains("team-b/probe/keyauth/key"), "{text}");
+
+    // An ad-hoc FERRUM_NAMESPACE only leaves `team-b` to its own run.
+    let adhoc = Repo::with_files(Some(&smoke), &files[..1]);
+    let vars = [("FERRUM_NAMESPACE", "ferrum")];
+    let output = adhoc.run_with(
+        &args,
+        "assembled/resources.yaml",
+        "assembled/mesh.yaml",
+        &vars,
+    );
+    assert!(output.status.success(), "{}", shown(&output));
 }
 
 #[cfg(unix)]

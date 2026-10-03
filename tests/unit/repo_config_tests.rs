@@ -403,6 +403,8 @@ fn synthetic_default_honors_explicit_env_over_ferrum_env_var() {
         EnvConfig {
             gateway_url: None,
             verify_base_url: None,
+            verify_probe_consumers: None,
+            verify_probe_consumers_bound: false,
             admin_jwt_secret: None,
             admin_jwt_viewer_secret: None,
             admin_jwt_issuer: "ferrum-edge".to_string(),
@@ -474,6 +476,8 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
     let env_config = EnvConfig {
         gateway_url: None,
         verify_base_url: None,
+        verify_probe_consumers: None,
+        verify_probe_consumers_bound: false,
         admin_jwt_secret: None,
         admin_jwt_viewer_secret: None,
         admin_jwt_issuer: "ferrum-edge".to_string(),
