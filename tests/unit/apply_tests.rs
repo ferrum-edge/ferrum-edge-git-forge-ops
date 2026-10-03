@@ -5862,7 +5862,7 @@ async fn apply_refuses_an_unresolved_plugin_config_secret_before_any_write() {
     assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
     let error = &result.errors[0];
     assert!(
-        error.contains("team-alpha/pc1/@plugin-config/config/headers/authorization"),
+        error.contains("team-alpha/pc1/@plugin/opa/config/headers/authorization"),
         "{error}"
     );
     assert!(!error.contains(placeholder), "{error}");

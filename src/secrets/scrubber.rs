@@ -421,7 +421,9 @@ fn collect_resolved_secrets(
     }
     for plugin in &config.plugin_configs {
         collect_resolved_leaves(&plugin.config, &mut Vec::new(), out, &|path| {
-            resolved.contains(plugin_config_slot(&plugin.namespace, &plugin.id, path).as_str())
+            let plugin_slot =
+                plugin_config_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, path);
+            resolved.contains(plugin_slot.as_str())
         });
     }
     for upstream in &config.upstreams {
