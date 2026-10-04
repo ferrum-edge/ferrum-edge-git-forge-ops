@@ -76,6 +76,7 @@ jobs:
             --required-check 'rust-ci-check'
             --required-check 'security-cargo-audit'
             --required-check 'security-supply-chain-policy'
+            --required-check 'trusted-supply-chain-policy'
             --required-check 'state-guard-reject-state-edits'
             --required-check 'gitforgeops-required-static-validation'
           )
