@@ -2969,16 +2969,6 @@ async fn cmd_apply(
     // existing value) afterward; rotation of an already-allocated slot is
     // an explicit `gitforgeops rotate` operation, not something apply does.
     let (_merged, mut per_shard) = load_credential_bundles(&env_config)?;
-    if matches!(resolved.ownership.mode, OwnershipMode::Shared)
-        && !state
-            .resources
-            .contains_key(&diff::resource_diff::state_key(ns, "Consumer", consumer))
-    {
-        return Err(
-            "rotation requires a repository-owned consumer; apply and claim it first".into(),
-        );
-    }
-
     let mut shard_count = state.credential_shard_count.max(1);
     let initial_bundle = secrets::merge_bundles(&per_shard);
     // Only this first resolve consults the ledger. The re-resolve after

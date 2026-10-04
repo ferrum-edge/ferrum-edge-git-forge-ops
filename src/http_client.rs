@@ -356,8 +356,16 @@ impl AdminClient {
                         });
                     }
 
-                    let parsed = ApiErrorBody::parse(&body);
-                    let retryable = classify_retry(status, &parsed, kind) == RetryDecision::Retry;
+                    let retryable = match ApiErrorBody::parse_mutation(&body) {
+                        Ok(parsed) => classify_retry(status, &parsed, kind) == RetryDecision::Retry,
+                        Err(_) if kind == RequestKind::Read => {
+                            classify_retry(status, &ApiErrorBody::default(), kind)
+                                == RetryDecision::Retry
+                        }
+                        // A malformed envelope may conceal applied:false or an
+                        // incomplete rollback. It cannot authorize another write.
+                        Err(_) => false,
+                    };
                     if retryable && attempt < max_attempts {
                         last_error = Some(format!("HTTP {status}"));
                         answered_before = true;
@@ -397,10 +405,14 @@ impl AdminClient {
 
     /// Turn a completed response into `Ok(())` or a typed error.
     fn check(&self, resp: &RawResponse, kind: RequestKind) -> crate::error::Result<()> {
-        if is_success_status(resp.status)
-            && (kind == RequestKind::Read || ApiErrorBody::parse(&resp.body).applied != Some(false))
-        {
-            return Ok(());
+        if is_success_status(resp.status) {
+            if kind == RequestKind::Read || (resp.status == 204 && resp.body.is_empty()) {
+                return Ok(());
+            }
+            let acknowledgement = ApiErrorBody::parse_mutation(&resp.body)?;
+            if acknowledgement.applied != Some(false) {
+                return Ok(());
+            }
         }
         Err(map_api_error_with_redirect_base(
             resp.status,
@@ -841,22 +853,8 @@ impl AdminClient {
                 }
             })?;
 
-        if is_success_status(resp.status) {
-            conditional::parse_sensitive(&resp.body).map_err(|_| {
-                crate::error::Error::AmbiguousMutation(
-                    "batch acknowledgement is invalid; reconcile without replaying".to_string(),
-                )
-            })?;
-        }
         if resp.status == 501 {
-            let refusal = conditional::parse_sensitive(&resp.body)
-                .ok()
-                .and_then(|value| serde_json::from_value::<ApiErrorBody>(value).ok())
-                .ok_or_else(|| {
-                    crate::error::Error::AmbiguousMutation(
-                        "batch rejection is invalid; do not fall back or replay".to_string(),
-                    )
-                })?;
+            let refusal = ApiErrorBody::parse_mutation(&resp.body)?;
             if refusal.applied.is_none() && refusal.rollback.is_none() {
                 return Ok(None);
             }
@@ -1189,13 +1187,6 @@ impl AdminClient {
                 message: precondition_failed_message("PUT", &path, resp.retried),
             }));
         }
-        if kind == "Consumer" && is_success_status(resp.status) {
-            conditional::parse_sensitive(&resp.body).map_err(|_| {
-                crate::error::Error::AmbiguousMutation(
-                    "consumer publication response is invalid; do not replay".to_string(),
-                )
-            })?;
-        }
         self.check_mutation(&resp, RequestKind::Mutation)
             .await
             .map_err(|error| {
@@ -1316,18 +1307,8 @@ impl AdminClient {
         if resp.status == 404 {
             return Ok(DeleteOutcome::NotFound);
         }
-        if delete_succeeded(resp.status) {
-            return Ok(DeleteOutcome::Deleted);
-        }
-        Err(self
-            .refine_mutation_error(map_api_error_with_redirect_base(
-                resp.status,
-                &resp.body,
-                RequestKind::Mutation,
-                resp.location.as_deref(),
-                Some(self.gateway_url.as_str()),
-            ))
-            .await)
+        self.check_mutation(&resp, RequestKind::Mutation).await?;
+        Ok(DeleteOutcome::Deleted)
     }
 }
 
@@ -1614,13 +1595,42 @@ pub struct ApiErrorBody {
 }
 
 impl ApiErrorBody {
-    /// Parse an error body, degrading to an empty envelope for non-JSON
-    /// responses (proxies and load balancers emit HTML).
+    /// Best-effort diagnostic parsing for reads and read-only refusals.
+    /// An empty envelope is not evidence of mutation success or safe replay.
     pub fn parse(body: &str) -> Self {
-        conditional::parse_sensitive(body)
-            .ok()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default()
+        Self::parse_mutation(body).unwrap_or_default()
+    }
+
+    /// Mutation evidence must be a unique-key object with correctly typed markers.
+    /// Never retain parser errors: their text can include secret field names or values.
+    fn parse_mutation(body: &str) -> crate::error::Result<Self> {
+        let invalid = || {
+            crate::error::Error::AmbiguousMutation(
+                "mutation response is malformed or ambiguous; details withheld. \
+                 The write may have committed; reconcile current gateway state without replaying"
+                    .to_string(),
+            )
+        };
+        let value = conditional::parse_sensitive(body).map_err(|_| invalid())?;
+        let object = value.as_object().ok_or_else(invalid)?;
+        // Optional means absent, not null: a null applied marker cannot prove
+        // live publication, and null refusal markers cannot prove safe replay.
+        if [
+            "error",
+            "applied",
+            "reason",
+            "rollback",
+            "failure_class",
+            "restore_errors",
+            "api_specs_at_risk",
+            "confirmation_required",
+        ]
+        .iter()
+        .any(|field| object.get(*field).is_some_and(serde_json::Value::is_null))
+        {
+            return Err(invalid());
+        }
+        serde_json::from_value(value).map_err(|_| invalid())
     }
 }
 
@@ -1902,6 +1912,21 @@ pub fn map_api_error_with_redirect_base(
              gateway). No further resources were attempted."
                 .to_string(),
         );
+    }
+
+    if kind != RequestKind::Read {
+        match ApiErrorBody::parse_mutation(body) {
+            Ok(_) => {}
+            // A bare 403 still permits the read-only health diagnosis, but
+            // untrusted response bytes never enter its diagnostic.
+            Err(_) if status == 403 => {
+                return crate::error::Error::ApiError {
+                    status,
+                    message: "mutation refused; response details withheld".to_string(),
+                };
+            }
+            Err(error) => return error,
+        }
     }
 
     if status == 409 && parsed.api_specs_at_risk.is_some() {

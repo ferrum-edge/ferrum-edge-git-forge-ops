@@ -540,7 +540,8 @@ fn validate_consumer(row: &Value, namespace: &str, id: &str) -> Result<()> {
         return Err(invalid());
     }
     // Credentials are deliberately opaque. The desired schema remains closed.
-    serde_json::from_value::<crate::config::schema::Consumer>(row.clone()).map_err(|_| invalid())?;
+    serde_json::from_value::<crate::config::schema::Consumer>(row.clone())
+        .map_err(|_| invalid())?;
     Ok(())
 }
 

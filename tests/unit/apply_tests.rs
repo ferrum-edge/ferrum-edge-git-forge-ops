@@ -4866,6 +4866,58 @@ async fn uncommitted_cycle_batch_defers_deletes_after_invalid_acknowledgement() 
     assert!(result.into_result().is_err());
 }
 
+#[tokio::test]
+async fn malformed_batch_markers_cannot_authorize_pruning_or_ledger_completion() {
+    const PRIVATE: &str = "batch-acknowledgement-secret-fixture";
+    let counts = serde_json::json!({
+        "proxies": 1, "consumers": 0, "plugin_configs": 1, "upstreams": 0
+    });
+    for body in [
+        serde_json::json!({"created": counts, "applied": false, "reason": {"private": PRIVATE}})
+            .to_string(),
+        format!(r#"{{"created":{counts},"applied":false,"applied":false,"error":"{PRIVATE}"}}"#),
+    ] {
+        let desired = scoped_plugin_desired();
+        let actual = GatewayConfig {
+            proxies: vec![proxy("old", "team-alpha", None)],
+            ..Default::default()
+        };
+        let mut state = proxy_ledger(&actual);
+        let original_ledger = state.resources.clone();
+        let managed = state.resources.keys().cloned().collect::<HashSet<_>>();
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("POST /batch".into(), 201, body, vec![]),
+            ("GET /backup".into(), 200, backup_body(&actual), vec![]),
+        ]);
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
+        let result = apply_api(
+            &desired,
+            &stub_client_with_retries(url, 3),
+            &["team-alpha".into()],
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            },
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((result.created, result.updated, result.deleted), (0, 0, 0));
+        assert_eq!(result.deletes_deferred, 1);
+        assert!(result.applied_incremental.is_empty());
+        assert!(result.adopted.is_empty());
+        assert!(!result.errors.is_empty());
+        assert!(!format!("{:?} {:?}", result.errors, result.fatal_error).contains(PRIVATE));
+        assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"]);
+        record_prune_result(&mut state, &result, &desired);
+        state.stamp_last_applied_if_clean(result.fatal_error.is_none() && result.errors.is_empty());
+        assert_eq!(state.resources, original_ledger);
+        assert!(state.last_applied_at.is_none());
+        assert!(result.into_result().is_err());
+    }
+}
+
 /// Live view and extras for one namespace, decoded the way `cmd_apply`
 /// decodes a `/backup` body, so `unmodeled_nested_fields` is populated.
 fn decoded_live(

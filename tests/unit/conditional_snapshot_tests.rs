@@ -4,7 +4,8 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use gitforgeops::apply::{apply_api, ApplyOptions};
-use gitforgeops::config::{ApplyStrategy, Consumer, EnvConfig, GatewayConfig};
+use gitforgeops::config::schema::Consumer;
+use gitforgeops::config::{ApplyStrategy, EnvConfig, GatewayConfig};
 use gitforgeops::diff::OwnershipScope;
 use gitforgeops::http_client::conditional::{
     conditional_backup, require_preserved_credentials, require_publishable_credentials,
@@ -300,6 +301,193 @@ fn verified(row: &Value, tag: &str) -> Reply {
             ("Cache-Control".to_string(), "no-store".to_string()),
         ],
     )
+}
+
+#[tokio::test]
+async fn malformed_create_and_conditional_put_acknowledgements_are_redacted_and_never_replayed() {
+    for status in [200, 503] {
+        for body in [
+            format!(r#"{{"applied":false,"applied":false,"error":"{SECRET}"}}"#),
+            format!(r#"{{"applied":false,"applied":true,"error":"{SECRET}"}}"#),
+            json!({"applied": false, "reason": {"private": SECRET}}).to_string(),
+            json!({"applied": null, "error": SECRET}).to_string(),
+            json!({"applied": SECRET}).to_string(),
+            json!({"error": {"private": SECRET}}).to_string(),
+            format!(r#"{{"{SECRET}":"unfinished""#),
+            format!("<html>{SECRET}</html>"),
+            "[]".to_string(),
+            String::new(),
+        ] {
+            for create in [true, false] {
+                let response = body.clone();
+                let (client, requests) = gateway(move |_, _| (status, response.clone(), vec![]));
+                let current = consumer();
+                let error = if create {
+                    client.create_consumer(&current, NS).await.unwrap_err()
+                } else {
+                    client
+                        .update_if_match("Consumer", "c1", &current, NS, ROW_TAG)
+                        .await
+                        .unwrap_err()
+                };
+                assert!(matches!(
+                    error,
+                    gitforgeops::error::Error::AmbiguousMutation(_)
+                ));
+                assert!(!format!("{error:?} {error}").contains(SECRET));
+                assert!(!format!("{error:?} {error}").contains(ROW_TAG));
+                let seen = requests.lock().unwrap();
+                assert_eq!(seen.len(), 1);
+                if create {
+                    assert!(seen[0].starts_with("POST /consumers "));
+                } else {
+                    assert!(seen[0].starts_with("PUT /consumers/c1 "));
+                    assert!(seen[0].contains(&format!("if-match: {ROW_TAG}\r\n")));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn valid_resource_acknowledgements_and_empty_204_deletes_remain_accepted() {
+    for (status, body) in [
+        (201, serde_json::to_value(consumer()).unwrap().to_string()),
+        (200, "{}".to_string()),
+        (200, json!({"applied": true}).to_string()),
+        (204, String::new()),
+    ] {
+        let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
+        let current = consumer();
+        client.create_consumer(&current, NS).await.unwrap();
+        assert!(matches!(
+            client
+                .update_if_match("Consumer", "c1", &current, NS, ROW_TAG)
+                .await
+                .unwrap(),
+            gitforgeops::http_client::ConditionalUpdate::Applied
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+    for (status, body, accepted) in [
+        (204, String::new(), true),
+        (
+            200,
+            json!({"applied": false, "reason": {"private": SECRET}}).to_string(),
+            false,
+        ),
+        (
+            200,
+            json!({"applied": false, "reason": "reload_timeout", "error": SECRET}).to_string(),
+            false,
+        ),
+    ] {
+        let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
+        let result = client.delete_if_match("Consumer", "c1", NS, ROW_TAG).await;
+        assert_eq!(result.is_ok(), accepted);
+        if let Err(error) = result {
+            assert!(!format!("{error:?} {error}").contains(SECRET));
+        }
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn malformed_consumer_writes_never_prune_or_update_the_managed_ledger() {
+    use gitforgeops::apply::AppliedOp;
+    use gitforgeops::diff::resource_diff::{state_key, DiffAction};
+    use gitforgeops::state::{ResourceKeys, StateFile};
+
+    for create in [true, false] {
+        let mut old = consumer();
+        old.id = "old".to_string();
+        let mut actual = GatewayConfig {
+            consumers: vec![old],
+            ..Default::default()
+        };
+        let mut desired = config();
+        if !create {
+            actual.consumers.push(consumer());
+            desired.consumers[0].username = "updated".to_string();
+        }
+        let extras = planned_extras(&actual, NS, BackupExtras::default());
+        let mut state = StateFile::default();
+        let actual_keys = ResourceKeys::from_config(&actual);
+        for row in &actual.consumers {
+            state
+                .record_op(
+                    &AppliedOp {
+                        kind: "Consumer".to_string(),
+                        namespace: NS.to_string(),
+                        id: row.id.clone(),
+                        action: DiffAction::Add,
+                    },
+                    &actual_keys,
+                )
+                .unwrap();
+        }
+        let original_ledger = serde_json::to_value(&state.resources).unwrap();
+        let managed = state.resources.keys().cloned().collect::<HashSet<_>>();
+        let raw = serde_json::to_value(consumer()).unwrap();
+        let (client, requests) = gateway(move |request, _| {
+            if request.starts_with("GET /health") {
+                healthy()
+            } else if request.starts_with("GET /consumers/c1/verification ") && !create {
+                verified(&raw, ROW_TAG)
+            } else if request.starts_with("POST /consumers ") && create {
+                (
+                    201,
+                    format!(r#"{{"applied":false,"applied":false,"error":"{SECRET}"}}"#),
+                    vec![],
+                )
+            } else if request.starts_with("PUT /consumers/c1 ") && !create {
+                (
+                    200,
+                    json!({"applied": false, "reason": {"private": SECRET}}).to_string(),
+                    vec![],
+                )
+            } else {
+                panic!("an ambiguous write must not authorize pruning or another mutation")
+            }
+        });
+        let result = apply_api(
+            &desired,
+            &client,
+            &[NS.to_string()],
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            },
+            Some(&BTreeMap::from([(NS.to_string(), actual)])),
+            Some(&BTreeMap::from([(NS.to_string(), extras)])),
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((result.created, result.updated, result.deleted), (0, 0, 0));
+        assert!(result.fatal_error.is_some());
+        assert!(result.applied_incremental.is_empty());
+        assert!(result.adopted.is_empty());
+        let desired_keys = ResourceKeys::from_config(&desired);
+        for op in result.applied_incremental.iter().chain(&result.adopted) {
+            state.record_op(op, &desired_keys).unwrap();
+        }
+        state.stamp_last_applied_if_clean(result.fatal_error.is_none() && result.errors.is_empty());
+        assert_eq!(
+            serde_json::to_value(&state.resources).unwrap(),
+            original_ledger
+        );
+        assert!(state
+            .resources
+            .contains_key(&state_key(NS, "Consumer", "old")));
+        assert!(state.last_applied_at.is_none());
+        assert!(!format!("{:?} {:?}", result.errors, result.fatal_error).contains(SECRET));
+        assert!(!requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.starts_with("DELETE ")));
+        assert!(result.into_result().is_err());
+    }
 }
 
 #[tokio::test]
@@ -679,6 +867,96 @@ async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_c
 }
 
 #[tokio::test]
+async fn malformed_rotation_acknowledgements_refuse_completion_without_replay() {
+    for status in [200, 503] {
+        let current = consumer();
+        let raw = serde_json::to_value(&current).unwrap();
+        let served = raw.clone();
+        let (client, requests) = gateway(move |request, _| {
+            if request.starts_with("GET /health") {
+                healthy()
+            } else if request.starts_with("GET /consumers/c1/verification ") {
+                verified(&served, ROW_TAG)
+            } else if request.starts_with("PUT /consumers/c1 ") {
+                (
+                    status,
+                    json!({"applied": false, "reason": {"private": SECRET}}).to_string(),
+                    vec![("Retry-After".to_string(), "0".to_string())],
+                )
+            } else {
+                panic!("rotation must retain its original evidence and refuse replay")
+            }
+        });
+        let prepared =
+            PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+                .await
+                .unwrap();
+        // Delivery has completed. Only confirmed live publication permits the
+        // CLI's successful completion arm to record rotation metadata.
+        let error = prepared
+            .publish(&client, "delivered-rotation-fixture")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            gitforgeops::error::Error::AmbiguousMutation(_)
+        ));
+        assert!(!format!("{error:?} {error}").contains(SECRET));
+        assert!(!format!("{error:?} {error}").contains(ROW_TAG));
+        let seen = requests.lock().unwrap();
+        let writes = seen
+            .iter()
+            .filter(|request| request.starts_with("PUT "))
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains(&format!("if-match: {ROW_TAG}\r\n")));
+        let body: Value =
+            serde_json::from_str(writes[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        let mut expected = raw;
+        expected["credentials"]["keyauth"][0]["key"] = json!("delivered-rotation-fixture");
+        assert_eq!(body, expected);
+        assert_eq!(seen.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn malformed_batch_envelopes_never_authorize_success_fallback_or_replay() {
+    let counts = json!({"proxies": 0, "consumers": 1, "plugin_configs": 0, "upstreams": 0});
+    for status in [201, 503, 501] {
+        for body in [
+            format!(r#"{{"created":{counts},"applied":false,"applied":false,"error":"{SECRET}"}}"#),
+            json!({"created": counts, "applied": false, "reason": {"private": SECRET}})
+                .to_string(),
+            json!({"created": counts, "applied": null, "error": SECRET}).to_string(),
+        ] {
+            let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
+            let batch = gitforgeops::http_client::BatchCreate {
+                consumers: vec![consumer()],
+                ..Default::default()
+            };
+            let error = client.post_batch(&batch, NS).await.unwrap_err();
+            assert!(matches!(
+                error,
+                gitforgeops::error::Error::AmbiguousMutation(_)
+            ));
+            assert!(!format!("{error:?} {error}").contains(SECRET));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+    for status in [200, 201] {
+        let body = json!({"created": counts}).to_string();
+        let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
+        let batch = gitforgeops::http_client::BatchCreate {
+            consumers: vec![consumer()],
+            ..Default::default()
+        };
+        let created = client.post_batch(&batch, NS).await.unwrap().unwrap();
+        assert_eq!(created.consumers, 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn restore_retries_only_proven_precommit_failure_with_the_exact_original_body_and_token() {
     for refusal in [412, 501, 503, 200] {
         let (client, requests) = gateway(move |request, position| {
@@ -755,6 +1033,24 @@ async fn restore_uncertain_admission_fence_and_bad_seal_responses_are_never_repl
         (
             503,
             r#"{"failure_class":"audit_admission","failure_class":"connectivity"}"#.to_string(),
+        ),
+        (
+            503,
+            json!({"failure_class": "connectivity", "applied": false,
+                "reason": {"private": SECRET}})
+            .to_string(),
+        ),
+        (
+            503,
+            json!({"failure_class": "connectivity", "applied": null, "error": SECRET})
+                .to_string(),
+        ),
+        (
+            200,
+            json!({"applied": false, "reason": {"private": SECRET},
+                "restored": {"proxies": 0, "consumers": 0, "upstreams": 0,
+                    "plugin_configs": 0, "api_specs": 0, "gateway_trust_bundles": 0}})
+            .to_string(),
         ),
     ] {
         let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));

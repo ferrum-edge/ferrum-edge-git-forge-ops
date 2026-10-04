@@ -1107,6 +1107,33 @@ fn applied_false_maps_to_committed_not_live() {
 }
 
 #[test]
+fn malformed_mutation_diagnostics_never_expose_response_or_parser_values() {
+    const PRIVATE: &str = "malformed-response-secret-fixture";
+    for kind in [
+        RequestKind::Mutation,
+        RequestKind::NonIdempotentMutation,
+        RequestKind::Restore,
+    ] {
+        for body in [
+            format!(r#"{{"applied":false,"applied":false,"error":"{PRIVATE}"}}"#),
+            serde_json::json!({"applied": false, "reason": {"private": PRIVATE}}).to_string(),
+            serde_json::json!({"applied": PRIVATE}).to_string(),
+            format!(r#"{{"{PRIVATE}":"unfinished""#),
+            format!("<html>{PRIVATE}</html>"),
+        ] {
+            for status in [200, 503] {
+                let error = map_api_error(status, &body, kind);
+                assert!(matches!(
+                    error,
+                    gitforgeops::error::Error::AmbiguousMutation(_)
+                ));
+                assert!(!format!("{error:?} {error}").contains(PRIVATE));
+            }
+        }
+    }
+}
+
+#[test]
 fn a_redirect_without_a_location_still_explains_itself() {
     let error = map_api_error(301, "", RequestKind::Read);
     let message = error.to_string();

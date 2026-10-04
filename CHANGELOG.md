@@ -73,6 +73,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Mutation acknowledgements refuse duplicate keys, malformed field types and
+  ambiguous envelopes without exposing response bytes (#462). Invalid responses
+  cannot authorize retries, pruning, ownership ledger updates or rotation
+  completion. Ordinary empty 204 acknowledgements remain valid; batch counts and
+  conditional restore count seals still require complete matching evidence.
 - Consumer modify/delete, ownership claims, pending-create and ambiguous-create/batch
   recovery require complete stored evidence. Rotation establishes health, ownership
   and representability before broker publication, then changes only the authorized

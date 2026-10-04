@@ -63,6 +63,15 @@ Never retried:
 - **`applied: false`** in the body → `CommittedNotLive` (reason
   `config_rejected`, `reload_timeout` or `sequence_unavailable`). The write is
   stored but not live; check gateway health instead of re-sending.
+- **Malformed mutation envelopes.** Duplicate keys, incorrectly typed fields,
+  null markers and non-object responses cannot establish success or permit a
+  retry. Diagnostics withhold response bytes and parser details. Ordinary writes
+  accept empty HTTP 204 acknowledgements; batch creates still require matching
+  per-kind counts, and conditional restore still requires its complete count seal.
+  An invalid acknowledgement leaves the write's outcome uncertain: no blind
+  replay, pruning or ledger completion is authorized. Create and batch recovery
+  may establish success through authoritative readback and conditional ownership
+  assertions; rotation records completion only after confirmed live publication.
 - **`/restore` failures** other than the connectivity case. A 500 with
   `rollback: incomplete` or `unknown_outcome` is `RestoreNeedsManualRecovery`.
 - **Request timeouts.** The outcome is unknown; the next run re-diffs.
