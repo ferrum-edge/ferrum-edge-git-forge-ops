@@ -206,7 +206,9 @@ jobs:
   # the repository has no configured environments or desired resources.
   validator-pairing:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -232,6 +234,86 @@ jobs:
         run: |
           bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \
             "$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge"
+
+      # Preserve the protected install/probe bindings above. This extends the
+      # existing required pairing job without changing a privileged binding.
+      # No cache is restored or published by the producer/consumer builds.
+      - name: Check out pinned Alloy producer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ferrum-edge/ferrum-alloy
+          ref: 690aed7a9fa8458aeea4ac8416170c8daeb0470b
+          path: alloy-producer
+          persist-credentials: false
+
+      - name: Verify Alloy producer provenance
+        working-directory: alloy-producer
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = 690aed7a9fa8458aeea4ac8416170c8daeb0470b ]
+          sha256sum --check "$GITHUB_WORKSPACE/tests/fixtures/alloy-producer/SHA256SUMS"
+
+      - name: Install Alloy consumer test toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.98.0
+        with:
+          toolchain: 1.98.0
+
+      - name: Build Alloy producer and GitForgeOps consumer
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 build --locked --manifest-path alloy-producer/Cargo.toml \
+            -p ferrum-alloy-cli --bin ferrum-alloy --target-dir "$RUNNER_TEMP/alloy-producer-target"
+          cargo build --locked --bin gitforgeops
+
+      - name: Generate actual Alloy GitForgeOps fixture trees
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/alloy-generated"
+          for fixture in orders-api plain-http; do
+            "$RUNNER_TEMP/alloy-producer-target/debug/ferrum-alloy" edge export \
+              --manifest "alloy-producer/contracts/fixtures/manifests/${fixture}.toml" \
+              --format gitforgeops --output "$RUNNER_TEMP/alloy-generated/${fixture}"
+          done
+
+      - name: Require generated Alloy consumer qualification
+        env:
+          GITFORGEOPS_ALLOY_FIXTURE_ROOT: ${{ runner.temp }}/alloy-generated
+          GITFORGEOPS_ALLOY_VALIDATOR: ${{ runner.temp }}/gitforgeops-validator-bin/ferrum-edge
+        run: |
+          set -euo pipefail
+          # Edge validates the original orders fixture's TLS file contents.
+          # Claim a new directory exclusively; never overwrite existing material.
+          umask 077
+          cleanup_tls() {
+            sudo rm -f -- /etc/ferrum/edge-client.pem /etc/ferrum/edge-client.key \
+              /etc/ferrum/alloy-ca.pem /etc/ferrum/alloy-ca.key /etc/ferrum/edge-client.csr
+            sudo rmdir -- /etc/ferrum
+          }
+          sudo mkdir --mode=0700 /etc/ferrum
+          trap cleanup_tls EXIT
+          sudo chown "$(id -u):$(id -g)" /etc/ferrum
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -keyout /etc/ferrum/alloy-ca.key -out /etc/ferrum/alloy-ca.pem \
+            -subj '/CN=alloy-ci-ca' -addext 'basicConstraints=critical,CA:TRUE' \
+            -addext 'keyUsage=critical,keyCertSign,cRLSign' >/dev/null 2>&1
+          openssl req -new -newkey rsa:2048 -nodes \
+            -keyout /etc/ferrum/edge-client.key -out /etc/ferrum/edge-client.csr \
+            -subj '/CN=alloy-ci-client' -addext 'basicConstraints=critical,CA:FALSE' \
+            -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+            -addext 'extendedKeyUsage=clientAuth' >/dev/null 2>&1
+          openssl x509 -req -in /etc/ferrum/edge-client.csr \
+            -CA /etc/ferrum/alloy-ca.pem -CAkey /etc/ferrum/alloy-ca.key \
+            -set_serial 2 -days 365 -copy_extensions copy \
+            -out /etc/ferrum/edge-client.pem >/dev/null 2>&1
+          chmod 0600 /etc/ferrum/alloy-ca.key /etc/ferrum/edge-client.key \
+            /etc/ferrum/alloy-ca.pem /etc/ferrum/edge-client.pem /etc/ferrum/edge-client.csr
+          openssl verify -CAfile /etc/ferrum/alloy-ca.pem -purpose sslclient \
+            /etc/ferrum/edge-client.pem >/dev/null 2>&1
+          test_name=unit::companion_schema_tests::alloy_generated_resources_load_assemble_and_validate
+          listed=$(cargo test --locked --test unit_tests "$test_name" -- --ignored --exact --list --format terse)
+          [ "$(grep -c ': test$' <<< "$listed")" -eq 1 ]
+          grep -Fxq "$test_name: test" <<< "$listed"
+          cargo test --locked --test unit_tests "$test_name" -- --ignored --exact --nocapture
 
   gitforgeops-required-static-validation:
     name: gitforgeops-required-static-validation

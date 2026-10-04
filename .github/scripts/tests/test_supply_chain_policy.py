@@ -3176,6 +3176,77 @@ class SupplyChainPolicyTests(unittest.TestCase):
                         any(f": {job_name} " in item for item in violations), violations
                     )
 
+    def test_alloy_consumer_uses_existing_pairing_bindings_and_immutable_producer(self):
+        workflow_path = ".github/workflows/validate-pr.yml"
+        workflow = (ROOT / workflow_path).read_text()
+        document = check_supply_chain.parse_workflow(workflow)
+        job = document["jobs"]["validator-pairing"]
+        provenance = json.loads(
+            (ROOT / "tests/fixtures/alloy-producer/PROVENANCE.json").read_text()
+        )
+        self.assertEqual(check_supply_chain.trusted_validator_probe_violations(workflow), [])
+        self.assertEqual(check_supply_chain.untrusted_pr_installer_violations(workflow), [])
+        self.assertEqual(check_supply_chain.installer_step_auth_violations(workflow_path, workflow), [])
+        self.assertEqual(check_supply_chain.validator_locator_violations([workflow]), [])
+        self.assertEqual(check_supply_chain.probe_consumer_binding_violations(workflow_path, document), [])
+        self.assertEqual(check_supply_chain.status_write_permission_violations(workflow_path, document), [])
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", job)
+        self.assertNotIn("env", job)
+        producer = self._step(document, "validator-pairing", "Check out pinned Alloy producer")
+        self.assertEqual(producer["with"]["repository"], provenance["repository"])
+        self.assertEqual(producer["with"]["ref"], provenance["commit"])
+        self.assertRegex(provenance["commit"], r"^[0-9a-f]{40}$")
+        self.assertEqual(producer["with"]["persist-credentials"], "false")
+        verify = self._step(document, "validator-pairing", "Verify Alloy producer provenance")
+        self.assertIn(provenance["commit"], verify["run"])
+        self.assertIn("sha256sum --check", verify["run"])
+        build = self._step(document, "validator-pairing", "Build Alloy producer and GitForgeOps consumer")
+        self.assertIn("cargo +1.98.0 build --locked", build["run"])
+        self.assertIn("cargo build --locked --bin gitforgeops", build["run"])
+        generate = self._step(document, "validator-pairing", "Generate actual Alloy GitForgeOps fixture trees")
+        self.assertIn("for fixture in orders-api plain-http; do", generate["run"])
+        self.assertIn("--format gitforgeops", generate["run"])
+        qualify = self._step(document, "validator-pairing", "Require generated Alloy consumer qualification")
+        self.assertIn('-- --ignored --exact --list --format terse', qualify["run"])
+        self.assertIn('[ "$(grep -c \': test$\' <<< "$listed")" -eq 1 ]', qualify["run"])
+        self.assertIn('grep -Fxq "$test_name: test" <<< "$listed"', qualify["run"])
+        self.assertIn('-- --ignored --exact --nocapture', qualify["run"])
+        tls_run = qualify["run"]
+        self.assertIn("umask 077", tls_run)
+        self.assertIn("sudo mkdir --mode=0700 /etc/ferrum", tls_run)
+        self.assertNotIn("mkdir -p /etc/ferrum", tls_run)
+        self.assertIn('sudo chown "$(id -u):$(id -g)" /etc/ferrum', tls_run)
+        self.assertIn("trap cleanup_tls EXIT", tls_run)
+        self.assertIn("sudo rmdir -- /etc/ferrum", tls_run)
+        self.assertIn("openssl req -x509 -newkey rsa:2048", tls_run)
+        self.assertIn("openssl req -new -newkey rsa:2048", tls_run)
+        self.assertIn("-copy_extensions copy", tls_run)
+        self.assertIn("-purpose sslclient", tls_run)
+        self.assertEqual(tls_run.count(">/dev/null 2>&1"), 4)
+        self.assertIn("chmod 0600 /etc/ferrum/alloy-ca.key /etc/ferrum/edge-client.key", tls_run)
+        for name in ("edge-client.pem", "edge-client.key", "alloy-ca.pem",
+                     "alloy-ca.key", "edge-client.csr"):
+            self.assertIn(f"/etc/ferrum/{name}", tls_run.split("sudo mkdir", 1)[0])
+        self.assertLess(tls_run.index("sudo mkdir"), tls_run.index("trap cleanup_tls EXIT"))
+        self.assertLess(tls_run.index("trap cleanup_tls EXIT"), tls_run.index("sudo chown"))
+        self.assertLess(tls_run.index("sudo chown"), tls_run.index("openssl req"))
+        self.assertLess(tls_run.index("openssl verify"), tls_run.index("test_name="))
+        self.assertNotIn("/etc/ferrum", generate["run"])
+        for step in job["steps"]:
+            self.assertNotIn("if", step)
+            self.assertNotIn("continue-on-error", step)
+            self.assertNotIn("cache", step.get("uses", "").lower())
+            self.assertNotIn("secrets.", json.dumps(step))
+            if step.get("name") != "Download pairing validator":
+                self.assertNotIn("github.token", json.dumps(step))
+        order = [step.get("name") for step in job["steps"]]
+        self.assertLess(order.index("Require resource-label compatibility"), order.index(producer["name"]))
+        self.assertLess(order.index(producer["name"]), order.index(verify["name"]))
+        self.assertLess(order.index(verify["name"]), order.index(build["name"]))
+        self.assertLess(order.index(build["name"]), order.index(generate["name"]))
+        self.assertLess(order.index(generate["name"]), order.index(qualify["name"]))
+
     def test_validator_probe_cannot_be_missing_duplicated_or_run_before_install(self):
         workflow = (ROOT / ".github/workflows/validate-pr.yml").read_text()
         probe = (
